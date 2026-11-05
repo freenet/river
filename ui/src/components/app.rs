@@ -8,6 +8,10 @@ pub mod update_banner;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::document_title::DocumentTitleUpdater;
+use crate::components::app::freenet_api::connection_manager::control::{
+    self as connection_control, AttemptId, ConnectionControl,
+};
+use crate::components::app::freenet_api::error_report::ErrorReport;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::freenet_api::FreenetSynchronizer;
 use crate::components::direct_messages::{DmThreadModal, InviteViaDmPickerModal};
@@ -61,6 +65,95 @@ pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> = Global::new(|| {
         SynchronizerStatus::Connecting
     }
 });
+/// The newest connection error report, kept until the display reaches
+/// Connected, so Connecting and Disconnected can still explain and copy it.
+pub static LAST_CONNECTION_ERROR: GlobalSignal<Option<ErrorReport>> = Global::new(|| None);
+
+/// Where a display status write comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusOrigin {
+    /// A decision about this connection attempt: its socket's callbacks, its
+    /// timeout, or the message loop acting on the current attempt.
+    Attempt(AttemptId),
+    /// The `setSyncStatus` test hook.
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")),
+        allow(dead_code)
+    )]
+    Test,
+}
+
+impl StatusOrigin {
+    /// The message loop's own decisions, about whatever attempt is current.
+    pub fn current() -> Self {
+        StatusOrigin::Attempt(connection_control::get().current_attempt())
+    }
+}
+
+/// Whether a display write from `origin` may still apply: a write from a
+/// replaced attempt never does, whether it is refused where it starts or was
+/// already queued when the attempt changed.
+pub(crate) fn origin_is_live(control: &ConnectionControl, origin: StatusOrigin) -> bool {
+    match origin {
+        StatusOrigin::Attempt(attempt) => control.is_current(attempt),
+        StatusOrigin::Test => true,
+    }
+}
+
+/// The error report to retain once `next` is displayed: a new error replaces
+/// it, Connected clears it, anything else keeps it.
+pub(crate) fn retained_error(
+    previous: Option<ErrorReport>,
+    next: &SynchronizerStatus,
+) -> Option<ErrorReport> {
+    match next {
+        SynchronizerStatus::Error(report) => Some(report.clone()),
+        SynchronizerStatus::Connected => None,
+        SynchronizerStatus::Connecting | SynchronizerStatus::Disconnected => previous,
+    }
+}
+
+/// The one way to change what the connection pill shows. The status and the
+/// retained report are committed together in one deferred closure (callers
+/// are handlers, callbacks and futures), so no reader sees one without the
+/// other. Connection decisions do NOT wait for this: they go through
+/// [`connection_control`], synchronously, before calling here.
+pub fn set_sync_status(status: SynchronizerStatus, origin: StatusOrigin) {
+    schedule_status_commit(
+        connection_control::get(),
+        status,
+        origin,
+        crate::util::defer,
+        |status| {
+            LAST_CONNECTION_ERROR.with_mut(|last| *last = retained_error(last.take(), &status));
+            *SYNC_STATUS.write() = status;
+        },
+    );
+}
+
+/// `set_sync_status` with its scheduler and its commit passed in, so the
+/// tests run this exact policy: refused at the origin if the attempt was
+/// replaced, and checked again when the queued commit runs.
+pub(crate) fn schedule_status_commit(
+    control: &'static ConnectionControl,
+    status: SynchronizerStatus,
+    origin: StatusOrigin,
+    schedule: impl FnOnce(Box<dyn FnOnce()>),
+    commit: impl FnOnce(SynchronizerStatus) + 'static,
+) {
+    if !origin_is_live(control, origin) {
+        debug!("Dropping a display status from a replaced connection attempt");
+        return;
+    }
+    schedule(Box::new(move || {
+        if !origin_is_live(control, origin) {
+            debug!("Dropping a queued display status: its attempt was replaced");
+            return;
+        }
+        commit(status);
+    }));
+}
+
 pub static SYNCHRONIZER: GlobalSignal<FreenetSynchronizer> = Global::new(FreenetSynchronizer::new);
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Global::new(|| None);
 pub static AUTH_TOKEN: GlobalSignal<Option<String>> = Global::new(|| None);
@@ -168,7 +261,7 @@ fn install_wide_viewport_listener() {
 }
 
 // Build metadata from build.rs
-const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP_ISO");
+use crate::util::BUILD_TIMESTAMP_ISO as BUILD_TIMESTAMP;
 const GIT_COMMIT: &str = env!("GIT_COMMIT_HASH");
 
 #[component]
@@ -745,6 +838,188 @@ fn get_auth_token_from_window() {
 
 #[cfg(test)]
 mod tests {
+    use super::{retained_error, schedule_status_commit, StatusOrigin};
+    use crate::components::app::freenet_api::connection_manager::control::ConnectionControl;
+    use crate::components::app::freenet_api::error_report::ErrorReport;
+    use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The display the pill shows: status and retained report.
+    #[derive(Default)]
+    struct Display {
+        status: Option<SynchronizerStatus>,
+        last_error: Option<ErrorReport>,
+    }
+
+    /// `set_sync_status`'s own policy (`schedule_status_commit`), with the
+    /// `defer` queue made explicit and the signals replaced by `display`.
+    type Queue = Rc<RefCell<Vec<Box<dyn FnOnce()>>>>;
+
+    struct Harness {
+        control: &'static ConnectionControl,
+        queue: Queue,
+        display: Rc<RefCell<Display>>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                control: Box::leak(Box::new(ConnectionControl::new())),
+                queue: Rc::default(),
+                display: Rc::default(),
+            }
+        }
+        fn set(&mut self, status: SynchronizerStatus, origin: StatusOrigin) {
+            let queue = self.queue.clone();
+            let display = self.display.clone();
+            schedule_status_commit(
+                self.control,
+                status,
+                origin,
+                move |commit| queue.borrow_mut().push(commit),
+                move |status| {
+                    let mut d = display.borrow_mut();
+                    d.last_error = retained_error(d.last_error.take(), &status);
+                    d.status = Some(status);
+                },
+            );
+        }
+        fn run_queue(&mut self) {
+            let queued = std::mem::take(&mut *self.queue.borrow_mut());
+            for commit in queued {
+                commit();
+            }
+        }
+        fn label(&self) -> Option<SynchronizerStatus> {
+            self.display.borrow().status.clone()
+        }
+        fn last_error(&self) -> Option<ErrorReport> {
+            self.display.borrow().last_error.clone()
+        }
+    }
+
+    fn closed() -> SynchronizerStatus {
+        SynchronizerStatus::Error(ErrorReport::new(
+            "Disconnected",
+            "Connection closed",
+            "WebSocket error: connection closed",
+        ))
+    }
+
+    #[test]
+    fn an_error_is_kept_through_reconnecting_and_cleared_by_connected() {
+        let mut h = Harness::new();
+        let a = h.control.begin_attempt();
+        h.set(closed(), StatusOrigin::Attempt(a));
+        h.set(SynchronizerStatus::Disconnected, StatusOrigin::Attempt(a));
+        h.run_queue();
+        assert_eq!(h.label(), Some(SynchronizerStatus::Disconnected));
+        assert_eq!(
+            h.last_error().map(|r| r.summary),
+            Some("Connection closed".to_string())
+        );
+
+        let b = h.control.begin_attempt();
+        h.set(SynchronizerStatus::Connecting, StatusOrigin::Attempt(b));
+        h.run_queue();
+        assert_eq!(h.label(), Some(SynchronizerStatus::Connecting));
+        assert!(h.last_error().is_some(), "Connecting keeps the last error");
+
+        h.set(SynchronizerStatus::Connected, StatusOrigin::Attempt(b));
+        h.run_queue();
+        assert_eq!(h.label(), Some(SynchronizerStatus::Connected));
+        assert!(h.last_error().is_none(), "Connected clears it");
+    }
+
+    #[test]
+    fn a_replaced_attempt_cannot_resurrect_an_error() {
+        let mut h = Harness::new();
+        let old = h.control.begin_attempt();
+        let new = h.control.begin_attempt();
+        h.set(SynchronizerStatus::Connected, StatusOrigin::Attempt(new));
+        h.run_queue();
+        // The old socket's timeout or close, after the new one connected.
+        h.set(closed(), StatusOrigin::Attempt(old));
+        h.run_queue();
+        assert_eq!(h.label(), Some(SynchronizerStatus::Connected));
+        assert!(h.last_error().is_none());
+    }
+
+    #[test]
+    fn a_write_queued_before_its_attempt_was_replaced_is_dropped() {
+        let mut h = Harness::new();
+        let old = h.control.begin_attempt();
+        h.set(closed(), StatusOrigin::Attempt(old));
+        // A new attempt begins before the queued write runs.
+        let new = h.control.begin_attempt();
+        h.set(SynchronizerStatus::Connecting, StatusOrigin::Attempt(new));
+        h.run_queue();
+        assert_eq!(h.label(), Some(SynchronizerStatus::Connecting));
+        assert!(h.last_error().is_none());
+    }
+
+    #[test]
+    fn writes_apply_in_the_order_they_were_made() {
+        let mut h = Harness::new();
+        let a = h.control.begin_attempt();
+        h.set(SynchronizerStatus::Connecting, StatusOrigin::Attempt(a));
+        h.set(closed(), StatusOrigin::Attempt(a));
+        h.set(SynchronizerStatus::Connected, StatusOrigin::Attempt(a));
+        h.run_queue();
+        assert_eq!(h.label(), Some(SynchronizerStatus::Connected));
+        assert!(h.last_error().is_none());
+    }
+
+    #[test]
+    fn test_hook_writes_always_apply() {
+        let mut h = Harness::new();
+        h.control.begin_attempt();
+        h.set(closed(), StatusOrigin::Test);
+        h.run_queue();
+        assert!(matches!(
+            h.label(),
+            Some(SynchronizerStatus::Error(r)) if r.summary == "Connection closed"
+        ));
+    }
+
+    /// Every display write goes through `set_sync_status`: one written
+    /// directly (synchronously, or deferred on its own) could land out of
+    /// order with the others or skip the attempt check.
+    #[test]
+    fn sync_status_is_written_only_by_set_sync_status() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for file in crate::util::source_scan::rust_files(&src_dir) {
+            let code = crate::util::source_scan::production_only(
+                &std::fs::read_to_string(&file).expect("readable source"),
+            );
+            for needle in [
+                "SYNC_STATUS.write()",
+                "SYNC_STATUS.with_mut(",
+                "SYNC_STATUS.set(",
+                "LAST_CONNECTION_ERROR.write()",
+                "LAST_CONNECTION_ERROR.with_mut(",
+                "LAST_CONNECTION_ERROR.set(",
+            ] {
+                let count = code.matches(needle).count();
+                if count > 0 {
+                    offenders.push((file.display().to_string(), needle, count));
+                }
+            }
+        }
+        let setter: Vec<_> = offenders
+            .iter()
+            .filter(|(f, _, _)| f.ends_with("components/app.rs"))
+            .collect();
+        assert_eq!(
+            offenders.len(),
+            2,
+            "only set_sync_status writes the display: {offenders:?}"
+        );
+        assert_eq!(setter.len(), 2, "{offenders:?}");
+    }
+
     // -----------------------------------------------------------------
     // Issue freenet/river#279 regression guard:
     //

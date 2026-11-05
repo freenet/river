@@ -571,7 +571,97 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The connection pill's status, through the same deferred, ordered
+    // `set_sync_status` the synchronizer uses: "connected", "connecting",
+    // "disconnected", "error" (a closed connection), or "error:<message>".
+    set_hook(
+        "setSyncStatus",
+        Closure::<dyn FnMut(String)>::new(move |status: String| {
+            use crate::components::app::freenet_api::error_report::ErrorReport;
+            use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
+            use crate::components::app::{set_sync_status, StatusOrigin};
+            let status = match status.as_str() {
+                "connected" => SynchronizerStatus::Connected,
+                "connecting" => SynchronizerStatus::Connecting,
+                "disconnected" => SynchronizerStatus::Disconnected,
+                "error" => SynchronizerStatus::Error(ErrorReport::new(
+                    crate::components::app::freenet_api::error_report::LABEL_DISCONNECTED,
+                    "Connection closed",
+                    "WebSocket error: request error: {\"error\":\"connection closed\",\"source\":\"close\"}",
+                )),
+                other => match other.strip_prefix("error:") {
+                    Some(message) => SynchronizerStatus::Error(ErrorReport::from_text(message)),
+                    None => wasm_bindgen::throw_str(&format!("unknown sync status {other:?}")),
+                },
+            };
+            set_sync_status(status, StatusOrigin::Test);
+        })
+        .into_js_value(),
+    );
+
+    // A connection error report with a given label (one of the report
+    // labels in `error_report.rs`), summary and detail.
+    set_hook(
+        "setSyncErrorReport",
+        Closure::<dyn FnMut(String, String, String)>::new(
+            move |label: String, summary: String, detail: String| {
+                use crate::components::app::freenet_api::error_report::ErrorReport;
+                use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
+                use crate::components::app::{set_sync_status, StatusOrigin};
+                let report = ErrorReport::new(report_label(&label), summary, detail);
+                set_sync_status(SynchronizerStatus::Error(report), StatusOrigin::Test);
+            },
+        )
+        .into_js_value(),
+    );
+
+    // The current room as a placeholder still awaiting its initial sync (its
+    // configuration no longer verifies) whose sync ended in this error: the
+    // room banner and the rail's error marker.
+    set_hook(
+        "showRoomSyncError",
+        Closure::<dyn FnMut(String, String, String)>::new(
+            move |label: String, summary: String, detail: String| {
+                use crate::components::app::freenet_api::error_report::ErrorReport;
+                use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
+                let label = report_label(&label);
+                crate::util::defer(move || {
+                    let report = ErrorReport::new(label, summary, detail);
+                    with_current_room_mut(|room, room_key| {
+                        let signature = room.room_state.configuration.signature.to_bytes();
+                        let mut forged = signature;
+                        forged[0] ^= 1;
+                        room.room_state.configuration.signature =
+                            ed25519_dalek::Signature::from_bytes(&forged);
+                        let key = *room_key;
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.register_new_room(key);
+                            sync_info.update_sync_status(&key, RoomSyncStatus::Error(report));
+                        });
+                    });
+                });
+            },
+        )
+        .into_js_value(),
+    );
+
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
+}
+
+/// The report label named `label`; anything else throws.
+fn report_label(label: &str) -> &'static str {
+    use crate::components::app::freenet_api::error_report::*;
+    [
+        LABEL_DISCONNECTED,
+        LABEL_INVALID_OPERATION,
+        LABEL_UNEXPECTED_MESSAGE,
+        LABEL_REFRESHING,
+        LABEL_ROOM_NOT_FOUND,
+        LABEL_ROOM_FULL,
+    ]
+    .into_iter()
+    .find(|known| *known == label)
+    .unwrap_or_else(|| wasm_bindgen::throw_str(&format!("unknown report label {label:?}")))
 }
 
 /// Where a delivered message lands in the room's message list.

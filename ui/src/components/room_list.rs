@@ -11,6 +11,7 @@ use crate::components::app::chat_delegate::{
     retry_rooms_load, save_rooms_to_delegate, RoomsLoadState, ROOMS_LOAD_STATE,
 };
 use crate::components::app::document_title::count_unread_in_room_data_with_mode;
+use crate::components::app::freenet_api::error_report::ErrorReport;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::back_to_chat::BackToChatButton;
@@ -20,6 +21,7 @@ use crate::components::icons::{
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
+use crate::components::tooltip::WithTooltip;
 use crate::room_data::CurrentRoom;
 use dioxus::logger::tracing::error;
 use dioxus::prelude::*;
@@ -30,8 +32,7 @@ use dioxus_free_icons::{
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::privacy::PrivacyMode;
 
-// Access the build timestamp (ISO 8601 format) environment variable set by build.rs
-const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp not set");
+use crate::util::BUILD_TIMESTAMP_ISO;
 
 // Stable Dioxus key for the reorder tail drop zone (keys must be unique and
 // distinct from any room's `{room_key:?}`).
@@ -300,7 +301,7 @@ pub fn RoomList() -> Element {
                 // Scoped to placeholder-state rooms: a fully-synced room that
                 // later hits some other transient `Error` should not show the
                 // marker here.
-                let sync_error_msg: Option<String> = if room_data.is_awaiting_initial_sync() {
+                let sync_error_msg: Option<ErrorReport> = if room_data.is_awaiting_initial_sync() {
                     // Second fallible read in this memo, so it nudges too: a
                     // contended pass drops the SYNC_INFO subscription and the
                     // room's error marker silently reads as a spinner until an
@@ -313,7 +314,7 @@ pub fn RoomList() -> Element {
                         }
                     };
                     match status {
-                        Some(RoomSyncStatus::Error(msg)) => Some(msg),
+                        Some(RoomSyncStatus::Error(report)) => Some(report),
                         _ => None,
                     }
                 } else {
@@ -607,7 +608,7 @@ pub fn RoomList() -> Element {
                             // drag gesture).
                             draggable: "true",
                             class: format!(
-                                "rounded-lg cursor-grab active:cursor-grabbing select-none transition-opacity border-t-2 {} {}",
+                                "tooltip-frame rounded-lg cursor-grab active:cursor-grabbing select-none transition-opacity border-t-2 {} {}",
                                 if is_dragged { "opacity-50" } else { "" },
                                 if is_drag_over && !is_dragged { "border-accent" } else { "border-transparent" },
                             ),
@@ -729,15 +730,19 @@ pub fn RoomList() -> Element {
                                     }
                                     if awaiting_sync {
                                         div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
-                                    } else if let Some(err_msg) = sync_error_msg {
+                                    } else if let Some(report) = sync_error_msg {
                                         // Terminal sync failure for a placeholder room: the
                                         // bounded contract-absent case (freenet/river#290) or a
-                                        // failed GET/PUT send. Show a warning marker (tooltip = the
-                                        // stored error message) instead of a perpetual spinner.
-                                        span {
-                                            class: "flex-shrink-0 text-danger",
-                                            title: "{err_msg}",
-                                            "aria-label": "Room sync failed",
+                                        // failed GET/PUT send. A warning marker instead of a
+                                        // perpetual spinner; its tooltip explains, and it does
+                                        // not copy (it sits inside the row's button, which
+                                        // still opens the room, whose banner copies).
+                                        WithTooltip {
+                                            tip: report.summary.clone(),
+                                            class: "flex-shrink-0 text-danger tooltip-host--end tooltip-host--framed tooltip-host--below",
+                                            test_id: "room-sync-error-marker",
+                                            role: "img",
+                                            "aria-label": "Room sync failed: {report.label}",
                                             Icon { width: 12, height: 12, icon: FaTriangleExclamation }
                                         }
                                     }

@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
+use super::connection_manager::control::{self as connection_control, Phase};
 use super::connection_manager::ConnectionManager;
 use super::delegate_migration::note_legacy_delegate_not_installed;
 use super::error::SynchronizerError;
+use super::error_report::ErrorReport;
 use super::response_handler::ResponseHandler;
 use super::room_synchronizer::RoomSynchronizer;
 use crate::components::app::chat_delegate::{
@@ -11,7 +13,7 @@ use crate::components::app::chat_delegate::{
     set_up_chat_delegate,
 };
 use crate::components::app::sync_info::SYNC_INFO;
-use crate::components::app::{ROOMS, SYNC_STATUS, WEB_API};
+use crate::components::app::{set_sync_status, StatusOrigin, ROOMS, WEB_API};
 use crate::util::{owner_vk_to_contract_key, safe_spawn_local, sleep};
 use dioxus::logger::tracing::{debug, error, info, warn};
 use dioxus::prelude::*;
@@ -250,18 +252,15 @@ pub struct FreenetSynchronizer {
     connection_ready: bool,
 }
 
+/// What the connection pill shows. Written only through
+/// [`set_sync_status`](crate::components::app::set_sync_status); decisions
+/// read [`control`](super::connection_manager::control) instead.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SynchronizerStatus {
     Disconnected,
     Connecting,
     Connected,
-    Error(String),
-}
-
-impl From<SynchronizerError> for SynchronizerStatus {
-    fn from(error: SynchronizerError) -> Self {
-        SynchronizerStatus::Error(error.to_string())
-    }
+    Error(ErrorReport),
 }
 
 impl FreenetSynchronizer {
@@ -344,7 +343,7 @@ impl FreenetSynchronizer {
             // detects a half-open / silently-dead socket — one the browser
             // never reports as closed/errored — and raises ConnectionLost so
             // the normal reconnect + re-subscribe + re-GET path recovers the
-            // frozen live-update stream. Dormant unless SYNC_STATUS==Connected,
+            // frozen live-update stream. Dormant unless the connection is up,
             // so it can't add reconnect pressure while already reconnecting.
             super::connection_watchdog::spawn_liveness_watchdog(message_tx.clone());
 
@@ -424,9 +423,15 @@ impl FreenetSynchronizer {
                                 info!("ConnectionLost ignored — a reconnect is already pending");
                             }
                             Some(armed) => {
-                                // Clear the web API so is_connected() returns false
+                                // Clear the web API and mark the connection down
+                                // now, so is_connected() returns false at once;
+                                // the pill follows a macrotask later.
                                 WEB_API.write().take();
-                                *SYNC_STATUS.write() = SynchronizerStatus::Disconnected;
+                                connection_control::get().set_phase(Phase::Disconnected);
+                                set_sync_status(
+                                    SynchronizerStatus::Disconnected,
+                                    StatusOrigin::current(),
+                                );
                                 // No generation reload until the reconnect has
                                 // caught up, and keep the update banner honest
                                 // about it (freenet/river#580). Only here, where
@@ -528,7 +533,7 @@ impl FreenetSynchronizer {
                             continue;
                         }
                         // This is the sleep/wake path where the WebSocket *appears* alive
-                        // (SYNC_STATUS == Connected) so we refresh rather than reconnect —
+                        // (is_connected()) so we refresh rather than reconnect —
                         // but the node-side contract subscriptions may have been dropped
                         // while suspended. Re-arm the per-session EnsureRoomSubscription
                         // dedup and re-run the load-rooms pass so owned private rooms are
@@ -592,12 +597,12 @@ impl FreenetSynchronizer {
                         // orphaned `onclose` then injects a spurious ConnectionLost
                         // and self-sustains the loop (freenet/river#406). Skip when
                         // we already have a live, usable connection. Both conditions
-                        // are required: SYNC_STATUS and WEB_API are written by
-                        // separate deferred tasks, so a late `onopen` can leave
-                        // `is_connected()` true while WEB_API is still None (a
-                        // half-open zombie). Gating on WEB_API too keeps the skip
-                        // self-contained rather than relying on a later onclose to
-                        // re-assert the disconnect.
+                        // are required: `is_connected()` reads the connection
+                        // phase, which the connect path sets only after WEB_API,
+                        // but a loss clears them in separate steps, and a
+                        // half-open zombie must never pass. Gating on WEB_API
+                        // too keeps the skip self-contained rather than relying
+                        // on a later onclose to re-assert the disconnect.
                         reconnect.note_connect_attempt();
                         if connection_manager.is_connected() && WEB_API.read().is_some() {
                             info!("Connect ignored — already connected");
@@ -895,8 +900,14 @@ impl FreenetSynchronizer {
                                 if e.to_string().contains("not supported") {
                                     warn!("Detected 'not supported' WebSocket operation. This may indicate API version mismatch.");
                                     // Don't immediately reconnect for this specific error as it's likely to recur
-                                    *SYNC_STATUS.write() = SynchronizerStatus::Error(
-                                        "WebSocket API operation not supported. Check server compatibility.".to_string()
+                                    connection_control::get().set_phase(Phase::Failed);
+                                    set_sync_status(
+                                        SynchronizerStatus::Error(
+                                            ErrorReport::unsupported_operation(format!(
+                                                "WebSocket API operation not supported. Check server compatibility. ({e})"
+                                            )),
+                                        ),
+                                        StatusOrigin::current(),
                                     );
                                     continue;
                                 }
@@ -1048,8 +1059,11 @@ impl FreenetSynchronizer {
         self.message_rx.is_none()
     }
 
+    /// Whether the current connection attempt is connected: the same
+    /// control state `ConnectionManager::is_connected` reads, never the
+    /// pill's deferred display status.
     pub fn is_connected(&self) -> bool {
-        matches!(*SYNC_STATUS.read(), SynchronizerStatus::Connected)
+        connection_control::get().is_connected()
     }
 }
 

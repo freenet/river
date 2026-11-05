@@ -1,3 +1,4 @@
+use crate::components::app::freenet_api::error_report::{ErrorReport, LABEL_ROOM_NOT_FOUND};
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::ROOMS;
 use dioxus::logger::tracing::{info, warn};
@@ -65,9 +66,11 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
                 crate::util::defer(move || {
                     SYNC_INFO.write().update_sync_status(
                         &owner_vk,
-                        RoomSyncStatus::Error(
-                            "Subscription failed - contract not found on network".to_string(),
-                        ),
+                        RoomSyncStatus::Error(ErrorReport::new(
+                            LABEL_ROOM_NOT_FOUND,
+                            "This room's contract was not found on the network",
+                            "Subscription failed - contract not found on network",
+                        )),
                     );
                 });
                 false

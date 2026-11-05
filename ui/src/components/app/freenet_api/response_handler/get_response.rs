@@ -3,6 +3,9 @@ use crate::components::app::freenet_api::backward_probe::{
     RekeyStart,
 };
 use crate::components::app::freenet_api::error::SynchronizerError;
+use crate::components::app::freenet_api::error_report::{
+    first_sentence, ErrorReport, LABEL_DISCONNECTED, LABEL_ROOM_FULL,
+};
 use crate::components::app::freenet_api::response_handler::update_notification::{
     clear_upgrade_target, follow_upgrade_pointer_if_needed, upgrade_target_owner,
 };
@@ -437,11 +440,15 @@ pub async fn handle_get_response(
                         MemberId::from(owner_vk),
                         err
                     );
-                    let err_msg = err.to_string();
+                    let report = ErrorReport::new(
+                        LABEL_ROOM_FULL,
+                        first_sentence(&err.to_string()),
+                        err.to_string(),
+                    );
                     crate::util::defer(move || {
                         SYNC_INFO
                             .write()
-                            .update_sync_status(&owner_vk, RoomSyncStatus::Error(err_msg.clone()));
+                            .update_sync_status(&owner_vk, RoomSyncStatus::Error(report));
                     });
                     // Surface failure on PENDING_INVITES so the
                     // existing modal can report it and the user can
@@ -449,7 +456,8 @@ pub async fn handle_get_response(
                     crate::util::defer(move || {
                         PENDING_INVITES.with_mut(|pending| {
                             if let Some(join) = pending.map.get_mut(&owner_vk) {
-                                join.status = PendingRoomStatus::Error(err.to_string());
+                                join.status =
+                                    PendingRoomStatus::Error(first_sentence(&err.to_string()));
                             }
                         });
                     });
@@ -796,18 +804,25 @@ pub async fn handle_get_response(
                             MemberId::from(owner_vk),
                             e
                         );
-                        Err(e.to_string())
+                        Err(ErrorReport::from_client_error_during(
+                            "Couldn't publish this room",
+                            &e,
+                        ))
                     }
                 }
             } else {
-                Err("WebAPI not available".to_string())
+                Err(ErrorReport::new(
+                    LABEL_DISCONNECTED,
+                    "Couldn't publish this room: not connected to your Freenet node",
+                    "WebAPI not available",
+                ))
             };
 
-            if let Err(e) = put_result {
+            if let Err(report) = put_result {
                 crate::util::defer(move || {
                     SYNC_INFO
                         .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(e.clone()));
+                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(report));
                 });
                 // Reset invite status so the normal retry flow can pick it up
                 crate::util::defer(move || {

@@ -626,3 +626,116 @@
         animation-name: app-toast-fade-in;
     }
 }
+
+/* Instant tooltips (`components/tooltip.rs`): the connection pill, the room
+ * sync banner and the rail's sync-error marker. No transition and no native
+ * `title` delay: the card shows the moment its host is hovered or focused.
+ *
+ * The card is a child of its host. Its padding touches the host, so the
+ * pointer can travel onto it (and a click on it is a click on the host)
+ * without leaving the host's :hover.
+ *
+ * With anchor positioning (the @supports block) the card is fixed to its host
+ * (`anchor-name` / `position-anchor` are inline, one name per host) and flips
+ * to stay in the viewport, escaping the rails' overflow. The base rules are
+ * the fallback: absolutely positioned above the host. In a rail, which clips
+ * (`overflow-y: auto`), a `--framed` host's card instead spans its
+ * `.tooltip-frame` (the pill's strip, the room's row) so it fits the rail's
+ * width. Either way the card is the host's `aria-describedby`, so the
+ * explanation does not depend on it being painted.
+ *
+ * z-index 65: above the update banner (50) and the toast (60). A native
+ * popover's top layer still paints above it. */
+.tooltip-host,
+.tooltip-frame {
+    position: relative;
+}
+
+.tooltip-host--framed {
+    position: static;
+}
+
+.tooltip-host--copy {
+    cursor: pointer;
+    border-radius: 0.375rem;
+}
+
+.tooltip-host--copy:focus-visible {
+    outline: 2px solid var(--color-link);
+    outline-offset: 2px;
+}
+
+.tooltip-card {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    z-index: 65;
+    display: block;
+    width: max-content;
+    max-width: min(18rem, calc(100vw - 2rem));
+    padding-block: 6px;
+    visibility: hidden;
+    text-align: left;
+    white-space: normal;
+}
+
+.tooltip-host--framed > .tooltip-card {
+    left: 0.5rem;
+    right: 0.5rem;
+    width: auto;
+    max-width: none;
+}
+
+.tooltip-host--below > .tooltip-card {
+    top: 100%;
+    bottom: auto;
+}
+
+.tooltip-host:hover > .tooltip-card,
+.tooltip-host--copy:focus-visible > .tooltip-card,
+:focus-visible .tooltip-host > .tooltip-card {
+    visibility: visible;
+}
+
+.tooltip-box {
+    display: block;
+    padding: 0.375rem 0.625rem;
+    border: 1px solid var(--color-border);
+    border-radius: 0.375rem;
+    background: var(--color-panel);
+    color: var(--color-text);
+    font-size: 0.75rem;
+    font-weight: 400;
+    line-height: 1rem;
+    box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+}
+
+.tooltip-text {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+}
+
+.tooltip-hint {
+    display: block;
+    margin-top: 0.25rem;
+    color: var(--color-text-muted);
+}
+
+@supports (anchor-name: --a) and (position-area: top) {
+    .tooltip-host > .tooltip-card {
+        position: fixed;
+        inset: auto;
+        width: max-content;
+        max-width: min(18rem, calc(100vw - 2rem));
+        position-area: top span-right;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    }
+
+    .tooltip-host--end > .tooltip-card {
+        position-area: top span-left;
+    }
+}

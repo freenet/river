@@ -49,13 +49,15 @@ async function waitForApp(page: Page) {
 // The dots use the theme's status tokens; the spec checks the class AND the
 // painted colour, which must be the token's (status-contrast.spec.ts pins
 // the tokens themselves).
+// An error report shows its own short label (error_report.rs): the error
+// dot, except "Refreshing..." (an auth reload under way), which is progress.
 const STATUS_STATES = [
   { dot: "bg-success", token: "--color-success", label: "Connected" },
   { dot: "bg-warning", token: "--color-warning", label: "Connecting..." },
+  { dot: "bg-warning", token: "--color-warning", label: "Refreshing..." },
   { dot: "bg-error", token: "--color-error", label: "Disconnected" },
-  // SynchronizerStatus::Error renders "Error: <msg>" with the error dot; the
-  // label is matched with a prefix below rather than an exact string.
-  { dot: "bg-error", token: "--color-error", label: "Error:" },
+  { dot: "bg-error", token: "--color-error", label: "Invalid operation" },
+  { dot: "bg-error", token: "--color-error", label: "Unexpected message" },
 ];
 
 // Assert the visible pill renders a coherent connection state: its dot
@@ -64,18 +66,20 @@ const STATUS_STATES = [
 // stuck-state regression" check — a pill that never picks up a real state
 // (no subscription) cannot satisfy both halves.
 async function expectCoherentState(visiblePill: Locator) {
-  const dot = visiblePill.locator("div").first();
+  const dot = visiblePill.getByTestId("connection-status-dot");
+  const label = visiblePill.getByTestId("connection-status-label");
   await expect(dot).toBeVisible({ timeout: 5_000 });
   // The label span always renders some status text; wait for it via a
   // retrying assertion before the non-retrying getAttribute/textContent
   // reads below, so a mid-render empty read can't make this flaky.
-  await expect(visiblePill).toContainText(/\S/, { timeout: 5_000 });
+  await expect(label).toContainText(/\S/, { timeout: 5_000 });
 
   const dotClass = (await dot.getAttribute("class")) ?? "";
-  const labelText = ((await visiblePill.textContent()) ?? "").trim();
+  // The label alone: a pill with an error report also holds its tooltip.
+  const labelText = ((await label.textContent()) ?? "").trim();
 
-  // Distinct status colours — `bg-error` is shared by Disconnected and
-  // Error, so dedupe before counting how many the dot carries.
+  // Distinct status colours — several labels share a colour, so dedupe
+  // before counting how many the dot carries.
   const colours = [...new Set(STATUS_STATES.map((s) => s.dot))];
   const present = colours.filter((c) =>
     new RegExp(`(^|\\s)${c}(\\s|$)`).test(dotClass)
@@ -99,9 +103,7 @@ async function expectCoherentState(visiblePill: Locator) {
   const expectedLabels = STATUS_STATES.filter((s) => s.dot === colour).map(
     (s) => s.label
   );
-  const labelMatches = expectedLabels.some((l) =>
-    l.endsWith(":") ? labelText.startsWith(l) : labelText === l
-  );
+  const labelMatches = expectedLabels.includes(labelText);
   expect(
     labelMatches,
     `label "${labelText}" must match dot colour "${colour}" (one of ${JSON.stringify(

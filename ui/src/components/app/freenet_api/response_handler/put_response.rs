@@ -1,4 +1,5 @@
 use crate::components::app::freenet_api::error::SynchronizerError;
+use crate::components::app::freenet_api::error_report::ErrorReport;
 use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::ROOMS;
@@ -70,11 +71,11 @@ pub async fn handle_put_response(
             if let Err(e) = subscribe_result {
                 error!("Failed to subscribe to contract after PUT: {}", e);
                 // Update the sync status to error
-                let error_msg = e.to_string();
+                let report = ErrorReport::from_synchronizer_error(&e);
                 crate::util::defer(move || {
                     SYNC_INFO
                         .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(error_msg));
+                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(report));
                 });
             } else {
                 // Update sync status in a separate block to avoid nested borrows

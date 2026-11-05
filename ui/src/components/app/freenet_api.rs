@@ -9,6 +9,7 @@ pub mod connection_watchdog;
 pub mod constants;
 pub mod delegate_migration;
 pub mod error;
+pub mod error_report;
 pub mod freenet_synchronizer;
 pub mod generation_watch;
 pub mod migration_journal;
