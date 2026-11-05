@@ -27,7 +27,7 @@ pub const LABEL_ROOM_FULL: &str = "Room is full";
 
 /// The most raw text (detail or stack) the copied diagnostics carry, per
 /// field. It bounds size; it is not redaction.
-pub const MAX_RAW_CHARS: usize = 8_000;
+const MAX_RAW_CHARS: usize = 8_000;
 
 /// Reads a `serde_json::Value` into a [`ConnectionPayload`]. A macro, with
 /// method calls only, because river-ui does not depend on `serde_json`: the
@@ -75,8 +75,6 @@ macro_rules! connection_payload {
         }
     }};
 }
-#[allow(unused_imports)]
-pub(crate) use connection_payload;
 
 /// One failure, as the UI shows and copies it.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,19 +117,21 @@ impl ErrorReport {
 
     /// A report for a transport error the `WebApi` handed River.
     pub fn from_client_error(error: &client_api::Error) -> Self {
-        let (label, summary) = classify_client_error(error);
-        Self::new(label, summary, client_error_detail(error))
+        let ClientErrorParts {
+            label,
+            summary,
+            detail,
+        } = analyse_client_error(error);
+        Self::new(label, summary, detail)
     }
 
     /// The same, for an error whose operation the summary should name
     /// ("Couldn't fetch this room: Connection closed").
     pub fn from_client_error_during(operation: &str, error: &client_api::Error) -> Self {
-        let (label, summary) = classify_client_error(error);
-        Self::new(
-            label,
-            format!("{operation}: {summary}"),
-            format!("{operation}: {}", client_error_detail(error)),
-        )
+        let mut report = Self::from_client_error(error);
+        report.summary = format!("{operation}: {}", report.summary);
+        report.detail = format!("{operation}: {}", report.detail);
+        report
     }
 
     /// A report for a synchronizer error, in its own short words
@@ -190,13 +190,28 @@ impl ErrorReport {
     }
 }
 
-/// The label and one-sentence summary for a transport error.
-pub fn classify_client_error(error: &client_api::Error) -> (&'static str, String) {
+/// A transport error as a report shows it, read from its payload once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientErrorParts {
+    pub label: &'static str,
+    pub summary: String,
+    /// See [`client_error_detail`].
+    pub detail: String,
+}
+
+/// The label, one-sentence summary and copied detail of a transport error.
+pub fn analyse_client_error(error: &client_api::Error) -> ClientErrorParts {
     #[cfg(target_family = "wasm")]
     if let client_api::Error::ConnectionError(value) = error {
-        return classify_connection_payload(&connection_payload!(value));
+        let payload = connection_payload!(value);
+        let (label, summary) = classify_connection_payload(&payload);
+        return ClientErrorParts {
+            label,
+            summary,
+            detail: payload_detail(&payload),
+        };
     }
-    match error {
+    let (label, summary) = match error {
         client_api::Error::ConnectionClosed => (LABEL_DISCONNECTED, "Connection closed".into()),
         client_api::Error::ChannelClosed => (LABEL_DISCONNECTED, "Connection closed".into()),
         client_api::Error::Deserialization(e) => (
@@ -204,6 +219,11 @@ pub fn classify_client_error(error: &client_api::Error) -> (&'static str, String
             format!("The node's reply could not be decoded ({e})"),
         ),
         other => (LABEL_DISCONNECTED, first_sentence(&other.to_string())),
+    };
+    ClientErrorParts {
+        label,
+        summary,
+        detail: format!("WebSocket error: {error}"),
     }
 }
 
@@ -214,29 +234,30 @@ pub fn classify_client_error(error: &client_api::Error) -> (&'static str, String
 pub fn client_error_detail(error: &client_api::Error) -> String {
     #[cfg(target_family = "wasm")]
     if let client_api::Error::ConnectionError(value) = error {
-        return format!(
-            "WebSocket error: request error: {}",
-            connection_payload!(value).redacted
-        );
+        return payload_detail(&connection_payload!(value));
     }
     format!("WebSocket error: {error}")
 }
 
+fn payload_detail(payload: &ConnectionPayload) -> String {
+    format!("WebSocket error: request error: {}", payload.redacted)
+}
+
 /// The fields of the browser `WebApi`'s JSON error payload River reads.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ConnectionPayload {
-    pub source: String,
-    pub origin: String,
+struct ConnectionPayload {
+    source: String,
+    origin: String,
     /// The `error` field as text: a string as is, an object's `message`, any
     /// other non-null value as compact JSON.
-    pub error: Option<String>,
+    error: Option<String>,
     /// The whole payload as JSON, its `request` replaced by the request's kind.
-    pub redacted: String,
+    redacted: String,
 }
 
 /// The label and summary for the browser `WebApi`'s error payload, by where
 /// the payload says the failure came from.
-pub fn classify_connection_payload(payload: &ConnectionPayload) -> (&'static str, String) {
+fn classify_connection_payload(payload: &ConnectionPayload) -> (&'static str, String) {
     let text = payload.error.clone();
     match (payload.source.as_str(), payload.origin.as_str()) {
         ("close", _) => (LABEL_DISCONNECTED, "Connection closed".into()),
@@ -296,7 +317,7 @@ fn with_reason(lead: &str, reason: Option<String>) -> String {
 
 /// The leading variant names of a request's Debug, e.g.
 /// `ContractOp(Put` for `ContractOp(Put { contract: …`.
-pub fn request_kind(debug: &str) -> String {
+fn request_kind(debug: &str) -> String {
     let end = debug
         .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '(' || c == ':'))
         .unwrap_or(debug.len());
@@ -324,7 +345,7 @@ pub fn first_sentence(text: &str) -> String {
     capitalise_first(text[..end].trim_end_matches('.'))
 }
 
-pub fn capitalise_first(s: &str) -> String {
+fn capitalise_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -333,7 +354,7 @@ pub fn capitalise_first(s: &str) -> String {
 }
 
 /// `text` capped at [`MAX_RAW_CHARS`] characters, saying how many it dropped.
-pub fn cap_raw(text: &str) -> String {
+fn cap_raw(text: &str) -> String {
     let total = text.chars().count();
     if total <= MAX_RAW_CHARS {
         return text.to_string();
@@ -344,7 +365,7 @@ pub fn cap_raw(text: &str) -> String {
 
 /// The copied diagnostics. Absent fields are left out; detail and stack are
 /// capped by [`cap_raw`].
-pub fn format_diagnostics(report: &ErrorReport, build: &str) -> String {
+fn format_diagnostics(report: &ErrorReport, build: &str) -> String {
     let mut lines = vec![format!("River: {}", report.label)];
     if !report.summary.is_empty() {
         lines.push(report.summary.clone());
@@ -485,17 +506,36 @@ mod tests {
 
     #[test]
     fn native_error_variants_classify() {
+        let closed = ClientErrorParts {
+            label: LABEL_DISCONNECTED,
+            summary: "Connection closed".into(),
+            detail: "WebSocket error: connection closed".into(),
+        };
         assert_eq!(
-            classify_client_error(&client_api::Error::ConnectionClosed),
-            (LABEL_DISCONNECTED, "Connection closed".into())
+            analyse_client_error(&client_api::Error::ConnectionClosed),
+            closed
         );
         assert_eq!(
-            classify_client_error(&client_api::Error::ChannelClosed),
-            (LABEL_DISCONNECTED, "Connection closed".into())
+            analyse_client_error(&client_api::Error::ChannelClosed).summary,
+            "Connection closed"
         );
         assert_eq!(
             client_error_detail(&client_api::Error::ConnectionClosed),
-            "WebSocket error: connection closed"
+            closed.detail
+        );
+    }
+
+    #[test]
+    fn an_operation_prefixes_summary_and_detail() {
+        let r = ErrorReport::from_client_error_during(
+            "Couldn't fetch this room",
+            &client_api::Error::ConnectionClosed,
+        );
+        assert_eq!(r.label, LABEL_DISCONNECTED);
+        assert_eq!(r.summary, "Couldn't fetch this room: Connection closed");
+        assert_eq!(
+            r.detail,
+            "Couldn't fetch this room: WebSocket error: connection closed"
         );
     }
 

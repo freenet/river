@@ -93,7 +93,7 @@ impl StatusOrigin {
 /// Whether a display write from `origin` may still apply: a write from a
 /// replaced attempt never does, whether it is refused where it starts or was
 /// already queued when the attempt changed.
-pub(crate) fn origin_is_live(control: &ConnectionControl, origin: StatusOrigin) -> bool {
+fn origin_is_live(control: &ConnectionControl, origin: StatusOrigin) -> bool {
     match origin {
         StatusOrigin::Attempt(attempt) => control.is_current(attempt),
         StatusOrigin::Test => true,
@@ -102,10 +102,7 @@ pub(crate) fn origin_is_live(control: &ConnectionControl, origin: StatusOrigin) 
 
 /// The error report to retain once `next` is displayed: a new error replaces
 /// it, Connected clears it, anything else keeps it.
-pub(crate) fn retained_error(
-    previous: Option<ErrorReport>,
-    next: &SynchronizerStatus,
-) -> Option<ErrorReport> {
+fn retained_error(previous: Option<ErrorReport>, next: &SynchronizerStatus) -> Option<ErrorReport> {
     match next {
         SynchronizerStatus::Error(report) => Some(report.clone()),
         SynchronizerStatus::Connected => None,
@@ -134,7 +131,7 @@ pub fn set_sync_status(status: SynchronizerStatus, origin: StatusOrigin) {
 /// `set_sync_status` with its scheduler and its commit passed in, so the
 /// tests run this exact policy: refused at the origin if the attempt was
 /// replaced, and checked again when the queued commit runs.
-pub(crate) fn schedule_status_commit(
+fn schedule_status_commit(
     control: &'static ConnectionControl,
     status: SynchronizerStatus,
     origin: StatusOrigin,

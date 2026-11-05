@@ -19,7 +19,7 @@
 use dioxus::prelude::*;
 
 /// What the toast says after a copy.
-pub const COPIED_MESSAGE: &str = "Error details copied";
+const COPIED_MESSAGE: &str = "Error details copied";
 
 thread_local! {
     static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

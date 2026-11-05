@@ -1803,11 +1803,11 @@ impl RoomSynchronizer {
                 }
                 Err(e) => {
                     error!("Failed to send subscription request: {}", e);
-                    let (_, summary) = super::error_report::classify_client_error(&e);
+                    let parts = super::error_report::analyse_client_error(&e);
                     Err(SynchronizerError::SubscribeSendFailed {
-                        summary,
+                        summary: parts.summary,
                         raw: e.to_string(),
-                        detail: super::error_report::client_error_detail(&e),
+                        detail: parts.detail,
                     })
                 }
             }

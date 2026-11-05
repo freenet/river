@@ -62,7 +62,7 @@ type RiverTestHooks = {
 };
 
 export type SyncStatus = "connected" | "connecting" | "disconnected" | "error" | `error:${string}`;
-export type ReportLabel =
+type ReportLabel =
   | "Disconnected"
   | "Invalid operation"
   | "Unexpected message"
