@@ -116,6 +116,7 @@ pub mod control {
     /// follows the connect timeout (which closes the socket), and the timeout
     /// that follows a refused socket's close, keep it. A close before the
     /// socket ever opened is a failed connect, not a dropped connection.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum FailureReport {
         /// Keep the report already shown for this attempt.
@@ -127,6 +128,7 @@ pub mod control {
     }
 
     /// For an error or close from the attempt's socket.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
     pub fn socket_failure_report(phase_before: Phase, is_close: bool) -> FailureReport {
         match (phase_before, is_close) {
             (Phase::Failed, true) => FailureReport::Keep,
@@ -136,6 +138,7 @@ pub mod control {
     }
 
     /// For the connect timeout.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
     pub fn timeout_failure_report(phase_before: Phase) -> FailureReport {
         if phase_before == Phase::Failed {
             FailureReport::Keep
@@ -229,7 +232,7 @@ mod imp {
     use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
     use crate::components::app::{set_sync_status, StatusOrigin, AUTH_TOKEN, WEB_API};
     use crate::util::sleep;
-    use dioxus::logger::tracing::{error, info, warn};
+    use dioxus::logger::tracing::{debug, error, info, warn};
     use dioxus::prelude::ReadableExt;
     use freenet_stdlib::client_api::{ClientError, HostResponse, WebApi};
     use futures::channel::mpsc::UnboundedSender;
@@ -310,8 +313,8 @@ mod imp {
 
             info!("Starting WebAPI with callbacks");
 
-            // Clone message_tx for the error handler to trigger reconnection
-            let error_tx = message_tx.clone();
+            // The error handler sends ConnectionLost to trigger reconnection.
+            let error_tx = message_tx;
 
             let web_api = WebApi::start(
                 websocket.clone(),
@@ -422,7 +425,6 @@ mod imp {
                 {
                     move |error| {
                         let error_msg = format!("WebSocket error: {}", error);
-                        error!("{}", error_msg);
 
                         // A socket this page already replaced: its errors and
                         // its close belong to a connection nobody uses any
@@ -430,9 +432,10 @@ mod imp {
                         // start another reconnect.
                         let phase_before = control::get().phase();
                         if !control::get().set_phase_for(attempt, Phase::Failed) {
-                            info!("Ignoring an error from a replaced WebSocket: {}", error_msg);
+                            debug!("Ignoring an error from a replaced WebSocket: {}", error_msg);
                             return;
                         }
+                        error!("{}", error_msg);
 
                         // Check if this is a connection closed error
                         let is_connection_closed = error_msg.contains("connection closed");
@@ -455,18 +458,15 @@ mod imp {
                         if let Some(report) = report {
                             set_sync_status(SynchronizerStatus::Error(report), origin);
                         }
-                        let tx = error_tx.clone();
-                        spawn_local(async move {
-                            // Trigger reconnection for connection closed errors
-                            if is_connection_closed {
-                                info!("Connection closed, triggering reconnection");
-                                if let Err(e) = tx.unbounded_send(
-                                    freenet_synchronizer::SynchronizerMessage::ConnectionLost,
-                                ) {
-                                    error!("Failed to send ConnectionLost message: {}", e);
-                                }
+                        // Trigger reconnection for connection closed errors
+                        if is_connection_closed {
+                            info!("Connection closed, triggering reconnection");
+                            if let Err(e) = error_tx.unbounded_send(
+                                freenet_synchronizer::SynchronizerMessage::ConnectionLost,
+                            ) {
+                                error!("Failed to send ConnectionLost message: {}", e);
                             }
-                        });
+                        }
                     }
                 },
                 {
@@ -488,7 +488,6 @@ mod imp {
                                 let _ = storage.remove_item("river_last_auth_reload");
                             }
                         }
-                        set_sync_status(SynchronizerStatus::Connected, origin);
                         let _ = ready_tx.send(());
                     }
                 },
