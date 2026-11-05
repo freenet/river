@@ -52,11 +52,8 @@ pub enum SynchronizerError {
     #[error("Failed to put contract state: {0}")]
     PutContractError(String),
 
-    #[error("Failed to subscribe to contract: {0}")]
-    SubscribeError(String),
-
-    /// The subscribe request could not be sent. Displays (and so logs) like
-    /// `SubscribeError`; `summary` is the short explanation the room's error
+    /// The subscribe request could not be sent. Displays (and so logs) as
+    /// "Failed to subscribe to contract: {raw}"; `summary` is the short explanation the room's error
     /// report shows, `detail` the redacted text its copied diagnostics carry
     /// ([`ErrorReport`](super::error_report::ErrorReport)).
     #[error("Failed to subscribe to contract: {raw}")]
@@ -147,10 +144,7 @@ mod tests {
         };
         assert_eq!(
             e.to_string(),
-            SynchronizerError::SubscribeError(
-                "request error: {\"origin\":\"send precondition check\"}".into()
-            )
-            .to_string()
+            "Failed to subscribe to contract: request error: {\"origin\":\"send precondition check\"}"
         );
     }
 }

@@ -76,7 +76,7 @@ macro_rules! connection_payload {
 }
 
 /// One failure, as the UI shows and copies it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ErrorReport {
     /// The short label the pill or room surface shows.
     pub label: &'static str,
@@ -88,6 +88,17 @@ pub struct ErrorReport {
     pub time: Option<String>,
     /// The JS stack where the report was made, if available.
     pub stack: Option<String>,
+}
+
+/// The label and summary only: a status is logged on every sync pass, and the
+/// time and multi-line JS stack belong in the copied diagnostics.
+impl std::fmt::Debug for ErrorReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErrorReport")
+            .field("label", &self.label)
+            .field("summary", &self.summary)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ErrorReport {
@@ -114,21 +125,16 @@ impl ErrorReport {
         format_diagnostics(self, crate::util::BUILD_TIMESTAMP_ISO)
     }
 
-    /// A report for a transport error the `WebApi` handed River.
-    pub fn from_client_error(error: &client_api::Error) -> Self {
-        Self::from_parts(analyse_client_error(error))
-    }
-
     /// A report for a transport error already read by
     /// [`analyse_client_error`].
     pub fn from_parts(parts: ClientErrorParts) -> Self {
         Self::new(parts.label, parts.summary, parts.detail)
     }
 
-    /// The same, for an error whose operation the summary should name
-    /// ("Couldn't fetch this room: Connection closed").
+    /// A report for a transport error the `WebApi` handed River, naming the
+    /// operation it failed ("Couldn't fetch this room: Connection closed").
     pub fn from_client_error_during(operation: &str, error: &client_api::Error) -> Self {
-        let mut report = Self::from_client_error(error);
+        let mut report = Self::from_parts(analyse_client_error(error));
         report.summary = format!("{operation}: {}", report.summary);
         report.detail = format!("{operation}: {}", report.detail);
         report
@@ -268,7 +274,7 @@ fn analyse_connection_payload(payload: &ConnectionPayload) -> ClientErrorParts {
     ClientErrorParts {
         label,
         summary,
-        detail: payload_detail(payload),
+        detail: format!("WebSocket error: request error: {}", payload.redacted),
         is_connection_closed: payload.source == "close",
     }
 }
@@ -278,10 +284,6 @@ fn analyse_connection_payload(payload: &ConnectionPayload) -> ClientErrorParts {
 #[cfg(test)]
 pub(crate) fn analyse_browser_payload(value: &serde_json::Value) -> ClientErrorParts {
     analyse_connection_payload(&connection_payload!(value))
-}
-
-fn payload_detail(payload: &ConnectionPayload) -> String {
-    format!("WebSocket error: request error: {}", payload.redacted)
 }
 
 /// The fields of the browser `WebApi`'s JSON error payload River reads.

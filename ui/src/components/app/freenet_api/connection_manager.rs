@@ -129,7 +129,7 @@ pub mod control {
 
     /// For an error or close from the attempt's socket.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
-    pub(super) fn socket_failure_report(phase_before: Phase, is_close: bool) -> FailureReport {
+    fn socket_failure_report(phase_before: Phase, is_close: bool) -> FailureReport {
         match (phase_before, is_close) {
             (Phase::Failed, true) => FailureReport::Keep,
             (Phase::Connecting, true) => FailureReport::ConnectFailed,
@@ -592,7 +592,7 @@ mod imp {
                             control::get(),
                             attempt,
                             parts.is_connection_closed,
-                            |chosen| {
+                            move |chosen| {
                                 let report = match chosen {
                                     control::FailureReport::ConnectFailed => {
                                         ErrorReport::connect_timeout(format!(
@@ -600,7 +600,7 @@ mod imp {
                                             parts.detail
                                         ))
                                     }
-                                    _ => ErrorReport::from_parts(parts.clone()),
+                                    _ => ErrorReport::from_parts(parts),
                                 };
                                 set_sync_status(SynchronizerStatus::Error(report), origin);
                             },

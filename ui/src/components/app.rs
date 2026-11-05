@@ -70,7 +70,7 @@ pub static SYNC_STATUS: GlobalSignal<SynchronizerStatus> = Global::new(|| {
 pub static LAST_CONNECTION_ERROR: GlobalSignal<Option<ErrorReport>> = Global::new(|| None);
 
 /// Where a display status write comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum StatusOrigin {
     /// A decision about this connection attempt: its socket's callbacks, its
     /// timeout, or the message loop acting on the current attempt.
