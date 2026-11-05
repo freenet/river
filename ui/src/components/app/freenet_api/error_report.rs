@@ -4,7 +4,8 @@
 //! A report has three parts: a short `label` the surface shows ("Disconnected",
 //! "Room not found"), a one-sentence `summary` its tooltip explains, and the
 //! raw `detail` (the original error text) that only the copied diagnostics
-//! carry. Logging is unchanged: every site still logs the error it always did.
+//! carry. Logs keep the error text they always had; an error from a socket
+//! the page already replaced logs at debug level, without its payload.
 //!
 //! freenet-stdlib's browser `WebApi` reports transport failures as
 //! `Error::ConnectionError(json)`, whose `source` / `origin` field says where
@@ -62,12 +63,10 @@ macro_rules! connection_payload {
         });
         let mut redacted = value.clone();
         if let Some(request) = redacted.get_mut("request") {
-            let kind = $crate::components::app::freenet_api::error_report::request_kind(
-                request.as_str().unwrap_or(""),
-            );
+            let kind = request_kind(request.as_str().unwrap_or(""));
             *request = format!("{kind} (contents omitted)").into();
         }
-        $crate::components::app::freenet_api::error_report::ConnectionPayload {
+        ConnectionPayload {
             source: field("source"),
             origin: field("origin"),
             error,
@@ -134,14 +133,26 @@ impl ErrorReport {
         report
     }
 
-    /// A report for a synchronizer error, in its own short words
-    /// ([`SynchronizerError::user_message`]).
+    /// A report for a room that could not be subscribed to after it was
+    /// published. The copied detail of a send failure is the redacted one,
+    /// never its raw text.
     pub fn from_synchronizer_error(error: &super::error::SynchronizerError) -> Self {
-        let detail = match error {
-            super::error::SynchronizerError::SubscribeSendFailed { detail, .. } => detail.clone(),
-            other => other.to_string(),
-        };
-        Self::new(LABEL_DISCONNECTED, error.user_message(), detail)
+        use super::error::SynchronizerError as E;
+        match error {
+            E::SubscribeSendFailed {
+                summary, detail, ..
+            } => Self::new(
+                LABEL_DISCONNECTED,
+                format!("Couldn't subscribe to this room: {summary}"),
+                detail.clone(),
+            ),
+            E::ApiNotInitialized => Self::new(
+                LABEL_DISCONNECTED,
+                "Couldn't subscribe to this room: not connected to your Freenet node",
+                error.to_string(),
+            ),
+            other => Self::from_text(LABEL_DISCONNECTED, &other.to_string()),
+        }
     }
 
     /// The node answered a request with an error that says the operation is
@@ -182,11 +193,10 @@ impl ErrorReport {
         )
     }
 
-    /// A report from a free-form error text, as the `setSyncStatus` test hook
-    /// and the native stub give one. The label is Disconnected.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // only the test hooks, on wasm
-    pub fn from_text(text: &str) -> Self {
-        Self::new(LABEL_DISCONNECTED, first_sentence(text), text)
+    /// A report from a free-form error text: its first sentence explains it,
+    /// the whole text is the detail.
+    pub fn from_text(label: &'static str, text: &str) -> Self {
+        Self::new(label, first_sentence(text), text)
     }
 }
 
@@ -244,7 +254,7 @@ fn payload_detail(payload: &ConnectionPayload) -> String {
 }
 
 /// The fields of the browser `WebApi`'s JSON error payload River reads.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug)]
 struct ConnectionPayload {
     source: String,
     origin: String,
@@ -335,7 +345,7 @@ fn request_kind(debug: &str) -> String {
 
 /// The text up to the end of its first sentence, capitalised, with no
 /// trailing full stop: a summary is one short sentence.
-pub fn first_sentence(text: &str) -> String {
+fn first_sentence(text: &str) -> String {
     let text = text.trim();
     let end = text
         .char_indices()
@@ -429,9 +439,9 @@ mod tests {
                 "WebSocket state: CLOSED",
             ),
             (
-                json!({"error": "WebSocket is not open (state: CONNECTING)", "origin": "send precondition check"}),
+                json!({"error": "socket gone", "origin": "send precondition check"}),
                 LABEL_DISCONNECTED,
-                "WebSocket state: CONNECTING",
+                "WebSocket is not open",
             ),
             (
                 json!({"error": {"name": "InvalidStateError"}, "origin": "request sending"}),
@@ -624,10 +634,32 @@ mod tests {
         assert!(ErrorReport::auth_expired("x").is_progress());
         assert!(!ErrorReport::auth_reload_loop("x").is_progress());
         assert!(!ErrorReport::connect_timeout("x").is_progress());
-        assert_eq!(ErrorReport::auth_expired("x").label, LABEL_REFRESHING);
+    }
+
+    #[test]
+    fn a_subscribe_send_failure_copies_the_redacted_detail_never_the_raw_text() {
+        use super::super::error::SynchronizerError;
+        let e = SynchronizerError::SubscribeSendFailed {
+            summary: "WebSocket state: CLOSED".into(),
+            raw: "request error: RAW-ROOM-STATE".into(),
+            detail: "WebSocket error: request error: ContractOp(Put (contents omitted)".into(),
+        };
+        let r = ErrorReport::from_synchronizer_error(&e);
+        assert_eq!(r.label, LABEL_DISCONNECTED);
         assert_eq!(
-            ErrorReport::auth_reload_loop("x").summary,
-            "Connection lost. Please refresh the page."
+            r.summary,
+            "Couldn't subscribe to this room: WebSocket state: CLOSED"
+        );
+        let copied = r.diagnostics();
+        assert!(
+            copied.contains("ContractOp(Put (contents omitted)"),
+            "{copied}"
+        );
+        assert!(!copied.contains("RAW-ROOM-STATE"), "{copied}");
+
+        assert_eq!(
+            ErrorReport::from_synchronizer_error(&SynchronizerError::ApiNotInitialized).summary,
+            "Couldn't subscribe to this room: not connected to your Freenet node"
         );
     }
 }

@@ -577,7 +577,9 @@ pub fn install_test_hooks() {
     set_hook(
         "setSyncStatus",
         Closure::<dyn FnMut(String)>::new(move |status: String| {
-            use crate::components::app::freenet_api::error_report::ErrorReport;
+            use crate::components::app::freenet_api::error_report::{
+                ErrorReport, LABEL_DISCONNECTED,
+            };
             use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
             use crate::components::app::{set_sync_status, StatusOrigin};
             let status = match status.as_str() {
@@ -585,12 +587,12 @@ pub fn install_test_hooks() {
                 "connecting" => SynchronizerStatus::Connecting,
                 "disconnected" => SynchronizerStatus::Disconnected,
                 "error" => SynchronizerStatus::Error(ErrorReport::new(
-                    crate::components::app::freenet_api::error_report::LABEL_DISCONNECTED,
+                    LABEL_DISCONNECTED,
                     "Connection closed",
                     "WebSocket error: request error: {\"error\":\"connection closed\",\"source\":\"close\"}",
                 )),
                 other => match other.strip_prefix("error:") {
-                    Some(message) => SynchronizerStatus::Error(ErrorReport::from_text(message)),
+                    Some(message) => SynchronizerStatus::Error(ErrorReport::from_text(LABEL_DISCONNECTED, message)),
                     None => wasm_bindgen::throw_str(&format!("unknown sync status {other:?}")),
                 },
             };

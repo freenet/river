@@ -117,50 +117,6 @@ impl SynchronizerError {
         }
     }
 
-    /// One short sentence for the user. Exhaustive, so a new variant has to
-    /// say what it means to someone who is not reading the logs; the Display
-    /// above stays the log text.
-    pub fn user_message(&self) -> String {
-        use super::error_report::first_sentence;
-        match self {
-            SynchronizerError::WebSocketError(m)
-            | SynchronizerError::DelegateMissing { message: m, .. }
-            | SynchronizerError::DelegateRegisterFailed { message: m, .. }
-            | SynchronizerError::ClientApiError(m)
-            | SynchronizerError::Unknown(m) => first_sentence(m),
-            SynchronizerError::WebSocketNotSupported(_) => {
-                "Your Freenet node does not support an operation River used".into()
-            }
-            SynchronizerError::ConnectionTimeout(ms) => {
-                format!("The node did not answer within {} seconds", ms / 1000)
-            }
-            SynchronizerError::ApiNotInitialized => "Not connected to your Freenet node".into(),
-            SynchronizerError::RoomNotFound(_) => "This room is not stored on this device".into(),
-            SynchronizerError::ContractInfoNotFound(_) => {
-                "River has no contract details for this room yet".into()
-            }
-            SynchronizerError::MessageSendError(m) => {
-                format!("A message could not be sent: {}", first_sentence(m))
-            }
-            SynchronizerError::StateMergeError(_) | SynchronizerError::DeltaApplyError(_) => {
-                "An update from the network could not be applied".into()
-            }
-            SynchronizerError::PutContractError(m) => {
-                format!("The room could not be published: {}", first_sentence(m))
-            }
-            SynchronizerError::SubscribeError(m) => {
-                format!("Couldn't subscribe to this room: {}", first_sentence(m))
-            }
-            SynchronizerError::SubscribeSendFailed { summary, .. } => {
-                format!("Couldn't subscribe to this room: {summary}")
-            }
-            SynchronizerError::SerializationError(_) => "River could not encode a request".into(),
-            SynchronizerError::DeserializationError(_) => {
-                "River could not read a reply from the node".into()
-            }
-        }
-    }
-
     /// The delegate a typed `DelegateError::Missing` names, if this is one.
     pub fn missing_delegate_key(&self) -> Option<&DelegateKey> {
         match self {
@@ -183,7 +139,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscribe_send_failures_display_as_before_and_explain_shortly() {
+    fn subscribe_send_failures_display_as_before() {
         let e = SynchronizerError::SubscribeSendFailed {
             summary: "WebSocket state: CLOSED".into(),
             raw: "request error: {\"origin\":\"send precondition check\"}".into(),
@@ -195,18 +151,6 @@ mod tests {
                 "request error: {\"origin\":\"send precondition check\"}".into()
             )
             .to_string()
-        );
-        assert_eq!(
-            e.user_message(),
-            "Couldn't subscribe to this room: WebSocket state: CLOSED"
-        );
-        assert_eq!(
-            SynchronizerError::ApiNotInitialized.user_message(),
-            "Not connected to your Freenet node"
-        );
-        assert_eq!(
-            SynchronizerError::WebSocketError("connection closed. retrying".into()).user_message(),
-            "Connection closed"
         );
     }
 }

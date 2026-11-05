@@ -118,7 +118,7 @@ pub mod control {
     /// socket ever opened is a failed connect, not a dropped connection.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum FailureReport {
+    pub(super) enum FailureReport {
         /// Keep the report already shown for this attempt.
         Keep,
         /// "WebSocket connection failed or timed out".
@@ -129,7 +129,7 @@ pub mod control {
 
     /// For an error or close from the attempt's socket.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
-    pub fn socket_failure_report(phase_before: Phase, is_close: bool) -> FailureReport {
+    pub(super) fn socket_failure_report(phase_before: Phase, is_close: bool) -> FailureReport {
         match (phase_before, is_close) {
             (Phase::Failed, true) => FailureReport::Keep,
             (Phase::Connecting, true) => FailureReport::ConnectFailed,
@@ -139,7 +139,7 @@ pub mod control {
 
     /// For the connect timeout.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
-    pub fn timeout_failure_report(phase_before: Phase) -> FailureReport {
+    pub(super) fn timeout_failure_report(phase_before: Phase) -> FailureReport {
         if phase_before == Phase::Failed {
             FailureReport::Keep
         } else {
@@ -227,7 +227,9 @@ mod imp {
     use super::control::{self, Phase};
     use crate::components::app::freenet_api::constants::*;
     use crate::components::app::freenet_api::error::SynchronizerError;
-    use crate::components::app::freenet_api::error_report::{client_error_detail, ErrorReport};
+    use crate::components::app::freenet_api::error_report::{
+        client_error_detail, ErrorReport, LABEL_DISCONNECTED,
+    };
     use crate::components::app::freenet_api::freenet_synchronizer;
     use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
     use crate::components::app::{set_sync_status, StatusOrigin, AUTH_TOKEN, WEB_API};
@@ -298,7 +300,7 @@ mod imp {
                 control::get().set_phase_for(attempt, Phase::Failed);
                 set_sync_status(
                     SynchronizerStatus::Error(ErrorReport::new(
-                        crate::components::app::freenet_api::error_report::LABEL_DISCONNECTED,
+                        LABEL_DISCONNECTED,
                         "The browser could not open a WebSocket to your Freenet node",
                         error_msg.clone(),
                     )),
@@ -312,9 +314,6 @@ mod imp {
             let message_tx_clone = message_tx.clone();
 
             info!("Starting WebAPI with callbacks");
-
-            // The error handler sends ConnectionLost to trigger reconnection.
-            let error_tx = message_tx;
 
             let web_api = WebApi::start(
                 websocket.clone(),
@@ -432,7 +431,7 @@ mod imp {
                         // start another reconnect.
                         let phase_before = control::get().phase();
                         if !control::get().set_phase_for(attempt, Phase::Failed) {
-                            debug!("Ignoring an error from a replaced WebSocket: {}", error_msg);
+                            debug!("Ignoring an error from a replaced WebSocket");
                             return;
                         }
                         error!("{}", error_msg);
@@ -461,7 +460,7 @@ mod imp {
                         // Trigger reconnection for connection closed errors
                         if is_connection_closed {
                             info!("Connection closed, triggering reconnection");
-                            if let Err(e) = error_tx.unbounded_send(
+                            if let Err(e) = message_tx.unbounded_send(
                                 freenet_synchronizer::SynchronizerMessage::ConnectionLost,
                             ) {
                                 error!("Failed to send ConnectionLost message: {}", e);
@@ -554,7 +553,7 @@ pub use imp::ConnectionManager;
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use crate::components::app::freenet_api::error::SynchronizerError;
-    use crate::components::app::freenet_api::error_report::ErrorReport;
+    use crate::components::app::freenet_api::error_report::{ErrorReport, LABEL_DISCONNECTED};
     use crate::components::app::freenet_api::freenet_synchronizer;
     use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
     use crate::components::app::{set_sync_status, StatusOrigin, WEB_API};
@@ -581,6 +580,7 @@ mod imp {
             warn!("ConnectionManager::initialize_connection is a no-op on non-wasm targets");
             set_sync_status(
                 SynchronizerStatus::Error(ErrorReport::from_text(
+                    LABEL_DISCONNECTED,
                     "Web API connection only available when targeting wasm32",
                 )),
                 StatusOrigin::current(),

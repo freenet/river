@@ -100,6 +100,9 @@ pub fn ConnectionStatusIndicator() -> Element {
         }
         SynchronizerStatus::Error(report) => ("text-danger", "bg-error", report.label),
     };
+    // `retained_error`'s rule, applied here too: if one read above fell back
+    // to the snapshot, the two values can be a render apart, and this keeps a
+    // Connected pill from offering a stale error.
     let report = match status {
         SynchronizerStatus::Error(report) => Some(report),
         SynchronizerStatus::Connected => None,

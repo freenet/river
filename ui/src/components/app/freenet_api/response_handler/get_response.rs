@@ -4,7 +4,7 @@ use crate::components::app::freenet_api::backward_probe::{
 };
 use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::error_report::{
-    first_sentence, ErrorReport, LABEL_DISCONNECTED, LABEL_ROOM_FULL,
+    ErrorReport, LABEL_DISCONNECTED, LABEL_ROOM_FULL,
 };
 use crate::components::app::freenet_api::response_handler::update_notification::{
     clear_upgrade_target, follow_upgrade_pointer_if_needed, upgrade_target_owner,
@@ -440,11 +440,8 @@ pub async fn handle_get_response(
                         MemberId::from(owner_vk),
                         err
                     );
-                    let report = ErrorReport::new(
-                        LABEL_ROOM_FULL,
-                        first_sentence(&err.to_string()),
-                        err.to_string(),
-                    );
+                    let report = ErrorReport::from_text(LABEL_ROOM_FULL, &err.to_string());
+                    let pending_summary = report.summary.clone();
                     crate::util::defer(move || {
                         SYNC_INFO
                             .write()
@@ -456,8 +453,7 @@ pub async fn handle_get_response(
                     crate::util::defer(move || {
                         PENDING_INVITES.with_mut(|pending| {
                             if let Some(join) = pending.map.get_mut(&owner_vk) {
-                                join.status =
-                                    PendingRoomStatus::Error(first_sentence(&err.to_string()));
+                                join.status = PendingRoomStatus::Error(pending_summary);
                             }
                         });
                     });
