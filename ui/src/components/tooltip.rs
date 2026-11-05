@@ -5,8 +5,10 @@
 //! tooltip, which is its child) copies the text through the sandbox-safe
 //! clipboard helper and says so in the app toast. Without `copy` the host is a
 //! plain `span`, so it can sit inside another button (a room row) without
-//! nesting interactive controls; it then shows while that ancestor has
-//! keyboard focus.
+//! nesting interactive controls; it then also shows while that ancestor
+//! button is hovered anywhere or has keyboard focus. (Gecko reports a hover
+//! inside a button on the button, not on the span, so the ancestor rule is
+//! what shows it there at all.)
 //!
 //! The card is a child of its host, so moving the pointer onto it keeps the
 //! host hovered; its padding touches the host and bridges the gap. Where CSS

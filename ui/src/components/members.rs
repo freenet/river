@@ -59,7 +59,9 @@ use self::invite_member_modal::InviteMemberModal;
 /// report's label ("Invalid operation", "Refreshing..."). When there is an
 /// error report, the current one or the last one kept through a reconnect
 /// (`LAST_CONNECTION_ERROR`, cleared on Connected), hovering or focusing the
-/// pill explains it and clicking copies its diagnostics.
+/// pill explains it and clicking copies its diagnostics. Its accessible name
+/// carries the label shown ("WebSocket connection status: Connecting..."),
+/// even while the report it explains and copies is an earlier one.
 ///
 /// Signal safety: both signals are read with `try_read()`. A contended read
 /// keeps this instance's last good snapshot (never a made-up state, and the
@@ -125,12 +127,12 @@ pub fn ConnectionStatusIndicator() -> Element {
                     copy: report.diagnostics(),
                     class: "{host_classes} tooltip-host--framed text-left",
                     test_id: "connection-status-indicator",
-                    "aria-label": "WebSocket connection status",
+                    "aria-label": "WebSocket connection status: {label}",
                     {content}
                 }
             } else {
                 div {
-                    "aria-label": "WebSocket connection status",
+                    "aria-label": "WebSocket connection status: {label}",
                     "data-testid": "connection-status-indicator",
                     class: "{host_classes}",
                     {content}

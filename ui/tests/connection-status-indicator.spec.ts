@@ -131,10 +131,14 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     // weren't `md:hidden`.
     await expect(page.locator(PILL)).toHaveCount(2);
 
+    // Offline example data starts Disconnected with no error report, so the
+    // pill is a generic div: its name is the attribute, which carries the
+    // status it shows.
     const visiblePill = page.locator(VISIBLE_PILL);
+    await expect(visiblePill).toHaveJSProperty("tagName", "DIV");
     await expect(visiblePill).toHaveAttribute(
       "aria-label",
-      "WebSocket connection status"
+      "WebSocket connection status: Disconnected"
     );
   });
 

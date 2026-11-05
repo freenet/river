@@ -1242,6 +1242,16 @@ fn note_description_overflow(description_overflows: &mut Signal<bool>) {
     }
 }
 
+/// Whether the room banner's `SYNC_INFO` read is to fail this time. Never,
+/// except in the offline test build, where `test_hooks` can make one read
+/// fail as a contended `try_read` does, to check the banner recovers.
+fn banner_sync_read_fails() -> bool {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    return crate::test_hooks::take_banner_read_failure();
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+    false
+}
+
 #[component]
 pub fn Conversation() -> Element {
     // The open room as the last render whose `ROOMS` read succeeded saw it.
@@ -3345,12 +3355,32 @@ pub fn Conversation() -> Element {
                         if !room_data.is_awaiting_initial_sync() {
                             return None;
                         }
-                        match SYNC_INFO
-                            .try_read()
-                            .ok()
-                            .and_then(|si| si.get_sync_status(&room_data.owner_vk).cloned())
-                        {
-                            Some(RoomSyncStatus::Error(report)) => Some(report),
+                        // A contended read neither returns the status nor
+                        // subscribes to SYNC_INFO, so without a retry the
+                        // banner would read as the spinner until something
+                        // unrelated re-rendered (freenet/river#555). The
+                        // anchor keeps this render subscribed to the nudge.
+                        crate::util::signal_guard::anchor();
+                        let read = if banner_sync_read_fails() {
+                            None
+                        } else {
+                            SYNC_INFO.try_read().ok()
+                        };
+                        let status = match read {
+                            Some(si) => si.get_sync_status(&room_data.owner_vk).cloned(),
+                            None => {
+                                #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+                                crate::test_hooks::note_banner_read_failed();
+                                crate::util::signal_guard::schedule_nudge();
+                                None
+                            }
+                        };
+                        match status {
+                            Some(RoomSyncStatus::Error(report)) => {
+                                #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+                                crate::test_hooks::note_banner_error_read();
+                                Some(report)
+                            }
                             _ => None,
                         }
                     });

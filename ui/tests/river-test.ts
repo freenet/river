@@ -59,6 +59,12 @@ type RiverTestHooks = {
   setSyncErrorReport(label: ReportLabel, summary: string, detail: string): void;
   // The current room as a placeholder awaiting its initial sync that ended in this error.
   showRoomSyncError(label: ReportLabel, summary: string, detail: string): void;
+  // The same, with the room banner's first read of that error failing as a contended read does.
+  showRoomSyncErrorFailingBannerRead(label: ReportLabel, summary: string, detail: string): void;
+  // Room banner sync-status reads that failed since the last call (the count restarts at 0).
+  takeBannerReadFailures(): number;
+  // Room banner reads that found the room's sync error since the last call (restarts at 0).
+  takeBannerErrorReads(): number;
 };
 
 export type SyncStatus = "connected" | "connecting" | "disconnected" | "error" | `error:${string}`;

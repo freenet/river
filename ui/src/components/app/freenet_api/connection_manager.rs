@@ -137,6 +137,35 @@ pub mod control {
         }
     }
 
+    /// What an error or close from `attempt`'s socket does. A replaced
+    /// attempt's does nothing at all: no phase change, no report, no loss.
+    /// Otherwise the attempt is `Failed` at once, `report` is asked for the
+    /// report [`socket_failure_report`] chooses (never with `Keep`), and a
+    /// close (`is_close`, read from the error's structure) queues one
+    /// `lose`, even when the report is kept. Returns whether the failure was
+    /// the current attempt's.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
+    pub(super) fn dispatch_socket_failure(
+        control: &ConnectionControl,
+        attempt: AttemptId,
+        is_close: bool,
+        report: impl FnOnce(FailureReport),
+        lose: impl FnOnce(),
+    ) -> bool {
+        let phase_before = control.phase();
+        if !control.set_phase_for(attempt, Phase::Failed) {
+            return false;
+        }
+        match socket_failure_report(phase_before, is_close) {
+            FailureReport::Keep => {}
+            chosen => report(chosen),
+        }
+        if is_close {
+            lose();
+        }
+        true
+    }
+
     /// For the connect timeout.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the WASM socket callbacks only
     pub(super) fn timeout_failure_report(phase_before: Phase) -> FailureReport {
@@ -210,6 +239,139 @@ pub mod control {
             );
         }
 
+        /// What one socket failure did: the reports it asked for, the
+        /// losses it queued, and whether it was the current attempt's.
+        #[derive(Debug, PartialEq)]
+        struct Effects {
+            reports: Vec<FailureReport>,
+            losses: usize,
+            applied: bool,
+        }
+
+        /// Feeds a browser `WebApi` payload, analysed as production analyses
+        /// it, to the production dispatcher.
+        fn fail(
+            control: &ConnectionControl,
+            attempt: AttemptId,
+            payload: serde_json::Value,
+        ) -> Effects {
+            let parts = crate::components::app::freenet_api::error_report::analyse_browser_payload(
+                &payload,
+            );
+            let mut reports = Vec::new();
+            let mut losses = 0;
+            let applied = dispatch_socket_failure(
+                control,
+                attempt,
+                parts.is_connection_closed,
+                |report| reports.push(report),
+                || losses += 1,
+            );
+            Effects {
+                reports,
+                losses,
+                applied,
+            }
+        }
+
+        fn close() -> serde_json::Value {
+            serde_json::json!({"error": "connection closed", "source": "close"})
+        }
+
+        fn connected() -> (ConnectionControl, AttemptId) {
+            let control = ConnectionControl::new();
+            let attempt = control.begin_attempt();
+            assert!(control.set_phase_for(attempt, Phase::Connected));
+            (control, attempt)
+        }
+
+        #[test]
+        fn a_request_that_mentions_a_close_queues_no_loss() {
+            let (control, attempt) = connected();
+            let effects = fail(
+                &control,
+                attempt,
+                serde_json::json!({
+                    "error": "WebSocket is not open (state: CLOSED)",
+                    "origin": "send precondition check",
+                    "request": "ContractOp(Put { state: \"connection closed\" })",
+                }),
+            );
+            assert_eq!(
+                effects,
+                Effects {
+                    reports: vec![FailureReport::AsReported],
+                    losses: 0,
+                    applied: true,
+                }
+            );
+            assert_eq!(control.phase(), Phase::Failed);
+        }
+
+        #[test]
+        fn a_close_of_the_current_connection_queues_one_loss() {
+            let (control, attempt) = connected();
+            assert_eq!(
+                fail(&control, attempt, close()),
+                Effects {
+                    reports: vec![FailureReport::AsReported],
+                    losses: 1,
+                    applied: true,
+                }
+            );
+            assert_eq!(control.phase(), Phase::Failed);
+        }
+
+        #[test]
+        fn a_close_before_the_socket_opened_is_a_failed_connect() {
+            let control = ConnectionControl::new();
+            let attempt = control.begin_attempt();
+            assert_eq!(
+                fail(&control, attempt, close()),
+                Effects {
+                    reports: vec![FailureReport::ConnectFailed],
+                    losses: 1,
+                    applied: true,
+                }
+            );
+            assert_eq!(control.phase(), Phase::Failed);
+        }
+
+        #[test]
+        fn a_close_after_a_failure_keeps_its_report_and_still_queues_a_loss() {
+            let control = ConnectionControl::new();
+            let attempt = control.begin_attempt();
+            // The connect timeout already explained this attempt.
+            assert!(control.set_phase_for(attempt, Phase::Failed));
+            assert_eq!(
+                fail(&control, attempt, close()),
+                Effects {
+                    reports: vec![],
+                    losses: 1,
+                    applied: true,
+                }
+            );
+            assert_eq!(control.phase(), Phase::Failed);
+        }
+
+        #[test]
+        fn a_replaced_sockets_close_has_no_effect() {
+            let control = ConnectionControl::new();
+            let old = control.begin_attempt();
+            let current = control.begin_attempt();
+            assert!(control.set_phase_for(current, Phase::Connected));
+            assert_eq!(
+                fail(&control, old, close()),
+                Effects {
+                    reports: vec![],
+                    losses: 0,
+                    applied: false,
+                }
+            );
+            assert_eq!(control.phase(), Phase::Connected);
+            assert!(control.is_current(current));
+        }
+
         #[test]
         fn the_loop_decides_immediately() {
             let control = ConnectionControl::new();
@@ -227,9 +389,7 @@ mod imp {
     use super::control::{self, Phase};
     use crate::components::app::freenet_api::constants::*;
     use crate::components::app::freenet_api::error::SynchronizerError;
-    use crate::components::app::freenet_api::error_report::{
-        client_error_detail, ErrorReport, LABEL_DISCONNECTED,
-    };
+    use crate::components::app::freenet_api::error_report::{analyse_client_error, ErrorReport};
     use crate::components::app::freenet_api::freenet_synchronizer;
     use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
     use crate::components::app::{set_sync_status, StatusOrigin, AUTH_TOKEN, WEB_API};
@@ -298,12 +458,10 @@ mod imp {
                 let error_msg = format!("Failed to create WebSocket: {:?}", e);
                 error!("{}", error_msg);
                 control::get().set_phase_for(attempt, Phase::Failed);
+                // The exception can echo the URL and its auth token: the
+                // copyable report names only the endpoint.
                 set_sync_status(
-                    SynchronizerStatus::Error(ErrorReport::new(
-                        LABEL_DISCONNECTED,
-                        "The browser could not open a WebSocket to your Freenet node",
-                        error_msg.clone(),
-                    )),
+                    SynchronizerStatus::Error(ErrorReport::websocket_creation_failed(log_url)),
                     origin,
                 );
                 SynchronizerError::WebSocketError(error_msg)
@@ -423,48 +581,42 @@ mod imp {
                 },
                 {
                     move |error| {
-                        let error_msg = format!("WebSocket error: {}", error);
-
                         // A socket this page already replaced: its errors and
                         // its close belong to a connection nobody uses any
-                        // more, and must not mark the current one down or
-                        // start another reconnect.
-                        let phase_before = control::get().phase();
-                        if !control::get().set_phase_for(attempt, Phase::Failed) {
+                        // more, and must not mark the current one down,
+                        // report, or start another reconnect. Whether this is
+                        // a close is read from the error's structure: its
+                        // text can carry request contents.
+                        let parts = analyse_client_error(&error);
+                        let current = control::dispatch_socket_failure(
+                            control::get(),
+                            attempt,
+                            parts.is_connection_closed,
+                            |chosen| {
+                                let report = match chosen {
+                                    control::FailureReport::ConnectFailed => {
+                                        ErrorReport::connect_timeout(format!(
+                                            "{} (closed before it opened)",
+                                            parts.detail
+                                        ))
+                                    }
+                                    _ => ErrorReport::from_parts(parts.clone()),
+                                };
+                                set_sync_status(SynchronizerStatus::Error(report), origin);
+                            },
+                            || {
+                                info!("Connection closed, triggering reconnection");
+                                if let Err(e) = message_tx.unbounded_send(
+                                    freenet_synchronizer::SynchronizerMessage::ConnectionLost,
+                                ) {
+                                    error!("Failed to send ConnectionLost message: {}", e);
+                                }
+                            },
+                        );
+                        if current {
+                            error!("WebSocket error: {}", error);
+                        } else {
                             debug!("Ignoring an error from a replaced WebSocket");
-                            return;
-                        }
-                        error!("{}", error_msg);
-
-                        // Check if this is a connection closed error
-                        let is_connection_closed = error_msg.contains("connection closed");
-
-                        let report = match control::socket_failure_report(
-                            phase_before,
-                            is_connection_closed,
-                        ) {
-                            control::FailureReport::Keep => None,
-                            control::FailureReport::ConnectFailed => {
-                                Some(ErrorReport::connect_timeout(format!(
-                                    "{} (closed before it opened)",
-                                    client_error_detail(&error)
-                                )))
-                            }
-                            control::FailureReport::AsReported => {
-                                Some(ErrorReport::from_client_error(&error))
-                            }
-                        };
-                        if let Some(report) = report {
-                            set_sync_status(SynchronizerStatus::Error(report), origin);
-                        }
-                        // Trigger reconnection for connection closed errors
-                        if is_connection_closed {
-                            info!("Connection closed, triggering reconnection");
-                            if let Err(e) = message_tx.unbounded_send(
-                                freenet_synchronizer::SynchronizerMessage::ConnectionLost,
-                            ) {
-                                error!("Failed to send ConnectionLost message: {}", e);
-                            }
                         }
                     }
                 },
@@ -598,6 +750,82 @@ pub use imp::ConnectionManager;
 
 #[cfg(test)]
 mod tests {
+    /// The production source between `start` and the end of the first
+    /// following `end`.
+    fn section<'a>(code: &'a str, start: &str, end: &str) -> &'a str {
+        let from = code.find(start).unwrap_or_else(|| panic!("{start}"));
+        let len = code[from..].find(end).unwrap_or_else(|| panic!("{end}"));
+        &code[from..from + len + end.len()]
+    }
+
+    /// The constructor's exception can echo the authenticated URL, so the
+    /// copyable report is built from the query-free `log_url` alone.
+    #[test]
+    fn the_constructor_failure_report_never_carries_the_exception() {
+        let code = crate::util::source_scan::production_only(include_str!("connection_manager.rs"));
+        let branch = section(&code, "web_sys::WebSocket::new(&websocket_url)", "})?;");
+        let status = section(branch, "set_sync_status(", "origin,");
+        assert!(
+            status.contains("ErrorReport::websocket_creation_failed(log_url)"),
+            "{status}"
+        );
+        for raw in [
+            "error_msg",
+            "ErrorReport::new",
+            "{:?}",
+            "(e)",
+            "websocket_url",
+        ] {
+            assert!(!status.contains(raw), "{raw} reaches the report: {status}");
+        }
+    }
+
+    /// The call starting at `start`, through its balanced closing paren.
+    fn call<'a>(code: &'a str, start: &str) -> &'a str {
+        let from = code.find(start).unwrap_or_else(|| panic!("{start}"));
+        let mut depth = 0;
+        for (i, c) in code[from..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 1 => return &code[from..=from + i],
+                ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        panic!("unbalanced {start}");
+    }
+
+    /// The WASM socket-error callback reports and queues a loss only through
+    /// the tested `dispatch_socket_failure`, with the close read from the
+    /// error's structure, never from its text.
+    #[test]
+    fn the_socket_error_callback_delegates_its_effects_to_the_dispatcher() {
+        let code = crate::util::source_scan::production_only(include_str!("connection_manager.rs"));
+        let callback = section(&code, "move |error| {", "move || {");
+        assert!(
+            callback.contains("let parts = analyse_client_error(&error);"),
+            "{callback}"
+        );
+        let dispatch = call(callback, "control::dispatch_socket_failure(");
+        assert!(
+            dispatch.contains("parts.is_connection_closed"),
+            "{dispatch}"
+        );
+        for effect in ["set_sync_status(", "SynchronizerMessage::ConnectionLost"] {
+            assert_eq!(callback.matches(effect).count(), 1, "{effect}: {callback}");
+            assert!(
+                dispatch.contains(effect),
+                "{effect} happens outside the dispatcher: {callback}"
+            );
+        }
+        for independent in [".contains(", "set_phase_for", "socket_failure_report("] {
+            assert!(
+                !callback.contains(independent),
+                "{independent} decided outside the dispatcher: {callback}"
+            );
+        }
+    }
+
     #[test]
     fn webapi_onerror_is_cleared_after_start() {
         let code = crate::util::source_scan::production_only(include_str!("connection_manager.rs"));

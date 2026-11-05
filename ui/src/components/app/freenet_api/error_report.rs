@@ -116,12 +116,13 @@ impl ErrorReport {
 
     /// A report for a transport error the `WebApi` handed River.
     pub fn from_client_error(error: &client_api::Error) -> Self {
-        let ClientErrorParts {
-            label,
-            summary,
-            detail,
-        } = analyse_client_error(error);
-        Self::new(label, summary, detail)
+        Self::from_parts(analyse_client_error(error))
+    }
+
+    /// A report for a transport error already read by
+    /// [`analyse_client_error`].
+    pub fn from_parts(parts: ClientErrorParts) -> Self {
+        Self::new(parts.label, parts.summary, parts.detail)
     }
 
     /// The same, for an error whose operation the summary should name
@@ -165,6 +166,19 @@ impl ErrorReport {
         )
     }
 
+    /// The browser refused to construct the WebSocket. The copied detail
+    /// names only the endpoint: the browser's exception can echo the URL,
+    /// whose query carries the page's auth token, so it is never copied, and
+    /// the query is stripped here too in case a caller passes the full URL.
+    pub fn websocket_creation_failed(url: &str) -> Self {
+        let endpoint = url.split(['?', '#']).next().unwrap_or_default();
+        Self::new(
+            LABEL_DISCONNECTED,
+            "The browser could not open a WebSocket to your Freenet node",
+            format!("Failed to create WebSocket at {endpoint}"),
+        )
+    }
+
     /// The socket did not open in time (P4).
     pub fn connect_timeout(detail: impl Into<String>) -> Self {
         Self::new(
@@ -205,48 +219,65 @@ impl ErrorReport {
 pub struct ClientErrorParts {
     pub label: &'static str,
     pub summary: String,
-    /// See [`client_error_detail`].
+    /// The raw text the copied diagnostics carry: the error's Display, with
+    /// the request contents the browser `WebApi` embeds replaced by the
+    /// request's kind (a PUT carries the whole room state, a delegate request
+    /// the user's stored rooms).
     pub detail: String,
+    /// Whether this is the socket closing: the browser `WebApi`'s close
+    /// callback (`source: "close"`) or a typed closed variant. Read from
+    /// structure only, never from the error's text, which can carry request
+    /// contents.
+    pub is_connection_closed: bool,
 }
 
-/// The label, one-sentence summary and copied detail of a transport error.
+/// The label, one-sentence summary, copied detail and close flag of a
+/// transport error.
 pub fn analyse_client_error(error: &client_api::Error) -> ClientErrorParts {
     #[cfg(target_family = "wasm")]
     if let client_api::Error::ConnectionError(value) = error {
-        let payload = connection_payload!(value);
-        let (label, summary) = classify_connection_payload(&payload);
-        return ClientErrorParts {
-            label,
-            summary,
-            detail: payload_detail(&payload),
-        };
+        return analyse_connection_payload(&connection_payload!(value));
     }
-    let (label, summary) = match error {
-        client_api::Error::ConnectionClosed => (LABEL_DISCONNECTED, "Connection closed".into()),
-        client_api::Error::ChannelClosed => (LABEL_DISCONNECTED, "Connection closed".into()),
+    let (label, summary, is_connection_closed) = match error {
+        client_api::Error::ConnectionClosed | client_api::Error::ChannelClosed => {
+            (LABEL_DISCONNECTED, "Connection closed".into(), true)
+        }
         client_api::Error::Deserialization(e) => (
             LABEL_UNEXPECTED_MESSAGE,
             format!("The node's reply could not be decoded ({e})"),
+            false,
         ),
-        other => (LABEL_DISCONNECTED, first_sentence(&other.to_string())),
+        other => (
+            LABEL_DISCONNECTED,
+            first_sentence(&other.to_string()),
+            false,
+        ),
     };
     ClientErrorParts {
         label,
         summary,
         detail: format!("WebSocket error: {error}"),
+        is_connection_closed,
     }
 }
 
-/// The raw text the copied diagnostics carry for a transport error: its
-/// Display, with the request contents the browser `WebApi` embeds replaced by
-/// the request's kind (a PUT carries the whole room state, a delegate request
-/// the user's stored rooms).
-pub fn client_error_detail(error: &client_api::Error) -> String {
-    #[cfg(target_family = "wasm")]
-    if let client_api::Error::ConnectionError(value) = error {
-        return payload_detail(&connection_payload!(value));
+/// The browser `WebApi`'s JSON error payload, read once. Shared by the WASM
+/// path and the native tests, so both run the same classification.
+fn analyse_connection_payload(payload: &ConnectionPayload) -> ClientErrorParts {
+    let (label, summary) = classify_connection_payload(payload);
+    ClientErrorParts {
+        label,
+        summary,
+        detail: payload_detail(payload),
+        is_connection_closed: payload.source == "close",
     }
-    format!("WebSocket error: {error}")
+}
+
+/// [`analyse_connection_payload`] from the payload's JSON, for native tests
+/// (natives have no JSON `ConnectionError`).
+#[cfg(test)]
+pub(crate) fn analyse_browser_payload(value: &serde_json::Value) -> ClientErrorParts {
+    analyse_connection_payload(&connection_payload!(value))
 }
 
 fn payload_detail(payload: &ConnectionPayload) -> String {
@@ -520,18 +551,96 @@ mod tests {
             label: LABEL_DISCONNECTED,
             summary: "Connection closed".into(),
             detail: "WebSocket error: connection closed".into(),
+            is_connection_closed: true,
         };
         assert_eq!(
             analyse_client_error(&client_api::Error::ConnectionClosed),
             closed
         );
+        let channel = analyse_client_error(&client_api::Error::ChannelClosed);
+        assert_eq!(channel.summary, "Connection closed");
+        assert!(channel.is_connection_closed);
+    }
+
+    /// Only the close callback's `source: "close"` (and the typed closed
+    /// variants) is a close. A request whose contents, or an error whose
+    /// prose, says "connection closed" is not: the browser `WebApi` embeds
+    /// the whole request Debug in its payload, so room or delegate data could
+    /// otherwise fake a lost connection.
+    #[test]
+    fn only_a_structured_close_is_a_close() {
+        let close =
+            analyse_browser_payload(&json!({"error": "connection closed", "source": "close"}));
         assert_eq!(
-            analyse_client_error(&client_api::Error::ChannelClosed).summary,
-            "Connection closed"
+            close,
+            ClientErrorParts {
+                label: LABEL_DISCONNECTED,
+                summary: "Connection closed".into(),
+                detail: "WebSocket error: request error: {\"error\":\"connection closed\",\"source\":\"close\"}".into(),
+                is_connection_closed: true,
+            }
         );
-        assert_eq!(
-            client_error_detail(&client_api::Error::ConnectionClosed),
-            closed.detail
+        // Whatever the close's prose says, its source decides.
+        assert!(analyse_browser_payload(&json!({"source": "close"})).is_connection_closed);
+
+        let not_closes = [
+            // The phrase in the request contents, for each origin that embeds one.
+            json!({
+                "error": "WebSocket is not open (state: CLOSED)",
+                "origin": "send precondition check",
+                "request": "ContractOp(Put { state: \"connection closed\" })",
+            }),
+            json!({
+                "error": "total_chunks 300 exceeds maximum 256",
+                "origin": "chunk cap check",
+                "request": "DelegateOp(ApplicationMessages { payload: \"connection closed\" })",
+            }),
+            json!({
+                "error": "invalid type: map",
+                "origin": "request serialization",
+                "request": "ContractOp(Update { data: \"connection closed\" })",
+            }),
+            json!({
+                "error": {"message": "Still in CONNECTING state."},
+                "origin": "request sending",
+                "request": "ContractOp(Get { key: \"connection closed\" })",
+            }),
+            // The phrase only in the error prose.
+            json!({"error": "connection closed", "source": "exec error"}),
+            json!({"error": "connection closed"}),
+            // Unknown, missing or malformed sources.
+            json!({"error": "connection closed", "source": "somewhere new"}),
+            json!({"error": "connection closed", "source": "Close"}),
+            json!({"error": "connection closed", "source": " close"}),
+            json!({"error": "connection closed", "source": null}),
+            json!({"error": "connection closed", "source": 42}),
+            json!({"error": "connection closed", "source": {"kind": "close"}}),
+            json!({"error": "connection closed", "origin": "close"}),
+            json!({}),
+            json!("connection closed"),
+            json!(["close"]),
+        ];
+        for payload in not_closes {
+            let parts = analyse_browser_payload(&payload);
+            assert!(!parts.is_connection_closed, "{payload} read as a close");
+            // The flag changes nothing else about the report.
+            assert_eq!(
+                (parts.label, parts.summary),
+                classify(&payload),
+                "{payload}"
+            );
+            assert!(
+                !parts.detail.contains("\"connection closed\" }"),
+                "the request dump reached the detail: {}",
+                parts.detail
+            );
+        }
+
+        // A typed error that only says it in its prose.
+        let other = client_api::Error::OtherError("connection closed".into());
+        assert!(
+            !analyse_client_error(&other).is_connection_closed,
+            "{other}"
         );
     }
 
@@ -634,6 +743,41 @@ mod tests {
         assert!(ErrorReport::auth_expired("x").is_progress());
         assert!(!ErrorReport::auth_reload_loop("x").is_progress());
         assert!(!ErrorReport::connect_timeout("x").is_progress());
+    }
+
+    /// The constructor's exception can echo the URL it was given, which
+    /// carries the page's auth token: the copied report names only the
+    /// endpoint, even when handed the full URL.
+    #[test]
+    fn a_constructor_failure_copies_the_endpoint_never_the_auth_query() {
+        for (url, endpoint) in [
+            (
+                "ws://127.0.0.1:7510/?authToken=constructor-secret&other=value",
+                "ws://127.0.0.1:7510/",
+            ),
+            (
+                "ws://127.0.0.1:7510/v1/contract/command?encodingProtocol=native&authToken=constructor-secret",
+                "ws://127.0.0.1:7510/v1/contract/command",
+            ),
+            (
+                "ws://127.0.0.1:7510/v1/contract/command",
+                "ws://127.0.0.1:7510/v1/contract/command",
+            ),
+        ] {
+            let r = ErrorReport::websocket_creation_failed(url);
+            assert_eq!(r.label, LABEL_DISCONNECTED);
+            assert_eq!(
+                r.summary,
+                "The browser could not open a WebSocket to your Freenet node"
+            );
+            assert_eq!(r.detail, format!("Failed to create WebSocket at {endpoint}"));
+            let copied = r.diagnostics();
+            assert!(copied.contains(endpoint), "{copied}");
+            for leaked in ["authToken", "constructor-secret", "other=value", "?"] {
+                assert!(!r.detail.contains(leaked), "{leaked} in {}", r.detail);
+                assert!(!copied.contains(leaked), "{leaked} in {copied}");
+            }
+        }
     }
 
     #[test]
