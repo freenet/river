@@ -68,6 +68,116 @@ async function withinViewport(page: Page, el: Locator) {
   expect(box.y + box.height, "bottom edge on screen").toBeLessThanOrEqual(vp.height + 0.5);
 }
 
+/// Clicking a copy host's shown card copies what clicking the host did, and
+/// says so again. The toast is replaced first, so its text proves this click.
+async function expectCardCopies(page: Page, host: Locator, copied: string) {
+  await callRiverTest(page, "showToast", "Before the card click", null);
+  await expect(page.getByTestId("toast-message")).toHaveText("Before the card click");
+  await host.hover();
+  const card = tooltipOf(host);
+  await expect(card).toBeVisible();
+  await card.click();
+  await expect(page.getByTestId("toast-message")).toHaveText("Error details copied");
+  expect(await clipboardWrites(page)).toEqual([copied, copied]);
+}
+
+const ROOM_NOT_FOUND = "This room could not be found on the network — it may have been removed.";
+
+/// Press a control from the keyboard, which keeps focus-visible for later focus.
+async function pressFromKeyboard(page: Page, control: Locator) {
+  await control.focus();
+  await page.keyboard.press("Enter");
+}
+
+/// Example rooms load in no fixed order. Move Team Chat Room off the ends of
+/// the rail with the reorder controls, so another row lies on each side of it
+/// whichever way its card opens.
+async function placeTeamChatInMiddle(page: Page) {
+  const names = page.getByTestId("room-list").locator('[data-testid^="room-item-"] button .truncate');
+  const indexOfTeamChat = async () => (await names.allTextContents()).indexOf("Team Chat Room");
+  const count = await names.count();
+  expect(count, "a row on each side needs three rooms").toBeGreaterThanOrEqual(3);
+  const at = await indexOfTeamChat();
+  if (at > 0 && at < count - 1) return;
+  const item = page.getByTestId("room-list").locator('[data-testid^="room-item-"]', { hasText: "Team Chat Room" });
+  await pressFromKeyboard(page, page.getByTestId("reorder-rooms-toggle"));
+  await pressFromKeyboard(page, item.getByTestId(at === 0 ? "reorder-room-down" : "reorder-room-up"));
+  await expect.poll(indexOfTeamChat).toBe(at === 0 ? 1 : count - 2);
+  await pressFromKeyboard(page, page.getByTestId("reorder-rooms-toggle"));
+  await expect(page.getByTestId("reorder-room-up")).toHaveCount(0);
+}
+
+/// Team Chat Room open with a sync error, its row focused from the keyboard
+/// so the marker's card stays shown wherever the pointer goes. Hooks and keys
+/// only: no pointer has been used on the page, so script focus is focus-visible.
+async function focusFailedRoomRow(page: Page): Promise<{ row: Locator; card: Locator }> {
+  await placeTeamChatInMiddle(page);
+  await callRiverTest(page, "switchRoom", "Team Chat Room");
+  await callRiverTest(page, "showRoomSyncError", "Room not found", ROOM_NOT_FOUND, "Initial sync failed 10 times");
+  await expect(page.getByTestId("room-sync-error")).toBeVisible();
+  const marker = page.getByTestId("room-sync-error-marker");
+  const row = page.getByTestId("room-list").locator("button", { has: marker });
+  await row.focus();
+  expect(await row.evaluate((el) => el.matches(":focus-visible"))).toBe(true);
+  const card = tooltipOf(marker);
+  await expectShownAtOnce(card);
+  return { row, card };
+}
+
+/// Another room's row under the card's painted box, and a point inside both,
+/// clear of their edges. Whichever neighbour the engine placed it over.
+async function roomUnderCard(page: Page, card: Locator) {
+  const found = await card.evaluate((cardEl) => {
+    const inset = 3;
+    const box = cardEl.querySelector(".tooltip-box")!.getBoundingClientRect();
+    let best: { testId: string; name: string; x: number; y: number; area: number } | null = null;
+    for (const item of document.querySelectorAll('[data-testid="room-list"] [data-testid^="room-item-"]')) {
+      if (item.contains(cardEl)) continue;
+      const button = item.querySelector("button")!;
+      const r = button.getBoundingClientRect();
+      const left = Math.max(box.left, r.left) + inset;
+      const right = Math.min(box.right, r.right) - inset;
+      const top = Math.max(box.top, r.top) + inset;
+      const bottom = Math.min(box.bottom, r.bottom) - inset;
+      const area = (right - left) * (bottom - top);
+      if (right > left && bottom > top && (best === null || area > best.area)) {
+        best = {
+          testId: item.getAttribute("data-testid")!,
+          name: button.querySelector(".truncate")!.textContent!,
+          x: (left + right) / 2,
+          y: (top + bottom) / 2,
+          area,
+        };
+      }
+    }
+    return best;
+  });
+  expect(found, "the card covers another room's row").not.toBeNull();
+  return found!;
+}
+
+/// A real click on the shown card where it covers another room opens that
+/// room: the explanation does not take the click, and copies nothing.
+async function expectClickPassesThroughCard(page: Page, card: Locator) {
+  const { testId, name, x, y } = await roomUnderCard(page, card);
+  expect(name).not.toBe("Team Chat Room");
+  const target = page.getByTestId(testId).locator("button").first();
+  await page.mouse.move(x, y);
+  expect(await card.isVisible(), "the card is still shown under the pointer").toBe(true);
+  const reached = await target.evaluate(
+    (button, [px, py]) => {
+      const hit = document.elementFromPoint(px, py);
+      return hit !== null && button.contains(hit);
+    },
+    [x, y]
+  );
+  expect(reached, `the point over ${name} reaches its row, not the card`).toBe(true);
+  await page.mouse.click(x, y);
+  await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  await expect(page.getByTestId("room-sync-error")).toHaveCount(0);
+  expect(await clipboardWrites(page)).toEqual([]);
+}
+
 test.describe("Connection error details", () => {
   test("a closed connection reads Disconnected, explains on hover and copies on click", async ({
     page,
@@ -102,6 +212,9 @@ test.describe("Connection error details", () => {
     expect(copied).toMatch(
       /^River: Disconnected\nConnection closed\nWebSocket error: request error: .*"source":"close".*\nTime: \d{4}-\d\d-\d\dT[^\n]+\nBuild: [^\n]+/
     );
+
+    // The shown card copies too: unlike an explain-only card, it takes clicks.
+    await expectCardCopies(page, pill(page), copied);
   });
 
   test("keyboard focus explains and Enter copies", async ({ page }) => {
@@ -277,9 +390,12 @@ test.describe("Room sync error details", () => {
     await expect(tooltipOf(banner)).toContainText("could not be found on the network");
     await banner.click();
     await expect(page.getByTestId("toast-message")).toHaveText("Error details copied");
-    expect((await clipboardWrites(page))[0]).toMatch(
+    const [copied] = await clipboardWrites(page);
+    expect(copied).toMatch(
       /^River: Room not found\nThis room could not be found on the network — it may have been removed\.\nInitial sync failed 10 times\nTime: /
     );
+
+    await expectCardCopies(page, banner, copied);
   });
 
   /// The room row's button that holds the marker.
@@ -389,6 +505,19 @@ test.describe("Room sync error details", () => {
     await expect(page.getByTestId("room-sync-error")).toBeVisible();
     expect(await clipboardWrites(page)).toEqual([]);
   });
+
+  test("a click on the marker's card opens the room beneath it", async ({ page }) => {
+    await open(page);
+    const { card } = await focusFailedRoomRow(page);
+    // Anchored where the engine supports it, else the absolute fallback.
+    const anchored = await page.evaluate(
+      () => CSS.supports("anchor-name: --a") && CSS.supports("position-area: top")
+    );
+    expect(await card.evaluate((el) => getComputedStyle(el).position)).toBe(
+      anchored ? "fixed" : "absolute"
+    );
+    await expectClickPassesThroughCard(page, card);
+  });
 });
 
 // Engines without CSS anchor positioning get the absolute fallback. Forced
@@ -449,5 +578,13 @@ test.describe("Tooltip fallback without anchor positioning", () => {
     await expect(card).toBeVisible();
     expect(await card.evaluate((el) => getComputedStyle(el).position)).toBe("absolute");
     await insideRail(page, card);
+  });
+
+  test("a click on the marker's card opens the room beneath it", async ({ page }) => {
+    await open(page);
+    await forceFallback(page);
+    const { card } = await focusFailedRoomRow(page);
+    expect(await card.evaluate((el) => getComputedStyle(el).position)).toBe("absolute");
+    await expectClickPassesThroughCard(page, card);
   });
 });

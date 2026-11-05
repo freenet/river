@@ -706,6 +706,11 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
     display: block;
 }
 
+/* Explain-only cards must not intercept the controls beneath them. */
+.tooltip-host:not(.tooltip-host--copy) > .tooltip-card {
+    pointer-events: none;
+}
+
 .tooltip-box {
     display: block;
     padding: 0.375rem 0.625rem;
