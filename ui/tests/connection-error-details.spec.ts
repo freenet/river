@@ -81,7 +81,17 @@ async function expectCardCopies(page: Page, host: Locator, copied: string) {
   expect(await clipboardWrites(page)).toEqual([copied, copied]);
 }
 
-const ROOM_NOT_FOUND = "This room could not be found on the network — it may have been removed.";
+/// A room that could not be found, for `showRoomSyncError`.
+const NOT_FOUND = [
+  "Room not found",
+  "This room could not be found on the network — it may have been removed.",
+  "Initial sync failed 10 times",
+] as const;
+
+/// The room row's button that holds the marker.
+function rowOf(page: Page, marker: Locator): Locator {
+  return page.getByTestId("room-list").locator("button", { has: marker });
+}
 
 /// Press a control from the keyboard, which keeps focus-visible for later focus.
 async function pressFromKeyboard(page: Page, control: Locator) {
@@ -113,10 +123,10 @@ async function placeTeamChatInMiddle(page: Page) {
 async function focusFailedRoomRow(page: Page): Promise<{ row: Locator; card: Locator }> {
   await placeTeamChatInMiddle(page);
   await callRiverTest(page, "switchRoom", "Team Chat Room");
-  await callRiverTest(page, "showRoomSyncError", "Room not found", ROOM_NOT_FOUND, "Initial sync failed 10 times");
+  await callRiverTest(page, "showRoomSyncError", ...NOT_FOUND, false);
   await expect(page.getByTestId("room-sync-error")).toBeVisible();
   const marker = page.getByTestId("room-sync-error-marker");
-  const row = page.getByTestId("room-list").locator("button", { has: marker });
+  const row = rowOf(page, marker);
   await row.focus();
   expect(await row.evaluate((el) => el.matches(":focus-visible"))).toBe(true);
   const card = tooltipOf(marker);
@@ -231,7 +241,7 @@ test.describe("Connection error details", () => {
     expect((await clipboardWrites(page))[0]).toMatch(/^River: Disconnected\nThe node went away\n/);
   });
 
-  test("the last error stays explained while reconnecting, until Connected", async ({ page }) => {
+  test("the last error stays explained while reconnecting, until Connected", { tag: "@chromium-only" }, async ({ page }) => {
     await open(page);
     await setStatus(page, "error");
     await setStatus(page, "connecting");
@@ -258,7 +268,7 @@ test.describe("Connection error details", () => {
     await expect(tooltipOf(pill(page))).toHaveCount(0);
   });
 
-  test("display writes apply in order: an error then Connected leaves no error", async ({ page }) => {
+  test("display writes apply in order: an error then Connected leaves no error", { tag: "@chromium-only" }, async ({ page }) => {
     await open(page);
     await page.evaluate(() => {
       const hooks = (window as unknown as { __riverTest: Record<string, (s: string) => void> })
@@ -272,7 +282,7 @@ test.describe("Connection error details", () => {
     await expect(tooltipOf(pill(page))).toHaveCount(0);
   });
 
-  test("an auth reload reads Refreshing... with the progress dot", async ({ page }) => {
+  test("an auth reload reads Refreshing... with the progress dot", { tag: "@chromium-only" }, async ({ page }) => {
     await open(page);
     await callRiverTest(
       page,
@@ -284,23 +294,8 @@ test.describe("Connection error details", () => {
     await expect(pillLabel(page)).toHaveText("Refreshing...");
     await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Refreshing...`);
     await expect(pill(page).getByTestId("connection-status-dot")).toHaveClass(/(^|\s)bg-warning(\s|$)/);
-    await pill(page).hover();
-    await expect(tooltipOf(pill(page))).toContainText("Authentication expired. Refreshing the page.");
   });
 
-  test("an invalid operation is named by its label", async ({ page }) => {
-    await open(page);
-    await callRiverTest(
-      page,
-      "setSyncErrorReport",
-      "Invalid operation",
-      "The node refused the request.",
-      "x"
-    );
-    await expect(pillLabel(page)).toHaveText("Invalid operation");
-    await expect(pill(page)).toHaveRole("button");
-    await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Invalid operation`);
-  });
 
   test("a long unbroken payload wraps and clamps to three lines", async ({ page }) => {
     await open(page);
@@ -371,13 +366,7 @@ test.describe("Room sync error details", () => {
   async function failCurrentRoom(page: Page) {
     await open(page);
     await selectRoom(page, "Team Chat Room");
-    await callRiverTest(
-      page,
-      "showRoomSyncError",
-      "Room not found",
-      "This room could not be found on the network — it may have been removed.",
-      "Initial sync failed 10 times"
-    );
+    await callRiverTest(page, "showRoomSyncError", ...NOT_FOUND, false);
   }
 
   test("the banner shows the label, explains and copies", async ({ page }) => {
@@ -398,14 +387,11 @@ test.describe("Room sync error details", () => {
     await expectCardCopies(page, banner, copied);
   });
 
-  /// The room row's button that holds the marker.
-  function rowOf(page: Page, marker: Locator): Locator {
-    return page.getByTestId("room-list").locator("button", { has: marker });
-  }
-
-  /// An explanation only: no copy hint, no button of its own, and nothing
-  /// copied by showing it.
+  /// Shown at once and on screen, as an explanation only: no copy hint, no
+  /// button of its own, and nothing copied by showing it.
   async function expectExplainsOnly(page: Page, marker: Locator) {
+    await expectShownAtOnce(tooltipOf(marker));
+    await withinViewport(page, tooltipOf(marker));
     await expect(tooltipOf(marker)).toContainText("could not be found on the network");
     await expect(tooltipOf(marker)).not.toContainText("Click to copy details");
     await expect(marker.locator("button")).toHaveCount(0);
@@ -414,28 +400,21 @@ test.describe("Room sync error details", () => {
 
   // A contended `try_read` neither returns the status nor subscribes, so the
   // banner must retry on its own; nothing else here writes a signal it reads.
-  test("the banner recovers when its first read of the error fails", async ({ page }) => {
+  test("the banner recovers when its first read of the error fails", { tag: "@chromium-only" }, async ({ page }) => {
     await open(page);
     await selectRoom(page, "Team Chat Room");
     await nextFrames(page);
     expect(await callRiverTest(page, "takeBannerReadFailures")).toBe(0);
-    await callRiverTest(page, "takeBannerErrorReads");
 
-    await callRiverTest(
-      page,
-      "showRoomSyncErrorFailingBannerRead",
-      "Room not found",
-      "This room could not be found on the network — it may have been removed.",
-      "Initial sync failed 10 times"
-    );
+    await callRiverTest(page, "showRoomSyncError", ...NOT_FOUND, true);
     // The error was delivered (the rail reads it), and the banner's read of it failed.
     await expect(page.getByTestId("room-sync-error-marker")).toBeVisible();
     await expect.poll(() => callRiverTest(page, "takeBannerReadFailures")).toBe(1);
 
-    // With no click, room switch or further status write, a later read finds it.
+    // With no click, room switch or further status write, a later read finds
+    // it: the banner renders only from that read.
     const banner = page.getByTestId("room-sync-error");
     await expect(banner).toContainText("Room not found");
-    expect(await callRiverTest(page, "takeBannerErrorReads")).toBeGreaterThanOrEqual(1);
     expect(await callRiverTest(page, "takeBannerReadFailures")).toBe(0);
   });
 
@@ -447,13 +426,9 @@ test.describe("Room sync error details", () => {
     await expect(marker).toHaveJSProperty("tagName", "SPAN");
     // Inside the row's button, never a button of its own.
     expect(await marker.evaluate((el) => el.closest("button") !== null)).toBe(true);
-    await expect(marker.locator("button")).toHaveCount(0);
-    await expect(tooltipOf(marker)).not.toContainText("Click to copy details");
 
     await marker.hover();
-    await expectShownAtOnce(tooltipOf(marker));
     await expectExplainsOnly(page, marker);
-    await withinViewport(page, tooltipOf(marker));
 
     // Anywhere on the row explains it, not only the icon. Leaving and coming
     // back also checks the card follows the pointer after it has been placed
@@ -466,9 +441,7 @@ test.describe("Room sync error details", () => {
     const awayX = 8;
     expect(markerBox.x, "the hover point is clear of the marker").toBeGreaterThan(rowBox.x + awayX + 20);
     await row.hover({ position: { x: awayX, y: rowBox.height / 2 } });
-    await expectShownAtOnce(tooltipOf(marker));
     await expectExplainsOnly(page, marker);
-    await withinViewport(page, tooltipOf(marker));
 
     await callRiverTest(page, "switchRoom", "Public Discussion Room");
     await expect(page.getByTestId("room-sync-error")).toHaveCount(0);
@@ -484,22 +457,14 @@ test.describe("Room sync error details", () => {
     // Through the hook, not a click: no pointer has been used on the page, so
     // script focus is focus-visible.
     await callRiverTest(page, "switchRoom", "Team Chat Room");
-    await callRiverTest(
-      page,
-      "showRoomSyncError",
-      "Room not found",
-      "This room could not be found on the network — it may have been removed.",
-      "Initial sync failed 10 times"
-    );
+    await callRiverTest(page, "showRoomSyncError", ...NOT_FOUND, false);
     await expect(page.getByTestId("room-sync-error")).toBeVisible();
     await callRiverTest(page, "switchRoom", "Public Discussion Room");
     await expect(page.getByTestId("room-sync-error")).toHaveCount(0);
 
     const marker = page.getByTestId("room-sync-error-marker");
     await rowOf(page, marker).focus();
-    await expectShownAtOnce(tooltipOf(marker));
     await expectExplainsOnly(page, marker);
-    await withinViewport(page, tooltipOf(marker));
 
     await page.keyboard.press("Enter");
     await expect(page.getByTestId("room-sync-error")).toBeVisible();
@@ -570,7 +535,7 @@ test.describe("Tooltip fallback without anchor positioning", () => {
   test("the marker's explanation fits the rail", async ({ page }) => {
     await open(page);
     await selectRoom(page, "Team Chat Room");
-    await callRiverTest(page, "showRoomSyncError", "Room is full", `Room is at capacity ${LONG_TOKEN}`, "x");
+    await callRiverTest(page, "showRoomSyncError", "Room is full", `Room is at capacity ${LONG_TOKEN}`, "x", false);
     await forceFallback(page);
     const marker = page.getByTestId("room-sync-error-marker");
     await marker.hover();

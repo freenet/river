@@ -3376,11 +3376,7 @@ pub fn Conversation() -> Element {
                             }
                         };
                         match status {
-                            Some(RoomSyncStatus::Error(report)) => {
-                                #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-                                crate::test_hooks::note_banner_error_read();
-                                Some(report)
-                            }
+                            Some(RoomSyncStatus::Error(report)) => Some(report),
                             _ => None,
                         }
                     });

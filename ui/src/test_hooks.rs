@@ -55,13 +55,10 @@ thread_local! {
         Option<crate::components::app::chat_delegate::LoadWorkerGuard>,
     > = const { std::cell::RefCell::new(None) };
     /// The room banner's next `SYNC_INFO` read fails, as a contended
-    /// `try_read` does (armed by `showRoomSyncErrorFailingBannerRead`).
+    /// `try_read` does (armed by `showRoomSyncError`'s `failBannerRead`).
     static FAIL_NEXT_BANNER_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Banner reads that failed, since `takeBannerReadFailures` last read them.
     static BANNER_READ_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Banner reads that found the room's stored sync error, since
-    /// `takeBannerErrorReads` last read them.
-    static BANNER_ERROR_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the room banner's `SYNC_INFO` read is to fail this time; consumes
@@ -75,12 +72,6 @@ pub fn take_banner_read_failure() -> bool {
 /// `takeBannerReadFailures`. Plain counters, so reading them renders nothing.
 pub fn note_banner_read_failed() {
     BANNER_READ_FAILURES.with(|n| n.set(n.get() + 1));
-}
-
-/// Counts one banner read that found the room's sync error, for
-/// `takeBannerErrorReads`.
-pub fn note_banner_error_read() {
-    BANNER_ERROR_READS.with(|n| n.set(n.get() + 1));
 }
 
 /// `signature` with one bit flipped if `forgeNextSendSignature` was called
@@ -647,29 +638,20 @@ pub fn install_test_hooks() {
 
     // The current room as a placeholder still awaiting its initial sync (its
     // configuration no longer verifies) whose sync ended in this error: the
-    // room banner and the rail's error marker.
+    // room banner and the rail's error marker. With `fail_banner_read`, the
+    // banner's first read of the error fails, as a contended
+    // `SYNC_INFO.try_read()` does. Armed in the same deferred action that
+    // delivers the error, so it is the render that brings the error whose
+    // read fails, and no other.
     set_hook(
         "showRoomSyncError",
-        Closure::<dyn FnMut(String, String, String)>::new(
-            move |label: String, summary: String, detail: String| {
-                let label = report_label(&label);
-                crate::util::defer(move || show_room_sync_error(label, summary, detail));
-            },
-        )
-        .into_js_value(),
-    );
-
-    // The same, with the room banner's first read of the error failing, as a
-    // contended `SYNC_INFO.try_read()` does. Armed in the same deferred
-    // action that delivers the error, so it is the render that brings the
-    // error whose read fails, and no other.
-    set_hook(
-        "showRoomSyncErrorFailingBannerRead",
-        Closure::<dyn FnMut(String, String, String)>::new(
-            move |label: String, summary: String, detail: String| {
+        Closure::<dyn FnMut(String, String, String, bool)>::new(
+            move |label: String, summary: String, detail: String, fail_banner_read: bool| {
                 let label = report_label(&label);
                 crate::util::defer(move || {
-                    FAIL_NEXT_BANNER_READ.with(|f| f.set(true));
+                    if fail_banner_read {
+                        FAIL_NEXT_BANNER_READ.with(|f| f.set(true));
+                    }
                     show_room_sync_error(label, summary, detail);
                 });
             },
@@ -680,12 +662,6 @@ pub fn install_test_hooks() {
     set_hook(
         "takeBannerReadFailures",
         Closure::<dyn FnMut() -> u32>::new(move || BANNER_READ_FAILURES.with(|n| n.replace(0)))
-            .into_js_value(),
-    );
-
-    set_hook(
-        "takeBannerErrorReads",
-        Closure::<dyn FnMut() -> u32>::new(move || BANNER_ERROR_READS.with(|n| n.replace(0)))
             .into_js_value(),
     );
 
