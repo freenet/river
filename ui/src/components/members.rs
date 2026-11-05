@@ -1,7 +1,11 @@
+use crate::components::app::freenet_api::error_report::ErrorReport;
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{CURRENT_ROOM, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS};
+use crate::components::app::{
+    CURRENT_ROOM, LAST_CONNECTION_ERROR, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS,
+};
 use crate::components::back_to_chat::BackToChatButton;
 use crate::components::icons::*;
+use crate::components::tooltip::WithTooltip;
 use crate::util::confusable::{
     ConfusableTier, ImpersonationChecker, ImpersonationWarning, ProtectedName, ProtectedRole,
 };
@@ -51,41 +55,88 @@ use self::invite_member_modal::InviteMemberModal;
 /// when no room is selected, leaving brand-new users with no signal
 /// that their node WebSocket was broken.
 ///
-/// Signal-safety note (AGENTS.md "Dioxus WASM Signal Safety Rules"):
-/// `SYNC_STATUS` is read via `try_read()` and the value is snapshotted
-/// once per render. The synchronizer writes to `SYNC_STATUS` from
-/// places that can fire subscriber notifications during the write
-/// guard's Drop on Firefox mobile; an infallible `.read()` here would
-/// risk the documented `RefCell already borrowed` panic. If the read
-/// fails (signal currently mid-write), we fall back to "Connecting..."
-/// — the same neutral state used on initial app boot — and the next
-/// render will pick up the real value.
+/// Short labels only: Connected, Connecting..., Disconnected, or an error
+/// report's label ("Invalid operation", "Refreshing..."). When there is an
+/// error report, the current one or the last one kept through a reconnect
+/// (`LAST_CONNECTION_ERROR`, cleared on Connected), hovering or focusing the
+/// pill explains it and clicking copies its diagnostics. Its accessible name
+/// carries the label shown ("WebSocket connection status: Connecting..."),
+/// even while the report it explains and copies is an earlier one.
+///
+/// Signal safety: both signals are read with `try_read()`. A contended read
+/// keeps this instance's last good snapshot (never a made-up state, and the
+/// copy button is not swapped out from under a click) and nudges, because a
+/// failed `try_read` does not subscribe (freenet/river#555).
 #[component]
 pub fn ConnectionStatusIndicator() -> Element {
-    // Snapshot the status once per render. `try_read()` returns Err if
-    // another writer holds the RefCell; fall back to a neutral state.
-    let status: SynchronizerStatus = SYNC_STATUS
-        .try_read()
-        .map(|r| r.clone())
-        .unwrap_or(SynchronizerStatus::Connecting);
+    let snapshot: std::rc::Rc<std::cell::RefCell<(SynchronizerStatus, Option<ErrorReport>)>> =
+        use_hook(|| {
+            std::rc::Rc::new(std::cell::RefCell::new((
+                SynchronizerStatus::Connecting,
+                None,
+            )))
+        });
+    crate::util::signal_guard::anchor();
+    let status = match SYNC_STATUS.try_read() {
+        Ok(status) => status.clone(),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            snapshot.borrow().0.clone()
+        }
+    };
+    let last_error = match LAST_CONNECTION_ERROR.try_read() {
+        Ok(last) => last.clone(),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            snapshot.borrow().1.clone()
+        }
+    };
+    *snapshot.borrow_mut() = (status.clone(), last_error.clone());
 
     let (pill_classes, dot_classes, label) = match &status {
-        SynchronizerStatus::Connected => ("text-text-muted", "bg-success", "Connected".to_string()),
-        SynchronizerStatus::Connecting => {
-            ("text-text-muted", "bg-warning", "Connecting...".to_string())
+        SynchronizerStatus::Connected => ("text-text-muted", "bg-success", "Connected"),
+        SynchronizerStatus::Connecting => ("text-text-muted", "bg-warning", "Connecting..."),
+        SynchronizerStatus::Disconnected => ("text-danger", "bg-error", "Disconnected"),
+        SynchronizerStatus::Error(report) if report.is_progress() => {
+            ("text-text-muted", "bg-warning", report.label)
         }
-        SynchronizerStatus::Disconnected => ("text-danger", "bg-error", "Disconnected".to_string()),
-        SynchronizerStatus::Error(msg) => ("text-danger", "bg-error", format!("Error: {}", msg)),
+        SynchronizerStatus::Error(report) => ("text-danger", "bg-error", report.label),
+    };
+    // `retained_error`'s rule, applied here too: if one read above fell back
+    // to the snapshot, the two values can be a render apart, and this keeps a
+    // Connected pill from offering a stale error.
+    let report = match status {
+        SynchronizerStatus::Error(report) => Some(report),
+        SynchronizerStatus::Connected => None,
+        SynchronizerStatus::Connecting | SynchronizerStatus::Disconnected => last_error,
+    };
+    let host_classes = format!("flex items-center gap-2 text-[12.5px] font-medium {pill_classes}");
+    let content = rsx! {
+        span {
+            "data-testid": "connection-status-dot",
+            class: "block w-[7px] h-[7px] rounded-full flex-shrink-0 {dot_classes}",
+        }
+        span { "data-testid": "connection-status-label", "{label}" }
     };
 
     rsx! {
-        div { class: "px-4 flex-shrink-0",
-            div {
-                "aria-label": "WebSocket connection status",
-                "data-testid": "connection-status-indicator",
-                class: "flex items-center gap-2 text-[12.5px] font-medium {pill_classes}",
-                div { class: "w-[7px] h-[7px] rounded-full flex-shrink-0 {dot_classes}" }
-                span { "{label}" }
+        div { class: "tooltip-frame px-4 flex-shrink-0",
+            if let Some(report) = report {
+                WithTooltip {
+                    tip: report.summary.clone(),
+                    copy: report.diagnostics(),
+                    class: "{host_classes} tooltip-host--framed text-left",
+                    test_id: "connection-status-indicator",
+                    "aria-label": "WebSocket connection status: {label}",
+                    {content}
+                }
+            } else {
+                div {
+                    "aria-label": "WebSocket connection status: {label}",
+                    "data-testid": "connection-status-indicator",
+                    class: "{host_classes}",
+                    {content}
+                }
             }
         }
     }

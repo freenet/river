@@ -8,6 +8,9 @@ pub mod signal_guard;
 #[cfg(test)]
 pub(crate) mod source_scan;
 
+/// When this UI was built (ISO 8601), set by `ui/build.rs`.
+pub const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "Build timestamp not set");
+
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
 use std::time::*;

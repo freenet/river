@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::error::SynchronizerError;
+use super::error_report::ErrorReport;
 use crate::components::app::chat_delegate::save_rooms_to_delegate;
 use crate::components::app::document_title::update_document_title;
 use crate::components::app::freenet_api::backward_probe::{start_rekey_merge, RekeyStart};
@@ -1022,7 +1023,12 @@ impl RoomSynchronizer {
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info.update_sync_status(
                                         owner_vk,
-                                        RoomSyncStatus::Error(e.to_string()),
+                                        RoomSyncStatus::Error(
+                                            ErrorReport::from_client_error_during(
+                                                "Couldn't fetch this room",
+                                                &e,
+                                            ),
+                                        ),
                                     );
                                 });
                             }
@@ -1081,7 +1087,12 @@ impl RoomSynchronizer {
                                     sync_info.take_subscribe_get(owner_vk);
                                     sync_info.update_sync_status(
                                         owner_vk,
-                                        RoomSyncStatus::Error(e.to_string()),
+                                        RoomSyncStatus::Error(
+                                            ErrorReport::from_client_error_during(
+                                                "Couldn't fetch this room",
+                                                &e,
+                                            ),
+                                        ),
                                     );
                                 });
                             }
@@ -1122,7 +1133,10 @@ impl RoomSynchronizer {
                             SYNC_INFO.with_mut(|sync_info| {
                                 sync_info.update_sync_status(
                                     owner_vk,
-                                    RoomSyncStatus::Error(e.to_string()),
+                                    RoomSyncStatus::Error(ErrorReport::from_client_error_during(
+                                        "Couldn't publish this room",
+                                        &e,
+                                    )),
                                 );
                             });
                         }
@@ -1789,7 +1803,12 @@ impl RoomSynchronizer {
                 }
                 Err(e) => {
                     error!("Failed to send subscription request: {}", e);
-                    Err(SynchronizerError::SubscribeError(e.to_string()))
+                    let parts = super::error_report::analyse_client_error(&e);
+                    Err(SynchronizerError::SubscribeSendFailed {
+                        summary: parts.summary,
+                        raw: e.to_string(),
+                        detail: parts.detail,
+                    })
                 }
             }
         } else {

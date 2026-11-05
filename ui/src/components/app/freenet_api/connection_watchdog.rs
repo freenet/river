@@ -50,8 +50,8 @@
 //!
 //! ## Anti-storm design
 //!
-//! * The watchdog only guards an **established** connection (`SYNC_STATUS ==
-//!   Connected`). While disconnected/reconnecting it is dormant — the existing
+//! * The watchdog only guards an **established** connection (the connection
+//!   phase in `connection_manager::control` is `Connected`). While disconnected/reconnecting it is dormant — the existing
 //!   backoff owns recovery, so the watchdog can't add reconnect pressure.
 //! * At most **one** probe is outstanding per idle period. A healthy idle room
 //!   costs one local GET per [`LIVENESS_IDLE_PROBE_MS`]; any inbound traffic
@@ -60,13 +60,13 @@
 //!   On declaring death the watchdog latches into
 //!   [`WatchdogState::ReconnectRequested`] and refuses to raise a second
 //!   `ConnectionLost` until it observes the reconnect actually happen — either
-//!   `SYNC_STATUS` leaving `Connected`, or a NEW socket opening (the
+//!   the connection phase leaving `Connected`, or a NEW socket opening (the
 //!   connection-generation counter [`ws_connect_seq`] advancing, bumped only by
 //!   a reconnect's `onopen`). It deliberately does NOT release on arbitrary
 //!   inbound activity: a straggler message delivered late on the old,
 //!   condemned socket would otherwise release the latch mid-lag and let a second
 //!   `ConnectionLost` through (Codex #384 review, P2). This latch is
-//!   load-bearing because `SYNC_STATUS` flips to `Disconnected`
+//!   load-bearing because the connection phase flips to `Disconnected`
 //!   *asynchronously* in the synchronizer message loop: if that loop lags
 //!   longer than a probe tick plus [`LIVENESS_PROBE_TIMEOUT_MS`], a naive
 //!   watchdog would re-probe and fire a SECOND `ConnectionLost`, and each one
@@ -193,7 +193,7 @@ pub enum WatchdogState {
     /// watchdog is latched dormant until the reconnect is actually observed, so
     /// it cannot raise a second `ConnectionLost` for the same stall episode
     /// while the synchronizer message loop is still lagging in flipping
-    /// `SYNC_STATUS` to `Disconnected`. `connect_seq_at_reconnect` snapshots the
+    /// the connection phase to `Disconnected`. `connect_seq_at_reconnect` snapshots the
     /// connection-generation counter (`ws_connect_seq`) at the moment death was
     /// declared — a later increment means a NEW socket opened (`onopen`), i.e.
     /// the reconnect landed, so the latch releases back to `Monitoring`. It is
@@ -234,7 +234,7 @@ pub enum WatchdogAction {
 ///   above) also returns to `Monitoring`. It does NOT release on `activity_seq`
 ///   alone, so an old-socket straggler can't spring the latch early. This
 ///   guarantees at most one `ConnectionLost` per stall episode even while the
-///   synchronizer message loop lags in flipping `SYNC_STATUS` to `Disconnected`.
+///   synchronizer message loop lags in flipping the connection phase to `Disconnected`.
 /// * Otherwise → keep waiting.
 pub fn watchdog_tick(
     state: WatchdogState,
@@ -280,7 +280,7 @@ pub fn watchdog_tick(
                 // Probe unanswered past the timeout — treat as dead. Latch into
                 // `ReconnectRequested` (snapshotting `connect_seq`) rather than
                 // returning to `Monitoring`, so that a lagging synchronizer
-                // message loop — which flips `SYNC_STATUS` to `Disconnected`
+                // message loop — which flips the connection phase to `Disconnected`
                 // only asynchronously — can't drive us to re-probe and fire a
                 // SECOND `ConnectionLost` for this same stall episode.
                 //
@@ -318,7 +318,7 @@ pub fn watchdog_tick(
                 // a second `ConnectionLost` through (Codex #384 review).
                 (WatchdogState::Monitoring, WatchdogAction::Wait)
             } else {
-                // No new socket yet and `SYNC_STATUS` hasn't flipped to
+                // No new socket yet and the connection phase hasn't flipped to
                 // `Disconnected` yet (message-loop lag). Hold the latch — do NOT
                 // fire another `ConnectionLost`. The `!connected` branch above
                 // is the other release path once the loop catches up.
@@ -337,11 +337,9 @@ pub fn spawn_liveness_watchdog(
     >,
 ) {
     use super::constants::WATCHDOG_TICK_MS;
-    use super::freenet_synchronizer::{SynchronizerMessage, SynchronizerStatus};
-    use crate::components::app::SYNC_STATUS;
+    use super::freenet_synchronizer::SynchronizerMessage;
     use crate::util::sleep;
     use dioxus::logger::tracing::{info, warn};
-    use dioxus::prelude::ReadableExt;
     use std::time::Duration;
 
     let cfg = WatchdogConfig::from_constants();
@@ -362,14 +360,9 @@ pub fn spawn_liveness_watchdog(
         loop {
             sleep(Duration::from_millis(WATCHDOG_TICK_MS)).await;
 
-            // Read connection state via `try_read()` (signal-safety): a
-            // momentary Err (a writer holds the borrow) is treated as
-            // "not connected" for this tick, which only defers monitoring one
-            // tick — harmless.
-            let connected = matches!(
-                SYNC_STATUS.try_read().map(|s| s.clone()),
-                Ok(SynchronizerStatus::Connected)
-            );
+            // The connection control state, not the pill's display status
+            // (written a macrotask later, through `set_sync_status`).
+            let connected = super::connection_manager::control::get().is_connected();
 
             let (next_state, action) = watchdog_tick(
                 state,
@@ -703,7 +696,7 @@ mod tests {
 
     #[test]
     fn reconnect_requested_holds_latch_and_does_not_refire() {
-        // Core anti-refire guard: while latched (SYNC_STATUS still Connected, no
+        // Core anti-refire guard: while latched (the connection phase still Connected, no
         // new socket opened), even a wildly-idle tick must NOT declare a second
         // death. This is the failure the guard exists to prevent.
         let (state, action) = watchdog_tick(
@@ -732,7 +725,7 @@ mod tests {
         // OLD, condemned socket bumps `activity_seq` but NOT `connect_seq` (no
         // new socket opened). The latch must HOLD — releasing here would let the
         // watchdog return to Monitoring, re-probe after the idle interval, and
-        // fire a SECOND ConnectionLost while SYNC_STATUS is still Connected,
+        // fire a SECOND ConnectionLost while the connection phase is still Connected,
         // which is exactly the duplicate-reconnect the latch exists to prevent.
         let (state, action) = watchdog_tick(
             WatchdogState::ReconnectRequested {
@@ -779,7 +772,7 @@ mod tests {
 
     #[test]
     fn reconnect_requested_releases_when_disconnected() {
-        // The other release path: once the message loop flips SYNC_STATUS to
+        // The other release path: once the message loop flips the connection phase to
         // Disconnected (connected == false), the latch clears to Monitoring via
         // the top-of-function dormant branch, even if no new socket opened yet.
         let (state, action) = watchdog_tick(
@@ -841,7 +834,7 @@ mod tests {
         // is latched (death declared at connection generation `conn`). Old-socket
         // stragglers have bumped `activity_seq` to a high value, but no NEW socket
         // has opened (`connect_seq` stays `conn`) because the reconnect hasn't
-        // landed yet and SYNC_STATUS is still Connected (loop lagged). No matter
+        // landed yet and the connection phase is still Connected (loop lagged). No matter
         // how long we wait, the latch must hold and NOT fire another
         // ConnectionLost. (With the earlier activity-keyed release this fired
         // repeatedly.)
@@ -903,7 +896,7 @@ mod tests {
         assert_eq!(
             reconnects, 1,
             "a single stall episode must raise ConnectionLost exactly once, \
-             even while the message loop lags with SYNC_STATUS still Connected"
+             even while the message loop lags with the connection phase still Connected"
         );
         assert_eq!(
             state,
@@ -914,7 +907,7 @@ mod tests {
         );
 
         // The reconnect finally lands: onopen opens a NEW socket (connect_seq
-        // advances) and records activity; SYNC_STATUS returns to Connected. The
+        // advances) and records activity; the connection phase returns to Connected. The
         // latch must release.
         let conn1 = conn0 + 1;
         let seq_after_reconnect = seq_dead + 1;

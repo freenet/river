@@ -52,8 +52,16 @@ pub enum SynchronizerError {
     #[error("Failed to put contract state: {0}")]
     PutContractError(String),
 
-    #[error("Failed to subscribe to contract: {0}")]
-    SubscribeError(String),
+    /// The subscribe request could not be sent. Displays (and so logs) as
+    /// "Failed to subscribe to contract: {raw}"; `summary` is the short explanation the room's error
+    /// report shows, `detail` the redacted text its copied diagnostics carry
+    /// ([`ErrorReport`](super::error_report::ErrorReport)).
+    #[error("Failed to subscribe to contract: {raw}")]
+    SubscribeSendFailed {
+        summary: String,
+        raw: String,
+        detail: String,
+    },
 
     #[error("Serialization error: {0}")]
     SerializationError(String),
@@ -120,5 +128,23 @@ impl SynchronizerError {
             SynchronizerError::DelegateRegisterFailed { key, .. } => Some(key),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribe_send_failures_display_as_before() {
+        let e = SynchronizerError::SubscribeSendFailed {
+            summary: "WebSocket state: CLOSED".into(),
+            raw: "request error: {\"origin\":\"send precondition check\"}".into(),
+            detail: "WebSocket error: request error: {}".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "Failed to subscribe to contract: request error: {\"origin\":\"send precondition check\"}"
+        );
     }
 }

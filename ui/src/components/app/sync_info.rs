@@ -1,4 +1,5 @@
 use crate::components::app::freenet_api::constants::REPUT_DELAY_MS;
+use crate::components::app::freenet_api::error_report::{ErrorReport, LABEL_ROOM_NOT_FOUND};
 use crate::components::app::ROOMS;
 use crate::util::owner_vk_to_contract_key;
 use dioxus::logger::tracing::{debug, warn};
@@ -324,7 +325,14 @@ impl SyncInfo {
                 MemberId::from(*owner_key),
                 sync_info.failed_sync_attempts
             );
-            sync_info.sync_status = RoomSyncStatus::Error(CONTRACT_NOT_FOUND_ERROR.to_string());
+            sync_info.sync_status = RoomSyncStatus::Error(ErrorReport::new(
+                LABEL_ROOM_NOT_FOUND,
+                CONTRACT_NOT_FOUND_ERROR,
+                format!(
+                    "Initial sync failed {} times; the room's contract was not found on the network",
+                    sync_info.failed_sync_attempts
+                ),
+            ));
             false
         } else {
             sync_info.sync_status = RoomSyncStatus::Disconnected;
@@ -572,7 +580,7 @@ pub enum RoomSyncStatus {
 
     Subscribed,
 
-    Error(String),
+    Error(ErrorReport),
 }
 
 #[cfg(test)]
@@ -621,7 +629,8 @@ mod tests {
             si.register_new_room(*k);
         }
         si.update_sync_status(&subscribing, RoomSyncStatus::Subscribing);
-        si.update_sync_status(&errored, RoomSyncStatus::Error("gave up".into()));
+        let gave_up = ErrorReport::new(LABEL_ROOM_NOT_FOUND, "gave up", "gave up");
+        si.update_sync_status(&errored, RoomSyncStatus::Error(gave_up.clone()));
         si.update_sync_status(&disconnected, RoomSyncStatus::Disconnected);
 
         assert_eq!(
@@ -643,7 +652,7 @@ mod tests {
         );
         assert_eq!(
             si.get_sync_status(&errored),
-            Some(&RoomSyncStatus::Error("gave up".into())),
+            Some(&RoomSyncStatus::Error(gave_up)),
             "a terminal Error room must not be revived by a reconnect"
         );
     }

@@ -1,4 +1,5 @@
 use crate::components::app::document_title::count_unread_behind_rooms_panel;
+use crate::components::app::freenet_api::error_report::ErrorReport;
 #[cfg(target_arch = "wasm32")]
 use crate::components::app::notifications::request_permission_on_first_message;
 use crate::components::app::receive_times::{
@@ -20,6 +21,7 @@ use crate::components::scroll_to_latest::is_arrival;
 #[cfg(target_arch = "wasm32")]
 use crate::components::scroll_to_latest::observe_newest;
 use crate::components::scroll_to_latest::LatestButton;
+use crate::components::tooltip::WithTooltip;
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
 use crate::util::display_name::display_nickname;
@@ -1238,6 +1240,16 @@ fn note_description_overflow(description_overflows: &mut Signal<bool>) {
     if changed {
         description_overflows.set(next);
     }
+}
+
+/// Whether the room banner's `SYNC_INFO` read is to fail this time. Never,
+/// except in the offline test build, where `test_hooks` can make one read
+/// fail as a contended `try_read` does, to check the banner recovers.
+fn banner_sync_read_fails() -> bool {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    return crate::test_hooks::take_banner_read_failure();
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+    false
 }
 
 #[component]
@@ -3329,36 +3341,59 @@ pub fn Conversation() -> Element {
                 // GET/PUT send (WebSocket/API error). The spinner below is gated
                 // on `is_awaiting_initial_sync()`, which stays true while the
                 // room holds placeholder state — so without this check it would
-                // spin forever. Surface the STORED error message (not a
+                // spin forever. Surface the STORED error report (not a
                 // hardcoded "not found") so WebSocket/API failures are not
-                // misreported as the room being removed.
+                // misreported as the room being removed: its short label,
+                // explained on hover/focus, with its diagnostics a click away.
                 //
                 // Scoped to rooms that are STILL awaiting initial sync: a room
                 // that already synced real state and later hit some other
                 // `Error` (e.g. a transient PUT failure) is handled by the
                 // normal `Some(room_data)` arm below.
-                let initial_sync_error_msg: Option<String> =
+                let initial_sync_error: Option<ErrorReport> =
                     current_room_data.as_ref().and_then(|room_data| {
                         if !room_data.is_awaiting_initial_sync() {
                             return None;
                         }
-                        match SYNC_INFO
-                            .try_read()
-                            .ok()
-                            .and_then(|si| si.get_sync_status(&room_data.owner_vk).cloned())
-                        {
-                            Some(RoomSyncStatus::Error(msg)) => Some(msg),
+                        // A contended read neither returns the status nor
+                        // subscribes to SYNC_INFO, so without a retry the
+                        // banner would read as the spinner until something
+                        // unrelated re-rendered (freenet/river#555). The
+                        // anchor keeps this render subscribed to the nudge.
+                        crate::util::signal_guard::anchor();
+                        let read = if banner_sync_read_fails() {
+                            None
+                        } else {
+                            SYNC_INFO.try_read().ok()
+                        };
+                        let status = match read {
+                            Some(si) => si.get_sync_status(&room_data.owner_vk).cloned(),
+                            None => {
+                                #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+                                crate::test_hooks::note_banner_read_failed();
+                                crate::util::signal_guard::schedule_nudge();
+                                None
+                            }
+                        };
+                        match status {
+                            Some(RoomSyncStatus::Error(report)) => Some(report),
                             _ => None,
                         }
                     });
 
                 match current_room_data.as_ref() {
-                    Some(_) if initial_sync_error_msg.is_some() => {
-                        let msg = initial_sync_error_msg.unwrap_or_default();
+                    Some(_) if initial_sync_error.is_some() => {
+                        let report = initial_sync_error.unwrap();
                         rsx! {
-                            div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg rounded-lg text-sm text-danger flex items-center gap-3",
-                                Icon { width: 16, height: 16, icon: FaTriangleExclamation }
-                                span { "{msg}" }
+                            div { class: "px-4 mb-4",
+                                WithTooltip {
+                                    tip: report.summary.clone(),
+                                    copy: report.diagnostics(),
+                                    class: "w-full px-4 py-3 bg-error-bg rounded-lg text-sm text-danger flex items-center gap-3 text-left",
+                                    test_id: "room-sync-error",
+                                    Icon { width: 16, height: 16, icon: FaTriangleExclamation }
+                                    span { "{report.label}" }
+                                }
                             }
                         }
                     },
