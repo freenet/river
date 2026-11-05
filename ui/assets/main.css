@@ -670,11 +670,10 @@
     bottom: 100%;
     left: 0;
     z-index: 65;
-    display: block;
+    display: none;
     width: max-content;
     max-width: min(18rem, calc(100vw - 2rem));
     padding-block: 6px;
-    visibility: hidden;
     text-align: left;
     white-space: normal;
 }
@@ -693,13 +692,18 @@
 
 /* A non-copying host sits inside another button (a room row) and explains
  * it: shown while that button is hovered anywhere, not only over the icon,
- * or has keyboard focus. Gecko also reports the hover on the button rather
- * than on the span inside it, so a direct :hover alone never matches there. */
+ * or has keyboard focus.
+ *
+ * Shown and hidden with `display`, not `visibility`. Gecko does not restyle
+ * an anchored card it has moved to a `position-try-fallbacks` position when
+ * only a paint property changes: the card kept whatever visibility it had
+ * when it was placed, so it stuck shown after the pointer left or stayed
+ * hidden on keyboard focus. A `display` change lays it out again. */
 .tooltip-host:hover > .tooltip-card,
 button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
 .tooltip-host--copy:focus-visible > .tooltip-card,
 :focus-visible .tooltip-host > .tooltip-card {
-    visibility: visible;
+    display: block;
 }
 
 .tooltip-box {

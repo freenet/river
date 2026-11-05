@@ -45,12 +45,18 @@ async function expectShownAtOnce(card: Locator) {
   const style = await card.evaluate((el) => {
     const cs = getComputedStyle(el);
     return {
+      display: cs.display,
       visibility: cs.visibility,
       transition: cs.transitionDuration,
       animation: cs.animationName,
     };
   });
-  expect(style).toEqual({ visibility: "visible", transition: "0s", animation: "none" });
+  expect(style).toEqual({
+    display: "block",
+    visibility: "visible",
+    transition: "0s",
+    animation: "none",
+  });
 }
 
 async function withinViewport(page: Page, el: Locator) {
@@ -333,8 +339,9 @@ test.describe("Room sync error details", () => {
     await expectExplainsOnly(page, marker);
     await withinViewport(page, tooltipOf(marker));
 
-    // Anywhere on the row explains it, not only the icon. (Gecko reports the
-    // hover on the row's button rather than on the span inside it.)
+    // Anywhere on the row explains it, not only the icon. Leaving and coming
+    // back also checks the card follows the pointer after it has been placed
+    // (Gecko left a flipped card's visibility stale; see main.css).
     const row = rowOf(page, marker);
     await page.getByTestId("room-sync-error").hover();
     await expect(tooltipOf(marker)).toBeHidden();

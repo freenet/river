@@ -6,9 +6,7 @@
 //! clipboard helper and says so in the app toast. Without `copy` the host is a
 //! plain `span`, so it can sit inside another button (a room row) without
 //! nesting interactive controls; it then also shows while that ancestor
-//! button is hovered anywhere or has keyboard focus. (Gecko reports a hover
-//! inside a button on the button, not on the span, so the ancestor rule is
-//! what shows it there at all.)
+//! button is hovered anywhere or has keyboard focus.
 //!
 //! The card is a child of its host, so moving the pointer onto it keeps the
 //! host hovered; its padding touches the host and bridges the gap. Where CSS
@@ -16,7 +14,9 @@
 //! host, and flips to stay on screen, which also escapes a scrolling rail's
 //! clipping. Elsewhere it falls back to `position: absolute` above the host.
 //! Either way it is linked by `aria-describedby`, so the explanation does not
-//! depend on it being painted. Styles: `.tooltip-*` in `assets/main.css`.
+//! depend on it being painted. It is shown and hidden with `display`, not
+//! `visibility`, which Gecko leaves stale on a flipped anchored card. Styles:
+//! `.tooltip-*` in `assets/main.css`.
 
 use dioxus::prelude::*;
 
