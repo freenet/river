@@ -636,8 +636,7 @@ mod tests {
         let vk = owner_sk().verifying_key();
         outbox.enqueue(room, kind(), vk, vec![sealed(1)]);
         outbox.enqueue(room, kind(), vk, vec![sealed(2), sealed(1)]);
-        let id = queue_send(&mut outbox, room, "public", 3);
-        let _ = id;
+        queue_send(&mut outbox, room, "public", 3);
         let mut entries = Vec::new();
         for e in outbox.pending_rows(&room, &vk) {
             entries.push(e.id);
@@ -656,6 +655,63 @@ mod tests {
         assert!(
             !get(2).is_stale_sealed(None),
             "a public body is never stale"
+        );
+    }
+
+    /// The commit refuses a message sealed under a secret the room has since
+    /// rotated away from, leaving the room unchanged, and admits one sealed
+    /// under the current secret.
+    #[test]
+    fn a_stale_sealed_message_is_not_committed() {
+        let room = owner_sk().verifying_key();
+        let sealed_send = |outbox: &mut Outbox, version: u32| {
+            let message = MessageV1 {
+                room_owner: MemberId::from(&room),
+                author: MemberId::from(&owner_sk().verifying_key()),
+                content: RoomMessageBody::private(
+                    river_core::room_state::content::CONTENT_TYPE_TEXT,
+                    river_core::room_state::content::TEXT_CONTENT_VERSION,
+                    vec![1, 2, 3],
+                    [0u8; 12],
+                    version,
+                ),
+                time: SystemTime::now(),
+            };
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+            let (id, work) = outbox.enqueue(
+                room,
+                PendingKind::Send {
+                    text: "secret".to_string(),
+                    author_name: "Owner".to_string(),
+                },
+                owner_sk().verifying_key(),
+                vec![(message, bytes)],
+            );
+            outbox.record_signature(&room, id, 0, owner_sk().sign(&work[0].1));
+            outbox.take_ready(&room).pop().unwrap()
+        };
+        let mut outbox = Outbox::default();
+        let mut room_data = crate::room_data::test_minimal_room_data(room);
+        room_data.secrets.insert(2, [7u8; 32]);
+        room_data.current_secret_version = Some(2);
+
+        let before = room_data.room_state.clone();
+        let stale = sealed_send(&mut outbox, 1);
+        assert!(
+            apply_entry(&mut room_data, &stale).is_err(),
+            "sealed v1, room at v2"
+        );
+        assert!(room_data.room_state == before);
+
+        let current = sealed_send(&mut outbox, 2);
+        apply_entry(&mut room_data, &current).expect("sealed under the current secret");
+
+        room_data.current_secret_version = None;
+        let unknown = sealed_send(&mut outbox, 2);
+        assert!(
+            apply_entry(&mut room_data, &unknown).is_err(),
+            "no current secret: refused"
         );
     }
 

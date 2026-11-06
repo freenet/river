@@ -1039,7 +1039,11 @@ mod runtime {
     /// The least time the delegate flush gets in `reload_after_flush`, however
     /// long the waits before it took.
     const FLUSH_MIN_MS: u64 = 3_000;
-    /// Longest a reload waits for pending writes before it goes anyway.
+    /// Longest a reload waits for pending writes (`NEEDS_SYNC`, messages still
+    /// signing) before it goes anyway. The delegate flush then still gets
+    /// [`FLUSH_MIN_MS`], so a reload's waits total at most this plus that
+    /// (plus a clicked reload's settle period). A message still signing past
+    /// this (signing times out at 10 s) is lost to a clicked reload.
     const FLUSH_TIMEOUT_MS: u64 = 5_000;
 
     fn now_ms() -> u64 {
@@ -2990,8 +2994,6 @@ mod tests {
         assert!(rooms > connect);
     }
 
-    /// `user_is_busy` finds the composers by these hooks. Renaming one would
-    /// fail OPEN (reload over unsent text) without anything else noticing.
     #[test]
     fn unsent_messages_hold_and_delay_a_reload() {
         // The outbox is memory only: a reload loses what it holds, and the
@@ -3020,6 +3022,8 @@ mod tests {
         );
     }
 
+    /// `user_is_busy` finds the composers by these hooks. Renaming one would
+    /// fail OPEN (reload over unsent text) without anything else noticing.
     #[test]
     fn busy_detection_selectors_still_exist() {
         let src = |s: &str| crate::util::strip_comments(s);
