@@ -580,3 +580,176 @@ fn resealing_is_bounded_and_retry_seals_again() {
         "Retry sealed it under the current secret"
     );
 }
+
+/// A message sealed under v1, nothing to seal it from (`enqueue` keeps no
+/// `SealInput`), so it cannot be sealed again.
+fn sealed_without_input(
+    outbox: &mut Outbox,
+    text: &str,
+    ms: u64,
+    version: u32,
+) -> (u64, SigningWork) {
+    use super::super::seal::SealInput;
+    let (mut message, _) = message(text, ms);
+    message.content = SealInput::Text(text.to_string()).seal(&[1u8; 32], version);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+    outbox.enqueue(
+        room(),
+        PendingKind::Send {
+            text: text.to_string(),
+            author_name: "Me".to_string(),
+        },
+        author().verifying_key(),
+        vec![(message, bytes)],
+    )
+}
+
+/// A stale entry that cannot be sealed again fails, and the entries behind it
+/// still commit: one failure never strands the queue.
+#[test]
+fn a_reseal_that_fails_does_not_strand_what_follows() {
+    let current = Some(([2u8; 32], 2));
+    // At the bound.
+    let mut outbox = Outbox::default();
+    let (a, wa) = sealed_entry(&mut outbox, "keeps rotating", 1, 1);
+    let (b, wb) = sealed_entry(&mut outbox, "behind it", 2, 2);
+    for v in 0..MAX_RESEALS {
+        outbox.reseal(&room(), a, &[9u8; 32], 1 + v).unwrap();
+    }
+    let _ = wa;
+    let work = outbox.entry(&room(), a).unwrap().work();
+    sign_all(&mut outbox, a, &work);
+    sign_all(&mut outbox, b, &wb);
+    let (ready, resign) = outbox.take_committable(&room(), current);
+    assert!(resign.is_empty());
+    assert_eq!(texts(&ready), ["behind it"]);
+    assert!(outbox.pending_rows(&room(), &author().verifying_key())[0]
+        .failed
+        .is_some());
+
+    // No current secret on this device, and nothing to seal from: each fails,
+    // and the public entry behind them commits.
+    for (current, make) in [
+        (
+            None,
+            sealed_entry as fn(&mut Outbox, &str, u64, u32) -> (u64, SigningWork),
+        ),
+        (current, sealed_without_input),
+    ] {
+        let mut outbox = Outbox::default();
+        let (a, wa) = make(&mut outbox, "stale", 1, 1);
+        let (b, wb) = send(&mut outbox, "public behind it", 2);
+        sign_all(&mut outbox, a, &wa);
+        sign_all(&mut outbox, b, &wb);
+        let (ready, resign) = outbox.take_committable(&room(), current);
+        assert!(resign.is_empty());
+        assert_eq!(texts(&ready), ["public behind it"]);
+    }
+}
+
+/// A body sealed under a newer version than this device holds is never sealed
+/// down to the older secret.
+#[test]
+fn a_reseal_never_moves_to_an_older_secret() {
+    let mut outbox = Outbox::default();
+    let (a, wa) = sealed_entry(&mut outbox, "sealed at v3", 1, 3);
+    sign_all(&mut outbox, a, &wa);
+    let (ready, resign) = outbox.take_committable(&room(), Some(([2u8; 32], 2)));
+    assert!(ready.is_empty() && resign.is_empty());
+    assert!(outbox.pending_rows(&room(), &author().verifying_key())[0]
+        .failed
+        .is_some());
+}
+
+/// The everyday path: public messages, and messages sealed under the current
+/// secret (v0 included), commit with no resealing.
+#[test]
+fn current_and_public_messages_commit_without_resealing() {
+    let mut outbox = Outbox::default();
+    let (a, wa) = send(&mut outbox, "public", 1);
+    let (b, wb) = sealed_entry(&mut outbox, "sealed at v0", 2, 0);
+    sign_all(&mut outbox, a, &wa);
+    sign_all(&mut outbox, b, &wb);
+    let (ready, resign) = outbox.take_committable(&room(), Some(([0u8; 32], 0)));
+    assert!(resign.is_empty());
+    assert_eq!(texts(&ready), ["public", "sealed at v0"]);
+
+    let mut outbox = Outbox::default();
+    let (a, wa) = send(&mut outbox, "public room", 1);
+    sign_all(&mut outbox, a, &wa);
+    let (ready, resign) = outbox.take_committable(&room(), None);
+    assert!(resign.is_empty());
+    assert_eq!(
+        texts(&ready),
+        ["public room"],
+        "a public room has no secret"
+    );
+}
+
+/// Both halves of a reaction swap are sealed again, and both must be signed
+/// again before it commits.
+#[test]
+fn every_message_of_an_entry_is_sealed_again() {
+    use super::super::seal::SealInput;
+    use river_core::room_state::content::ActionContentV1;
+    let mut outbox = Outbox::default();
+    let target = river_core::room_state::message::MessageId(freenet_scaffold::util::FastHash(1));
+    let half = |action: ActionContentV1, ms: u64| {
+        let seal = SealInput::Action(action);
+        let (mut message, _) = message("half", ms);
+        message.content = seal.seal(&[1u8; 32], 1);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+        (message, bytes, Some(seal))
+    };
+    let (id, work) = outbox.enqueue_sealed(
+        room(),
+        PendingKind::Action {
+            label: "reaction",
+            effects: vec![],
+        },
+        author().verifying_key(),
+        vec![
+            half(
+                ActionContentV1::remove_reaction(target.clone(), "a".into()),
+                1,
+            ),
+            half(ActionContentV1::reaction(target, "b".into()), 1),
+        ],
+    );
+    sign_all(&mut outbox, id, &work);
+    let (_, resign) = outbox.take_committable(&room(), Some(([2u8; 32], 2)));
+    let (_, _, work) = resign.into_iter().next().unwrap();
+    assert_eq!(work.len(), 2, "both halves are signed again");
+    outbox.record_signature(&room(), id, 0, author().sign(&work[0].1));
+    assert!(!outbox.has_ready(&room()), "one half signed is not enough");
+    outbox.record_signature(&room(), id, 1, author().sign(&work[1].1));
+    let (ready, _) = outbox.take_committable(&room(), Some(([2u8; 32], 2)));
+    for m in &ready[0].messages {
+        assert!(matches!(
+            m.message.content,
+            RoomMessageBody::Private {
+                secret_version: 2,
+                ..
+            }
+        ));
+    }
+}
+
+/// Retry resets the reseal count, so a retried message gets the full bound.
+#[test]
+fn retry_resets_the_reseal_count() {
+    let mut outbox = Outbox::default();
+    let (a, _) = sealed_entry(&mut outbox, "retried", 1, 1);
+    for v in 0..MAX_RESEALS {
+        outbox.reseal(&room(), a, &[9u8; 32], 2 + v).unwrap();
+    }
+    assert!(outbox.reseal(&room(), a, &[9u8; 32], 9).is_none());
+    outbox
+        .retry(&room(), a, later(), Some(([9u8; 32], 9)))
+        .unwrap();
+    for v in 0..MAX_RESEALS {
+        assert!(outbox.reseal(&room(), a, &[9u8; 32], 10 + v).is_some());
+    }
+}

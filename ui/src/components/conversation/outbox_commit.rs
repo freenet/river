@@ -200,15 +200,17 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
         return;
     }
     // An entry sealed under a secret the room has since rotated away from (a
-    // join, prune or ban while it was signing) stops the take: it is sealed
-    // again under the current secret and re-signed below, keeping its
-    // timestamp, and what follows it waits, so typed order holds.
+    // join, prune or ban while it was signing) is sealed again under the
+    // current secret and signed again, keeping its timestamp and its place;
+    // one that cannot be is failed and passed over (`take_committable`).
     let (fallback_key, secret) = room_signing_context(&room);
-    let (ready, stale) = OUTBOX
-        .with_mut(|o| o.take_ready_sealed_under(&room, Some(secret.map(|(_, version)| version))));
-    if let Some(id) = stale {
-        reseal_now(room, id, secret, fallback_key);
+    let (ready, resign) = OUTBOX.with_mut(|o| o.take_committable(&room, secret));
+    for (id, author_vk, work) in resign {
+        info!("Message {id}: the room's secret rotated while signing; sealed again");
+        start_signing(room, id, author_vk, work, fallback_key.clone());
     }
+    // A failed action (one that could not be sealed again) has no row.
+    report_failed_actions_now(room);
     if ready.is_empty() {
         return;
     }
@@ -243,37 +245,6 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
     }
 }
 
-/// Seal entry `id` again under the room's current secret and sign it again;
-/// after `MAX_RESEALS`, or with no current secret on this device, it fails
-/// (a send shows as a failed row whose Retry seals it again).
-fn reseal_now(
-    room: VerifyingKey,
-    id: u64,
-    secret: Option<([u8; 32], u32)>,
-    fallback_key: Option<SigningKey>,
-) {
-    let resealed = match secret {
-        Some((secret, version)) => {
-            info!("Message {id}: the room's secret rotated while signing; sealing again under v{version}");
-            OUTBOX.with_mut(|o| o.reseal(&room, id, &secret, version))
-        }
-        None => {
-            OUTBOX.with_mut(|o| {
-                o.record_failure(
-                    &room,
-                    id,
-                    "the room's key is not available on this device yet".to_string(),
-                )
-            });
-            None
-        }
-    };
-    match resealed {
-        Some((author_vk, work)) => start_signing(room, id, author_vk, work, fallback_key),
-        None => report_failed_actions_now(room),
-    }
-}
-
 /// A failed edit, delete or reaction has no row to show it on: say so once and
 /// drop it.
 fn report_failed_actions_now(room: VerifyingKey) {
@@ -295,15 +266,13 @@ fn action_failed_toast(label: &'static str) {
 /// Apply one entry's signed messages to the room, with a rejoin if this member
 /// was pruned for inactivity.
 fn apply_entry(room_data: &mut RoomData, entry: &PendingEntry) -> Result<(), String> {
-    // Sealed under a secret the room has since rotated away from (a ban
-    // rotates it while this was signing, or before a Retry): publishing it
-    // would reach the member the rotation excluded. The room itself admits
-    // any version it has a record of, so the sender is the only check.
+    // Backstop: sealed under a secret the room has since rotated away from.
+    // `commit_ready_now` seals such an entry again before it gets here
+    // (`Outbox::take_committable`); publishing it as it is would reach a
+    // member the rotation excluded, and the room itself admits any version
+    // it has a record of, so the sender is the only check.
     if entry.is_stale_sealed(room_data.get_secret().map(|(_, version)| version)) {
-        return Err(
-            "the room's key changed since this was written; copy the text and send it again"
-                .to_string(),
-        );
+        return Err("the room's key changed while this was sending; Retry to send it".to_string());
     }
     // Written as an identity this room no longer uses (an identity import
     // replaced it while this was signing): never publish it under the old one.
@@ -647,10 +616,7 @@ mod tests {
                 "OUTBOX.peek().has_other_identities(&room,&current)",
                 "o.drop_other_identities(&room,&current)",
             ),
-            (
-                "OUTBOX.peek().has_ready(&room)",
-                "o.take_ready_sealed_under(",
-            ),
+            ("OUTBOX.peek().has_ready(&room)", "o.take_committable("),
             (
                 "OUTBOX.peek().has_failed_actions(&room)",
                 "o.take_failed_actions(&room)",
@@ -805,18 +771,14 @@ mod tests {
         );
         outbox.record_signature(&room, id, 0, owner_sk().sign(&work[0].1));
 
-        let (secret, version) = room_data
-            .get_secret()
-            .map(|(s, v)| (*s, v))
-            .expect("the room's current secret");
-        let (ready, stale) = outbox.take_ready_sealed_under(&room, Some(Some(version)));
-        assert!(ready.is_empty());
-        let (_, work) = outbox
-            .reseal(&room, stale.expect("stale"), &secret, version)
-            .expect("sealed again");
+        let current = room_data.get_secret().map(|(s, v)| (*s, v));
+        let (ready, resign) = outbox.take_committable(&room, current);
+        assert!(ready.is_empty(), "not committed under the old secret");
+        let (resealed, _, work) = resign.into_iter().next().expect("sealed again");
+        assert_eq!(resealed, id);
         outbox.record_signature(&room, id, 0, owner_sk().sign(&work[0].1));
-        let (ready, stale) = outbox.take_ready_sealed_under(&room, Some(Some(version)));
-        assert_eq!(stale, None);
+        let (ready, resign) = outbox.take_committable(&room, current);
+        assert!(resign.is_empty());
         apply_entry(&mut room_data, &ready[0]).expect("committed under the current secret");
         let held = room_data
             .room_state
@@ -861,9 +823,13 @@ mod tests {
             .find("pub(crate)fncommit_ready_now(")
             .expect("commit_ready_now exists");
         let body = &squashed[start..];
-        let body = &body[..body.find("fnreseal_now(").expect("next fn")];
+        let body = &body[..body.find("fnreport_failed_actions_now(").expect("next fn")];
+        // Resealing is wired: the take is given the room's current secret, and
+        // what it seals again is signed again.
+        assert!(body.contains("o.take_committable(&room,secret)"));
+        assert!(body.contains("inresign{") && body.contains("start_signing("));
         let take = body
-            .find("o.take_ready_sealed_under(")
+            .find("o.take_committable(")
             .expect("takes from the outbox");
         let write = body.find("ROOMS.with_mut(").expect("writes ROOMS");
         assert!(take < write);

@@ -17,6 +17,14 @@
 //! them). Leaving the room drops what is waiting in it
 //! (`outbox_commit::clear_room_now`).
 //!
+//! A private room's secret rotates (on a ban, a join or a prune). A message
+//! sealed under the previous secret whose signature arrives after a rotation
+//! is not published as it is, which would reach a member the rotation
+//! excluded: it is sealed again under the current secret from what the user
+//! wrote (`seal.rs`) and signed again, keeping its timestamp and its place,
+//! and what follows it waits for it (`take_committable`). At most
+//! `MAX_RESEALS` times; then it fails, and Retry seals it again.
+//!
 //! The outbox is memory only: a reload while a message is still being signed
 //! loses it.
 //!
@@ -124,16 +132,28 @@ impl PendingEntry {
     }
 
     /// Whether any message is sealed under a room secret version other than
-    /// `current` (the version the room would seal with now). Resending such a
-    /// message after a rotation (a ban rotates the secret) would reach the
-    /// member the rotation was meant to exclude, so it is never committed.
-    /// With no current secret, any sealed message counts as stale.
+    /// `current` (the version the room would seal with now). Publishing such
+    /// a message after a rotation (a ban, a join or a prune rotates the
+    /// secret) would reach a member the rotation excluded, so it is sealed
+    /// again first (`take_committable`), and `apply_entry` refuses it as a
+    /// backstop. With no current secret, any sealed message counts as stale.
     pub fn is_stale_sealed(&self, current: Option<u32>) -> bool {
         self.messages.iter().any(|m| match &m.message.content {
             river_core::room_state::message::RoomMessageBody::Private {
                 secret_version, ..
             } => Some(*secret_version) != current,
             _ => false,
+        })
+    }
+
+    /// Whether every sealed body is sealed at `version` or below (so sealing
+    /// again under `version` moves forward, never back).
+    pub fn sealed_at_or_below(&self, version: u32) -> bool {
+        self.messages.iter().all(|m| match &m.message.content {
+            river_core::room_state::message::RoomMessageBody::Private {
+                secret_version, ..
+            } => *secret_version <= version,
+            _ => true,
         })
     }
 
@@ -305,8 +325,9 @@ impl Outbox {
         }
     }
 
-    /// Whether `take_ready` would return anything (so a caller can skip the
-    /// signal write, and the renders it causes, when it would not).
+    /// Whether the head of the queue is fully signed, so `take_committable`
+    /// has something to commit or to seal again (and a caller can otherwise
+    /// skip the signal write, and the renders it causes).
     pub fn has_ready(&self, room: &VerifyingKey) -> bool {
         self.rooms.get(room).is_some_and(|queue| {
             queue
@@ -347,7 +368,6 @@ impl Outbox {
     }
 
     /// The entry `id` in `room`, if it is still there.
-    #[cfg(test)]
     pub fn entry(&self, room: &VerifyingKey, id: u64) -> Option<&PendingEntry> {
         self.rooms.get(room)?.iter().find(|e| e.id == id)
     }
@@ -424,6 +444,69 @@ impl Outbox {
         Some((entry.author_vk, entry.work()))
     }
 
+    /// One commit step for `room`, given the room's current secret: the
+    /// entries ready to commit, in order, and the entries sealed again under
+    /// the current secret that must now be signed again (author key, work).
+    ///
+    /// The take stops at a ready entry sealed under an older version (the
+    /// room's secret rotated while it was being signed), seals it again and
+    /// re-signs it, and what follows it waits, so typed order holds. If that
+    /// entry cannot be sealed again (`MAX_RESEALS` reached, no current secret
+    /// on this device, sealed under a NEWER version than this device holds,
+    /// nothing to seal it from), it is failed and the take carries on past
+    /// it, as it does past any failed entry: a failure never strands the
+    /// entries behind it.
+    pub fn take_committable(
+        &mut self,
+        room: &VerifyingKey,
+        current: Option<([u8; 32], u32)>,
+    ) -> (Vec<PendingEntry>, Vec<(u64, VerifyingKey, SigningWork)>) {
+        let current_version = current.map(|(_, version)| version);
+        let mut ready = Vec::new();
+        let mut resign = Vec::new();
+        loop {
+            let (taken, stale) = self.take_ready_sealed_under(room, Some(current_version));
+            ready.extend(taken);
+            let Some(id) = stale else {
+                break;
+            };
+            let resealed = match (current, self.entry(room, id)) {
+                // Only ever forward: a body sealed under a newer version than
+                // this device holds is not sealed down to an older secret.
+                (Some((secret, version)), Some(entry)) if entry.sealed_at_or_below(version) => {
+                    self.reseal(room, id, &secret, version)
+                }
+                (None, _) => {
+                    self.record_failure(
+                        room,
+                        id,
+                        "the room's key is not available on this device yet; Retry to send it"
+                            .to_string(),
+                    );
+                    None
+                }
+                _ => {
+                    self.record_failure(
+                        room,
+                        id,
+                        "this device's copy of the room's key is older than the message's; Retry to send it"
+                            .to_string(),
+                    );
+                    None
+                }
+            };
+            match resealed {
+                Some((author_vk, work)) => {
+                    resign.push((id, author_vk, work));
+                    break;
+                }
+                // Failed now: the next take passes over it.
+                None => continue,
+            }
+        }
+        (ready, resign)
+    }
+
     /// Put back an entry that was taken but did not commit, failed, in its
     /// original place.
     pub fn restore_failed(&mut self, room: VerifyingKey, mut entry: PendingEntry, reason: String) {
@@ -436,7 +519,10 @@ impl Outbox {
         queue.insert(at, entry);
     }
 
-    /// Start a failed entry signing again, restamped `now`: a retry is a new
+    /// Start a failed entry signing again, restamped `now` and, if `current`
+    /// (the room's current secret) is newer than what it was sealed under,
+    /// sealed again under it, so Retry can succeed whatever happened to the
+    /// key. Resets the reseal count. A retry is a new
     /// send. (Keeping the original stamp would let a room at its message cap
     /// prune the retried message the moment it lands, so Retry could never
     /// succeed.) Returns the author's key and the work, or `None` if the entry
