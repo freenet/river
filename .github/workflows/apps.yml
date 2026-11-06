@@ -1,0 +1,82 @@
+name: Native apps
+
+# River's native apps (apps/) are a separate Cargo workspace with their own
+# lockfile and toolchain pin, so build.yml never compiles them. This workflow
+# does: format, clippy, unit tests, and a headless render of every setup screen.
+#
+# GitHub-hosted ubuntu-latest, which is free on this public repo (see the
+# runs-on comment in build.yml for why larger runners are not used).
+
+on:
+  pull_request:
+    paths:
+      - 'apps/**'
+      - '.github/workflows/apps.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - '.github/workflows/apps.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rune links libxkbcommon and libwayland-client at build time; the
+      # software Vulkan driver lets the headless renderer run with no GPU.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev mesa-vulkan-drivers
+
+      # apps/rust-toolchain.toml pins the compiler; this installs it.
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      # Render every named setup screen. A screen that fails to lay out or
+      # draw fails here, and the PNGs are kept for review.
+      - name: Render setup screens
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: |
+          cargo build --locked -p river-desktop
+          mkdir -p snapshots
+          scenes=$(./target/debug/river --list-scenes)
+          test -n "$scenes"
+          for scene in $scenes; do
+            ./target/debug/river --snap "snapshots/$scene.png" --scene "$scene" --scale 2
+            test -s "snapshots/$scene.png"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: setup-screens
+          path: apps/snapshots/
+          if-no-files-found: ignore
