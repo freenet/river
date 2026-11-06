@@ -42,8 +42,8 @@ pub struct ReplyTo {
 pub struct Message {
     pub id: MessageId,
     pub author: MemberId,
-    /// Minutes since the start of the example's first day. Example data needs no calendar:
-    /// the view only shows a day heading and a time of day.
+    /// Minutes since the start of day 0 of message time. The chat knows which calendar date
+    /// day 0 is (`Chat::day_zero`), which the day headings use.
     pub time: u32,
     pub text: String,
     pub reply_to: Option<ReplyTo>,
@@ -224,7 +224,10 @@ pub fn preview(text: &str, max_chars: usize) -> String {
         return flat;
     }
     let cut: String = flat.chars().take(max_chars).collect();
+    // A cut that lands just before a space already ends on a whole word.
+    let at_word_end = flat.chars().nth(max_chars).is_some_and(char::is_whitespace);
     let cut = match cut.rfind(' ') {
+        _ if at_word_end => cut.as_str(),
         Some(i) if i > 0 => &cut[..i],
         _ => cut.as_str(),
     };
@@ -353,6 +356,9 @@ mod tests {
         );
         assert_eq!(preview("short", 5), "short");
         assert_eq!(preview("abcdefghij", 4), "abcd…");
+        // The cut falls just before a space, so the last word is whole and stays.
+        assert_eq!(preview("one two three", 7), "one two…");
+        assert_eq!(preview("one two three", 6), "one…");
     }
 
     #[test]

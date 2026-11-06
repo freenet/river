@@ -120,24 +120,34 @@ fn typing_and_pressing_return_sends_and_clears_the_composer() {
 #[test]
 fn a_draft_stays_in_the_room_it_was_typed_in() {
     let mut rt = render(connected(), WINDOW_SIZE);
-    let counts = |rt: &Runtime<RiverApp>| {
+    let texts_in = |rt: &Runtime<RiverApp>, key: &str| {
         rt.state
             .chat
-            .rooms
+            .rooms()
             .iter()
-            .map(|r| r.messages.len())
+            .find(|r| r.key == key)
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
             .collect::<Vec<_>>()
     };
-    let before = counts(&rt);
+    let town_before = texts_in(&rt, "town-square");
     press(&mut rt, "composer-field");
     key(&mut rt, Key::Text("for Town Square only".into()));
     press(&mut rt, &format!("room-{PRIVATE_ROOM}"));
     assert_eq!(rt.state.chat.composer.text, "");
     assert!(!shows(&rt, "for Town Square only"));
-    // Return in the other room sends nothing anywhere.
+    // Type and send in the other room: only its own text goes, and only to it. A leaked
+    // draft would arrive here as "for Town Square onlyfor Design Crew", or in Town Square.
     press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("for Design Crew".into()));
     key(&mut rt, Key::Enter);
-    assert_eq!(counts(&rt), before);
+    assert_eq!(
+        texts_in(&rt, PRIVATE_ROOM).last().map(String::as_str),
+        Some("for Design Crew")
+    );
+    assert_eq!(texts_in(&rt, "town-square"), town_before);
     press(&mut rt, "room-town-square");
     assert_eq!(rt.state.chat.composer.text, "for Town Square only");
     assert!(shows(&rt, "for Town Square only"));
@@ -173,12 +183,13 @@ fn controls_that_do_nothing_yet_say_so() {
 fn each_room_opens_at_its_newest_message() {
     // Two long rooms: Town Square and a copy of it.
     let mut state = connected();
-    let mut copy = state.chat.rooms[0].clone();
+    let mut copy = state.chat.rooms()[0].clone();
     copy.key = "town-square-copy".into();
     copy.name = "Town Square copy".into();
-    state.chat.rooms.push(copy);
-    let first = format!("msg-{}", state.chat.rooms[0].messages[0].id);
-    let last = format!("msg-{}", state.chat.rooms[0].last_message().unwrap().id);
+    state.chat.edit_rooms(|rooms| rooms.push(copy));
+    let town = &state.chat.rooms()[0];
+    let first = format!("msg-{}", town.messages[0].id);
+    let last = format!("msg-{}", town.last_message().unwrap().id);
     let mut rt = render(state, WINDOW_SIZE);
     assert!(visible(&rt, &last) && !visible(&rt, &first));
     // Scroll Town Square to its top.
@@ -242,6 +253,22 @@ fn a_narrow_window_opens_members_over_the_conversation() {
     press(&mut rt, "toggle-members");
     press(&mut rt, "members-scrim");
     assert!(!rt.state.chat.members_overlay);
+    // Tab stays inside it, and Escape closes it.
+    press(&mut rt, "toggle-members");
+    assert!(rt.state.chat.members_overlay);
+    for _ in 0..8 {
+        key(&mut rt, Key::Tab);
+        for e in rt.elements().into_iter().filter(|e| e.focused) {
+            assert!(e.path.contains("members-overlay"), "Tab reached {}", e.path);
+        }
+    }
+    key(&mut rt, Key::Escape);
+    assert!(!rt.state.chat.members_overlay);
+    // The room list is behind it too: a press there closes the panel and opens nothing.
+    press(&mut rt, "toggle-members");
+    press(&mut rt, &format!("room-{PRIVATE_ROOM}"));
+    assert!(!rt.state.chat.members_overlay);
+    assert_eq!(rt.state.chat.room().unwrap().key, "town-square");
 }
 
 #[test]
@@ -282,4 +309,44 @@ fn narrow_scenes_are_named_narrow() {
         narrow += usize::from(is_narrow);
     }
     assert!(narrow > 0, "no scene shows the narrow layout");
+}
+
+#[test]
+fn the_town_square_history_renders_its_parts() {
+    let rt = render(connected(), WINDOW_SIZE);
+    assert!(shows(&rt, "Yesterday"));
+    assert!(shows(&rt, "Today"));
+    // The release notes message's address is a link (`find` also finds link boxes).
+    assert!(rt.find("https://freenet.org/news").is_some());
+    assert!(rt.find("reply").is_some());
+    assert!(rt.find("reaction-🎉").is_some());
+    assert!(rt.find("tag-owner").is_some());
+}
+
+#[test]
+fn removing_the_open_room_shows_another_not_an_empty_screen() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.state
+        .chat
+        .edit_rooms(|rooms| rooms.retain(|r| r.key != "town-square"));
+    // State changed outside a handler, so ask for the view to run again.
+    rt.invalidate();
+    rt.frame(0.5);
+    rt.frame(0.6);
+    assert!(rt.find("no-rooms").is_none());
+    assert!(rt.find("room-header").is_some());
+    let open = rt.state.chat.room().expect("a room is open").key.clone();
+    assert_eq!(open, PRIVATE_ROOM);
+    assert_eq!(rt.state.chat.room().unwrap().unread, 0);
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("still here".into()));
+    key(&mut rt, Key::Enter);
+    let last = rt.state.chat.room().unwrap().last_message().unwrap();
+    assert_eq!(last.text, "still here");
+    // With no rooms at all, the empty screen shows.
+    rt.state.chat.set_rooms(Vec::new());
+    rt.invalidate();
+    rt.frame(0.7);
+    rt.frame(0.8);
+    assert!(rt.find("no-rooms").is_some());
 }

@@ -30,9 +30,11 @@ pub enum Source {
 
 pub struct Chat {
     pub source: Source,
-    pub rooms: Vec<Room>,
-    /// The key of the open room. Rooms are looked up by key, so adding or removing a room never
-    /// opens a different one.
+    /// The rooms, in the room list's order. Private so every change goes through
+    /// [`Chat::set_rooms`], which keeps a room open whenever there is one.
+    rooms: Vec<Room>,
+    /// The key of the open room. Rooms are looked up by key, so adding or removing other rooms
+    /// never opens a different one.
     selected: String,
     /// What is typed in the open room's composer.
     pub composer: TextEdit,
@@ -49,31 +51,68 @@ pub struct Chat {
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
     pub day_zero: i64,
     /// The time a message sent now is stamped with, in message time's minutes.
+    // TODO: a fixed time for example data; it goes once the app reads real rooms and stamps
+    // messages with the clock.
     pub now: u32,
 }
 
 impl Chat {
-    pub fn example() -> Self {
-        let data = example::data();
-        Chat {
-            source: Source::Example,
-            selected: data
-                .rooms
-                .first()
-                .map(|r| r.key.clone())
-                .unwrap_or_default(),
-            rooms: data.rooms,
+    /// A chat screen showing `rooms`, with the first one open.
+    pub fn new(source: Source, rooms: Vec<Room>, today: u32, day_zero: i64, now: u32) -> Self {
+        let mut chat = Chat {
+            source,
+            rooms: Vec::new(),
+            selected: String::new(),
             composer: TextEdit::new(""),
             drafts: HashMap::new(),
             members_open: true,
             members_overlay: false,
-            today: data.today,
-            day_zero: data.day_zero,
-            now: data.now,
-        }
+            today,
+            day_zero,
+            now,
+        };
+        chat.set_rooms(rooms);
+        chat
     }
 
-    /// The open room, if its key still names one.
+    pub fn example() -> Self {
+        let data = example::data();
+        Chat::new(
+            Source::Example,
+            data.rooms,
+            data.today,
+            data.day_zero,
+            data.now,
+        )
+    }
+
+    pub fn rooms(&self) -> &[Room] {
+        &self.rooms
+    }
+
+    /// Replace the rooms. The open room stays open if it is still there; otherwise the first
+    /// room opens (through [`Chat::select`], so it is marked read and its draft comes back).
+    /// Drafts of rooms that are gone are dropped.
+    pub fn set_rooms(&mut self, rooms: Vec<Room>) {
+        self.rooms = rooms;
+        if self.room().is_none()
+            && let Some(first) = self.rooms.first().map(|r| r.key.clone())
+        {
+            self.select(&first);
+        }
+        let rooms = &self.rooms;
+        self.drafts
+            .retain(|key, _| rooms.iter().any(|r| &r.key == key));
+    }
+
+    /// Change the rooms in place, then settle the open room as [`Chat::set_rooms`] does.
+    pub fn edit_rooms(&mut self, f: impl FnOnce(&mut Vec<Room>)) {
+        let mut rooms = std::mem::take(&mut self.rooms);
+        f(&mut rooms);
+        self.set_rooms(rooms);
+    }
+
+    /// The open room. `None` only when there are no rooms.
     pub fn room(&self) -> Option<&Room> {
         self.rooms.iter().find(|r| r.key == self.selected)
     }
@@ -92,6 +131,11 @@ impl Chat {
         if key == self.selected {
             return;
         }
+        if self.selected.is_empty() {
+            // Nothing was open, so what the composer holds belongs to no room yet: keep it.
+            self.selected = key.to_owned();
+            return;
+        }
         let incoming = self.drafts.remove(key).unwrap_or_else(|| TextEdit::new(""));
         let mut outgoing = std::mem::replace(&mut self.composer, incoming);
         outgoing.focused = false;
@@ -100,7 +144,6 @@ impl Chat {
         }
         self.selected = key.to_owned();
     }
-
     /// Send what the composer holds to the open room. Blank text sends nothing; otherwise the
     /// composer clears (keeping focus, so the next message can be typed straight away).
     pub fn send(&mut self) -> bool {
@@ -141,31 +184,74 @@ impl Chat {
 mod state_tests {
     use super::*;
 
+    fn counts(c: &Chat) -> Vec<usize> {
+        c.rooms().iter().map(|r| r.messages.len()).collect()
+    }
+
     #[test]
     fn selecting_marks_the_room_read() {
         let mut chat = Chat::example();
         let i = chat
-            .rooms
+            .rooms()
             .iter()
             .position(|r| r.unread > 0)
             .expect("the example has an unread room");
-        let key = chat.rooms[i].key.clone();
+        let key = chat.rooms()[i].key.clone();
         chat.select(&key);
         assert_eq!(chat.room().unwrap().key, key);
-        assert_eq!(chat.rooms[i].unread, 0);
+        assert_eq!(chat.rooms()[i].unread, 0);
         chat.select("no-such-room");
         assert_eq!(chat.room().unwrap().key, key);
+    }
+
+    #[test]
+    fn the_first_room_opens_read() {
+        let mut data = example::data();
+        data.rooms[0].unread = 3;
+        let first = data.rooms[0].key.clone();
+        let chat = Chat::new(Source::Example, data.rooms, 0, 0, 0);
+        assert_eq!(chat.room().unwrap().key, first);
+        assert_eq!(chat.room().unwrap().unread, 0);
     }
 
     #[test]
     fn the_open_room_is_kept_by_key_when_rooms_move() {
         let mut chat = Chat::example();
         chat.select(example::PRIVATE_ROOM);
-        chat.rooms.reverse();
+        chat.edit_rooms(|rooms| rooms.reverse());
         assert_eq!(chat.room().unwrap().key, example::PRIVATE_ROOM);
-        chat.rooms.retain(|r| r.key != example::PRIVATE_ROOM);
+    }
+
+    #[test]
+    fn removing_the_open_room_opens_the_first_one() {
+        let mut chat = Chat::example();
+        chat.select(example::PRIVATE_ROOM);
+        chat.composer.replace_text("typed in the room that goes");
+        chat.edit_rooms(|rooms| {
+            rooms.retain(|r| r.key != example::PRIVATE_ROOM);
+            rooms.rotate_left(1);
+            rooms[0].unread = 2;
+        });
+        let first = chat.rooms()[0].key.clone();
+        assert_eq!(chat.room().unwrap().key, first);
+        assert_eq!(chat.room().unwrap().unread, 0);
+        // The gone room's draft does not follow into the room that opened.
+        assert_eq!(chat.composer.text, "");
+        chat.composer.replace_text("hello");
+        assert!(chat.send());
+        assert_eq!(chat.room().unwrap().last_message().unwrap().text, "hello");
+    }
+
+    #[test]
+    fn with_no_rooms_nothing_is_open_until_rooms_arrive() {
+        let mut chat = Chat::new(Source::Example, Vec::new(), 0, 0, 0);
         assert!(chat.room().is_none());
+        // Text in the composer, so only the missing room can stop the send.
+        chat.composer.replace_text("into the void");
         assert!(!chat.send());
+        chat.set_rooms(example::data().rooms);
+        assert!(chat.room().is_some());
+        assert!(chat.send());
     }
 
     #[test]
@@ -173,22 +259,27 @@ mod state_tests {
         let mut chat = Chat::example();
         let a = chat.room().unwrap().key.clone();
         let b = example::PRIVATE_ROOM;
-        let counts = |c: &Chat| c.rooms.iter().map(|r| r.messages.len()).collect::<Vec<_>>();
-        let before = counts(&chat);
-        chat.composer.replace_text("half a thought");
+        chat.composer.replace_text("for A");
         chat.select(b);
         assert_eq!(chat.composer.text, "");
-        // Return in B with an empty composer sends nothing, to B or to A.
-        assert!(!chat.send());
-        assert_eq!(counts(&chat), before);
+        // B's own text goes to B, and A's draft goes nowhere.
+        chat.composer.replace_text("for B");
+        let before = counts(&chat);
+        assert!(chat.send());
+        let after = counts(&chat);
+        let bi = chat.rooms().iter().position(|r| r.key == b).unwrap();
+        for (i, (x, y)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(*y, x + usize::from(i == bi));
+        }
+        assert_eq!(chat.room().unwrap().last_message().unwrap().text, "for B");
         chat.select(&a);
-        assert_eq!(chat.composer.text, "half a thought");
+        assert_eq!(chat.composer.text, "for A");
         assert!(!chat.composer.focused);
     }
 
     #[test]
     fn example_unread_counts_are_possible() {
-        for room in &Chat::example().rooms {
+        for room in Chat::example().rooms() {
             assert!(room.unread <= room.from_others(), "{}", room.key);
         }
     }

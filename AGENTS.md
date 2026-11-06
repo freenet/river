@@ -241,6 +241,12 @@ cargo run -p river-desktop -- --snap out.png --scene not-installed   # headless 
 cargo run -p river-desktop -- --snap out.png --scene chat-narrow --size 820x720
 ```
 
+The window opens at 1280x800 and can shrink to 640x480. Every screen, setup
+included, uses one dark palette (`apps/river-app/src/chat/style.rs`); there is
+no light theme yet. A scene cannot set the window size, so the `*narrow*`
+scenes need `--size 820x720` to render as CI renders them (`scene_size` in
+`apps/river-app/src/lib.rs`, checked against `apps.yml` by a test).
+
 Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders
 without a GPU need a software Vulkan driver (`mesa-vulkan-drivers`, then point
 `VK_ICD_FILENAMES` at its `lvp_icd*.json`).

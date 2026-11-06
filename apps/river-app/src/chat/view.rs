@@ -45,19 +45,21 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     if chat.members_shown(narrow) {
         let panel = members(room, narrow, &p);
         if narrow {
-            // Dim the conversation under the panel; pressing it closes the panel.
+            // Dim everything under the panel, the room list too: while it is open the panel
+            // is modal, and a press anywhere outside it only closes it.
             screen = screen.child(
                 el().key("members-scrim")
                     .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                    .fill(p.scrim)
-                    .on_press(|s: &mut RiverApp| s.chat.toggle_members(true)),
+                    .fill(p.scrim),
             );
         }
         screen = screen.child(if narrow {
-            // Over the conversation, against the window's right edge.
+            // Over the conversation, against the window's right edge. Modal: Tab stays inside
+            // it, and Escape or a press outside closes it.
             panel
                 .key("members-overlay")
                 .pin(None, Some(0.0), Some(0.0), Some(0.0))
+                .modal(true, |s: &mut RiverApp| s.chat.members_overlay = false)
         } else {
             panel
         });
@@ -142,7 +144,7 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette) -> El {
         )));
     let width = if narrow { ROOMS_NARROW_W } else { ROOMS_W };
     let mut list = col().key("room-list").gap(2.0).px(10.0).pb(10.0);
-    for room in &chat.rooms {
+    for room in chat.rooms() {
         let selected = chat.room().is_some_and(|r| r.key == room.key);
         list = list.child(room_row(room, selected, width, p));
     }

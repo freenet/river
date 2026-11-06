@@ -36,8 +36,9 @@ struct Logo {
 /// this app too, which is why `apps.yml` runs for that file.
 const LOGO_SVG: &[u8] = include_bytes!("../../../ui/assets/river_logo.svg");
 const LOGO_PATH: &str = "ui/assets/river_logo.svg";
-/// The logo's largest drawn size in points (the setup card's), and the scale it rasterizes at.
-const LOGO_PT: f32 = 48.0;
+/// The logo's largest drawn size in points (the setup card draws it at this size, the room
+/// list smaller), and the scale it rasterizes at. Smaller draws use its mips.
+const LOGO_PT: f32 = 36.0;
 const LOGO_SCALE: f32 = 2.0;
 
 /// `AppSpec::setup`: start rasterizing the logo on the image cache's worker. A headless run
@@ -62,6 +63,7 @@ impl RiverApp {
     pub fn detached() -> Self {
         RiverApp {
             setup: Setup::Checking,
+            // TODO: example rooms; this goes once the app reads real rooms from the node.
             chat: Chat::example(),
             ctl: None,
             logo: None,
@@ -73,6 +75,7 @@ impl RiverApp {
         ctl.check();
         RiverApp {
             setup: Setup::Checking,
+            // TODO: example rooms; this goes once the app reads real rooms from the node.
             chat: Chat::example(),
             ctl: Some(ctl),
             logo: None,
@@ -318,8 +321,8 @@ type Progress = Option<(f32, Option<String>)>;
 fn panel(t: Look, title: &str, body: &str, progress: Progress, actions: Vec<El>) -> El {
     let (p, logo) = t;
     let mark = match logo {
-        Some(px) => el().size(36.0, 36.0).pixels(px),
-        None => el().size(36.0, 36.0),
+        Some(px) => el().size(LOGO_PT, LOGO_PT).pixels(px),
+        None => el().size(LOGO_PT, LOGO_PT),
     };
     let mut card = col()
         .key("panel")
@@ -597,7 +600,9 @@ mod tests {
     }
 
     /// The logo is a gradient SVG shared with the web UI; this fails if an edit there breaks
-    /// it for the native renderer.
+    /// it for the native renderer. It checks the raster's size only: Rune's image handle does
+    /// not expose decoded pixels, and checking coverage directly would mean depending on
+    /// resvg here. The CI render step shows the result.
     #[test]
     fn the_logo_rasterizes() {
         let cache = rune::image::ImageCache::new(std::sync::Arc::new(|| {}));
@@ -605,6 +610,24 @@ mod tests {
         let [w, h] = image.wait().expect("the logo rasterizes");
         let px = (LOGO_PT * LOGO_SCALE) as u32;
         assert!(w > px / 2 && h > px / 2 && w <= px && h <= px, "{w}x{h}");
+    }
+
+    /// CI renders the `*narrow*` scenes with a `--size` it spells out itself; it must be the
+    /// size [`scene_size`] and the tests use.
+    #[test]
+    fn ci_renders_narrow_scenes_at_the_narrow_size() {
+        const WORKFLOW: &str = include_str!("../../../.github/workflows/apps.yml");
+        let line = WORKFLOW
+            .lines()
+            .find(|l| l.contains("*narrow*)"))
+            .expect("apps.yml picks a size for the narrow scenes");
+        let size = line
+            .split("--size ")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_alphanumeric()).next())
+            .expect("a --size WxH");
+        let (w, h) = NARROW_SCENE_SIZE;
+        assert_eq!(size, format!("{w}x{h}"));
     }
 
     #[test]

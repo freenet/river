@@ -182,6 +182,7 @@ pub(super) fn avatar(member: Option<&Member>, id: u32, size: f32) -> El {
 /// An outlined small-caps tag after a name ("OWNER").
 fn tag(s: &str, p: &Palette) -> El {
     row()
+        .key(format!("tag-{}", s.to_lowercase()))
         .h(18.0)
         .px(5.0)
         .radius(4.0)
@@ -305,6 +306,7 @@ fn message_el(room: &Room, m: &Message, p: &Palette) -> El {
             let mine = r.by.contains(&room.me);
             pills = pills.child(
                 row()
+                    .key(format!("reaction-{}", r.emoji))
                     .h(26.0)
                     .px(8.0)
                     .gap(5.0)
