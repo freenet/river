@@ -800,4 +800,19 @@ fn retry_never_seals_down_and_leaves_a_current_seal_alone() {
             .is_none(),
         "cannot be sealed again"
     );
+
+    // With no current secret here, a sealed message's Retry waits for it
+    // rather than signing something that cannot commit.
+    let (waiting, _) = sealed_entry(&mut outbox, "no key here", 4, 1);
+    outbox.record_failure(&room(), waiting, "x".to_string());
+    assert!(outbox.retry(&room(), waiting, later(), None).is_none());
+    for row in outbox.pending_rows(&room(), &author().verifying_key()) {
+        if row.id != current {
+            assert!(
+                row.failed.is_some(),
+                "a row that cannot be retried stays failed"
+            );
+            assert_ne!(row.failed.as_deref(), Some("x"), "with its new reason");
+        }
+    }
 }

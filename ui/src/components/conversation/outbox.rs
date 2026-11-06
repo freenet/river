@@ -439,6 +439,10 @@ impl Outbox {
         version: u32,
     ) -> Option<(VerifyingKey, SigningWork)> {
         let entry = self.entry_mut(room, id)?;
+        debug_assert!(
+            entry.sealed_at_or_below(version),
+            "a reseal only ever moves forward (take_committable checks first)"
+        );
         if entry.reseals >= MAX_RESEALS {
             entry.fail("the room's key kept changing while this was sending");
             return None;
@@ -538,17 +542,21 @@ impl Outbox {
         // ever forward: a body sealed under a newer version than this device
         // holds is never sealed down to the older secret, which a member the
         // newer rotation excluded can read. That Retry waits for the key.
-        if let Some((_, version)) = current {
-            if entry.is_stale_sealed(Some(version)) && !entry.sealed_at_or_below(version) {
-                entry.state = PendingState::Failed(KEY_NOT_YET_HERE.to_string());
-                return None;
-            }
+        let waits_for_key = match current {
+            Some((_, version)) => !entry.sealed_at_or_below(version),
+            None => entry.is_stale_sealed(None),
+        };
+        if waits_for_key {
+            entry.state = PendingState::Failed(KEY_NOT_YET_HERE.to_string());
+            return None;
         }
         let resealing = current.filter(|(_, v)| entry.is_stale_sealed(Some(*v)));
         let reseal = resealing
             .as_ref()
             .map(|(secret, version)| (secret, *version));
         if !entry.seal_again(reseal, Some(now)) {
+            entry.state =
+                PendingState::Failed("this message could not be sealed again".to_string());
             return None;
         }
         entry.reseals = 0;

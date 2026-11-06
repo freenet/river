@@ -831,7 +831,8 @@ mod tests {
             .find("inresign{")
             .expect("re-signs what was sealed again");
         assert!(
-            body[resign_at..]
+            body[resign_at
+                ..resign_at + body[resign_at..].find("report_failed_actions_now").unwrap()]
                 .contains("start_signing(room,id,author_vk,work,fallback_key.clone())"),
             "what was sealed again is signed again, with the fallback key"
         );
