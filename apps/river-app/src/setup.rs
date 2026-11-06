@@ -152,6 +152,11 @@ impl Controller {
 
     /// Report a new state. A settled state ends the current work, so the controller is freed
     /// BEFORE it is reported: the buttons that state shows must work the moment they appear.
+    ///
+    /// That leaves a moment where the controller is free but the settled state hasn't reached
+    /// the window. A new job can't start in it from the window: the only buttons that start
+    /// work are the ones the settled state itself shows, and while it is in flight the window
+    /// still shows the previous, unsettled state, which has none.
     fn set(&self, setup: Setup) {
         if setup.is_settled() {
             self.busy.store(false, Ordering::Release);
@@ -164,12 +169,13 @@ fn outdated(running: Option<String>, minimum: String) -> Setup {
     Setup::Failed(match running {
         Some(v) => format!(
             "The Freenet running on this computer is version {v}, and River needs {minimum} \
-             or newer. Update it by running `freenet update`, then try again."
+             or newer. Update it (run `freenet update`, or install the latest from \
+             freenet.org), then try again."
         ),
         None => format!(
             "Something is answering on Freenet's port (7509) but doesn't say which version of \
-             Freenet it is. If it's an old Freenet, update it by running `freenet update` \
-             (River needs {minimum} or newer), then try again."
+             Freenet it is. If it's an old Freenet, update it (run `freenet update`, or install \
+             the latest from freenet.org; River needs {minimum} or newer), then try again."
         ),
     })
 }
@@ -394,7 +400,8 @@ mod tests {
             seen.last(),
             Some(&Setup::Failed(
                 "The Freenet running on this computer is version 0.2.60, and River needs \
-                 0.2.155 or newer. Update it by running `freenet update`, then try again."
+                 0.2.155 or newer. Update it (run `freenet update`, or install the latest from \
+                 freenet.org), then try again."
                     .into()
             ))
         );

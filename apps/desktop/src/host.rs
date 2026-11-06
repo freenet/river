@@ -23,8 +23,8 @@ const COMMAND_DEADLINE: Duration = Duration::from_secs(120);
 #[derive(Debug, PartialEq, Eq)]
 enum Answer {
     Version(String),
-    /// Something HTTP answered, but not with a version: a Freenet older than 0.2.71, or
-    /// another program on the port.
+    /// Something HTTP answered definitely without a version (see [`ask`]): a Freenet older
+    /// than 0.2.71, or another program on the port.
     NoVersion,
     Nothing,
 }
@@ -53,9 +53,12 @@ fn probe_agent() -> ureq::Agent {
         .build()
 }
 
-/// Ask `url` for the node's version. In ureq 2 a `Status` error is a parsed HTTP response
-/// with status 400 or above, so something HTTP did answer; a `Transport` error (refused,
-/// timed out, not HTTP) means nothing usable did.
+/// Ask `url` for the node's version.
+///
+/// Only a definite answer counts as "no version": a 404 or 405 (the endpoint doesn't exist,
+/// as before Freenet 0.2.71) or a success that isn't a version. Any other error status (a 503
+/// while starting, say) and any transport failure (refused, timed out, not HTTP) count as
+/// nothing usable answering yet, so River keeps waiting rather than calling it outdated.
 fn ask(agent: &ureq::Agent, url: &str) -> Answer {
     match agent.get(url).call() {
         Ok(resp) => resp
@@ -64,8 +67,8 @@ fn ask(agent: &ureq::Agent, url: &str) -> Answer {
             .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
             .and_then(|v| v.get("version")?.as_str().map(str::to_owned))
             .map_or(Answer::NoVersion, Answer::Version),
-        Err(ureq::Error::Status(..)) => Answer::NoVersion,
-        Err(ureq::Error::Transport(_)) => Answer::Nothing,
+        Err(ureq::Error::Status(404 | 405, _)) => Answer::NoVersion,
+        Err(ureq::Error::Status(..) | ureq::Error::Transport(_)) => Answer::Nothing,
     }
 }
 
@@ -129,11 +132,37 @@ impl NodeHost for DesktopHost {
             Installed::Binary(bin) => start_binary(
                 &bin,
                 &SystemRunner,
-                install::installed_by_river(&bin),
-                system_service_installed(),
+                // Asked only when needed: it hashes the binary.
+                &|| install::installed_by_river(&bin),
+                registered_services(),
                 &mut install::forget_install,
             ),
         }
+    }
+}
+
+/// Which Freenet services are registered on this machine, judged by freenet-core's unit
+/// files: Linux `~/.config/systemd/user/freenet.service` and
+/// `/etc/systemd/system/freenet.service`, macOS `~/Library/LaunchAgents/org.freenet.node.plist`.
+#[derive(Clone, Copy, Debug, Default)]
+struct Services {
+    user: bool,
+    system: bool,
+}
+
+fn registered_services() -> Services {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let user_unit = if cfg!(target_os = "linux") {
+        home.map(|h| h.join(".config/systemd/user/freenet.service"))
+    } else if cfg!(target_os = "macos") {
+        home.map(|h| h.join("Library/LaunchAgents/org.freenet.node.plist"))
+    } else {
+        None
+    };
+    Services {
+        user: user_unit.is_some_and(|p| p.exists()),
+        system: cfg!(target_os = "linux")
+            && Path::new("/etc/systemd/system/freenet.service").exists(),
     }
 }
 
@@ -152,33 +181,45 @@ impl Runner for SystemRunner {
 
 /// Start the node from a `freenet` binary with `freenet service start`.
 ///
-/// If no service is registered yet and River installed this copy (recorded when it installed
-/// it), River registers one first, as freenet-core's own installer would. Any other copy
-/// belongs to whoever installed it, and River only reports why it wouldn't start.
+/// If that fails because no service is registered, and River installed this copy (recorded
+/// when it installed it), River registers one, as freenet-core's own installer would. A
+/// registered service that fails to start is reported, never registered again. Any copy River
+/// didn't install belongs to whoever installed it, and River only reports why it didn't start.
 ///
 /// River never runs the node outside a service manager: a bare `freenet network` stops for
 /// good the first time it finds an update, because nothing is there to apply it and restart.
 ///
-/// `registered` runs once River has registered the service, so River's record of its install
-/// can be dropped: from then on the binary is started like any other, and if the user later
-/// removes the service, River doesn't put it back.
+/// `done_with_record` runs once River's copy has a service (River registered it, or a start
+/// shows one exists), so River's record of its install can be dropped: from then on the
+/// binary is started like any other, and if the user later removes the service, River
+/// doesn't put it back.
 fn start_binary(
     bin: &Path,
     runner: &dyn Runner,
-    installed_by_river: bool,
-    system_service: bool,
-    registered: &mut dyn FnMut(),
+    installed_by_river: &dyn Fn() -> bool,
+    services: Services,
+    done_with_record: &mut dyn FnMut(),
 ) -> Result<(), String> {
     let first = match runner.run(bin, &["service", "start"]) {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            // A start that works shows a service exists, however it got there.
+            done_with_record();
+            return Ok(());
+        }
         Err(e) => e,
     };
-    if system_service {
-        return Err("Freenet is installed as a system service. Start it with \
-                    `sudo systemctl start freenet`, then try again."
-            .into());
+    if services.system {
+        return Err(format!(
+            "Freenet's system service didn't start ({first}). Start it with \
+             `sudo systemctl start freenet`, then try again."
+        ));
     }
-    if !installed_by_river {
+    if services.user {
+        return Err(format!(
+            "Freenet's background service didn't start: {first}"
+        ));
+    }
+    if !installed_by_river() {
         return Err(format!(
             "the Freenet at {} didn't start ({first}). Start it yourself, then try again.",
             bin.display()
@@ -198,7 +239,7 @@ fn start_binary(
         };
         format!("couldn't set Freenet up as a background service ({e}).{hint}")
     })?;
-    registered();
+    done_with_record();
     runner
         .run(bin, &["service", "start"])
         .map_err(|e| format!("Freenet's service was set up but didn't start: {e}"))
@@ -242,10 +283,6 @@ fn on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|p| p.is_file())
-}
-
-fn system_service_installed() -> bool {
-    cfg!(target_os = "linux") && Path::new("/etc/systemd/system/freenet.service").exists()
 }
 
 /// Run a command to completion, returning the last line of its stderr on failure.
@@ -357,29 +394,63 @@ mod tests {
 
     const BIN: &str = "/home/u/.local/bin/freenet";
 
-    /// Run `start_binary`, returning its result and how many times it reported registering.
-    fn start(r: &FakeRunner, ours: bool, system: bool) -> (Result<(), String>, usize) {
-        let mut registered = 0;
-        let result = start_binary(Path::new(BIN), r, ours, system, &mut || registered += 1);
-        (result, registered)
+    const NONE: Services = Services {
+        user: false,
+        system: false,
+    };
+    const USER: Services = Services {
+        user: true,
+        system: false,
+    };
+    const SYSTEM: Services = Services {
+        user: false,
+        system: true,
+    };
+
+    /// Run `start_binary`, returning its result and how many times it dropped River's record.
+    fn start(r: &FakeRunner, ours: bool, services: Services) -> (Result<(), String>, usize) {
+        let mut dropped = 0;
+        let result = start_binary(Path::new(BIN), r, &|| ours, services, &mut || dropped += 1);
+        (result, dropped)
     }
 
     #[test]
     fn a_registered_service_is_just_started() {
         let r = FakeRunner::failing(&[]);
-        let (result, registered) = start(&r, true, false);
+        let (result, dropped) = start(&r, true, USER);
         result.unwrap();
         assert_eq!(r.calls(), vec!["service start"]);
-        assert_eq!(
-            registered, 0,
-            "River's record is only dropped when it registers"
-        );
+        assert_eq!(dropped, 1, "a working start shows a service exists");
+    }
+
+    #[test]
+    fn a_registered_service_that_fails_is_reported_not_registered_again() {
+        let r = FakeRunner::failing(&["service start"]);
+        let (result, dropped) = start(&r, true, USER);
+        let err = result.unwrap_err();
+        assert_eq!(r.calls(), vec!["service start"]);
+        assert!(err.contains("background service didn't start"), "{err}");
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn whether_river_owns_the_binary_is_only_asked_when_needed() {
+        // Asking hashes a 66 MB file, so a working start mustn't ask.
+        let r = FakeRunner::failing(&[]);
+        let mut dropped = 0;
+        let asked = std::cell::Cell::new(false);
+        let ours = || {
+            asked.set(true);
+            true
+        };
+        start_binary(Path::new(BIN), &r, &ours, NONE, &mut || dropped += 1).unwrap();
+        assert!(!asked.get());
     }
 
     #[test]
     fn river_registers_the_service_for_its_own_copy() {
         let r = FakeRunner::failing(&["service start"]);
-        let (result, registered) = start(&r, true, false);
+        let (result, registered) = start(&r, true, NONE);
         result.unwrap();
         assert_eq!(
             r.calls(),
@@ -389,19 +460,19 @@ mod tests {
 
         // Registered, then the start fails: the service exists, so the record still goes.
         let r = FakeRunner::failing(&["service start", "service start"]);
-        let (result, registered) = start(&r, true, false);
+        let (result, registered) = start(&r, true, NONE);
         assert!(result.is_err());
         assert_eq!(registered, 1);
 
         // Registration fails: the record stays, so a retry can register.
         let r = FakeRunner::failing(&["service start", "service install"]);
-        assert_eq!(start(&r, true, false).1, 0);
+        assert_eq!(start(&r, true, NONE).1, 0);
     }
 
     #[test]
     fn registration_failures_explain_themselves_and_run_nothing_else() {
         let r = FakeRunner::failing(&["service start", "service install"]);
-        let err = start(&r, true, false).0.unwrap_err();
+        let err = start(&r, true, NONE).0.unwrap_err();
         assert_eq!(r.calls(), vec!["service start", "service install"]);
         assert!(err.contains("service install failed"), "{err}");
         assert!(
@@ -416,7 +487,7 @@ mod tests {
         }
 
         let r = FakeRunner::failing(&["service start", "service start"]);
-        let err = start(&r, true, false).0.unwrap_err();
+        let err = start(&r, true, NONE).0.unwrap_err();
         assert_eq!(
             r.calls(),
             vec!["service start", "service install", "service start"]
@@ -427,7 +498,7 @@ mod tests {
     #[test]
     fn someone_elses_copy_is_never_registered() {
         let r = FakeRunner::failing(&["service start"]);
-        let err = start(&r, false, false).0.unwrap_err();
+        let err = start(&r, false, NONE).0.unwrap_err();
         assert_eq!(r.calls(), vec!["service start"]);
         assert!(
             err.contains(BIN) && err.contains("service start failed"),
@@ -438,8 +509,12 @@ mod tests {
     #[test]
     fn a_stopped_system_service_is_left_to_the_administrator() {
         let r = FakeRunner::failing(&["service start"]);
-        let err = start(&r, true, true).0.unwrap_err();
+        let err = start(&r, true, SYSTEM).0.unwrap_err();
         assert!(err.contains("sudo systemctl start freenet"), "{err}");
+        assert!(
+            err.contains("service start failed"),
+            "the real error is kept: {err}"
+        );
         assert_eq!(r.calls(), vec!["service start"]);
     }
 
@@ -536,18 +611,20 @@ mod tests {
         assert_eq!(ask(&agent, &serve_once(html)), Answer::NoVersion);
         let missing = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
         assert_eq!(ask(&agent, &serve_once(missing)), Answer::NoVersion);
+        // A node still starting may answer 503: not "outdated", just not ready.
+        let starting = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(ask(&agent, &serve_once(starting)), Answer::Nothing);
         // A redirect is not followed: the node's endpoint never redirects.
         let moved =
             "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/x\r\ncontent-length: 0\r\n\r\n";
         assert_eq!(ask(&agent, &serve_once(moved)), Answer::NoVersion);
 
-        // Something accepts the connection but never answers: a transport failure (here, the
-        // timeout), like a refused connection. The listener is held for the whole call, so no
-        // other program can take the port meanwhile.
+        // Something accepts the connection but never answers, so the call times out: a
+        // transport failure, which `ask` treats the same way as a refused connection. The
+        // listener is held for the whole call, so no other program can take the port.
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/version", silent.local_addr().unwrap());
         assert_eq!(ask(&agent, &url), Answer::Nothing);
-        drop(silent);
     }
 
     #[test]

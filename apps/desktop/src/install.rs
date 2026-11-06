@@ -37,7 +37,14 @@ fn record_installed_at(marker: &Path, binary: &Path, bytes: &[u8]) -> Result<(),
     let mut record = hex::encode(Sha256::digest(bytes)).into_bytes();
     record.push(b'\n');
     record.extend_from_slice(binary.as_os_str().as_encoded_bytes());
-    fs::write(marker, record).map_err(|e| format!("couldn't write {}: {e}", marker.display()))
+    // Written whole or not at all, like the binary: a torn record would disown River's copy.
+    let dir = marker.parent().ok_or("bad record path")?;
+    let write_err = |e: std::io::Error| format!("couldn't write {}: {e}", marker.display());
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(write_err)?;
+    tmp.write_all(&record).map_err(write_err)?;
+    tmp.as_file().sync_all().map_err(write_err)?;
+    tmp.persist(marker).map_err(|e| write_err(e.error))?;
+    Ok(())
 }
 
 fn was_installed_at(marker: &Path, binary: &Path) -> bool {
@@ -55,17 +62,23 @@ fn was_installed_at(marker: &Path, binary: &Path) -> bool {
             .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)).as_bytes() == hash.as_slice())
 }
 
-/// Whether the `freenet` binary at `binary` is the one River installed, unchanged.
+/// Whether the `freenet` binary at `binary` is the one River installed, unchanged. Strictly,
+/// "the bytes River installed, still at that path": the same release installed there another
+/// way would match too, which is harmless, since it is the same signed binary.
 pub fn installed_by_river(binary: &Path) -> bool {
     marker_path().is_some_and(|marker| was_installed_at(&marker, binary))
 }
 
-/// Forget River's install once its service is registered. From then on the binary is managed
+/// Forget River's install once a service exists for it. From then on the binary is managed
 /// like any other: River starts it, and never registers a service for it again.
 pub fn forget_install() {
     if let Some(marker) = marker_path() {
-        let _ = fs::remove_file(marker);
+        forget_install_at(&marker);
     }
+}
+
+fn forget_install_at(marker: &Path) {
+    let _ = fs::remove_file(marker);
 }
 
 /// Where a bare `freenet` binary lives, matching freenet-core's install scripts
@@ -120,10 +133,24 @@ enum Placed {
 /// Install the binary, then record that River installed it. The record comes second so it
 /// never names a binary River didn't install. If recording fails, River's binary is removed
 /// again, since a binary River can't show it installed would never get a service; a retry then
-/// starts clean. A binary that appeared meanwhile is neither replaced nor recorded.
+/// starts clean. Anything that appeared at `dest` meanwhile is neither replaced nor recorded,
+/// and the user is told what River found.
 fn install_and_record(binary: &[u8], dest: &Path, marker: &Path) -> Result<(), String> {
     if install_binary(binary, dest)? == Placed::AlreadyThere {
-        return Ok(());
+        return Err(if dest.is_file() {
+            format!(
+                "Freenet appeared at {} while River was downloading it, so River left that \
+                 copy alone. Choose Try again to use it.",
+                dest.display()
+            )
+        } else {
+            // A dangling symlink, or a directory: neither runs, and River won't remove it.
+            format!(
+                "{} already exists but isn't a program River can run. Remove it, then try \
+                 again.",
+                dest.display()
+            )
+        });
     }
     record_installed_at(marker, dest, binary).inspect_err(|_| {
         let _ = fs::remove_file(dest);
@@ -373,9 +400,11 @@ fn spawn_installer(installer: &Path) -> std::io::Result<std::process::Child> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         // Deliberately NOT `host::no_console_window`. `freenet.exe` is a console program, so a
-        // console window opens behind the wizard. That console matters: the wizard's "run
-        // without installing" choice runs the node in this same process, and the console is
-        // then the user's only window onto it and only way to stop it.
+        // console window opens behind the wizard, as it does when the user double-clicks it;
+        // the wizard detaches it once the user chooses to install. With "run without
+        // installing" the node runs in this same process, and the console is the only window
+        // that stops it. It stays blank (stdio is null, which a GUI parent has to pass), and
+        // closing it while the wizard is open closes the wizard too.
         let spawned = cmd.spawn();
         match spawned {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
@@ -517,11 +546,20 @@ mod tests {
         assert!(!was_installed_at(&marker, &ours));
         fs::remove_file(&ours).unwrap();
         assert!(!was_installed_at(&marker, &ours), "deleted");
-        fs::write(&marker, b"garbage").unwrap();
+        // A corrupt record matches nothing, even River's own unchanged copy.
+        fs::write(&ours, b"river's bytes").unwrap();
         assert!(
-            !was_installed_at(&marker, &other),
-            "a corrupt record matches nothing"
+            was_installed_at(&marker, &ours),
+            "sanity: the good record matches"
         );
+        fs::write(&marker, b"garbage").unwrap();
+        assert!(!was_installed_at(&marker, &ours));
+
+        // Forgetting removes the record; forgetting twice is fine.
+        record_installed_at(&marker, &ours, b"river's bytes").unwrap();
+        forget_install_at(&marker);
+        assert!(!was_installed_at(&marker, &ours));
+        forget_install_at(&marker);
     }
 
     #[test]
@@ -553,8 +591,25 @@ mod tests {
         fs::create_dir_all(theirs.parent().unwrap()).unwrap();
         fs::write(&theirs, b"their binary").unwrap();
         let their_marker = dir.path().join("state/their-marker");
-        install_and_record(b"binary", &theirs, &their_marker).unwrap();
+        let err = install_and_record(b"binary", &theirs, &their_marker).unwrap_err();
+        assert!(err.contains("left that copy alone"), "{err}");
         assert_eq!(fs::read(&theirs).unwrap(), b"their binary");
+        assert!(!their_marker.exists());
+
+        // Something that isn't a program (a directory, or a dangling symlink) is reported, not
+        // treated as an install that worked.
+        let squatted = dir.path().join("squatted/freenet");
+        fs::create_dir_all(&squatted).unwrap();
+        let err = install_and_record(b"binary", &squatted, &their_marker).unwrap_err();
+        assert!(err.contains("isn't a program"), "{err}");
+        #[cfg(unix)]
+        {
+            let dangling = dir.path().join("dangling/freenet");
+            fs::create_dir_all(dangling.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+            let err = install_and_record(b"binary", &dangling, &their_marker).unwrap_err();
+            assert!(err.contains("isn't a program"), "{err}");
+        }
         assert!(!their_marker.exists());
 
         // The binary can't be installed: nothing is recorded.

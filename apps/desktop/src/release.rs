@@ -86,11 +86,12 @@ pub fn parse_version(version: &str) -> Result<Version, String> {
     Ok(parsed)
 }
 
-/// The tag from the `Location` of a `releases/latest` redirect.
+/// The tag from the `Location` of a `releases/latest` redirect, which must point back into
+/// this repository's releases.
 fn tag_from_latest_redirect(location: &str) -> Result<(String, Version), String> {
     let tag = location
-        .rsplit_once("/releases/tag/")
-        .map(|(_, t)| t)
+        .strip_prefix(REPO)
+        .and_then(|rest| rest.strip_prefix("/releases/tag/"))
         .ok_or("unexpected latest-release redirect")?;
     let version = parse_tag(tag)?;
     if version < MIN_VERSION {
@@ -306,7 +307,8 @@ fn read_with_progress(
     if total.is_some_and(|t| t > max) {
         return Err(format!("it is larger than the {max}-byte limit"));
     }
-    let mut bytes = Vec::with_capacity(total.unwrap_or(0) as usize);
+    // Pre-allocate from the announced size only up to a point: it isn't authenticated.
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0).min(16 << 20) as usize);
     let mut buf = [0u8; 64 * 1024];
     let mut last = Instant::now();
     loop {
@@ -470,6 +472,14 @@ mod tests {
         assert!(tag_from_latest_redirect(&format!("{base}v0.2.154")).is_err());
         assert!(tag_from_latest_redirect("https://github.com/login").is_err());
         assert!(tag_from_latest_redirect(&format!(r"{base}v\..\x")).is_err());
+        // The redirect must stay in this repository.
+        assert!(tag_from_latest_redirect("https://example.com/x/releases/tag/v0.2.160").is_err());
+        assert!(
+            tag_from_latest_redirect(
+                "https://github.com/someone/freenet-core/releases/tag/v0.2.160"
+            )
+            .is_err()
+        );
     }
 
     #[test]
