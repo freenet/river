@@ -19,7 +19,18 @@ type RiverTestHooks = {
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
+  // The next own message signature arrives corrupted, so the room does not admit it.
   forgeNextSendSignature(): void;
+  // Own-message signing requests wait (a slow chat delegate) until released.
+  holdMessageSigning(): void;
+  // Release the index-th held request (0 = first sent); returns how many were held.
+  releaseMessageSign(index: number): number;
+  // Release every held request and stop holding.
+  releaseMessageSigning(): void;
+  // Own-message signing results (signature or failure) recorded since the page loaded.
+  messageSignsRecorded(): number;
+  // The next own-message signing fails with no local key to fall back on.
+  failNextMessageSign(): void;
   setRoomsLoadState(state: RoomsLoadState): void;
   // Same, without clearing ROOMS: the rail's note under a partly restored list.
   // "migrating" also holds a load worker open until the next call.

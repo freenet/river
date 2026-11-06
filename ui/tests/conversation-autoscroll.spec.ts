@@ -1205,6 +1205,22 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
+  test("sending from a held range while signing is slow shows the pending row in the latest range", { tag: "@chromium-only" }, async ({
+    page,
+  }) => {
+    await parkPastTheCeiling(page);
+    await callRiverTest(page, "appendMessage", "newest before the slow send");
+    await expect.poll(() => withheld(page), { message: "premise: newer messages are held back" }).toBeGreaterThan(0);
+
+    await callRiverTest(page, "holdMessageSigning");
+    await sendWithEnter(page, "slow send from a held range");
+    const row = page.getByTestId("pending-message").filter({ hasText: "slow send from a held range" });
+    await expect(row, "the pending row shows before the signature").toBeInViewport();
+    expect(await withheld(page), "the send took the latest range").toBe(0);
+    await callRiverTest(page, "releaseMessageSigning");
+    await expectAtEndShowing(page, "slow send from a held range", "the committed send is not at the end");
+  });
+
   // A send's scroll belongs to the room it was sent in. A switch that lands
   // after the keypress but before the send applies leaves the new room to its
   // own opening, and a later arrival there must not finish the old room's send.
@@ -1240,7 +1256,29 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
-  test("a send that fails to apply does not navigate", { tag: "@chromium-only" }, async ({ page }) => {
+  test("a send while its signature is slow shows its pending row at the end at once", { tag: "@chromium-only" }, async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Your Private Room");
+    await fillHistory(page);
+    await readerScrollsWithoutGesture(page, 0);
+    await expectParkedAwayFromEnd(page, "premise: reading older messages");
+
+    // The delegate has not answered: nothing reaches the room, so the only
+    // thing that can take the view to the end is the pending row itself.
+    await callRiverTest(page, "holdMessageSigning");
+    await sendWithEnter(page, "own send while signing is slow");
+    const row = page.getByTestId("pending-message").filter({ hasText: "own send while signing is slow" });
+    await expect(row, "the pending row is shown at the end before the signature").toBeInViewport();
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect(
+      page.getByTestId("conversation-history").getByText("own send while signing is slow", { exact: false }),
+    ).toHaveCount(1);
+  });
+
+  test("a send the room does not admit stays on screen, failed, for a retry", { tag: "@chromium-only" }, async ({
+    page,
+  }) => {
     const applyFailures: string[] = [];
     page.on("console", (msg) => {
       if (msg.text().includes("Failed to apply message delta")) applyFailures.push(msg.text());
@@ -1249,10 +1287,12 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
     await expectParkedAwayFromEnd(page, "premise: reading older messages");
-    const row = await expectReadingRow(page);
 
     // A message the room does not admit (its signature is corrupted), so the
-    // send fails at the local apply after the draft is handed off.
+    // send fails at the local apply after the draft is handed off. The
+    // message showed, pending, on Enter (an own send goes to the end), so it
+    // must stay where the reader saw it, marked failed: the typed text is
+    // never dropped.
     await callRiverTest(page, "forgeNextSendSignature");
     await sendWithEnter(page, "own send that fails to apply");
     await expect
@@ -1261,12 +1301,13 @@ test.describe("Own send goes to the newest message once (A06)", () => {
       })
       .toBeGreaterThan(0);
 
-    await expectRowHeld(page, row.key, row.top, "a send that failed to apply moved the view");
+    const failed = page.getByTestId("pending-message").filter({ hasText: "own send that fails to apply" });
+    await expect(failed).toHaveAttribute("data-pending-state", "failed");
+    await expect(failed, "the failed message is in view").toBeInViewport();
     await expect(
-      page.getByText("own send that fails to apply", { exact: false }),
-      "premise: the send should have failed to apply",
+      page.getByTestId("conversation-history").getByText("own send that fails to apply", { exact: false }),
+      "the room holds no copy of a message it did not admit",
     ).toHaveCount(0);
-    await expectParkedAwayFromEnd(page, "a send that failed to apply took the reader to the latest message");
   });
 });
 

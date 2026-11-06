@@ -412,6 +412,8 @@ pub fn EditRoomModal() -> Element {
                                                     // is what makes leave survive across reloads /
                                                     // legacy-delegate merges (freenet/river#247).
                                                     ROOMS.write().leave_room(room_vk);
+                                                    // Unsent messages go with the room.
+                                                    crate::components::conversation::clear_outbox_for_room_now(room_vk);
 
                                                     // Leaving cancels any earlier same-session
                                                     // rejoin intent, so a later background content

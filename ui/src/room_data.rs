@@ -1178,12 +1178,14 @@ impl RoomData {
     /// A user is considered a member if they are the owner, are in the active
     /// members list, or have a stored invitation (self_authorized_member).
     pub fn can_send_message(&self) -> Result<(), SendMessageError> {
-        // Sending means producing a SIGNED message, so this needs the private
-        // key — not merely a known identity. Gating on `self_verifying_key`
-        // alone would answer `Ok` for a copy that knows who it is but cannot
-        // sign, which shows the user a composer whose every send is silently
-        // rejected. Reported as its own reason rather than mislabelled
-        // "not a member": the user may well be a member.
+        // Messages are signed by the chat delegate, with the private key here
+        // only as the fallback (`signing::sign_message_with_fallback`), and the
+        // send path itself needs only the verifying key. This gate still
+        // requires the private key so that a copy with no key never offers a
+        // composer while that fallback is how a missed delegate answer is
+        // recovered. Phase B (no private key in the UI) relaxes it to
+        // `self_verifying_key`. Reported as its own reason rather than
+        // mislabelled "not a member": the user may well be a member.
         let Some(self_sk) = self.signing_key() else {
             return Err(SendMessageError::IdentityUnavailable);
         };

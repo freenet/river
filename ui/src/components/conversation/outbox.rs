@@ -1,0 +1,672 @@
+//! The messages this device has authored but not yet committed to `ROOMS`.
+//!
+//! Chat messages are signed by the chat delegate (`signing::sign_message_with_fallback`).
+//! That round trip is usually ~1 ms but sometimes seconds, because delegate
+//! requests queue behind contract WASM on the node. The reader must never wait
+//! for it, so a composed message goes into this outbox the moment it is sent,
+//! renders from here as a pending row (`pending_sends.rs`), and moves into
+//! `ROOMS` when its signature arrives. Unsigned messages live only here: never
+//! in `ROOMS`, the delegate's rooms blob, or anything sent to the network.
+//!
+//! Per room, entries commit in the order they were made. A later entry whose
+//! signature arrives first waits for the earlier ones, so a send followed by an
+//! edit of an earlier message, or three messages typed quickly, reach `ROOMS`
+//! (and so the network) in the order the user made them. A failed entry does
+//! not hold back the ones after it: it stays, marked failed, until the user
+//! retries or discards it (a retried message is restamped, and commits after
+//! them). Leaving the room drops what is waiting in it
+//! (`outbox_commit::clear_room_now`).
+//!
+//! A private room's secret rotates (on a ban, a join or a prune). A message
+//! sealed under the previous secret whose signature arrives after a rotation
+//! is not published as it is, which would reach a member the rotation
+//! excluded: it is sealed again under the current secret from what the user
+//! wrote (`seal.rs`) and signed again, keeping its timestamp and its place,
+//! and what follows it waits for it (`take_committable`). At most
+//! `MAX_RESEALS` times; then it fails, and Retry seals it again.
+//!
+//! The outbox is memory only: a reload while a message is still being signed
+//! loses it.
+//!
+//! Each message keeps the timestamp it was given when the user acted; signing
+//! later does not restamp it, so the order on screen is the typed order. Only
+//! a Retry restamps.
+
+use super::seal::SealInput;
+use dioxus::prelude::*;
+use ed25519_dalek::{Signature, VerifyingKey};
+use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1};
+use std::collections::HashMap;
+use std::time::SystemTime;
+
+pub(crate) static OUTBOX: GlobalSignal<Outbox> = Global::new(Outbox::default);
+
+/// How many times one entry is sealed again for a rotating room secret
+/// before it is shown as failed (where Retry seals it once more).
+pub(crate) const MAX_RESEALS: u32 = 3;
+
+/// Why a sealed message waits: this device does not yet hold the room's
+/// current secret (or holds an older one than the message was sealed under).
+const KEY_NOT_YET_HERE: &str =
+    "this device does not have the room's newest key yet; Retry once it arrives";
+
+/// A message to enqueue: the message, its CBOR bytes, and for a sealed body
+/// what the user wrote (`SealInput`).
+pub(crate) type NewMessage = (MessageV1, Vec<u8>, Option<SealInput>);
+
+/// What the user did, which decides how a pending entry shows.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum PendingKind {
+    /// A message or reply from the composer. Shown as a pending row, with the
+    /// typed text, until it commits; kept as a failed row if it cannot.
+    Send { text: String, author_name: String },
+    /// An edit, a delete or a reaction toggle. Shown while pending by applying
+    /// `effects` over the committed messages (`pending_effects`); a failure is
+    /// reported with a toast and the entry dropped (`label` names the action
+    /// in that toast).
+    Action {
+        label: &'static str,
+        effects: Vec<PendingEffect>,
+    },
+}
+
+/// What a pending action does to the conversation, in plaintext: the
+/// messages themselves may be sealed under the room secret.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum PendingEffect {
+    React { target: MessageId, emoji: String },
+    Unreact { target: MessageId, emoji: String },
+    Edit { target: MessageId, text: String },
+    Delete { target: MessageId },
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum PendingState {
+    /// Waiting for at least one signature.
+    Signing,
+    /// Signing or committing failed. The reason is for the log and the tooltip.
+    Failed(String),
+}
+
+/// One message of an entry. A reaction swap is two messages (remove the old
+/// reaction, add the new one) that commit together.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct UnsignedMessage {
+    pub message: MessageV1,
+    /// The CBOR encoding of `message`: the bytes the signature covers.
+    pub bytes: Vec<u8>,
+    pub signature: Option<Signature>,
+    /// What the user wrote, for a body sealed under a room secret: kept so the
+    /// body can be sealed again under a newer secret (`reseal`).
+    pub seal: Option<SealInput>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct PendingEntry {
+    /// Local only, increasing in the order entries were made.
+    pub id: u64,
+    pub kind: PendingKind,
+    /// The author's verifying key: a signature is accepted only under it.
+    pub author_vk: VerifyingKey,
+    pub messages: Vec<UnsignedMessage>,
+    pub state: PendingState,
+    /// Times the entry was sealed again because the room's secret rotated
+    /// while it was being signed (bounded by `MAX_RESEALS`).
+    pub reseals: u32,
+}
+
+impl PendingEntry {
+    fn fully_signed(&self) -> bool {
+        self.messages.iter().all(|m| m.signature.is_some())
+    }
+
+    /// The signed messages. Only meaningful once `fully_signed`.
+    pub fn authorized(&self) -> Vec<AuthorizedMessageV1> {
+        self.messages
+            .iter()
+            .filter_map(|m| {
+                m.signature
+                    .map(|sig| AuthorizedMessageV1::with_signature(m.message.clone(), sig))
+            })
+            .collect()
+    }
+
+    /// Ids of the signed messages: what the room holds once this commits.
+    pub fn message_ids(&self) -> Vec<MessageId> {
+        self.authorized().iter().map(|m| m.id()).collect()
+    }
+
+    /// Whether any message is sealed under a room secret version other than
+    /// `current` (the version the room would seal with now). Publishing such
+    /// a message after a rotation (a ban, a join or a prune rotates the
+    /// secret) would reach a member the rotation excluded, so it is sealed
+    /// again first (`take_committable`), and `apply_entry` refuses it as a
+    /// backstop. With no current secret, any sealed message counts as stale.
+    pub fn is_stale_sealed(&self, current: Option<u32>) -> bool {
+        self.messages.iter().any(|m| match &m.message.content {
+            river_core::room_state::message::RoomMessageBody::Private {
+                secret_version, ..
+            } => Some(*secret_version) != current,
+            _ => false,
+        })
+    }
+
+    /// Whether every sealed body is sealed at `version` or below (so sealing
+    /// again under `version` moves forward, never back).
+    pub fn sealed_at_or_below(&self, version: u32) -> bool {
+        self.messages.iter().all(|m| match &m.message.content {
+            river_core::room_state::message::RoomMessageBody::Private {
+                secret_version, ..
+            } => *secret_version <= version,
+            _ => true,
+        })
+    }
+
+    /// When the user acted (the first message's timestamp).
+    pub fn time(&self) -> SystemTime {
+        self.messages
+            .first()
+            .map(|m| m.message.time)
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+}
+
+impl PendingEntry {
+    /// The signing work: every message's bytes.
+    fn work(&self) -> SigningWork {
+        self.messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i, m.bytes.clone()))
+            .collect()
+    }
+
+    fn fail(&mut self, reason: &str) {
+        self.state = PendingState::Failed(reason.to_string());
+        for m in &mut self.messages {
+            m.signature = None;
+        }
+    }
+
+    /// Rebuild every message: when `reseal` is given, each sealed body is
+    /// sealed again from its `SealInput` under that secret and version; when
+    /// `restamp` is given, each message takes that time. Encodes everything
+    /// first and replaces nothing on failure, so a signature can never cover
+    /// bytes other than the message's. Clears signatures; the entry is
+    /// Signing again.
+    fn seal_again(
+        &mut self,
+        reseal: Option<(&[u8; 32], u32)>,
+        restamp: Option<SystemTime>,
+    ) -> bool {
+        let mut rebuilt = Vec::with_capacity(self.messages.len());
+        for m in &self.messages {
+            let mut message = m.message.clone();
+            if let Some((secret, version)) = reseal {
+                if matches!(
+                    message.content,
+                    river_core::room_state::message::RoomMessageBody::Private { .. }
+                ) {
+                    let Some(seal) = &m.seal else {
+                        return false;
+                    };
+                    message.content = seal.seal(secret, version);
+                }
+            }
+            if let Some(time) = restamp {
+                message.time = time;
+            }
+            let mut bytes = Vec::new();
+            if ciborium::ser::into_writer(&message, &mut bytes).is_err() {
+                return false;
+            }
+            rebuilt.push((message, bytes));
+        }
+        for (m, (message, bytes)) in self.messages.iter_mut().zip(rebuilt) {
+            m.message = message;
+            m.bytes = bytes;
+            m.signature = None;
+        }
+        self.state = PendingState::Signing;
+        true
+    }
+}
+
+/// A pending row as the conversation shows it.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct PendingRow {
+    pub id: u64,
+    pub text: String,
+    pub author_name: String,
+    pub time: SystemTime,
+    pub failed: Option<String>,
+}
+
+/// Signing work for one entry: `(message index, bytes to sign)`.
+pub(crate) type SigningWork = Vec<(usize, Vec<u8>)>;
+
+#[derive(Default, Debug)]
+pub(crate) struct Outbox {
+    rooms: HashMap<VerifyingKey, Vec<PendingEntry>>,
+    next_id: u64,
+}
+
+impl Outbox {
+    /// Add an entry at the end of `room`'s queue, in the Signing state.
+    /// Returns its id and the signing work to start.
+    #[cfg(test)]
+    pub fn enqueue(
+        &mut self,
+        room: VerifyingKey,
+        kind: PendingKind,
+        author_vk: VerifyingKey,
+        messages: Vec<(MessageV1, Vec<u8>)>,
+    ) -> (u64, SigningWork) {
+        let messages = messages.into_iter().map(|(m, b)| (m, b, None)).collect();
+        self.enqueue_sealed(room, kind, author_vk, messages)
+    }
+
+    /// `enqueue`, keeping what the user wrote for each sealed body.
+    pub fn enqueue_sealed(
+        &mut self,
+        room: VerifyingKey,
+        kind: PendingKind,
+        author_vk: VerifyingKey,
+        messages: Vec<NewMessage>,
+    ) -> (u64, SigningWork) {
+        self.next_id += 1;
+        let id = self.next_id;
+        let work = messages
+            .iter()
+            .enumerate()
+            .map(|(i, (_, bytes, _))| (i, bytes.clone()))
+            .collect();
+        self.rooms.entry(room).or_default().push(PendingEntry {
+            id,
+            kind,
+            author_vk,
+            messages: messages
+                .into_iter()
+                .map(|(message, bytes, seal)| UnsignedMessage {
+                    message,
+                    bytes,
+                    signature: None,
+                    seal,
+                })
+                .collect(),
+            state: PendingState::Signing,
+            reseals: 0,
+        });
+        (id, work)
+    }
+
+    fn entry_mut(&mut self, room: &VerifyingKey, id: u64) -> Option<&mut PendingEntry> {
+        self.rooms.get_mut(room)?.iter_mut().find(|e| e.id == id)
+    }
+
+    /// Record one message's signature. Ignored for an entry that is gone or
+    /// has failed (a late answer to an abandoned attempt). Results are keyed
+    /// by entry and index, not by attempt: a late result from an earlier
+    /// attempt would land on the new one. A reseal starts a new attempt only
+    /// for a fully signed entry, so nothing of the old one is outstanding; a
+    /// Retry is offered only for sends (one message, failed once its request
+    /// completed). A stray late signature cannot publish old content anyway:
+    /// it does not verify over the new bytes, and the room skips the message.
+    pub fn record_signature(&mut self, room: &VerifyingKey, id: u64, index: usize, sig: Signature) {
+        if let Some(entry) = self.entry_mut(room, id) {
+            if entry.state == PendingState::Signing {
+                if let Some(m) = entry.messages.get_mut(index) {
+                    m.signature = Some(sig);
+                }
+            }
+        }
+    }
+
+    /// Mark an entry failed. Its signatures are dropped, so a retry signs again.
+    pub fn record_failure(&mut self, room: &VerifyingKey, id: u64, reason: String) {
+        if let Some(entry) = self.entry_mut(room, id) {
+            entry.state = PendingState::Failed(reason);
+            for m in &mut entry.messages {
+                m.signature = None;
+            }
+        }
+    }
+
+    /// Whether the head of the queue is fully signed, so `take_committable`
+    /// has something to commit or to seal again (and a caller can otherwise
+    /// skip the signal write, and the renders it causes).
+    pub fn has_ready(&self, room: &VerifyingKey) -> bool {
+        self.rooms.get(room).is_some_and(|queue| {
+            queue
+                .iter()
+                .find(|e| e.state == PendingState::Signing)
+                .is_some_and(|e| e.fully_signed())
+        })
+    }
+
+    /// Whether `take_failed_actions` would return anything.
+    pub fn has_failed_actions(&self, room: &VerifyingKey) -> bool {
+        self.rooms.get(room).is_some_and(|queue| {
+            queue.iter().any(|e| {
+                matches!(e.kind, PendingKind::Action { .. })
+                    && matches!(e.state, PendingState::Failed(_))
+            })
+        })
+    }
+
+    /// Whether a page reload would lose something the user can still act on:
+    /// a message being signed (in any room), or a failed send shown on
+    /// screen, that is, in a room `shown` reports the identity of (`Some`
+    /// for a room still held, with its current identity) and written as that
+    /// identity. A failed row nobody can see (its room removed, its identity
+    /// replaced) does not count, or it would hold a reload back for the life
+    /// of the page.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn has_unsent(&self, shown: impl Fn(&VerifyingKey) -> Option<VerifyingKey>) -> bool {
+        self.rooms.iter().any(|(room, queue)| {
+            let current = shown(room);
+            queue.iter().any(|e| match e.state {
+                PendingState::Signing => true,
+                PendingState::Failed(_) => {
+                    matches!(e.kind, PendingKind::Send { .. }) && current == Some(e.author_vk)
+                }
+            })
+        })
+    }
+
+    /// The entry `id` in `room`, if it is still there.
+    pub fn entry(&self, room: &VerifyingKey, id: u64) -> Option<&PendingEntry> {
+        self.rooms.get(room)?.iter().find(|e| e.id == id)
+    }
+
+    /// Whether anything waits in `room`.
+    pub fn has_room(&self, room: &VerifyingKey) -> bool {
+        self.rooms.contains_key(room)
+    }
+
+    /// Remove and return, in order, the entries ready to commit: from the
+    /// front of the queue, every fully signed entry up to the first one still
+    /// signing. Failed entries are passed over and stay where they are.
+    #[cfg(test)]
+    pub fn take_ready(&mut self, room: &VerifyingKey) -> Vec<PendingEntry> {
+        self.take_ready_sealed_under(room, None).0
+    }
+
+    /// `take_ready`, stopping at the first ready entry sealed under a secret
+    /// version other than `current` (when `current` is given): that entry
+    /// must be sealed again and re-signed before it, or anything after it,
+    /// commits. Returns the entries taken and that entry's id.
+    pub fn take_ready_sealed_under(
+        &mut self,
+        room: &VerifyingKey,
+        current: Option<Option<u32>>,
+    ) -> (Vec<PendingEntry>, Option<u64>) {
+        let Some(queue) = self.rooms.get_mut(room) else {
+            return (Vec::new(), None);
+        };
+        let mut ready = Vec::new();
+        let mut stale = None;
+        let mut i = 0;
+        while i < queue.len() {
+            match queue[i].state {
+                PendingState::Failed(_) => i += 1,
+                PendingState::Signing if queue[i].fully_signed() => {
+                    if current.is_some_and(|c| queue[i].is_stale_sealed(c)) {
+                        stale = Some(queue[i].id);
+                        break;
+                    }
+                    ready.push(queue.remove(i))
+                }
+                PendingState::Signing => break,
+            }
+        }
+        if queue.is_empty() {
+            self.rooms.remove(room);
+        }
+        (ready, stale)
+    }
+
+    /// Seal entry `id` again under `secret` at `version` (the room's secret
+    /// rotated while it was being signed) and return the author's key and the
+    /// signing work, keeping its timestamp and place. After `MAX_RESEALS`, or
+    /// if a sealed body has nothing to seal it from, the entry is marked
+    /// failed instead and `None` is returned.
+    pub fn reseal(
+        &mut self,
+        room: &VerifyingKey,
+        id: u64,
+        secret: &[u8; 32],
+        version: u32,
+    ) -> Option<(VerifyingKey, SigningWork)> {
+        let entry = self.entry_mut(room, id)?;
+        debug_assert!(
+            entry.sealed_at_or_below(version),
+            "a reseal only ever moves forward (take_committable checks first)"
+        );
+        if entry.reseals >= MAX_RESEALS {
+            entry.fail("the room's key kept changing while this was sending");
+            return None;
+        }
+        if !entry.seal_again(Some((secret, version)), None) {
+            entry.fail("this message could not be sealed again");
+            return None;
+        }
+        entry.reseals += 1;
+        Some((entry.author_vk, entry.work()))
+    }
+
+    /// One commit step for `room`, given the room's current secret: the
+    /// entries ready to commit, in order, and the entries sealed again under
+    /// the current secret that must now be signed again (author key, work).
+    ///
+    /// The take stops at a ready entry sealed under an older version (the
+    /// room's secret rotated while it was being signed), seals it again and
+    /// re-signs it, and what follows it waits, so typed order holds. If that
+    /// entry cannot be sealed again (`MAX_RESEALS` reached, no current secret
+    /// on this device, sealed under a NEWER version than this device holds,
+    /// nothing to seal it from), it is failed and the take carries on past
+    /// it, as it does past any failed entry: a failure never strands the
+    /// entries behind it.
+    pub fn take_committable(
+        &mut self,
+        room: &VerifyingKey,
+        current: Option<([u8; 32], u32)>,
+    ) -> (Vec<PendingEntry>, Vec<(u64, VerifyingKey, SigningWork)>) {
+        let current_version = current.map(|(_, version)| version);
+        let mut ready = Vec::new();
+        let mut resign = Vec::new();
+        loop {
+            let (taken, stale) = self.take_ready_sealed_under(room, Some(current_version));
+            ready.extend(taken);
+            let Some(id) = stale else {
+                break;
+            };
+            let resealed = match (current, self.entry(room, id)) {
+                // Only ever forward: a body sealed under a newer version than
+                // this device holds is not sealed down to an older secret.
+                (Some((secret, version)), Some(entry)) if entry.sealed_at_or_below(version) => {
+                    self.reseal(room, id, &secret, version)
+                }
+                _ => {
+                    // No current secret here, or an older one than the
+                    // message was sealed under.
+                    self.record_failure(room, id, KEY_NOT_YET_HERE.to_string());
+                    None
+                }
+            };
+            match resealed {
+                Some((author_vk, work)) => {
+                    resign.push((id, author_vk, work));
+                    break;
+                }
+                // Failed now: the next take passes over it.
+                None => continue,
+            }
+        }
+        (ready, resign)
+    }
+
+    /// Put back an entry that was taken but did not commit, failed, in its
+    /// original place.
+    pub fn restore_failed(&mut self, room: VerifyingKey, mut entry: PendingEntry, reason: String) {
+        entry.state = PendingState::Failed(reason);
+        for m in &mut entry.messages {
+            m.signature = None;
+        }
+        let queue = self.rooms.entry(room).or_default();
+        let at = queue.partition_point(|e| e.id < entry.id);
+        queue.insert(at, entry);
+    }
+
+    /// Start a failed entry signing again, restamped `now` and, if `current`
+    /// (the room's current secret) is newer than what it was sealed under,
+    /// sealed again under it, so Retry can succeed whatever happened to the
+    /// key. Resets the reseal count. A retry is a new
+    /// send. (Keeping the original stamp would let a room at its message cap
+    /// prune the retried message the moment it lands, so Retry could never
+    /// succeed.) Returns the author's key and the work, or `None` if the entry
+    /// is gone or not failed.
+    pub fn retry(
+        &mut self,
+        room: &VerifyingKey,
+        id: u64,
+        now: SystemTime,
+        current: Option<([u8; 32], u32)>,
+    ) -> Option<(VerifyingKey, SigningWork)> {
+        let entry = self.entry_mut(room, id)?;
+        if !matches!(entry.state, PendingState::Failed(_)) {
+            return None;
+        }
+        // Sealed again under the room's current secret if it has rotated, so
+        // a Retry can succeed whatever happened to the key meanwhile. Only
+        // ever forward: a body sealed under a newer version than this device
+        // holds is never sealed down to the older secret, which a member the
+        // newer rotation excluded can read. That Retry waits for the key.
+        let waits_for_key = match current {
+            Some((_, version)) => !entry.sealed_at_or_below(version),
+            None => entry.is_stale_sealed(None),
+        };
+        if waits_for_key {
+            entry.state = PendingState::Failed(KEY_NOT_YET_HERE.to_string());
+            return None;
+        }
+        let resealing = current.filter(|(_, v)| entry.is_stale_sealed(Some(*v)));
+        let reseal = resealing
+            .as_ref()
+            .map(|(secret, version)| (secret, *version));
+        if !entry.seal_again(reseal, Some(now)) {
+            entry.state =
+                PendingState::Failed("this message could not be sealed again".to_string());
+            return None;
+        }
+        entry.reseals = 0;
+        entry.state = PendingState::Signing;
+        Some((entry.author_vk, entry.work()))
+    }
+
+    /// Drop `room`'s entries written as any identity but `author` (the room's
+    /// identity was replaced while they waited). Returns how many.
+    pub fn drop_other_identities(&mut self, room: &VerifyingKey, author: &VerifyingKey) -> usize {
+        let Some(queue) = self.rooms.get_mut(room) else {
+            return 0;
+        };
+        let before = queue.len();
+        queue.retain(|e| e.author_vk == *author);
+        let dropped = before - queue.len();
+        if queue.is_empty() {
+            self.rooms.remove(room);
+        }
+        dropped
+    }
+
+    /// Whether any of `room`'s entries were written as an identity but `author`.
+    pub fn has_other_identities(&self, room: &VerifyingKey, author: &VerifyingKey) -> bool {
+        self.rooms
+            .get(room)
+            .is_some_and(|q| q.iter().any(|e| e.author_vk != *author))
+    }
+
+    /// Drop everything waiting in `room` (the user left it).
+    pub fn clear_room(&mut self, room: &VerifyingKey) -> usize {
+        self.rooms.remove(room).map_or(0, |q| q.len())
+    }
+
+    /// Drop an entry (the user discarded a failed message).
+    pub fn discard(&mut self, room: &VerifyingKey, id: u64) -> Option<PendingEntry> {
+        let queue = self.rooms.get_mut(room)?;
+        let at = queue.iter().position(|e| e.id == id)?;
+        let entry = queue.remove(at);
+        if queue.is_empty() {
+            self.rooms.remove(room);
+        }
+        Some(entry)
+    }
+
+    /// Remove and return the failed actions (edit, delete, reaction) in
+    /// `room`. They have no row to wait on, so they are reported and dropped.
+    pub fn take_failed_actions(&mut self, room: &VerifyingKey) -> Vec<PendingEntry> {
+        let Some(queue) = self.rooms.get_mut(room) else {
+            return Vec::new();
+        };
+        let (failed, kept): (Vec<_>, Vec<_>) = std::mem::take(queue).into_iter().partition(|e| {
+            matches!(e.kind, PendingKind::Action { .. })
+                && matches!(e.state, PendingState::Failed(_))
+        });
+        if kept.is_empty() {
+            self.rooms.remove(room);
+        } else {
+            *queue = kept;
+        }
+        failed
+    }
+
+    /// The effects of `room`'s actions still being signed, in the order they
+    /// were made, for the conversation to show before they commit. Only
+    /// `author`'s: entries written as an identity the room has since replaced
+    /// are never shown under the new one (and never commit, `apply_entry`).
+    pub fn pending_effects(
+        &self,
+        room: &VerifyingKey,
+        author: &VerifyingKey,
+    ) -> Vec<PendingEffect> {
+        self.rooms
+            .get(room)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.state == PendingState::Signing && e.author_vk == *author)
+            .filter_map(|e| match &e.kind {
+                PendingKind::Action { effects, .. } => Some(effects.iter().cloned()),
+                PendingKind::Send { .. } => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// `author`'s composer messages waiting in `room`, in the order they were
+    /// sent (see `pending_effects` for why only `author`'s).
+    pub fn pending_rows(&self, room: &VerifyingKey, author: &VerifyingKey) -> Vec<PendingRow> {
+        self.rooms
+            .get(room)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.author_vk == *author)
+            .filter_map(|e| match &e.kind {
+                PendingKind::Send { text, author_name } => Some(PendingRow {
+                    id: e.id,
+                    text: text.clone(),
+                    author_name: author_name.clone(),
+                    time: e.time(),
+                    failed: match &e.state {
+                        PendingState::Failed(reason) => Some(reason.clone()),
+                        PendingState::Signing => None,
+                    },
+                }),
+                PendingKind::Action { .. } => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+#[path = "outbox_tests.rs"]
+mod tests;

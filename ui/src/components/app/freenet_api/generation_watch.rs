@@ -1036,7 +1036,14 @@ mod runtime {
     /// The reader counts as busy for this long after the last busy sign, so a
     /// message just sent has time to leave before the page goes.
     const SETTLE_MS: u64 = 5_000;
-    /// Longest a reload waits for pending writes before it goes anyway.
+    /// The least time the delegate flush gets in `reload_after_flush`, however
+    /// long the waits before it took.
+    const FLUSH_MIN_MS: u64 = 3_000;
+    /// Longest a reload waits for pending writes (`NEEDS_SYNC`, messages still
+    /// signing) before it goes anyway. The delegate flush then still gets
+    /// [`FLUSH_MIN_MS`], so a reload's waits total at most this plus that
+    /// (plus a clicked reload's settle period). A message still signing past
+    /// this (signing times out at 10 s) is lost to a clicked reload.
     const FLUSH_TIMEOUT_MS: u64 = 5_000;
 
     fn now_ms() -> u64 {
@@ -1094,6 +1101,12 @@ mod runtime {
             }
         }
         if matches!(document.query_selector("[id^=\"edit-msg-\"]"), Ok(Some(_))) {
+            return true;
+        }
+        // A message sent but not yet committed (still signing, or failed and
+        // shown for a retry): it lives only in memory, and the composer is
+        // already empty, so nothing above sees it. Held like a draft.
+        if crate::components::conversation::outbox_has_unsent() {
             return true;
         }
         if let Ok(overlays) = document.query_selector_all(".fixed.inset-0") {
@@ -1323,10 +1336,25 @@ mod runtime {
             }
         }
         let deadline = now_ms() + FLUSH_TIMEOUT_MS;
-        while now_ms() < deadline && NEEDS_SYNC.try_read().map_or(true, |s| !s.is_empty()) {
+        // A message still being signed commits into NEEDS_SYNC, so wait for
+        // both. A failed one is not waited for (`outbox_has_signing`).
+        while now_ms() < deadline
+            && (NEEDS_SYNC.try_read().map_or(true, |s| !s.is_empty())
+                || crate::components::conversation::outbox_has_signing())
+        {
             crate::util::sleep(Duration::from_millis(250)).await;
         }
-        let remaining = deadline.saturating_sub(now_ms()).max(500);
+        // A send that committed during that wait gets its settle period too,
+        // within the deadline: `NEEDS_SYNC` clears when the update is queued,
+        // not sent.
+        let settle_end = (LAST_SYNC_MS.load(Ordering::SeqCst) + SETTLE_MS).min(deadline);
+        let wait = settle_end.saturating_sub(now_ms());
+        if wait > 0 {
+            crate::util::sleep(Duration::from_millis(wait)).await;
+        }
+        // The waits above may use the whole deadline; the delegate flush
+        // still gets a real budget of its own.
+        let remaining = deadline.saturating_sub(now_ms()).max(FLUSH_MIN_MS);
         let flush = Box::pin(crate::components::app::chat_delegate::flush_rooms_to_delegate());
         let timeout = Box::pin(crate::util::sleep(Duration::from_millis(remaining)));
         if let futures::future::Either::Right(_) = futures::future::select(flush, timeout).await {
@@ -2964,6 +2992,34 @@ mod tests {
             .rfind("process_rooms()")
             .expect("process_rooms before on_connected");
         assert!(rooms > connect);
+    }
+
+    #[test]
+    fn unsent_messages_hold_and_delay_a_reload() {
+        // The outbox is memory only: a reload loses what it holds, and the
+        // composer is already empty by then, so these are the only guards.
+        let code = crate::util::strip_comments(include_str!("generation_watch.rs"));
+        let busy_at = code
+            .find("fn user_is_busy() -> bool {")
+            .expect("user_is_busy");
+        let busy = &code[busy_at..busy_at + code[busy_at..].find("fn note_sync_queued").unwrap()];
+        assert!(
+            busy.contains("outbox_has_unsent()"),
+            "an unsent message must hold an automatic reload, as a draft does"
+        );
+        let flush_at = code.find("async fn reload_after_flush(").expect("flush");
+        let flush = &code[flush_at..];
+        let wait = flush
+            .find("outbox_has_signing()")
+            .expect("a clicked reload must wait for messages still signing");
+        let delegate = flush
+            .find("flush_rooms_to_delegate()")
+            .expect("delegate flush");
+        assert!(wait < delegate, "the signing wait comes before the flush");
+        assert!(
+            flush[..delegate].contains(".max(FLUSH_MIN_MS)"),
+            "the flush keeps a budget of its own after the waits"
+        );
     }
 
     /// `user_is_busy` finds the composers by these hooks. Renaming one would
