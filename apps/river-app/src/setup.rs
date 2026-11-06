@@ -105,11 +105,14 @@ impl Controller {
                 // that put Freenet somewhere River doesn't look may still be starting it.
                 NodeProbe::NotInstalled => {
                     ctl.set(Setup::Starting);
-                    ctl.wait_for_node(format!(
-                        "The installer finished, but no Freenet answered within {} seconds, \
-                         and River can't find where it was installed.",
-                        ctl.start_timeout.as_secs()
-                    ));
+                    ctl.wait_for_node(
+                        format!(
+                            "The installer finished, but no Freenet answered within {} \
+                             seconds, and River can't find where it was installed.",
+                            ctl.start_timeout.as_secs()
+                        ),
+                        true,
+                    );
                 }
                 NodeProbe::InstalledNotRunning => ctl.start_and_wait(),
             }
@@ -140,20 +143,27 @@ impl Controller {
         if let Err(e) = self.host.start() {
             return self.set(Setup::Failed(format!("Couldn't start Freenet: {e}")));
         }
-        self.wait_for_node(format!(
-            "Freenet was started but didn't answer within {} seconds.",
-            self.start_timeout.as_secs()
-        ));
+        self.wait_for_node(
+            format!(
+                "Freenet was started but didn't answer within {} seconds.",
+                self.start_timeout.as_secs()
+            ),
+            false,
+        );
     }
 
-    /// Poll until a node answers, or report `give_up` after the start timeout.
-    fn wait_for_node(&self, give_up: String) {
+    /// Poll until a node answers, or report `give_up` after the start timeout. With
+    /// `start_once_found`, an install that becomes visible while waiting is started.
+    fn wait_for_node(&self, give_up: String, start_once_found: bool) {
         let deadline = Instant::now() + self.start_timeout;
         while Instant::now() < deadline {
             match self.host.probe() {
                 NodeProbe::Running { version } => return self.set(Setup::Connected { version }),
                 NodeProbe::Outdated { running, minimum } => {
                     return self.set(outdated(running, minimum));
+                }
+                NodeProbe::InstalledNotRunning if start_once_found => {
+                    return self.start_and_wait();
                 }
                 NodeProbe::InstalledNotRunning | NodeProbe::NotInstalled => {}
             }
@@ -413,6 +423,17 @@ mod tests {
         let (seen, host) = drive(FakeHost::new(probes), Controller::install);
         assert_eq!(seen.last(), Some(&connected()));
         assert_eq!(host.starts.load(Ordering::SeqCst), 0, "nothing to start");
+
+        // The install becomes visible while River waits, but nothing runs: start it.
+        let probes = vec![
+            NodeProbe::NotInstalled,
+            NodeProbe::NotInstalled,
+            NodeProbe::InstalledNotRunning,
+            running(),
+        ];
+        let (seen, host) = drive(FakeHost::new(probes), Controller::install);
+        assert_eq!(seen.last(), Some(&connected()));
+        assert_eq!(host.starts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

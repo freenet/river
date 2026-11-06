@@ -48,8 +48,10 @@ fn record_installed_at(marker: &Path, binary: &Path, bytes: &[u8]) -> Result<(),
     Ok(())
 }
 
-/// Make a rename into `dir` durable, so after a crash the binary and River's record of it are
-/// both there or both not. Best effort, and only meaningful on Unix.
+/// Make a rename into `dir` durable. With the binary synced before its record is written,
+/// River's record never survives a crash without the binary. The reverse can happen (a crash
+/// between the two leaves a binary with no record, which River then treats as not its own).
+/// Best effort, and only meaningful on Unix.
 fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(d) = fs::File::open(dir) {
@@ -306,10 +308,13 @@ fn copy_app_from(mount: &Path, dest_dir: &Path) -> Result<(), String> {
         return Err("the disk image has no Freenet.app in it".into());
     }
     let dest = dest_dir.join("Freenet.app");
-    // `symlink_metadata`, not `exists`: a dangling symlink, which `exists` misses, would be
-    // replaced by the rename below.
+    // `symlink_metadata`, not `exists`: `exists` misses a dangling symlink, and River would
+    // then offer to install and fail with an unclear error from the rename below.
     if fs::symlink_metadata(&dest).is_ok() {
-        return Err(format!("{} already exists", dest.display()));
+        return Err(format!(
+            "{} already exists but isn't a Freenet River can open. Remove it, then try again.",
+            dest.display()
+        ));
     }
     let staging = private_dir(".Freenet.app.river-")
         .tempdir_in(dest_dir)
@@ -517,7 +522,7 @@ mod tests {
             b"plist"
         );
         let err = copy_app_from(mount.path(), apps.path()).unwrap_err();
-        assert!(err.ends_with("already exists"), "{err}");
+        assert!(err.contains("already exists"), "{err}");
         let names: Vec<_> = fs::read_dir(apps.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -526,6 +531,19 @@ mod tests {
             names,
             vec!["Freenet.app"],
             "staging directories are removed"
+        );
+
+        // A dangling symlink where the app would go is refused, and left as it was.
+        let other_apps = tempfile::tempdir().unwrap();
+        let dangling = other_apps.path().join("Freenet.app");
+        std::os::unix::fs::symlink(other_apps.path().join("gone"), &dangling).unwrap();
+        let err = copy_app_from(mount.path(), other_apps.path()).unwrap_err();
+        assert!(err.contains("Remove it"), "{err}");
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
@@ -580,24 +598,44 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_record_write_leaves_the_previous_record_whole() {
+    fn a_failed_record_write_leaves_no_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
         let ours = dir.path().join("freenet");
-        fs::write(&ours, b"river's bytes").unwrap();
-        let marker = dir.path().join("state/installed-freenet");
-        record_installed_at(&marker, &ours, b"river's bytes").unwrap();
-
-        // The rename onto the record can't happen (a directory took its place): the write
-        // fails, and what was recorded before is untouched, not torn.
-        let blocked = dir.path().join("state/blocked");
+        // The final rename can't happen (a directory is where the record goes).
+        let blocked = dir.path().join("state/installed-freenet");
         fs::create_dir_all(blocked.join("in-use")).unwrap();
-        assert!(record_installed_at(&blocked, &ours, b"other bytes").is_err());
-        assert!(was_installed_at(&marker, &ours));
+        assert!(record_installed_at(&blocked, &ours, b"bytes").is_err());
         let left: Vec<_> = fs::read_dir(dir.path().join("state"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(left.len(), 2, "no temporary record left behind: {left:?}");
+        assert_eq!(left, vec!["installed-freenet"], "no temporary record left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rewrite_of_a_record_leaves_it_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("freenet");
+        fs::write(&ours, b"river's bytes").unwrap();
+        let state = dir.path().join("state");
+        let marker = state.join("installed-freenet");
+        record_installed_at(&marker, &ours, b"river's bytes").unwrap();
+        let before = fs::read(&marker).unwrap();
+
+        // Writing a new record into the same place fails (its directory is read-only). The
+        // old record must be exactly as it was: an in-place write could have truncated it.
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+        let probe_blocked = fs::write(state.join("probe"), b"").is_err();
+        let result = record_installed_at(&marker, &ours, b"other bytes");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        if !probe_blocked {
+            return; // Running as root: permissions don't stop the write, nothing to test.
+        }
+        assert!(result.is_err());
+        assert_eq!(fs::read(&marker).unwrap(), before);
+        assert!(was_installed_at(&marker, &ours));
     }
 
     #[test]

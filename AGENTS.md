@@ -237,6 +237,12 @@ Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders
 without a GPU need a software Vulkan driver (`mesa-vulkan-drivers`, then point
 `VK_ICD_FILENAMES` at its `lvp_icd*.json`).
 
+**When releasing the desktop app**, raise `MIN_VERSION` in
+`apps/desktop/src/release.rs` to the current Freenet release. It is the oldest
+Freenet the installer will install, and the only thing stopping someone who
+can edit GitHub releases (but not sign them) from steering new users to an old
+signed release.
+
 ## Share Links in Messages
 
 Freenet share links in message text (`https://freenet.org/open#<id>…`,
@@ -279,10 +285,12 @@ under `common/src/room_state/`, `common/src/key_derivation.rs`,
 
 Changes to delegate or contract WASM (anything under `delegates/`,
 `contracts/`, or `common/`, plus most changes to the root
-Cargo.toml/Cargo.lock) alter the delegate/contract key. `apps/` has its own
-Cargo.toml and Cargo.lock, which cannot (while `apps/` depends on no crate in
-the root workspace; see the note in `apps/Cargo.toml`). Without a migration entry, **users lose
-all room data**.
+Cargo.toml/Cargo.lock) alter the delegate/contract key. Without a migration
+entry, **users lose all room data**.
+
+Changes to `apps/Cargo.toml` and `apps/Cargo.lock` cannot alter the key while
+`apps/` depends on no crate in the root workspace (see the note in
+`apps/Cargo.toml`).
 
 The full workflow — `cargo make add-migration` BEFORE rebuilding, the
 two single-source-of-truth TOMLs, CI validation, and the key files —

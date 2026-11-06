@@ -186,22 +186,20 @@ impl Runner for SystemRunner {
 
 /// Start the node from a `freenet` binary with `freenet service start`.
 ///
-/// If that fails and River installed this copy (recorded when it installed it, and dropped
-/// once a service exists), River registers the service, as freenet-core's own installer
-/// would. While River's record remains, that includes finishing a registration that stopped
-/// part-way (freenet-core writes the unit file before reloading and enabling it), so a retry
-/// can complete it; `service install` is safe to repeat. Any other registered service that
-/// fails to start is reported, never registered again, checking the user unit first as
-/// freenet-core does. Any copy River didn't install belongs to whoever installed it, and
-/// River only reports why it didn't start.
+/// River registers a service (`freenet service install`, as freenet-core's own installer
+/// would) only when no service unit exists at all and River installed this copy, as recorded
+/// when it installed it. River never runs `service install` over an existing unit: freenet-core
+/// rewrites the unit file unconditionally, which would replace one the user wrote or edited.
+/// Any registered service that fails to start is reported with what to do next, checking the
+/// user unit first as freenet-core does. Any copy River didn't install belongs to whoever
+/// installed it, and River only reports why it didn't start.
 ///
 /// River never runs the node outside a service manager: a bare `freenet network` stops for
 /// good the first time it finds an update, because nothing is there to apply it and restart.
 ///
-/// `done_with_record` runs once River's copy has a service (River registered it, or a start
-/// shows one exists), so River's record of its install can be dropped: from then on the
-/// binary is started like any other, and if the user later removes the service, River
-/// doesn't put it back.
+/// `done_with_record` runs when a start works or River has registered a service, so River's
+/// record of its install can be dropped: from then on the binary is started like any other,
+/// and if the user later removes the service, River doesn't put it back.
 fn start_binary(
     bin: &Path,
     runner: &dyn Runner,
@@ -217,37 +215,31 @@ fn start_binary(
         }
         Err(e) => e,
     };
-    // freenet-core uses the user unit when there is one, so a system unit only matters alone.
-    if services.system && !services.user {
+    // freenet-core uses the user unit when there is one, so check it first.
+    if services.user {
+        return Err(user_service_failed(&first, services.system));
+    }
+    if services.system {
         return Err(format!(
             "Freenet's system service didn't start ({first}). Start it with \
              `sudo systemctl start freenet`, then try again."
         ));
     }
-    let ours = installed_by_river();
-    if services.user && !ours {
-        let check = if cfg!(target_os = "linux") {
-            " See why with `systemctl --user status freenet`, then try again."
-        } else {
-            ""
-        };
-        return Err(format!(
-            "Freenet's background service didn't start ({first}).{check}"
-        ));
-    }
-    if !ours {
+    // Asked only now: it hashes the binary.
+    if !installed_by_river() {
         return Err(format!(
             "the Freenet at {} didn't start ({first}). Start it yourself, then try again.",
             bin.display()
         ));
     }
     runner.run(bin, &["service", "install"]).map_err(|e| {
-        // freenet-core's own advice when a user service can't run. Never a bare
-        // `freenet network`: that stops for good the first time it finds an update.
+        // Never suggest a bare `freenet network`: it stops for good at its first update.
         let hint = if cfg!(target_os = "linux") {
             format!(
-                " Without a systemd user session, set it up for the whole system with \
-                 `sudo {} service install --system`, then try again.",
+                " Without a systemd user session, remove the user unit it may have left \
+                 (`rm ~/.config/systemd/user/freenet.service`), set Freenet up for the whole \
+                 system with `sudo {} service install --system`, start it with `sudo \
+                 systemctl start freenet`, then try again.",
                 bin.display()
             )
         } else {
@@ -259,6 +251,27 @@ fn start_binary(
     runner
         .run(bin, &["service", "start"])
         .map_err(|e| format!("Freenet's service was set up but didn't start: {e}"))
+}
+
+/// What to say when the user service exists but didn't start. freenet-core prefers the user
+/// unit, so a system unit next to it is ignored until the user unit is removed.
+fn user_service_failed(first: &str, system_unit_too: bool) -> String {
+    if !cfg!(target_os = "linux") {
+        return format!("Freenet's background service didn't start ({first}).");
+    }
+    let mut message = format!(
+        "Freenet's background service didn't start ({first}). See why with \
+         `systemctl --user status freenet`."
+    );
+    if system_unit_too {
+        message.push_str(
+            " There is also a system service, which Freenet won't use while the user one \
+             exists. To use it instead, remove `~/.config/systemd/user/freenet.service` and \
+             run `sudo systemctl start freenet`.",
+        );
+    }
+    message.push_str(" Then try again.");
+    message
 }
 
 #[derive(Debug)]
@@ -440,53 +453,54 @@ mod tests {
     }
 
     #[test]
-    fn a_registered_service_that_fails_is_reported_not_registered_again() {
-        let r = FakeRunner::failing(&["service start"]);
-        let (result, dropped) = start(&r, false, USER);
-        let err = result.unwrap_err();
-        assert_eq!(r.calls(), vec!["service start"]);
-        assert!(err.contains("background service didn't start"), "{err}");
-        assert!(
-            err.contains("service start failed"),
-            "the real error is kept: {err}"
-        );
-        if cfg!(target_os = "linux") {
-            assert!(err.contains("systemctl --user status freenet"), "{err}");
+    fn a_registered_service_that_fails_is_reported_never_registered_again() {
+        // Whoever installed the binary, River never runs `service install` over an existing
+        // unit: freenet-core rewrites the unit file, which could replace one the user edited.
+        for ours in [false, true] {
+            let r = FakeRunner::failing(&["service start"]);
+            let (result, dropped) = start(&r, ours, USER);
+            let err = result.unwrap_err();
+            assert_eq!(r.calls(), vec!["service start"], "ours = {ours}");
+            assert!(err.contains("background service didn't start"), "{err}");
+            assert!(
+                err.contains("service start failed"),
+                "the real error is kept: {err}"
+            );
+            if cfg!(target_os = "linux") {
+                assert!(err.contains("systemctl --user status freenet"), "{err}");
+            }
+            assert_eq!(dropped, 0);
         }
-        assert_eq!(dropped, 0);
     }
 
     #[test]
-    fn a_registration_river_started_but_didnt_finish_is_finished() {
-        // freenet-core wrote the unit file, then reloading systemd failed. River's record is
-        // still there, so a retry registers again rather than giving up on the unit file.
-        let r = FakeRunner::failing(&["service start"]);
-        let (result, dropped) = start(&r, true, USER);
-        result.unwrap();
-        assert_eq!(
-            r.calls(),
-            vec!["service start", "service install", "service start"]
-        );
-        assert_eq!(dropped, 1);
-    }
-
-    #[test]
-    fn a_user_unit_comes_before_a_system_unit() {
-        // With both, freenet-core uses the user unit: so does the advice.
+    fn a_leftover_user_unit_beside_a_system_unit_gets_a_way_out() {
+        // A user install that failed part-way (no user session) left a user unit; the user
+        // then set up the system service. freenet-core still picks the user unit, so the
+        // advice must say to remove it, and River must not touch either unit.
         let both = Services {
             user: true,
             system: true,
         };
-        let r = FakeRunner::failing(&["service start"]);
-        let err = start(&r, false, both).0.unwrap_err();
-        assert!(err.contains("background service"), "{err}");
-        assert!(!err.contains("sudo systemctl"), "{err}");
+        for ours in [false, true] {
+            let r = FakeRunner::failing(&["service start"]);
+            let err = start(&r, ours, both).0.unwrap_err();
+            assert_eq!(r.calls(), vec!["service start"], "ours = {ours}");
+            if cfg!(target_os = "linux") {
+                assert!(
+                    err.contains("rm ~/.config/systemd/user/freenet.service")
+                        || err.contains("remove `~/.config/systemd/user/freenet.service`"),
+                    "{err}"
+                );
+                assert!(err.contains("sudo systemctl start freenet"), "{err}");
+            }
+        }
     }
 
     #[test]
     fn whether_river_owns_the_binary_is_only_asked_when_needed() {
         // Asking hashes a 66 MB file, so it is skipped when the answer can't matter: a start
-        // that works, or a system service on its own.
+        // that works, or any registered service.
         let asked = std::cell::Cell::new(false);
         let ours = || {
             asked.set(true);
@@ -494,9 +508,10 @@ mod tests {
         };
         let r = FakeRunner::failing(&[]);
         start_binary(Path::new(BIN), &r, &ours, NONE, &mut || {}).unwrap();
-        assert!(!asked.get());
-        let r = FakeRunner::failing(&["service start"]);
-        assert!(start_binary(Path::new(BIN), &r, &ours, SYSTEM, &mut || {}).is_err());
+        for services in [SYSTEM, USER] {
+            let r = FakeRunner::failing(&["service start"]);
+            assert!(start_binary(Path::new(BIN), &r, &ours, services, &mut || {}).is_err());
+        }
         assert!(!asked.get());
     }
 
@@ -701,8 +716,20 @@ mod tests {
         let missing = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
         assert_eq!(ask(&agent, &serve_once(missing)), Answer::NoVersion);
         // A proxy in front of a node that isn't up yet answers 502-504: not ready, not outdated.
-        let starting = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
-        assert_eq!(ask(&agent, &serve_once(starting)), Answer::Nothing);
+        for status in [
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
+        ] {
+            let response: &'static str = Box::leak(
+                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n").into_boxed_str(),
+            );
+            assert_eq!(
+                ask(&agent, &serve_once(response)),
+                Answer::Nothing,
+                "{status}"
+            );
+        }
         // Freenet never answers its version endpoint with these, so whatever does isn't a
         // usable Freenet and is reported rather than waited on.
         let auth = "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n";
