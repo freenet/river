@@ -220,8 +220,9 @@ fn start_binary(
         Err(e) => e,
     };
     if services.user || services.system {
-        // A service exists, however it got there: River will never register one for this
-        // binary, so its record has done its job.
+        // A service unit exists, however it got there, and River never registers over one,
+        // so its record has done its job. If the user later deletes the unit, River treats the
+        // binary like any other (it reports why it didn't start rather than registering).
         done_with_record();
     }
     // freenet-core uses the user unit when there is one, so check it first.
@@ -261,10 +262,10 @@ fn start_binary(
 /// update, with nothing to apply it and restart.
 fn no_user_session_recipe(bin: &Path) -> String {
     format!(
-        "If there is no systemd user session here (so that command fails too), remove \
-         `~/.config/systemd/user/freenet.service`, set Freenet up for the whole system with \
-         `sudo {} service install --system`, start it with `sudo systemctl start freenet`, \
-         then try again. Freenet needs systemd on Linux.",
+        "If `systemctl --user` can't connect (there is no systemd user session here), remove \
+         `~/.config/systemd/user/freenet.service` if it exists, set Freenet up for the whole \
+         system with `sudo \"{}\" service install --system`, start it with `sudo systemctl \
+         start freenet`, then try again. Freenet needs systemd on Linux.",
         bin.display()
     )
 }
@@ -372,19 +373,26 @@ fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String
     if status.success() {
         return Ok(());
     }
-    // The end of the output is where the error is.
+    // The error is near the end of the output.
     const TAIL: u64 = 64 * 1024;
     let len = stderr.seek(SeekFrom::End(0)).unwrap_or(0);
     let _ = stderr.seek(SeekFrom::Start(len.saturating_sub(TAIL)));
     let mut tail = Vec::new();
     let _ = stderr.take(TAIL).read_to_end(&mut tail);
     let tail = String::from_utf8_lossy(&tail);
-    let detail = tail
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("no error output");
-    Err(format!("{} failed: {detail}", describe(cmd)))
+    Err(format!("{} failed: {}", describe(cmd), error_line(&tail)))
+}
+
+/// The line of a failed command's stderr that says what went wrong. freenet-core prints
+/// `Error: ...` followed by hint lines (`Hint:`, `Try: ...`), so its last `Error:` line is the
+/// cause; anything else reports its last line.
+fn error_line(output: &str) -> &str {
+    let lines = || output.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines()
+        .filter_map(|l| l.strip_prefix("Error:").map(str::trim))
+        .rfind(|l| !l.is_empty())
+        .or_else(|| lines().next_back())
+        .unwrap_or("no error output")
 }
 
 /// Windows: don't flash a console window for a console program run from River.
@@ -490,7 +498,7 @@ mod tests {
                     "{err}"
                 );
                 assert!(
-                    err.contains(&format!("`sudo {BIN} service install --system`")),
+                    err.contains(&format!("`sudo \"{BIN}\" service install --system`")),
                     "{err}"
                 );
                 assert!(err.contains("sudo systemctl start freenet"), "{err}");
@@ -514,7 +522,9 @@ mod tests {
         };
         for ours in [false, true] {
             let r = FakeRunner::failing(&["service start"]);
-            let err = start(&r, ours, both).0.unwrap_err();
+            let (result, dropped) = start(&r, ours, both);
+            let err = result.unwrap_err();
+            assert_eq!(dropped, 1, "a unit exists, so the record goes");
             assert_eq!(r.calls(), vec!["service start"], "ours = {ours}");
             if cfg!(target_os = "linux") {
                 assert!(err.contains("also a system service"), "{err}");
@@ -600,7 +610,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(registered, 1);
 
-        // Registration fails: the record stays, so a retry can register.
+        // Registration fails before writing a unit: the record stays, so a retry with still
+        // no unit can register. (When freenet-core got as far as writing the unit, the retry
+        // sees it and reports it instead; River never registers over a unit.)
         let r = FakeRunner::failing(&["service start", "service install"]);
         assert_eq!(start(&r, true, NONE).1, 0);
     }
@@ -622,7 +634,7 @@ mod tests {
                 "{err}"
             );
             assert!(
-                err.contains(&format!("`sudo {BIN} service install --system`")),
+                err.contains(&format!("`sudo \"{BIN}\" service install --system`")),
                 "{err}"
             );
             assert!(err.contains("sudo systemctl start freenet"), "{err}");
@@ -652,7 +664,9 @@ mod tests {
     #[test]
     fn a_stopped_system_service_is_left_to_the_administrator() {
         let r = FakeRunner::failing(&["service start"]);
-        let err = start(&r, true, SYSTEM).0.unwrap_err();
+        let (result, dropped) = start(&r, true, SYSTEM);
+        let err = result.unwrap_err();
+        assert_eq!(dropped, 1, "a unit exists, so the record goes");
         assert!(err.contains("sudo systemctl start freenet"), "{err}");
         assert!(
             err.contains("service start failed"),
@@ -692,6 +706,11 @@ mod tests {
         ));
         assert!(matches!(
             classify(version(format!("{newer}+build.7")), true),
+            NodeProbe::Running { .. }
+        ));
+        // ...and doesn't push a newer version below it either.
+        assert!(matches!(
+            classify(version(format!("{newer}-rc.1")), true),
             NodeProbe::Running { .. }
         ));
         // A pre-release of the floor itself comes before it; build metadata doesn't.
@@ -806,6 +825,20 @@ mod tests {
         assert_eq!(on_path("freenet", &path), Some(dir.path().join("freenet")));
         let only_relative = std::env::join_paths([Path::new("."), Path::new("")]).unwrap();
         assert_eq!(on_path("freenet", &only_relative), None);
+    }
+
+    #[test]
+    fn the_reported_line_is_the_error_not_a_trailing_hint() {
+        // How freenet-core fails: the cause, then hint lines.
+        let freenet = "Error: Failed to reload systemd\n\nHint: User systemd session not \
+                       available\nTry: sudo freenet service install --system\n";
+        assert_eq!(error_line(freenet), "Failed to reload systemd");
+        // Several: the last one, which is the most specific.
+        assert_eq!(error_line("Error: outer\nError: inner\nHint: x\n"), "inner");
+        // Anything else: its last line.
+        assert_eq!(error_line("first\nboom\n\n"), "boom");
+        assert_eq!(error_line(""), "no error output");
+        assert_eq!(error_line("Error:\nreal problem\n"), "real problem");
     }
 
     #[cfg(unix)]

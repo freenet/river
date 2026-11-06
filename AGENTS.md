@@ -247,6 +247,11 @@ days, and raising it early tells people with a working node that theirs is
 too old. The tests derive from both constants, so raising either needs no
 test changes.
 
+The installer ties a release's signed checksums to its tag by finding
+`Freenet-<version>.dmg` in them, on every platform (`check_manifest_version`
+in `release.rs`). If freenet-core ever stops shipping that DMG, River refuses
+every release until that check changes.
+
 ## Share Links in Messages
 
 Freenet share links in message text (`https://freenet.org/open#<id>…`,

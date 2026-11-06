@@ -122,7 +122,7 @@ pub fn install(
     if asset.ends_with(".tar.gz") {
         progress(InstallStep::Installing);
         let dest = binary_install_path().ok_or("couldn't find your home directory")?;
-        let marker = marker_path().ok_or("couldn't find your home directory")?;
+        let marker = marker_path().ok_or("couldn't find a folder for River's data")?;
         install_and_record(&extract_freenet(bytes)?, &dest, &marker)
     } else if asset.ends_with(".dmg") {
         progress(InstallStep::Installing);
@@ -203,8 +203,9 @@ fn install_binary(binary: &[u8], dest: &Path) -> Result<Placed, String> {
     }
 }
 
-/// The `freenet` executable from a release tarball. Only that one regular file is read, so
-/// the archive's paths are never used to write anywhere.
+/// The `freenet` executable from a release tarball: the regular file `freenet` at its top
+/// level, where freenet-core's release job puts it. Only that one file is read, so the
+/// archive's paths are never used to write anywhere.
 fn extract_freenet(tarball: &[u8]) -> Result<Vec<u8>, String> {
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
     for entry in archive
@@ -215,7 +216,13 @@ fn extract_freenet(tarball: &[u8]) -> Result<Vec<u8>, String> {
         let is_freenet = entry
             .path()
             .ok()
-            .and_then(|p| p.file_name().map(|n| n == "freenet"))
+            .map(|p| {
+                let parts: Vec<_> = p
+                    .components()
+                    .filter(|c| !matches!(c, std::path::Component::CurDir))
+                    .collect();
+                parts.len() == 1 && parts[0].as_os_str() == "freenet"
+            })
             .unwrap_or(false);
         if is_freenet && entry.header().entry_type().is_file() {
             let mut binary = Vec::new();
@@ -478,12 +485,20 @@ mod tests {
     }
 
     #[test]
-    fn finds_freenet_inside_a_directory_but_not_a_lookalike_or_a_directory() {
+    fn takes_only_a_top_level_freenet_file() {
+        // The release layout: `freenet` at the top (checked against v0.2.155's tarball).
+        assert_eq!(
+            extract_freenet(&tarball(&[("./freenet", FILE, b"yes")])).unwrap(),
+            b"yes"
+        );
+        // A file of the same name deeper down, listed first, is not the binary.
         let archive = tarball(&[
-            ("freenet-x/freenet-helper", FILE, b"no"),
-            ("freenet-x/freenet", FILE, b"yes"),
+            ("share/doc/freenet", FILE, b"no"),
+            ("freenet-helper", FILE, b"no"),
+            ("freenet", FILE, b"yes"),
         ]);
         assert_eq!(extract_freenet(&archive).unwrap(), b"yes");
+        assert!(extract_freenet(&tarball(&[("dir/freenet", FILE, b"no")])).is_err());
         assert!(extract_freenet(&tarball(&[("fdev", FILE, b"no")])).is_err());
         assert!(extract_freenet(&tarball(&[("freenet", tar::EntryType::Directory, b"")])).is_err());
     }
