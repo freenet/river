@@ -71,11 +71,7 @@ pub fn install(
         progress(InstallStep::Installing);
         let dest = binary_install_path().ok_or("couldn't find your home directory")?;
         let marker = marker_path().ok_or("couldn't find your home directory")?;
-        let binary = extract_freenet(bytes)?;
-        // Record first: a marker for a binary that then fails to install is harmless, but a
-        // binary River can't later show it installed would never get a service.
-        record_installed_at(&marker, &dest)?;
-        install_binary(&binary, &dest)
+        install_and_record(&extract_freenet(bytes)?, &dest, &marker)
     } else if asset.ends_with(".dmg") {
         progress(InstallStep::Installing);
         install_mac_app(bytes)
@@ -85,6 +81,18 @@ pub fn install(
     } else {
         Err(format!("don't know how to install {asset}"))
     }
+}
+
+/// Install the binary, then record that River installed it. The record comes second so it
+/// never names a binary River didn't install (a later manual install at the same path would
+/// otherwise count as River's). If recording fails, the binary is removed again: River only
+/// installs where nothing was installed, and a binary it can't show it installed would never
+/// get a service. Either way a retry starts clean.
+fn install_and_record(binary: &[u8], dest: &Path, marker: &Path) -> Result<(), String> {
+    install_binary(binary, dest)?;
+    record_installed_at(marker, dest).inspect_err(|_| {
+        let _ = fs::remove_file(dest);
+    })
 }
 
 /// Linux: put `freenet` at `dest`. Registering it as a service is left to starting it
@@ -322,11 +330,14 @@ fn run_installer(
 fn spawn_installer(installer: &Path) -> std::io::Result<std::process::Child> {
     let mut attempts = 0;
     loop {
-        let spawned = Command::new(installer)
-            .stdin(Stdio::null())
+        let mut cmd = Command::new(installer);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        // `freenet.exe` is a console program: without this, Windows opens a console window
+        // behind the wizard. The wizard's own window is unaffected.
+        crate::host::no_console_window(&mut cmd);
+        let spawned = cmd.spawn();
         match spawned {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
                 attempts += 1;
@@ -475,6 +486,28 @@ mod tests {
         let path = a.path().to_path_buf();
         drop(a);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_install_is_recorded_only_when_it_succeeds_and_undone_if_recording_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("bin/freenet");
+        let marker = dir.path().join("state/installed-freenet");
+        install_and_record(b"binary", &dest, &marker).unwrap();
+        assert!(dest.exists() && was_installed_at(&marker, &dest));
+
+        // The binary can't be installed: nothing is recorded.
+        let blocked = dir.path().join("not-a-dir");
+        fs::write(&blocked, b"").unwrap();
+        let other_marker = dir.path().join("state/other-marker");
+        assert!(install_and_record(b"binary", &blocked.join("freenet"), &other_marker).is_err());
+        assert!(!other_marker.exists());
+
+        // The record can't be written (its directory is a file): the binary is removed again.
+        let dest2 = dir.path().join("bin2/freenet");
+        let bad_marker = blocked.join("marker");
+        assert!(install_and_record(b"binary", &dest2, &bad_marker).is_err());
+        assert!(!dest2.exists(), "a binary River can't record is removed");
     }
 
     #[test]
