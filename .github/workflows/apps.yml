@@ -2,7 +2,9 @@ name: Native apps
 
 # River's native apps (apps/) are a separate Cargo workspace with their own
 # lockfile and toolchain pin, so build.yml never compiles them. This workflow
-# does: format, clippy, unit tests, and a headless render of every setup screen.
+# does: format, clippy, unit tests, and a headless render of every screen
+# (setup and chat). river-app compiles in ui/assets/river_logo.svg, so that
+# file is in both path lists too.
 #
 # GitHub-hosted ubuntu-latest, which is free on this public repo (see the
 # runs-on comment in build.yml for why larger runners are not used).
@@ -13,11 +15,13 @@ on:
   pull_request:
     paths:
       - 'apps/**'
+      - 'ui/assets/river_logo.svg'
       - '.github/workflows/apps.yml'
   push:
     branches: [main]
     paths:
       - 'apps/**'
+      - 'ui/assets/river_logo.svg'
       - '.github/workflows/apps.yml'
   workflow_dispatch:
 
@@ -109,7 +113,9 @@ jobs:
           test -n "$scenes"
           for scene in $scenes; do
             # A scene cannot set the window size, so the narrow-layout scenes
-            # get it here (see SCENES in apps/river-app/src/lib.rs).
+            # get it here. Keep this equal to NARROW_SCENE_SIZE in
+            # apps/river-app/src/lib.rs, whose scene_size() makes the same
+            # choice and is what the narrow_scenes_are_named_narrow test checks.
             size=()
             case "$scene" in *narrow*) size=(--size 820x720) ;; esac
             ./target/debug/river --snap "snapshots/$scene.png" --scene "$scene" --scale 2 "${size[@]}"

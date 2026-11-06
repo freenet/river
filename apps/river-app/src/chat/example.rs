@@ -5,12 +5,14 @@
 //! part of the conversation view (groups, a reply, reactions, a long wrapping message, a link,
 //! an edit).
 
-use super::model::{Member, MemberId, Message, Reaction, ReplyTo, Role, Room};
+use super::model::{self, Member, MemberId, Message, Reaction, ReplyTo, Role, Room};
 
 pub struct ExampleData {
     pub rooms: Vec<Room>,
     /// The day number the example treats as today.
     pub today: u32,
+    /// The date of day 0, in days since 1970-01-01: today is Friday 6 November 2026.
+    pub day_zero: i64,
     /// The time stamped on a message sent now.
     pub now: u32,
 }
@@ -84,14 +86,15 @@ impl MessageExt for Message {
     }
 }
 
-// Member ids, shared across rooms so one person keeps one avatar colour.
-const ME: MemberId = 11;
+// Member ids, shared across rooms so one person keeps one avatar colour. They are chosen so
+// the seven people get seven different hues (see `style::avatar_colors`).
+const ME: MemberId = 21;
 const MAYA: MemberId = 12;
-const JONAS: MemberId = 13;
-const PRIYA: MemberId = 14;
+const JONAS: MemberId = 30;
+const PRIYA: MemberId = 27;
 const TOMAS: MemberId = 15;
 const ELENA: MemberId = 16;
-const KWAME: MemberId = 17;
+const KWAME: MemberId = 19;
 
 fn town_square() -> Room {
     let mut b = Builder::new();
@@ -240,7 +243,7 @@ fn rust_help() -> Room {
         ],
         messages: b.messages,
         me: ME,
-        unread: 5,
+        unread: 2,
     }
 }
 
@@ -290,6 +293,7 @@ pub fn data() -> ExampleData {
             book_club(),
         ],
         today: TODAY,
+        day_zero: model::days_from_civil(2026, 11, 6) - TODAY as i64,
         now: at(TODAY, 10, 14),
     }
 }

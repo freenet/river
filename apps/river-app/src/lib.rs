@@ -32,16 +32,24 @@ struct Logo {
     image: rune::image::Image,
 }
 
-/// The web UI's logo, so both apps carry the same mark.
+/// The web UI's logo, so both apps carry the same mark. It is shared: an edit to it changes
+/// this app too, which is why `apps.yml` runs for that file.
 const LOGO_SVG: &[u8] = include_bytes!("../../../ui/assets/river_logo.svg");
+const LOGO_PATH: &str = "ui/assets/river_logo.svg";
+/// The logo's largest drawn size in points (the setup card's), and the scale it rasterizes at.
+const LOGO_PT: f32 = 48.0;
+const LOGO_SCALE: f32 = 2.0;
 
 /// `AppSpec::setup`: start rasterizing the logo on the image cache's worker. A headless run
-/// (`--snap`) waits for it, so snapshots show it.
+/// (`--snap`) waits for it, so snapshots show it, and fails if it does not rasterize, so a
+/// broken logo stops CI's render step instead of rendering as an empty square.
 fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
     let cache = rune::image::ImageCache::new(waker);
-    let image = cache.svg(LOGO_SVG, 48.0, 2.0);
-    if rune::is_headless() {
-        let _ = image.wait();
+    let image = cache.svg(LOGO_SVG, LOGO_PT, LOGO_SCALE);
+    if rune::is_headless()
+        && let Err(e) = image.wait()
+    {
+        panic!("River's logo ({LOGO_PATH}) did not rasterize: {e}");
     }
     s.logo = Some(Logo {
         _cache: cache,
@@ -158,6 +166,19 @@ fn connect(s: &mut RiverApp) {
 /// members panel side by side.
 pub const WINDOW_SIZE: (f32, f32) = (1280.0, 800.0);
 
+/// The size the `*narrow*` scenes are rendered at. `.github/workflows/apps.yml` passes it as
+/// `--size 820x720`; keep the two in step.
+pub const NARROW_SCENE_SIZE: (f32, f32) = (820.0, 720.0);
+
+/// The window size a scene is meant to be rendered at.
+pub fn scene_size(name: &str) -> (f32, f32) {
+    if name.contains("narrow") {
+        NARROW_SCENE_SIZE
+    } else {
+        WINDOW_SIZE
+    }
+}
+
 pub fn spec() -> AppSpec<RiverApp> {
     AppSpec {
         scenes: SCENES,
@@ -217,7 +238,8 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
         ),
         Setup::Installing(step) => {
             let (title, fraction) = install_progress(step);
-            panel(t, title, "This only happens once.", fraction, vec![])
+            let progress = fraction.map(|f| (f, download_detail(step)));
+            panel(t, title, "This only happens once.", progress, vec![])
         }
         Setup::Starting => panel(
             t,
@@ -233,7 +255,7 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
             None,
             vec![retry_button(&k), manual_install_button(&k)],
         ),
-        Setup::Connected { version } => return chat::view(&s.chat, version, logo, cx),
+        Setup::Connected { .. } => return chat::view(&s.chat, logo, cx),
     };
     col()
         .key("root")
@@ -265,12 +287,35 @@ fn install_progress(step: &InstallStep) -> (&'static str, Option<f32>) {
     }
 }
 
+/// "9.4 of 23.4 MB" under the download bar, when the download's size is known.
+fn download_detail(step: &InstallStep) -> Option<String> {
+    let InstallStep::Downloading {
+        received,
+        total: Some(total),
+    } = step
+    else {
+        return None;
+    };
+    let mb = |b: u64| b as f64 / 1_000_000.0;
+    Some(format!(
+        "{:.1} of {:.1} MB",
+        mb((*received).min(*total)),
+        mb(*total)
+    ))
+}
+
 /// The setup card's inner width.
 const PANEL_W: f32 = 380.0;
+/// The card's least height. With it every step's card is the same height, so the card, which
+/// is centred, keeps its top (and the logo) still as setup moves from step to step.
+const PANEL_MIN_H: f32 = 276.0;
 
 type Look<'a> = (&'a chat::style::Palette, Option<&'a rune::Pixels>);
 
-fn panel(t: Look, title: &str, body: &str, progress: Option<f32>, actions: Vec<El>) -> El {
+/// A progress bar's fraction, and the text under it.
+type Progress = Option<(f32, Option<String>)>;
+
+fn panel(t: Look, title: &str, body: &str, progress: Progress, actions: Vec<El>) -> El {
     let (p, logo) = t;
     let mark = match logo {
         Some(px) => el().size(36.0, 36.0).pixels(px),
@@ -279,6 +324,7 @@ fn panel(t: Look, title: &str, body: &str, progress: Option<f32>, actions: Vec<E
     let mut card = col()
         .key("panel")
         .w(PANEL_W + 64.0)
+        .min_h(PANEL_MIN_H)
         .padding(32.0)
         .gap(12.0)
         .radius(16.0)
@@ -310,8 +356,16 @@ fn panel(t: Look, title: &str, body: &str, progress: Option<f32>, actions: Vec<E
                 .wrap()
                 .w_full(),
         );
-    if let Some(fraction) = progress {
+    if let Some((fraction, detail)) = progress {
         card = card.child(progress_bar(p, fraction));
+        if let Some(detail) = detail {
+            card = card.child(
+                text(detail)
+                    .key("progress-detail")
+                    .font(chat::style::SMALL)
+                    .color(p.text_muted),
+            );
+        }
     }
     if !actions.is_empty() {
         let mut buttons = row().key("actions").gap(8.0).mt(10.0).flex_wrap();
@@ -540,5 +594,31 @@ mod tests {
         covered.sort();
         covered.dedup();
         assert_eq!(covered.len(), 10, "{covered:?}");
+    }
+
+    /// The logo is a gradient SVG shared with the web UI; this fails if an edit there breaks
+    /// it for the native renderer.
+    #[test]
+    fn the_logo_rasterizes() {
+        let cache = rune::image::ImageCache::new(std::sync::Arc::new(|| {}));
+        let image = cache.svg(LOGO_SVG, LOGO_PT, LOGO_SCALE);
+        let [w, h] = image.wait().expect("the logo rasterizes");
+        let px = (LOGO_PT * LOGO_SCALE) as u32;
+        assert!(w > px / 2 && h > px / 2 && w <= px && h <= px, "{w}x{h}");
+    }
+
+    #[test]
+    fn a_download_of_known_size_says_how_far_it_is() {
+        assert_eq!(
+            download_detail(&downloading(9_400_000, Some(23_372_438))).as_deref(),
+            Some("9.4 of 23.4 MB")
+        );
+        assert_eq!(download_detail(&downloading(9_400_000, None)), None);
+        assert_eq!(
+            download_detail(&downloading(150, Some(100))).as_deref(),
+            Some("0.0 of 0.0 MB")
+        );
+        let rt = render(Setup::Installing(downloading(50, Some(100))));
+        assert!(rt.find("progress-detail").is_some());
     }
 }

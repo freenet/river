@@ -225,7 +225,10 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
   Once setup connects it shows the chat screen (`src/chat/`), which for now
   runs on built-in example data (`chat::Source::Example`): it does not read
   or send anything through the node yet. Its colours and sizes follow the web
-  UI in `ui/`.
+  UI in `ui/`. It also compiles in one web UI file, the logo
+  `ui/assets/river_logo.svg` (`include_bytes!` in `apps/river-app/src/lib.rs`),
+  so an edit to that file changes the native app too and runs `apps.yml`.
+  Nothing else under `ui/` is read by `apps/`.
 - `apps/desktop`: the desktop shell (binary `river`), including the Freenet
   installer, which verifies the release's signed checksums.
 
