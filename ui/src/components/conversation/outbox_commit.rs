@@ -139,6 +139,21 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
         }
         return;
     }
+    // An identity import replaced the room's identity while these waited:
+    // they are never committed (`apply_entry`) or shown under the new one.
+    if let Some(current) = ROOMS
+        .peek()
+        .map
+        .get(&room)
+        .and_then(|r| r.self_verifying_key())
+    {
+        if OUTBOX.peek().has_other_identities(&room, &current) {
+            let dropped = OUTBOX.with_mut(|o| o.drop_other_identities(&room, &current));
+            warn!(
+                "Room identity replaced with {dropped} unsent message(s) from the old one; dropped"
+            );
+        }
+    }
     // Checked first so a result that commits nothing writes no signal.
     if !OUTBOX.peek().has_ready(&room) {
         return;

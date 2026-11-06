@@ -1805,8 +1805,10 @@ pub fn Conversation() -> Element {
                 // read shows the committed state for this pass and nudges.
                 match OUTBOX.try_read() {
                     Ok(outbox) => {
-                        if let Some(self_id) = self_member_id {
-                            let effects = outbox.pending_effects(&key);
+                        if let (Some(self_id), Some(self_vk)) =
+                            (self_member_id, room_data.self_verifying_key())
+                        {
+                            let effects = outbox.pending_effects(&key, &self_vk);
                             apply_pending_effects(&mut groups, &effects, self_id, &member_names);
                         }
                     }
@@ -1959,7 +1961,7 @@ pub fn Conversation() -> Element {
                 // screen already shows them (`pending_effects.rs`), so a second
                 // click must undo the pending one, not add it again.
                 let pending = match OUTBOX.try_read() {
-                    Ok(outbox) => outbox.pending_effects(&current_room),
+                    Ok(outbox) => outbox.pending_effects(&current_room, &identity.author_vk),
                     Err(_) => {
                         warn!("Outbox busy while toggling a reaction; using committed reactions");
                         Vec::new()
@@ -3068,9 +3070,12 @@ pub fn Conversation() -> Element {
                     // failed, below the newest message (`pending_sends.rs`).
                     // Not under a held range: they belong after the latest
                     // message, and an own send requests the latest range.
-                    if let Some(room) = current_room_data.as_ref().map(|r| r.owner_vk) {
+                    if let Some((room, author)) = current_room_data
+                        .as_ref()
+                        .and_then(|r| Some((r.owner_vk, r.self_verifying_key()?)))
+                    {
                         if !reader_position.has_newer.get() {
-                            PendingSends { room }
+                            PendingSends { room, author }
                         }
                     }
                     // Invisible sentinel right under the newest rendered row,

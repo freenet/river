@@ -13,13 +13,13 @@ use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 
 #[component]
-pub(super) fn PendingSends(room: VerifyingKey) -> Element {
+pub(super) fn PendingSends(room: VerifyingKey, author: VerifyingKey) -> Element {
     // Rendered from the outbox, which only a deferred closure writes; still
     // read fallibly, and anchored so a contended read cannot leave this
     // unsubscribed (freenet/river#555).
     crate::util::signal_guard::anchor();
     let rows = match OUTBOX.try_read() {
-        Ok(outbox) => outbox.pending_rows(&room),
+        Ok(outbox) => outbox.pending_rows(&room, &author),
         Err(_) => {
             crate::util::signal_guard::schedule_nudge();
             return rsx! {};

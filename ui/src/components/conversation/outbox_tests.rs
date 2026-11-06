@@ -58,7 +58,7 @@ fn a_send_shows_as_pending_until_its_signature_arrives_then_commits_once() {
     let mut outbox = Outbox::default();
     let (id, work) = send(&mut outbox, "hello", 10);
 
-    let rows = outbox.pending_rows(&room());
+    let rows = outbox.pending_rows(&room(), &author().verifying_key());
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].text, "hello");
     assert_eq!(rows[0].author_name, "Me");
@@ -86,7 +86,9 @@ fn a_send_shows_as_pending_until_its_signature_arrives_then_commits_once() {
         "signing does not restamp the message"
     );
     assert!(
-        outbox.pending_rows(&room()).is_empty(),
+        outbox
+            .pending_rows(&room(), &author().verifying_key())
+            .is_empty(),
         "the pending row is gone once the entry is taken to commit"
     );
     assert!(outbox.take_ready(&room()).is_empty(), "it commits once");
@@ -109,7 +111,12 @@ fn messages_commit_in_the_order_they_were_sent_whatever_order_they_are_signed_in
         outbox.take_ready(&room()).is_empty(),
         "b and c are signed but must wait for a"
     );
-    assert_eq!(outbox.pending_rows(&room()).len(), 3);
+    assert_eq!(
+        outbox
+            .pending_rows(&room(), &author().verifying_key())
+            .len(),
+        3
+    );
 
     sign_all(&mut outbox, a, &wa);
     assert!(outbox.has_ready(&room()));
@@ -131,7 +138,7 @@ fn a_failed_message_stays_and_does_not_hold_back_later_ones() {
     );
     assert_eq!(texts(&outbox.take_ready(&room())), ["b"]);
 
-    let rows = outbox.pending_rows(&room());
+    let rows = outbox.pending_rows(&room(), &author().verifying_key());
     assert_eq!(rows.len(), 1, "the failed text is kept, never dropped");
     assert_eq!(rows[0].text, "a");
     assert_eq!(rows[0].failed.as_deref(), Some("no signing key"));
@@ -144,7 +151,9 @@ fn a_late_signature_for_a_failed_attempt_is_ignored() {
     outbox.record_failure(&room(), a, "timed out".to_string());
     sign_all(&mut outbox, a, &wa);
     assert!(outbox.take_ready(&room()).is_empty());
-    assert!(outbox.pending_rows(&room())[0].failed.is_some());
+    assert!(outbox.pending_rows(&room(), &author().verifying_key())[0]
+        .failed
+        .is_some());
 }
 
 #[test]
@@ -161,7 +170,7 @@ fn retry_signs_again_and_commits() {
     assert_eq!(vk, author().verifying_key());
     assert_eq!(work, wa, "a retry signs the same bytes");
     assert_eq!(
-        outbox.pending_rows(&room())[0].failed,
+        outbox.pending_rows(&room(), &author().verifying_key())[0].failed,
         None,
         "sending again"
     );
@@ -183,7 +192,7 @@ fn a_message_the_room_refused_goes_back_failed_in_its_place() {
 
     let b_entry = ready.pop().unwrap();
     outbox.restore_failed(room(), b_entry, "not admitted".to_string());
-    let rows = outbox.pending_rows(&room());
+    let rows = outbox.pending_rows(&room(), &author().verifying_key());
     assert_eq!(
         rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
         ["b", "c"],
@@ -205,7 +214,9 @@ fn a_reaction_swap_commits_only_when_both_halves_are_signed() {
         vec![message("remove", 1), message("add", 1)],
     );
     assert!(
-        outbox.pending_rows(&room()).is_empty(),
+        outbox
+            .pending_rows(&room(), &author().verifying_key())
+            .is_empty(),
         "an action is not shown as a pending row"
     );
     outbox.record_signature(&room(), id, 1, author().sign(&work[1].1));
@@ -222,7 +233,9 @@ fn discard_removes_the_entry() {
     let (a, _) = send(&mut outbox, "a", 1);
     outbox.record_failure(&room(), a, "x".to_string());
     assert!(outbox.discard(&room(), a).is_some());
-    assert!(outbox.pending_rows(&room()).is_empty());
+    assert!(outbox
+        .pending_rows(&room(), &author().verifying_key())
+        .is_empty());
     assert!(outbox.discard(&room(), a).is_none());
 }
 
@@ -282,7 +295,9 @@ fn a_failed_action_is_taken_out_and_a_failed_send_is_not() {
     assert_eq!(texts(&outbox.take_failed_actions(&room())), ["edit"]);
     assert!(!outbox.has_failed_actions(&room()));
     assert_eq!(
-        outbox.pending_rows(&room()).len(),
+        outbox
+            .pending_rows(&room(), &author().verifying_key())
+            .len(),
         1,
         "the failed send stays"
     );
@@ -319,7 +334,10 @@ fn pending_effects_are_those_of_actions_still_signing() {
         vec![message("y", 3)],
     );
     outbox.record_failure(&room(), failed, "x".to_string());
-    assert_eq!(outbox.pending_effects(&room()), vec![effect("signing")]);
+    assert_eq!(
+        outbox.pending_effects(&room(), &author().verifying_key()),
+        vec![effect("signing")]
+    );
 }
 
 /// By design: a message that failed and is retried commits after the ones
@@ -356,7 +374,10 @@ fn a_refused_message_can_be_retried() {
     outbox.restore_failed(room(), entry, "not admitted".to_string());
     let (_, work) = outbox.retry(&room(), a).expect("a refused message retries");
     assert_eq!(work, wa);
-    assert_eq!(outbox.pending_rows(&room())[0].failed, None);
+    assert_eq!(
+        outbox.pending_rows(&room(), &author().verifying_key())[0].failed,
+        None
+    );
 }
 
 #[test]
@@ -388,6 +409,22 @@ fn leaving_a_room_drops_what_waits_in_it() {
     send(&mut outbox, "b", 2);
     assert!(outbox.has_room(&room()));
     assert_eq!(outbox.clear_room(&room()), 2);
-    assert!(outbox.pending_rows(&room()).is_empty());
+    assert!(outbox
+        .pending_rows(&room(), &author().verifying_key())
+        .is_empty());
+    assert!(!outbox.has_room(&room()));
+}
+
+#[test]
+fn entries_from_a_replaced_identity_are_neither_shown_nor_kept() {
+    let mut outbox = Outbox::default();
+    send(&mut outbox, "old identity", 1);
+    let new_identity = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+    assert!(
+        outbox.pending_rows(&room(), &new_identity).is_empty(),
+        "the new identity does not see the old one's pending text"
+    );
+    assert!(outbox.has_other_identities(&room(), &new_identity));
+    assert_eq!(outbox.drop_other_identities(&room(), &new_identity), 1);
     assert!(!outbox.has_room(&room()));
 }

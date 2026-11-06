@@ -278,6 +278,28 @@ impl Outbox {
         ))
     }
 
+    /// Drop `room`'s entries written as any identity but `author` (the room's
+    /// identity was replaced while they waited). Returns how many.
+    pub fn drop_other_identities(&mut self, room: &VerifyingKey, author: &VerifyingKey) -> usize {
+        let Some(queue) = self.rooms.get_mut(room) else {
+            return 0;
+        };
+        let before = queue.len();
+        queue.retain(|e| e.author_vk == *author);
+        let dropped = before - queue.len();
+        if queue.is_empty() {
+            self.rooms.remove(room);
+        }
+        dropped
+    }
+
+    /// Whether any of `room`'s entries were written as an identity but `author`.
+    pub fn has_other_identities(&self, room: &VerifyingKey, author: &VerifyingKey) -> bool {
+        self.rooms
+            .get(room)
+            .is_some_and(|q| q.iter().any(|e| e.author_vk != *author))
+    }
+
     /// Drop everything waiting in `room` (the user left it).
     pub fn clear_room(&mut self, room: &VerifyingKey) -> usize {
         self.rooms.remove(room).map_or(0, |q| q.len())
@@ -313,13 +335,19 @@ impl Outbox {
     }
 
     /// The effects of `room`'s actions still being signed, in the order they
-    /// were made, for the conversation to show before they commit.
-    pub fn pending_effects(&self, room: &VerifyingKey) -> Vec<PendingEffect> {
+    /// were made, for the conversation to show before they commit. Only
+    /// `author`'s: entries written as an identity the room has since replaced
+    /// are never shown under the new one (and never commit, `apply_entry`).
+    pub fn pending_effects(
+        &self,
+        room: &VerifyingKey,
+        author: &VerifyingKey,
+    ) -> Vec<PendingEffect> {
         self.rooms
             .get(room)
             .into_iter()
             .flatten()
-            .filter(|e| e.state == PendingState::Signing)
+            .filter(|e| e.state == PendingState::Signing && e.author_vk == *author)
             .filter_map(|e| match &e.kind {
                 PendingKind::Action { effects, .. } => Some(effects.iter().cloned()),
                 PendingKind::Send { .. } => None,
@@ -328,12 +356,14 @@ impl Outbox {
             .collect()
     }
 
-    /// The composer messages waiting in `room`, in the order they were sent.
-    pub fn pending_rows(&self, room: &VerifyingKey) -> Vec<PendingRow> {
+    /// `author`'s composer messages waiting in `room`, in the order they were
+    /// sent (see `pending_effects` for why only `author`'s).
+    pub fn pending_rows(&self, room: &VerifyingKey, author: &VerifyingKey) -> Vec<PendingRow> {
         self.rooms
             .get(room)
             .into_iter()
             .flatten()
+            .filter(|e| e.author_vk == *author)
             .filter_map(|e| match &e.kind {
                 PendingKind::Send { text, author_name } => Some(PendingRow {
                     id: e.id,
