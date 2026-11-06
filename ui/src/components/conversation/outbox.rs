@@ -45,6 +45,11 @@ pub(crate) static OUTBOX: GlobalSignal<Outbox> = Global::new(Outbox::default);
 /// before it is shown as failed (where Retry seals it once more).
 pub(crate) const MAX_RESEALS: u32 = 3;
 
+/// Why a sealed message waits: this device does not yet hold the room's
+/// current secret (or holds an older one than the message was sealed under).
+const KEY_NOT_YET_HERE: &str =
+    "this device does not have the room's newest key yet; Retry once it arrives";
+
 /// A message to enqueue: the message, its CBOR bytes, and for a sealed body
 /// what the user wrote (`SealInput`).
 pub(crate) type NewMessage = (MessageV1, Vec<u8>, Option<SealInput>);
@@ -301,10 +306,12 @@ impl Outbox {
 
     /// Record one message's signature. Ignored for an entry that is gone or
     /// has failed (a late answer to an abandoned attempt). Results are keyed
-    /// by entry and index, not by attempt: a late result from an attempt
-    /// before a Retry would land on the new attempt. That cannot happen today,
-    /// because only sends (one message, failed once its request completed) are
-    /// retried.
+    /// by entry and index, not by attempt: a late result from an earlier
+    /// attempt would land on the new one. A reseal starts a new attempt only
+    /// for a fully signed entry, so nothing of the old one is outstanding; a
+    /// Retry is offered only for sends (one message, failed once its request
+    /// completed). A stray late signature cannot publish old content anyway:
+    /// it does not verify over the new bytes, and the room skips the message.
     pub fn record_signature(&mut self, room: &VerifyingKey, id: u64, index: usize, sig: Signature) {
         if let Some(entry) = self.entry_mut(room, id) {
             if entry.state == PendingState::Signing {
@@ -476,22 +483,10 @@ impl Outbox {
                 (Some((secret, version)), Some(entry)) if entry.sealed_at_or_below(version) => {
                     self.reseal(room, id, &secret, version)
                 }
-                (None, _) => {
-                    self.record_failure(
-                        room,
-                        id,
-                        "the room's key is not available on this device yet; Retry to send it"
-                            .to_string(),
-                    );
-                    None
-                }
                 _ => {
-                    self.record_failure(
-                        room,
-                        id,
-                        "this device's copy of the room's key is older than the message's; Retry to send it"
-                            .to_string(),
-                    );
+                    // No current secret here, or an older one than the
+                    // message was sealed under.
+                    self.record_failure(room, id, KEY_NOT_YET_HERE.to_string());
                     None
                 }
             };
@@ -539,7 +534,16 @@ impl Outbox {
             return None;
         }
         // Sealed again under the room's current secret if it has rotated, so
-        // a Retry can succeed whatever happened to the key meanwhile.
+        // a Retry can succeed whatever happened to the key meanwhile. Only
+        // ever forward: a body sealed under a newer version than this device
+        // holds is never sealed down to the older secret, which a member the
+        // newer rotation excluded can read. That Retry waits for the key.
+        if let Some((_, version)) = current {
+            if entry.is_stale_sealed(Some(version)) && !entry.sealed_at_or_below(version) {
+                entry.state = PendingState::Failed(KEY_NOT_YET_HERE.to_string());
+                return None;
+            }
+        }
         let resealing = current.filter(|(_, v)| entry.is_stale_sealed(Some(*v)));
         let reseal = resealing
             .as_ref()

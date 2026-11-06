@@ -614,8 +614,10 @@ fn a_reseal_that_fails_does_not_strand_what_follows() {
     let mut outbox = Outbox::default();
     let (a, wa) = sealed_entry(&mut outbox, "keeps rotating", 1, 1);
     let (b, wb) = sealed_entry(&mut outbox, "behind it", 2, 2);
-    for v in 0..MAX_RESEALS {
-        outbox.reseal(&room(), a, &[9u8; 32], 1 + v).unwrap();
+    // Sealed again at v1 each time, so at current v2 it is stale and sealed
+    // at or below the current version: only the bound fails it.
+    for _ in 0..MAX_RESEALS {
+        outbox.reseal(&room(), a, &[9u8; 32], 1).unwrap();
     }
     let _ = wa;
     let work = outbox.entry(&room(), a).unwrap().work();
@@ -752,4 +754,50 @@ fn retry_resets_the_reseal_count() {
     for v in 0..MAX_RESEALS {
         assert!(outbox.reseal(&room(), a, &[9u8; 32], 10 + v).is_some());
     }
+}
+
+/// Retry seals forward only: it never seals a message down to an older
+/// secret this device holds, and leaves one already sealed under the current
+/// secret as it is.
+#[test]
+fn retry_never_seals_down_and_leaves_a_current_seal_alone() {
+    let ciphertext_of =
+        |outbox: &Outbox, id: u64| match &outbox.entry(&room(), id).unwrap().messages[0]
+            .message
+            .content
+        {
+            RoomMessageBody::Private { ciphertext, .. } => ciphertext.clone(),
+            RoomMessageBody::Public { .. } => panic!("sealed"),
+        };
+    let mut outbox = Outbox::default();
+    let (newer, _) = sealed_entry(&mut outbox, "sealed at v3", 1, 3);
+    outbox.record_failure(&room(), newer, "x".to_string());
+    let before = ciphertext_of(&outbox, newer);
+    assert!(
+        outbox
+            .retry(&room(), newer, later(), Some(([2u8; 32], 2)))
+            .is_none(),
+        "no Retry down to v2"
+    );
+    assert_eq!(ciphertext_of(&outbox, newer), before);
+    assert!(outbox.pending_rows(&room(), &author().verifying_key())[0]
+        .failed
+        .is_some());
+
+    let (current, _) = sealed_entry(&mut outbox, "sealed at v2", 2, 2);
+    outbox.record_failure(&room(), current, "x".to_string());
+    let before = ciphertext_of(&outbox, current);
+    outbox
+        .retry(&room(), current, later(), Some(([2u8; 32], 2)))
+        .unwrap();
+    assert_eq!(ciphertext_of(&outbox, current), before, "not sealed again");
+
+    let (bare, _) = sealed_without_input(&mut outbox, "nothing to seal from", 3, 1);
+    outbox.record_failure(&room(), bare, "x".to_string());
+    assert!(
+        outbox
+            .retry(&room(), bare, later(), Some(([2u8; 32], 2)))
+            .is_none(),
+        "cannot be sealed again"
+    );
 }

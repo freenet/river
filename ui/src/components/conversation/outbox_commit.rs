@@ -827,7 +827,22 @@ mod tests {
         // Resealing is wired: the take is given the room's current secret, and
         // what it seals again is signed again.
         assert!(body.contains("o.take_committable(&room,secret)"));
-        assert!(body.contains("inresign{") && body.contains("start_signing("));
+        let resign_at = body
+            .find("inresign{")
+            .expect("re-signs what was sealed again");
+        assert!(
+            body[resign_at..]
+                .contains("start_signing(room,id,author_vk,work,fallback_key.clone())"),
+            "what was sealed again is signed again, with the fallback key"
+        );
+        let report = body
+            .find("report_failed_actions_now(room);")
+            .expect("a failed reseal of an action is reported");
+        let empty = body.find("ifready.is_empty(){").expect("early return");
+        assert!(
+            body.find("o.take_committable(").unwrap() < report && report < empty,
+            "failed actions are reported after the take, before returning"
+        );
         let take = body
             .find("o.take_committable(")
             .expect("takes from the outbox");
