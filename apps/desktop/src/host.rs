@@ -407,7 +407,9 @@ fn error_line(output: &str) -> String {
     };
     let raw: Vec<&str> = output.lines().collect();
     // At column 0 first, so an indented cause that happens to begin with "error:" isn't taken
-    // for the message; an indented `Error:` only when nothing starts a line with one.
+    // for the message; an indented `Error:` only when nothing starts a line with one. Known
+    // limit of that fallback: if everything is indented AND a cause begins with "error:", the
+    // cause is reported without its message. No known source indents freenet-core's output.
     let found = (0..raw.len())
         .rev()
         .find_map(|i| error_at(raw[i]).map(|rest| (i, rest)))

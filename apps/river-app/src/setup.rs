@@ -123,10 +123,12 @@ impl Controller {
                     );
                 }
                 // Right after an installer, a node it started may still be booting, and this
-                // start could launch a second one. That is safe: freenet-core's wrapper holds a
-                // single-instance lock, and a second wrapper exits quietly (`run_wrapper` and
-                // `WRAPPER_MUTEX_NAME` in freenet-core's
-                // crates/core/src/bin/commands/service/{wrapper,single_instance}.rs).
+                // start could launch a second one. That is safe: on Windows and macOS
+                // freenet-core's wrapper takes a single-instance lock (a named mutex,
+                // `WRAPPER_MUTEX_NAME`, on Windows; a lockfile on macOS) and a second wrapper
+                // exits (`run_wrapper` in freenet-core's
+                // crates/core/src/bin/commands/service/{wrapper,single_instance}.rs). On Linux
+                // the start goes through systemd, which won't run a second instance of a unit.
                 NodeProbe::InstalledNotRunning => ctl.start_and_wait(),
             }
         });
