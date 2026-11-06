@@ -105,16 +105,26 @@ impl Controller {
                 NodeProbe::Outdated { running, minimum } => ctl.set(outdated(running, minimum)),
                 // The installer exited successfully but River sees no install. Freenet's
                 // Windows wizard installs where River looks and also exits 0 when cancelled,
-                // so this is almost always a cancel; look briefly in case it is still
-                // finishing, rather than making someone who cancelled wait out a start.
+                // so this is usually a cancel; look briefly rather than make someone who
+                // cancelled wait out a start. The known exception: when an earlier install's
+                // start-at-login entry is still registered, the wizard skips itself, starts a
+                // node from where it was run, and exits; that node may take longer than the
+                // look to answer, so the message leaves room for it.
                 NodeProbe::NotInstalled => {
                     ctl.set(Setup::Checking);
                     ctl.wait_for_node(
-                        "The installer closed without installing Freenet.".into(),
+                        "The installer finished, but River can't find Freenet where it looks \
+                         and no Freenet has answered. Choose Try again: if Freenet is still \
+                         starting River will find it, and if the install was cancelled River \
+                         will offer to install it again."
+                            .into(),
                         true,
                         POST_INSTALL_GRACE.min(ctl.start_timeout),
                     );
                 }
+                // Right after an installer, a node it started may still be booting, and this
+                // start could launch a second one. That is safe: freenet-core's wrapper holds a
+                // single-instance lock, and a second wrapper exits quietly.
                 NodeProbe::InstalledNotRunning => ctl.start_and_wait(),
             }
         });
@@ -414,7 +424,11 @@ mod tests {
         assert_eq!(
             seen.last(),
             Some(&Setup::Failed(
-                "The installer closed without installing Freenet.".into()
+                "The installer finished, but River can't find Freenet where it looks and no \
+                 Freenet has answered. Choose Try again: if Freenet is still starting River \
+                 will find it, and if the install was cancelled River will offer to install \
+                 it again."
+                    .into()
             ))
         );
         assert_eq!(host.starts.load(Ordering::SeqCst), 0);

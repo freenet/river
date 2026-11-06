@@ -399,11 +399,19 @@ fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String
 /// without an `Error:` line (clap prints `error:`, matched too) reports its last line.
 fn error_line(output: &str) -> String {
     let lines: Vec<&str> = output.lines().map(str::trim).collect();
-    let found = lines.iter().enumerate().rev().find_map(|(i, line)| {
-        let head = line.get(..6)?;
-        let rest = line[6..].trim();
-        (head.eq_ignore_ascii_case("error:") && !rest.is_empty()).then_some((i, rest))
-    });
+    // Matched at the start of the line as printed, so an indented cause that happens to begin
+    // with "error:" isn't taken for the message.
+    let found = output
+        .lines()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .find_map(|(i, line)| {
+            let head = line.get(..6)?;
+            let rest = line[6..].trim();
+            (head.eq_ignore_ascii_case("error:") && !rest.is_empty()).then_some((i, rest))
+        });
     let Some((at, message)) = found else {
         return lines
             .iter()
@@ -892,6 +900,11 @@ mod tests {
         let clap = "error: unrecognized subcommand 'service'\n\nUsage: freenet [OPTIONS]\n\n\
                     For more information, try '--help'.\n";
         assert_eq!(error_line(clap), "unrecognized subcommand 'service'");
+        // Several `Error:` lines (other output first, freenet-core's error last): the last.
+        assert_eq!(error_line("Error: outer\nError: inner\nHint: x\n"), "inner");
+        // An indented cause that begins with "error:" is a cause, not the message.
+        let cause_says_error = "Error: Failed to X\n\nCaused by:\n    error: Y\n";
+        assert_eq!(error_line(cause_says_error), "Failed to X: error: Y");
         // Anything else: its last line.
         assert_eq!(error_line("first\nboom\n\n"), "boom");
         assert_eq!(error_line(""), "no error output");
@@ -906,6 +919,12 @@ mod tests {
         );
         assert_eq!(shell_quote("/a b/$x/`y`/\"z\""), "'/a b/$x/`y`/\"z\"'");
         assert_eq!(shell_quote("/it's/freenet"), r"'/it'\''s/freenet'");
+        // And the advice actually uses it.
+        let recipe = no_user_session_recipe(Path::new("/a b/it's/freenet"));
+        assert!(
+            recipe.contains(r"`sudo '/a b/it'\''s/freenet' service install --system`"),
+            "{recipe}"
+        );
     }
 
     #[cfg(unix)]

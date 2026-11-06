@@ -8,6 +8,8 @@ name: Native apps
 # runs-on comment in build.yml for why larger runners are not used).
 
 on:
+  # When the apps start depending on river-core, add 'common/**' to both path
+  # lists, or a change there that breaks the apps won't run this workflow.
   pull_request:
     paths:
       - 'apps/**'
