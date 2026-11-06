@@ -39,6 +39,9 @@ mod mention;
 mod message_actions;
 mod message_input;
 mod not_member_notification;
+mod outbox;
+mod outbox_commit;
+mod pending_sends;
 use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
@@ -54,6 +57,8 @@ use self::markdown::{
     render_message_html_cached, running_behind_freenet_gateway,
 };
 use self::not_member_notification::NotMemberNotification;
+use self::outbox::PendingKind;
+use self::pending_sends::PendingSends;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
@@ -62,18 +67,15 @@ use dioxus_free_icons::icons::fa_solid_icons::{
     FaEllipsisVertical, FaFaceSmile, FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation,
 };
 use dioxus_free_icons::Icon;
-use freenet_scaffold::ComposableState;
-use river_core::room_state::member::{MemberId, MembersDelta};
+use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
 use river_core::room_state::message::{
     AuthorizedMessageV1, MessageId, MessageV1, MessagesV1, RoomMessageBody,
 };
-use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 use web_sys;
 
 /// The `member_info` records of the owner and present members. Since
@@ -94,25 +96,6 @@ fn present_member_infos(
             id == owner_id || present.contains_key(&id)
         })
         .collect()
-}
-
-/// Try to build a rejoin delta for the current user in the given room.
-/// Returns (None, None) if the user is already a member or ROOMS is busy.
-fn try_rejoin_delta(
-    room_key: &ed25519_dalek::VerifyingKey,
-    action: &str,
-) -> (Option<MembersDelta>, Option<Vec<AuthorizedMemberInfo>>) {
-    let rooms_guard = ROOMS.try_read();
-    if let Ok(rooms_read) = rooms_guard {
-        if let Some(room_data) = rooms_read.map.get(room_key) {
-            room_data.build_rejoin_delta()
-        } else {
-            (None, None)
-        }
-    } else {
-        warn!("ROOMS signal busy during {action}, skipping re-add check");
-        (None, None)
-    }
 }
 
 /// Snapshot the currently-open room's data, cloning it out of [`ROOMS`].
@@ -150,6 +133,93 @@ fn current_room_data_snapshot() -> Option<crate::room_data::RoomData> {
             None
         }
     }
+}
+
+/// Who signs a message the user authors in a room: their verifying key, and
+/// while this build still holds it, the private key as the signing fallback
+/// (`signing::sign_message_with_fallback`).
+struct ActionIdentity {
+    author_vk: ed25519_dalek::VerifyingKey,
+    fallback_key: Option<ed25519_dalek::SigningKey>,
+}
+
+impl ActionIdentity {
+    fn of(room_data: &crate::room_data::RoomData) -> Option<Self> {
+        Some(Self {
+            author_vk: room_data.self_verifying_key()?,
+            fallback_key: room_data.signing_key().cloned(),
+        })
+    }
+}
+
+/// The current room secret, for a private room; `None` for a public one.
+/// `Some(None)` is a private room whose secret is not on this device.
+fn action_secret(room_data: &crate::room_data::RoomData) -> Option<Option<([u8; 32], u32)>> {
+    room_data.is_private().then(|| {
+        room_data
+            .get_secret()
+            .map(|(secret, version)| (*secret, version))
+    })
+}
+
+/// An action's message body: sealed under the room secret in a private room,
+/// plain in a public one. `None` when the room is private and the secret is
+/// missing.
+fn action_body(
+    action: river_core::room_state::content::ActionContentV1,
+    secret: Option<Option<([u8; 32], u32)>>,
+) -> Option<RoomMessageBody> {
+    match secret {
+        // What `RoomMessageBody::{edit, delete, reaction, remove_reaction}`
+        // build: the same encoding, so the same bytes.
+        None => Some(RoomMessageBody::Public {
+            content_type: river_core::room_state::content::CONTENT_TYPE_ACTION,
+            content_version: river_core::room_state::content::ACTION_CONTENT_VERSION,
+            data: action.encode(),
+        }),
+        Some(None) => None,
+        Some(Some((secret, version))) => {
+            let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &action.encode());
+            Some(RoomMessageBody::private_action(ciphertext, nonce, version))
+        }
+    }
+}
+
+/// A message by `identity` in `room`, stamped now, with the CBOR bytes its
+/// signature will cover. `None` (logged) if it does not serialize.
+fn unsigned_message(
+    room: ed25519_dalek::VerifyingKey,
+    identity: &ActionIdentity,
+    content: RoomMessageBody,
+) -> Option<(MessageV1, Vec<u8>)> {
+    let message = MessageV1 {
+        room_owner: MemberId::from(room),
+        author: MemberId::from(&identity.author_vk),
+        content,
+        time: get_current_system_time(),
+    };
+    let mut bytes = Vec::new();
+    if let Err(e) = ciborium::ser::into_writer(&message, &mut bytes) {
+        error!("Failed to serialize message for signing: {:?}", e);
+        return None;
+    }
+    Some((message, bytes))
+}
+
+/// The sender's own nickname, as the room shows it, for a pending row.
+fn own_display_name(
+    room_data: &crate::room_data::RoomData,
+    author_vk: &ed25519_dalek::VerifyingKey,
+) -> String {
+    let self_id = MemberId::from(author_vk);
+    room_data
+        .room_state
+        .member_info
+        .member_info
+        .iter()
+        .find(|info| info.member_info.member_id == self_id)
+        .map(|info| display_nickname(&info.member_info.preferred_nickname, &room_data.secrets))
+        .unwrap_or_else(|| "You".to_string())
 }
 
 /// Context for a reply-in-progress (held in a signal)
@@ -1831,27 +1901,15 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                // Reactions are signed locally. Without the private key we
-                // cannot author one, so the toggle degrades to a no-op rather
-                // than sending an unsigned (contract-rejected) message.
-                let Some(self_sk) = current_room_data.signing_key().cloned() else {
-                    warn!("Cannot toggle reaction: local signing key unavailable for this room");
+                let Some(identity) = ActionIdentity::of(&current_room_data) else {
+                    warn!("Cannot toggle reaction: no identity for this room");
                     return;
                 };
-                let room_state_clone = current_room_data.room_state.clone();
-                let is_private = current_room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .privacy_mode
-                    == river_core::room_state::privacy::PrivacyMode::Private;
-                let secret_opt = current_room_data
-                    .get_secret()
-                    .map(|(secret, version)| (*secret, version));
+                let secret_opt = action_secret(&current_room_data);
 
                 // Check user's existing reaction on this message (if any)
                 // Rule: one reaction per user per message
-                let self_member_id = MemberId::from(&self_sk.verifying_key());
+                let self_member_id = MemberId::from(&identity.author_vk);
                 let existing_reaction: Option<String> = current_room_data
                     .room_state
                     .recent_messages
@@ -1865,159 +1923,50 @@ pub fn Conversation() -> Element {
                             }
                         })
                     });
+                drop(current_room_data);
 
+                use river_core::room_state::content::ActionContentV1;
+                // Build list of actions:
+                // - If clicking same emoji: just remove it
+                // - If clicking different emoji: remove old (if any) + add new
                 let clicked_same = existing_reaction.as_ref() == Some(&emoji);
-                let has_existing = existing_reaction.is_some();
-
-                // Retained even though this block no longer awaits anything:
-                // it keeps the body off the event handler's stack. The guard
-                // that actually protects the ROOMS write is the
-                // `crate::util::defer` below (a real setTimeout) — inlining
-                // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512).
-                spawn_local(async move {
-                    use crate::util::ecies::encrypt_with_symmetric_key;
-                    use river_core::room_state::content::ActionContentV1;
-                    // Build list of actions:
-                    // - If clicking same emoji: just remove it
-                    // - If clicking different emoji: remove old (if any) + add new
-                    let mut messages_to_send = Vec::new();
-
-                    if clicked_same {
-                        // Remove the existing reaction
-                        let content = if is_private {
-                            if let Some((secret, version)) = &secret_opt {
-                                let action = ActionContentV1::remove_reaction(
-                                    target_message_id.clone(),
-                                    emoji.clone(),
-                                );
-                                let action_bytes = action.encode();
-                                let (ciphertext, nonce) =
-                                    encrypt_with_symmetric_key(secret, &action_bytes);
-                                RoomMessageBody::private_action(ciphertext, nonce, *version)
-                            } else {
-                                warn!("Room is private but no secret available");
-                                return;
-                            }
-                        } else {
-                            RoomMessageBody::remove_reaction(
-                                target_message_id.clone(),
-                                emoji.clone(),
-                            )
-                        };
-                        messages_to_send.push(content);
-                    } else {
-                        // Remove old reaction if exists, then add new one
-                        if let Some(old_emoji) = existing_reaction {
-                            let content = if is_private {
-                                if let Some((secret, version)) = &secret_opt {
-                                    let action = ActionContentV1::remove_reaction(
-                                        target_message_id.clone(),
-                                        old_emoji,
-                                    );
-                                    let action_bytes = action.encode();
-                                    let (ciphertext, nonce) =
-                                        encrypt_with_symmetric_key(secret, &action_bytes);
-                                    RoomMessageBody::private_action(ciphertext, nonce, *version)
-                                } else {
-                                    warn!("Room is private but no secret available");
-                                    return;
-                                }
-                            } else {
-                                RoomMessageBody::remove_reaction(
-                                    target_message_id.clone(),
-                                    old_emoji,
-                                )
-                            };
-                            messages_to_send.push(content);
-                        }
-
-                        // Add new reaction
-                        let content = if is_private {
-                            if let Some((secret, version)) = &secret_opt {
-                                let action = ActionContentV1::reaction(
-                                    target_message_id.clone(),
-                                    emoji.clone(),
-                                );
-                                let action_bytes = action.encode();
-                                let (ciphertext, nonce) =
-                                    encrypt_with_symmetric_key(secret, &action_bytes);
-                                RoomMessageBody::private_action(ciphertext, nonce, *version)
-                            } else {
-                                warn!("Room is private but no secret available");
-                                return;
-                            }
-                        } else {
-                            RoomMessageBody::reaction(target_message_id.clone(), emoji.clone())
-                        };
-                        messages_to_send.push(content);
+                let mut actions = Vec::new();
+                if clicked_same {
+                    actions.push(ActionContentV1::remove_reaction(
+                        target_message_id.clone(),
+                        emoji,
+                    ));
+                } else {
+                    if let Some(old_emoji) = existing_reaction {
+                        actions.push(ActionContentV1::remove_reaction(
+                            target_message_id.clone(),
+                            old_emoji,
+                        ));
                     }
-
-                    // Sign and collect all messages
-                    let mut auth_messages = Vec::new();
-                    for content in messages_to_send {
-                        let message = MessageV1 {
-                            room_owner: MemberId::from(current_room),
-                            author: MemberId::from(&self_sk.verifying_key()),
-                            content,
-                            time: get_current_system_time(),
-                        };
-
-                        let mut message_bytes = Vec::new();
-                        if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
-                            error!("Failed to serialize reaction message: {:?}", e);
-                            return;
-                        }
-
-                        let signature =
-                            crate::signing::sign_message_locally(&message_bytes, &self_sk);
-
-                        auth_messages.push(AuthorizedMessageV1::with_signature(message, signature));
-                    }
-
-                    // Apply all messages in one delta
-                    if !auth_messages.is_empty() {
-                        let (members_delta, member_info_delta) =
-                            try_rejoin_delta(&current_room, "reaction");
-                        let delta = ChatRoomStateV1Delta {
-                            recent_messages: Some(auth_messages),
-                            members: members_delta,
-                            member_info: member_info_delta,
-                            ..Default::default()
-                        };
-                        info!(
-                            "Toggling reaction (clicked_same={}, had_existing={})",
-                            clicked_same, has_existing
-                        );
-                        // Defer ROOMS mutation to a clean execution context to
-                        // prevent RefCell re-entrant borrow panics (see #send handler).
-                        crate::util::defer(move || {
-                            let reaction_applied = ROOMS.with_mut(|rooms| {
-                                if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                    if let Err(e) = room_data.room_state.apply_delta(
-                                        &room_state_clone,
-                                        &ChatRoomParametersV1 {
-                                            owner: current_room,
-                                        },
-                                        &Some(delta),
-                                    ) {
-                                        error!("Failed to apply reaction delta: {:?}", e);
-                                        false
-                                    } else {
-                                        // See #310 — keep private actions_state intact
-                                        // across the optimistic apply_delta.
-                                        room_data.rebuild_private_actions_state();
-                                        true
-                                    }
-                                } else {
-                                    false
-                                }
-                            });
-                            if reaction_applied {
-                                crate::components::app::mark_needs_sync(current_room);
-                            }
-                        });
-                    }
+                    actions.push(ActionContentV1::reaction(target_message_id, emoji));
+                }
+                let mut messages = Vec::new();
+                for action in actions {
+                    let Some(content) = action_body(action, secret_opt) else {
+                        warn!("Room is private but no secret available");
+                        return;
+                    };
+                    let Some(message) = unsigned_message(current_room, &identity, content) else {
+                        return;
+                    };
+                    messages.push(message);
+                }
+                info!("Toggling reaction (clicked_same={})", clicked_same);
+                // Defer the signal write to a clean execution context to
+                // prevent RefCell re-entrant borrow panics.
+                crate::util::defer(move || {
+                    outbox_commit::submit_now(
+                        current_room,
+                        PendingKind::Action { label: "reaction" },
+                        identity.author_vk,
+                        messages,
+                        identity.fallback_key,
+                    );
                 });
             }
         }
@@ -2031,102 +1980,34 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                // Deletes are signed locally; with no private key there is
-                // nothing valid to send, so the action is a no-op.
-                let Some(self_sk) = current_room_data.signing_key().cloned() else {
-                    warn!("Cannot delete message: local signing key unavailable for this room");
+                let Some(identity) = ActionIdentity::of(&current_room_data) else {
+                    warn!("Cannot delete message: no identity for this room");
                     return;
                 };
-                let room_state_clone = current_room_data.room_state.clone();
-                let is_private = current_room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .privacy_mode
-                    == river_core::room_state::privacy::PrivacyMode::Private;
-                let secret_opt = current_room_data
-                    .get_secret()
-                    .map(|(secret, version)| (*secret, version));
+                let secret_opt = action_secret(&current_room_data);
+                drop(current_room_data);
 
-                // Retained even though this block no longer awaits anything:
-                // it keeps the body off the event handler's stack. The guard
-                // that actually protects the ROOMS write is the
-                // `crate::util::defer` below (a real setTimeout) — inlining
-                // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512).
-                spawn_local(async move {
-                    use crate::util::ecies::encrypt_with_symmetric_key;
-                    use river_core::room_state::content::ActionContentV1;
-
-                    // Create the action content - encrypt if private room
-                    let content = if is_private {
-                        if let Some((secret, version)) = secret_opt {
-                            let action = ActionContentV1::delete(target_message_id.clone());
-                            let action_bytes = action.encode();
-                            let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(&secret, &action_bytes);
-                            RoomMessageBody::private_action(ciphertext, nonce, version)
-                        } else {
-                            warn!("Room is private but no secret available, cannot send delete");
-                            return;
-                        }
-                    } else {
-                        RoomMessageBody::delete(target_message_id)
-                    };
-
-                    let message = MessageV1 {
-                        room_owner: MemberId::from(current_room),
-                        author: MemberId::from(&self_sk.verifying_key()),
-                        content,
-                        time: get_current_system_time(),
-                    };
-
-                    let mut message_bytes = Vec::new();
-                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
-                        error!("Failed to serialize delete message: {:?}", e);
-                        return;
-                    }
-
-                    let signature = crate::signing::sign_message_locally(&message_bytes, &self_sk);
-
-                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
-                    let (members_delta, member_info_delta) =
-                        try_rejoin_delta(&current_room, "delete");
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message]),
-                        members: members_delta,
-                        member_info: member_info_delta,
-                        ..Default::default()
-                    };
-                    info!("Sending delete action");
-                    // Defer ROOMS mutation to a clean execution context to
-                    // prevent RefCell re-entrant borrow panics.
-                    crate::util::defer(move || {
-                        let delete_applied = ROOMS.with_mut(|rooms| {
-                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                if let Err(e) = room_data.room_state.apply_delta(
-                                    &room_state_clone,
-                                    &ChatRoomParametersV1 {
-                                        owner: current_room,
-                                    },
-                                    &Some(delta),
-                                ) {
-                                    error!("Failed to apply delete delta: {:?}", e);
-                                    false
-                                } else {
-                                    // See #310 — keep private actions_state intact
-                                    // across the optimistic apply_delta.
-                                    room_data.rebuild_private_actions_state();
-                                    true
-                                }
-                            } else {
-                                false
-                            }
-                        });
-                        if delete_applied {
-                            crate::components::app::mark_needs_sync(current_room);
-                        }
-                    });
+                use river_core::room_state::content::ActionContentV1;
+                let Some(content) =
+                    action_body(ActionContentV1::delete(target_message_id), secret_opt)
+                else {
+                    warn!("Room is private but no secret available, cannot send delete");
+                    return;
+                };
+                let Some(message) = unsigned_message(current_room, &identity, content) else {
+                    return;
+                };
+                info!("Sending delete action");
+                // Defer the signal write to a clean execution context to
+                // prevent RefCell re-entrant borrow panics.
+                crate::util::defer(move || {
+                    outbox_commit::submit_now(
+                        current_room,
+                        PendingKind::Action { label: "delete" },
+                        identity.author_vk,
+                        vec![message],
+                        identity.fallback_key,
+                    );
                 });
             }
         }
@@ -2144,22 +2025,12 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                // Edits are signed locally; with no private key there is
-                // nothing valid to send, so the action is a no-op.
-                let Some(self_sk) = current_room_data.signing_key().cloned() else {
-                    warn!("Cannot edit message: local signing key unavailable for this room");
+                let Some(identity) = ActionIdentity::of(&current_room_data) else {
+                    warn!("Cannot edit message: no identity for this room");
                     return;
                 };
-                let room_state_clone = current_room_data.room_state.clone();
-                let is_private = current_room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .privacy_mode
-                    == river_core::room_state::privacy::PrivacyMode::Private;
-                let secret_opt = current_room_data
-                    .get_secret()
-                    .map(|(secret, version)| (*secret, version));
+                let is_private = current_room_data.is_private();
+                let secret_opt = action_secret(&current_room_data);
 
                 // Safety net (see the send-path twin): the edit form disables
                 // Save when the encoded action exceeds max_message_size. If
@@ -2170,6 +2041,7 @@ pub fn Conversation() -> Element {
                     .configuration
                     .configuration
                     .max_message_size;
+                drop(current_room_data);
                 let measured =
                     RoomMessageBody::measure_edit(target_message_id.clone(), &new_text, is_private);
                 if measured > max_size {
@@ -2180,88 +2052,28 @@ pub fn Conversation() -> Element {
                     return;
                 }
 
-                // Retained even though this block no longer awaits anything:
-                // it keeps the body off the event handler's stack. The guard
-                // that actually protects the ROOMS write is the
-                // `crate::util::defer` below (a real setTimeout) — inlining
-                // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512).
-                spawn_local(async move {
-                    use crate::util::ecies::encrypt_with_symmetric_key;
-                    use river_core::room_state::content::ActionContentV1;
-
-                    // Create the edit action content
-                    let content = if is_private {
-                        if let Some((secret, version)) = secret_opt {
-                            // For private rooms, encrypt the action
-                            let action = ActionContentV1::edit(target_message_id.clone(), new_text);
-                            let action_bytes = action.encode();
-                            let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(&secret, &action_bytes);
-                            RoomMessageBody::private_action(ciphertext, nonce, version)
-                        } else {
-                            warn!("Room is private but no secret available, cannot send edit");
-                            return;
-                        }
-                    } else {
-                        // For public rooms, use the public edit constructor
-                        RoomMessageBody::edit(target_message_id, new_text)
-                    };
-
-                    let message = MessageV1 {
-                        room_owner: MemberId::from(current_room),
-                        author: MemberId::from(&self_sk.verifying_key()),
-                        content,
-                        time: get_current_system_time(),
-                    };
-
-                    let mut message_bytes = Vec::new();
-                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
-                        error!("Failed to serialize edit message: {:?}", e);
-                        return;
-                    }
-
-                    let signature = crate::signing::sign_message_locally(&message_bytes, &self_sk);
-
-                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
-                    let (members_delta, member_info_delta) =
-                        try_rejoin_delta(&current_room, "edit");
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(vec![auth_message]),
-                        members: members_delta,
-                        member_info: member_info_delta,
-                        ..Default::default()
-                    };
-                    info!("Sending edit action");
-                    // Defer ROOMS mutation to a clean execution context to
-                    // prevent RefCell re-entrant borrow panics.
-                    crate::util::defer(move || {
-                        let edit_applied = ROOMS.with_mut(|rooms| {
-                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                if let Err(e) = room_data.room_state.apply_delta(
-                                    &room_state_clone,
-                                    &ChatRoomParametersV1 {
-                                        owner: current_room,
-                                    },
-                                    &Some(delta),
-                                ) {
-                                    error!("Failed to apply edit delta: {:?}", e);
-                                    false
-                                } else {
-                                    // See #310 — re-derive private actions_state so the
-                                    // just-made edit shows immediately instead of waiting
-                                    // for the network echo's decrypt-aware rebuild.
-                                    room_data.rebuild_private_actions_state();
-                                    true
-                                }
-                            } else {
-                                false
-                            }
-                        });
-                        if edit_applied {
-                            crate::components::app::mark_needs_sync(current_room);
-                        }
-                    });
+                use river_core::room_state::content::ActionContentV1;
+                let Some(content) = action_body(
+                    ActionContentV1::edit(target_message_id, new_text),
+                    secret_opt,
+                ) else {
+                    warn!("Room is private but no secret available, cannot send edit");
+                    return;
+                };
+                let Some(message) = unsigned_message(current_room, &identity, content) else {
+                    return;
+                };
+                info!("Sending edit action");
+                // Defer the signal write to a clean execution context to
+                // prevent RefCell re-entrant borrow panics.
+                crate::util::defer(move || {
+                    outbox_commit::submit_now(
+                        current_room,
+                        PendingKind::Action { label: "edit" },
+                        identity.author_vk,
+                        vec![message],
+                        identity.fallback_key,
+                    );
                 });
             }
         }
@@ -2294,242 +2106,154 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (current_room_opt, fresh_room_data)
             {
-                // Clone what we need for the async block.
-                // Sending signs locally: with no private key held for this
-                // room the send degrades to a logged no-op, the same shape as
-                // the "no room selected" / "room not loaded" bails above,
-                // rather than emitting an unsignable message.
-                let Some(self_sk) = current_room_data.signing_key().cloned() else {
-                    error!("Cannot send message: local signing key unavailable for this room");
+                // Everything up to the outbox insert is synchronous: the
+                // message must show, pending, before anything is awaited
+                // (freenet/river#512). Signing happens after, through the
+                // chat delegate (`outbox_commit`).
+                let Some(author_vk) = current_room_data.self_verifying_key() else {
+                    error!("Cannot send message: no identity for this room");
                     return;
                 };
-                let room_state_clone = current_room_data.room_state.clone();
+                // The local fallback while this build still holds the key.
+                let fallback_key = current_room_data.signing_key().cloned();
+                let author_name = own_display_name(&current_room_data, &author_vk);
                 let is_private = current_room_data.is_private();
                 // Copy the secret data (get_secret returns Option<(&[u8; 32], u32)>)
                 let secret_opt: Option<([u8; 32], u32)> = current_room_data
                     .get_secret()
                     .map(|(secret, version)| (*secret, version));
+                let max_size = current_room_data
+                    .room_state
+                    .configuration
+                    .configuration
+                    .max_message_size;
+                drop(current_room_data);
 
-                // Cloned into the async send so the scroll request is made
-                // ONLY after the delta applies locally — a rejected send
-                // (empty, over-size, serialize/sign/delta failure) then leaves
-                // the scroll position untouched rather than taking a later
-                // unrelated message to the end (#402).
-                let reader_position = reader_position.clone();
-                // Retained even though this block no longer awaits anything:
-                // it keeps the body off the event handler's stack. The guard
-                // that actually protects the ROOMS write is the
-                // `crate::util::defer` below (a real setTimeout) — inlining
-                // this block would put everything up to it back on the
-                // handler's stack (freenet/river#512).
-                spawn_local(async move {
-                    use river_core::room_state::content::{
-                        ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
-                        REPLY_CONTENT_VERSION, TEXT_CONTENT_VERSION,
-                    };
+                use river_core::room_state::content::{
+                    ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
+                    REPLY_CONTENT_VERSION, TEXT_CONTENT_VERSION,
+                };
 
-                    // Build content based on whether this is a reply or regular message
-                    let content = if let Some(reply) = reply_ctx {
-                        // Reply message
-                        if is_private {
-                            if let Some((secret, version)) = secret_opt {
-                                let reply_content = ReplyContentV1::new(
-                                    message_text.clone(),
-                                    reply.message_id,
-                                    reply.author_name,
-                                    reply.content_preview,
-                                );
-                                let content_bytes = reply_content.encode();
-                                let (ciphertext, nonce) =
-                                    encrypt_with_symmetric_key(&secret, &content_bytes);
-                                RoomMessageBody::private(
-                                    CONTENT_TYPE_REPLY,
-                                    REPLY_CONTENT_VERSION,
-                                    ciphertext,
-                                    nonce,
-                                    version,
-                                )
-                            } else {
-                                // The composer is not offered without the
-                                // secret (see `missing_room_secret`); this
-                                // is the backstop. A public body in a private
-                                // room is not admitted.
-                                error!(
-                                    "Cannot send: this private room's secret is not on this device"
-                                );
-                                return;
-                            }
-                        } else {
-                            RoomMessageBody::reply(
+                // Build content based on whether this is a reply or regular message
+                let content = if let Some(reply) = reply_ctx {
+                    // Reply message
+                    if is_private {
+                        if let Some((secret, version)) = secret_opt {
+                            let reply_content = ReplyContentV1::new(
                                 message_text.clone(),
                                 reply.message_id,
                                 reply.author_name,
                                 reply.content_preview,
+                            );
+                            let content_bytes = reply_content.encode();
+                            let (ciphertext, nonce) =
+                                encrypt_with_symmetric_key(&secret, &content_bytes);
+                            RoomMessageBody::private(
+                                CONTENT_TYPE_REPLY,
+                                REPLY_CONTENT_VERSION,
+                                ciphertext,
+                                nonce,
+                                version,
                             )
+                        } else {
+                            // The composer is not offered without the
+                            // secret (see `missing_room_secret`); this
+                            // is the backstop. A public body in a private
+                            // room is not admitted.
+                            error!("Cannot send: this private room's secret is not on this device");
+                            return;
                         }
                     } else {
-                        // Regular text message
-                        if is_private {
-                            if let Some((secret, version)) = secret_opt {
-                                let text_content = TextContentV1::new(message_text.clone());
-                                let content_bytes = text_content.encode();
-                                let (ciphertext, nonce) =
-                                    encrypt_with_symmetric_key(&secret, &content_bytes);
-                                RoomMessageBody::private(
-                                    CONTENT_TYPE_TEXT,
-                                    TEXT_CONTENT_VERSION,
-                                    ciphertext,
-                                    nonce,
-                                    version,
-                                )
-                            } else {
-                                // Backstop, as for a reply above.
-                                error!(
-                                    "Cannot send: this private room's secret is not on this device"
-                                );
-                                return;
-                            }
+                        RoomMessageBody::reply(
+                            message_text.clone(),
+                            reply.message_id,
+                            reply.author_name,
+                            reply.content_preview,
+                        )
+                    }
+                } else {
+                    // Regular text message
+                    if is_private {
+                        if let Some((secret, version)) = secret_opt {
+                            let text_content = TextContentV1::new(message_text.clone());
+                            let content_bytes = text_content.encode();
+                            let (ciphertext, nonce) =
+                                encrypt_with_symmetric_key(&secret, &content_bytes);
+                            RoomMessageBody::private(
+                                CONTENT_TYPE_TEXT,
+                                TEXT_CONTENT_VERSION,
+                                ciphertext,
+                                nonce,
+                                version,
+                            )
                         } else {
-                            RoomMessageBody::public(message_text.clone())
+                            // Backstop, as for a reply above.
+                            error!("Cannot send: this private room's secret is not on this device");
+                            return;
                         }
-                    };
-
-                    // Safety net: check encoded content size before signing.
-                    // Should be unreachable — the input gate measures the same
-                    // encoded size via RoomMessageBody::measure_* (pinned equal
-                    // to content_len() by river-core tests). If this fires, the
-                    // measure helpers have drifted from the body construction
-                    // above and the draft is already cleared: the message is
-                    // LOST, which is the HostFat bug. Fix the drift, don't
-                    // relax this check.
-                    let content_size = content.content_len();
-                    let max_size = room_state_clone
-                        .configuration
-                        .configuration
-                        .max_message_size;
-                    if content_size > max_size {
-                        error!(
-                            "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; message dropped",
-                            content_size, max_size
-                        );
-                        return;
+                    } else {
+                        RoomMessageBody::public(message_text.clone())
                     }
+                };
 
-                    let message = MessageV1 {
-                        room_owner: MemberId::from(current_room),
-                        author: MemberId::from(&self_sk.verifying_key()),
-                        content,
-                        time: get_current_system_time(),
-                    };
+                // Safety net: check encoded content size before signing.
+                // Should be unreachable — the input gate measures the same
+                // encoded size via RoomMessageBody::measure_* (pinned equal
+                // to content_len() by river-core tests). If this fires, the
+                // measure helpers have drifted from the body construction
+                // above and the draft is already cleared: the message is
+                // LOST, which is the HostFat bug. Fix the drift, don't
+                // relax this check.
+                let content_size = content.content_len();
+                if content_size > max_size {
+                    error!(
+                        "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; message dropped",
+                        content_size, max_size
+                    );
+                    return;
+                }
 
-                    // Serialize message to CBOR for signing
-                    let mut message_bytes = Vec::new();
-                    if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
-                        error!("Failed to serialize message for signing: {:?}", e);
-                        return;
+                // Stamped now, at Enter, and never restamped: several messages
+                // typed quickly keep their typed order however their
+                // signatures arrive.
+                let message = MessageV1 {
+                    room_owner: MemberId::from(current_room),
+                    author: MemberId::from(&author_vk),
+                    content,
+                    time: get_current_system_time(),
+                };
+
+                // Serialize message to CBOR: the bytes the signature covers.
+                let mut message_bytes = Vec::new();
+                if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
+                    error!("Failed to serialize message for signing: {:?}", e);
+                    return;
+                }
+
+                let reader_position = reader_position.clone();
+                crate::util::debug_log("[send] queued, signing via the delegate");
+                // Defer the signal writes to a clean execution context to
+                // prevent RefCell re-entrant borrow panics.
+                crate::util::defer(move || {
+                    outbox_commit::submit_now(
+                        current_room,
+                        PendingKind::Send {
+                            text: message_text,
+                            author_name,
+                        },
+                        author_vk,
+                        vec![(message, message_bytes)],
+                        fallback_key,
+                    );
+                    // An own send goes to the end, now, to show the pending
+                    // row; the committed message replaces it in place. Only
+                    // if the user is still in the room this send targeted
+                    // (#402): the defer is a task hop after the keypress.
+                    if CURRENT_ROOM.peek().owner_key == Some(current_room) {
+                        reader_position.request_end(Some(current_room));
                     }
-
-                    // Sign locally and synchronously. Do NOT reinstate a
-                    // delegate round-trip here — see `sign_message_locally`
-                    // (freenet/river#512): it cannot change these bytes, and
-                    // awaiting it is what made a sent message take seconds to
-                    // appear.
-                    crate::util::debug_log("[send] signing message...");
-                    let signature = crate::signing::sign_message_locally(&message_bytes, &self_sk);
-                    #[cfg(all(
-                        target_arch = "wasm32",
-                        feature = "example-data",
-                        feature = "no-sync"
-                    ))]
-                    let signature = crate::test_hooks::forge_if_requested(signature);
-                    crate::util::debug_log("[send] signed OK");
-
-                    let auth_message = AuthorizedMessageV1::with_signature(message, signature);
-                    let sent_id = auth_message.id();
-
-                    // Re-add ourselves if pruned for inactivity.
-                    // Uses try_read() to avoid RefCell re-entrant borrow panics
-                    // inside spawn_local (see AGENTS.md "Dioxus WASM Signal Safety Rules").
-                    let (members_delta, member_info_delta) =
-                        try_rejoin_delta(&current_room, "send");
-
-                    // Build message list. No join event here — join events are
-                    // published at invitation acceptance time (in get_response.rs).
-                    // This path only fires when re-adding after inactivity pruning.
-                    let messages = vec![auth_message.clone()];
-
-                    let delta = ChatRoomStateV1Delta {
-                        recent_messages: Some(messages),
-                        members: members_delta,
-                        member_info: member_info_delta,
-                        ..Default::default()
-                    };
-                    info!("Sending message: {:?}", auth_message);
-
-                    crate::util::debug_log("[send] applying delta to local state...");
-                    // Defer ROOMS mutation to a clean execution context to
-                    // prevent RefCell re-entrant borrow panics.
-                    crate::util::defer(move || {
-                        let delta_applied = ROOMS.with_mut(|rooms| {
-                            if let Some(room_data) = rooms.map.get_mut(&current_room) {
-                                if let Err(e) = room_data.room_state.apply_delta(
-                                    &room_state_clone,
-                                    &ChatRoomParametersV1 {
-                                        owner: current_room,
-                                    },
-                                    &Some(delta),
-                                ) {
-                                    crate::util::debug_log(&format!(
-                                        "[send] delta FAILED: {:?}",
-                                        e
-                                    ));
-                                    error!("Failed to apply message delta: {:?}", e);
-                                    false
-                                } else if !room_data
-                                    .room_state
-                                    .recent_messages
-                                    .messages
-                                    .iter()
-                                    .any(|m| m.id() == sent_id)
-                                {
-                                    // The room skips (does not reject) a
-                                    // message it does not admit, so a send
-                                    // that applied without error may still
-                                    // have added nothing.
-                                    error!("Failed to apply message delta: the room did not admit the message");
-                                    false
-                                } else {
-                                    crate::util::debug_log("[send] delta applied OK");
-                                    // For private rooms, re-derive actions_state with
-                                    // decrypted payloads. apply_delta's built-in rebuild
-                                    // only handles public actions, so without this the
-                                    // optimistic update wipes private edits/deletes/reactions
-                                    // until the network echo re-applies them (#310).
-                                    room_data.rebuild_private_actions_state();
-                                    true
-                                }
-                            } else {
-                                crate::util::debug_log("[send] room not found in ROOMS!");
-                                false
-                            }
-                        });
-                        if delta_applied {
-                            // Local apply succeeded and a message will mount:
-                            // take the view to it once, after the render that
-                            // adds it — but only if the user is still viewing
-                            // the room this send targeted. This runs two task
-                            // hops after the keypress (`spawn_local`, then
-                            // `defer`'s setTimeout), so they may have switched
-                            // rooms (#402).
-                            if CURRENT_ROOM.peek().owner_key == Some(current_room) {
-                                reader_position.request_end(Some(current_room));
-                            }
-                            crate::util::debug_log("[send] marking NEEDS_SYNC");
-                            crate::components::app::mark_needs_sync(current_room);
-                            #[cfg(target_arch = "wasm32")]
-                            request_permission_on_first_message();
-                        }
-                    });
+                    #[cfg(target_arch = "wasm32")]
+                    request_permission_on_first_message();
                 });
             }
         }
@@ -3265,6 +2989,15 @@ pub fn Conversation() -> Element {
                         } else {
                             reader_position.forget_range();
                             None
+                        }
+                    }
+                    // The sender's own messages still being signed, or that
+                    // failed, below the newest message (`pending_sends.rs`).
+                    // Not under a held range: they belong after the latest
+                    // message, and an own send requests the latest range.
+                    if let Some(room) = current_room_data.as_ref().map(|r| r.owner_vk) {
+                        if !reader_position.has_newer.get() {
+                            PendingSends { room }
                         }
                     }
                     // Invisible sentinel right under the newest rendered row,
@@ -5607,27 +5340,21 @@ mod tests {
     }
 
     /// Source-grep pin (freenet/river#512): nothing may be awaited between the
-    /// user acting on a message and that message reaching `ROOMS`.
+    /// user acting on a message and that message entering the outbox.
     ///
-    /// All four handlers — send, reaction, delete, edit — render optimistically:
-    /// the composer (or the reaction pill) updates the instant the delta is
-    /// applied to `ROOMS`, and nothing waits for the network echo. So every
-    /// suspension point before that write is dead air, with the composer
-    /// already cleared and no message in its place.
-    ///
-    /// The one that shipped was a delegate signing round-trip. On a hosted node
-    /// that is a WAN hop queued behind contract merges on a serial WASM
-    /// executor, with a 10s timeout before the local fallback. It cost seconds
-    /// and could not change the produced bytes — see
-    /// `signing::a_delegate_signature_can_never_differ_from_the_local_one`.
+    /// Messages are signed by the chat delegate, which usually answers in a
+    /// millisecond but sometimes takes seconds (delegate requests queue behind
+    /// contract WASM on the node). A sent message shows as a pending row from
+    /// the outbox meanwhile, so the outbox insert is the write the user sees,
+    /// and every suspension point before it is dead air with the composer
+    /// already cleared.
     ///
     /// It is also invisible in development: with `--features no-sync` the
-    /// delegate request fails instantly, so `dev-example` and every Playwright
-    /// spec only ever exercise the fast path. Nothing but this pin stands
-    /// between a future `.await` here and another silent multi-second
-    /// regression.
+    /// delegate request fails instantly. `pending-send.spec.ts` holds signing
+    /// open through a test hook to see the pending row; this pin covers the
+    /// edit, delete and reaction paths that spec does not drive.
     #[test]
-    fn nothing_is_awaited_between_acting_on_a_message_and_it_appearing() {
+    fn nothing_is_awaited_between_acting_on_a_message_and_it_entering_the_outbox() {
         let source = include_str!("conversation.rs");
         // Same cut as the pins around it — see
         // `author_deputy_badge_uses_the_shared_helper` for why it must be this
@@ -5635,12 +5362,10 @@ mod tests {
         let prod = &source[..source
             .find("#[cfg(test)]\nmod tests {")
             .expect("conversation.rs should have a `#[cfg(test)] mod tests` block")];
-        // Drop whole-line comments, so prose about awaiting (this file has
-        // plenty) cannot satisfy the search. Deliberately NOT `split_once`,
-        // which would also truncate a line at a `//` inside a string literal
-        // (`"https://…"`) and could hide a real trailing `.await`. A trailing
-        // comment that happens to contain the needle now fails the test
-        // instead, which is the safe direction: loud, not silent.
+        // Drop whole-line comments, so prose about awaiting cannot satisfy the
+        // search. Deliberately NOT `split_once("//")`, which would also cut a
+        // line at a `//` inside a string literal and could hide a real
+        // trailing `.await`.
         let code: String = prod
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -5649,9 +5374,6 @@ mod tests {
         // Whitespace-stripped so a rustfmt re-wrap cannot silently disarm it.
         let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
-        // Every optimistic-render handler, not just the one #512 was reported
-        // against: they are the same shape, and all four carried the same await.
-        // Each ends at the `defer` that performs its `ROOMS` write.
         for handler in [
             "lethandle_send_message={",
             "lethandle_toggle_reaction={",
@@ -5664,52 +5386,34 @@ mod tests {
                      this pin on whatever replaced it, do not delete it"
                 )
             });
-            // Anchored on the ROOMS write itself, not on the `defer` that
-            // wraps it: a future edit adding an EARLIER defer to a handler (a
-            // scroll defer, a focus defer) would otherwise shrink the region
-            // and quietly let an await through behind it.
             let end = squashed[start..]
-                .find("ROOMS.with_mut(")
+                .find("outbox_commit::submit_now(")
                 .map(|i| start + i)
                 .unwrap_or_else(|| {
                     panic!(
-                        "`{handler}` no longer applies its result to ROOMS \
-                         optimistically — re-anchor this pin, do not delete it"
+                        "`{handler}` no longer puts its message in the outbox — \
+                         re-anchor this pin, do not delete it"
                     )
                 });
             let region = &squashed[start..end];
-
             assert!(
                 !region.contains(".await"),
-                "`{handler}` awaits something before its optimistic ROOMS \
-                 write. The UI is already committed to the action by then, so \
-                 the user waits with nothing on screen for as long as that \
-                 future takes — which is what freenet/river#512 was. Do the \
-                 work after the local apply, or off this path entirely."
+                "`{handler}` awaits something before its message enters the \
+                 outbox, so the user waits with nothing on screen for as long \
+                 as that future takes (freenet/river#512)"
             );
-            // Per-region, so it also fails if signing moves INTO the deferred
-            // closure (outside the scanned region) or switches to another key.
+            // Signing belongs after the insert, in `outbox_commit`.
             assert!(
-                region.contains("sign_message_locally(&message_bytes,&self_sk)"),
-                "`{handler}` must sign with the room's own key, synchronously, \
-                 before the message reaches ROOMS"
+                !region.contains("sign_message") && !region.contains(".sign("),
+                "`{handler}` signs before the outbox insert"
             );
-            // The write must still be deferred to a clean execution context —
-            // that `setTimeout`, not `spawn_local`, is what keeps the Dioxus
-            // signal write off the event handler's stack.
+            // The insert is a global signal write: it must run in `defer`'s
+            // clean execution context, not on the event handler's stack.
             assert!(
                 region.contains("crate::util::defer(move||{"),
-                "`{handler}`'s ROOMS write must stay inside `crate::util::defer`"
+                "`{handler}`'s outbox insert must be inside `crate::util::defer`"
             );
         }
-
-        // No path may fall back to asking the delegate. Split so the needle
-        // cannot match its own text via `include_str!`.
-        assert!(
-            !squashed.contains(concat!("sign_message_", "with_fallback")),
-            "message signing must not go through the delegate on any path \
-             (freenet/river#512)"
-        );
     }
 
     /// Source-grep pin (freenet/river#509): the no-room screen must branch on

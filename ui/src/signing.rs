@@ -1,14 +1,16 @@
 //! Signing API for room payloads.
 //!
-//! The chat delegate holds a copy of each room's signing key, and most signable
-//! types (member, ban, config, member_info, secret, upgrade) are signed by
-//! asking it over the WebSocket — see the `sign_*_with_fallback` functions.
+//! The chat delegate holds a copy of each room's signing key, and every
+//! signable type is signed by asking it over the WebSocket — see the
+//! `sign_*_with_fallback` functions. Chat messages go through it too
+//! (`sign_message_with_fallback`), but the conversation never waits for that
+//! answer to show the message: it renders a pending row from the outbox
+//! (`components/conversation/outbox.rs`) and commits when the signature
+//! arrives.
 //!
-//! `RoomData::self_sk` is the authoritative key in every case, though: a
-//! delegate answer is used only when it verifies under it, and otherwise the
-//! payload is signed locally. Chat messages skip the round-trip entirely and
-//! sign locally (`sign_message_locally`, freenet/river#512), because the answer
-//! could not differ and waiting for it is what the sender sees as lag.
+//! While this build still holds `RoomData::self_sk`, it is the fallback: a
+//! delegate answer is used only when it verifies under the author's key, and
+//! otherwise the payload is signed locally.
 //!
 //! This module also owns the signing-key migration that puts `self_sk` into the
 //! delegate in the first place.
@@ -81,10 +83,16 @@ pub async fn get_public_key(room_key: RoomKey) -> Result<Option<VerifyingKey>, S
     }
 }
 
-// NOTE: there is deliberately no `sign_message` delegate request here. Chat
-// messages sign locally via `sign_message_locally` (freenet/river#512); the
-// `ChatDelegateRequestMsg::SignMessage` variant is retained in the delegate
-// protocol for older clients.
+/// Sign a chat message (`MessageV1`, CBOR-encoded) with the delegate.
+pub async fn sign_message(room_key: RoomKey, message_bytes: Vec<u8>) -> Result<Signature, String> {
+    let request = ChatDelegateRequestMsg::SignMessage {
+        room_key,
+        request_id: generate_request_id(),
+        message_bytes,
+    };
+
+    extract_signature(send_delegate_request(request).await)
+}
 
 /// Sign a member invitation (Member).
 pub async fn sign_member(room_key: RoomKey, member_bytes: Vec<u8>) -> Result<Signature, String> {
@@ -479,36 +487,75 @@ async fn delegate_sign_or_fallback(
     }
 }
 
-/// Sign message bytes (`MessageV1`) with the room's own key, synchronously.
+/// Which key produced a chat message's signature, for the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageSigner {
+    /// The chat delegate, with the author's key.
+    Delegate,
+    /// The local key, because the delegate answered with a signature that does
+    /// not verify under the author's key (a stale key mid identity-import).
+    LocalAfterStaleDelegate,
+    /// The local key, because the delegate failed or timed out.
+    LocalAfterDelegateFailed,
+}
+
+/// Sign a chat message (`MessageV1`, CBOR-encoded) with the chat delegate,
+/// falling back to `fallback_key` while this build still holds one.
 ///
-/// Chat messages deliberately do NOT ask the delegate for a signature, unlike
-/// every other signable type in this module. Do not "restore" the delegate
-/// round-trip here — it cannot change the produced bytes and it costs a WAN
-/// round-trip on the one path a user watches (freenet/river#512):
+/// Callers must not make anything the user is looking at wait for this. The
+/// delegate answers in ~1 ms at the median, but delegate requests queue behind
+/// contract WASM on the node, and about 1% stall for 0.3-2 s (6.2 s worst
+/// measured over 22k production requests, 2026-11-05), with a 10 s timeout
+/// before the fallback. The conversation shows the message from the outbox
+/// meanwhile (`components/conversation/outbox.rs`, freenet/river#512, which
+/// is what an awaited version of this cost before).
 ///
-/// 1. `delegate_sign_or_fallback` accepts the delegate's answer only when it
-///    verifies under `self_sk` (see above); otherwise it signs locally anyway.
-/// 2. Every writer stores `RoomData::self_sk`, so on the send path the private
-///    key is already in the browser and there is nothing to wait for. (The
-///    field is `Option` for reader tolerance — see its docs — and the send path
-///    refuses when it is absent rather than waiting on the delegate. Do NOT
-///    read this point as licence to make the field required again; it is a
-///    statement about where the key IS, not about the field's type.)
-/// 3. Ed25519 is deterministic (RFC 8032), and the delegate signs with
-///    `SigningKey::from_bytes(sk).sign(data)` — the same operation. So whenever
-///    the delegate's answer is *accepted*, it is byte-identical to this.
-///
-/// The awaited version rendered the sender's own message only after a
-/// round-trip that queued behind contract merges on the node's serial WASM
-/// executor, with a 10s timeout before the local fallback — seconds of blank
-/// composer for a signature the browser could produce in microseconds.
-///
-/// The same three facts hold for the other `sign_*_with_fallback` functions —
-/// their delegate answers are equally unable to change the bytes — so the
-/// delegate call is not buying them correctness either. They are left alone
-/// because none of them is on the send path, not because they need it.
-pub fn sign_message_locally(message_bytes: &[u8], self_sk: &SigningKey) -> Signature {
-    self_sk.sign(message_bytes)
+/// The answer is accepted only if it verifies under `author_vk`. With no
+/// fallback key (a blob written by a build that no longer stores `self_sk`),
+/// a delegate failure is an `Err` and the caller keeps the message, failed,
+/// for the user to retry. Ed25519 is deterministic (RFC 8032), so an
+/// accepted delegate signature is byte-identical to the local one.
+pub async fn sign_message_with_fallback(
+    room_key: RoomKey,
+    message_bytes: Vec<u8>,
+    author_vk: VerifyingKey,
+    fallback_key: Option<SigningKey>,
+) -> Result<(Signature, MessageSigner), String> {
+    delegate_message_sign_or_fallback(
+        sign_message(room_key, message_bytes.clone()),
+        &message_bytes,
+        &author_vk,
+        fallback_key.as_ref(),
+    )
+    .await
+}
+
+/// `sign_message_with_fallback`'s decision, with the delegate call injected.
+async fn delegate_message_sign_or_fallback(
+    delegate_sign: impl std::future::Future<Output = Result<Signature, String>>,
+    data: &[u8],
+    author_vk: &VerifyingKey,
+    fallback_key: Option<&SigningKey>,
+) -> Result<(Signature, MessageSigner), String> {
+    let (failure, signer) = match delegate_sign.await {
+        Ok(sig) if author_vk.verify_strict(data, &sig).is_ok() => {
+            return Ok((sig, MessageSigner::Delegate));
+        }
+        Ok(_) => (
+            "the delegate signed with a different key".to_string(),
+            MessageSigner::LocalAfterStaleDelegate,
+        ),
+        Err(e) => (e, MessageSigner::LocalAfterDelegateFailed),
+    };
+    // The local fallback. Delete this arm, and the `fallback_key` parameter,
+    // when the UI stops holding `self_sk`.
+    match fallback_key {
+        Some(key) if key.verifying_key() == *author_vk => {
+            warn!("Message signing: {failure}; signed with the local key");
+            Ok((key.sign(data), signer))
+        }
+        _ => Err(failure),
+    }
 }
 
 /// Sign member bytes with delegate, falling back to local signing if delegate fails
@@ -651,82 +698,67 @@ mod tests {
         );
     }
 
-    /// freenet/river#512: the premise the local-signing change rests on.
-    ///
-    /// `delegate_sign_or_fallback` has three arms, and for a message signed
-    /// with the room's own key EVERY one of them yields the same bytes
-    /// `sign_message_locally` produces:
-    ///
-    /// - delegate answered with our key → accepted, and ed25519 is
-    ///   deterministic (RFC 8032), so the bytes are identical;
-    /// - delegate answered with a stale key → rejected, signed locally;
-    /// - delegate failed → signed locally.
-    ///
-    /// So awaiting it on the send path could only ever cost latency. If this
-    /// ever stops holding — a randomized signature scheme, or a delegate
-    /// answer accepted without the local-key check — the send path must go
-    /// back to consulting the delegate, and this test is what says so.
+    /// Every arm of the message signer: which signature it returns, which
+    /// path it reports, and that it never returns a signature that does not
+    /// verify under the author's key.
     #[test]
-    fn a_delegate_signature_can_never_differ_from_the_local_one() {
+    fn message_signing_takes_the_delegate_answer_only_when_it_verifies() {
         let self_sk = SigningKey::from_bytes(&[9u8; 32]);
+        let author_vk = self_sk.verifying_key();
         let stale_sk = SigningKey::from_bytes(&[8u8; 32]);
         let data = b"a CBOR-encoded MessageV1, near enough";
-        let local = sign_message_locally(data, &self_sk);
+        let local = self_sk.sign(data);
+        let run = |delegate: Result<Signature, String>, fallback: Option<&SigningKey>| {
+            futures::executor::block_on(delegate_message_sign_or_fallback(
+                async move { delegate },
+                data,
+                &author_vk,
+                fallback,
+            ))
+        };
 
-        // Arm 1: the delegate holds the same key. This is what the delegate
-        // actually computes (handlers.rs: `SigningKey::from_bytes(sk).sign`).
-        let delegate_sig = self_sk.sign(data);
-        let accepted = futures::executor::block_on(delegate_sign_or_fallback(
-            async move { Ok(delegate_sig) },
-            data,
-            &self_sk,
-        ));
+        // The delegate holds the author's key (what `handlers.rs` computes).
         assert_eq!(
-            accepted.to_bytes(),
-            local.to_bytes(),
-            "an ACCEPTED delegate signature must be byte-identical to the \
-             local one — otherwise signing locally is not behaviour-preserving"
+            run(Ok(self_sk.sign(data)), Some(&self_sk)),
+            Ok((local, MessageSigner::Delegate))
         );
-
-        // Arm 2: the delegate holds a stale key (mid identity-import).
-        let stale_sig = stale_sk.sign(data);
-        assert_ne!(
-            stale_sig.to_bytes(),
-            local.to_bytes(),
-            "premise: a different key must produce a different signature, or \
-             arm 2 proves nothing"
-        );
-        let rejected = futures::executor::block_on(delegate_sign_or_fallback(
-            async move { Ok(stale_sig) },
-            data,
-            &self_sk,
-        ));
         assert_eq!(
-            rejected.to_bytes(),
-            local.to_bytes(),
-            "a stale-key delegate signature must be discarded in favour of the \
-             local one"
+            run(Ok(self_sk.sign(data)), None),
+            Ok((local, MessageSigner::Delegate)),
+            "with no local key the delegate's answer is all there is"
         );
 
-        // Arm 3: the delegate failed (no key on file, socket closed, timeout).
-        let failed = futures::executor::block_on(delegate_sign_or_fallback(
-            async { Err("delegate unavailable".to_string()) },
-            data,
-            &self_sk,
-        ));
+        // A stale delegate key: never accepted.
+        let stale = stale_sk.sign(data);
+        assert_ne!(stale, local, "premise: a different key signs differently");
         assert_eq!(
-            failed.to_bytes(),
-            local.to_bytes(),
-            "a failed delegate sign must fall back to the local signature"
+            run(Ok(stale), Some(&self_sk)),
+            Ok((local, MessageSigner::LocalAfterStaleDelegate))
         );
+        assert!(run(Ok(stale), None).is_err());
+
+        // The delegate failed (no key on file, socket closed, timeout).
+        assert_eq!(
+            run(Err("timed out".to_string()), Some(&self_sk)),
+            Ok((local, MessageSigner::LocalAfterDelegateFailed))
+        );
+        assert_eq!(
+            run(Err("timed out".to_string()), None),
+            Err("timed out".to_string()),
+            "no fallback key: the failure reaches the caller, which keeps the \
+             message for a retry"
+        );
+
+        // A fallback key for some other identity is not a fallback.
+        assert!(run(Err("timed out".to_string()), Some(&stale_sk)).is_err());
     }
 
-    /// freenet/river#512: the send path hand-rolls the signing preimage —
-    /// CBOR-encode `MessageV1`, then `sign_message_locally` those bytes —
-    /// because it needs to fail gracefully on a serialization error where
-    /// `sign_struct` would panic in WASM. That leaves four copies of the
-    /// preimage that must stay byte-identical to what the contract verifies,
-    /// held together by convention alone. Pin the two together: if
+    /// The message paths hand-roll the signing preimage (CBOR-encode
+    /// `MessageV1`, then sign those bytes, by the delegate or locally) because
+    /// they need to fail gracefully on a serialization error where
+    /// `sign_struct` would panic in WASM. That preimage must stay
+    /// byte-identical to what the contract verifies, held together by
+    /// convention alone. Pin the two together: if
     /// `sign_struct` ever gains a domain separator or a version tag, every
     /// message a user sends would be rejected by the contract while every
     /// other test still passed.
@@ -741,13 +773,12 @@ mod tests {
             time: std::time::SystemTime::UNIX_EPOCH,
         };
 
-        // Exactly what the four call sites in `conversation.rs` do.
+        // Exactly what `conversation.rs` puts in the outbox, and what the
+        // delegate signs (`SigningKey::from_bytes(sk).sign(bytes)`).
         let mut message_bytes = Vec::new();
         ciborium::ser::into_writer(&message, &mut message_bytes).expect("MessageV1 must serialize");
-        let sent = AuthorizedMessageV1::with_signature(
-            message.clone(),
-            sign_message_locally(&message_bytes, &self_sk),
-        );
+        let sent =
+            AuthorizedMessageV1::with_signature(message.clone(), self_sk.sign(&message_bytes));
 
         sent.validate(&self_sk.verifying_key()).expect(
             "a message signed on the send path must verify under the author's \
@@ -762,19 +793,12 @@ mod tests {
         );
     }
 
-    /// freenet/river#512 rests on the send path signing LOCALLY and never
-    /// waiting on the delegate. It used to rest on a second thing as well —
-    /// `RoomData::self_sk` being infallibly present — and the previous version
-    /// of this test asserted exactly that at compile time, with the note that
-    /// "if it ever becomes optional (delegate-only custody, a hardware key),
-    /// the message path needs rethinking rather than an `unwrap`".
-    ///
-    /// That has now happened: `self_sk` is `Option<SigningKey>` so that a blob
-    /// written by a future River which keeps the key elsewhere still decodes
-    /// here (see the field docs). This build still always WRITES the key, so
-    /// #512's local-signing property is untouched in practice. What changed is
-    /// the obligation the old test named: the send path must degrade, not
-    /// `unwrap`.
+    /// `RoomData::self_sk` is `Option<SigningKey>` so that a blob written by a
+    /// future River which keeps the key elsewhere still decodes here (see the
+    /// field docs). This build still always WRITES the key. The obligation
+    /// that follows: every signing path must degrade when it is absent (the
+    /// message paths sign through the delegate and keep a failed message for
+    /// retry; the others skip), never `unwrap` it.
     ///
     /// So this pins the successor invariant in both halves — the accessor is
     /// fallible (compile time), and no signing path recovers the key by

@@ -1,8 +1,9 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
 //! INBOUND messages, remove messages, drive the no-room screen's load states,
 //! complete an own DM while another thread is open, put reactions on the
-//! newest message, count message group renders, and make the room banner's
-//! sync-status read fail once.
+//! newest message, count message group renders, make the room banner's
+//! sync-status read fail once, and hold or fail the signing of own messages
+//! (the chat delegate's round trip).
 //!
 //! The composer is not a substitute: an own send is an explicit request to go
 //! to the newest message, so a message sent through the UI
@@ -47,6 +48,12 @@ thread_local! {
     /// sends are not held.
     static HELD_INVITE_SENDS: std::cell::RefCell<Option<Vec<futures::channel::oneshot::Sender<()>>>> =
         const { std::cell::RefCell::new(None) };
+    /// Message signing requests waiting for `releaseMessageSign(s)`, in the
+    /// order they arrived (a released slot is `None`); `None` while signing
+    /// is not held.
+    static HELD_MESSAGE_SIGNS: std::cell::RefCell<Option<Vec<Option<futures::channel::oneshot::Sender<()>>>>> =
+        const { std::cell::RefCell::new(None) };
+    static FAIL_NEXT_MESSAGE_SIGN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Runs of a `showToast` action since `takeToastActionRuns` last read them.
     static TOAST_ACTION_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
@@ -75,7 +82,8 @@ pub fn note_banner_read_failed() {
 }
 
 /// `signature` with one bit flipped if `forgeNextSendSignature` was called
-/// since the last send, else unchanged. Called by the composer's send path.
+/// since the last own message was signed, else unchanged. Called by the outbox
+/// when a signature arrives.
 pub fn forge_if_requested(signature: ed25519_dalek::Signature) -> ed25519_dalek::Signature {
     if !FORGE_NEXT_SEND.with(|f| f.replace(false)) {
         return signature;
@@ -98,6 +106,27 @@ pub async fn invite_send_gate() {
     if let Some(rx) = waiting {
         let _ = rx.await;
     }
+}
+
+/// Waits while `holdMessageSigning` holds message signing: the stand-in for a
+/// slow chat delegate. Called by the outbox before each signing request.
+pub async fn message_sign_gate() {
+    let waiting = HELD_MESSAGE_SIGNS.with(|held| {
+        held.borrow_mut().as_mut().map(|senders| {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            senders.push(Some(tx));
+            rx
+        })
+    });
+    if let Some(rx) = waiting {
+        let _ = rx.await;
+    }
+}
+
+/// Whether the next message signing is to fail as a delegate failure with no
+/// local key to fall back on; consumes the armed failure.
+pub fn take_message_sign_failure() -> bool {
+    FAIL_NEXT_MESSAGE_SIGN.with(|f| f.replace(false))
 }
 
 /// Counts one render of a message group, for `takeMessageGroupRenders`: a
@@ -541,6 +570,53 @@ pub fn install_test_hooks() {
             }
         })
         .into_js_value(),
+    );
+
+    set_hook(
+        "holdMessageSigning",
+        Closure::<dyn FnMut()>::new(move || {
+            HELD_MESSAGE_SIGNS.with(|held| {
+                held.borrow_mut().get_or_insert_with(Vec::new);
+            });
+        })
+        .into_js_value(),
+    );
+
+    // Release the `index`-th held signing request (0 = the first to arrive),
+    // so a spec can make signatures arrive out of order. Signing stays held.
+    // Returns how many requests are held, released ones included.
+    set_hook(
+        "releaseMessageSign",
+        Closure::<dyn FnMut(u32) -> u32>::new(move |index: u32| {
+            HELD_MESSAGE_SIGNS.with(|held| {
+                let mut held = held.borrow_mut();
+                let Some(senders) = held.as_mut() else {
+                    return 0;
+                };
+                if let Some(tx) = senders.get_mut(index as usize).and_then(Option::take) {
+                    let _ = tx.send(());
+                }
+                senders.len() as u32
+            })
+        })
+        .into_js_value(),
+    );
+
+    set_hook(
+        "releaseMessageSigning",
+        Closure::<dyn FnMut()>::new(move || {
+            let senders = HELD_MESSAGE_SIGNS.with(|held| held.borrow_mut().take());
+            for tx in senders.into_iter().flatten().flatten() {
+                let _ = tx.send(());
+            }
+        })
+        .into_js_value(),
+    );
+
+    set_hook(
+        "failNextMessageSign",
+        Closure::<dyn FnMut()>::new(move || FAIL_NEXT_MESSAGE_SIGN.with(|f| f.set(true)))
+            .into_js_value(),
     );
 
     set_hook(
