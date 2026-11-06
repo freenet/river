@@ -108,6 +108,20 @@ impl PendingEntry {
         self.authorized().iter().map(|m| m.id()).collect()
     }
 
+    /// Whether any message is sealed under a room secret version other than
+    /// `current` (the version the room would seal with now). Resending such a
+    /// message after a rotation (a ban rotates the secret) would reach the
+    /// member the rotation was meant to exclude, so it is never committed.
+    /// With no current secret, any sealed message counts as stale.
+    pub fn is_stale_sealed(&self, current: Option<u32>) -> bool {
+        self.messages.iter().any(|m| match &m.message.content {
+            river_core::room_state::message::RoomMessageBody::Private {
+                secret_version, ..
+            } => Some(*secret_version) != current,
+            _ => false,
+        })
+    }
+
     /// When the user acted (the first message's timestamp).
     pub fn time(&self) -> SystemTime {
         self.messages
@@ -221,15 +235,24 @@ impl Outbox {
         })
     }
 
-    /// Whether any message, in any room, is still being signed. Bounded:
-    /// each signing request times out (10 s), after which the entry commits
-    /// or fails. A failed entry does not count.
+    /// Whether a page reload would lose something the user can still act on:
+    /// a message being signed (in any room), or a failed send shown on
+    /// screen, that is, in a room `shown` reports the identity of (`Some`
+    /// for a room still held, with its current identity) and written as that
+    /// identity. A failed row nobody can see (its room removed, its identity
+    /// replaced) does not count, or it would hold a reload back for the life
+    /// of the page.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub fn has_signing(&self) -> bool {
-        self.rooms
-            .values()
-            .flatten()
-            .any(|e| e.state == PendingState::Signing)
+    pub fn has_unsent(&self, shown: impl Fn(&VerifyingKey) -> Option<VerifyingKey>) -> bool {
+        self.rooms.iter().any(|(room, queue)| {
+            let current = shown(room);
+            queue.iter().any(|e| match e.state {
+                PendingState::Signing => true,
+                PendingState::Failed(_) => {
+                    matches!(e.kind, PendingKind::Send { .. }) && current == Some(e.author_vk)
+                }
+            })
+        })
     }
 
     /// The entry `id` in `room`, if it is still there.

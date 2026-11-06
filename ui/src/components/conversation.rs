@@ -43,7 +43,9 @@ mod outbox;
 mod outbox_commit;
 pub(crate) use self::outbox_commit::clear_room_now as clear_outbox_for_room_now;
 #[cfg(target_arch = "wasm32")]
-pub(crate) use self::outbox_commit::has_signing as outbox_has_signing;
+pub(crate) use self::outbox_commit::{
+    has_signing as outbox_has_signing, has_unsent as outbox_has_unsent,
+};
 mod pending_effects;
 mod pending_sends;
 use self::emoji_picker::FREQUENT_EMOJIS;

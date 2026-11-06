@@ -449,19 +449,45 @@ fn entries_from_a_replaced_identity_are_neither_shown_nor_kept() {
 }
 
 #[test]
-fn only_a_message_still_signing_counts_as_signing() {
+fn a_reload_would_lose_signing_messages_and_failed_rows_on_screen_only() {
+    let me = author().verifying_key();
+    let shown = |_: &VerifyingKey| Some(me);
     let mut outbox = Outbox::default();
-    assert!(!outbox.has_signing());
-    let (a, wa) = send(&mut outbox, "a", 1);
-    assert!(outbox.has_signing());
+    assert!(!outbox.has_unsent(shown));
+    let (a, _) = send(&mut outbox, "a", 1);
+    assert!(outbox.has_unsent(|_| None), "signing counts even unseen");
     outbox.record_failure(&room(), a, "x".to_string());
     assert!(
-        !outbox.has_signing(),
-        "a failed row must not hold back a reload for as long as it is left"
+        outbox.has_unsent(shown),
+        "a failed row on screen is held like a draft"
     );
-    let _ = outbox.retry(&room(), a, later()).unwrap();
-    assert!(outbox.has_signing());
-    sign_all(&mut outbox, a, &wa);
+    assert!(
+        !outbox.has_unsent(|_| None),
+        "a failed row in a room no longer held does not hold a reload forever"
+    );
+    let other = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+    assert!(
+        !outbox.has_unsent(|_| Some(other)),
+        "nor does one written as a replaced identity"
+    );
+    let (e, _) = outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "edit",
+            effects: vec![],
+        },
+        me,
+        vec![message("edit", 2)],
+    );
+    outbox.record_failure(&room(), e, "x".to_string());
+    outbox.discard(&room(), a);
+    assert!(
+        !outbox.has_unsent(shown),
+        "a failed action has no row; it is reported and dropped"
+    );
+    let (_, work) = outbox.retry(&room(), e, later()).unwrap();
+    assert!(outbox.has_unsent(|_| None));
+    sign_all(&mut outbox, e, &work);
     let _ = outbox.take_ready(&room());
-    assert!(!outbox.has_signing());
+    assert!(!outbox.has_unsent(shown));
 }

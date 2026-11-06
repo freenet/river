@@ -38,35 +38,6 @@ pub(crate) fn retry(room: VerifyingKey, id: u64) {
             .map
             .get(&room)
             .and_then(|r| r.signing_key().cloned());
-        // A private-room message is sealed when written. If the room's secret
-        // has rotated since (a ban rotates it), resending the old ciphertext
-        // would reach a member the rotation was meant to exclude: refuse, and
-        // leave the text on screen to send again.
-        let current_version = ROOMS
-            .peek()
-            .map
-            .get(&room)
-            .and_then(|r| r.get_secret().map(|(_, version)| version));
-        let stale_seal = OUTBOX.peek().entry(&room, id).is_some_and(|entry| {
-            entry.messages.iter().any(|m| match &m.message.content {
-                river_core::room_state::message::RoomMessageBody::Private {
-                    secret_version,
-                    ..
-                } => Some(*secret_version) != current_version,
-                _ => false,
-            })
-        });
-        if stale_seal {
-            OUTBOX.with_mut(|o| {
-                o.record_failure(
-                    &room,
-                    id,
-                    "the room's key changed since this was written; copy the text and send it again"
-                        .to_string(),
-                )
-            });
-            return;
-        }
         // The fallback key is the current identity's; `sign_message_with_fallback`
         // uses it only if it matches `author_vk`, so a row from a replaced
         // identity cannot be signed with the new key.
@@ -78,15 +49,24 @@ pub(crate) fn retry(room: VerifyingKey, id: u64) {
     });
 }
 
-/// Whether any message is still being signed. The outbox is memory only, so
-/// a page reload loses it: the generation reload treats this as the reader
-/// being busy, and a clicked reload waits for it. Bounded by the signing
-/// timeout; a failed row does not count (it would hold the reload back for
-/// as long as it is left, so a reload loses it). Unreadable means "cannot
-/// tell": busy.
+/// Whether a page reload would lose a message the user can still act on
+/// (`Outbox::has_unsent`). The outbox is memory only: the generation reload
+/// treats this as the reader being busy, as it does a draft in the composer,
+/// and a clicked reload waits for messages still signing. Unreadable means
+/// "cannot tell": busy.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn has_unsent() -> bool {
+    let (Ok(outbox), Ok(rooms)) = (OUTBOX.try_read(), ROOMS.try_read()) else {
+        return true;
+    };
+    outbox.has_unsent(|room| rooms.map.get(room).and_then(|r| r.self_verifying_key()))
+}
+
+/// Whether any message is still being signed (`Outbox::has_unsent` with no
+/// room shown): what a clicked reload waits for. Unreadable means busy.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn has_signing() -> bool {
-    OUTBOX.try_read().map_or(true, |o| o.has_signing())
+    OUTBOX.try_read().map_or(true, |o| o.has_unsent(|_| None))
 }
 
 /// Drop everything waiting in `room`: the user left it. From a deferred
@@ -261,6 +241,16 @@ fn action_failed_toast(label: &'static str) {
 /// Apply one entry's signed messages to the room, with a rejoin if this member
 /// was pruned for inactivity.
 fn apply_entry(room_data: &mut RoomData, entry: &PendingEntry) -> Result<(), String> {
+    // Sealed under a secret the room has since rotated away from (a ban
+    // rotates it while this was signing, or before a Retry): publishing it
+    // would reach the member the rotation excluded. The room itself admits
+    // any version it has a record of, so the sender is the only check.
+    if entry.is_stale_sealed(room_data.get_secret().map(|(_, version)| version)) {
+        return Err(
+            "the room's key changed since this was written; copy the text and send it again"
+                .to_string(),
+        );
+    }
     // Written as an identity this room no longer uses (an identity import
     // replaced it while this was signing): never publish it under the old one.
     if room_data.self_verifying_key() != Some(entry.author_vk) {
@@ -616,6 +606,57 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing `{write}`"));
             assert!(g < w, "`{guard}` must come before `{write}`");
         }
+    }
+
+    #[test]
+    fn stale_sealed_is_any_private_body_under_another_version() {
+        let room = owner_sk().verifying_key();
+        let mut outbox = Outbox::default();
+        let sealed = |version: u32| {
+            let message = MessageV1 {
+                room_owner: MemberId::from(&room),
+                author: MemberId::from(&owner_sk().verifying_key()),
+                content: RoomMessageBody::private(
+                    river_core::room_state::content::CONTENT_TYPE_TEXT,
+                    river_core::room_state::content::TEXT_CONTENT_VERSION,
+                    vec![1, 2, 3],
+                    [0u8; 12],
+                    version,
+                ),
+                time: SystemTime::now(),
+            };
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+            (message, bytes)
+        };
+        let kind = || PendingKind::Send {
+            text: "x".to_string(),
+            author_name: "Owner".to_string(),
+        };
+        let vk = owner_sk().verifying_key();
+        outbox.enqueue(room, kind(), vk, vec![sealed(1)]);
+        outbox.enqueue(room, kind(), vk, vec![sealed(2), sealed(1)]);
+        let id = queue_send(&mut outbox, room, "public", 3);
+        let _ = id;
+        let mut entries = Vec::new();
+        for e in outbox.pending_rows(&room, &vk) {
+            entries.push(e.id);
+        }
+        let get = |n: usize| outbox.entry(&room, entries[n]).unwrap();
+        assert!(get(0).is_stale_sealed(Some(2)), "sealed v1, room now at v2");
+        assert!(
+            !get(0).is_stale_sealed(Some(1)),
+            "sealed under the current version"
+        );
+        assert!(get(0).is_stale_sealed(None), "no current secret: stale");
+        assert!(
+            get(1).is_stale_sealed(Some(2)),
+            "any stale half makes the entry stale"
+        );
+        assert!(
+            !get(2).is_stale_sealed(None),
+            "a public body is never stale"
+        );
     }
 
     /// A message written as an identity the room has since replaced (an
