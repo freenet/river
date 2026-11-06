@@ -395,22 +395,26 @@ fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String
 /// freenet-core prints its error with anyhow's `{:?}` format: `Error: <message>`, then, for an
 /// error with context, a blank line, `Caused by:` and the causes (numbered `0: ...` when there
 /// are several), the last being the root cause; hint lines (`Hint:`, `Try: ...`) may follow
-/// the message. So: the last `Error:` line, plus its root cause when there is one. Output
-/// without an `Error:` line (clap prints `error:`, matched too) reports its last line.
+/// the message. So: the last `Error:` line at the start of a line (column 0), plus its root
+/// cause when there is one; failing that, the last indented one. Output without an `Error:`
+/// line (clap prints `error:`, matched too) reports its last line.
 fn error_line(output: &str) -> String {
     let lines: Vec<&str> = output.lines().map(str::trim).collect();
-    // Matched at the start of the line as printed, so an indented cause that happens to begin
-    // with "error:" isn't taken for the message.
-    let found = output
-        .lines()
-        .enumerate()
-        .collect::<Vec<_>>()
-        .into_iter()
+    let error_at = |line: &str| -> Option<String> {
+        let head = line.get(..6)?;
+        let rest = line[6..].trim();
+        (head.eq_ignore_ascii_case("error:") && !rest.is_empty()).then(|| rest.to_string())
+    };
+    let raw: Vec<&str> = output.lines().collect();
+    // At column 0 first, so an indented cause that happens to begin with "error:" isn't taken
+    // for the message; an indented `Error:` only when nothing starts a line with one.
+    let found = (0..raw.len())
         .rev()
-        .find_map(|(i, line)| {
-            let head = line.get(..6)?;
-            let rest = line[6..].trim();
-            (head.eq_ignore_ascii_case("error:") && !rest.is_empty()).then_some((i, rest))
+        .find_map(|i| error_at(raw[i]).map(|rest| (i, rest)))
+        .or_else(|| {
+            (0..lines.len())
+                .rev()
+                .find_map(|i| error_at(lines[i]).map(|rest| (i, rest)))
         });
     let Some((at, message)) = found else {
         return lines
@@ -432,7 +436,7 @@ fn error_line(output: &str) -> String {
         .map(|cause| strip_cause_number(cause));
     match root_cause {
         Some(cause) => format!("{message}: {cause}"),
-        None => message.to_string(),
+        None => message,
     }
 }
 
@@ -905,6 +909,10 @@ mod tests {
         // An indented cause that begins with "error:" is a cause, not the message.
         let cause_says_error = "Error: Failed to X\n\nCaused by:\n    error: Y\n";
         assert_eq!(error_line(cause_says_error), "Failed to X: error: Y");
+        // An `Error:` that only ever appears indented (a wrapper indenting output) still
+        // counts, rather than falling through to a trailing hint.
+        let indented = "  Error: Failed to Z\n  Try: something\n";
+        assert_eq!(error_line(indented), "Failed to Z");
         // Anything else: its last line.
         assert_eq!(error_line("first\nboom\n\n"), "boom");
         assert_eq!(error_line(""), "no error output");
