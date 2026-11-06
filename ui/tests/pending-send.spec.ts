@@ -96,7 +96,7 @@ test("a failed message can be discarded", { tag: "@chromium-only" }, async ({ pa
   await expect(committed(page, "discard me")).toHaveCount(0);
 });
 
-test("an own reaction, edit and delete show while their signatures are held", async ({ page }) => {
+test("an own reaction and edit show while their signatures are held", async ({ page }) => {
   await openRoomWithComposer(page);
   await send(page, "act on me");
   const row = committed(page, "act on me");
