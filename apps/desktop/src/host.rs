@@ -35,38 +35,55 @@ pub struct DesktopHost {
 
 impl DesktopHost {
     pub fn new() -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(2))
-            .build();
-        DesktopHost { agent }
+        DesktopHost {
+            agent: probe_agent(),
+        }
     }
 
     fn ask_node(&self) -> Answer {
-        match self.agent.get(VERSION_URL).call() {
-            Ok(resp) => resp
-                .into_string()
-                .ok()
-                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-                .and_then(|v| v.get("version")?.as_str().map(str::to_owned))
-                .map_or(Answer::NoVersion, Answer::Version),
-            Err(ureq::Error::Status(..)) => Answer::NoVersion,
-            Err(ureq::Error::Transport(_)) => Answer::Nothing,
-        }
+        ask(&self.agent, VERSION_URL)
     }
 }
 
-/// Classify what answered. A version River can't parse is let through rather than refused:
-/// the node reported one, so it is new enough to have the endpoint.
+/// A short timeout, and no redirects: the node's own endpoint never redirects.
+fn probe_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(2))
+        .redirects(0)
+        .build()
+}
+
+/// Ask `url` for the node's version. In ureq 2 a `Status` error is a parsed HTTP response
+/// with status 400 or above, so something HTTP did answer; a `Transport` error (refused,
+/// timed out, not HTTP) means nothing usable did.
+fn ask(agent: &ureq::Agent, url: &str) -> Answer {
+    match agent.get(url).call() {
+        Ok(resp) => resp
+            .into_string()
+            .ok()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .and_then(|v| v.get("version")?.as_str().map(str::to_owned))
+            .map_or(Answer::NoVersion, Answer::Version),
+        Err(ureq::Error::Status(..)) => Answer::NoVersion,
+        Err(ureq::Error::Transport(_)) => Answer::Nothing,
+    }
+}
+
+/// Classify what answered. Only the `MAJOR.MINOR.PATCH` part of a version is compared, so a
+/// suffixed version (`0.2.100-rc.1`) is still held to the floor. A version River can't parse
+/// at all is let through: the node reported one, so it is new enough to have the endpoint.
 fn classify(answer: Answer, installed: bool) -> NodeProbe {
     let minimum = release::MIN_VERSION.to_string();
     match answer {
-        Answer::Version(version) => match release::parse_version(&version) {
-            Ok(v) if v < release::MIN_VERSION => NodeProbe::Outdated {
-                running: Some(version),
-                minimum,
-            },
-            _ => NodeProbe::Running { version },
-        },
+        Answer::Version(version) => {
+            match release::parse_version(version.split(['-', '+']).next().unwrap_or_default()) {
+                Ok(v) if v < release::MIN_VERSION => NodeProbe::Outdated {
+                    running: Some(version),
+                    minimum,
+                },
+                _ => NodeProbe::Running { version },
+            }
+        }
         Answer::NoVersion => NodeProbe::Outdated {
             running: None,
             minimum,
@@ -158,11 +175,18 @@ fn start_binary(
         ));
     }
     runner.run(bin, &["service", "install"]).map_err(|e| {
-        format!(
-            "couldn't set Freenet up as a background service ({e}). On a system without a \
-                 systemd user session, run `{} network` yourself, then try again.",
-            bin.display()
-        )
+        // freenet-core's own advice when a user service can't run. Never a bare
+        // `freenet network`: that stops for good the first time it finds an update.
+        let hint = if cfg!(target_os = "linux") {
+            format!(
+                " Without a systemd user session, set it up for the whole system with \
+                 `sudo {} service install --system`, then try again.",
+                bin.display()
+            )
+        } else {
+            String::new()
+        };
+        format!("couldn't set Freenet up as a background service ({e}).{hint}")
     })?;
     runner
         .run(bin, &["service", "start"])
@@ -345,7 +369,16 @@ mod tests {
         let err = start_binary(Path::new(BIN), &r, true, false).unwrap_err();
         assert_eq!(r.calls(), vec!["service start", "service install"]);
         assert!(err.contains("service install failed"), "{err}");
-        assert!(err.contains(&format!("`{BIN} network`")), "{err}");
+        assert!(
+            !err.contains(" network`"),
+            "never suggests a bare node: {err}"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                err.contains(&format!("`sudo {BIN} service install --system`")),
+                "{err}"
+            );
+        }
 
         let r = FakeRunner::failing(&["service start", "service start"]);
         let err = start_binary(Path::new(BIN), &r, true, false).unwrap_err();
@@ -390,6 +423,15 @@ mod tests {
                 version: "0.3.0".into()
             }
         );
+        // A suffix doesn't get a version past the floor.
+        assert!(matches!(
+            classify(version("0.2.100-rc.1"), true),
+            NodeProbe::Outdated { .. }
+        ));
+        assert!(matches!(
+            classify(version("0.2.160+build.7"), true),
+            NodeProbe::Running { .. }
+        ));
         assert_eq!(
             classify(version("0.2.100"), true),
             NodeProbe::Outdated {
@@ -399,7 +441,7 @@ mod tests {
         );
         // A version River can't parse came from the endpoint, so the node has it.
         assert!(matches!(
-            classify(version("0.4.0-rc1"), true),
+            classify(version("nightly"), true),
             NodeProbe::Running { .. }
         ));
         assert_eq!(
@@ -414,6 +456,47 @@ mod tests {
             NodeProbe::InstalledNotRunning
         );
         assert_eq!(classify(Answer::Nothing, false), NodeProbe::NotInstalled);
+    }
+
+    /// Serve one canned HTTP response on a local port and return its URL.
+    fn serve_once(response: &'static str) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/version", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(response.as_bytes());
+        });
+        url
+    }
+
+    #[test]
+    fn what_the_port_says_is_read_correctly() {
+        let agent = probe_agent();
+        let ok = "HTTP/1.1 200 OK\r\ncontent-length: 23\r\n\r\n{\"version\":\"0.2.155\"}\r\n";
+        assert_eq!(
+            ask(&agent, &serve_once(ok)),
+            Answer::Version("0.2.155".into())
+        );
+        let html = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
+        assert_eq!(ask(&agent, &serve_once(html)), Answer::NoVersion);
+        let missing = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(ask(&agent, &serve_once(missing)), Answer::NoVersion);
+        // A redirect is not followed: the node's endpoint never redirects.
+        let moved =
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/x\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(ask(&agent, &serve_once(moved)), Answer::NoVersion);
+
+        // Nothing listening.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let closed = format!("http://127.0.0.1:{port}/v1/version");
+        assert_eq!(ask(&agent, &closed), Answer::Nothing);
     }
 
     #[test]

@@ -71,8 +71,11 @@ pub fn install(
         progress(InstallStep::Installing);
         let dest = binary_install_path().ok_or("couldn't find your home directory")?;
         let marker = marker_path().ok_or("couldn't find your home directory")?;
-        install_binary(&extract_freenet(bytes)?, &dest)?;
-        record_installed_at(&marker, &dest)
+        let binary = extract_freenet(bytes)?;
+        // Record first: a marker for a binary that then fails to install is harmless, but a
+        // binary River can't later show it installed would never get a service.
+        record_installed_at(&marker, &dest)?;
+        install_binary(&binary, &dest)
     } else if asset.ends_with(".dmg") {
         progress(InstallStep::Installing);
         install_mac_app(bytes)
@@ -177,12 +180,34 @@ fn install_mac_app(dmg: &[u8]) -> Result<(), String> {
         let dest = applications_dir(Path::new("/Applications"), home.as_deref())?;
         copy_app_from(&mount, &dest)
     });
-    // Detach whatever happened, including an attach that failed or was cut off by its
-    // deadline after mounting. `-force` because Spotlight often holds a fresh mount busy.
-    let _ = run(Command::new("/usr/bin/hdiutil")
-        .args(["detach", "-quiet", "-force"])
-        .arg(&mount));
+    // Detach if the image is mounted, whatever happened, including an attach that failed or
+    // was cut off by its deadline after mounting. Only then: given a directory that is not a
+    // mount point, `hdiutil detach` acts on the volume holding it, which could be the user's
+    // own disk. `-force` because Spotlight often holds a fresh mount busy.
+    if is_mount_point(&mount, scratch.path()) {
+        let _ = run(Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-quiet", "-force"])
+            .arg(&mount));
+    }
     copied
+}
+
+/// Whether `dir` is the root of a different filesystem from `parent`, i.e. something is
+/// mounted on it.
+fn is_mount_point(dir: &Path, parent: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(dir), fs::metadata(parent)) {
+            (Ok(d), Ok(p)) => d.dev() != p.dev(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, parent);
+        false
+    }
 }
 
 /// Copy `mount/Freenet.app` to `dest_dir/Freenet.app`: into a staging directory first, then
@@ -263,20 +288,15 @@ fn run_installer(
         fs::set_permissions(&installer, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
     }
-    let mut child = Command::new(&installer)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let mut child = spawn_installer(&installer)
         .map_err(|e| format!("couldn't run the Freenet installer: {e}"))?;
     let deadline = Instant::now() + deadline;
     let outcome = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(format!("the Freenet installer stopped ({status})"))
-            };
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("the Freenet installer stopped ({status})")),
+            Ok(None) => {}
+            Err(e) => break Err(e.to_string()),
         }
         if node_up() {
             break Ok(());
@@ -287,12 +307,34 @@ fn run_installer(
         thread::sleep(poll);
     };
     // The installer is still open (a success screen, or a node it is running itself). Its
-    // directory can't be removed while it runs, so remove it once it exits.
+    // directory can't be removed while it runs, so remove it once it exits. If River exits
+    // first, the directory stays in the user's temp folder.
     thread::spawn(move || {
         let _ = child.wait();
         drop(scratch);
     });
     outcome
+}
+
+/// Spawn the installer with null stdio. On Unix (only ever in tests), an exec can fail with
+/// "text file busy" while another thread's fork still holds the just-written file open for
+/// writing; that clears once the fork execs, so retry briefly.
+fn spawn_installer(installer: &Path) -> std::io::Result<std::process::Child> {
+    let mut attempts = 0;
+    loop {
+        let spawned = Command::new(installer)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -435,10 +477,49 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// A stand-in installer: a shell script that records where it ran, then runs `body`.
+    #[test]
+    fn staging_and_scratch_builders_make_private_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let staging = private_dir(".Freenet.app.river-")
+            .tempdir_in(parent.path())
+            .unwrap();
+        assert!(staging.path().starts_with(parent.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(staging.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_mount_point() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("mnt");
+        fs::create_dir(&dir).unwrap();
+        assert!(!is_mount_point(&dir, parent.path()));
+        assert!(!is_mount_point(
+            &parent.path().join("missing"),
+            parent.path()
+        ));
+    }
+
+    /// A stand-in installer: a shell script that records where it ran (written to a temporary
+    /// name and moved into place, so the record is never seen half-written), then runs `body`.
     #[cfg(unix)]
     fn script(record: &Path, body: &str) -> Vec<u8> {
-        format!("#!/bin/sh\necho \"$0\" > '{}'\n{body}\n", record.display()).into_bytes()
+        let r = record.display();
+        format!("#!/bin/sh\necho \"$0\" > '{r}.tmp'\nmv '{r}.tmp' '{r}'\n{body}\n").into_bytes()
+    }
+
+    /// Script body that waits until the test creates `release`, so whether the installer is
+    /// still running is decided by the test, never by the clock.
+    #[cfg(unix)]
+    fn hold_until(release: &Path) -> String {
+        format!(
+            "while [ ! -e '{}' ]; do sleep 0.02; done\nexit 0",
+            release.display()
+        )
     }
 
     #[cfg(unix)]
@@ -448,6 +529,11 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting until {what}");
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(unix)]
+    fn ran_at(record: &Path) -> PathBuf {
+        PathBuf::from(fs::read_to_string(record).unwrap().trim())
     }
 
     #[cfg(unix)]
@@ -463,12 +549,10 @@ mod tests {
         let err =
             run_installer(&script(&record, "exit 3"), "setup", &never, poll, long).unwrap_err();
         assert!(err.contains("stopped"), "{err}");
-
-        // Its private directory is gone once it has exited.
-        let ran_at = PathBuf::from(fs::read_to_string(&record).unwrap().trim());
-        wait_until("the installer's directory is removed", || {
-            !ran_at.parent().unwrap().exists()
-        });
+        assert!(
+            !ran_at(&record).exists(),
+            "removed when it exits while River waits"
+        );
     }
 
     #[cfg(unix)]
@@ -478,8 +562,8 @@ mod tests {
         // answers. River stops waiting at once, and cleans up when the installer exits.
         let out = tempfile::tempdir().unwrap();
         let record = out.path().join("ran-at");
-        let exe = script(&record, "sleep 2; exit 0");
-        let started = Instant::now();
+        let release = out.path().join("release");
+        let exe = script(&record, &hold_until(&release));
         let node_up = || record.exists();
         run_installer(
             &exe,
@@ -489,13 +573,9 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-        let ran_at = PathBuf::from(fs::read_to_string(&record).unwrap().trim());
+        let ran_at = ran_at(&record);
         assert!(ran_at.exists(), "kept while the installer runs");
+        fs::write(&release, b"").unwrap();
         wait_until("the installer's directory is removed", || {
             !ran_at.parent().unwrap().exists()
         });
@@ -505,7 +585,9 @@ mod tests {
     #[test]
     fn an_installer_left_open_past_the_deadline_is_reported() {
         let out = tempfile::tempdir().unwrap();
-        let exe = script(&out.path().join("ran-at"), "sleep 1; exit 0");
+        let record = out.path().join("ran-at");
+        let release = out.path().join("release");
+        let exe = script(&record, &hold_until(&release));
         let err = run_installer(
             &exe,
             "setup",
@@ -515,5 +597,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("still open"), "{err}");
+        // Let it finish, and its directory is cleaned up.
+        wait_until("the installer has run", || record.exists());
+        let ran_at = ran_at(&record);
+        fs::write(&release, b"").unwrap();
+        wait_until("the installer's directory is removed", || {
+            !ran_at.parent().unwrap().exists()
+        });
     }
 }

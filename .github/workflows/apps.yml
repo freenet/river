@@ -26,6 +26,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The macOS and Windows install and start paths are compiled only on those
+  # platforms. Standard GitHub-hosted runners are free on this public repo.
+  other-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: apps
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
   desktop:
     runs-on: ubuntu-latest
     timeout-minutes: 30
