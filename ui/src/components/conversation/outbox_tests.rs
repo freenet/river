@@ -48,7 +48,7 @@ fn texts(entries: &[PendingEntry]) -> Vec<String> {
         .iter()
         .map(|e| match &e.kind {
             PendingKind::Send { text, .. } => text.clone(),
-            PendingKind::Action { label } => label.to_string(),
+            PendingKind::Action { label, .. } => label.to_string(),
         })
         .collect()
 }
@@ -187,7 +187,10 @@ fn a_reaction_swap_commits_only_when_both_halves_are_signed() {
     let mut outbox = Outbox::default();
     let (id, work) = outbox.enqueue(
         room(),
-        PendingKind::Action { label: "reaction" },
+        PendingKind::Action {
+            label: "reaction",
+            effects: vec![],
+        },
         author().verifying_key(),
         vec![message("remove", 1), message("add", 1)],
     );
@@ -243,13 +246,19 @@ fn a_failed_action_is_taken_out_and_a_failed_send_is_not() {
     let (a, _) = send(&mut outbox, "a", 1);
     let (e, _) = outbox.enqueue(
         room(),
-        PendingKind::Action { label: "edit" },
+        PendingKind::Action {
+            label: "edit",
+            effects: vec![],
+        },
         author().verifying_key(),
         vec![message("edit", 2)],
     );
     let (_pending_edit, _) = outbox.enqueue(
         room(),
-        PendingKind::Action { label: "delete" },
+        PendingKind::Action {
+            label: "delete",
+            effects: vec![],
+        },
         author().verifying_key(),
         vec![message("delete", 3)],
     );
@@ -265,4 +274,34 @@ fn a_failed_action_is_taken_out_and_a_failed_send_is_not() {
         outbox.take_ready(&room()).is_empty(),
         "the still-signing delete keeps its place"
     );
+}
+
+#[test]
+fn pending_effects_are_those_of_actions_still_signing() {
+    let mut outbox = Outbox::default();
+    let effect = |n: &str| PendingEffect::Edit {
+        target: river_core::room_state::message::MessageId(freenet_scaffold::util::FastHash(1)),
+        text: n.to_string(),
+    };
+    send(&mut outbox, "a send has no effect", 1);
+    let (failed, _) = outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "edit",
+            effects: vec![effect("failed")],
+        },
+        author().verifying_key(),
+        vec![message("x", 2)],
+    );
+    outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "edit",
+            effects: vec![effect("signing")],
+        },
+        author().verifying_key(),
+        vec![message("y", 3)],
+    );
+    outbox.record_failure(&room(), failed, "x".to_string());
+    assert_eq!(outbox.pending_effects(&room()), vec![effect("signing")]);
 }

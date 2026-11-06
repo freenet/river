@@ -197,18 +197,19 @@ message. Appears automatically on any crash, no query param needed.
 ### Signing flow
 
 1. **Room creation** → `create_room_modal.rs` generates `SigningKey`, stores it in the ROOMS signal as `RoomData::self_sk`, and calls `store_signing_key()` to save a copy in the chat delegate
-2. **Message send** → UI signs locally and synchronously: `sign_message_locally(&msg_bytes, &self_sk)`. There is **no** delegate round-trip on the message path (freenet/river#512) — it could not change the signature bytes and it cost seconds of visible lag
+2. **Message send, edit, delete, reaction** → the unsigned message goes into the outbox (`ui/src/components/conversation/outbox.rs`) on Enter; a sent message shows at once as a pending row (`pending_sends.rs`). Then `outbox_commit.rs` asks the delegate (`sign_message_with_fallback` → `SignMessage`). Nothing on screen waits for that answer (freenet/river#512). Per room, messages commit in the order they were made
 3. **Everything else** (member, ban, config, member_info, secret, upgrade) → `sign_*_with_fallback` → `send_delegate_request(Sign*{...})` → delegate looks up `signing_key:{origin}:{room_key}` → returns signature
-4. **Fallback** → the delegate's answer is used only if it verifies under `self_sk`; otherwise (and on any delegate failure) the payload is signed locally with `self_sk`
-5. **Delta applied** → Message added to local state → `NEEDS_SYNC` set → `ProcessRooms` → UPDATE sent
+4. **Fallback** → the delegate's answer is used only if it verifies under the author's key; otherwise (and on any delegate failure) the payload is signed locally with `self_sk` while the UI still holds it. A message with no fallback stays as a failed row with Retry
+5. **Delta applied** → Message added to local state, pending row removed in the same tick → `NEEDS_SYNC` set → `ProcessRooms` → UPDATE sent
 
 Key debugging points:
-- A slow **message** send is not the SIGNING step — nothing is asked of the
-  delegate there. Step 5 is a different matter: the `NEEDS_SYNC` effect also
-  fires `save_rooms_to_delegate()` alongside the UPDATE, so a delegate op does
-  contend for the same node afterwards
+- A message stuck on "Sending…" is waiting for the delegate's signature:
+  delegate requests queue behind contract WASM on the node, so ~1% take
+  0.3-2 s, and a lost answer falls back to the local key after 10 s. The
+  `NEEDS_SYNC` effect in step 5 also fires `save_rooms_to_delegate()`, which
+  contends for the same node
 - For the other payload types, node logs show `"Sign request for room, signature created: true/false"` — if false, the delegate doesn't have the key
-- Browser console shows the fallback path: `"Delegate signing failed, using fallback"`
+- Browser console shows the fallback path: `"Delegate signing failed, using fallback"` (other payloads) or `"Message signing: …; signed with the local key"` (messages)
 - If no UPDATE appears in node logs after signing, check if the WebSocket is still connected
 
 ### Check contract state via riverctl
@@ -219,14 +220,14 @@ riverctl --node-url ws://127.0.0.1:7510/v1/contract/command?encodingProtocol=nat
 
 ### Timeline analysis for message send
 
-1. `[send] signed OK` (browser, with `?debug=1`) → the message was signed locally
-2. `[send] delta applied OK` → it is in local state and on screen
-3. `Update { key: ... }` → UPDATE arrived at node
-4. `ResultRouter received result` → UPDATE processed, result sent back to client
+1. `[send] queued, signing via the delegate` (browser, with `?debug=1`) → the pending row is on screen
+2. `[send] signed via Delegate` (or `LocalAfterDelegateFailed` / `LocalAfterStaleDelegate`) → which key signed it; the gap from step 1 is the delegate round trip
+3. `[send] delta applied OK, marking NEEDS_SYNC` → it is in local state, committed
+4. `Update { key: ... }` → UPDATE arrived at node
+5. `ResultRouter received result` → UPDATE processed, result sent back to client
 
-If step 2 happens but step 3 doesn't, the browser died between applying the
-message locally and sending the UPDATE. There is no delegate step here — see
-"Signing flow" above.
+If step 3 happens but step 4 doesn't, the browser died between applying the
+message locally and sending the UPDATE.
 
 ### Firefox mobile: Dioxus RefCell re-entrant borrow panics
 

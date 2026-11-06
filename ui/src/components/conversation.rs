@@ -41,6 +41,7 @@ mod message_input;
 mod not_member_notification;
 mod outbox;
 mod outbox_commit;
+mod pending_effects;
 mod pending_sends;
 use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
@@ -57,7 +58,8 @@ use self::markdown::{
     render_message_html_cached, running_behind_freenet_gateway,
 };
 use self::not_member_notification::NotMemberNotification;
-use self::outbox::PendingKind;
+use self::outbox::{PendingEffect, PendingKind, OUTBOX};
+use self::pending_effects::apply_pending_effects;
 use self::pending_sends::PendingSends;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
@@ -1773,7 +1775,7 @@ pub fn Conversation() -> Element {
                 // and so did not subscribe; now it does. Harmless, and
                 // noted so the claim is not overstated.)
                 let receive_times = crate::components::app::receive_times::RECEIVE_TIMES.read();
-                let groups = group_messages(
+                let mut groups = group_messages(
                     &room_state.recent_messages,
                     &room_state.member_info,
                     self_member_id,
@@ -1789,6 +1791,18 @@ pub fn Conversation() -> Element {
                         fallback_now: Utc::now(),
                     },
                 );
+                // The user's own edits, deletes and reactions still being
+                // signed show at once (`pending_effects.rs`). A contended
+                // read shows the committed state for this pass and nudges.
+                match OUTBOX.try_read() {
+                    Ok(outbox) => {
+                        if let Some(self_id) = self_member_id {
+                            let effects = outbox.pending_effects(&key);
+                            apply_pending_effects(&mut groups, &effects, self_id, &member_names);
+                        }
+                    }
+                    Err(_) => crate::util::signal_guard::schedule_nudge(),
+                }
                 return Some(Rc::new((
                     groups,
                     self_member_id,
@@ -1931,19 +1945,33 @@ pub fn Conversation() -> Element {
                 // - If clicking different emoji: remove old (if any) + add new
                 let clicked_same = existing_reaction.as_ref() == Some(&emoji);
                 let mut actions = Vec::new();
-                if clicked_same {
+                let mut effects = Vec::new();
+                let remove = |emoji: String,
+                              actions: &mut Vec<ActionContentV1>,
+                              effects: &mut Vec<PendingEffect>| {
                     actions.push(ActionContentV1::remove_reaction(
                         target_message_id.clone(),
-                        emoji,
+                        emoji.clone(),
                     ));
+                    effects.push(PendingEffect::Unreact {
+                        target: target_message_id.clone(),
+                        emoji,
+                    });
+                };
+                if clicked_same {
+                    remove(emoji, &mut actions, &mut effects);
                 } else {
                     if let Some(old_emoji) = existing_reaction {
-                        actions.push(ActionContentV1::remove_reaction(
-                            target_message_id.clone(),
-                            old_emoji,
-                        ));
+                        remove(old_emoji, &mut actions, &mut effects);
                     }
-                    actions.push(ActionContentV1::reaction(target_message_id, emoji));
+                    actions.push(ActionContentV1::reaction(
+                        target_message_id.clone(),
+                        emoji.clone(),
+                    ));
+                    effects.push(PendingEffect::React {
+                        target: target_message_id.clone(),
+                        emoji,
+                    });
                 }
                 let mut messages = Vec::new();
                 for action in actions {
@@ -1962,7 +1990,10 @@ pub fn Conversation() -> Element {
                 crate::util::defer(move || {
                     outbox_commit::submit_now(
                         current_room,
-                        PendingKind::Action { label: "reaction" },
+                        PendingKind::Action {
+                            label: "reaction",
+                            effects,
+                        },
                         identity.author_vk,
                         messages,
                         identity.fallback_key,
@@ -1988,6 +2019,9 @@ pub fn Conversation() -> Element {
                 drop(current_room_data);
 
                 use river_core::room_state::content::ActionContentV1;
+                let effects = vec![PendingEffect::Delete {
+                    target: target_message_id.clone(),
+                }];
                 let Some(content) =
                     action_body(ActionContentV1::delete(target_message_id), secret_opt)
                 else {
@@ -2003,7 +2037,10 @@ pub fn Conversation() -> Element {
                 crate::util::defer(move || {
                     outbox_commit::submit_now(
                         current_room,
-                        PendingKind::Action { label: "delete" },
+                        PendingKind::Action {
+                            label: "delete",
+                            effects,
+                        },
                         identity.author_vk,
                         vec![message],
                         identity.fallback_key,
@@ -2053,6 +2090,10 @@ pub fn Conversation() -> Element {
                 }
 
                 use river_core::room_state::content::ActionContentV1;
+                let effects = vec![PendingEffect::Edit {
+                    target: target_message_id.clone(),
+                    text: new_text.clone(),
+                }];
                 let Some(content) = action_body(
                     ActionContentV1::edit(target_message_id, new_text),
                     secret_opt,
@@ -2069,7 +2110,10 @@ pub fn Conversation() -> Element {
                 crate::util::defer(move || {
                     outbox_commit::submit_now(
                         current_room,
-                        PendingKind::Action { label: "edit" },
+                        PendingKind::Action {
+                            label: "edit",
+                            effects,
+                        },
                         identity.author_vk,
                         vec![message],
                         identity.fallback_key,

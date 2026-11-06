@@ -32,10 +32,24 @@ pub(crate) enum PendingKind {
     /// A message or reply from the composer. Shown as a pending row, with the
     /// typed text, until it commits; kept as a failed row if it cannot.
     Send { text: String, author_name: String },
-    /// An edit, a delete or a reaction toggle. Not shown while pending; a
-    /// failure is reported with a toast and the entry dropped (`label` names
-    /// the action in that toast).
-    Action { label: &'static str },
+    /// An edit, a delete or a reaction toggle. Shown while pending by applying
+    /// `effects` over the committed messages (`pending_effects`); a failure is
+    /// reported with a toast and the entry dropped (`label` names the action
+    /// in that toast).
+    Action {
+        label: &'static str,
+        effects: Vec<PendingEffect>,
+    },
+}
+
+/// What a pending action does to the conversation, in plaintext: the
+/// messages themselves may be sealed under the room secret.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum PendingEffect {
+    React { target: MessageId, emoji: String },
+    Unreact { target: MessageId, emoji: String },
+    Edit { target: MessageId, text: String },
+    Delete { target: MessageId },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -256,6 +270,22 @@ impl Outbox {
             *queue = kept;
         }
         failed
+    }
+
+    /// The effects of `room`'s actions still being signed, in the order they
+    /// were made, for the conversation to show before they commit.
+    pub fn pending_effects(&self, room: &VerifyingKey) -> Vec<PendingEffect> {
+        self.rooms
+            .get(room)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.state == PendingState::Signing)
+            .filter_map(|e| match &e.kind {
+                PendingKind::Action { effects, .. } => Some(effects.iter().cloned()),
+                PendingKind::Send { .. } => None,
+            })
+            .flatten()
+            .collect()
     }
 
     /// The composer messages waiting in `room`, in the order they were sent.

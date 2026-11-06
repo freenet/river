@@ -1240,7 +1240,9 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
-  test("a send that fails to apply does not navigate", { tag: "@chromium-only" }, async ({ page }) => {
+  test("a send the room does not admit stays on screen, failed, for a retry", { tag: "@chromium-only" }, async ({
+    page,
+  }) => {
     const applyFailures: string[] = [];
     page.on("console", (msg) => {
       if (msg.text().includes("Failed to apply message delta")) applyFailures.push(msg.text());
@@ -1249,10 +1251,12 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
     await expectParkedAwayFromEnd(page, "premise: reading older messages");
-    const row = await expectReadingRow(page);
 
     // A message the room does not admit (its signature is corrupted), so the
-    // send fails at the local apply after the draft is handed off.
+    // send fails at the local apply after the draft is handed off. The
+    // message showed, pending, on Enter (an own send goes to the end), so it
+    // must stay where the reader saw it, marked failed: the typed text is
+    // never dropped.
     await callRiverTest(page, "forgeNextSendSignature");
     await sendWithEnter(page, "own send that fails to apply");
     await expect
@@ -1261,12 +1265,13 @@ test.describe("Own send goes to the newest message once (A06)", () => {
       })
       .toBeGreaterThan(0);
 
-    await expectRowHeld(page, row.key, row.top, "a send that failed to apply moved the view");
+    const failed = page.getByTestId("pending-message").filter({ hasText: "own send that fails to apply" });
+    await expect(failed).toHaveAttribute("data-pending-state", "failed");
+    await expect(failed, "the failed message is in view").toBeInViewport();
     await expect(
-      page.getByText("own send that fails to apply", { exact: false }),
-      "premise: the send should have failed to apply",
+      page.getByTestId("conversation-history").getByText("own send that fails to apply", { exact: false }),
+      "the room holds no copy of a message it did not admit",
     ).toHaveCount(0);
-    await expectParkedAwayFromEnd(page, "a send that failed to apply took the reader to the latest message");
   });
 });
 

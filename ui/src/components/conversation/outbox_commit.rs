@@ -142,7 +142,7 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
                     PendingKind::Send { .. } => {
                         OUTBOX.with_mut(|o| o.restore_failed(room, entry, reason))
                     }
-                    PendingKind::Action { label } => action_failed_toast(label),
+                    PendingKind::Action { label, .. } => action_failed_toast(label),
                 }
             }
         }
@@ -158,7 +158,7 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
 fn report_failed_actions_now(room: VerifyingKey) {
     let failed: Vec<PendingEntry> = OUTBOX.with_mut(|o| o.take_failed_actions(&room));
     for entry in failed {
-        if let PendingKind::Action { label } = entry.kind {
+        if let PendingKind::Action { label, .. } = entry.kind {
             action_failed_toast(label);
         }
     }
