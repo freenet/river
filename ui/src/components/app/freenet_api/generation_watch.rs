@@ -1096,10 +1096,10 @@ mod runtime {
         if matches!(document.query_selector("[id^=\"edit-msg-\"]"), Ok(Some(_))) {
             return true;
         }
-        // A message sent but not yet signed and committed, or failed and kept
-        // for a retry: it lives only in memory, and the composer is already
-        // empty, so nothing above sees it.
-        if crate::components::conversation::outbox_has_unsent() {
+        // A message sent but not yet signed and committed: it lives only in
+        // memory, and the composer is already empty, so nothing above sees
+        // it. Bounded by the signing timeout (`outbox_has_signing`).
+        if crate::components::conversation::outbox_has_signing() {
             return true;
         }
         if let Ok(overlays) = document.query_selector_all(".fixed.inset-0") {
@@ -1329,13 +1329,21 @@ mod runtime {
             }
         }
         let deadline = now_ms() + FLUSH_TIMEOUT_MS;
-        // Unsent messages (the outbox) commit into NEEDS_SYNC, so wait for
-        // both; a failed one never commits and is lost at the deadline.
+        // A message still being signed commits into NEEDS_SYNC, so wait for
+        // both. A failed one is not waited for (`outbox_has_signing`).
         while now_ms() < deadline
             && (NEEDS_SYNC.try_read().map_or(true, |s| !s.is_empty())
-                || crate::components::conversation::outbox_has_unsent())
+                || crate::components::conversation::outbox_has_signing())
         {
             crate::util::sleep(Duration::from_millis(250)).await;
+        }
+        // A send that committed during that wait gets its settle period too,
+        // within the deadline: `NEEDS_SYNC` clears when the update is queued,
+        // not sent.
+        let settle_end = (LAST_SYNC_MS.load(Ordering::SeqCst) + SETTLE_MS).min(deadline);
+        let wait = settle_end.saturating_sub(now_ms());
+        if wait > 0 {
+            crate::util::sleep(Duration::from_millis(wait)).await;
         }
         let remaining = deadline.saturating_sub(now_ms()).max(500);
         let flush = Box::pin(crate::components::app::chat_delegate::flush_rooms_to_delegate());

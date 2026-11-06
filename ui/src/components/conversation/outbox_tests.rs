@@ -447,3 +447,21 @@ fn entries_from_a_replaced_identity_are_neither_shown_nor_kept() {
     assert_eq!(outbox.drop_other_identities(&room(), &new_identity), 1);
     assert!(!outbox.has_room(&room()));
 }
+
+#[test]
+fn only_a_message_still_signing_counts_as_signing() {
+    let mut outbox = Outbox::default();
+    assert!(!outbox.has_signing());
+    let (a, wa) = send(&mut outbox, "a", 1);
+    assert!(outbox.has_signing());
+    outbox.record_failure(&room(), a, "x".to_string());
+    assert!(
+        !outbox.has_signing(),
+        "a failed row must not hold back a reload for as long as it is left"
+    );
+    let _ = outbox.retry(&room(), a, later()).unwrap();
+    assert!(outbox.has_signing());
+    sign_all(&mut outbox, a, &wa);
+    let _ = outbox.take_ready(&room());
+    assert!(!outbox.has_signing());
+}

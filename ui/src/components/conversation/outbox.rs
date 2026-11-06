@@ -221,10 +221,20 @@ impl Outbox {
         })
     }
 
-    /// Whether nothing waits in any room.
+    /// Whether any message, in any room, is still being signed. Bounded:
+    /// each signing request times out (10 s), after which the entry commits
+    /// or fails. A failed entry does not count.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub fn is_empty(&self) -> bool {
-        self.rooms.is_empty()
+    pub fn has_signing(&self) -> bool {
+        self.rooms
+            .values()
+            .flatten()
+            .any(|e| e.state == PendingState::Signing)
+    }
+
+    /// The entry `id` in `room`, if it is still there.
+    pub fn entry(&self, room: &VerifyingKey, id: u64) -> Option<&PendingEntry> {
+        self.rooms.get(room)?.iter().find(|e| e.id == id)
     }
 
     /// Whether anything waits in `room`.
@@ -281,14 +291,21 @@ impl Outbox {
         if !matches!(entry.state, PendingState::Failed(_)) {
             return None;
         }
-        entry.state = PendingState::Signing;
-        for m in &mut entry.messages {
-            m.message.time = now;
+        // Re-encode first, then commit the new stamp and bytes together, so
+        // a signature can never cover bytes other than the message's.
+        let mut restamped = Vec::with_capacity(entry.messages.len());
+        for m in &entry.messages {
+            let mut message = m.message.clone();
+            message.time = now;
             let mut bytes = Vec::new();
-            if ciborium::ser::into_writer(&m.message, &mut bytes).is_ok() {
-                m.bytes = bytes;
-            }
+            ciborium::ser::into_writer(&message, &mut bytes).ok()?;
+            restamped.push((message, bytes));
         }
+        for (m, (message, bytes)) in entry.messages.iter_mut().zip(restamped) {
+            m.message = message;
+            m.bytes = bytes;
+        }
+        entry.state = PendingState::Signing;
         Some((
             entry.author_vk,
             entry

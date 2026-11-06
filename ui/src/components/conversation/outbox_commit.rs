@@ -38,6 +38,35 @@ pub(crate) fn retry(room: VerifyingKey, id: u64) {
             .map
             .get(&room)
             .and_then(|r| r.signing_key().cloned());
+        // A private-room message is sealed when written. If the room's secret
+        // has rotated since (a ban rotates it), resending the old ciphertext
+        // would reach a member the rotation was meant to exclude: refuse, and
+        // leave the text on screen to send again.
+        let current_version = ROOMS
+            .peek()
+            .map
+            .get(&room)
+            .and_then(|r| r.get_secret().map(|(_, version)| version));
+        let stale_seal = OUTBOX.peek().entry(&room, id).is_some_and(|entry| {
+            entry.messages.iter().any(|m| match &m.message.content {
+                river_core::room_state::message::RoomMessageBody::Private {
+                    secret_version,
+                    ..
+                } => Some(*secret_version) != current_version,
+                _ => false,
+            })
+        });
+        if stale_seal {
+            OUTBOX.with_mut(|o| {
+                o.record_failure(
+                    &room,
+                    id,
+                    "the room's key changed since this was written; copy the text and send it again"
+                        .to_string(),
+                )
+            });
+            return;
+        }
         // The fallback key is the current identity's; `sign_message_with_fallback`
         // uses it only if it matches `author_vk`, so a row from a replaced
         // identity cannot be signed with the new key.
@@ -49,13 +78,15 @@ pub(crate) fn retry(room: VerifyingKey, id: u64) {
     });
 }
 
-/// Whether any message is waiting in the outbox (signing, or failed and kept
-/// for a retry). The outbox is memory only, so a page reload loses these:
-/// the generation reload treats this as the reader being busy, and waits for
-/// it before reloading. Unreadable means "cannot tell": busy.
+/// Whether any message is still being signed. The outbox is memory only, so
+/// a page reload loses it: the generation reload treats this as the reader
+/// being busy, and a clicked reload waits for it. Bounded by the signing
+/// timeout; a failed row does not count (it would hold the reload back for
+/// as long as it is left, so a reload loses it). Unreadable means "cannot
+/// tell": busy.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn has_unsent() -> bool {
-    OUTBOX.try_read().map_or(true, |o| !o.is_empty())
+pub(crate) fn has_signing() -> bool {
+    OUTBOX.try_read().map_or(true, |o| o.has_signing())
 }
 
 /// Drop everything waiting in `room`: the user left it. From a deferred
@@ -168,7 +199,7 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
                 "Room identity replaced with {dropped} unsent message(s) from the old one; dropped"
             );
             crate::components::toast::show_toast(
-                format!("{dropped} unsent message(s) from your previous identity in this room were discarded"),
+                format!("{dropped} unsent message(s) or action(s) from your previous identity in this room were discarded"),
                 None,
             );
         }
