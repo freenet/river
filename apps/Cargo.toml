@@ -11,7 +11,8 @@
 # apps depend on river-core (common/), editing common/ will still change the
 # WASM exactly as it does today, and any client-only feature added to river-core
 # must stay off for the contract and delegate builds (as `migration` and
-# `mentions` are).
+# `mentions` are). At that point `.github/workflows/apps.yml` must also run for
+# `common/**` changes; today its path filter is `apps/**` only.
 [workspace]
 resolver = "3"
 members = ["river-app", "desktop"]

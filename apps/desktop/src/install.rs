@@ -44,7 +44,19 @@ fn record_installed_at(marker: &Path, binary: &Path, bytes: &[u8]) -> Result<(),
     tmp.write_all(&record).map_err(write_err)?;
     tmp.as_file().sync_all().map_err(write_err)?;
     tmp.persist(marker).map_err(|e| write_err(e.error))?;
+    sync_dir(dir);
     Ok(())
+}
+
+/// Make a rename into `dir` durable, so after a crash the binary and River's record of it are
+/// both there or both not. Best effort, and only meaningful on Unix.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 fn was_installed_at(marker: &Path, binary: &Path) -> bool {
@@ -140,7 +152,7 @@ fn install_and_record(binary: &[u8], dest: &Path, marker: &Path) -> Result<(), S
         return Err(if dest.is_file() {
             format!(
                 "Freenet appeared at {} while River was downloading it, so River left that \
-                 copy alone. Choose Try again to use it.",
+                 copy alone. Choose Try again to start it.",
                 dest.display()
             )
         } else {
@@ -180,7 +192,10 @@ fn install_binary(binary: &[u8], dest: &Path) -> Result<Placed, String> {
     tmp.as_file().sync_all().map_err(|e| e.to_string())?;
     // Never replace what's there: the probe that offered to install was minutes ago.
     match tmp.persist_noclobber(dest) {
-        Ok(_) => Ok(Placed::Installed),
+        Ok(_) => {
+            sync_dir(dir);
+            Ok(Placed::Installed)
+        }
         Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Placed::AlreadyThere),
         Err(e) => Err(format!("couldn't install {}: {}", dest.display(), e.error)),
     }
@@ -291,7 +306,9 @@ fn copy_app_from(mount: &Path, dest_dir: &Path) -> Result<(), String> {
         return Err("the disk image has no Freenet.app in it".into());
     }
     let dest = dest_dir.join("Freenet.app");
-    if dest.exists() {
+    // `symlink_metadata`, not `exists`: a dangling symlink, which `exists` misses, would be
+    // replaced by the rename below.
+    if fs::symlink_metadata(&dest).is_ok() {
         return Err(format!("{} already exists", dest.display()));
     }
     let staging = private_dir(".Freenet.app.river-")
@@ -563,6 +580,27 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_record_write_leaves_the_previous_record_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("freenet");
+        fs::write(&ours, b"river's bytes").unwrap();
+        let marker = dir.path().join("state/installed-freenet");
+        record_installed_at(&marker, &ours, b"river's bytes").unwrap();
+
+        // The rename onto the record can't happen (a directory took its place): the write
+        // fails, and what was recorded before is untouched, not torn.
+        let blocked = dir.path().join("state/blocked");
+        fs::create_dir_all(blocked.join("in-use")).unwrap();
+        assert!(record_installed_at(&blocked, &ours, b"other bytes").is_err());
+        assert!(was_installed_at(&marker, &ours));
+        let left: Vec<_> = fs::read_dir(dir.path().join("state"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "no temporary record left behind: {left:?}");
+    }
+
+    #[test]
     fn scratch_directories_are_private_unique_and_removed() {
         let a = scratch_dir().unwrap();
         let b = scratch_dir().unwrap();
@@ -602,6 +640,7 @@ mod tests {
         fs::create_dir_all(&squatted).unwrap();
         let err = install_and_record(b"binary", &squatted, &their_marker).unwrap_err();
         assert!(err.contains("isn't a program"), "{err}");
+        assert!(squatted.is_dir(), "left alone");
         #[cfg(unix)]
         {
             let dangling = dir.path().join("dangling/freenet");
@@ -609,8 +648,18 @@ mod tests {
             std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
             let err = install_and_record(b"binary", &dangling, &their_marker).unwrap_err();
             assert!(err.contains("isn't a program"), "{err}");
+            let kind = fs::symlink_metadata(&dangling).unwrap().file_type();
+            assert!(kind.is_symlink(), "left alone");
         }
         assert!(!their_marker.exists());
+        // Nothing but what was there before is left beside any of them.
+        for parent in ["theirs", "squatted", "dangling"] {
+            let Ok(entries) = fs::read_dir(dir.path().join(parent)) else {
+                continue;
+            };
+            let names: Vec<_> = entries.map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(names, vec!["freenet"], "no temporary file left in {parent}");
+        }
 
         // The binary can't be installed: nothing is recorded.
         let blocked = dir.path().join("not-a-dir");

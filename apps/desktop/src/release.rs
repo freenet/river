@@ -474,6 +474,7 @@ mod tests {
         assert!(tag_from_latest_redirect(&format!(r"{base}v\..\x")).is_err());
         // The redirect must stay in this repository.
         assert!(tag_from_latest_redirect("https://example.com/x/releases/tag/v0.2.160").is_err());
+        assert!(tag_from_latest_redirect(&format!("{REPO}-evil/releases/tag/v0.2.160")).is_err());
         assert!(
             tag_from_latest_redirect(
                 "https://github.com/someone/freenet-core/releases/tag/v0.2.160"

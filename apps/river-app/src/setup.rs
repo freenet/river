@@ -101,9 +101,16 @@ impl Controller {
             match ctl.host.probe() {
                 NodeProbe::Running { version } => ctl.set(Setup::Connected { version }),
                 NodeProbe::Outdated { running, minimum } => ctl.set(outdated(running, minimum)),
-                NodeProbe::NotInstalled => ctl.set(Setup::Failed(
-                    "The installer closed without installing Freenet.".into(),
-                )),
+                // The installer said it succeeded, but River can't see an install: an installer
+                // that put Freenet somewhere River doesn't look may still be starting it.
+                NodeProbe::NotInstalled => {
+                    ctl.set(Setup::Starting);
+                    ctl.wait_for_node(format!(
+                        "The installer finished, but no Freenet answered within {} seconds, \
+                         and River can't find where it was installed.",
+                        ctl.start_timeout.as_secs()
+                    ));
+                }
                 NodeProbe::InstalledNotRunning => ctl.start_and_wait(),
             }
         });
@@ -133,6 +140,14 @@ impl Controller {
         if let Err(e) = self.host.start() {
             return self.set(Setup::Failed(format!("Couldn't start Freenet: {e}")));
         }
+        self.wait_for_node(format!(
+            "Freenet was started but didn't answer within {} seconds.",
+            self.start_timeout.as_secs()
+        ));
+    }
+
+    /// Poll until a node answers, or report `give_up` after the start timeout.
+    fn wait_for_node(&self, give_up: String) {
         let deadline = Instant::now() + self.start_timeout;
         while Instant::now() < deadline {
             match self.host.probe() {
@@ -144,10 +159,7 @@ impl Controller {
             }
             thread::sleep(START_POLL.min(self.start_timeout));
         }
-        self.set(Setup::Failed(format!(
-            "Freenet was started but didn't answer within {} seconds.",
-            self.start_timeout.as_secs()
-        )));
+        self.set(Setup::Failed(give_up));
     }
 
     /// Report a new state. A settled state ends the current work, so the controller is freed
@@ -377,16 +389,30 @@ mod tests {
             ))
         );
 
-        let (seen, _) = drive(
-            FakeHost::new(vec![NodeProbe::NotInstalled]),
-            Controller::install,
-        );
+        // The installer reported success, but no install can be seen and no node answers.
+        let (mut ctl, _, rx) = controller(FakeHost::new(vec![NodeProbe::NotInstalled]));
+        ctl.start_timeout = Duration::from_secs(1);
+        ctl.install();
+        let seen = settle(&rx);
+        assert!(seen.contains(&Setup::Starting), "{seen:?}");
         assert_eq!(
             seen.last(),
             Some(&Setup::Failed(
-                "The installer closed without installing Freenet.".into()
+                "The installer finished, but no Freenet answered within 1 seconds, and River \
+                 can't find where it was installed."
+                    .into()
             ))
         );
+    }
+
+    #[test]
+    fn a_node_an_installer_started_from_somewhere_unexpected_is_waited_for() {
+        // The installer exits, River can't see where it installed Freenet, but the node it
+        // started answers shortly after: that is a success, not "not installed".
+        let probes = vec![NodeProbe::NotInstalled, NodeProbe::NotInstalled, running()];
+        let (seen, host) = drive(FakeHost::new(probes), Controller::install);
+        assert_eq!(seen.last(), Some(&connected()));
+        assert_eq!(host.starts.load(Ordering::SeqCst), 0, "nothing to start");
     }
 
     #[test]
@@ -418,6 +444,10 @@ mod tests {
             panic!("{seen:?}")
         };
         assert!(msg.contains("doesn't say which version"), "{msg}");
+        assert!(
+            msg.contains("freenet.org") && msg.contains("0.2.155"),
+            "{msg}"
+        );
     }
 
     #[test]

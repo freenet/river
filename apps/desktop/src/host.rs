@@ -55,10 +55,11 @@ fn probe_agent() -> ureq::Agent {
 
 /// Ask `url` for the node's version.
 ///
-/// Only a definite answer counts as "no version": a 404 or 405 (the endpoint doesn't exist,
-/// as before Freenet 0.2.71) or a success that isn't a version. Any other error status (a 503
-/// while starting, say) and any transport failure (refused, timed out, not HTTP) count as
-/// nothing usable answering yet, so River keeps waiting rather than calling it outdated.
+/// Freenet answers `/v1/version` with its version whenever its HTTP server is up, and a
+/// Freenet before 0.2.71 answers 404. So any other HTTP answer means something that isn't a
+/// usable Freenet holds the port, and is reported, not waited on. The exception is a 502, 503
+/// or 504, which only a proxy in front of a node that isn't up yet would send: that, like a
+/// transport failure (refused, timed out, not HTTP), counts as nothing answering yet.
 fn ask(agent: &ureq::Agent, url: &str) -> Answer {
     match agent.get(url).call() {
         Ok(resp) => resp
@@ -67,8 +68,8 @@ fn ask(agent: &ureq::Agent, url: &str) -> Answer {
             .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
             .and_then(|v| v.get("version")?.as_str().map(str::to_owned))
             .map_or(Answer::NoVersion, Answer::Version),
-        Err(ureq::Error::Status(404 | 405, _)) => Answer::NoVersion,
-        Err(ureq::Error::Status(..) | ureq::Error::Transport(_)) => Answer::Nothing,
+        Err(ureq::Error::Status(502..=504, _) | ureq::Error::Transport(_)) => Answer::Nothing,
+        Err(ureq::Error::Status(..)) => Answer::NoVersion,
     }
 }
 
@@ -141,10 +142,12 @@ impl NodeHost for DesktopHost {
     }
 }
 
-/// Which Freenet services are registered on this machine, judged by freenet-core's unit
-/// files: Linux `~/.config/systemd/user/freenet.service` and
-/// `/etc/systemd/system/freenet.service`, macOS `~/Library/LaunchAgents/org.freenet.node.plist`.
-#[derive(Clone, Copy, Debug, Default)]
+/// Which Freenet services are registered on this machine, judged by the unit files
+/// freenet-core writes, at the paths it uses (it doesn't follow `XDG_CONFIG_HOME` either):
+/// Linux `~/.config/systemd/user/freenet.service` and `/etc/systemd/system/freenet.service`,
+/// macOS `~/Library/LaunchAgents/org.freenet.node.plist`. Windows has no unit file;
+/// `service start` there always launches the wrapper.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Services {
     user: bool,
     system: bool,
@@ -152,17 +155,19 @@ struct Services {
 
 fn registered_services() -> Services {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let user_unit = if cfg!(target_os = "linux") {
-        home.map(|h| h.join(".config/systemd/user/freenet.service"))
-    } else if cfg!(target_os = "macos") {
-        home.map(|h| h.join("Library/LaunchAgents/org.freenet.node.plist"))
-    } else {
-        None
+    registered_services_in(std::env::consts::OS, home.as_deref(), Path::new("/"))
+}
+
+/// [`registered_services`] for `os`, with `home` and the filesystem `root` given, for tests.
+fn registered_services_in(os: &str, home: Option<&Path>, root: &Path) -> Services {
+    let user_unit = match os {
+        "linux" => home.map(|h| h.join(".config/systemd/user/freenet.service")),
+        "macos" => home.map(|h| h.join("Library/LaunchAgents/org.freenet.node.plist")),
+        _ => None,
     };
     Services {
         user: user_unit.is_some_and(|p| p.exists()),
-        system: cfg!(target_os = "linux")
-            && Path::new("/etc/systemd/system/freenet.service").exists(),
+        system: os == "linux" && root.join("etc/systemd/system/freenet.service").exists(),
     }
 }
 
@@ -181,10 +186,14 @@ impl Runner for SystemRunner {
 
 /// Start the node from a `freenet` binary with `freenet service start`.
 ///
-/// If that fails because no service is registered, and River installed this copy (recorded
-/// when it installed it), River registers one, as freenet-core's own installer would. A
-/// registered service that fails to start is reported, never registered again. Any copy River
-/// didn't install belongs to whoever installed it, and River only reports why it didn't start.
+/// If that fails and River installed this copy (recorded when it installed it, and dropped
+/// once a service exists), River registers the service, as freenet-core's own installer
+/// would. While River's record remains, that includes finishing a registration that stopped
+/// part-way (freenet-core writes the unit file before reloading and enabling it), so a retry
+/// can complete it; `service install` is safe to repeat. Any other registered service that
+/// fails to start is reported, never registered again, checking the user unit first as
+/// freenet-core does. Any copy River didn't install belongs to whoever installed it, and
+/// River only reports why it didn't start.
 ///
 /// River never runs the node outside a service manager: a bare `freenet network` stops for
 /// good the first time it finds an update, because nothing is there to apply it and restart.
@@ -208,18 +217,25 @@ fn start_binary(
         }
         Err(e) => e,
     };
-    if services.system {
+    // freenet-core uses the user unit when there is one, so a system unit only matters alone.
+    if services.system && !services.user {
         return Err(format!(
             "Freenet's system service didn't start ({first}). Start it with \
              `sudo systemctl start freenet`, then try again."
         ));
     }
-    if services.user {
+    let ours = installed_by_river();
+    if services.user && !ours {
+        let check = if cfg!(target_os = "linux") {
+            " See why with `systemctl --user status freenet`, then try again."
+        } else {
+            ""
+        };
         return Err(format!(
-            "Freenet's background service didn't start: {first}"
+            "Freenet's background service didn't start ({first}).{check}"
         ));
     }
-    if !installed_by_river() {
+    if !ours {
         return Err(format!(
             "the Freenet at {} didn't start ({first}). Start it yourself, then try again.",
             bin.display()
@@ -426,25 +442,98 @@ mod tests {
     #[test]
     fn a_registered_service_that_fails_is_reported_not_registered_again() {
         let r = FakeRunner::failing(&["service start"]);
-        let (result, dropped) = start(&r, true, USER);
+        let (result, dropped) = start(&r, false, USER);
         let err = result.unwrap_err();
         assert_eq!(r.calls(), vec!["service start"]);
         assert!(err.contains("background service didn't start"), "{err}");
+        assert!(
+            err.contains("service start failed"),
+            "the real error is kept: {err}"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(err.contains("systemctl --user status freenet"), "{err}");
+        }
         assert_eq!(dropped, 0);
     }
 
     #[test]
+    fn a_registration_river_started_but_didnt_finish_is_finished() {
+        // freenet-core wrote the unit file, then reloading systemd failed. River's record is
+        // still there, so a retry registers again rather than giving up on the unit file.
+        let r = FakeRunner::failing(&["service start"]);
+        let (result, dropped) = start(&r, true, USER);
+        result.unwrap();
+        assert_eq!(
+            r.calls(),
+            vec!["service start", "service install", "service start"]
+        );
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn a_user_unit_comes_before_a_system_unit() {
+        // With both, freenet-core uses the user unit: so does the advice.
+        let both = Services {
+            user: true,
+            system: true,
+        };
+        let r = FakeRunner::failing(&["service start"]);
+        let err = start(&r, false, both).0.unwrap_err();
+        assert!(err.contains("background service"), "{err}");
+        assert!(!err.contains("sudo systemctl"), "{err}");
+    }
+
+    #[test]
     fn whether_river_owns_the_binary_is_only_asked_when_needed() {
-        // Asking hashes a 66 MB file, so a working start mustn't ask.
-        let r = FakeRunner::failing(&[]);
-        let mut dropped = 0;
+        // Asking hashes a 66 MB file, so it is skipped when the answer can't matter: a start
+        // that works, or a system service on its own.
         let asked = std::cell::Cell::new(false);
         let ours = || {
             asked.set(true);
             true
         };
-        start_binary(Path::new(BIN), &r, &ours, NONE, &mut || dropped += 1).unwrap();
+        let r = FakeRunner::failing(&[]);
+        start_binary(Path::new(BIN), &r, &ours, NONE, &mut || {}).unwrap();
         assert!(!asked.get());
+        let r = FakeRunner::failing(&["service start"]);
+        assert!(start_binary(Path::new(BIN), &r, &ours, SYSTEM, &mut || {}).is_err());
+        assert!(!asked.get());
+    }
+
+    #[test]
+    fn registered_services_are_found_where_freenet_core_puts_them() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let h = Some(home.path());
+        assert_eq!(registered_services_in("linux", h, root.path()), NONE);
+
+        let user = home.path().join(".config/systemd/user/freenet.service");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, b"").unwrap();
+        assert_eq!(registered_services_in("linux", h, root.path()), USER);
+        assert_eq!(
+            registered_services_in("linux", None, root.path()),
+            NONE,
+            "no home"
+        );
+
+        let system = root.path().join("etc/systemd/system/freenet.service");
+        std::fs::create_dir_all(system.parent().unwrap()).unwrap();
+        std::fs::write(&system, b"").unwrap();
+        let both = Services {
+            user: true,
+            system: true,
+        };
+        assert_eq!(registered_services_in("linux", h, root.path()), both);
+
+        let plist = home
+            .path()
+            .join("Library/LaunchAgents/org.freenet.node.plist");
+        assert_eq!(registered_services_in("macos", h, root.path()), NONE);
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, b"").unwrap();
+        assert_eq!(registered_services_in("macos", h, root.path()), USER);
+        assert_eq!(registered_services_in("windows", h, root.path()), NONE);
     }
 
     #[test]
@@ -611,9 +700,15 @@ mod tests {
         assert_eq!(ask(&agent, &serve_once(html)), Answer::NoVersion);
         let missing = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
         assert_eq!(ask(&agent, &serve_once(missing)), Answer::NoVersion);
-        // A node still starting may answer 503: not "outdated", just not ready.
+        // A proxy in front of a node that isn't up yet answers 502-504: not ready, not outdated.
         let starting = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
         assert_eq!(ask(&agent, &serve_once(starting)), Answer::Nothing);
+        // Freenet never answers its version endpoint with these, so whatever does isn't a
+        // usable Freenet and is reported rather than waited on.
+        let auth = "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(ask(&agent, &serve_once(auth)), Answer::NoVersion);
+        let broken = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(ask(&agent, &serve_once(broken)), Answer::NoVersion);
         // A redirect is not followed: the node's endpoint never redirects.
         let moved =
             "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/x\r\ncontent-length: 0\r\n\r\n";
