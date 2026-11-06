@@ -3,20 +3,59 @@
 //! A shell (today `apps/desktop`) supplies a [`NodeHost`] that knows how to find, install and
 //! start Freenet on its platform; everything the user sees lives here.
 
+pub mod chat;
 pub mod node;
 pub mod setup;
 
-use rune::tok::{self, type_};
 use rune::{AppHandle, AppSpec, Cx, El, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Kit};
 
+pub use chat::Chat;
 pub use node::{InstallStep, MANUAL_INSTALL_URL, NodeHost, NodeProbe};
 pub use setup::{Controller, Setup};
 
 pub struct RiverApp {
     pub setup: Setup,
+    /// The chat screen, shown once setup reaches [`Setup::Connected`]. It holds example data
+    /// for now ([`chat::Source::Example`]): nothing is read from or sent to the node yet.
+    pub chat: Chat,
     /// `None` in headless snapshots and tests, where nothing runs in the background.
     ctl: Option<Controller>,
+    /// River's logo, rasterized once by [`load_logo`]. `None` until then, and in tests, which
+    /// draw an empty square in its place.
+    logo: Option<Logo>,
+}
+
+/// The logo and the cache that keeps its pixels alive.
+struct Logo {
+    _cache: rune::image::ImageCache,
+    image: rune::image::Image,
+}
+
+/// The web UI's logo, so both apps carry the same mark. It is shared: an edit to it changes
+/// this app too, which is why `apps.yml` runs for that file.
+const LOGO_SVG: &[u8] = include_bytes!("../../../ui/assets/river_logo.svg");
+const LOGO_PATH: &str = "ui/assets/river_logo.svg";
+/// The logo's largest drawn size in points (the setup card draws it at this size, the room
+/// list smaller), and the scale it rasterizes at. Smaller draws use its mips.
+const LOGO_PT: f32 = 36.0;
+const LOGO_SCALE: f32 = 2.0;
+
+/// `AppSpec::setup`: start rasterizing the logo on the image cache's worker. A headless run
+/// (`--snap`) waits for it, so snapshots show it, and fails if it does not rasterize, so a
+/// broken logo stops CI's render step instead of rendering as an empty square.
+fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
+    let cache = rune::image::ImageCache::new(waker);
+    let image = cache.svg(LOGO_SVG, LOGO_PT, LOGO_SCALE);
+    if rune::is_headless()
+        && let Err(e) = image.wait()
+    {
+        panic!("River's logo ({LOGO_PATH}) did not rasterize: {e}");
+    }
+    s.logo = Some(Logo {
+        _cache: cache,
+        image,
+    });
 }
 
 impl RiverApp {
@@ -24,7 +63,10 @@ impl RiverApp {
     pub fn detached() -> Self {
         RiverApp {
             setup: Setup::Checking,
+            // TODO: example rooms; this goes once the app reads real rooms from the node.
+            chat: Chat::example(),
             ctl: None,
+            logo: None,
         }
     }
 
@@ -33,7 +75,10 @@ impl RiverApp {
         ctl.check();
         RiverApp {
             setup: Setup::Checking,
+            // TODO: example rooms; this goes once the app reads real rooms from the node.
+            chat: Chat::example(),
             ctl: Some(ctl),
+            logo: None,
         }
     }
 
@@ -83,18 +128,66 @@ pub const SCENES: &[Scene] = &[
     ("failed", |s| {
         s.setup = Setup::Failed("Couldn't install Freenet: the download was interrupted.".into())
     }),
-    ("connected", |s| {
-        s.setup = Setup::Connected {
-            version: "0.2.155".into(),
-        }
+    // Connected: the chat screen, on example data.
+    ("chat", connect),
+    ("chat-members-hidden", |s| {
+        connect(s);
+        s.chat.members_open = false;
+    }),
+    ("chat-private-room", |s| {
+        connect(s);
+        s.chat.select(chat::example::PRIVATE_ROOM);
+    }),
+    ("chat-composing", |s| {
+        connect(s);
+        s.chat
+            .composer
+            .replace_text("Sounds good, I'll bring the slides on Thursday");
+        s.chat.composer.focused = true;
+    }),
+    ("chat-empty-room", |s| {
+        connect(s);
+        s.chat.select(chat::example::EMPTY_ROOM);
+    }),
+    // Scenes named `*narrow*` are rendered at a narrow size (`--size 820x720`, see
+    // `.github/workflows/apps.yml`): the layout follows the window's width, which a scene
+    // cannot set. At the default size they look like the wide layout.
+    ("chat-narrow", connect),
+    ("chat-narrow-members", |s| {
+        connect(s);
+        s.chat.members_overlay = true;
     }),
 ];
+
+fn connect(s: &mut RiverApp) {
+    s.setup = Setup::Connected {
+        version: "0.2.155".into(),
+    };
+}
+
+/// The window's opening size, in points: room for the room list, a conversation and the
+/// members panel side by side.
+pub const WINDOW_SIZE: (f32, f32) = (1280.0, 800.0);
+
+/// The size the `*narrow*` scenes are rendered at. `.github/workflows/apps.yml` passes it as
+/// `--size 820x720`; keep the two in step.
+pub const NARROW_SCENE_SIZE: (f32, f32) = (820.0, 720.0);
+
+/// The window size a scene is meant to be rendered at.
+pub fn scene_size(name: &str) -> (f32, f32) {
+    if name.contains("narrow") {
+        NARROW_SCENE_SIZE
+    } else {
+        WINDOW_SIZE
+    }
+}
 
 pub fn spec() -> AppSpec<RiverApp> {
     AppSpec {
         scenes: SCENES,
-        min_size: Some((420.0, 400.0)),
-        ..AppSpec::new("River", (560.0, 440.0), RiverApp::detached, view)
+        min_size: Some((640.0, 480.0)),
+        setup: Some(load_logo),
+        ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
 }
 
@@ -106,9 +199,11 @@ pub fn app(make: impl FnOnce(AppHandle<RiverApp>) -> RiverApp + 'static) -> rune
 }
 
 pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
-    let dark = cx.system_dark();
-    let t = tok::theme(dark);
-    let k = Kit::neutral(dark);
+    // River is dark-only for now, like the chat screen; the setup screens match it.
+    let palette = chat::style::palette();
+    let k = Kit::neutral(true);
+    let logo = s.logo.as_ref().map(|l| l.image.pixels());
+    let t = (&palette, logo);
     let body = match &s.setup {
         Setup::Checking => panel(
             t,
@@ -146,7 +241,8 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
         ),
         Setup::Installing(step) => {
             let (title, fraction) = install_progress(step);
-            panel(t, title, "This only happens once.", fraction, vec![])
+            let progress = fraction.map(|f| (f, download_detail(step)));
+            panel(t, title, "This only happens once.", progress, vec![])
         }
         Setup::Starting => panel(
             t,
@@ -162,20 +258,15 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
             None,
             vec![retry_button(&k), manual_install_button(&k)],
         ),
-        Setup::Connected { version } => panel(
-            t,
-            "Connected to Freenet",
-            &format!("Freenet {version} is running on this computer."),
-            None,
-            vec![],
-        ),
+        Setup::Connected { .. } => return chat::view(&s.chat, logo, cx),
     };
     col()
         .key("root")
         .w_full()
         .h_full()
         .center()
-        .fill(t.bg)
+        .padding(24.0)
+        .fill(palette.rail)
         .child(body)
 }
 
@@ -199,38 +290,88 @@ fn install_progress(step: &InstallStep) -> (&'static str, Option<f32>) {
     }
 }
 
-fn panel(t: tok::Theme, title: &str, body: &str, progress: Option<f32>, actions: Vec<El>) -> El {
+/// "9.4 of 23.4 MB" under the download bar, when the download's size is known.
+fn download_detail(step: &InstallStep) -> Option<String> {
+    let InstallStep::Downloading {
+        received,
+        total: Some(total),
+    } = step
+    else {
+        return None;
+    };
+    let mb = |b: u64| b as f64 / 1_000_000.0;
+    Some(format!(
+        "{:.1} of {:.1} MB",
+        mb((*received).min(*total)),
+        mb(*total)
+    ))
+}
+
+/// The setup card's inner width.
+const PANEL_W: f32 = 380.0;
+/// The card's least height. With it every step's card is the same height, so the card, which
+/// is centred, keeps its top (and the logo) still as setup moves from step to step.
+const PANEL_MIN_H: f32 = 276.0;
+
+type Look<'a> = (&'a chat::style::Palette, Option<&'a rune::Pixels>);
+
+/// A progress bar's fraction, and the text under it.
+type Progress = Option<(f32, Option<String>)>;
+
+fn panel(t: Look, title: &str, body: &str, progress: Progress, actions: Vec<El>) -> El {
+    let (p, logo) = t;
+    let mark = match logo {
+        Some(px) => el().size(LOGO_PT, LOGO_PT).pixels(px),
+        None => el().size(LOGO_PT, LOGO_PT),
+    };
     let mut card = col()
         .key("panel")
-        .w(400.0)
+        .w(PANEL_W + 64.0)
+        .min_h(PANEL_MIN_H)
+        .padding(32.0)
         .gap(12.0)
+        .radius(16.0)
+        .fill(p.bg)
+        .border(1.0, p.line)
+        .shadow(18.0, 48.0, p.shadow)
         .child(
-            text("River")
+            row()
                 .key("wordmark")
-                .font(type_::LABEL)
-                .color(tok::accent(0, true)),
+                .gap(10.0)
+                .mb(10.0)
+                .center_y()
+                .child(mark)
+                .child(text("River").font(chat::style::BRAND).color(p.text)),
         )
         .child(
             text(title.to_owned())
                 .key("title")
-                .font(type_::TITLE)
-                .color(t.text)
+                .font(chat::style::TITLE)
+                .color(p.text)
                 .wrap()
                 .w_full(),
         )
         .child(
             text(body.to_owned())
                 .key("body")
-                .font(type_::BODY)
-                .color(t.text_secondary)
+                .font(chat::style::BODY.lh(21.0))
+                .color(p.text_secondary)
                 .wrap()
                 .w_full(),
         );
-    if let Some(fraction) = progress {
-        card = card.child(progress_bar(t, fraction));
+    if let Some((fraction, detail)) = progress {
+        card = card.child(progress_bar(p, fraction));
+        if let Some(detail) = detail {
+            card = card.child(
+                text(detail)
+                    .key("progress-detail")
+                    .font(chat::style::SMALL)
+                    .color(p.text_muted),
+            );
+        }
     }
     if !actions.is_empty() {
-        let mut buttons = row().key("actions").gap(8.0).mt(8.0);
+        let mut buttons = row().key("actions").gap(8.0).mt(10.0).flex_wrap();
         for action in actions {
             buttons = buttons.child(action);
         }
@@ -239,18 +380,19 @@ fn panel(t: tok::Theme, title: &str, body: &str, progress: Option<f32>, actions:
     card
 }
 
-fn progress_bar(t: tok::Theme, fraction: f32) -> El {
+fn progress_bar(p: &chat::style::Palette, fraction: f32) -> El {
     el().key("track")
         .w_full()
         .h(4.0)
+        .mt(6.0)
         .radius(2.0)
-        .fill(t.control_off)
+        .fill(p.surface_hover)
         .child(
             el().key("bar")
-                .w(400.0 * fraction.clamp(0.0, 1.0))
+                .w(PANEL_W * fraction.clamp(0.0, 1.0))
                 .h(4.0)
                 .radius(2.0)
-                .fill(tok::accent(0, true))
+                .fill(p.accent)
                 .motion(rune::Spring::new(0.3, 0.0)),
         )
 }
@@ -386,7 +528,9 @@ mod tests {
         let ctl = Controller::reporting_to(host.clone(), |_| {});
         let state = RiverApp {
             setup,
+            chat: Chat::example(),
             ctl: Some(ctl),
+            logo: None,
         };
         let env = Env {
             system_dark: true,
@@ -433,7 +577,7 @@ mod tests {
                 Setup::Installing(InstallStep::WaitingForInstaller) => "waiting-for-installer",
                 Setup::Starting => "starting",
                 Setup::Failed(_) => "failed",
-                Setup::Connected { .. } => "connected",
+                Setup::Connected { .. } => "chat",
             }
         }
         let mut covered: Vec<&str> = SCENES
@@ -441,12 +585,69 @@ mod tests {
             .map(|(name, apply)| {
                 let mut s = RiverApp::detached();
                 apply(&mut s);
-                assert_eq!(screen(&s.setup), *name, "scene {name} shows another screen");
-                *name
+                let shown = screen(&s.setup);
+                // Variants of one screen share its name as a prefix ("chat-private-room").
+                assert!(
+                    *name == shown || name.starts_with(&format!("{shown}-")),
+                    "scene {name} shows the {shown} screen"
+                );
+                shown
             })
             .collect();
         covered.sort();
         covered.dedup();
         assert_eq!(covered.len(), 10, "{covered:?}");
+    }
+
+    /// The logo is a gradient SVG shared with the web UI; this fails if an edit there breaks
+    /// it for the native renderer. It checks the raster's size only: Rune's image handle does
+    /// not expose decoded pixels, and checking coverage directly would mean depending on
+    /// resvg here. The CI render step shows the result.
+    #[test]
+    fn the_logo_rasterizes() {
+        let cache = rune::image::ImageCache::new(std::sync::Arc::new(|| {}));
+        let image = cache.svg(LOGO_SVG, LOGO_PT, LOGO_SCALE);
+        let [w, h] = image.wait().expect("the logo rasterizes");
+        let px = (LOGO_PT * LOGO_SCALE) as u32;
+        assert!(w > px / 2 && h > px / 2 && w <= px && h <= px, "{w}x{h}");
+    }
+
+    /// CI renders the `*narrow*` scenes with a `--size` it spells out itself; it must be the
+    /// size [`scene_size`] and the tests use.
+    #[test]
+    fn ci_renders_narrow_scenes_at_the_narrow_size() {
+        const WORKFLOW: &str = include_str!("../../../.github/workflows/apps.yml");
+        let line = WORKFLOW
+            .lines()
+            .find(|l| l.contains("*narrow*)"))
+            .expect("apps.yml picks a size for the narrow scenes");
+        let size = line
+            .split("--size ")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_alphanumeric()).next())
+            .expect("a --size WxH");
+        let (w, h) = NARROW_SCENE_SIZE;
+        assert_eq!(size, format!("{w}x{h}"));
+        // And the size it picks reaches the render.
+        let snap = WORKFLOW
+            .lines()
+            .find(|l| l.contains("--snap"))
+            .expect("apps.yml renders scenes with --snap");
+        assert!(snap.contains("\"${size[@]}\""), "{snap}");
+    }
+
+    #[test]
+    fn a_download_of_known_size_says_how_far_it_is() {
+        assert_eq!(
+            download_detail(&downloading(9_400_000, Some(23_372_438))).as_deref(),
+            Some("9.4 of 23.4 MB")
+        );
+        assert_eq!(download_detail(&downloading(9_400_000, None)), None);
+        assert_eq!(
+            download_detail(&downloading(150, Some(100))).as_deref(),
+            Some("0.0 of 0.0 MB")
+        );
+        let rt = render(Setup::Installing(downloading(50, Some(100))));
+        assert!(rt.find("progress-detail").is_some());
     }
 }

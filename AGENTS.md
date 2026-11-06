@@ -222,6 +222,13 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
 `.github/workflows/apps.yml` does.
 
 - `apps/river-app`: the UI and setup state machine, shared by every platform.
+  Once setup connects it shows the chat screen (`src/chat/`), which for now
+  runs on built-in example data (`chat::Source::Example`): it does not read
+  or send anything through the node yet. Its colours and sizes follow the web
+  UI in `ui/`. It also compiles in one web UI file, the logo
+  `ui/assets/river_logo.svg` (`include_bytes!` in `apps/river-app/src/lib.rs`),
+  so an edit to that file changes the native app too and runs `apps.yml`.
+  Nothing else under `ui/` is read by `apps/`.
 - `apps/desktop`: the desktop shell (binary `river`), including the Freenet
   installer, which verifies the release's signed checksums.
 
@@ -231,7 +238,14 @@ cargo test --locked                  # unit tests
 cargo run -p river-desktop           # the app
 cargo run -p river-desktop -- --list-scenes
 cargo run -p river-desktop -- --snap out.png --scene not-installed   # headless render
+cargo run -p river-desktop -- --snap out.png --scene chat-narrow --size 820x720
 ```
+
+The window opens at 1280x800 and can shrink to 640x480. Every screen, setup
+included, uses one dark palette (`apps/river-app/src/chat/style.rs`); there is
+no light theme yet. A scene cannot set the window size, so the `*narrow*`
+scenes need `--size 820x720` to render as CI renders them (`scene_size` in
+`apps/river-app/src/lib.rs`, checked against `apps.yml` by a test).
 
 Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders
 without a GPU need a software Vulkan driver (`mesa-vulkan-drivers`, then point
