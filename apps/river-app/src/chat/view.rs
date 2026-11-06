@@ -37,6 +37,14 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         .w_full()
         .h_full()
         .fill(p.bg)
+        // The narrow layout's members overlay is modal. A frame laid out wide shows no
+        // overlay, so close it then: otherwise it would come back, and take focus from the
+        // composer, the next time the window narrows.
+        .on_layout(|s: &mut RiverApp, r: [f32; 4]| {
+            if r[2] >= NARROW_WIDTH {
+                s.chat.members_overlay = false;
+            }
+        })
         .child(rooms(chat, logo, narrow, &p));
     let Some(room) = chat.room() else {
         return screen.child(no_rooms(&p));

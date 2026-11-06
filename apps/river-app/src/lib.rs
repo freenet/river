@@ -628,6 +628,12 @@ mod tests {
             .expect("a --size WxH");
         let (w, h) = NARROW_SCENE_SIZE;
         assert_eq!(size, format!("{w}x{h}"));
+        // And the size it picks reaches the render.
+        let snap = WORKFLOW
+            .lines()
+            .find(|l| l.contains("--snap"))
+            .expect("apps.yml renders scenes with --snap");
+        assert!(snap.contains("\"${size[@]}\""), "{snap}");
     }
 
     #[test]

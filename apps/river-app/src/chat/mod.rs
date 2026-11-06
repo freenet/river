@@ -92,12 +92,22 @@ impl Chat {
 
     /// Replace the rooms. The open room stays open if it is still there; otherwise the first
     /// room opens (through [`Chat::select`], so it is marked read and its draft comes back).
-    /// Drafts of rooms that are gone are dropped.
+    /// Drafts of rooms that are gone are dropped, except when the list is empty.
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
-        if self.room().is_none()
-            && let Some(first) = self.rooms.first().map(|r| r.key.clone())
-        {
+        if self.rooms.is_empty() {
+            // An empty list is often a reload on its way to the full one, so keep every draft,
+            // the open room's included, and open nothing. The room that opens when rooms come
+            // back then goes through `select` from nothing, and is marked read.
+            let open = std::mem::replace(&mut self.composer, TextEdit::new(""));
+            let key = std::mem::take(&mut self.selected);
+            if !key.is_empty() && !open.text.is_empty() {
+                self.drafts.insert(key, open);
+            }
+            return;
+        }
+        if self.room().is_none() {
+            let first = self.rooms[0].key.clone();
             self.select(&first);
         }
         let rooms = &self.rooms;
@@ -132,7 +142,13 @@ impl Chat {
             return;
         }
         if self.selected.is_empty() {
-            // Nothing was open, so what the composer holds belongs to no room yet: keep it.
+            // Nothing was open, so what the composer holds belongs to no room yet: keep it,
+            // unless it is empty and this room has a draft.
+            if self.composer.text.is_empty()
+                && let Some(draft) = self.drafts.remove(key)
+            {
+                self.composer = draft;
+            }
             self.selected = key.to_owned();
             return;
         }
@@ -252,6 +268,26 @@ mod state_tests {
         chat.set_rooms(example::data().rooms);
         assert!(chat.room().is_some());
         assert!(chat.send());
+    }
+
+    #[test]
+    fn a_reload_through_an_empty_list_keeps_drafts_and_marks_the_open_room_read() {
+        let mut chat = Chat::example();
+        let a = chat.room().unwrap().key.clone();
+        chat.composer.replace_text("draft in A");
+        chat.select(example::PRIVATE_ROOM);
+        chat.composer.replace_text("draft in B");
+        chat.set_rooms(Vec::new());
+        assert!(chat.room().is_none());
+        assert_eq!(chat.composer.text, "");
+        let mut rooms = example::data().rooms;
+        rooms[0].unread = 4;
+        chat.set_rooms(rooms);
+        assert_eq!(chat.room().unwrap().key, a);
+        assert_eq!(chat.room().unwrap().unread, 0);
+        assert_eq!(chat.composer.text, "draft in A");
+        chat.select(example::PRIVATE_ROOM);
+        assert_eq!(chat.composer.text, "draft in B");
     }
 
     #[test]

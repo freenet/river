@@ -79,6 +79,8 @@ fn selecting_a_room_opens_its_conversation() {
     assert!(shows(&rt, "pushed the new mockups"));
     assert!(rt.find("private-badge").is_some());
     assert!(!shows(&rt, "Release notes are at"));
+    // Two days back is written as a date, so the example's calendar reaches the view.
+    assert!(shows(&rt, "Wednesday, November 4"));
 }
 
 #[test]
@@ -256,9 +258,13 @@ fn a_narrow_window_opens_members_over_the_conversation() {
     // Tab stays inside it, and Escape closes it.
     press(&mut rt, "toggle-members");
     assert!(rt.state.chat.members_overlay);
-    for _ in 0..8 {
+    for i in 0..8 {
         key(&mut rt, Key::Tab);
-        for e in rt.elements().into_iter().filter(|e| e.focused) {
+        let focused: Vec<_> = rt.elements().into_iter().filter(|e| e.focused).collect();
+        if i == 0 {
+            assert!(!focused.is_empty(), "Tab focuses something in the panel");
+        }
+        for e in focused {
             assert!(e.path.contains("members-overlay"), "Tab reached {}", e.path);
         }
     }
@@ -349,4 +355,38 @@ fn removing_the_open_room_shows_another_not_an_empty_screen() {
     rt.frame(0.7);
     rt.frame(0.8);
     assert!(rt.find("no-rooms").is_some());
+}
+
+/// Opening members in a narrow window, widening, typing, then narrowing again must not bring
+/// the modal panel back and take the keyboard from the composer.
+#[test]
+fn widening_closes_the_narrow_members_panel() {
+    let mut rt = render(connected(), NARROW_SCENE_SIZE);
+    press(&mut rt, "toggle-members");
+    assert!(rt.find("members-overlay").is_some());
+    let mut t = 1.0;
+    let mut settle = |rt: &mut Runtime<RiverApp>| {
+        for _ in 0..4 {
+            t += 1.0 / 60.0;
+            rt.frame(t);
+        }
+    };
+    rt.set_viewport(WINDOW_SIZE, 1.0);
+    settle(&mut rt);
+    assert!(!rt.state.chat.members_overlay);
+    let (x, y) = rt.find("composer-field").unwrap();
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    settle(&mut rt);
+    assert!(rt.state.chat.composer.focused);
+    rt.set_viewport(NARROW_SCENE_SIZE, 1.0);
+    settle(&mut rt);
+    assert!(rt.find("members-overlay").is_none());
+    assert!(rt.state.chat.composer.focused);
+    rt.key(KeyEvent {
+        key: Key::Text("still typing".into()),
+        mods: Default::default(),
+    });
+    settle(&mut rt);
+    assert_eq!(rt.state.chat.composer.text, "still typing");
 }
