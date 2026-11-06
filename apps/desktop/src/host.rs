@@ -264,10 +264,16 @@ fn no_user_session_recipe(bin: &Path) -> String {
     format!(
         "If `systemctl --user` can't connect (there is no systemd user session here), remove \
          `~/.config/systemd/user/freenet.service` if it exists, set Freenet up for the whole \
-         system with `sudo \"{}\" service install --system`, start it with `sudo systemctl \
+         system with `sudo {} service install --system`, start it with `sudo systemctl \
          start freenet`, then try again. Freenet needs systemd on Linux.",
-        bin.display()
+        shell_quote(&bin.to_string_lossy())
     )
+}
+
+/// `s` as one POSIX shell word: single-quoted, so nothing inside is expanded, with any single
+/// quote written as `'\''`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// What to say when the user service exists but didn't start. freenet-core prefers the user
@@ -330,7 +336,8 @@ fn on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Run a command to completion, returning the last line of its stderr on failure.
+/// Run a command to completion, returning what its stderr says went wrong on failure (see
+/// [`error_line`]).
 pub fn run(cmd: &mut Command) -> Result<(), String> {
     run_with_deadline(cmd, COMMAND_DEADLINE)
 }
@@ -383,16 +390,50 @@ fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String
     Err(format!("{} failed: {}", describe(cmd), error_line(&tail)))
 }
 
-/// The line of a failed command's stderr that says what went wrong. freenet-core prints
-/// `Error: ...` followed by hint lines (`Hint:`, `Try: ...`), so its last `Error:` line is the
-/// cause; anything else reports its last line.
-fn error_line(output: &str) -> &str {
-    let lines = || output.lines().map(str::trim).filter(|l| !l.is_empty());
-    lines()
-        .filter_map(|l| l.strip_prefix("Error:").map(str::trim))
-        .rfind(|l| !l.is_empty())
-        .or_else(|| lines().next_back())
-        .unwrap_or("no error output")
+/// What a failed command's stderr says went wrong.
+///
+/// freenet-core prints its error with anyhow's `{:?}` format: `Error: <message>`, then, for an
+/// error with context, a blank line, `Caused by:` and the causes (numbered `0: ...` when there
+/// are several), the last being the root cause; hint lines (`Hint:`, `Try: ...`) may follow
+/// the message. So: the last `Error:` line, plus its root cause when there is one. Output
+/// without an `Error:` line (clap prints `error:`, matched too) reports its last line.
+fn error_line(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().map(str::trim).collect();
+    let found = lines.iter().enumerate().rev().find_map(|(i, line)| {
+        let head = line.get(..6)?;
+        let rest = line[6..].trim();
+        (head.eq_ignore_ascii_case("error:") && !rest.is_empty()).then_some((i, rest))
+    });
+    let Some((at, message)) = found else {
+        return lines
+            .iter()
+            .rev()
+            .find(|l| !l.is_empty())
+            .map_or("no error output".into(), |l| l.to_string());
+    };
+    let after = &lines[at + 1..];
+    let root_cause = after
+        .iter()
+        .position(|l| *l == "Caused by:")
+        .and_then(|start| {
+            after[start + 1..]
+                .iter()
+                .take_while(|l| !l.is_empty())
+                .last()
+        })
+        .map(|cause| strip_cause_number(cause));
+    match root_cause {
+        Some(cause) => format!("{message}: {cause}"),
+        None => message.to_string(),
+    }
+}
+
+/// `3: Permission denied` -> `Permission denied`; anything else unchanged.
+fn strip_cause_number(cause: &str) -> &str {
+    match cause.split_once(": ") {
+        Some((n, rest)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => rest,
+        _ => cause,
+    }
 }
 
 /// Windows: don't flash a console window for a console program run from River.
@@ -498,7 +539,7 @@ mod tests {
                     "{err}"
                 );
                 assert!(
-                    err.contains(&format!("`sudo \"{BIN}\" service install --system`")),
+                    err.contains(&format!("`sudo '{BIN}' service install --system`")),
                     "{err}"
                 );
                 assert!(err.contains("sudo systemctl start freenet"), "{err}");
@@ -634,7 +675,7 @@ mod tests {
                 "{err}"
             );
             assert!(
-                err.contains(&format!("`sudo \"{BIN}\" service install --system`")),
+                err.contains(&format!("`sudo '{BIN}' service install --system`")),
                 "{err}"
             );
             assert!(err.contains("sudo systemctl start freenet"), "{err}");
@@ -829,16 +870,42 @@ mod tests {
 
     #[test]
     fn the_reported_line_is_the_error_not_a_trailing_hint() {
-        // How freenet-core fails: the cause, then hint lines.
-        let freenet = "Error: Failed to reload systemd\n\nHint: User systemd session not \
-                       available\nTry: sudo freenet service install --system\n";
-        assert_eq!(error_line(freenet), "Failed to reload systemd");
-        // Several: the last one, which is the most specific.
-        assert_eq!(error_line("Error: outer\nError: inner\nHint: x\n"), "inner");
+        // freenet-core's `bail!` with a hint: the message, not the trailing `Try:` line.
+        let hinted = "Error: Failed to reload systemd\n\nHint: User systemd session not \
+                      available\nTry: sudo freenet service install --system\n";
+        assert_eq!(error_line(hinted), "Failed to reload systemd");
+        // anyhow `.context(...)`: the message and its root cause, which is what to fix.
+        let with_cause = "Error: Failed to create systemd user directory\n\nCaused by:\n    \
+                          Permission denied (os error 13)\n";
+        assert_eq!(
+            error_line(with_cause),
+            "Failed to create systemd user directory: Permission denied (os error 13)"
+        );
+        // Several causes, numbered, then a backtrace: the last cause, unnumbered.
+        let chain = "Error: Failed to write service file\n\nCaused by:\n    0: writing unit\n    \
+                     1: No space left on device (os error 28)\n\nStack backtrace:\n   0: main\n";
+        assert_eq!(
+            error_line(chain),
+            "Failed to write service file: No space left on device (os error 28)"
+        );
+        // clap's lowercase `error:`, before its usage text.
+        let clap = "error: unrecognized subcommand 'service'\n\nUsage: freenet [OPTIONS]\n\n\
+                    For more information, try '--help'.\n";
+        assert_eq!(error_line(clap), "unrecognized subcommand 'service'");
         // Anything else: its last line.
         assert_eq!(error_line("first\nboom\n\n"), "boom");
         assert_eq!(error_line(""), "no error output");
         assert_eq!(error_line("Error:\nreal problem\n"), "real problem");
+    }
+
+    #[test]
+    fn a_suggested_command_survives_any_path() {
+        assert_eq!(
+            shell_quote("/home/u/.local/bin/freenet"),
+            "'/home/u/.local/bin/freenet'"
+        );
+        assert_eq!(shell_quote("/a b/$x/`y`/\"z\""), "'/a b/$x/`y`/\"z\"'");
+        assert_eq!(shell_quote("/it's/freenet"), r"'/it'\''s/freenet'");
     }
 
     #[cfg(unix)]

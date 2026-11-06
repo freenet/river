@@ -17,6 +17,8 @@ use crate::node::{InstallStep, NodeHost, NodeProbe};
 /// How long a freshly started node may take to answer before we call it a failure.
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 const START_POLL: Duration = Duration::from_millis(500);
+/// How long to look for an install after an installer exits successfully without one.
+const POST_INSTALL_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Setup {
@@ -101,17 +103,16 @@ impl Controller {
             match ctl.host.probe() {
                 NodeProbe::Running { version } => ctl.set(Setup::Connected { version }),
                 NodeProbe::Outdated { running, minimum } => ctl.set(outdated(running, minimum)),
-                // The installer said it succeeded, but River can't see an install: an installer
-                // that put Freenet somewhere River doesn't look may still be starting it.
+                // The installer exited successfully but River sees no install. Freenet's
+                // Windows wizard installs where River looks and also exits 0 when cancelled,
+                // so this is almost always a cancel; look briefly in case it is still
+                // finishing, rather than making someone who cancelled wait out a start.
                 NodeProbe::NotInstalled => {
-                    ctl.set(Setup::Starting);
+                    ctl.set(Setup::Checking);
                     ctl.wait_for_node(
-                        format!(
-                            "The installer finished, but no Freenet answered within {} \
-                             seconds, and River can't find where it was installed.",
-                            ctl.start_timeout.as_secs()
-                        ),
+                        "The installer closed without installing Freenet.".into(),
                         true,
+                        POST_INSTALL_GRACE.min(ctl.start_timeout),
                     );
                 }
                 NodeProbe::InstalledNotRunning => ctl.start_and_wait(),
@@ -149,13 +150,14 @@ impl Controller {
                 self.start_timeout.as_secs()
             ),
             false,
+            self.start_timeout,
         );
     }
 
-    /// Poll until a node answers, or report `give_up` after the start timeout. With
+    /// Poll until a node answers, or report `give_up` after `timeout`. With
     /// `start_once_found`, an install that becomes visible while waiting is started.
-    fn wait_for_node(&self, give_up: String, start_once_found: bool) {
-        let deadline = Instant::now() + self.start_timeout;
+    fn wait_for_node(&self, give_up: String, start_once_found: bool, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             match self.host.probe() {
                 NodeProbe::Running { version } => return self.set(Setup::Connected { version }),
@@ -399,20 +401,28 @@ mod tests {
             ))
         );
 
-        // The installer reported success, but no install can be seen and no node answers.
-        let (mut ctl, _, rx) = controller(FakeHost::new(vec![NodeProbe::NotInstalled]));
+        // The installer exited successfully, but no install can be seen and no node answers:
+        // with Freenet's wizard, a cancel. Reported after a short look, not a start timeout.
+        let (mut ctl, host, rx) = controller(FakeHost::new(vec![NodeProbe::NotInstalled]));
         ctl.start_timeout = Duration::from_secs(1);
         ctl.install();
         let seen = settle(&rx);
-        assert!(seen.contains(&Setup::Starting), "{seen:?}");
+        assert!(
+            !seen.contains(&Setup::Starting),
+            "nothing was started: {seen:?}"
+        );
         assert_eq!(
             seen.last(),
             Some(&Setup::Failed(
-                "The installer finished, but no Freenet answered within 1 seconds, and River \
-                 can't find where it was installed."
-                    .into()
+                "The installer closed without installing Freenet.".into()
             ))
         );
+        assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_cancelled_installer_is_reported_well_before_a_start_would_time_out() {
+        assert!(POST_INSTALL_GRACE * 4 < START_TIMEOUT);
     }
 
     #[test]

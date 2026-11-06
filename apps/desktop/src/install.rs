@@ -459,6 +459,9 @@ fn spawn_installer(installer: &Path) -> std::io::Result<std::process::Child> {
 mod tests {
     use super::*;
 
+    /// A gzipped tarball with exactly these entry names. The names are written into the header
+    /// as given: `tar::Builder`'s path setters would drop a leading `./`, so a `./freenet` test
+    /// would never reach the reader as `./freenet`.
     fn tarball(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
         let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         let mut builder = tar::Builder::new(gz);
@@ -467,10 +470,22 @@ mod tests {
             header.set_entry_type(*kind);
             header.set_size(data.len() as u64);
             header.set_mode(0o755);
+            let name = &mut header.as_old_mut().name;
+            assert!(path.len() < name.len(), "test names are short");
+            name[..path.len()].copy_from_slice(path.as_bytes());
             header.set_cksum();
-            builder.append_data(&mut header, path, *data).unwrap();
+            builder.append(&header, *data).unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// The entry names a tarball actually holds, as a reader sees them.
+    fn names_in(archive: &[u8]) -> Vec<String> {
+        tar::Archive::new(flate2::read::GzDecoder::new(archive))
+            .entries()
+            .unwrap()
+            .map(|e| String::from_utf8_lossy(&e.unwrap().path_bytes()).into_owned())
+            .collect()
     }
 
     const FILE: tar::EntryType = tar::EntryType::Regular;
@@ -488,9 +503,17 @@ mod tests {
     fn takes_only_a_top_level_freenet_file() {
         // The release layout: `freenet` at the top (checked against v0.2.155's tarball).
         assert_eq!(
-            extract_freenet(&tarball(&[("./freenet", FILE, b"yes")])).unwrap(),
+            extract_freenet(&tarball(&[("freenet", FILE, b"yes")])).unwrap(),
             b"yes"
         );
+        // The same with a leading `./`, as `tar -C dir .` would write it.
+        let dotted = tarball(&[("./freenet", FILE, b"yes")]);
+        assert_eq!(
+            names_in(&dotted),
+            vec!["./freenet"],
+            "the reader really sees ./freenet"
+        );
+        assert_eq!(extract_freenet(&dotted).unwrap(), b"yes");
         // A file of the same name deeper down, listed first, is not the binary.
         let archive = tarball(&[
             ("share/doc/freenet", FILE, b"no"),
