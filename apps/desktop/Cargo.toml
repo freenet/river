@@ -18,7 +18,7 @@ rune.workspace = true
 ureq = { version = "2", default-features = false, features = ["tls"] }
 serde_json = "1"
 sha2 = "0.10"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 hex = "0.4"
 flate2 = "1"
 tar = "0.4"
