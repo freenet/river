@@ -8,6 +8,11 @@ fn room() -> VerifyingKey {
     SigningKey::from_bytes(&[1u8; 32]).verifying_key()
 }
 
+/// When a retry happens in these tests.
+fn later() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(3600)
+}
+
 fn author() -> SigningKey {
     SigningKey::from_bytes(&[2u8; 32])
 }
@@ -161,14 +166,16 @@ fn retry_signs_again_and_commits() {
     let mut outbox = Outbox::default();
     let (a, wa) = send(&mut outbox, "a", 1);
     assert!(
-        outbox.retry(&room(), a).is_none(),
+        outbox.retry(&room(), a, later()).is_none(),
         "only a failed entry can be retried"
     );
     outbox.record_failure(&room(), a, "timed out".to_string());
 
-    let (vk, work) = outbox.retry(&room(), a).expect("a failed entry retries");
+    let (vk, work) = outbox
+        .retry(&room(), a, later())
+        .expect("a failed entry retries");
     assert_eq!(vk, author().verifying_key());
-    assert_eq!(work, wa, "a retry signs the same bytes");
+    assert_ne!(work, wa, "a retry is restamped, so it signs new bytes");
     assert_eq!(
         outbox.pending_rows(&room(), &author().verifying_key())[0].failed,
         None,
@@ -338,10 +345,15 @@ fn pending_effects_are_those_of_actions_still_signing() {
         outbox.pending_effects(&room(), &author().verifying_key()),
         vec![effect("signing")]
     );
+    let other = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+    assert!(
+        outbox.pending_effects(&room(), &other).is_empty(),
+        "another identity's actions are not shown"
+    );
 }
 
 /// By design: a message that failed and is retried commits after the ones
-/// sent after it (keeping its own timestamp, so it still shows in typed order).
+/// sent after it, and is restamped at the retry, so it shows after them too.
 #[test]
 fn a_retried_message_commits_after_the_ones_that_went_ahead() {
     let mut outbox = Outbox::default();
@@ -349,7 +361,7 @@ fn a_retried_message_commits_after_the_ones_that_went_ahead() {
     let (b, wb) = send(&mut outbox, "b", 2);
     outbox.record_failure(&room(), a, "timed out".to_string());
     sign_all(&mut outbox, b, &wb);
-    let (_, wa) = outbox.retry(&room(), a).unwrap();
+    let (_, wa) = outbox.retry(&room(), a, later()).unwrap();
     sign_all(&mut outbox, a, &wa);
     let first = outbox.take_ready(&room());
     assert_eq!(texts(&first), ["a", "b"], "both ready: committed in order");
@@ -360,7 +372,7 @@ fn a_retried_message_commits_after_the_ones_that_went_ahead() {
     outbox.record_failure(&room(), a, "timed out".to_string());
     sign_all(&mut outbox, b, &wb);
     assert_eq!(texts(&outbox.take_ready(&room())), ["b"]);
-    let (_, wa) = outbox.retry(&room(), a).unwrap();
+    let (_, wa) = outbox.retry(&room(), a, later()).unwrap();
     sign_all(&mut outbox, a, &wa);
     assert_eq!(texts(&outbox.take_ready(&room())), ["a"]);
 }
@@ -372,8 +384,15 @@ fn a_refused_message_can_be_retried() {
     sign_all(&mut outbox, a, &wa);
     let entry = outbox.take_ready(&room()).pop().unwrap();
     outbox.restore_failed(room(), entry, "not admitted".to_string());
-    let (_, work) = outbox.retry(&room(), a).expect("a refused message retries");
-    assert_eq!(work, wa);
+    let (_, work) = outbox
+        .retry(&room(), a, later())
+        .expect("a refused message retries");
+    assert_ne!(work, wa, "a retry is restamped, so it signs new bytes");
+    assert_eq!(
+        outbox.pending_rows(&room(), &author().verifying_key())[0].time,
+        later(),
+        "the retried message carries the retry's time, so a room at its cap keeps it"
+    );
     assert_eq!(
         outbox.pending_rows(&room(), &author().verifying_key())[0].failed,
         None

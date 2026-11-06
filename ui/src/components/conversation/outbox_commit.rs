@@ -38,10 +38,24 @@ pub(crate) fn retry(room: VerifyingKey, id: u64) {
             .map
             .get(&room)
             .and_then(|r| r.signing_key().cloned());
-        if let Some((author_vk, work)) = OUTBOX.with_mut(|o| o.retry(&room, id)) {
+        // The fallback key is the current identity's; `sign_message_with_fallback`
+        // uses it only if it matches `author_vk`, so a row from a replaced
+        // identity cannot be signed with the new key.
+        if let Some((author_vk, work)) =
+            OUTBOX.with_mut(|o| o.retry(&room, id, crate::util::get_current_system_time()))
+        {
             start_signing(room, id, author_vk, work, fallback_key);
         }
     });
+}
+
+/// Whether any message is waiting in the outbox (signing, or failed and kept
+/// for a retry). The outbox is memory only, so a page reload loses these:
+/// the generation reload treats this as the reader being busy, and waits for
+/// it before reloading. Unreadable means "cannot tell": busy.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn has_unsent() -> bool {
+    OUTBOX.try_read().map_or(true, |o| !o.is_empty())
 }
 
 /// Drop everything waiting in `room`: the user left it. From a deferred
@@ -141,16 +155,21 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
     }
     // An identity import replaced the room's identity while these waited:
     // they are never committed (`apply_entry`) or shown under the new one.
-    if let Some(current) = ROOMS
+    // The key is bound first so no `ROOMS` borrow is live during the write.
+    let current = ROOMS
         .peek()
         .map
         .get(&room)
-        .and_then(|r| r.self_verifying_key())
-    {
+        .and_then(|r| r.self_verifying_key());
+    if let Some(current) = current {
         if OUTBOX.peek().has_other_identities(&room, &current) {
             let dropped = OUTBOX.with_mut(|o| o.drop_other_identities(&room, &current));
             warn!(
                 "Room identity replaced with {dropped} unsent message(s) from the old one; dropped"
+            );
+            crate::components::toast::show_toast(
+                format!("{dropped} unsent message(s) from your previous identity in this room were discarded"),
+                None,
             );
         }
     }
@@ -337,7 +356,7 @@ mod tests {
         // if the fallback check were bypassed.
         let other = SigningKey::from_bytes(&[7u8; 32]);
         outbox.record_failure(&room, id, String::new());
-        let (_, work) = outbox.retry(&room, id).unwrap();
+        let (_, work) = outbox.retry(&room, id, SystemTime::now()).unwrap();
         outbox.record_signature(&room, id, 0, other.sign(&work[0].1));
         let entry = outbox.take_ready(&room).pop().unwrap();
         assert!(apply_entry(&mut room_data, &entry).is_err());
@@ -548,6 +567,10 @@ mod tests {
         let source = include_str!("outbox_commit.rs");
         let prod = squash(&source[..source.find("#[cfg(test)]\nmod tests").unwrap()]);
         for (guard, write) in [
+            (
+                "OUTBOX.peek().has_other_identities(&room,&current)",
+                "o.drop_other_identities(&room,&current)",
+            ),
             ("OUTBOX.peek().has_ready(&room)", "o.take_ready(&room)"),
             (
                 "OUTBOX.peek().has_failed_actions(&room)",

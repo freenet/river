@@ -13,15 +13,16 @@
 //! edit of an earlier message, or three messages typed quickly, reach `ROOMS`
 //! (and so the network) in the order the user made them. A failed entry does
 //! not hold back the ones after it: it stays, marked failed, until the user
-//! retries or discards it (a retried message then commits after them, keeping
-//! its original timestamp). Leaving the room drops what is waiting in it
+//! retries or discards it (a retried message is restamped, and commits after
+//! them). Leaving the room drops what is waiting in it
 //! (`outbox_commit::clear_room_now`).
 //!
 //! The outbox is memory only: a reload while a message is still being signed
 //! loses it.
 //!
 //! Each message keeps the timestamp it was given when the user acted; signing
-//! later does not restamp it, so the order on screen is the typed order.
+//! later does not restamp it, so the order on screen is the typed order. Only
+//! a Retry restamps.
 
 use dioxus::prelude::*;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -220,6 +221,12 @@ impl Outbox {
         })
     }
 
+    /// Whether nothing waits in any room.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.rooms.is_empty()
+    }
+
     /// Whether anything waits in `room`.
     pub fn has_room(&self, room: &VerifyingKey) -> bool {
         self.rooms.contains_key(room)
@@ -259,14 +266,29 @@ impl Outbox {
         queue.insert(at, entry);
     }
 
-    /// Start a failed entry signing again. Returns the author's key and the
-    /// work, or `None` if the entry is gone or not failed.
-    pub fn retry(&mut self, room: &VerifyingKey, id: u64) -> Option<(VerifyingKey, SigningWork)> {
+    /// Start a failed entry signing again, restamped `now`: a retry is a new
+    /// send. (Keeping the original stamp would let a room at its message cap
+    /// prune the retried message the moment it lands, so Retry could never
+    /// succeed.) Returns the author's key and the work, or `None` if the entry
+    /// is gone or not failed.
+    pub fn retry(
+        &mut self,
+        room: &VerifyingKey,
+        id: u64,
+        now: SystemTime,
+    ) -> Option<(VerifyingKey, SigningWork)> {
         let entry = self.entry_mut(room, id)?;
         if !matches!(entry.state, PendingState::Failed(_)) {
             return None;
         }
         entry.state = PendingState::Signing;
+        for m in &mut entry.messages {
+            m.message.time = now;
+            let mut bytes = Vec::new();
+            if ciborium::ser::into_writer(&m.message, &mut bytes).is_ok() {
+                m.bytes = bytes;
+            }
+        }
         Some((
             entry.author_vk,
             entry

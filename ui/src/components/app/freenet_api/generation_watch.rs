@@ -1096,6 +1096,12 @@ mod runtime {
         if matches!(document.query_selector("[id^=\"edit-msg-\"]"), Ok(Some(_))) {
             return true;
         }
+        // A message sent but not yet signed and committed, or failed and kept
+        // for a retry: it lives only in memory, and the composer is already
+        // empty, so nothing above sees it.
+        if crate::components::conversation::outbox_has_unsent() {
+            return true;
+        }
         if let Ok(overlays) = document.query_selector_all(".fixed.inset-0") {
             for i in 0..overlays.length() {
                 let visible = overlays
@@ -1323,7 +1329,12 @@ mod runtime {
             }
         }
         let deadline = now_ms() + FLUSH_TIMEOUT_MS;
-        while now_ms() < deadline && NEEDS_SYNC.try_read().map_or(true, |s| !s.is_empty()) {
+        // Unsent messages (the outbox) commit into NEEDS_SYNC, so wait for
+        // both; a failed one never commits and is lost at the deadline.
+        while now_ms() < deadline
+            && (NEEDS_SYNC.try_read().map_or(true, |s| !s.is_empty())
+                || crate::components::conversation::outbox_has_unsent())
+        {
             crate::util::sleep(Duration::from_millis(250)).await;
         }
         let remaining = deadline.saturating_sub(now_ms()).max(500);
