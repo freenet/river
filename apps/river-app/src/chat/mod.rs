@@ -8,7 +8,9 @@
 pub mod example;
 mod icons;
 pub mod model;
-mod style;
+pub(crate) mod style;
+#[cfg(test)]
+mod tests;
 mod view;
 
 use rune::TextEdit;
@@ -29,7 +31,11 @@ pub struct Chat {
     /// Index into `rooms` of the open room.
     pub selected: usize,
     pub composer: TextEdit,
+    /// Whether a wide window shows the members panel beside the conversation.
     pub members_open: bool,
+    /// Whether a narrow window shows the members panel over the conversation. Separate from
+    /// `members_open`, so a narrow window opens on the conversation however the wide one was left.
+    pub members_overlay: bool,
     /// Today's day number, for the "Today" and "Yesterday" headings.
     pub today: u32,
     /// The time a message sent now is stamped with, in the example's minutes.
@@ -45,6 +51,7 @@ impl Chat {
             selected: 0,
             composer: TextEdit::new(""),
             members_open: true,
+            members_overlay: false,
             today: data.today,
             now: data.now,
         }
@@ -78,13 +85,28 @@ impl Chat {
         true
     }
 
-    pub fn toggle_members(&mut self) {
-        self.members_open = !self.members_open;
+    /// Show or hide the members panel, in the layout the window is in now.
+    pub fn toggle_members(&mut self, narrow: bool) {
+        let open = if narrow {
+            &mut self.members_overlay
+        } else {
+            &mut self.members_open
+        };
+        *open = !*open;
+    }
+
+    /// Whether the members panel shows, in a window that is `narrow` or not.
+    pub fn members_shown(&self, narrow: bool) -> bool {
+        if narrow {
+            self.members_overlay
+        } else {
+            self.members_open
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod state_tests {
     use super::*;
 
     #[test]

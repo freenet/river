@@ -7,7 +7,6 @@ pub mod chat;
 pub mod node;
 pub mod setup;
 
-use rune::tok::{self, type_};
 use rune::{AppHandle, AppSpec, Cx, El, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Kit};
 
@@ -22,6 +21,32 @@ pub struct RiverApp {
     pub chat: Chat,
     /// `None` in headless snapshots and tests, where nothing runs in the background.
     ctl: Option<Controller>,
+    /// River's logo, rasterized once by [`load_logo`]. `None` until then, and in tests, which
+    /// draw an empty square in its place.
+    logo: Option<Logo>,
+}
+
+/// The logo and the cache that keeps its pixels alive.
+struct Logo {
+    _cache: rune::image::ImageCache,
+    image: rune::image::Image,
+}
+
+/// The web UI's logo, so both apps carry the same mark.
+const LOGO_SVG: &[u8] = include_bytes!("../../../ui/assets/river_logo.svg");
+
+/// `AppSpec::setup`: start rasterizing the logo on the image cache's worker. A headless run
+/// (`--snap`) waits for it, so snapshots show it.
+fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
+    let cache = rune::image::ImageCache::new(waker);
+    let image = cache.svg(LOGO_SVG, 48.0, 2.0);
+    if rune::is_headless() {
+        let _ = image.wait();
+    }
+    s.logo = Some(Logo {
+        _cache: cache,
+        image,
+    });
 }
 
 impl RiverApp {
@@ -31,6 +56,7 @@ impl RiverApp {
             setup: Setup::Checking,
             chat: Chat::example(),
             ctl: None,
+            logo: None,
         }
     }
 
@@ -41,6 +67,7 @@ impl RiverApp {
             setup: Setup::Checking,
             chat: Chat::example(),
             ctl: Some(ctl),
+            logo: None,
         }
     }
 
@@ -111,9 +138,14 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat.select(chat::example::EMPTY_ROOM);
     }),
-    // Render this one at a narrow size (`--size 820x720`): the layout follows the window's
-    // width, and a scene cannot set that.
+    // Scenes named `*narrow*` are rendered at a narrow size (`--size 820x720`, see
+    // `.github/workflows/apps.yml`): the layout follows the window's width, which a scene
+    // cannot set. At the default size they look like the wide layout.
     ("chat-narrow", connect),
+    ("chat-narrow-members", |s| {
+        connect(s);
+        s.chat.members_overlay = true;
+    }),
 ];
 
 fn connect(s: &mut RiverApp) {
@@ -130,6 +162,7 @@ pub fn spec() -> AppSpec<RiverApp> {
     AppSpec {
         scenes: SCENES,
         min_size: Some((640.0, 480.0)),
+        setup: Some(load_logo),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
 }
@@ -142,9 +175,11 @@ pub fn app(make: impl FnOnce(AppHandle<RiverApp>) -> RiverApp + 'static) -> rune
 }
 
 pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
-    let dark = cx.system_dark();
-    let t = tok::theme(dark);
-    let k = Kit::neutral(dark);
+    // River is dark-only for now, like the chat screen; the setup screens match it.
+    let palette = chat::style::palette();
+    let k = Kit::neutral(true);
+    let logo = s.logo.as_ref().map(|l| l.image.pixels());
+    let t = (&palette, logo);
     let body = match &s.setup {
         Setup::Checking => panel(
             t,
@@ -198,14 +233,15 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
             None,
             vec![retry_button(&k), manual_install_button(&k)],
         ),
-        Setup::Connected { version } => return chat::view(&s.chat, version, cx),
+        Setup::Connected { version } => return chat::view(&s.chat, version, logo, cx),
     };
     col()
         .key("root")
         .w_full()
         .h_full()
         .center()
-        .fill(t.bg)
+        .padding(24.0)
+        .fill(palette.rail)
         .child(body)
 }
 
@@ -229,38 +265,56 @@ fn install_progress(step: &InstallStep) -> (&'static str, Option<f32>) {
     }
 }
 
-fn panel(t: tok::Theme, title: &str, body: &str, progress: Option<f32>, actions: Vec<El>) -> El {
+/// The setup card's inner width.
+const PANEL_W: f32 = 380.0;
+
+type Look<'a> = (&'a chat::style::Palette, Option<&'a rune::Pixels>);
+
+fn panel(t: Look, title: &str, body: &str, progress: Option<f32>, actions: Vec<El>) -> El {
+    let (p, logo) = t;
+    let mark = match logo {
+        Some(px) => el().size(36.0, 36.0).pixels(px),
+        None => el().size(36.0, 36.0),
+    };
     let mut card = col()
         .key("panel")
-        .w(400.0)
+        .w(PANEL_W + 64.0)
+        .padding(32.0)
         .gap(12.0)
+        .radius(16.0)
+        .fill(p.bg)
+        .border(1.0, p.line)
+        .shadow(18.0, 48.0, p.shadow)
         .child(
-            text("River")
+            row()
                 .key("wordmark")
-                .font(type_::LABEL)
-                .color(tok::accent(0, true)),
+                .gap(10.0)
+                .mb(10.0)
+                .center_y()
+                .child(mark)
+                .child(text("River").font(chat::style::BRAND).color(p.text)),
         )
         .child(
             text(title.to_owned())
                 .key("title")
-                .font(type_::TITLE)
-                .color(t.text)
+                .font(chat::style::TITLE)
+                .color(p.text)
                 .wrap()
                 .w_full(),
         )
         .child(
             text(body.to_owned())
                 .key("body")
-                .font(type_::BODY)
-                .color(t.text_secondary)
+                .font(chat::style::BODY.lh(21.0))
+                .color(p.text_secondary)
                 .wrap()
                 .w_full(),
         );
     if let Some(fraction) = progress {
-        card = card.child(progress_bar(t, fraction));
+        card = card.child(progress_bar(p, fraction));
     }
     if !actions.is_empty() {
-        let mut buttons = row().key("actions").gap(8.0).mt(8.0);
+        let mut buttons = row().key("actions").gap(8.0).mt(10.0).flex_wrap();
         for action in actions {
             buttons = buttons.child(action);
         }
@@ -269,18 +323,19 @@ fn panel(t: tok::Theme, title: &str, body: &str, progress: Option<f32>, actions:
     card
 }
 
-fn progress_bar(t: tok::Theme, fraction: f32) -> El {
+fn progress_bar(p: &chat::style::Palette, fraction: f32) -> El {
     el().key("track")
         .w_full()
         .h(4.0)
+        .mt(6.0)
         .radius(2.0)
-        .fill(t.control_off)
+        .fill(p.surface_hover)
         .child(
             el().key("bar")
-                .w(400.0 * fraction.clamp(0.0, 1.0))
+                .w(PANEL_W * fraction.clamp(0.0, 1.0))
                 .h(4.0)
                 .radius(2.0)
-                .fill(tok::accent(0, true))
+                .fill(p.accent)
                 .motion(rune::Spring::new(0.3, 0.0)),
         )
 }
@@ -418,6 +473,7 @@ mod tests {
             setup,
             chat: Chat::example(),
             ctl: Some(ctl),
+            logo: None,
         };
         let env = Env {
             system_dark: true,

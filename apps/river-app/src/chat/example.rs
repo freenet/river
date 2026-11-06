@@ -178,7 +178,7 @@ fn design_crew() -> Room {
         at(TODAY - 2, 16, 41),
         "These look great. The owner badge reads much better now.",
     )
-    .react("😊", &[PRIYA]);
+    .react("😊\u{fe0f}", &[PRIYA]);
     b.say(
         KWAME,
         at(TODAY, 8, 55),
