@@ -1,0 +1,12 @@
+[package]
+name = "river-app"
+description = "River's native UI, shared by the desktop and (later) mobile shells"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rune.workspace = true
+rune-kit.workspace = true

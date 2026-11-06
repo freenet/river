@@ -1,0 +1,26 @@
+[package]
+name = "river-desktop"
+description = "River desktop app: finds or installs a local Freenet node, then runs River"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "river"
+path = "src/main.rs"
+
+[dependencies]
+river-app.workspace = true
+rune.workspace = true
+# Blocking HTTP over rustls: the installer runs on a worker thread, never the UI thread.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+serde_json = "1"
+sha2 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+directories = "6"

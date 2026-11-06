@@ -1,0 +1,3 @@
+# These are signed bytes: a line-ending conversion on checkout (Windows) would
+# change them and the signature would no longer verify.
+* -text

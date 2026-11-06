@@ -1,0 +1,120 @@
+name: Native apps
+
+# River's native apps (apps/) are a separate Cargo workspace with their own
+# lockfile and toolchain pin, so build.yml never compiles them. This workflow
+# does: format, clippy, unit tests, and a headless render of every setup screen.
+#
+# GitHub-hosted ubuntu-latest, which is free on this public repo (see the
+# runs-on comment in build.yml for why larger runners are not used).
+
+on:
+  # When the apps start depending on river-core, add 'common/**' to both path
+  # lists, or a change there that breaks the apps won't run this workflow.
+  pull_request:
+    paths:
+      - 'apps/**'
+      - '.github/workflows/apps.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - '.github/workflows/apps.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The macOS and Windows install and start paths are compiled only on those
+  # platforms. Standard GitHub-hosted runners are free on this public repo.
+  other-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: apps
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rune links libxkbcommon and libwayland-client at build time; the
+      # software Vulkan driver lets the headless renderer run with no GPU.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev mesa-vulkan-drivers
+
+      # apps/rust-toolchain.toml pins the compiler; this installs it.
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      # Render every named setup screen and keep the PNGs for review. This
+      # fails when rendering panics or writes nothing; it does not compare
+      # pixels, so a blank screen passes. What each screen shows is checked by
+      # the view tests in river-app.
+      - name: Render setup screens
+        run: |
+          # The software Vulkan driver's file name varies by mesa version
+          # (lvp_icd.json, lvp_icd.x86_64.json). Fail loudly if there is none,
+          # rather than rendering on whatever else the loader finds.
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)
+          test -n "$icd"
+          export VK_ICD_FILENAMES="$icd"
+          echo "Using $icd"
+          cargo build --locked -p river-desktop
+          mkdir -p snapshots
+          scenes=$(./target/debug/river --list-scenes)
+          test -n "$scenes"
+          for scene in $scenes; do
+            ./target/debug/river --snap "snapshots/$scene.png" --scene "$scene" --scale 2
+            test -s "snapshots/$scene.png"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: setup-screens
+          path: apps/snapshots/
+          if-no-files-found: ignore

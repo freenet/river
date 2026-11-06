@@ -211,6 +211,46 @@ and the version-number policy) lives in
 3. `contracts/web-container-contract`: serves the compiled UI as a Freenet contract asset.
 4. `delegates/chat-delegate`: handles chat-specific workflows and background tasks.
 5. `ui/`: Dioxus UI, including `example-data` and `no-sync` modes for offline testing.
+6. `apps/`: native apps built with Rune (see below).
+
+## Native Apps (`apps/`)
+
+`apps/` is a **separate Cargo workspace** with its own `Cargo.lock` and
+`rust-toolchain.toml`. It is separate so its UI dependencies can never change
+the root lockfile, which fixes the contract/delegate WASM bytes and therefore
+their keys. `cargo make` tasks and `build.yml` do not build it;
+`.github/workflows/apps.yml` does.
+
+- `apps/river-app`: the UI and setup state machine, shared by every platform.
+- `apps/desktop`: the desktop shell (binary `river`), including the Freenet
+  installer, which verifies the release's signed checksums.
+
+```bash
+cd apps
+cargo test --locked                  # unit tests
+cargo run -p river-desktop           # the app
+cargo run -p river-desktop -- --list-scenes
+cargo run -p river-desktop -- --snap out.png --scene not-installed   # headless render
+```
+
+Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders
+without a GPU need a software Vulkan driver (`mesa-vulkan-drivers`, then point
+`VK_ICD_FILENAMES` at its `lvp_icd*.json`).
+
+**When releasing the desktop app**, raise `MIN_INSTALL_VERSION` in
+`apps/desktop/src/release.rs` to the current Freenet release. It is the oldest
+Freenet the installer will install, and the only thing stopping someone who
+can edit GitHub releases (but not sign them) from steering new users to an old
+signed release. Leave `MIN_NODE_VERSION`, the oldest running node River
+accepts, alone unless River needs something newer: nodes update over hours to
+days, and raising it early tells people with a working node that theirs is
+too old. The tests derive from both constants, so raising either needs no
+test changes.
+
+The installer ties a release's signed checksums to its tag by finding
+`Freenet-<version>.dmg` in them, on every platform (`check_manifest_version`
+in `release.rs`). If freenet-core ever stops shipping that DMG, River refuses
+every release until that check changes.
 
 ## Share Links in Messages
 
@@ -253,9 +293,13 @@ under `common/src/room_state/`, `common/src/key_derivation.rs`,
 ## Delegate & Contract WASM Migration
 
 Changes to delegate or contract WASM (anything under `delegates/`,
-`contracts/`, or `common/`, plus most Cargo.toml/Cargo.lock changes)
-alter the delegate/contract key. Without a migration entry, **users lose
-all room data**.
+`contracts/`, or `common/`, plus most changes to the root
+Cargo.toml/Cargo.lock) alter the delegate/contract key. Without a migration
+entry, **users lose all room data**.
+
+Changes to `apps/Cargo.toml` and `apps/Cargo.lock` cannot alter the key while
+`apps/` depends on no crate in the root workspace (see the note in
+`apps/Cargo.toml`).
 
 The full workflow — `cargo make add-migration` BEFORE rebuilding, the
 two single-source-of-truth TOMLs, CI validation, and the key files —

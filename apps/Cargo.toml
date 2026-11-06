@@ -1,0 +1,31 @@
+# River's native apps. This is deliberately a SEPARATE Cargo workspace from the
+# repository root, with its own Cargo.lock.
+#
+# The root lockfile pins the bytes of the room-contract and chat-delegate WASM,
+# and the delegate key is a hash of those bytes. If these apps' UI dependencies
+# (rune, wgpu, winit, ...) joined the root workspace, version unification could
+# bump a dependency the WASM shares and silently re-key the delegate, orphaning
+# every user's stored rooms. Keeping the apps here makes that impossible.
+#
+# That holds while nothing here depends on the root workspace's crates. When the
+# apps depend on river-core (common/), editing common/ will still change the
+# WASM exactly as it does today, and any client-only feature added to river-core
+# must stay off for the contract and delegate builds (as `migration` and
+# `mentions` are). At that point `.github/workflows/apps.yml` must also run for
+# `common/**` changes; today its path filter is `apps/**` only.
+[workspace]
+resolver = "3"
+members = ["river-app", "desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-only"
+authors = ["Freenet Project"]
+
+[workspace.dependencies]
+# Rune is pre-release and git-only. Pin a rev of its `dev` branch (which is
+# never rewritten) and bump it deliberately, re-rendering the snapshots.
+rune = { git = "https://github.com/anomalyco/rune", rev = "7ead7d63fcf6f9dd9669385a8b90e2ae80015d7b" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "7ead7d63fcf6f9dd9669385a8b90e2ae80015d7b" }
+river-app = { path = "river-app" }

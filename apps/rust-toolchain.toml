@@ -1,0 +1,7 @@
+[toolchain]
+# The repository root pins an older rustc so the contract and delegate WASM stay
+# byte-identical (their keys are hashes of those bytes). These apps build no WASM
+# and Rune needs a newer compiler, so this workspace has its own pin. Changing it
+# cannot re-key anything: the WASM is always built from the root, with the root pin.
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

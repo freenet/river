@@ -1,5 +1,5 @@
 ---
-description: When modifying code in common/, delegates/, contracts/, or updating Cargo.toml/Cargo.lock — any change that could alter delegate or contract WASM
+description: When modifying code in common/, delegates/, contracts/, or updating the root Cargo.toml/Cargo.lock (not apps/, a separate workspace) — any change that could alter delegate or contract WASM
 globs:
   - common/**
   - delegates/**
