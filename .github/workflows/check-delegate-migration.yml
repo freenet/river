@@ -23,7 +23,7 @@ jobs:
     # the right home only for jobs that genuinely need the cores.
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
         fetch-depth: 0
