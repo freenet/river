@@ -6,6 +6,12 @@
 # (rune, wgpu, winit, ...) joined the root workspace, version unification could
 # bump a dependency the WASM shares and silently re-key the delegate, orphaning
 # every user's stored rooms. Keeping the apps here makes that impossible.
+#
+# That holds while nothing here depends on the root workspace's crates. When the
+# apps depend on river-core (common/), editing common/ will still change the
+# WASM exactly as it does today, and any client-only feature added to river-core
+# must stay off for the contract and delegate builds (as `migration` and
+# `mentions` are).
 [workspace]
 resolver = "3"
 members = ["river-app", "desktop"]

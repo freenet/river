@@ -78,6 +78,26 @@ updates:
           - "minor"
           - "patch"
 
+  # The native apps are their own workspace and lockfile (apps/Cargo.toml), so
+  # nothing here can move a contract address. The installer's HTTP, hashing and
+  # signature crates are the reason to keep these current.
+  - package-ecosystem: "cargo"
+    directory: "/apps"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 20
+    labels:
+      - "dependencies"
+    groups:
+      apps-cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

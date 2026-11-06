@@ -14,21 +14,10 @@ use std::sync::Arc;
 
 use river_app::{Controller, RiverApp};
 
-/// Rune's headless tooling flags. A headless run gets a window with nothing behind it, so a
-/// snapshot never probes for a node or installs anything.
-const HEADLESS_FLAGS: &[&str] = &[
-    "--snap",
-    "--tree",
-    "--script",
-    "--list-scenes",
-    "--trace",
-    "--video",
-    "--frames",
-    "--strip",
-];
-
 fn main() {
-    if std::env::args().any(|a| HEADLESS_FLAGS.contains(&a.as_str())) {
+    // A headless run (`--snap`, `--tree`, `--script`, ...) gets a window with nothing behind
+    // it, so rendering a screen never probes for a node or installs anything.
+    if rune::is_headless() {
         rune::run(river_app::spec());
         return;
     }

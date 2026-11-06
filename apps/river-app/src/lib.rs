@@ -54,13 +54,16 @@ impl RiverApp {
     }
 }
 
-/// Named states for `--snap` and `--list-scenes`.
-/// A named state for snapshots: a name and how it changes the initial state.
+/// A named state for `--snap` and `--list-scenes`: a name and how it changes the initial state.
 pub type Scene = (&'static str, fn(&mut RiverApp));
 
+/// One scene per screen. CI renders every one of them.
 pub const SCENES: &[Scene] = &[
     ("checking", |s| s.setup = Setup::Checking),
     ("not-installed", |s| s.setup = Setup::NotInstalled),
+    ("finding-release", |s| {
+        s.setup = Setup::Installing(InstallStep::FindingRelease)
+    }),
     ("downloading", |s| {
         s.setup = Setup::Installing(InstallStep::Downloading {
             received: 9_400_000,
@@ -69,6 +72,12 @@ pub const SCENES: &[Scene] = &[
     }),
     ("verifying", |s| {
         s.setup = Setup::Installing(InstallStep::Verifying)
+    }),
+    ("installing", |s| {
+        s.setup = Setup::Installing(InstallStep::Installing)
+    }),
+    ("waiting-for-installer", |s| {
+        s.setup = Setup::Installing(InstallStep::WaitingForInstaller)
     }),
     ("starting", |s| s.setup = Setup::Starting),
     ("failed", |s| {
@@ -136,7 +145,7 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
         Setup::Starting => panel(
             t,
             "Starting Freenet…",
-            "Connecting to the network. This can take a moment the first time.",
+            "This can take a moment the first time.",
             None,
             vec![],
         ),
@@ -167,13 +176,12 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
 fn install_progress(step: &InstallStep) -> (&'static str, Option<f32>) {
     match step {
         InstallStep::FindingRelease => ("Finding the latest Freenet release…", None),
+        // No bar when the size is unknown: an empty bar that never moves looks stuck.
         InstallStep::Downloading { received, total } => (
             "Downloading Freenet…",
-            Some(
-                total
-                    .filter(|t| *t > 0)
-                    .map_or(0.0, |t| *received as f32 / t as f32),
-            ),
+            total
+                .filter(|t| *t > 0)
+                .map(|t| (*received as f32 / t as f32).clamp(0.0, 1.0)),
         ),
         InstallStep::Verifying => ("Checking the download's signature…", None),
         InstallStep::Installing => ("Installing Freenet…", None),
@@ -305,36 +313,132 @@ mod tests {
         }
     }
 
+    fn downloading(received: u64, total: Option<u64>) -> InstallStep {
+        InstallStep::Downloading { received, total }
+    }
+
     #[test]
-    fn a_download_shows_how_far_it_has_got() {
-        let rt = render(Setup::Installing(InstallStep::Downloading {
-            received: 50,
-            total: Some(100),
-        }));
-        assert!(rt.find("bar").is_some());
-        assert_eq!(
-            install_progress(&InstallStep::Downloading {
-                received: 50,
-                total: Some(100)
-            })
-            .1,
-            Some(0.5)
+    fn only_a_download_of_known_size_shows_a_bar() {
+        assert!(
+            render(Setup::Installing(downloading(50, Some(100))))
+                .find("bar")
+                .is_some()
         );
-        assert_eq!(
-            install_progress(&InstallStep::Downloading {
-                received: 50,
-                total: None
+        for step in [
+            downloading(50, None),
+            downloading(50, Some(0)),
+            InstallStep::FindingRelease,
+            InstallStep::Verifying,
+            InstallStep::Installing,
+            InstallStep::WaitingForInstaller,
+        ] {
+            assert!(
+                render(Setup::Installing(step.clone()))
+                    .find("bar")
+                    .is_none(),
+                "{step:?}"
+            );
+        }
+        assert_eq!(install_progress(&downloading(50, Some(100))).1, Some(0.5));
+        // A server that sends more than it announced doesn't overflow the bar.
+        assert_eq!(install_progress(&downloading(150, Some(100))).1, Some(1.0));
+    }
+
+    /// A host that only counts probes, for pressing buttons in a live window.
+    struct CountingHost {
+        installable: bool,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NodeHost for CountingHost {
+        fn probe(&self) -> NodeProbe {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            NodeProbe::NotInstalled
+        }
+        fn can_install(&self) -> bool {
+            self.installable
+        }
+        fn install(&self, _: &mut dyn FnMut(InstallStep)) -> Result<(), String> {
+            Ok(())
+        }
+        fn start(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn render_with_host(
+        setup: Setup,
+        installable: bool,
+    ) -> (Runtime<RiverApp>, std::sync::Arc<CountingHost>) {
+        let host = std::sync::Arc::new(CountingHost {
+            installable,
+            probes: Default::default(),
+        });
+        let ctl = Controller::reporting_to(host.clone(), |_| {});
+        let state = RiverApp {
+            setup,
+            ctl: Some(ctl),
+        };
+        let env = Env {
+            system_dark: true,
+            scale: 1.0,
+        };
+        let mut rt = Runtime::new(state, view, (560.0, 440.0), env);
+        rt.frame(0.0);
+        (rt, host)
+    }
+
+    #[test]
+    fn a_platform_that_cannot_install_offers_no_install_button() {
+        let (rt, _) = render_with_host(Setup::NotInstalled, false);
+        assert!(rt.find("install").is_none());
+        assert!(rt.find("manual").is_some());
+        assert!(rt.find("retry").is_some());
+    }
+
+    #[test]
+    fn pressing_retry_checks_for_the_node_again() {
+        let (mut rt, host) = render_with_host(Setup::Failed("x".into()), true);
+        let (x, y) = rt.find("retry").expect("retry button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while host.probes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "retry never probed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Fails to compile when a new screen is added, and fails when it has no scene.
+    #[test]
+    fn every_screen_has_a_scene() {
+        fn screen(s: &Setup) -> &'static str {
+            match s {
+                Setup::Checking => "checking",
+                Setup::NotInstalled => "not-installed",
+                Setup::Installing(InstallStep::FindingRelease) => "finding-release",
+                Setup::Installing(InstallStep::Downloading { .. }) => "downloading",
+                Setup::Installing(InstallStep::Verifying) => "verifying",
+                Setup::Installing(InstallStep::Installing) => "installing",
+                Setup::Installing(InstallStep::WaitingForInstaller) => "waiting-for-installer",
+                Setup::Starting => "starting",
+                Setup::Failed(_) => "failed",
+                Setup::Connected { .. } => "connected",
+            }
+        }
+        let mut covered: Vec<&str> = SCENES
+            .iter()
+            .map(|(name, apply)| {
+                let mut s = RiverApp::detached();
+                apply(&mut s);
+                assert_eq!(screen(&s.setup), *name, "scene {name} shows another screen");
+                *name
             })
-            .1,
-            Some(0.0)
-        );
-        assert_eq!(
-            install_progress(&InstallStep::Downloading {
-                received: 50,
-                total: Some(0)
-            })
-            .1,
-            Some(0.0)
-        );
+            .collect();
+        covered.sort();
+        covered.dedup();
+        assert_eq!(covered.len(), 10, "{covered:?}");
     }
 }

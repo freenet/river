@@ -211,6 +211,31 @@ and the version-number policy) lives in
 3. `contracts/web-container-contract`: serves the compiled UI as a Freenet contract asset.
 4. `delegates/chat-delegate`: handles chat-specific workflows and background tasks.
 5. `ui/`: Dioxus UI, including `example-data` and `no-sync` modes for offline testing.
+6. `apps/`: native apps built with Rune (see below).
+
+## Native Apps (`apps/`)
+
+`apps/` is a **separate Cargo workspace** with its own `Cargo.lock` and
+`rust-toolchain.toml`. It is separate so its UI dependencies can never change
+the root lockfile, which fixes the contract/delegate WASM bytes and therefore
+their keys. `cargo make` tasks and `build.yml` do not build it;
+`.github/workflows/apps.yml` does.
+
+- `apps/river-app`: the UI and setup state machine, shared by every platform.
+- `apps/desktop`: the desktop shell (binary `river`), including the Freenet
+  installer, which verifies the release's signed checksums.
+
+```bash
+cd apps
+cargo test --locked                  # unit tests
+cargo run -p river-desktop           # the app
+cargo run -p river-desktop -- --list-scenes
+cargo run -p river-desktop -- --snap out.png --scene not-installed   # headless render
+```
+
+Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders
+without a GPU need a software Vulkan driver (`mesa-vulkan-drivers`, then point
+`VK_ICD_FILENAMES` at its `lvp_icd*.json`).
 
 ## Share Links in Messages
 
@@ -253,8 +278,9 @@ under `common/src/room_state/`, `common/src/key_derivation.rs`,
 ## Delegate & Contract WASM Migration
 
 Changes to delegate or contract WASM (anything under `delegates/`,
-`contracts/`, or `common/`, plus most Cargo.toml/Cargo.lock changes)
-alter the delegate/contract key. Without a migration entry, **users lose
+`contracts/`, or `common/`, plus most changes to the root
+Cargo.toml/Cargo.lock) alter the delegate/contract key. `apps/` has its own
+Cargo.toml and Cargo.lock, which cannot. Without a migration entry, **users lose
 all room data**.
 
 The full workflow — `cargo make add-migration` BEFORE rebuilding, the

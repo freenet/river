@@ -62,9 +62,14 @@ jobs:
       # Render every named setup screen. A screen that fails to lay out or
       # draw fails here, and the PNGs are kept for review.
       - name: Render setup screens
-        env:
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
         run: |
+          # The software Vulkan driver's file name varies by mesa version
+          # (lvp_icd.json, lvp_icd.x86_64.json). Fail loudly if there is none,
+          # rather than rendering on whatever else the loader finds.
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)
+          test -n "$icd"
+          export VK_ICD_FILENAMES="$icd"
+          echo "Using $icd"
           cargo build --locked -p river-desktop
           mkdir -p snapshots
           scenes=$(./target/debug/river --list-scenes)
