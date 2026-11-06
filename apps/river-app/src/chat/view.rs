@@ -44,6 +44,15 @@ pub fn view(chat: &Chat, version: &str, logo: Option<&Pixels>, cx: &mut Cx<River
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     if chat.members_shown(narrow) {
         let panel = members(room, narrow, &p);
+        if narrow {
+            // Dim the conversation under the panel; pressing it closes the panel.
+            screen = screen.child(
+                el().key("members-scrim")
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .fill(p.shadow)
+                    .on_press(|s: &mut RiverApp| s.chat.toggle_members(true)),
+            );
+        }
         screen = screen.child(if narrow {
             // Over the conversation, against the window's right edge.
             panel
@@ -159,7 +168,7 @@ fn rooms(chat: &Chat, version: &str, logo: Option<&Pixels>, narrow: bool, p: &Pa
                 )
                 .child(
                     label(
-                        format!("Node {version} · showing example rooms"),
+                        format!("Node {version} · example rooms"),
                         st::SMALL,
                         p.text_muted,
                     )

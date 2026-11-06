@@ -141,6 +141,10 @@ fn a_narrow_window_opens_members_over_the_conversation() {
     press(&mut rt, "close-members");
     assert!(!rt.state.chat.members_overlay);
     assert!(rt.find("members").is_none());
+    // Pressing the dimmed conversation closes it too.
+    press(&mut rt, "toggle-members");
+    press(&mut rt, "members-scrim");
+    assert!(!rt.state.chat.members_overlay);
 }
 
 #[test]
