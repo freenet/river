@@ -129,6 +129,12 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
                     .build(&k)
                     .key("install"),
                 manual_install_button(&k),
+                // For someone who installed Freenet another way and came back.
+                Button::new("Check again")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.retry())
+                    .build(&k)
+                    .key("retry"),
             ],
         ),
         Setup::NotInstalled => panel(
@@ -292,7 +298,7 @@ mod tests {
     fn each_stage_offers_the_right_actions() {
         let cases = [
             (Setup::Checking, &[][..]),
-            (Setup::NotInstalled, &["install", "manual"][..]),
+            (Setup::NotInstalled, &["install", "manual", "retry"][..]),
             (Setup::Installing(InstallStep::Verifying), &[][..]),
             (Setup::Starting, &[][..]),
             (Setup::Failed("x".into()), &["retry", "manual"][..]),

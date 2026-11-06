@@ -76,11 +76,15 @@ fn classify(answer: Answer, installed: bool) -> NodeProbe {
     let minimum = release::MIN_VERSION.to_string();
     match answer {
         Answer::Version(version) => {
+            let pre_release = version.split('+').next().unwrap_or_default().contains('-');
             match release::parse_version(version.split(['-', '+']).next().unwrap_or_default()) {
-                Ok(v) if v < release::MIN_VERSION => NodeProbe::Outdated {
-                    running: Some(version),
-                    minimum,
-                },
+                // A pre-release comes before its release, so `0.2.155-rc.1` is below 0.2.155.
+                Ok(v) if v < release::MIN_VERSION || (v == release::MIN_VERSION && pre_release) => {
+                    NodeProbe::Outdated {
+                        running: Some(version),
+                        minimum,
+                    }
+                }
                 _ => NodeProbe::Running { version },
             }
         }
@@ -127,6 +131,7 @@ impl NodeHost for DesktopHost {
                 &SystemRunner,
                 install::installed_by_river(&bin),
                 system_service_installed(),
+                &mut install::forget_install,
             ),
         }
     }
@@ -153,11 +158,16 @@ impl Runner for SystemRunner {
 ///
 /// River never runs the node outside a service manager: a bare `freenet network` stops for
 /// good the first time it finds an update, because nothing is there to apply it and restart.
+///
+/// `registered` runs once River has registered the service, so River's record of its install
+/// can be dropped: from then on the binary is started like any other, and if the user later
+/// removes the service, River doesn't put it back.
 fn start_binary(
     bin: &Path,
     runner: &dyn Runner,
     installed_by_river: bool,
     system_service: bool,
+    registered: &mut dyn FnMut(),
 ) -> Result<(), String> {
     let first = match runner.run(bin, &["service", "start"]) {
         Ok(()) => return Ok(()),
@@ -188,6 +198,7 @@ fn start_binary(
         };
         format!("couldn't set Freenet up as a background service ({e}).{hint}")
     })?;
+    registered();
     runner
         .run(bin, &["service", "start"])
         .map_err(|e| format!("Freenet's service was set up but didn't start: {e}"))
@@ -346,27 +357,51 @@ mod tests {
 
     const BIN: &str = "/home/u/.local/bin/freenet";
 
+    /// Run `start_binary`, returning its result and how many times it reported registering.
+    fn start(r: &FakeRunner, ours: bool, system: bool) -> (Result<(), String>, usize) {
+        let mut registered = 0;
+        let result = start_binary(Path::new(BIN), r, ours, system, &mut || registered += 1);
+        (result, registered)
+    }
+
     #[test]
     fn a_registered_service_is_just_started() {
         let r = FakeRunner::failing(&[]);
-        start_binary(Path::new(BIN), &r, true, false).unwrap();
+        let (result, registered) = start(&r, true, false);
+        result.unwrap();
         assert_eq!(r.calls(), vec!["service start"]);
+        assert_eq!(
+            registered, 0,
+            "River's record is only dropped when it registers"
+        );
     }
 
     #[test]
     fn river_registers_the_service_for_its_own_copy() {
         let r = FakeRunner::failing(&["service start"]);
-        start_binary(Path::new(BIN), &r, true, false).unwrap();
+        let (result, registered) = start(&r, true, false);
+        result.unwrap();
         assert_eq!(
             r.calls(),
             vec!["service start", "service install", "service start"]
         );
+        assert_eq!(registered, 1);
+
+        // Registered, then the start fails: the service exists, so the record still goes.
+        let r = FakeRunner::failing(&["service start", "service start"]);
+        let (result, registered) = start(&r, true, false);
+        assert!(result.is_err());
+        assert_eq!(registered, 1);
+
+        // Registration fails: the record stays, so a retry can register.
+        let r = FakeRunner::failing(&["service start", "service install"]);
+        assert_eq!(start(&r, true, false).1, 0);
     }
 
     #[test]
     fn registration_failures_explain_themselves_and_run_nothing_else() {
         let r = FakeRunner::failing(&["service start", "service install"]);
-        let err = start_binary(Path::new(BIN), &r, true, false).unwrap_err();
+        let err = start(&r, true, false).0.unwrap_err();
         assert_eq!(r.calls(), vec!["service start", "service install"]);
         assert!(err.contains("service install failed"), "{err}");
         assert!(
@@ -381,7 +416,7 @@ mod tests {
         }
 
         let r = FakeRunner::failing(&["service start", "service start"]);
-        let err = start_binary(Path::new(BIN), &r, true, false).unwrap_err();
+        let err = start(&r, true, false).0.unwrap_err();
         assert_eq!(
             r.calls(),
             vec!["service start", "service install", "service start"]
@@ -392,7 +427,7 @@ mod tests {
     #[test]
     fn someone_elses_copy_is_never_registered() {
         let r = FakeRunner::failing(&["service start"]);
-        let err = start_binary(Path::new(BIN), &r, false, false).unwrap_err();
+        let err = start(&r, false, false).0.unwrap_err();
         assert_eq!(r.calls(), vec!["service start"]);
         assert!(
             err.contains(BIN) && err.contains("service start failed"),
@@ -403,7 +438,7 @@ mod tests {
     #[test]
     fn a_stopped_system_service_is_left_to_the_administrator() {
         let r = FakeRunner::failing(&["service start"]);
-        let err = start_binary(Path::new(BIN), &r, true, true).unwrap_err();
+        let err = start(&r, true, true).0.unwrap_err();
         assert!(err.contains("sudo systemctl start freenet"), "{err}");
         assert_eq!(r.calls(), vec!["service start"]);
     }
@@ -430,6 +465,15 @@ mod tests {
         ));
         assert!(matches!(
             classify(version("0.2.160+build.7"), true),
+            NodeProbe::Running { .. }
+        ));
+        // A pre-release of the floor itself comes before it; build metadata doesn't.
+        assert!(matches!(
+            classify(version("0.2.155-rc.1"), true),
+            NodeProbe::Outdated { .. }
+        ));
+        assert!(matches!(
+            classify(version("0.2.155+build.7"), true),
             NodeProbe::Running { .. }
         ));
         assert_eq!(
@@ -465,8 +509,16 @@ mod tests {
         let url = format!("http://{}/v1/version", listener.local_addr().unwrap());
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request);
+            // Read the whole request before answering: closing with unread data can reset the
+            // connection and lose the response.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
             let _ = stream.write_all(response.as_bytes());
         });
         url
@@ -489,14 +541,13 @@ mod tests {
             "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/x\r\ncontent-length: 0\r\n\r\n";
         assert_eq!(ask(&agent, &serve_once(moved)), Answer::NoVersion);
 
-        // Nothing listening.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let closed = format!("http://127.0.0.1:{port}/v1/version");
-        assert_eq!(ask(&agent, &closed), Answer::Nothing);
+        // Something accepts the connection but never answers: a transport failure (here, the
+        // timeout), like a refused connection. The listener is held for the whole call, so no
+        // other program can take the port meanwhile.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/version", silent.local_addr().unwrap());
+        assert_eq!(ask(&agent, &url), Answer::Nothing);
+        drop(silent);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use river_app::InstallStep;
+use sha2::{Digest, Sha256};
 
 use crate::host::run;
 
@@ -18,29 +19,53 @@ const INSTALLER_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// The `freenet` binary is about 66 MB; anything far larger in a release archive is refused.
 const MAX_BINARY: u64 = 512 * 1024 * 1024;
 
-/// Where River records the `freenet` binary it installed. River registers a service only for
-/// that copy: a binary at the same path put there by freenet-core's own installer belongs to
-/// whoever installed it.
+/// Where River records the `freenet` binary it installed and hasn't yet registered a service
+/// for. River registers a service only for that copy: a binary at the same path put there by
+/// freenet-core's own installer, or by hand, belongs to whoever put it there.
 fn marker_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "Freenet", "River")
         .map(|dirs| dirs.data_local_dir().join("installed-freenet"))
 }
 
-fn record_installed_at(marker: &Path, binary: &Path) -> Result<(), String> {
+/// Record the SHA-256 of the bytes River installed and where it installed them, so the record
+/// matches only that exact file. Freenet's auto-update later replaces the binary, which is
+/// fine: the record is only needed until the service is registered, and is then removed.
+fn record_installed_at(marker: &Path, binary: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = marker.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
     }
-    fs::write(marker, binary.as_os_str().as_encoded_bytes())
-        .map_err(|e| format!("couldn't write {}: {e}", marker.display()))
+    let mut record = hex::encode(Sha256::digest(bytes)).into_bytes();
+    record.push(b'\n');
+    record.extend_from_slice(binary.as_os_str().as_encoded_bytes());
+    fs::write(marker, record).map_err(|e| format!("couldn't write {}: {e}", marker.display()))
 }
 
 fn was_installed_at(marker: &Path, binary: &Path) -> bool {
-    fs::read(marker).is_ok_and(|recorded| recorded == binary.as_os_str().as_encoded_bytes())
+    let Ok(record) = fs::read(marker) else {
+        return false;
+    };
+    let Some((hash, path)) = record.split_first_chunk::<64>() else {
+        return false;
+    };
+    let Some(path) = path.strip_prefix(b"\n") else {
+        return false;
+    };
+    path == binary.as_os_str().as_encoded_bytes()
+        && fs::read(binary)
+            .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)).as_bytes() == hash.as_slice())
 }
 
-/// Whether River installed the `freenet` binary at `binary`.
+/// Whether the `freenet` binary at `binary` is the one River installed, unchanged.
 pub fn installed_by_river(binary: &Path) -> bool {
     marker_path().is_some_and(|marker| was_installed_at(&marker, binary))
+}
+
+/// Forget River's install once its service is registered. From then on the binary is managed
+/// like any other: River starts it, and never registers a service for it again.
+pub fn forget_install() {
+    if let Some(marker) = marker_path() {
+        let _ = fs::remove_file(marker);
+    }
 }
 
 /// Where a bare `freenet` binary lives, matching freenet-core's install scripts
@@ -83,24 +108,34 @@ pub fn install(
     }
 }
 
+/// What installing the binary did.
+#[derive(Debug, PartialEq, Eq)]
+enum Placed {
+    Installed,
+    /// Something appeared at the destination while River was downloading (the user ran
+    /// another installer, say). It is left alone.
+    AlreadyThere,
+}
+
 /// Install the binary, then record that River installed it. The record comes second so it
-/// never names a binary River didn't install (a later manual install at the same path would
-/// otherwise count as River's). If recording fails, the binary is removed again: River only
-/// installs where nothing was installed, and a binary it can't show it installed would never
-/// get a service. Either way a retry starts clean.
+/// never names a binary River didn't install. If recording fails, River's binary is removed
+/// again, since a binary River can't show it installed would never get a service; a retry then
+/// starts clean. A binary that appeared meanwhile is neither replaced nor recorded.
 fn install_and_record(binary: &[u8], dest: &Path, marker: &Path) -> Result<(), String> {
-    install_binary(binary, dest)?;
-    record_installed_at(marker, dest).inspect_err(|_| {
+    if install_binary(binary, dest)? == Placed::AlreadyThere {
+        return Ok(());
+    }
+    record_installed_at(marker, dest, binary).inspect_err(|_| {
         let _ = fs::remove_file(dest);
     })
 }
 
-/// Linux: put `freenet` at `dest`. Registering it as a service is left to starting it
-/// (`host::start_binary`).
-fn install_binary(binary: &[u8], dest: &Path) -> Result<(), String> {
+/// Linux: put `freenet` at `dest`, unless something is already there. Registering it as a
+/// service is left to starting it (`host::start_binary`).
+fn install_binary(binary: &[u8], dest: &Path) -> Result<Placed, String> {
     let dir = dest.parent().ok_or("bad install path")?;
     fs::create_dir_all(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
-    // Write to a fresh, uniquely named file beside the destination, then rename it into place,
+    // Write to a fresh, uniquely named file beside the destination, then move it into place,
     // so a half-written binary is never runnable and no existing file is written through.
     let mut tmp = tempfile::Builder::new()
         .prefix(".freenet.river-install-")
@@ -114,11 +149,14 @@ fn install_binary(binary: &[u8], dest: &Path) -> Result<(), String> {
             .set_permissions(fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
     }
-    // On disk before the rename, so a crash can't leave an empty file at `dest`.
+    // On disk before the move, so a crash can't leave an empty file at `dest`.
     tmp.as_file().sync_all().map_err(|e| e.to_string())?;
-    tmp.persist(dest)
-        .map_err(|e| format!("couldn't install {}: {}", dest.display(), e.error))?;
-    Ok(())
+    // Never replace what's there: the probe that offered to install was minutes ago.
+    match tmp.persist_noclobber(dest) {
+        Ok(_) => Ok(Placed::Installed),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Placed::AlreadyThere),
+        Err(e) => Err(format!("couldn't install {}: {}", dest.display(), e.error)),
+    }
 }
 
 /// The `freenet` executable from a release tarball. Only that one regular file is read, so
@@ -334,9 +372,10 @@ fn spawn_installer(installer: &Path) -> std::io::Result<std::process::Child> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // `freenet.exe` is a console program: without this, Windows opens a console window
-        // behind the wizard. The wizard's own window is unaffected.
-        crate::host::no_console_window(&mut cmd);
+        // Deliberately NOT `host::no_console_window`. `freenet.exe` is a console program, so a
+        // console window opens behind the wizard. That console matters: the wizard's "run
+        // without installing" choice runs the node in this same process, and the console is
+        // then the user's only window onto it and only way to stop it.
         let spawned = cmd.spawn();
         match spawned {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
@@ -389,12 +428,12 @@ mod tests {
     }
 
     #[test]
-    fn installs_the_binary_executable_and_replaces_an_old_one() {
+    fn installs_the_binary_executable_and_never_replaces_one() {
         let home = tempfile::tempdir().unwrap();
         let dest = home.path().join(".local/bin/freenet");
-        install_binary(b"first", &dest).unwrap();
-        install_binary(b"second", &dest).unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"second");
+        assert_eq!(install_binary(b"first", &dest), Ok(Placed::Installed));
+        assert_eq!(install_binary(b"second", &dest), Ok(Placed::AlreadyThere));
+        assert_eq!(fs::read(&dest).unwrap(), b"first");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -462,14 +501,27 @@ mod tests {
     fn only_the_recorded_copy_counts_as_installed_by_river() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("state/installed-freenet");
-        let ours = dir.path().join("bin/freenet");
+        let ours = dir.path().join("freenet");
+        let other = dir.path().join("other-freenet");
+        fs::write(&ours, b"river's bytes").unwrap();
+        fs::write(&other, b"river's bytes").unwrap();
         assert!(!was_installed_at(&marker, &ours), "nothing recorded yet");
-        record_installed_at(&marker, &ours).unwrap();
+        record_installed_at(&marker, &ours, b"river's bytes").unwrap();
         assert!(was_installed_at(&marker, &ours));
-        assert!(!was_installed_at(
-            &marker,
-            &dir.path().join("other/freenet")
-        ));
+        assert!(
+            !was_installed_at(&marker, &other),
+            "same bytes, another path"
+        );
+        // Replaced by hand (or by anything else) at the same path: no longer River's.
+        fs::write(&ours, b"someone else's bytes").unwrap();
+        assert!(!was_installed_at(&marker, &ours));
+        fs::remove_file(&ours).unwrap();
+        assert!(!was_installed_at(&marker, &ours), "deleted");
+        fs::write(&marker, b"garbage").unwrap();
+        assert!(
+            !was_installed_at(&marker, &other),
+            "a corrupt record matches nothing"
+        );
     }
 
     #[test]
@@ -495,6 +547,15 @@ mod tests {
         let marker = dir.path().join("state/installed-freenet");
         install_and_record(b"binary", &dest, &marker).unwrap();
         assert!(dest.exists() && was_installed_at(&marker, &dest));
+
+        // Something appeared at the destination meanwhile: left alone, and not recorded.
+        let theirs = dir.path().join("theirs/freenet");
+        fs::create_dir_all(theirs.parent().unwrap()).unwrap();
+        fs::write(&theirs, b"their binary").unwrap();
+        let their_marker = dir.path().join("state/their-marker");
+        install_and_record(b"binary", &theirs, &their_marker).unwrap();
+        assert_eq!(fs::read(&theirs).unwrap(), b"their binary");
+        assert!(!their_marker.exists());
 
         // The binary can't be installed: nothing is recorded.
         let blocked = dir.path().join("not-a-dir");
@@ -546,11 +607,15 @@ mod tests {
     }
 
     /// Script body that waits until the test creates `release`, so whether the installer is
-    /// still running is decided by the test, never by the clock.
+    /// still running is decided by the test, never by the clock. It also gives up if the
+    /// test's directory is gone (a failed test unwound) or after about a minute, so a failing
+    /// test can't leave it spinning.
     #[cfg(unix)]
     fn hold_until(release: &Path) -> String {
+        let dir = release.parent().unwrap().display();
         format!(
-            "while [ ! -e '{}' ]; do sleep 0.02; done\nexit 0",
+            "n=0\nwhile [ ! -e '{}' ] && [ -d '{dir}' ] && [ $n -lt 3000 ]; do \
+             sleep 0.02; n=$((n+1)); done\nexit 0",
             release.display()
         )
     }
