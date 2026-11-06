@@ -1240,6 +1240,26 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
+  test("a send while its signature is slow shows its pending row at the end at once", { tag: "@chromium-only" }, async ({
+    page,
+  }) => {
+    await openRoomAtBottom(page, "Your Private Room");
+    await fillHistory(page);
+    await readerScrollsWithoutGesture(page, 0);
+    await expectParkedAwayFromEnd(page, "premise: reading older messages");
+
+    // The delegate has not answered: nothing reaches the room, so the only
+    // thing that can take the view to the end is the pending row itself.
+    await callRiverTest(page, "holdMessageSigning");
+    await sendWithEnter(page, "own send while signing is slow");
+    const row = page.getByTestId("pending-message").filter({ hasText: "own send while signing is slow" });
+    await expect(row, "the pending row is shown at the end before the signature").toBeInViewport();
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect(
+      page.getByTestId("conversation-history").getByText("own send while signing is slow", { exact: false }),
+    ).toHaveCount(1);
+  });
+
   test("a send the room does not admit stays on screen, failed, for a retry", { tag: "@chromium-only" }, async ({
     page,
   }) => {

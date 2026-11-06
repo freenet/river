@@ -59,7 +59,7 @@ use self::markdown::{
 };
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{PendingEffect, PendingKind, OUTBOX};
-use self::pending_effects::apply_pending_effects;
+use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
 use self::pending_sends::PendingSends;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
@@ -1359,6 +1359,14 @@ pub fn Conversation() -> Element {
             None
         }
     };
+    // Render again when this room's pending sends change, not only the
+    // `PendingSends` child: an own send requests the end when its pending row
+    // is added, and this render is what takes the latest range for a reader
+    // in a held range before the scroll effect lands the request.
+    if OUTBOX.try_read().is_err() {
+        crate::util::signal_guard::anchor();
+        crate::util::signal_guard::schedule_nudge();
+    }
     // Drives the scroll-to-latest button: "is the newest message's bottom on
     // screen right now?".
     let mut newest_in_view = use_signal(|| true);
@@ -1866,10 +1874,18 @@ pub fn Conversation() -> Element {
     {
         let reader_position = reader_position.clone();
         use_effect(move || {
+            // Before the fallible read below (freenet/river#555).
+            crate::util::signal_guard::anchor();
             // Subscribe: a backfill and a newer page change `window_items`,
             // and heads swap on content changes too.
             let _ = message_groups.read().is_some();
             let _ = window_items();
+            // And the outbox: an own send requests the end when its pending
+            // row is added, which changes neither of the above, so without
+            // this the request would wait for the commit (`pending_sends.rs`).
+            if OUTBOX.try_read().is_err() {
+                crate::util::signal_guard::schedule_nudge();
+            }
             note_patch_while_hidden(&reader_position);
             correct_view_after_patch(&reader_position);
             complete_scroll_request(&reader_position, opening_snap_done);
@@ -1938,6 +1954,18 @@ pub fn Conversation() -> Element {
                         })
                     });
                 drop(current_room_data);
+                // Count this user's reactions still being signed: the chip on
+                // screen already shows them (`pending_effects.rs`), so a second
+                // click must undo the pending one, not add it again.
+                let pending = match OUTBOX.try_read() {
+                    Ok(outbox) => outbox.pending_effects(&current_room),
+                    Err(_) => {
+                        warn!("Outbox busy while toggling a reaction; using committed reactions");
+                        Vec::new()
+                    }
+                };
+                let existing_reaction =
+                    own_reaction_after_pending(existing_reaction, &pending, &target_message_id);
 
                 use river_core::room_state::content::ActionContentV1;
                 // Build list of actions:
@@ -5452,12 +5480,25 @@ mod tests {
                 "`{handler}` signs before the outbox insert"
             );
             // The insert is a global signal write: it must run in `defer`'s
-            // clean execution context, not on the event handler's stack.
+            // clean execution context, not on the event handler's stack. So
+            // the last `defer` before it must still be open at the insert.
+            let opened = region
+                .rfind("crate::util::defer(move||{")
+                .unwrap_or_else(|| {
+                    panic!("`{handler}`'s outbox insert must be inside `crate::util::defer`")
+                });
             assert!(
-                region.contains("crate::util::defer(move||{"),
-                "`{handler}`'s outbox insert must be inside `crate::util::defer`"
+                !region[opened..].contains("});"),
+                "`{handler}`'s outbox insert is after its `defer` closed, so it \
+                 runs on the event handler's stack"
             );
         }
+        // Every path into the outbox is one of the four above.
+        assert_eq!(
+            squashed.matches("outbox_commit::submit_now(").count(),
+            4,
+            "a new path puts messages in the outbox: add it to this pin"
+        );
     }
 
     /// Source-grep pin (freenet/river#509): the no-room screen must branch on

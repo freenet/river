@@ -61,6 +61,28 @@ pub(super) fn apply_pending_effects(
     }
 }
 
+/// This user's reaction on `target` once the pending `effects` apply over the
+/// `committed` one (one reaction per user per message, as the toggle keeps it).
+pub(super) fn own_reaction_after_pending(
+    committed: Option<String>,
+    effects: &[PendingEffect],
+    target: &river_core::room_state::message::MessageId,
+) -> Option<String> {
+    let mut own = committed;
+    for effect in effects {
+        match effect {
+            PendingEffect::React { target: t, emoji } if t == target => own = Some(emoji.clone()),
+            PendingEffect::Unreact { target: t, emoji }
+                if t == target && own.as_deref() == Some(emoji.as_str()) =>
+            {
+                own = None
+            }
+            _ => {}
+        }
+    }
+    own
+}
+
 fn find<'a>(
     items: &'a mut [DisplayItem],
     target: &river_core::room_state::message::MessageId,
@@ -198,6 +220,41 @@ mod tests {
             &HashMap::new(),
         );
         assert!(shown.is_empty(), "an emptied group is not rendered");
+    }
+
+    /// A second click while the first is still being signed must act on what
+    /// the user sees: undo the pending reaction, or swap from it.
+    #[test]
+    fn the_toggle_sees_this_users_pending_reactions() {
+        let react = |emoji: &str| PendingEffect::React {
+            target: id(1),
+            emoji: emoji.to_string(),
+        };
+        let unreact = |emoji: &str| PendingEffect::Unreact {
+            target: id(1),
+            emoji: emoji.to_string(),
+        };
+        assert_eq!(
+            own_reaction_after_pending(None, &[react("👍")], &id(1)).as_deref(),
+            Some("👍"),
+            "a pending reaction is the user's reaction"
+        );
+        assert_eq!(
+            own_reaction_after_pending(Some("👍".into()), &[unreact("👍")], &id(1)),
+            None,
+            "a pending removal leaves none"
+        );
+        assert_eq!(
+            own_reaction_after_pending(Some("👍".into()), &[unreact("👍"), react("🎉")], &id(1))
+                .as_deref(),
+            Some("🎉"),
+            "a pending swap"
+        );
+        assert_eq!(
+            own_reaction_after_pending(Some("👍".into()), &[react("🎉")], &id(2)).as_deref(),
+            Some("👍"),
+            "another message's effects do not count"
+        );
     }
 
     #[test]

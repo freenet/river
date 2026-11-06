@@ -54,6 +54,8 @@ thread_local! {
     static HELD_MESSAGE_SIGNS: std::cell::RefCell<Option<Vec<Option<futures::channel::oneshot::Sender<()>>>>> =
         const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_MESSAGE_SIGN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Message signing results recorded in the outbox since the page loaded.
+    static MESSAGE_SIGNS_RECORDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Runs of a `showToast` action since `takeToastActionRuns` last read them.
     static TOAST_ACTION_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The load worker `setRoomsLoadStateKeepingRooms("migrating")` holds open
@@ -121,6 +123,12 @@ pub async fn message_sign_gate() {
     if let Some(rx) = waiting {
         let _ = rx.await;
     }
+}
+
+/// Counts one signing result (signature or failure) reaching the outbox, for
+/// `messageSignsRecorded`.
+pub fn note_message_sign_recorded() {
+    MESSAGE_SIGNS_RECORDED.with(|n| n.set(n.get() + 1));
 }
 
 /// Whether the next message signing is to fail as a delegate failure with no
@@ -611,6 +619,12 @@ pub fn install_test_hooks() {
             }
         })
         .into_js_value(),
+    );
+
+    set_hook(
+        "messageSignsRecorded",
+        Closure::<dyn FnMut() -> u32>::new(move || MESSAGE_SIGNS_RECORDED.with(|n| n.get()))
+            .into_js_value(),
     );
 
     set_hook(

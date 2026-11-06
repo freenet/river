@@ -13,7 +13,11 @@
 //! edit of an earlier message, or three messages typed quickly, reach `ROOMS`
 //! (and so the network) in the order the user made them. A failed entry does
 //! not hold back the ones after it: it stays, marked failed, until the user
-//! retries or discards it.
+//! retries or discards it (a retried message then commits after them, keeping
+//! its original timestamp). Leaving the room drops what is waiting in it.
+//!
+//! The outbox is memory only: a reload while a message is still being signed
+//! loses it.
 //!
 //! Each message keeps the timestamp it was given when the user acted; signing
 //! later does not restamp it, so the order on screen is the typed order.
@@ -241,6 +245,11 @@ impl Outbox {
                 .map(|(i, m)| (i, m.bytes.clone()))
                 .collect(),
         ))
+    }
+
+    /// Drop everything waiting in `room` (the user left it).
+    pub fn clear_room(&mut self, room: &VerifyingKey) -> usize {
+        self.rooms.remove(room).map_or(0, |q| q.len())
     }
 
     /// Drop an entry (the user discarded a failed message).

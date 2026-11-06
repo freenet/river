@@ -305,3 +305,71 @@ fn pending_effects_are_those_of_actions_still_signing() {
     outbox.record_failure(&room(), failed, "x".to_string());
     assert_eq!(outbox.pending_effects(&room()), vec![effect("signing")]);
 }
+
+/// By design: a message that failed and is retried commits after the ones
+/// sent after it (keeping its own timestamp, so it still shows in typed order).
+#[test]
+fn a_retried_message_commits_after_the_ones_that_went_ahead() {
+    let mut outbox = Outbox::default();
+    let (a, _) = send(&mut outbox, "a", 1);
+    let (b, wb) = send(&mut outbox, "b", 2);
+    outbox.record_failure(&room(), a, "timed out".to_string());
+    sign_all(&mut outbox, b, &wb);
+    let (_, wa) = outbox.retry(&room(), a).unwrap();
+    sign_all(&mut outbox, a, &wa);
+    let first = outbox.take_ready(&room());
+    assert_eq!(texts(&first), ["a", "b"], "both ready: committed in order");
+
+    let mut outbox = Outbox::default();
+    let (a, _) = send(&mut outbox, "a", 1);
+    let (b, wb) = send(&mut outbox, "b", 2);
+    outbox.record_failure(&room(), a, "timed out".to_string());
+    sign_all(&mut outbox, b, &wb);
+    assert_eq!(texts(&outbox.take_ready(&room())), ["b"]);
+    let (_, wa) = outbox.retry(&room(), a).unwrap();
+    sign_all(&mut outbox, a, &wa);
+    assert_eq!(texts(&outbox.take_ready(&room())), ["a"]);
+}
+
+#[test]
+fn a_refused_message_can_be_retried() {
+    let mut outbox = Outbox::default();
+    let (a, wa) = send(&mut outbox, "a", 1);
+    sign_all(&mut outbox, a, &wa);
+    let entry = outbox.take_ready(&room()).pop().unwrap();
+    outbox.restore_failed(room(), entry, "not admitted".to_string());
+    let (_, work) = outbox.retry(&room(), a).expect("a refused message retries");
+    assert_eq!(work, wa);
+    assert_eq!(outbox.pending_rows(&room())[0].failed, None);
+}
+
+#[test]
+fn a_reaction_swap_with_one_half_failed_is_reported_whole() {
+    let mut outbox = Outbox::default();
+    let (id, work) = outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "reaction",
+            effects: vec![],
+        },
+        author().verifying_key(),
+        vec![message("remove", 1), message("add", 1)],
+    );
+    outbox.record_failure(&room(), id, "timed out".to_string());
+    // The other half's signature arrives afterwards and is ignored.
+    outbox.record_signature(&room(), id, 1, author().sign(&work[1].1));
+    assert!(
+        outbox.take_ready(&room()).is_empty(),
+        "neither half commits"
+    );
+    assert_eq!(texts(&outbox.take_failed_actions(&room())), ["reaction"]);
+}
+
+#[test]
+fn leaving_a_room_drops_what_waits_in_it() {
+    let mut outbox = Outbox::default();
+    send(&mut outbox, "a", 1);
+    send(&mut outbox, "b", 2);
+    assert_eq!(outbox.clear_room(&room()), 2);
+    assert!(outbox.pending_rows(&room()).is_empty());
+}

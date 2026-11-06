@@ -279,7 +279,7 @@ for canonical examples.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Messages fail to send (new room) | Signing key not stored in delegate | Fixed: `create_room_modal.rs` now calls `store_signing_key` after room creation |
-| "signature created: false" in node logs | Delegate can't find signing key for room | Ensure `StoreSigningKey` is sent after room creation; fallback signs locally |
+| "signature created: false" in node logs | Delegate can't find signing key for room | Ensure `StoreSigningKey` is sent after room creation; the fallback signs locally while the UI still holds `self_sk` |
 | Mobile send appears stuck | Browser suspends WASM when screen locks | Keep phone screen active; delegate signing avoids long async chains |
 | `RefCell already borrowed` on Firefox mobile | Dioxus signal re-entrant borrow during Drop | Use `try_read()` instead of `read()` for reactive signal access |
 | Crash at `singlethread.rs:132` | spawn_local inside polled future on Firefox | Use `safe_spawn_local()` to defer via setTimeout(0) |

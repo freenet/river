@@ -96,6 +96,8 @@ fn start_signing(
                 }
             }
             crate::util::defer(move || {
+                #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+                crate::test_hooks::note_message_sign_recorded();
                 OUTBOX.with_mut(|o| match result {
                     Ok((sig, _)) => {
                         #[cfg(all(
@@ -128,7 +130,13 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
         Some(ready.iter().map(|e| apply_entry(room_data, e)).collect())
     });
     let Some(outcomes) = outcomes else {
-        warn!("Room left with {} unsent message(s); dropped", ready.len());
+        // The room was left while these were signing: there is nowhere to
+        // commit them or show them, so they go with the room.
+        let rest = OUTBOX.with_mut(|o| o.clear_room(&room));
+        warn!(
+            "Room left with {} unsent message(s); dropped",
+            ready.len() + rest
+        );
         return;
     };
     let mut any_applied = false;
@@ -193,17 +201,16 @@ fn apply_entry(room_data: &mut RoomData, entry: &PendingEntry) -> Result<(), Str
     // this the apply wipes private edits/deletes/reactions until the network
     // echo re-applies them (#310).
     room_data.rebuild_private_actions_state();
-    // The room skips (does not reject) a message it does not admit, so an
-    // apply without error may still have added nothing.
-    if matches!(entry.kind, PendingKind::Send { .. }) {
-        let held = &room_data.room_state.recent_messages.messages;
-        if !entry
-            .message_ids()
-            .iter()
-            .all(|id| held.iter().any(|m| m.id() == *id))
-        {
-            return Err("the room did not admit the message".to_string());
-        }
+    // The room skips (does not reject) a message it does not admit (a banned
+    // or pruned author, a cap), so an apply without error may still have
+    // added nothing. Actions are messages too, so this holds for every kind.
+    let held = &room_data.room_state.recent_messages.messages;
+    if !entry
+        .message_ids()
+        .iter()
+        .all(|id| held.iter().any(|m| m.id() == *id))
+    {
+        return Err("the room did not admit the message".to_string());
     }
     Ok(())
 }
@@ -284,6 +291,57 @@ mod tests {
         let entry = outbox.take_ready(&room).pop().unwrap();
         assert!(apply_entry(&mut room_data, &entry).is_err());
         assert!(texts_in(&room_data).is_empty());
+    }
+
+    #[test]
+    fn an_edit_and_a_reaction_commit_and_change_what_the_room_shows() {
+        let room = owner_sk().verifying_key();
+        let mut room_data = crate::room_data::test_minimal_room_data(room);
+        let mut outbox = Outbox::default();
+        queue_send(&mut outbox, room, "original", 1);
+        let sent = outbox.take_ready(&room).pop().unwrap();
+        apply_entry(&mut room_data, &sent).unwrap();
+        let target = sent.message_ids()[0].clone();
+
+        let action = |body: RoomMessageBody, ms: u64| {
+            let message = MessageV1 {
+                room_owner: MemberId::from(&room),
+                author: MemberId::from(&owner_sk().verifying_key()),
+                content: body,
+                time: SystemTime::now() - Duration::from_secs(30) + Duration::from_millis(ms),
+            };
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+            (message, bytes)
+        };
+        let (id, work) = outbox.enqueue(
+            room,
+            PendingKind::Action {
+                label: "edit",
+                effects: vec![],
+            },
+            owner_sk().verifying_key(),
+            vec![
+                action(
+                    RoomMessageBody::edit(target.clone(), "changed".to_string()),
+                    1,
+                ),
+                action(
+                    RoomMessageBody::reaction(target.clone(), "👍".to_string()),
+                    2,
+                ),
+            ],
+        );
+        for (i, bytes) in work {
+            outbox.record_signature(&room, id, i, owner_sk().sign(&bytes));
+        }
+        let entry = outbox.take_ready(&room).pop().unwrap();
+        apply_entry(&mut room_data, &entry).expect("signed actions are admitted");
+        let messages = &room_data.room_state.recent_messages;
+        assert!(messages.is_edited(&target));
+        assert!(messages
+            .reactions(&target)
+            .is_some_and(|r| r.contains_key("👍")));
     }
 
     /// The commit takes the entry out of the outbox and writes it to `ROOMS`

@@ -50,8 +50,14 @@ test("messages commit in the order they were sent, whatever order they are signe
   await expect(pending(page)).toHaveText([/order one/, /order two/, /order three/]);
 
   // The second and third are signed first: they must wait for the first.
+  const recorded = await callRiverTest(page, "messageSignsRecorded");
   await expect.poll(() => callRiverTest(page, "releaseMessageSign", 2)).toBe(3);
   await callRiverTest(page, "releaseMessageSign", 1);
+  await expect
+    .poll(() => callRiverTest(page, "messageSignsRecorded"), {
+      message: "premise: the second and third signatures reach the outbox",
+    })
+    .toBe(recorded + 2);
   await settle(page);
   for (const text of ["order one", "order two", "order three"]) {
     await expect(committed(page, text), `"${text}" committed before "order one" was signed`).toHaveCount(0);
@@ -116,4 +122,21 @@ test("an own reaction and edit show while their signatures are held", async ({ p
   await settle(page);
   await expect(edited, "the committed edit replaces the pending one in place").toHaveCount(1);
   await expect(edited.getByTestId("reaction-chip")).toHaveCount(1);
+});
+
+test("a second click on a reaction still being signed undoes it", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await send(page, "react twice");
+  const row = committed(page, "react twice");
+  await expect(row).toHaveCount(1);
+
+  await callRiverTest(page, "holdMessageSigning");
+  const chip = await reactTo(page, row);
+  // A fine pointer removes its own reaction on click.
+  await chip.click();
+  await expect(row.getByTestId("reaction-chip"), "the pending reaction is undone").toHaveCount(0);
+
+  await callRiverTest(page, "releaseMessageSigning");
+  await settle(page);
+  await expect(row.getByTestId("reaction-chip"), "and stays undone once both are signed").toHaveCount(0);
 });
