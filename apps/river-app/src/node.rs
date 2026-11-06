@@ -9,6 +9,12 @@
 pub enum NodeProbe {
     /// A node answered on its client API.
     Running { version: String },
+    /// A node is running, but it is older than River supports. `running` is `None` when it is
+    /// too old to report its version at all.
+    Outdated {
+        running: Option<String>,
+        minimum: String,
+    },
     /// Freenet is installed but no node answered.
     InstalledNotRunning,
     /// Freenet is not installed.

@@ -280,7 +280,8 @@ under `common/src/room_state/`, `common/src/key_derivation.rs`,
 Changes to delegate or contract WASM (anything under `delegates/`,
 `contracts/`, or `common/`, plus most changes to the root
 Cargo.toml/Cargo.lock) alter the delegate/contract key. `apps/` has its own
-Cargo.toml and Cargo.lock, which cannot. Without a migration entry, **users lose
+Cargo.toml and Cargo.lock, which cannot (while `apps/` depends on no crate in
+the root workspace; see the note in `apps/Cargo.toml`). Without a migration entry, **users lose
 all room data**.
 
 The full workflow — `cargo make add-migration` BEFORE rebuilding, the

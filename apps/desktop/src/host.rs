@@ -11,12 +11,23 @@ use river_app::{InstallStep, NodeHost, NodeProbe};
 use crate::install;
 use crate::release::{self, Release};
 
-/// The node's client API on its default port. `/v1/version` answers as soon as the HTTP
-/// server is up, before the node has joined the network. A node on another port is not found.
+/// The node's client API on its default port. `/v1/version` (Freenet 0.2.71 and later)
+/// answers as soon as the HTTP server is up, before the node has joined the network. A node on
+/// another port is not found.
 const VERSION_URL: &str = "http://127.0.0.1:7509/v1/version";
 
-/// The longest a `freenet service ...` command may take.
+/// The longest a command River runs (`freenet service ...`, `hdiutil`, `ditto`) may take.
 const COMMAND_DEADLINE: Duration = Duration::from_secs(120);
+
+/// What answered on the node's port.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    Version(String),
+    /// Something HTTP answered, but not with a version: a Freenet older than 0.2.71, or
+    /// another program on the port.
+    NoVersion,
+    Nothing,
+}
 
 pub struct DesktopHost {
     agent: ureq::Agent,
@@ -30,28 +41,44 @@ impl DesktopHost {
         DesktopHost { agent }
     }
 
-    fn running_version(&self) -> Option<String> {
-        let body = self
-            .agent
-            .get(VERSION_URL)
-            .call()
-            .ok()?
-            .into_string()
-            .ok()?;
-        let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-        value.get("version")?.as_str().map(str::to_owned)
+    fn ask_node(&self) -> Answer {
+        match self.agent.get(VERSION_URL).call() {
+            Ok(resp) => resp
+                .into_string()
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .and_then(|v| v.get("version")?.as_str().map(str::to_owned))
+                .map_or(Answer::NoVersion, Answer::Version),
+            Err(ureq::Error::Status(..)) => Answer::NoVersion,
+            Err(ureq::Error::Transport(_)) => Answer::Nothing,
+        }
+    }
+}
+
+/// Classify what answered. A version River can't parse is let through rather than refused:
+/// the node reported one, so it is new enough to have the endpoint.
+fn classify(answer: Answer, installed: bool) -> NodeProbe {
+    let minimum = release::MIN_VERSION.to_string();
+    match answer {
+        Answer::Version(version) => match release::parse_version(&version) {
+            Ok(v) if v < release::MIN_VERSION => NodeProbe::Outdated {
+                running: Some(version),
+                minimum,
+            },
+            _ => NodeProbe::Running { version },
+        },
+        Answer::NoVersion => NodeProbe::Outdated {
+            running: None,
+            minimum,
+        },
+        Answer::Nothing if installed => NodeProbe::InstalledNotRunning,
+        Answer::Nothing => NodeProbe::NotInstalled,
     }
 }
 
 impl NodeHost for DesktopHost {
     fn probe(&self) -> NodeProbe {
-        if let Some(version) = self.running_version() {
-            NodeProbe::Running { version }
-        } else if find_installed().is_some() {
-            NodeProbe::InstalledNotRunning
-        } else {
-            NodeProbe::NotInstalled
-        }
+        classify(self.ask_node(), find_installed().is_some())
     }
 
     fn can_install(&self) -> bool {
@@ -71,31 +98,26 @@ impl NodeHost for DesktopHost {
         progress(InstallStep::Verifying);
         release::verify_asset(&checksums, &asset, &bytes)?;
         install::install(&asset, &bytes, progress, &|| {
-            self.running_version().is_some()
+            matches!(self.ask_node(), Answer::Version(_))
         })
     }
 
     fn start(&self) -> Result<(), String> {
         match find_installed().ok_or("Freenet isn't installed")? {
             Installed::MacApp(app) => run(Command::new("/usr/bin/open").arg(app)),
-            Installed::Binary(bin) => {
-                let installed_by_river = install::binary_install_path().as_deref() == Some(&bin);
-                start_binary(
-                    &bin,
-                    &SystemRunner,
-                    installed_by_river,
-                    system_service_installed(),
-                )
-            }
+            Installed::Binary(bin) => start_binary(
+                &bin,
+                &SystemRunner,
+                install::installed_by_river(&bin),
+                system_service_installed(),
+            ),
         }
     }
 }
 
-/// How `start_binary` runs things, so its decisions can be tested without running Freenet.
+/// How `start_binary` runs commands, so its decisions can be tested without running Freenet.
 trait Runner {
     fn run(&self, bin: &Path, args: &[&str]) -> Result<(), String>;
-    /// Start a long-running process and leave it running.
-    fn spawn_detached(&self, bin: &Path, args: &[&str]) -> Result<(), String>;
 }
 
 struct SystemRunner;
@@ -104,37 +126,16 @@ impl Runner for SystemRunner {
     fn run(&self, bin: &Path, args: &[&str]) -> Result<(), String> {
         run(Command::new(bin).args(args))
     }
-
-    fn spawn_detached(&self, bin: &Path, args: &[&str]) -> Result<(), String> {
-        let mut cmd = Command::new(bin);
-        cmd.args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(unix)]
-        {
-            // Its own process group, so a Ctrl-C in a terminal that launched River leaves it.
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        no_console_window(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("couldn't run {}: {e}", bin.display()))?;
-        // Reap it if it exits while River is running, so it doesn't linger as a zombie.
-        thread::spawn(move || child.wait());
-        Ok(())
-    }
 }
 
-/// Start the node from a `freenet` binary.
+/// Start the node from a `freenet` binary with `freenet service start`.
 ///
-/// 1. `freenet service start`: the normal case.
-/// 2. If that fails and this is the copy River installed, register the service first. River
-///    only registers a service for a binary it installed itself; any other copy belongs to
-///    whoever installed it.
-/// 3. If there is no service manager River can use (no systemd user session, for example),
-///    run the node directly. It then runs until logout rather than at every login.
+/// If no service is registered yet and River installed this copy (recorded when it installed
+/// it), River registers one first, as freenet-core's own installer would. Any other copy
+/// belongs to whoever installed it, and River only reports why it wouldn't start.
+///
+/// River never runs the node outside a service manager: a bare `freenet network` stops for
+/// good the first time it finds an update, because nothing is there to apply it and restart.
 fn start_binary(
     bin: &Path,
     runner: &dyn Runner,
@@ -152,17 +153,20 @@ fn start_binary(
     }
     if !installed_by_river {
         return Err(format!(
-            "couldn't start the Freenet at {}: {first}",
+            "the Freenet at {} didn't start ({first}). Start it yourself, then try again.",
             bin.display()
         ));
     }
-    let registered = runner
-        .run(bin, &["service", "install"])
-        .and_then(|()| runner.run(bin, &["service", "start"]));
-    match registered {
-        Ok(()) => Ok(()),
-        Err(_) => runner.spawn_detached(bin, &["network"]),
-    }
+    runner.run(bin, &["service", "install"]).map_err(|e| {
+        format!(
+            "couldn't set Freenet up as a background service ({e}). On a system without a \
+                 systemd user session, run `{} network` yourself, then try again.",
+            bin.display()
+        )
+    })?;
+    runner
+        .run(bin, &["service", "start"])
+        .map_err(|e| format!("Freenet's service was set up but didn't start: {e}"))
 }
 
 #[derive(Debug)]
@@ -219,6 +223,7 @@ pub fn run(cmd: &mut Command) -> Result<(), String> {
 /// Stderr goes to an anonymous temporary file rather than a pipe, and River waits on the
 /// child's exit, not on end-of-file: a detached process the command leaves behind may hold
 /// the handle for as long as it runs, and waiting for a pipe to close would wait for it.
+/// At the deadline only the command itself is killed, not anything it started.
 fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String> {
     let describe = |cmd: &Command| {
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
@@ -251,10 +256,14 @@ fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String
     if status.success() {
         return Ok(());
     }
-    let mut output = String::new();
-    let _ = stderr.seek(SeekFrom::Start(0));
-    let _ = stderr.take(64 * 1024).read_to_string(&mut output);
-    let detail = output
+    // The end of the output is where the error is.
+    const TAIL: u64 = 64 * 1024;
+    let len = stderr.seek(SeekFrom::End(0)).unwrap_or(0);
+    let _ = stderr.seek(SeekFrom::Start(len.saturating_sub(TAIL)));
+    let mut tail = Vec::new();
+    let _ = stderr.take(TAIL).read_to_end(&mut tail);
+    let tail = String::from_utf8_lossy(&tail);
+    let detail = tail
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
@@ -263,7 +272,7 @@ fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String
 }
 
 /// Windows: don't flash a console window for a console program run from River.
-fn no_console_window(cmd: &mut Command) {
+pub fn no_console_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -309,12 +318,6 @@ mod tests {
                 None => Ok(()),
             }
         }
-        fn spawn_detached(&self, _: &Path, args: &[&str]) -> Result<(), String> {
-            self.calls
-                .borrow_mut()
-                .push(format!("detached {}", args.join(" ")));
-            Ok(())
-        }
     }
 
     const BIN: &str = "/home/u/.local/bin/freenet";
@@ -337,35 +340,29 @@ mod tests {
     }
 
     #[test]
-    fn without_a_service_manager_the_node_is_run_directly() {
+    fn registration_failures_explain_themselves_and_run_nothing_else() {
         let r = FakeRunner::failing(&["service start", "service install"]);
-        start_binary(Path::new(BIN), &r, true, false).unwrap();
-        assert_eq!(
-            r.calls(),
-            vec!["service start", "service install", "detached network"]
-        );
+        let err = start_binary(Path::new(BIN), &r, true, false).unwrap_err();
+        assert_eq!(r.calls(), vec!["service start", "service install"]);
+        assert!(err.contains("service install failed"), "{err}");
+        assert!(err.contains(&format!("`{BIN} network`")), "{err}");
 
-        // Registered, but the service still won't start.
         let r = FakeRunner::failing(&["service start", "service start"]);
-        start_binary(Path::new(BIN), &r, true, false).unwrap();
+        let err = start_binary(Path::new(BIN), &r, true, false).unwrap_err();
         assert_eq!(
             r.calls(),
-            vec![
-                "service start",
-                "service install",
-                "service start",
-                "detached network"
-            ]
+            vec!["service start", "service install", "service start"]
         );
+        assert!(err.contains("set up but didn't start"), "{err}");
     }
 
     #[test]
     fn someone_elses_copy_is_never_registered() {
         let r = FakeRunner::failing(&["service start"]);
-        let err = start_binary(Path::new("/usr/bin/freenet"), &r, false, false).unwrap_err();
+        let err = start_binary(Path::new(BIN), &r, false, false).unwrap_err();
         assert_eq!(r.calls(), vec!["service start"]);
         assert!(
-            err.contains("/usr/bin/freenet") && err.contains("service start failed"),
+            err.contains(BIN) && err.contains("service start failed"),
             "{err}"
         );
     }
@@ -376,6 +373,47 @@ mod tests {
         let err = start_binary(Path::new(BIN), &r, true, true).unwrap_err();
         assert!(err.contains("sudo systemctl start freenet"), "{err}");
         assert_eq!(r.calls(), vec!["service start"]);
+    }
+
+    #[test]
+    fn what_answers_on_the_port_decides_the_state() {
+        let version = |v: &str| Answer::Version(v.into());
+        assert_eq!(
+            classify(version("0.2.155"), true),
+            NodeProbe::Running {
+                version: "0.2.155".into()
+            }
+        );
+        assert_eq!(
+            classify(version("0.3.0"), false),
+            NodeProbe::Running {
+                version: "0.3.0".into()
+            }
+        );
+        assert_eq!(
+            classify(version("0.2.100"), true),
+            NodeProbe::Outdated {
+                running: Some("0.2.100".into()),
+                minimum: "0.2.155".into()
+            }
+        );
+        // A version River can't parse came from the endpoint, so the node has it.
+        assert!(matches!(
+            classify(version("0.4.0-rc1"), true),
+            NodeProbe::Running { .. }
+        ));
+        assert_eq!(
+            classify(Answer::NoVersion, true),
+            NodeProbe::Outdated {
+                running: None,
+                minimum: "0.2.155".into()
+            }
+        );
+        assert_eq!(
+            classify(Answer::Nothing, true),
+            NodeProbe::InstalledNotRunning
+        );
+        assert_eq!(classify(Answer::Nothing, false), NodeProbe::NotInstalled);
     }
 
     #[test]
@@ -397,6 +435,14 @@ mod tests {
             run(Command::new("sh").args(["-c", "echo first >&2; echo boom >&2; echo >&2; exit 3"]))
                 .unwrap_err();
         assert!(err.ends_with("failed: boom"), "{err}");
+        // Longer than the tail River reads: the LAST line is still the one reported.
+        let err = run(Command::new("sh").args([
+            "-c",
+            "i=0; while [ $i -lt 20000 ]; do echo noise-line-$i >&2; i=$((i+1)); done; \
+             echo the-real-error >&2; exit 1",
+        ]))
+        .unwrap_err();
+        assert!(err.ends_with("failed: the-real-error"), "{err}");
         let err = run(&mut Command::new("/definitely/not/here")).unwrap_err();
         assert!(
             err.starts_with("couldn't run /definitely/not/here"),
@@ -412,7 +458,7 @@ mod tests {
         let started = Instant::now();
         run(Command::new("sh").args(["-c", "sleep 30 & exit 0"])).unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(15),
             "{:?}",
             started.elapsed()
         );

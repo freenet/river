@@ -84,6 +84,7 @@ impl Controller {
     pub fn check(&self) {
         self.spawn(Setup::Checking, |ctl| match ctl.host.probe() {
             NodeProbe::Running { version } => ctl.set(Setup::Connected { version }),
+            NodeProbe::Outdated { running, minimum } => ctl.set(outdated(running, minimum)),
             NodeProbe::NotInstalled => ctl.set(Setup::NotInstalled),
             NodeProbe::InstalledNotRunning => ctl.start_and_wait(),
         });
@@ -99,8 +100,9 @@ impl Controller {
             }
             match ctl.host.probe() {
                 NodeProbe::Running { version } => ctl.set(Setup::Connected { version }),
+                NodeProbe::Outdated { running, minimum } => ctl.set(outdated(running, minimum)),
                 NodeProbe::NotInstalled => ctl.set(Setup::Failed(
-                    "The installer finished, but Freenet still isn't installed.".into(),
+                    "The installer closed without installing Freenet.".into(),
                 )),
                 NodeProbe::InstalledNotRunning => ctl.start_and_wait(),
             }
@@ -133,8 +135,12 @@ impl Controller {
         }
         let deadline = Instant::now() + self.start_timeout;
         while Instant::now() < deadline {
-            if let NodeProbe::Running { version } = self.host.probe() {
-                return self.set(Setup::Connected { version });
+            match self.host.probe() {
+                NodeProbe::Running { version } => return self.set(Setup::Connected { version }),
+                NodeProbe::Outdated { running, minimum } => {
+                    return self.set(outdated(running, minimum));
+                }
+                NodeProbe::InstalledNotRunning | NodeProbe::NotInstalled => {}
             }
             thread::sleep(START_POLL.min(self.start_timeout));
         }
@@ -154,6 +160,20 @@ impl Controller {
     }
 }
 
+fn outdated(running: Option<String>, minimum: String) -> Setup {
+    Setup::Failed(match running {
+        Some(v) => format!(
+            "The Freenet running on this computer is version {v}, and River needs {minimum} \
+             or newer. Update it by running `freenet update`, then try again."
+        ),
+        None => format!(
+            "Something is answering on Freenet's port (7509) but doesn't say which version of \
+             Freenet it is. If it's an old Freenet, update it by running `freenet update` \
+             (River needs {minimum} or newer), then try again."
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,7 +186,8 @@ mod tests {
     struct FakeHost {
         probes: Mutex<VecDeque<NodeProbe>>,
         install: Result<(), String>,
-        install_delay: Duration,
+        /// When set, `install` blocks until the test sends on the paired sender.
+        install_gate: Mutex<Option<Receiver<()>>>,
         install_panics: bool,
         start: Result<(), String>,
         installs: AtomicUsize,
@@ -178,7 +199,7 @@ mod tests {
             FakeHost {
                 probes: Mutex::new(probes.into()),
                 install: Ok(()),
-                install_delay: Duration::ZERO,
+                install_gate: Mutex::new(None),
                 install_panics: false,
                 start: Ok(()),
                 installs: AtomicUsize::new(0),
@@ -201,7 +222,9 @@ mod tests {
         }
         fn install(&self, progress: &mut dyn FnMut(InstallStep)) -> Result<(), String> {
             self.installs.fetch_add(1, Ordering::SeqCst);
-            thread::sleep(self.install_delay);
+            if let Some(gate) = self.install_gate.lock().unwrap().take() {
+                gate.recv().expect("test releases the install");
+            }
             assert!(!self.install_panics, "installer bug");
             progress(InstallStep::Downloading {
                 received: 1,
@@ -355,9 +378,39 @@ mod tests {
         assert_eq!(
             seen.last(),
             Some(&Setup::Failed(
-                "The installer finished, but Freenet still isn't installed.".into()
+                "The installer closed without installing Freenet.".into()
             ))
         );
+    }
+
+    #[test]
+    fn an_outdated_node_is_reported_not_restarted() {
+        let old = NodeProbe::Outdated {
+            running: Some("0.2.60".into()),
+            minimum: "0.2.155".into(),
+        };
+        let (seen, host) = drive(FakeHost::new(vec![old]), Controller::check);
+        assert_eq!(
+            seen.last(),
+            Some(&Setup::Failed(
+                "The Freenet running on this computer is version 0.2.60, and River needs \
+                 0.2.155 or newer. Update it by running `freenet update`, then try again."
+                    .into()
+            ))
+        );
+        assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+
+        // Too old to say its version, found after starting it.
+        let unknown = NodeProbe::Outdated {
+            running: None,
+            minimum: "0.2.155".into(),
+        };
+        let probes = vec![NodeProbe::InstalledNotRunning, unknown];
+        let (seen, _) = drive(FakeHost::new(probes), Controller::check);
+        let Some(Setup::Failed(msg)) = seen.last() else {
+            panic!("{seen:?}")
+        };
+        assert!(msg.contains("doesn't say which version"), "{msg}");
     }
 
     #[test]
@@ -375,12 +428,16 @@ mod tests {
 
     #[test]
     fn a_second_press_while_installing_is_ignored() {
-        let mut host = FakeHost::new(vec![running()]);
-        host.install_delay = Duration::from_millis(300);
+        // The install blocks until released, so the second press certainly lands while the
+        // first install is still running, however slow the machine.
+        let host = FakeHost::new(vec![running()]);
+        let (release, gate) = mpsc::channel();
+        *host.install_gate.lock().unwrap() = Some(gate);
         let (ctl, host, rx) = controller(host);
         ctl.install();
         ctl.install();
         ctl.check();
+        release.send(()).unwrap();
         let seen = settle(&rx);
         assert_eq!(host.installs.load(Ordering::SeqCst), 1);
         assert_eq!(

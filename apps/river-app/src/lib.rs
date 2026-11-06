@@ -183,7 +183,9 @@ fn install_progress(step: &InstallStep) -> (&'static str, Option<f32>) {
                 .filter(|t| *t > 0)
                 .map(|t| (*received as f32 / t as f32).clamp(0.0, 1.0)),
         ),
-        InstallStep::Verifying => ("Checking the download's signature…", None),
+        // The release's signature was checked before downloading; this matches the download
+        // against the signed checksum.
+        InstallStep::Verifying => ("Checking the download…", None),
         InstallStep::Installing => ("Installing Freenet…", None),
         InstallStep::WaitingForInstaller => {
             ("Finish setting up Freenet in its installer window", None)

@@ -59,8 +59,10 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
-      # Render every named setup screen. A screen that fails to lay out or
-      # draw fails here, and the PNGs are kept for review.
+      # Render every named setup screen and keep the PNGs for review. This
+      # fails when rendering panics or writes nothing; it does not compare
+      # pixels, so a blank screen passes. What each screen shows is checked by
+      # the view tests in river-app.
       - name: Render setup screens
         run: |
           # The software Vulkan driver's file name varies by mesa version

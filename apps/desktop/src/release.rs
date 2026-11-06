@@ -6,8 +6,10 @@
 //! - A release with no `SHA256SUMS.txt.sig` is REFUSED. `freenet update` still tolerates a
 //!   missing signature for old releases; an installer has none to support.
 //! - There is no running version to compare against, so a compiled-in [`MIN_VERSION`] stops
-//!   anyone who can edit GitHub releases (but not sign them) from steering a new user to an
-//!   old signed release.
+//!   anyone who can edit GitHub releases (but not sign them) from steering a new user to a
+//!   signed release OLDER THAN THE FLOOR. It does not stop them marking any genuine release
+//!   at or above the floor as latest; closing that needs freenet-core to sign which release is
+//!   current. Raise the floor with each River app release so that window stays small.
 //!
 //! freenet-core also reserves an offline revocation key. Nothing checks a revocation yet, here
 //! or in `freenet update`.
@@ -28,7 +30,9 @@ const RELEASE_PUBKEY: [u8; 32] = [
     0x64, 0xd3, 0x34, 0x7f, 0xe8, 0x20, 0x74, 0xd9, 0x2b, 0x1e, 0x4b, 0xc6, 0x33, 0x6f, 0x86, 0x64,
 ];
 
-/// The oldest Freenet this installer will install. Raise it when River needs a newer node.
+/// The oldest Freenet this installer will install, and the oldest running node River accepts.
+/// Raise it with each River app release (see the module comment), and whenever River needs a
+/// newer node.
 pub const MIN_VERSION: Version = Version(0, 2, 155);
 
 /// How often download progress reaches the UI.
@@ -41,7 +45,10 @@ const MAX_SIGNATURE: u64 = 1024;
 const MAX_ASSET: u64 = 512 * 1024 * 1024;
 
 /// Give up on a download that hasn't finished in this long, however slowly bytes trickle in.
-const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(20 * 60);
+/// The asset's limit allows an 85 MB download at about 0.2 Mbit/s.
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(60 * 60);
+/// The manifest and signature are a few hundred bytes, so a short deadline.
+const SMALL_DOWNLOAD_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(pub u64, pub u64, pub u64);
@@ -55,20 +62,28 @@ impl std::fmt::Display for Version {
 /// Parse a release tag. Only `vMAJOR.MINOR.PATCH` is accepted, so a tag can't carry anything
 /// into the download URL.
 pub fn parse_tag(tag: &str) -> Result<Version, String> {
-    let bad = || format!("unexpected release tag {tag:?}");
-    let mut parts = tag.strip_prefix('v').ok_or_else(bad)?.split('.');
+    tag.strip_prefix('v')
+        .and_then(|v| parse_version(v).ok())
+        .ok_or_else(|| format!("unexpected release tag {tag:?}"))
+}
+
+/// Parse `MAJOR.MINOR.PATCH`: digits only, no leading zeros, so each version has one spelling.
+pub fn parse_version(version: &str) -> Result<Version, String> {
+    let bad = || format!("unexpected version {version:?}");
+    let mut parts = version.split('.');
     let mut next = || -> Result<u64, String> {
         let part = parts.next().ok_or_else(bad)?;
-        if part.is_empty() || part.len() > 9 || !part.bytes().all(|b| b.is_ascii_digit()) {
+        let digits_only = !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        if !digits_only || part.len() > 9 || (part.len() > 1 && part.starts_with('0')) {
             return Err(bad());
         }
         part.parse().map_err(|_| bad())
     };
-    let version = Version(next()?, next()?, next()?);
+    let parsed = Version(next()?, next()?, next()?);
     if parts.next().is_some() {
         return Err(bad());
     }
-    Ok(version)
+    Ok(parsed)
 }
 
 /// The tag from the `Location` of a `releases/latest` redirect.
@@ -127,13 +142,25 @@ fn verify_manifest_with(
 /// Check that a verified manifest belongs to release `version`.
 ///
 /// The signature binds asset names to hashes, but most asset names carry no version, so an
-/// older signed manifest would also verify. Every release lists its versioned DMG, which ties
-/// the manifest to its own tag.
+/// older signed manifest would also verify. The one versioned name is the macOS
+/// `Freenet-<version>.dmg`, so this check uses it, on every platform.
+///
+/// That depends on how freenet-core packages releases: its release job
+/// (`.github/workflows/cross-compile.yml`) builds the DMG before it writes and signs
+/// `SHA256SUMS.txt`, and names the DMG from the version of the binaries it built. If a
+/// release ever stops shipping that DMG, River refuses it everywhere until this changes.
 pub fn check_manifest_version(checksums: &Checksums, version: Version) -> Result<(), String> {
     checksums
         .get(&format!("Freenet-{version}.dmg"))
         .map(|_| ())
-        .map_err(|_| format!("the signed checksums are not for release {version}"))
+        .map_err(|_| {
+            format!(
+                "release {version}'s signed checksums don't list Freenet-{version}.dmg, which \
+                 River uses to confirm they belong to that release. Either the release is \
+                 packaged differently from what this version of River expects, or the \
+                 checksums are from another release."
+            )
+        })
 }
 
 fn parse_manifest(manifest: &[u8]) -> Result<Checksums, String> {
@@ -177,7 +204,9 @@ fn asset_name_for(os: &str, arch: &str, version: Version) -> Result<String, Stri
     };
     match os {
         "linux" => Ok(format!("freenet-{arch}-unknown-linux-musl.tar.gz")),
-        // The DMG is universal, signed and notarized, so Gatekeeper accepts it.
+        // The DMG holds a universal, signed and notarized app. River writes it itself, so it
+        // carries no quarantine flag and Gatekeeper never checks it: the release signature and
+        // SHA-256 above are what River relies on.
         "macos" => Ok(format!("Freenet-{version}.dmg")),
         // The signed exe is its own installer: run with no arguments it opens a setup wizard.
         "windows" if arch == "x86_64" => Ok("freenet.exe".to_string()),
@@ -220,8 +249,10 @@ impl Release {
 
     /// The release's signed checksums, checked to belong to this release.
     pub fn checksums(&self) -> Result<Checksums, String> {
-        let manifest = self.fetch_limited("SHA256SUMS.txt", MAX_MANIFEST, &mut |_, _| {})?;
-        let signature = self.fetch_limited("SHA256SUMS.txt.sig", MAX_SIGNATURE, &mut |_, _| {})?;
+        let small =
+            |asset, max| self.fetch_limited(asset, max, SMALL_DOWNLOAD_DEADLINE, &mut |_, _| {});
+        let manifest = small("SHA256SUMS.txt", MAX_MANIFEST)?;
+        let signature = small("SHA256SUMS.txt.sig", MAX_SIGNATURE)?;
         let checksums = verify_manifest(&manifest, &signature)?;
         check_manifest_version(&checksums, self.version)?;
         Ok(checksums)
@@ -233,13 +264,14 @@ impl Release {
         asset: &str,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<Vec<u8>, String> {
-        self.fetch_limited(asset, MAX_ASSET, progress)
+        self.fetch_limited(asset, MAX_ASSET, DOWNLOAD_DEADLINE, progress)
     }
 
     fn fetch_limited(
         &self,
         asset: &str,
         max: u64,
+        deadline: Duration,
         progress: &mut dyn FnMut(u64, Option<u64>),
     ) -> Result<Vec<u8>, String> {
         let url = format!("{REPO}/releases/download/{}/{asset}", self.tag);
@@ -253,7 +285,7 @@ impl Release {
             resp.into_reader(),
             total,
             max,
-            Instant::now() + DOWNLOAD_DEADLINE,
+            Instant::now() + deadline,
             PROGRESS_EVERY,
             progress,
         )
@@ -417,9 +449,14 @@ mod tests {
             "v0.2.155#x",
             "v+1.2.3",
             "v1.2.%2e",
+            "v0.02.155",
+            "v00.2.155",
         ] {
             assert!(parse_tag(bad).is_err(), "{bad} must be refused");
         }
+        assert_eq!(parse_tag("v10.0.0"), Ok(Version(10, 0, 0)));
+        assert_eq!(parse_version("0.2.155"), Ok(V155));
+        assert!(parse_version("v0.2.155").is_err());
     }
 
     #[test]

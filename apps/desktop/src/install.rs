@@ -15,6 +15,34 @@ use crate::host::run;
 /// How long the Windows setup wizard may stay open before River stops waiting for it.
 const INSTALLER_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
+/// The `freenet` binary is about 66 MB; anything far larger in a release archive is refused.
+const MAX_BINARY: u64 = 512 * 1024 * 1024;
+
+/// Where River records the `freenet` binary it installed. River registers a service only for
+/// that copy: a binary at the same path put there by freenet-core's own installer belongs to
+/// whoever installed it.
+fn marker_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "Freenet", "River")
+        .map(|dirs| dirs.data_local_dir().join("installed-freenet"))
+}
+
+fn record_installed_at(marker: &Path, binary: &Path) -> Result<(), String> {
+    if let Some(dir) = marker.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    }
+    fs::write(marker, binary.as_os_str().as_encoded_bytes())
+        .map_err(|e| format!("couldn't write {}: {e}", marker.display()))
+}
+
+fn was_installed_at(marker: &Path, binary: &Path) -> bool {
+    fs::read(marker).is_ok_and(|recorded| recorded == binary.as_os_str().as_encoded_bytes())
+}
+
+/// Whether River installed the `freenet` binary at `binary`.
+pub fn installed_by_river(binary: &Path) -> bool {
+    marker_path().is_some_and(|marker| was_installed_at(&marker, binary))
+}
+
 /// Where a bare `freenet` binary lives, matching freenet-core's install scripts
 /// (`install.sh`: `~/.local/bin`; `install.ps1`: `%LOCALAPPDATA%\Freenet\bin`).
 pub fn binary_install_path() -> Option<PathBuf> {
@@ -42,7 +70,9 @@ pub fn install(
     if asset.ends_with(".tar.gz") {
         progress(InstallStep::Installing);
         let dest = binary_install_path().ok_or("couldn't find your home directory")?;
-        install_binary(&extract_freenet(bytes)?, &dest)
+        let marker = marker_path().ok_or("couldn't find your home directory")?;
+        install_binary(&extract_freenet(bytes)?, &dest)?;
+        record_installed_at(&marker, &dest)
     } else if asset.ends_with(".dmg") {
         progress(InstallStep::Installing);
         install_mac_app(bytes)
@@ -55,7 +85,7 @@ pub fn install(
 }
 
 /// Linux: put `freenet` at `dest`. Registering it as a service is left to starting it
-/// (`host::start_binary`), which also handles systems without a usable service manager.
+/// (`host::start_binary`).
 fn install_binary(binary: &[u8], dest: &Path) -> Result<(), String> {
     let dir = dest.parent().ok_or("bad install path")?;
     fs::create_dir_all(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
@@ -69,9 +99,12 @@ fn install_binary(binary: &[u8], dest: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755))
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
     }
+    // On disk before the rename, so a crash can't leave an empty file at `dest`.
+    tmp.as_file().sync_all().map_err(|e| e.to_string())?;
     tmp.persist(dest)
         .map_err(|e| format!("couldn't install {}: {}", dest.display(), e.error))?;
     Ok(())
@@ -85,7 +118,7 @@ fn extract_freenet(tarball: &[u8]) -> Result<Vec<u8>, String> {
         .entries()
         .map_err(|e| format!("bad release archive: {e}"))?
     {
-        let mut entry = entry.map_err(|e| format!("bad release archive: {e}"))?;
+        let entry = entry.map_err(|e| format!("bad release archive: {e}"))?;
         let is_freenet = entry
             .path()
             .ok()
@@ -94,20 +127,37 @@ fn extract_freenet(tarball: &[u8]) -> Result<Vec<u8>, String> {
         if is_freenet && entry.header().entry_type().is_file() {
             let mut binary = Vec::new();
             entry
+                .take(MAX_BINARY + 1)
                 .read_to_end(&mut binary)
                 .map_err(|e| format!("bad release archive: {e}"))?;
+            if binary.len() as u64 > MAX_BINARY {
+                return Err("the freenet binary in the release archive is too large".into());
+            }
             return Ok(binary);
         }
     }
     Err("the release archive has no freenet binary".into())
 }
 
-/// A private scratch directory: randomly named, readable only by this user, removed on drop.
+/// A private scratch directory, removed on drop. See [`private_dir`].
 fn scratch_dir() -> Result<tempfile::TempDir, String> {
-    tempfile::Builder::new()
-        .prefix("river-freenet-")
+    private_dir("river-freenet-")
         .tempdir()
         .map_err(|e| format!("couldn't create a temporary directory: {e}"))
+}
+
+/// A builder for a randomly named directory that only this user can use. On Unix that is
+/// mode 0700, set explicitly: left to the default, the umask decides, and it is commonly
+/// 0775. On Windows the directory inherits its parent's access list; `%TEMP%` is per-user.
+fn private_dir(prefix: &str) -> tempfile::Builder<'_, 'static> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder
 }
 
 /// macOS: copy Freenet.app out of the signed DMG into /Applications (or ~/Applications).
@@ -117,16 +167,20 @@ fn install_mac_app(dmg: &[u8]) -> Result<(), String> {
     let mount = scratch.path().join("mnt");
     fs::write(&image, dmg).map_err(|e| e.to_string())?;
     fs::create_dir(&mount).map_err(|e| e.to_string())?;
-    run(Command::new("/usr/bin/hdiutil")
+    let copied = run(Command::new("/usr/bin/hdiutil")
         .arg("attach")
         .args(["-nobrowse", "-readonly", "-noautoopen", "-mountpoint"])
         .arg(&mount)
-        .arg(&image))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let copied = applications_dir(Path::new("/Applications"), home.as_deref())
-        .and_then(|dest| copy_app_from(&mount, &dest));
+        .arg(&image))
+    .and_then(|()| {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let dest = applications_dir(Path::new("/Applications"), home.as_deref())?;
+        copy_app_from(&mount, &dest)
+    });
+    // Detach whatever happened, including an attach that failed or was cut off by its
+    // deadline after mounting. `-force` because Spotlight often holds a fresh mount busy.
     let _ = run(Command::new("/usr/bin/hdiutil")
-        .args(["detach", "-quiet"])
+        .args(["detach", "-quiet", "-force"])
         .arg(&mount));
     copied
 }
@@ -142,8 +196,7 @@ fn copy_app_from(mount: &Path, dest_dir: &Path) -> Result<(), String> {
     if dest.exists() {
         return Err(format!("{} already exists", dest.display()));
     }
-    let staging = tempfile::Builder::new()
-        .prefix(".Freenet.app.river-")
+    let staging = private_dir(".Freenet.app.river-")
         .tempdir_in(dest_dir)
         .map_err(|e| format!("couldn't write to {}: {e}", dest_dir.display()))?;
     let staged = staging.path().join("Freenet.app");
@@ -183,18 +236,41 @@ fn applications_dir(system: &Path, home: Option<&Path>) -> Result<PathBuf, Strin
 /// Done when the wizard exits successfully, or as soon as a node answers. The wizard's "run
 /// without installing" choice runs the node in the wizard's own process, which never exits.
 fn run_windows_installer(exe: &[u8], node_up: &dyn Fn() -> bool) -> Result<(), String> {
+    run_installer(
+        exe,
+        "freenet.exe",
+        node_up,
+        Duration::from_millis(500),
+        INSTALLER_DEADLINE,
+    )
+}
+
+/// Write `exe` to a private directory, run it, and wait as described above. The directory is
+/// removed once the installer exits, even when River stops waiting first.
+fn run_installer(
+    exe: &[u8],
+    name: &str,
+    node_up: &dyn Fn() -> bool,
+    poll: Duration,
+    deadline: Duration,
+) -> Result<(), String> {
     let scratch = scratch_dir()?;
-    let installer = scratch.path().join("freenet.exe");
+    let installer = scratch.path().join(name);
     fs::write(&installer, exe).map_err(|e| e.to_string())?;
-    let mut cmd = Command::new(&installer);
-    cmd.stdin(Stdio::null())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&installer, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    let mut child = Command::new(&installer)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = cmd
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("couldn't run the Freenet installer: {e}"))?;
-    let deadline = Instant::now() + INSTALLER_DEADLINE;
-    loop {
+    let deadline = Instant::now() + deadline;
+    let outcome = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return if status.success() {
                 Ok(())
@@ -203,15 +279,20 @@ fn run_windows_installer(exe: &[u8], node_up: &dyn Fn() -> bool) -> Result<(), S
             };
         }
         if node_up() {
-            // The node may be running from the scratch directory; leave it in place.
-            let _ = scratch.keep();
-            return Ok(());
+            break Ok(());
         }
         if Instant::now() > deadline {
-            return Err("the Freenet installer is still open; finish it, then try again".into());
+            break Err("the Freenet installer is still open; finish it, then try again".into());
         }
-        thread::sleep(Duration::from_millis(500));
-    }
+        thread::sleep(poll);
+    };
+    // The installer is still open (a success screen, or a node it is running itself). Its
+    // directory can't be removed while it runs, so remove it once it exits.
+    thread::spawn(move || {
+        let _ = child.wait();
+        drop(scratch);
+    });
+    outcome
 }
 
 #[cfg(test)]
@@ -322,5 +403,117 @@ mod tests {
             applications_dir(home.path(), Some(home.path())).unwrap(),
             home.path()
         );
+    }
+
+    #[test]
+    fn only_the_recorded_copy_counts_as_installed_by_river() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("state/installed-freenet");
+        let ours = dir.path().join("bin/freenet");
+        assert!(!was_installed_at(&marker, &ours), "nothing recorded yet");
+        record_installed_at(&marker, &ours).unwrap();
+        assert!(was_installed_at(&marker, &ours));
+        assert!(!was_installed_at(
+            &marker,
+            &dir.path().join("other/freenet")
+        ));
+    }
+
+    #[test]
+    fn scratch_directories_are_private_unique_and_removed() {
+        let a = scratch_dir().unwrap();
+        let b = scratch_dir().unwrap();
+        assert_ne!(a.path(), b.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(a.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists());
+    }
+
+    /// A stand-in installer: a shell script that records where it ran, then runs `body`.
+    #[cfg(unix)]
+    fn script(record: &Path, body: &str) -> Vec<u8> {
+        format!("#!/bin/sh\necho \"$0\" > '{}'\n{body}\n", record.display()).into_bytes()
+    }
+
+    #[cfg(unix)]
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_installer_succeeds_or_fails_with_its_exit_status() {
+        let out = tempfile::tempdir().unwrap();
+        let record = out.path().join("ran-at");
+        let poll = Duration::from_millis(20);
+        let long = Duration::from_secs(30);
+        let never = || false;
+
+        run_installer(&script(&record, "exit 0"), "setup", &never, poll, long).unwrap();
+        let err =
+            run_installer(&script(&record, "exit 3"), "setup", &never, poll, long).unwrap_err();
+        assert!(err.contains("stopped"), "{err}");
+
+        // Its private directory is gone once it has exited.
+        let ran_at = PathBuf::from(fs::read_to_string(&record).unwrap().trim());
+        wait_until("the installer's directory is removed", || {
+            !ran_at.parent().unwrap().exists()
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_node_answering_ends_the_wait_and_the_directory_goes_when_the_installer_exits() {
+        // Like the wizard's "run without installing": the installer keeps running, and a node
+        // answers. River stops waiting at once, and cleans up when the installer exits.
+        let out = tempfile::tempdir().unwrap();
+        let record = out.path().join("ran-at");
+        let exe = script(&record, "sleep 2; exit 0");
+        let started = Instant::now();
+        let node_up = || record.exists();
+        run_installer(
+            &exe,
+            "setup",
+            &node_up,
+            Duration::from_millis(20),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let ran_at = PathBuf::from(fs::read_to_string(&record).unwrap().trim());
+        assert!(ran_at.exists(), "kept while the installer runs");
+        wait_until("the installer's directory is removed", || {
+            !ran_at.parent().unwrap().exists()
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_left_open_past_the_deadline_is_reported() {
+        let out = tempfile::tempdir().unwrap();
+        let exe = script(&out.path().join("ran-at"), "sleep 1; exit 0");
+        let err = run_installer(
+            &exe,
+            "setup",
+            &|| false,
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(err.contains("still open"), "{err}");
     }
 }
