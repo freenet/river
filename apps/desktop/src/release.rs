@@ -5,11 +5,12 @@
 //!
 //! - A release with no `SHA256SUMS.txt.sig` is REFUSED. `freenet update` still tolerates a
 //!   missing signature for old releases; an installer has none to support.
-//! - There is no running version to compare against, so a compiled-in [`MIN_VERSION`] stops
-//!   anyone who can edit GitHub releases (but not sign them) from steering a new user to a
-//!   signed release OLDER THAN THE FLOOR. It does not stop them marking any genuine release
-//!   at or above the floor as latest; closing that needs freenet-core to sign which release is
-//!   current. Raise the floor with each River app release so that window stays small.
+//! - There is no running version to compare against, so a compiled-in
+//!   [`MIN_INSTALL_VERSION`] stops anyone who can edit GitHub releases (but not sign them) from
+//!   steering a new user to a signed release OLDER THAN THE FLOOR. It does not stop them
+//!   marking any genuine release at or above the floor as latest; closing that needs
+//!   freenet-core to sign which release is current. Raise the floor with each River app
+//!   release so that window stays small.
 //!
 //! freenet-core also reserves an offline revocation key. Nothing checks a revocation yet, here
 //! or in `freenet update`.
@@ -30,10 +31,14 @@ const RELEASE_PUBKEY: [u8; 32] = [
     0x64, 0xd3, 0x34, 0x7f, 0xe8, 0x20, 0x74, 0xd9, 0x2b, 0x1e, 0x4b, 0xc6, 0x33, 0x6f, 0x86, 0x64,
 ];
 
-/// The oldest Freenet this installer will install, and the oldest running node River accepts.
-/// Raise it with each River app release (see the module comment), and whenever River needs a
-/// newer node.
-pub const MIN_VERSION: Version = Version(0, 2, 155);
+/// The oldest Freenet release this installer will install. Raise it to the current Freenet
+/// release with each River app release (see the module comment).
+pub const MIN_INSTALL_VERSION: Version = Version(0, 2, 155);
+
+/// The oldest running Freenet node River works with. Raise it only when River needs something
+/// a newer node provides: nodes update over hours to days, and raising it ahead of that tells
+/// people with a working node that theirs is too old. Never above [`MIN_INSTALL_VERSION`].
+pub const MIN_NODE_VERSION: Version = Version(0, 2, 155);
 
 /// How often download progress reaches the UI.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
@@ -94,9 +99,9 @@ fn tag_from_latest_redirect(location: &str) -> Result<(String, Version), String>
         .and_then(|rest| rest.strip_prefix("/releases/tag/"))
         .ok_or("unexpected latest-release redirect")?;
     let version = parse_tag(tag)?;
-    if version < MIN_VERSION {
+    if version < MIN_INSTALL_VERSION {
         return Err(format!(
-            "the latest release is {version}, older than {MIN_VERSION}, the oldest this \
+            "the latest release is {version}, older than {MIN_INSTALL_VERSION}, the oldest this \
              version of River will install"
         ));
     }
@@ -462,14 +467,27 @@ mod tests {
     }
 
     #[test]
+    fn river_never_requires_a_newer_node_than_it_would_install() {
+        assert!(MIN_NODE_VERSION <= MIN_INSTALL_VERSION);
+    }
+
+    #[test]
     fn the_latest_redirect_must_name_a_new_enough_release() {
+        // Derived from the floor, so raising it at a release doesn't break this test.
         let base = "https://github.com/freenet/freenet-core/releases/tag/";
+        let floor = MIN_INSTALL_VERSION;
         assert_eq!(
-            tag_from_latest_redirect(&format!("{base}v0.2.155")),
-            Ok(("v0.2.155".into(), V155))
+            tag_from_latest_redirect(&format!("{base}v{floor}")),
+            Ok((format!("v{floor}"), floor))
         );
-        assert!(tag_from_latest_redirect(&format!("{base}v0.3.0")).is_ok());
-        assert!(tag_from_latest_redirect(&format!("{base}v0.2.154")).is_err());
+        let newer = Version(floor.0, floor.1 + 1, 0);
+        assert!(tag_from_latest_redirect(&format!("{base}v{newer}")).is_ok());
+        let older = match floor {
+            Version(a, b, c) if c > 0 => Version(a, b, c - 1),
+            Version(a, b, _) if b > 0 => Version(a, b - 1, 999),
+            Version(a, _, _) => Version(a - 1, 999, 999),
+        };
+        assert!(tag_from_latest_redirect(&format!("{base}v{older}")).is_err());
         assert!(tag_from_latest_redirect("https://github.com/login").is_err());
         assert!(tag_from_latest_redirect(&format!(r"{base}v\..\x")).is_err());
         // The redirect must stay in this repository.

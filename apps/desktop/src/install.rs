@@ -311,10 +311,20 @@ fn copy_app_from(mount: &Path, dest_dir: &Path) -> Result<(), String> {
     // `symlink_metadata`, not `exists`: `exists` misses a dangling symlink, and River would
     // then offer to install and fail with an unclear error from the rename below.
     if fs::symlink_metadata(&dest).is_ok() {
-        return Err(format!(
-            "{} already exists but isn't a Freenet River can open. Remove it, then try again.",
-            dest.display()
-        ));
+        return Err(if dest.is_dir() {
+            // Most likely installed another way while River was downloading.
+            format!(
+                "Freenet appeared at {} while River was downloading it, so River left it \
+                 alone. Choose Try again to start it.",
+                dest.display()
+            )
+        } else {
+            format!(
+                "{} already exists but isn't an app River can open. Remove it, then try \
+                 again.",
+                dest.display()
+            )
+        });
     }
     let staging = private_dir(".Freenet.app.river-")
         .tempdir_in(dest_dir)
@@ -522,7 +532,9 @@ mod tests {
             b"plist"
         );
         let err = copy_app_from(mount.path(), apps.path()).unwrap_err();
-        assert!(err.contains("already exists"), "{err}");
+        // A real app already there is reported as such, not as something to remove.
+        assert!(err.contains("left it alone"), "{err}");
+        assert!(!err.contains("Remove it"), "{err}");
         let names: Vec<_> = fs::read_dir(apps.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())

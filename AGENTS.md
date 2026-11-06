@@ -237,11 +237,15 @@ Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders
 without a GPU need a software Vulkan driver (`mesa-vulkan-drivers`, then point
 `VK_ICD_FILENAMES` at its `lvp_icd*.json`).
 
-**When releasing the desktop app**, raise `MIN_VERSION` in
+**When releasing the desktop app**, raise `MIN_INSTALL_VERSION` in
 `apps/desktop/src/release.rs` to the current Freenet release. It is the oldest
 Freenet the installer will install, and the only thing stopping someone who
 can edit GitHub releases (but not sign them) from steering new users to an old
-signed release.
+signed release. Leave `MIN_NODE_VERSION`, the oldest running node River
+accepts, alone unless River needs something newer: nodes update over hours to
+days, and raising it early tells people with a working node that theirs is
+too old. The tests derive from both constants, so raising either needs no
+test changes.
 
 ## Share Links in Messages
 

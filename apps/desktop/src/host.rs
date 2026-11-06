@@ -77,13 +77,16 @@ fn ask(agent: &ureq::Agent, url: &str) -> Answer {
 /// suffixed version (`0.2.100-rc.1`) is still held to the floor. A version River can't parse
 /// at all is let through: the node reported one, so it is new enough to have the endpoint.
 fn classify(answer: Answer, installed: bool) -> NodeProbe {
-    let minimum = release::MIN_VERSION.to_string();
+    let minimum = release::MIN_NODE_VERSION.to_string();
     match answer {
         Answer::Version(version) => {
             let pre_release = version.split('+').next().unwrap_or_default().contains('-');
             match release::parse_version(version.split(['-', '+']).next().unwrap_or_default()) {
                 // A pre-release comes before its release, so `0.2.155-rc.1` is below 0.2.155.
-                Ok(v) if v < release::MIN_VERSION || (v == release::MIN_VERSION && pre_release) => {
+                Ok(v)
+                    if v < release::MIN_NODE_VERSION
+                        || (v == release::MIN_NODE_VERSION && pre_release) =>
+                {
                     NodeProbe::Outdated {
                         running: Some(version),
                         minimum,
@@ -107,7 +110,7 @@ impl NodeHost for DesktopHost {
     }
 
     fn can_install(&self) -> bool {
-        release::asset_name(release::MIN_VERSION).is_ok()
+        release::asset_name(release::MIN_INSTALL_VERSION).is_ok()
     }
 
     fn install(&self, progress: &mut dyn FnMut(InstallStep)) -> Result<(), String> {
@@ -197,9 +200,10 @@ impl Runner for SystemRunner {
 /// River never runs the node outside a service manager: a bare `freenet network` stops for
 /// good the first time it finds an update, because nothing is there to apply it and restart.
 ///
-/// `done_with_record` runs when a start works or River has registered a service, so River's
-/// record of its install can be dropped: from then on the binary is started like any other,
-/// and if the user later removes the service, River doesn't put it back.
+/// `done_with_record` runs when a service exists (a start works, a unit file is there, or
+/// River registered one), so River's record of its install can be dropped: from then on the
+/// binary is started like any other, and if the user later removes the service, River
+/// doesn't put it back.
 fn start_binary(
     bin: &Path,
     runner: &dyn Runner,
@@ -215,9 +219,14 @@ fn start_binary(
         }
         Err(e) => e,
     };
+    if services.user || services.system {
+        // A service exists, however it got there: River will never register one for this
+        // binary, so its record has done its job.
+        done_with_record();
+    }
     // freenet-core uses the user unit when there is one, so check it first.
     if services.user {
-        return Err(user_service_failed(&first, services.system));
+        return Err(user_service_failed(bin, &first, services.system));
     }
     if services.system {
         return Err(format!(
@@ -233,15 +242,8 @@ fn start_binary(
         ));
     }
     runner.run(bin, &["service", "install"]).map_err(|e| {
-        // Never suggest a bare `freenet network`: it stops for good at its first update.
         let hint = if cfg!(target_os = "linux") {
-            format!(
-                " Without a systemd user session, remove the user unit it may have left \
-                 (`rm ~/.config/systemd/user/freenet.service`), set Freenet up for the whole \
-                 system with `sudo {} service install --system`, start it with `sudo \
-                 systemctl start freenet`, then try again.",
-                bin.display()
-            )
+            format!(" {}", no_user_session_recipe(bin))
         } else {
             String::new()
         };
@@ -253,25 +255,38 @@ fn start_binary(
         .map_err(|e| format!("Freenet's service was set up but didn't start: {e}"))
 }
 
+/// Linux without a systemd user session: the steps that get Freenet running as a system
+/// service instead. The leftover user unit has to go first, because freenet-core prefers a
+/// user unit over a system one. Never a bare `freenet network`: it stops for good at its first
+/// update, with nothing to apply it and restart.
+fn no_user_session_recipe(bin: &Path) -> String {
+    format!(
+        "If there is no systemd user session here (so that command fails too), remove \
+         `~/.config/systemd/user/freenet.service`, set Freenet up for the whole system with \
+         `sudo {} service install --system`, start it with `sudo systemctl start freenet`, \
+         then try again. Freenet needs systemd on Linux.",
+        bin.display()
+    )
+}
+
 /// What to say when the user service exists but didn't start. freenet-core prefers the user
 /// unit, so a system unit next to it is ignored until the user unit is removed.
-fn user_service_failed(first: &str, system_unit_too: bool) -> String {
+fn user_service_failed(bin: &Path, first: &str, system_unit_too: bool) -> String {
     if !cfg!(target_os = "linux") {
-        return format!("Freenet's background service didn't start ({first}).");
+        return format!("Freenet's background service didn't start ({first}). Try again.");
     }
-    let mut message = format!(
-        "Freenet's background service didn't start ({first}). See why with \
-         `systemctl --user status freenet`."
-    );
-    if system_unit_too {
-        message.push_str(
-            " There is also a system service, which Freenet won't use while the user one \
-             exists. To use it instead, remove `~/.config/systemd/user/freenet.service` and \
-             run `sudo systemctl start freenet`.",
-        );
-    }
-    message.push_str(" Then try again.");
-    message
+    let next = if system_unit_too {
+        "There is also a system service, which Freenet won't use while the user one exists. \
+         To use it instead, remove `~/.config/systemd/user/freenet.service` and run `sudo \
+         systemctl start freenet`, then try again."
+            .to_string()
+    } else {
+        no_user_session_recipe(bin)
+    };
+    format!(
+        "Freenet's background service didn't start ({first}). See why with `systemctl --user \
+         status freenet`. {next}"
+    )
 }
 
 #[derive(Debug)]
@@ -468,8 +483,23 @@ mod tests {
             );
             if cfg!(target_os = "linux") {
                 assert!(err.contains("systemctl --user status freenet"), "{err}");
+                // The way out without a user session is in every such message, not just the
+                // first one, or a second attempt leaves the user with a command that fails.
+                assert!(
+                    err.contains("remove `~/.config/systemd/user/freenet.service`"),
+                    "{err}"
+                );
+                assert!(
+                    err.contains(&format!("`sudo {BIN} service install --system`")),
+                    "{err}"
+                );
+                assert!(err.contains("sudo systemctl start freenet"), "{err}");
+                assert!(!err.contains("also a system service"), "{err}");
             }
-            assert_eq!(dropped, 0);
+            assert_eq!(
+                dropped, 1,
+                "a unit exists, so River's record has done its job"
+            );
         }
     }
 
@@ -487,12 +517,14 @@ mod tests {
             let err = start(&r, ours, both).0.unwrap_err();
             assert_eq!(r.calls(), vec!["service start"], "ours = {ours}");
             if cfg!(target_os = "linux") {
+                assert!(err.contains("also a system service"), "{err}");
                 assert!(
-                    err.contains("rm ~/.config/systemd/user/freenet.service")
-                        || err.contains("remove `~/.config/systemd/user/freenet.service`"),
+                    err.contains("remove `~/.config/systemd/user/freenet.service`"),
                     "{err}"
                 );
                 assert!(err.contains("sudo systemctl start freenet"), "{err}");
+                // The system service is already set up: no install step this time.
+                assert!(!err.contains("service install --system"), "{err}");
             }
         }
     }
@@ -584,10 +616,17 @@ mod tests {
             "never suggests a bare node: {err}"
         );
         if cfg!(target_os = "linux") {
+            // All the steps that make the advice work, in an order that does.
+            assert!(
+                err.contains("remove `~/.config/systemd/user/freenet.service`"),
+                "{err}"
+            );
             assert!(
                 err.contains(&format!("`sudo {BIN} service install --system`")),
                 "{err}"
             );
+            assert!(err.contains("sudo systemctl start freenet"), "{err}");
+            assert!(err.contains("Freenet needs systemd on Linux"), "{err}");
         }
 
         let r = FakeRunner::failing(&["service start", "service start"]);
@@ -624,54 +663,63 @@ mod tests {
 
     #[test]
     fn what_answers_on_the_port_decides_the_state() {
-        let version = |v: &str| Answer::Version(v.into());
+        // Derived from the floor, so raising it doesn't break this test.
+        use release::Version;
+        let floor = release::MIN_NODE_VERSION;
+        let newer = Version(floor.0, floor.1 + 1, 0);
+        let older = match floor {
+            Version(a, b, c) if c > 0 => Version(a, b, c - 1),
+            Version(a, b, _) if b > 0 => Version(a, b - 1, 999),
+            Version(a, _, _) => Version(a - 1, 999, 999),
+        };
+        let version = |v: String| Answer::Version(v);
         assert_eq!(
-            classify(version("0.2.155"), true),
+            classify(version(floor.to_string()), true),
             NodeProbe::Running {
-                version: "0.2.155".into()
+                version: floor.to_string()
             }
         );
         assert_eq!(
-            classify(version("0.3.0"), false),
+            classify(version(newer.to_string()), false),
             NodeProbe::Running {
-                version: "0.3.0".into()
+                version: newer.to_string()
             }
         );
         // A suffix doesn't get a version past the floor.
         assert!(matches!(
-            classify(version("0.2.100-rc.1"), true),
+            classify(version(format!("{older}-rc.1")), true),
             NodeProbe::Outdated { .. }
         ));
         assert!(matches!(
-            classify(version("0.2.160+build.7"), true),
+            classify(version(format!("{newer}+build.7")), true),
             NodeProbe::Running { .. }
         ));
         // A pre-release of the floor itself comes before it; build metadata doesn't.
         assert!(matches!(
-            classify(version("0.2.155-rc.1"), true),
+            classify(version(format!("{floor}-rc.1")), true),
             NodeProbe::Outdated { .. }
         ));
         assert!(matches!(
-            classify(version("0.2.155+build.7"), true),
+            classify(version(format!("{floor}+build.7")), true),
             NodeProbe::Running { .. }
         ));
         assert_eq!(
-            classify(version("0.2.100"), true),
+            classify(version(older.to_string()), true),
             NodeProbe::Outdated {
-                running: Some("0.2.100".into()),
-                minimum: "0.2.155".into()
+                running: Some(older.to_string()),
+                minimum: floor.to_string()
             }
         );
         // A version River can't parse came from the endpoint, so the node has it.
         assert!(matches!(
-            classify(version("nightly"), true),
+            classify(version("nightly".into()), true),
             NodeProbe::Running { .. }
         ));
         assert_eq!(
             classify(Answer::NoVersion, true),
             NodeProbe::Outdated {
                 running: None,
-                minimum: "0.2.155".into()
+                minimum: floor.to_string()
             }
         );
         assert_eq!(
