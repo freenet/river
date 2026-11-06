@@ -125,6 +125,10 @@ fn a_failed_message_stays_and_does_not_hold_back_later_ones() {
 
     outbox.record_failure(&room(), a, "no signing key".to_string());
     sign_all(&mut outbox, b, &wb);
+    assert!(
+        outbox.has_ready(&room()),
+        "has_ready skips a failed head as take_ready does"
+    );
     assert_eq!(texts(&outbox.take_ready(&room())), ["b"]);
 
     let rows = outbox.pending_rows(&room());

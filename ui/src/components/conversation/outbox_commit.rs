@@ -1,8 +1,9 @@
 //! Moving outbox entries (`outbox.rs`) through signing into `ROOMS`.
 //!
-//! Every function here that writes a signal must run in a clean execution
-//! context (inside `crate::util::defer`), per `.claude/rules/dioxus-signal-safety.md`;
-//! they are named `*_now` to say so.
+//! Every signal write here runs in a clean execution context (inside
+//! `crate::util::defer`), per `.claude/rules/dioxus-signal-safety.md`. The
+//! `*_now` functions write directly and must be called from a deferred
+//! closure; `retry` and `discard` defer themselves.
 
 use super::outbox::{PendingEntry, PendingKind, SigningWork, OUTBOX};
 use crate::components::app::ROOMS;
@@ -312,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_the_room_does_not_admit_is_reported_not_dropped_silently() {
+    fn a_wrongly_signed_message_is_refused() {
         let room = owner_sk().verifying_key();
         let mut room_data = crate::room_data::test_minimal_room_data(room);
         let mut outbox = Outbox::default();
@@ -453,6 +454,99 @@ mod tests {
             room_data.room_state == before,
             "a refused entry leaves no trace"
         );
+    }
+
+    /// A refused entry is undone whole: a two-message entry whose second
+    /// message the room skips must not leave the first applied locally.
+    #[test]
+    fn a_refused_entry_leaves_no_half_applied() {
+        let room = owner_sk().verifying_key();
+        let mut room_data = crate::room_data::test_minimal_room_data(room);
+        let mut outbox = Outbox::default();
+        queue_send(&mut outbox, room, "original", 1);
+        let sent = outbox.take_ready(&room).pop().unwrap();
+        apply_entry(&mut room_data, &sent).unwrap();
+        let target = sent.message_ids()[0].clone();
+
+        let by = |sk: &SigningKey, body: RoomMessageBody| {
+            let message = MessageV1 {
+                room_owner: MemberId::from(&room),
+                author: MemberId::from(&sk.verifying_key()),
+                content: body,
+                time: SystemTime::now(),
+            };
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+            (message, bytes)
+        };
+        // The first half is the owner's and is admitted; the second is a
+        // validly signed message by a non-member, which the room skips.
+        let stranger = SigningKey::from_bytes(&[9u8; 32]);
+        let (id, work) = outbox.enqueue(
+            room,
+            PendingKind::Action {
+                label: "reaction",
+                effects: vec![],
+            },
+            owner_sk().verifying_key(),
+            vec![
+                by(
+                    &owner_sk(),
+                    RoomMessageBody::reaction(target.clone(), "👍".to_string()),
+                ),
+                by(
+                    &stranger,
+                    RoomMessageBody::reaction(target.clone(), "🎉".to_string()),
+                ),
+            ],
+        );
+        outbox.record_signature(&room, id, 0, owner_sk().sign(&work[0].1));
+        outbox.record_signature(&room, id, 1, stranger.sign(&work[1].1));
+        let entry = outbox.take_ready(&room).pop().unwrap();
+        let before = room_data.room_state.clone();
+        assert!(apply_entry(&mut room_data, &entry).is_err());
+        assert!(
+            room_data.room_state == before,
+            "the admitted half was rolled back with the refused one"
+        );
+        assert!(room_data
+            .room_state
+            .recent_messages
+            .reactions(&target)
+            .is_none());
+    }
+
+    /// Guards that have no runtime to test them in: leaving a room clears its
+    /// outbox, and a signing result that commits or reports nothing writes no
+    /// signal (each write re-renders the conversation).
+    #[test]
+    fn leave_clears_and_empty_results_write_nothing() {
+        let squash = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        let leave = squash(include_str!("../room_list/edit_room_modal.rs"));
+        let left = leave
+            .find("ROOMS.write().leave_room(room_vk);")
+            .expect("leave site");
+        assert!(
+            leave[left..].contains("clear_outbox_for_room_now(room_vk);"),
+            "leaving a room must clear its outbox"
+        );
+        let source = include_str!("outbox_commit.rs");
+        let prod = squash(&source[..source.find("#[cfg(test)]\nmod tests").unwrap()]);
+        for (guard, write) in [
+            ("OUTBOX.peek().has_ready(&room)", "o.take_ready(&room)"),
+            (
+                "OUTBOX.peek().has_failed_actions(&room)",
+                "o.take_failed_actions(&room)",
+            ),
+        ] {
+            let g = prod
+                .find(guard)
+                .unwrap_or_else(|| panic!("missing `{guard}`"));
+            let w = prod
+                .find(write)
+                .unwrap_or_else(|| panic!("missing `{write}`"));
+            assert!(g < w, "`{guard}` must come before `{write}`");
+        }
     }
 
     /// A message written as an identity the room has since replaced (an
