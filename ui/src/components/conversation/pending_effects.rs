@@ -245,6 +245,11 @@ mod tests {
             "a pending removal leaves none"
         );
         assert_eq!(
+            own_reaction_after_pending(None, &[react("👍"), unreact("👍")], &id(1)),
+            None,
+            "a pending reaction undone by a second click leaves none"
+        );
+        assert_eq!(
             own_reaction_after_pending(Some("👍".into()), &[unreact("👍"), react("🎉")], &id(1))
                 .as_deref(),
             Some("🎉"),

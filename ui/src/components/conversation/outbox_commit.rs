@@ -43,6 +43,14 @@ pub(crate) fn retry(room: VerifyingKey, id: u64) {
     });
 }
 
+/// Drop everything waiting in `room`: the user left it. From a deferred
+/// closure only.
+pub(crate) fn clear_room_now(room: VerifyingKey) {
+    if OUTBOX.peek().has_room(&room) {
+        OUTBOX.with_mut(|o| o.clear_room(&room));
+    }
+}
+
 /// Drop a failed entry at the user's request.
 pub(crate) fn discard(room: VerifyingKey, id: u64) {
     crate::util::defer(move || {
@@ -121,22 +129,27 @@ fn start_signing(
 /// that removes it from the outbox: the pending row and the committed message
 /// are swapped in one render, so neither a gap nor a duplicate shows.
 pub(crate) fn commit_ready_now(room: VerifyingKey) {
-    let ready = OUTBOX.with_mut(|o| o.take_ready(&room));
-    if ready.is_empty() {
+    if !ROOMS.peek().map.contains_key(&room) {
+        // Left (on any path) while these were signing: there is nowhere to
+        // commit them or show them, so they go with the room.
+        if OUTBOX.peek().has_room(&room) {
+            let dropped = OUTBOX.with_mut(|o| o.clear_room(&room));
+            warn!("Room left with {dropped} unsent message(s); dropped");
+        }
         return;
     }
+    // Checked first so a result that commits nothing writes no signal.
+    if !OUTBOX.peek().has_ready(&room) {
+        return;
+    }
+    let ready = OUTBOX.with_mut(|o| o.take_ready(&room));
     let outcomes: Option<Vec<Result<(), String>>> = ROOMS.with_mut(|rooms| {
         let room_data = rooms.map.get_mut(&room)?;
         Some(ready.iter().map(|e| apply_entry(room_data, e)).collect())
     });
     let Some(outcomes) = outcomes else {
-        // The room was left while these were signing: there is nowhere to
-        // commit them or show them, so they go with the room.
-        let rest = OUTBOX.with_mut(|o| o.clear_room(&room));
-        warn!(
-            "Room left with {} unsent message(s); dropped",
-            ready.len() + rest
-        );
+        // Unreachable: checked above, in the same synchronous call.
+        warn!("Room left with {} unsent message(s); dropped", ready.len());
         return;
     };
     let mut any_applied = false;
@@ -164,6 +177,9 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
 /// A failed edit, delete or reaction has no row to show it on: say so once and
 /// drop it.
 fn report_failed_actions_now(room: VerifyingKey) {
+    if !OUTBOX.peek().has_failed_actions(&room) {
+        return;
+    }
     let failed: Vec<PendingEntry> = OUTBOX.with_mut(|o| o.take_failed_actions(&room));
     for entry in failed {
         if let PendingKind::Action { label, .. } = entry.kind {
@@ -179,6 +195,26 @@ fn action_failed_toast(label: &'static str) {
 /// Apply one entry's signed messages to the room, with a rejoin if this member
 /// was pruned for inactivity.
 fn apply_entry(room_data: &mut RoomData, entry: &PendingEntry) -> Result<(), String> {
+    // Written as an identity this room no longer uses (an identity import
+    // replaced it while this was signing): never publish it under the old one.
+    if room_data.self_verifying_key() != Some(entry.author_vk) {
+        return Err("this room's identity changed after the message was written".to_string());
+    }
+    let parent = room_data.room_state.clone();
+    let result = apply_entry_to(room_data, entry, &parent);
+    if result.is_err() {
+        // All of the entry or none of it: a reaction swap whose second half
+        // the room skipped must not leave the first half applied locally.
+        room_data.room_state = parent;
+    }
+    result
+}
+
+fn apply_entry_to(
+    room_data: &mut RoomData,
+    entry: &PendingEntry,
+    parent: &river_core::ChatRoomStateV1,
+) -> Result<(), String> {
     let (members, member_info) = room_data.build_rejoin_delta();
     let delta = ChatRoomStateV1Delta {
         recent_messages: Some(entry.authorized()),
@@ -186,11 +222,10 @@ fn apply_entry(room_data: &mut RoomData, entry: &PendingEntry) -> Result<(), Str
         member_info,
         ..Default::default()
     };
-    let parent = room_data.room_state.clone();
     room_data
         .room_state
         .apply_delta(
-            &parent,
+            parent,
             &ChatRoomParametersV1 {
                 owner: room_data.owner_vk,
             },
@@ -342,6 +377,96 @@ mod tests {
         assert!(messages
             .reactions(&target)
             .is_some_and(|r| r.contains_key("👍")));
+
+        // The other two kinds: removing the reaction, then deleting.
+        let (id, work) = outbox.enqueue(
+            room,
+            PendingKind::Action {
+                label: "delete",
+                effects: vec![],
+            },
+            owner_sk().verifying_key(),
+            vec![
+                action(
+                    RoomMessageBody::remove_reaction(target.clone(), "👍".to_string()),
+                    3,
+                ),
+                action(RoomMessageBody::delete(target.clone()), 4),
+            ],
+        );
+        for (i, bytes) in work {
+            outbox.record_signature(&room, id, i, owner_sk().sign(&bytes));
+        }
+        let entry = outbox.take_ready(&room).pop().unwrap();
+        apply_entry(&mut room_data, &entry)
+            .expect("a reaction removal and a delete are admitted, not reported as refused");
+        let messages = &room_data.room_state.recent_messages;
+        assert!(messages
+            .reactions(&target)
+            .is_none_or(|r| !r.contains_key("👍")));
+        assert!(messages.display_messages().all(|m| m.id() != target));
+    }
+
+    /// An action the room does not admit is reported, so the user is told
+    /// (`commit_ready_now` toasts it) instead of the change silently undoing.
+    #[test]
+    fn an_action_the_room_does_not_admit_is_reported() {
+        let room = owner_sk().verifying_key();
+        let mut room_data = crate::room_data::test_minimal_room_data(room);
+        let mut outbox = Outbox::default();
+        queue_send(&mut outbox, room, "original", 1);
+        let sent = outbox.take_ready(&room).pop().unwrap();
+        apply_entry(&mut room_data, &sent).unwrap();
+        let target = sent.message_ids()[0].clone();
+
+        // Validly signed by someone who is not a member of the room: the room
+        // skips it without an error. (This device holds that identity, so it
+        // is the admission check that refuses it, not the identity check.)
+        let stranger = SigningKey::from_bytes(&[9u8; 32]);
+        room_data.self_sk = Some(stranger.clone());
+        let message = MessageV1 {
+            room_owner: MemberId::from(&room),
+            author: MemberId::from(&stranger.verifying_key()),
+            content: RoomMessageBody::edit(target.clone(), "hijacked".to_string()),
+            time: SystemTime::now(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+        let (id, work) = outbox.enqueue(
+            room,
+            PendingKind::Action {
+                label: "edit",
+                effects: vec![],
+            },
+            stranger.verifying_key(),
+            vec![(message, bytes)],
+        );
+        outbox.record_signature(&room, id, 0, stranger.sign(&work[0].1));
+        let entry = outbox.take_ready(&room).pop().unwrap();
+        let before = room_data.room_state.clone();
+        assert_eq!(
+            apply_entry(&mut room_data, &entry),
+            Err("the room did not admit the message".to_string())
+        );
+        assert!(!room_data.room_state.recent_messages.is_edited(&target));
+        assert!(
+            room_data.room_state == before,
+            "a refused entry leaves no trace"
+        );
+    }
+
+    /// A message written as an identity the room has since replaced (an
+    /// identity import while it was signing) is never committed under it.
+    #[test]
+    fn a_message_from_a_replaced_identity_is_not_committed() {
+        let room = owner_sk().verifying_key();
+        let mut room_data = crate::room_data::test_minimal_room_data(room);
+        let mut outbox = Outbox::default();
+        queue_send(&mut outbox, room, "from the old identity", 1);
+        let entry = outbox.take_ready(&room).pop().unwrap();
+        room_data.self_sk = Some(SigningKey::from_bytes(&[3u8; 32]));
+        assert!(apply_entry(&mut room_data, &entry).is_err());
+        assert!(texts_in(&room_data).is_empty());
     }
 
     /// The commit takes the entry out of the outbox and writes it to `ROOMS`

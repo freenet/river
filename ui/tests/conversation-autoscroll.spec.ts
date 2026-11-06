@@ -1205,6 +1205,22 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
+  test("sending from a held range while signing is slow shows the pending row in the latest range", { tag: "@chromium-only" }, async ({
+    page,
+  }) => {
+    await parkPastTheCeiling(page);
+    await callRiverTest(page, "appendMessage", "newest before the slow send");
+    await expect.poll(() => withheld(page), { message: "premise: newer messages are held back" }).toBeGreaterThan(0);
+
+    await callRiverTest(page, "holdMessageSigning");
+    await sendWithEnter(page, "slow send from a held range");
+    const row = page.getByTestId("pending-message").filter({ hasText: "slow send from a held range" });
+    await expect(row, "the pending row shows before the signature").toBeInViewport();
+    expect(await withheld(page), "the send took the latest range").toBe(0);
+    await callRiverTest(page, "releaseMessageSigning");
+    await expectAtEndShowing(page, "slow send from a held range", "the committed send is not at the end");
+  });
+
   // A send's scroll belongs to the room it was sent in. A switch that lands
   // after the keypress but before the send applies leaves the new room to its
   // own opening, and a later arrival there must not finish the old room's send.

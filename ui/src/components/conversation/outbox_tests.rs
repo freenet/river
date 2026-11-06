@@ -102,13 +102,19 @@ fn messages_commit_in_the_order_they_were_sent_whatever_order_they_are_signed_in
     sign_all(&mut outbox, c, &wc);
     sign_all(&mut outbox, b, &wb);
     assert!(
+        !outbox.has_ready(&room()),
+        "has_ready agrees with take_ready"
+    );
+    assert!(
         outbox.take_ready(&room()).is_empty(),
         "b and c are signed but must wait for a"
     );
     assert_eq!(outbox.pending_rows(&room()).len(), 3);
 
     sign_all(&mut outbox, a, &wa);
+    assert!(outbox.has_ready(&room()));
     assert_eq!(texts(&outbox.take_ready(&room())), ["a", "b", "c"]);
+    assert!(!outbox.has_ready(&room()));
 }
 
 #[test]
@@ -263,8 +269,14 @@ fn a_failed_action_is_taken_out_and_a_failed_send_is_not() {
         vec![message("delete", 3)],
     );
     outbox.record_failure(&room(), a, "x".to_string());
+    assert!(
+        !outbox.has_failed_actions(&room()),
+        "a failed send is not one"
+    );
     outbox.record_failure(&room(), e, "x".to_string());
+    assert!(outbox.has_failed_actions(&room()));
     assert_eq!(texts(&outbox.take_failed_actions(&room())), ["edit"]);
+    assert!(!outbox.has_failed_actions(&room()));
     assert_eq!(
         outbox.pending_rows(&room()).len(),
         1,
@@ -370,6 +382,8 @@ fn leaving_a_room_drops_what_waits_in_it() {
     let mut outbox = Outbox::default();
     send(&mut outbox, "a", 1);
     send(&mut outbox, "b", 2);
+    assert!(outbox.has_room(&room()));
     assert_eq!(outbox.clear_room(&room()), 2);
     assert!(outbox.pending_rows(&room()).is_empty());
+    assert!(!outbox.has_room(&room()));
 }

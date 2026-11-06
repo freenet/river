@@ -41,6 +41,7 @@ mod message_input;
 mod not_member_notification;
 mod outbox;
 mod outbox_commit;
+pub(crate) use self::outbox_commit::clear_room_now as clear_outbox_for_room_now;
 mod pending_effects;
 mod pending_sends;
 use self::emoji_picker::FREQUENT_EMOJIS;
@@ -5493,6 +5494,25 @@ mod tests {
                  runs on the event handler's stack"
             );
         }
+        // An own send requests the end when its pending row is added. That
+        // write changes neither `message_groups` nor `window_items`, so both
+        // the render (which takes the latest range for a held reader) and the
+        // post-render scroll effect (which lands the request) must subscribe
+        // to the outbox, or the view waits for the commit.
+        let body = &squashed[squashed.find("pubfnConversation()->Element{").unwrap()..];
+        let render = &body[..body.find("letmutnewest_in_view=").unwrap()];
+        assert!(
+            render.contains("OUTBOX.try_read()"),
+            "the Conversation render must subscribe to OUTBOX"
+        );
+        let effect_end = body
+            .find("complete_scroll_request(&reader_position")
+            .unwrap();
+        let effect = &body[body[..effect_end].rfind("use_effect(").unwrap()..effect_end];
+        assert!(
+            effect.contains("OUTBOX.try_read()"),
+            "the scroll effect must subscribe to OUTBOX"
+        );
         // Every path into the outbox is one of the four above.
         assert_eq!(
             squashed.matches("outbox_commit::submit_now(").count(),

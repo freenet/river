@@ -14,7 +14,8 @@
 //! (and so the network) in the order the user made them. A failed entry does
 //! not hold back the ones after it: it stays, marked failed, until the user
 //! retries or discards it (a retried message then commits after them, keeping
-//! its original timestamp). Leaving the room drops what is waiting in it.
+//! its original timestamp). Leaving the room drops what is waiting in it
+//! (`outbox_commit::clear_room_now`).
 //!
 //! The outbox is memory only: a reload while a message is still being signed
 //! loses it.
@@ -173,7 +174,11 @@ impl Outbox {
     }
 
     /// Record one message's signature. Ignored for an entry that is gone or
-    /// has failed (a late answer to an abandoned attempt).
+    /// has failed (a late answer to an abandoned attempt). Results are keyed
+    /// by entry and index, not by attempt: a late result from an attempt
+    /// before a Retry would land on the new attempt. That cannot happen today,
+    /// because only sends (one message, failed once its request completed) are
+    /// retried.
     pub fn record_signature(&mut self, room: &VerifyingKey, id: u64, index: usize, sig: Signature) {
         if let Some(entry) = self.entry_mut(room, id) {
             if entry.state == PendingState::Signing {
@@ -192,6 +197,32 @@ impl Outbox {
                 m.signature = None;
             }
         }
+    }
+
+    /// Whether `take_ready` would return anything (so a caller can skip the
+    /// signal write, and the renders it causes, when it would not).
+    pub fn has_ready(&self, room: &VerifyingKey) -> bool {
+        self.rooms.get(room).is_some_and(|queue| {
+            queue
+                .iter()
+                .find(|e| e.state == PendingState::Signing)
+                .is_some_and(|e| e.fully_signed())
+        })
+    }
+
+    /// Whether `take_failed_actions` would return anything.
+    pub fn has_failed_actions(&self, room: &VerifyingKey) -> bool {
+        self.rooms.get(room).is_some_and(|queue| {
+            queue.iter().any(|e| {
+                matches!(e.kind, PendingKind::Action { .. })
+                    && matches!(e.state, PendingState::Failed(_))
+            })
+        })
+    }
+
+    /// Whether anything waits in `room`.
+    pub fn has_room(&self, room: &VerifyingKey) -> bool {
+        self.rooms.contains_key(room)
     }
 
     /// Remove and return, in order, the entries ready to commit: from the
