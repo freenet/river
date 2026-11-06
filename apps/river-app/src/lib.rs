@@ -3,6 +3,7 @@
 //! A shell (today `apps/desktop`) supplies a [`NodeHost`] that knows how to find, install and
 //! start Freenet on its platform; everything the user sees lives here.
 
+pub mod chat;
 pub mod node;
 pub mod setup;
 
@@ -10,11 +11,15 @@ use rune::tok::{self, type_};
 use rune::{AppHandle, AppSpec, Cx, El, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Kit};
 
+pub use chat::Chat;
 pub use node::{InstallStep, MANUAL_INSTALL_URL, NodeHost, NodeProbe};
 pub use setup::{Controller, Setup};
 
 pub struct RiverApp {
     pub setup: Setup,
+    /// The chat screen, shown once setup reaches [`Setup::Connected`]. It holds example data
+    /// for now ([`chat::Source::Example`]): nothing is read from or sent to the node yet.
+    pub chat: Chat,
     /// `None` in headless snapshots and tests, where nothing runs in the background.
     ctl: Option<Controller>,
 }
@@ -24,6 +29,7 @@ impl RiverApp {
     pub fn detached() -> Self {
         RiverApp {
             setup: Setup::Checking,
+            chat: Chat::example(),
             ctl: None,
         }
     }
@@ -33,6 +39,7 @@ impl RiverApp {
         ctl.check();
         RiverApp {
             setup: Setup::Checking,
+            chat: Chat::example(),
             ctl: Some(ctl),
         }
     }
@@ -83,18 +90,47 @@ pub const SCENES: &[Scene] = &[
     ("failed", |s| {
         s.setup = Setup::Failed("Couldn't install Freenet: the download was interrupted.".into())
     }),
-    ("connected", |s| {
-        s.setup = Setup::Connected {
-            version: "0.2.155".into(),
-        }
+    // Connected: the chat screen, on example data.
+    ("chat", connect),
+    ("chat-members-hidden", |s| {
+        connect(s);
+        s.chat.members_open = false;
     }),
+    ("chat-private-room", |s| {
+        connect(s);
+        s.chat.select(chat::example::PRIVATE_ROOM);
+    }),
+    ("chat-composing", |s| {
+        connect(s);
+        s.chat
+            .composer
+            .replace_text("Sounds good, I'll bring the slides on Thursday");
+        s.chat.composer.focused = true;
+    }),
+    ("chat-empty-room", |s| {
+        connect(s);
+        s.chat.select(chat::example::EMPTY_ROOM);
+    }),
+    // Render this one at a narrow size (`--size 820x720`): the layout follows the window's
+    // width, and a scene cannot set that.
+    ("chat-narrow", connect),
 ];
+
+fn connect(s: &mut RiverApp) {
+    s.setup = Setup::Connected {
+        version: "0.2.155".into(),
+    };
+}
+
+/// The window's opening size, in points: room for the room list, a conversation and the
+/// members panel side by side.
+pub const WINDOW_SIZE: (f32, f32) = (1280.0, 800.0);
 
 pub fn spec() -> AppSpec<RiverApp> {
     AppSpec {
         scenes: SCENES,
-        min_size: Some((420.0, 400.0)),
-        ..AppSpec::new("River", (560.0, 440.0), RiverApp::detached, view)
+        min_size: Some((640.0, 480.0)),
+        ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
 }
 
@@ -162,13 +198,7 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
             None,
             vec![retry_button(&k), manual_install_button(&k)],
         ),
-        Setup::Connected { version } => panel(
-            t,
-            "Connected to Freenet",
-            &format!("Freenet {version} is running on this computer."),
-            None,
-            vec![],
-        ),
+        Setup::Connected { version } => return chat::view(&s.chat, version, cx),
     };
     col()
         .key("root")
@@ -386,6 +416,7 @@ mod tests {
         let ctl = Controller::reporting_to(host.clone(), |_| {});
         let state = RiverApp {
             setup,
+            chat: Chat::example(),
             ctl: Some(ctl),
         };
         let env = Env {
@@ -433,7 +464,7 @@ mod tests {
                 Setup::Installing(InstallStep::WaitingForInstaller) => "waiting-for-installer",
                 Setup::Starting => "starting",
                 Setup::Failed(_) => "failed",
-                Setup::Connected { .. } => "connected",
+                Setup::Connected { .. } => "chat",
             }
         }
         let mut covered: Vec<&str> = SCENES
@@ -441,8 +472,13 @@ mod tests {
             .map(|(name, apply)| {
                 let mut s = RiverApp::detached();
                 apply(&mut s);
-                assert_eq!(screen(&s.setup), *name, "scene {name} shows another screen");
-                *name
+                let shown = screen(&s.setup);
+                // Variants of one screen share its name as a prefix ("chat-private-room").
+                assert!(
+                    *name == shown || name.starts_with(&format!("{shown}-")),
+                    "scene {name} shows the {shown} screen"
+                );
+                shown
             })
             .collect();
         covered.sort();
