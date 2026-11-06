@@ -25,7 +25,7 @@ use crate::components::tooltip::WithTooltip;
 use crate::room_data::{NotificationMode, SendMessageError};
 use crate::util::confusable::{ImpersonationChecker, ImpersonationWarning};
 use crate::util::display_name::display_nickname;
-use crate::util::ecies::{encrypt_with_symmetric_key, unseal_text_or_placeholder};
+use crate::util::ecies::unseal_text_or_placeholder;
 use crate::util::{
     date_separator_labels, format_utc_as_full_datetime, format_utc_as_local_time,
     get_current_system_time, local_message_date, local_today,
@@ -48,6 +48,7 @@ pub(crate) use self::outbox_commit::{
 };
 mod pending_effects;
 mod pending_sends;
+mod seal;
 use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
@@ -63,9 +64,10 @@ use self::markdown::{
     render_message_html_cached, running_behind_freenet_gateway,
 };
 use self::not_member_notification::NotMemberNotification;
-use self::outbox::{PendingEffect, PendingKind, OUTBOX};
+use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
 use self::pending_sends::PendingSends;
+use self::seal::SealInput;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
@@ -175,30 +177,34 @@ fn action_secret(room_data: &crate::room_data::RoomData) -> Option<Option<([u8; 
 fn action_body(
     action: river_core::room_state::content::ActionContentV1,
     secret: Option<Option<([u8; 32], u32)>>,
-) -> Option<RoomMessageBody> {
+) -> Option<(RoomMessageBody, Option<SealInput>)> {
     match secret {
         // What `RoomMessageBody::{edit, delete, reaction, remove_reaction}`
         // build: the same encoding, so the same bytes.
-        None => Some(RoomMessageBody::Public {
-            content_type: river_core::room_state::content::CONTENT_TYPE_ACTION,
-            content_version: river_core::room_state::content::ACTION_CONTENT_VERSION,
-            data: action.encode(),
-        }),
+        None => Some((
+            RoomMessageBody::Public {
+                content_type: river_core::room_state::content::CONTENT_TYPE_ACTION,
+                content_version: river_core::room_state::content::ACTION_CONTENT_VERSION,
+                data: action.encode(),
+            },
+            None,
+        )),
         Some(None) => None,
         Some(Some((secret, version))) => {
-            let (ciphertext, nonce) = encrypt_with_symmetric_key(&secret, &action.encode());
-            Some(RoomMessageBody::private_action(ciphertext, nonce, version))
+            let seal = SealInput::Action(action);
+            Some((seal.seal(&secret, version), Some(seal)))
         }
     }
 }
 
 /// A message by `identity` in `room`, stamped now, with the CBOR bytes its
-/// signature will cover. `None` (logged) if it does not serialize.
+/// signature will cover and, for a sealed body, what it was sealed from.
+/// `None` (logged) if it does not serialize.
 fn unsigned_message(
     room: ed25519_dalek::VerifyingKey,
     identity: &ActionIdentity,
-    content: RoomMessageBody,
-) -> Option<(MessageV1, Vec<u8>)> {
+    (content, seal): (RoomMessageBody, Option<SealInput>),
+) -> Option<NewMessage> {
     let message = MessageV1 {
         room_owner: MemberId::from(room),
         author: MemberId::from(&identity.author_vk),
@@ -210,7 +216,7 @@ fn unsigned_message(
         error!("Failed to serialize message for signing: {:?}", e);
         return None;
     }
-    Some((message, bytes))
+    Some((message, bytes, seal))
 }
 
 /// The sender's own nickname, as the room shows it, for a pending row.
@@ -2208,70 +2214,40 @@ pub fn Conversation() -> Element {
                     .max_message_size;
                 drop(current_room_data);
 
-                use river_core::room_state::content::{
-                    ReplyContentV1, TextContentV1, CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT,
-                    REPLY_CONTENT_VERSION, TEXT_CONTENT_VERSION,
-                };
-
-                // Build content based on whether this is a reply or regular message
-                let content = if let Some(reply) = reply_ctx {
-                    // Reply message
-                    if is_private {
-                        if let Some((secret, version)) = secret_opt {
-                            let reply_content = ReplyContentV1::new(
-                                message_text.clone(),
-                                reply.message_id,
-                                reply.author_name,
-                                reply.content_preview,
-                            );
-                            let content_bytes = reply_content.encode();
-                            let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(&secret, &content_bytes);
-                            RoomMessageBody::private(
-                                CONTENT_TYPE_REPLY,
-                                REPLY_CONTENT_VERSION,
-                                ciphertext,
-                                nonce,
-                                version,
-                            )
-                        } else {
+                // Build content based on whether this is a reply or regular
+                // message. A private body keeps what it was sealed from, so
+                // it can be sealed again if the room's secret rotates while
+                // it is being signed (`seal.rs`).
+                let (content, seal) = match (reply_ctx, is_private) {
+                    (Some(reply), false) => (
+                        RoomMessageBody::reply(
+                            message_text.clone(),
+                            reply.message_id,
+                            reply.author_name,
+                            reply.content_preview,
+                        ),
+                        None,
+                    ),
+                    (None, false) => (RoomMessageBody::public(message_text.clone()), None),
+                    (reply, true) => {
+                        let Some((secret, version)) = secret_opt else {
                             // The composer is not offered without the
                             // secret (see `missing_room_secret`); this
                             // is the backstop. A public body in a private
                             // room is not admitted.
                             error!("Cannot send: this private room's secret is not on this device");
                             return;
-                        }
-                    } else {
-                        RoomMessageBody::reply(
-                            message_text.clone(),
-                            reply.message_id,
-                            reply.author_name,
-                            reply.content_preview,
-                        )
-                    }
-                } else {
-                    // Regular text message
-                    if is_private {
-                        if let Some((secret, version)) = secret_opt {
-                            let text_content = TextContentV1::new(message_text.clone());
-                            let content_bytes = text_content.encode();
-                            let (ciphertext, nonce) =
-                                encrypt_with_symmetric_key(&secret, &content_bytes);
-                            RoomMessageBody::private(
-                                CONTENT_TYPE_TEXT,
-                                TEXT_CONTENT_VERSION,
-                                ciphertext,
-                                nonce,
-                                version,
-                            )
-                        } else {
-                            // Backstop, as for a reply above.
-                            error!("Cannot send: this private room's secret is not on this device");
-                            return;
-                        }
-                    } else {
-                        RoomMessageBody::public(message_text.clone())
+                        };
+                        let seal = match reply {
+                            Some(reply) => SealInput::Reply {
+                                text: message_text.clone(),
+                                message_id: reply.message_id,
+                                author_name: reply.author_name,
+                                content_preview: reply.content_preview,
+                            },
+                            None => SealInput::Text(message_text.clone()),
+                        };
+                        (seal.seal(&secret, version), Some(seal))
                     }
                 };
 
@@ -2321,7 +2297,7 @@ pub fn Conversation() -> Element {
                             author_name,
                         },
                         author_vk,
-                        vec![(message, message_bytes)],
+                        vec![(message, message_bytes, seal)],
                         fallback_key,
                     );
                     // An own send goes to the end, now, to show the pending

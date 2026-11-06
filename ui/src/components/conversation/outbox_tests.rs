@@ -166,13 +166,13 @@ fn retry_signs_again_and_commits() {
     let mut outbox = Outbox::default();
     let (a, wa) = send(&mut outbox, "a", 1);
     assert!(
-        outbox.retry(&room(), a, later()).is_none(),
+        outbox.retry(&room(), a, later(), None).is_none(),
         "only a failed entry can be retried"
     );
     outbox.record_failure(&room(), a, "timed out".to_string());
 
     let (vk, work) = outbox
-        .retry(&room(), a, later())
+        .retry(&room(), a, later(), None)
         .expect("a failed entry retries");
     assert_eq!(vk, author().verifying_key());
     assert_ne!(work, wa, "a retry is restamped, so it signs new bytes");
@@ -361,7 +361,7 @@ fn a_retried_message_commits_after_the_ones_that_went_ahead() {
     let (b, wb) = send(&mut outbox, "b", 2);
     outbox.record_failure(&room(), a, "timed out".to_string());
     sign_all(&mut outbox, b, &wb);
-    let (_, wa) = outbox.retry(&room(), a, later()).unwrap();
+    let (_, wa) = outbox.retry(&room(), a, later(), None).unwrap();
     sign_all(&mut outbox, a, &wa);
     let first = outbox.take_ready(&room());
     assert_eq!(texts(&first), ["a", "b"], "both ready: committed in order");
@@ -372,7 +372,7 @@ fn a_retried_message_commits_after_the_ones_that_went_ahead() {
     outbox.record_failure(&room(), a, "timed out".to_string());
     sign_all(&mut outbox, b, &wb);
     assert_eq!(texts(&outbox.take_ready(&room())), ["b"]);
-    let (_, wa) = outbox.retry(&room(), a, later()).unwrap();
+    let (_, wa) = outbox.retry(&room(), a, later(), None).unwrap();
     sign_all(&mut outbox, a, &wa);
     assert_eq!(texts(&outbox.take_ready(&room())), ["a"]);
 }
@@ -385,7 +385,7 @@ fn a_refused_message_can_be_retried() {
     let entry = outbox.take_ready(&room()).pop().unwrap();
     outbox.restore_failed(room(), entry, "not admitted".to_string());
     let (_, work) = outbox
-        .retry(&room(), a, later())
+        .retry(&room(), a, later(), None)
         .expect("a refused message retries");
     assert_ne!(work, wa, "a retry is restamped, so it signs new bytes");
     assert_eq!(
@@ -485,9 +485,98 @@ fn a_reload_would_lose_signing_messages_and_failed_rows_on_screen_only() {
         !outbox.has_unsent(shown),
         "a failed action has no row; it is reported and dropped"
     );
-    let (_, work) = outbox.retry(&room(), e, later()).unwrap();
+    let (_, work) = outbox.retry(&room(), e, later(), None).unwrap();
     assert!(outbox.has_unsent(|_| None));
     sign_all(&mut outbox, e, &work);
     let _ = outbox.take_ready(&room());
     assert!(!outbox.has_unsent(shown));
+}
+
+/// A private message sealed under v1, signed while the room rotated to v2.
+fn sealed_entry(outbox: &mut Outbox, text: &str, ms: u64, version: u32) -> (u64, SigningWork) {
+    use super::super::seal::SealInput;
+    let seal = SealInput::Text(text.to_string());
+    let (mut message, _) = message(text, ms);
+    message.content = seal.seal(&[1u8; 32], version);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+    outbox.enqueue_sealed(
+        room(),
+        PendingKind::Send {
+            text: text.to_string(),
+            author_name: "Me".to_string(),
+        },
+        author().verifying_key(),
+        vec![(message, bytes, Some(seal))],
+    )
+}
+
+fn version_of(entry: &PendingEntry) -> u32 {
+    match &entry.messages[0].message.content {
+        RoomMessageBody::Private { secret_version, .. } => *secret_version,
+        RoomMessageBody::Public { .. } => panic!("expected a sealed body"),
+    }
+}
+
+/// The room's secret rotated (a join, a prune or a ban) while a private
+/// message was being signed: it is not committed under the old secret, it is
+/// sealed again under the new one, re-signed, and committed, keeping its
+/// timestamp and its place ahead of what was sent after it.
+#[test]
+fn a_message_signed_across_a_rotation_is_sealed_again_and_committed_in_order() {
+    let mut outbox = Outbox::default();
+    let (a, wa) = sealed_entry(&mut outbox, "across the rotation", 10, 1);
+    let (b, wb) = sealed_entry(&mut outbox, "after it", 20, 2);
+    sign_all(&mut outbox, a, &wa);
+    sign_all(&mut outbox, b, &wb);
+
+    let (ready, stale) = outbox.take_ready_sealed_under(&room(), Some(Some(2)));
+    assert!(ready.is_empty(), "nothing commits ahead of the stale entry");
+    assert_eq!(stale, Some(a));
+
+    let (vk, work) = outbox
+        .reseal(&room(), a, &[2u8; 32], 2)
+        .expect("sealed again under the current secret");
+    assert_eq!(vk, author().verifying_key());
+    assert_ne!(work, wa, "new bytes to sign");
+    sign_all(&mut outbox, a, &work);
+
+    let (ready, stale) = outbox.take_ready_sealed_under(&room(), Some(Some(2)));
+    assert_eq!(stale, None);
+    assert_eq!(texts(&ready), ["across the rotation", "after it"]);
+    assert_eq!(version_of(&ready[0]), 2, "committed under the new secret");
+    assert_eq!(
+        ready[0].messages[0].message.time,
+        SystemTime::UNIX_EPOCH + Duration::from_millis(10),
+        "keeping its Enter-time timestamp"
+    );
+    ready[0].authorized()[0]
+        .validate(&author().verifying_key())
+        .expect("the new signature covers the resealed message");
+}
+
+#[test]
+fn resealing_is_bounded_and_retry_seals_again() {
+    let mut outbox = Outbox::default();
+    let (a, _) = sealed_entry(&mut outbox, "keeps rotating", 10, 1);
+    for v in 2..2 + MAX_RESEALS {
+        assert!(outbox.reseal(&room(), a, &[3u8; 32], v).is_some());
+    }
+    assert!(
+        outbox.reseal(&room(), a, &[3u8; 32], 99).is_none(),
+        "bounded"
+    );
+    let rows = outbox.pending_rows(&room(), &author().verifying_key());
+    assert!(rows[0].failed.is_some(), "shown as failed, text kept");
+
+    let (_, work) = outbox
+        .retry(&room(), a, later(), Some(([4u8; 32], 7)))
+        .expect("Retry works on it");
+    sign_all(&mut outbox, a, &work);
+    let (ready, _) = outbox.take_ready_sealed_under(&room(), Some(Some(7)));
+    assert_eq!(
+        version_of(&ready[0]),
+        7,
+        "Retry sealed it under the current secret"
+    );
 }

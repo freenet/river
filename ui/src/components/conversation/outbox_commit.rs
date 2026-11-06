@@ -5,14 +5,13 @@
 //! `*_now` functions write directly and must be called from a deferred
 //! closure; `retry` and `discard` defer themselves.
 
-use super::outbox::{PendingEntry, PendingKind, SigningWork, OUTBOX};
+use super::outbox::{NewMessage, PendingEntry, PendingKind, SigningWork, OUTBOX};
 use crate::components::app::ROOMS;
 use crate::room_data::RoomData;
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
-use river_core::room_state::message::MessageV1;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
 
 /// Add an entry to `room`'s outbox and start signing it. Returns the entry's
@@ -22,10 +21,10 @@ pub(crate) fn submit_now(
     room: VerifyingKey,
     kind: PendingKind,
     author_vk: VerifyingKey,
-    messages: Vec<(MessageV1, Vec<u8>)>,
+    messages: Vec<NewMessage>,
     fallback_key: Option<SigningKey>,
 ) -> u64 {
-    let (id, work) = OUTBOX.with_mut(|o| o.enqueue(room, kind, author_vk, messages));
+    let (id, work) = OUTBOX.with_mut(|o| o.enqueue_sealed(room, kind, author_vk, messages));
     start_signing(room, id, author_vk, work, fallback_key);
     id
 }
@@ -33,20 +32,32 @@ pub(crate) fn submit_now(
 /// Sign a failed entry again. The fallback key is read afresh from `ROOMS`.
 pub(crate) fn retry(room: VerifyingKey, id: u64) {
     crate::util::defer(move || {
-        let fallback_key = ROOMS
-            .peek()
-            .map
-            .get(&room)
-            .and_then(|r| r.signing_key().cloned());
+        let (fallback_key, current) = room_signing_context(&room);
         // The fallback key is the current identity's; `sign_message_with_fallback`
         // uses it only if it matches `author_vk`, so a row from a replaced
-        // identity cannot be signed with the new key.
+        // identity cannot be signed with the new key. A private body is
+        // sealed again under the room's current secret if it has rotated.
         if let Some((author_vk, work)) =
-            OUTBOX.with_mut(|o| o.retry(&room, id, crate::util::get_current_system_time()))
+            OUTBOX.with_mut(|o| o.retry(&room, id, crate::util::get_current_system_time(), current))
         {
             start_signing(room, id, author_vk, work, fallback_key);
         }
     });
+}
+
+/// The room's local fallback key and current secret (`(secret, version)`),
+/// read without holding a `ROOMS` borrow afterwards.
+fn room_signing_context(room: &VerifyingKey) -> (Option<SigningKey>, Option<([u8; 32], u32)>) {
+    let rooms = ROOMS.peek();
+    let Some(room_data) = rooms.map.get(room) else {
+        return (None, None);
+    };
+    (
+        room_data.signing_key().cloned(),
+        room_data
+            .get_secret()
+            .map(|(secret, version)| (*secret, version)),
+    )
 }
 
 /// Whether a page reload would lose a message the user can still act on
@@ -188,7 +199,19 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
     if !OUTBOX.peek().has_ready(&room) {
         return;
     }
-    let ready = OUTBOX.with_mut(|o| o.take_ready(&room));
+    // An entry sealed under a secret the room has since rotated away from (a
+    // join, prune or ban while it was signing) stops the take: it is sealed
+    // again under the current secret and re-signed below, keeping its
+    // timestamp, and what follows it waits, so typed order holds.
+    let (fallback_key, secret) = room_signing_context(&room);
+    let (ready, stale) = OUTBOX
+        .with_mut(|o| o.take_ready_sealed_under(&room, Some(secret.map(|(_, version)| version))));
+    if let Some(id) = stale {
+        reseal_now(room, id, secret, fallback_key);
+    }
+    if ready.is_empty() {
+        return;
+    }
     let outcomes: Option<Vec<Result<(), String>>> = ROOMS.with_mut(|rooms| {
         let room_data = rooms.map.get_mut(&room)?;
         Some(ready.iter().map(|e| apply_entry(room_data, e)).collect())
@@ -217,6 +240,37 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
     if any_applied {
         crate::util::debug_log("[send] delta applied OK, marking NEEDS_SYNC");
         crate::components::app::mark_needs_sync(room);
+    }
+}
+
+/// Seal entry `id` again under the room's current secret and sign it again;
+/// after `MAX_RESEALS`, or with no current secret on this device, it fails
+/// (a send shows as a failed row whose Retry seals it again).
+fn reseal_now(
+    room: VerifyingKey,
+    id: u64,
+    secret: Option<([u8; 32], u32)>,
+    fallback_key: Option<SigningKey>,
+) {
+    let resealed = match secret {
+        Some((secret, version)) => {
+            info!("Message {id}: the room's secret rotated while signing; sealing again under v{version}");
+            OUTBOX.with_mut(|o| o.reseal(&room, id, &secret, version))
+        }
+        None => {
+            OUTBOX.with_mut(|o| {
+                o.record_failure(
+                    &room,
+                    id,
+                    "the room's key is not available on this device yet".to_string(),
+                )
+            });
+            None
+        }
+    };
+    match resealed {
+        Some((author_vk, work)) => start_signing(room, id, author_vk, work, fallback_key),
+        None => report_failed_actions_now(room),
     }
 }
 
@@ -312,6 +366,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::Signer;
     use river_core::room_state::member::MemberId;
+    use river_core::room_state::message::MessageV1;
     use river_core::room_state::message::RoomMessageBody;
     use std::time::{Duration, SystemTime};
 
@@ -377,7 +432,7 @@ mod tests {
         // if the fallback check were bypassed.
         let other = SigningKey::from_bytes(&[7u8; 32]);
         outbox.record_failure(&room, id, String::new());
-        let (_, work) = outbox.retry(&room, id, SystemTime::now()).unwrap();
+        let (_, work) = outbox.retry(&room, id, SystemTime::now(), None).unwrap();
         outbox.record_signature(&room, id, 0, other.sign(&work[0].1));
         let entry = outbox.take_ready(&room).pop().unwrap();
         assert!(apply_entry(&mut room_data, &entry).is_err());
@@ -592,7 +647,10 @@ mod tests {
                 "OUTBOX.peek().has_other_identities(&room,&current)",
                 "o.drop_other_identities(&room,&current)",
             ),
-            ("OUTBOX.peek().has_ready(&room)", "o.take_ready(&room)"),
+            (
+                "OUTBOX.peek().has_ready(&room)",
+                "o.take_ready_sealed_under(",
+            ),
             (
                 "OUTBOX.peek().has_failed_actions(&room)",
                 "o.take_failed_actions(&room)",
@@ -715,6 +773,67 @@ mod tests {
         );
     }
 
+    /// The commit path as `commit_ready_now` drives it: a private message
+    /// sealed under v1, signed while the room rotated to v2, is sealed again,
+    /// re-signed and committed under v2, not refused.
+    #[test]
+    fn a_message_signed_across_a_rotation_commits_under_the_new_secret() {
+        use super::super::seal::SealInput;
+        let room = owner_sk().verifying_key();
+        let mut room_data = crate::room_data::test_minimal_room_data(room);
+        room_data.secrets.insert(2, [7u8; 32]);
+        room_data.current_secret_version = Some(2);
+        let mut outbox = Outbox::default();
+
+        let seal = SealInput::Text("rotated".to_string());
+        let message = MessageV1 {
+            room_owner: MemberId::from(&room),
+            author: MemberId::from(&owner_sk().verifying_key()),
+            content: seal.seal(&[6u8; 32], 1),
+            time: SystemTime::now(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+        let (id, work) = outbox.enqueue_sealed(
+            room,
+            PendingKind::Send {
+                text: "rotated".to_string(),
+                author_name: "Owner".to_string(),
+            },
+            owner_sk().verifying_key(),
+            vec![(message, bytes, Some(seal))],
+        );
+        outbox.record_signature(&room, id, 0, owner_sk().sign(&work[0].1));
+
+        let (secret, version) = room_data
+            .get_secret()
+            .map(|(s, v)| (*s, v))
+            .expect("the room's current secret");
+        let (ready, stale) = outbox.take_ready_sealed_under(&room, Some(Some(version)));
+        assert!(ready.is_empty());
+        let (_, work) = outbox
+            .reseal(&room, stale.expect("stale"), &secret, version)
+            .expect("sealed again");
+        outbox.record_signature(&room, id, 0, owner_sk().sign(&work[0].1));
+        let (ready, stale) = outbox.take_ready_sealed_under(&room, Some(Some(version)));
+        assert_eq!(stale, None);
+        apply_entry(&mut room_data, &ready[0]).expect("committed under the current secret");
+        let held = room_data
+            .room_state
+            .recent_messages
+            .messages
+            .iter()
+            .find(|m| m.id() == ready[0].message_ids()[0])
+            .expect("in the room");
+        assert!(matches!(
+            held.message.content,
+            RoomMessageBody::Private {
+                secret_version: 2,
+                ..
+            }
+        ));
+    }
+
     /// A message written as an identity the room has since replaced (an
     /// identity import while it was signing) is never committed under it.
     #[test]
@@ -742,9 +861,9 @@ mod tests {
             .find("pub(crate)fncommit_ready_now(")
             .expect("commit_ready_now exists");
         let body = &squashed[start..];
-        let body = &body[..body.find("fnreport_failed_actions_now(").expect("next fn")];
+        let body = &body[..body.find("fnreseal_now(").expect("next fn")];
         let take = body
-            .find("o.take_ready(&room)")
+            .find("o.take_ready_sealed_under(")
             .expect("takes from the outbox");
         let write = body.find("ROOMS.with_mut(").expect("writes ROOMS");
         assert!(take < write);

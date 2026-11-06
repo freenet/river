@@ -24,6 +24,7 @@
 //! later does not restamp it, so the order on screen is the typed order. Only
 //! a Retry restamps.
 
+use super::seal::SealInput;
 use dioxus::prelude::*;
 use ed25519_dalek::{Signature, VerifyingKey};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1};
@@ -31,6 +32,14 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 pub(crate) static OUTBOX: GlobalSignal<Outbox> = Global::new(Outbox::default);
+
+/// How many times one entry is sealed again for a rotating room secret
+/// before it is shown as failed (where Retry seals it once more).
+pub(crate) const MAX_RESEALS: u32 = 3;
+
+/// A message to enqueue: the message, its CBOR bytes, and for a sealed body
+/// what the user wrote (`SealInput`).
+pub(crate) type NewMessage = (MessageV1, Vec<u8>, Option<SealInput>);
 
 /// What the user did, which decides how a pending entry shows.
 #[derive(Clone, PartialEq, Debug)]
@@ -74,6 +83,9 @@ pub(crate) struct UnsignedMessage {
     /// The CBOR encoding of `message`: the bytes the signature covers.
     pub bytes: Vec<u8>,
     pub signature: Option<Signature>,
+    /// What the user wrote, for a body sealed under a room secret: kept so the
+    /// body can be sealed again under a newer secret (`reseal`).
+    pub seal: Option<SealInput>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -85,6 +97,9 @@ pub(crate) struct PendingEntry {
     pub author_vk: VerifyingKey,
     pub messages: Vec<UnsignedMessage>,
     pub state: PendingState,
+    /// Times the entry was sealed again because the room's secret rotated
+    /// while it was being signed (bounded by `MAX_RESEALS`).
+    pub reseals: u32,
 }
 
 impl PendingEntry {
@@ -131,6 +146,67 @@ impl PendingEntry {
     }
 }
 
+impl PendingEntry {
+    /// The signing work: every message's bytes.
+    fn work(&self) -> SigningWork {
+        self.messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i, m.bytes.clone()))
+            .collect()
+    }
+
+    fn fail(&mut self, reason: &str) {
+        self.state = PendingState::Failed(reason.to_string());
+        for m in &mut self.messages {
+            m.signature = None;
+        }
+    }
+
+    /// Rebuild every message: when `reseal` is given, each sealed body is
+    /// sealed again from its `SealInput` under that secret and version; when
+    /// `restamp` is given, each message takes that time. Encodes everything
+    /// first and replaces nothing on failure, so a signature can never cover
+    /// bytes other than the message's. Clears signatures; the entry is
+    /// Signing again.
+    fn seal_again(
+        &mut self,
+        reseal: Option<(&[u8; 32], u32)>,
+        restamp: Option<SystemTime>,
+    ) -> bool {
+        let mut rebuilt = Vec::with_capacity(self.messages.len());
+        for m in &self.messages {
+            let mut message = m.message.clone();
+            if let Some((secret, version)) = reseal {
+                if matches!(
+                    message.content,
+                    river_core::room_state::message::RoomMessageBody::Private { .. }
+                ) {
+                    let Some(seal) = &m.seal else {
+                        return false;
+                    };
+                    message.content = seal.seal(secret, version);
+                }
+            }
+            if let Some(time) = restamp {
+                message.time = time;
+            }
+            let mut bytes = Vec::new();
+            if ciborium::ser::into_writer(&message, &mut bytes).is_err() {
+                return false;
+            }
+            rebuilt.push((message, bytes));
+        }
+        for (m, (message, bytes)) in self.messages.iter_mut().zip(rebuilt) {
+            m.message = message;
+            m.bytes = bytes;
+            m.signature = None;
+        }
+        self.state = PendingState::Signing;
+        true
+    }
+}
+
 /// A pending row as the conversation shows it.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct PendingRow {
@@ -153,6 +229,7 @@ pub(crate) struct Outbox {
 impl Outbox {
     /// Add an entry at the end of `room`'s queue, in the Signing state.
     /// Returns its id and the signing work to start.
+    #[cfg(test)]
     pub fn enqueue(
         &mut self,
         room: VerifyingKey,
@@ -160,12 +237,24 @@ impl Outbox {
         author_vk: VerifyingKey,
         messages: Vec<(MessageV1, Vec<u8>)>,
     ) -> (u64, SigningWork) {
+        let messages = messages.into_iter().map(|(m, b)| (m, b, None)).collect();
+        self.enqueue_sealed(room, kind, author_vk, messages)
+    }
+
+    /// `enqueue`, keeping what the user wrote for each sealed body.
+    pub fn enqueue_sealed(
+        &mut self,
+        room: VerifyingKey,
+        kind: PendingKind,
+        author_vk: VerifyingKey,
+        messages: Vec<NewMessage>,
+    ) -> (u64, SigningWork) {
         self.next_id += 1;
         let id = self.next_id;
         let work = messages
             .iter()
             .enumerate()
-            .map(|(i, (_, bytes))| (i, bytes.clone()))
+            .map(|(i, (_, bytes, _))| (i, bytes.clone()))
             .collect();
         self.rooms.entry(room).or_default().push(PendingEntry {
             id,
@@ -173,13 +262,15 @@ impl Outbox {
             author_vk,
             messages: messages
                 .into_iter()
-                .map(|(message, bytes)| UnsignedMessage {
+                .map(|(message, bytes, seal)| UnsignedMessage {
                     message,
                     bytes,
                     signature: None,
+                    seal,
                 })
                 .collect(),
             state: PendingState::Signing,
+            reseals: 0,
         });
         (id, work)
     }
@@ -256,6 +347,7 @@ impl Outbox {
     }
 
     /// The entry `id` in `room`, if it is still there.
+    #[cfg(test)]
     pub fn entry(&self, room: &VerifyingKey, id: u64) -> Option<&PendingEntry> {
         self.rooms.get(room)?.iter().find(|e| e.id == id)
     }
@@ -268,23 +360,68 @@ impl Outbox {
     /// Remove and return, in order, the entries ready to commit: from the
     /// front of the queue, every fully signed entry up to the first one still
     /// signing. Failed entries are passed over and stay where they are.
+    #[cfg(test)]
     pub fn take_ready(&mut self, room: &VerifyingKey) -> Vec<PendingEntry> {
+        self.take_ready_sealed_under(room, None).0
+    }
+
+    /// `take_ready`, stopping at the first ready entry sealed under a secret
+    /// version other than `current` (when `current` is given): that entry
+    /// must be sealed again and re-signed before it, or anything after it,
+    /// commits. Returns the entries taken and that entry's id.
+    pub fn take_ready_sealed_under(
+        &mut self,
+        room: &VerifyingKey,
+        current: Option<Option<u32>>,
+    ) -> (Vec<PendingEntry>, Option<u64>) {
         let Some(queue) = self.rooms.get_mut(room) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let mut ready = Vec::new();
+        let mut stale = None;
         let mut i = 0;
         while i < queue.len() {
             match queue[i].state {
                 PendingState::Failed(_) => i += 1,
-                PendingState::Signing if queue[i].fully_signed() => ready.push(queue.remove(i)),
+                PendingState::Signing if queue[i].fully_signed() => {
+                    if current.is_some_and(|c| queue[i].is_stale_sealed(c)) {
+                        stale = Some(queue[i].id);
+                        break;
+                    }
+                    ready.push(queue.remove(i))
+                }
                 PendingState::Signing => break,
             }
         }
         if queue.is_empty() {
             self.rooms.remove(room);
         }
-        ready
+        (ready, stale)
+    }
+
+    /// Seal entry `id` again under `secret` at `version` (the room's secret
+    /// rotated while it was being signed) and return the author's key and the
+    /// signing work, keeping its timestamp and place. After `MAX_RESEALS`, or
+    /// if a sealed body has nothing to seal it from, the entry is marked
+    /// failed instead and `None` is returned.
+    pub fn reseal(
+        &mut self,
+        room: &VerifyingKey,
+        id: u64,
+        secret: &[u8; 32],
+        version: u32,
+    ) -> Option<(VerifyingKey, SigningWork)> {
+        let entry = self.entry_mut(room, id)?;
+        if entry.reseals >= MAX_RESEALS {
+            entry.fail("the room's key kept changing while this was sending");
+            return None;
+        }
+        if !entry.seal_again(Some((secret, version)), None) {
+            entry.fail("this message could not be sealed again");
+            return None;
+        }
+        entry.reseals += 1;
+        Some((entry.author_vk, entry.work()))
     }
 
     /// Put back an entry that was taken but did not commit, failed, in its
@@ -309,35 +446,24 @@ impl Outbox {
         room: &VerifyingKey,
         id: u64,
         now: SystemTime,
+        current: Option<([u8; 32], u32)>,
     ) -> Option<(VerifyingKey, SigningWork)> {
         let entry = self.entry_mut(room, id)?;
         if !matches!(entry.state, PendingState::Failed(_)) {
             return None;
         }
-        // Re-encode first, then commit the new stamp and bytes together, so
-        // a signature can never cover bytes other than the message's.
-        let mut restamped = Vec::with_capacity(entry.messages.len());
-        for m in &entry.messages {
-            let mut message = m.message.clone();
-            message.time = now;
-            let mut bytes = Vec::new();
-            ciborium::ser::into_writer(&message, &mut bytes).ok()?;
-            restamped.push((message, bytes));
+        // Sealed again under the room's current secret if it has rotated, so
+        // a Retry can succeed whatever happened to the key meanwhile.
+        let resealing = current.filter(|(_, v)| entry.is_stale_sealed(Some(*v)));
+        let reseal = resealing
+            .as_ref()
+            .map(|(secret, version)| (secret, *version));
+        if !entry.seal_again(reseal, Some(now)) {
+            return None;
         }
-        for (m, (message, bytes)) in entry.messages.iter_mut().zip(restamped) {
-            m.message = message;
-            m.bytes = bytes;
-        }
+        entry.reseals = 0;
         entry.state = PendingState::Signing;
-        Some((
-            entry.author_vk,
-            entry
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (i, m.bytes.clone()))
-                .collect(),
-        ))
+        Some((entry.author_vk, entry.work()))
     }
 
     /// Drop `room`'s entries written as any identity but `author` (the room's
