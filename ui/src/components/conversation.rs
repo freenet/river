@@ -267,13 +267,10 @@ struct MessageGroup {
     /// `a_shield_and_a_warning_can_both_render` pins the co-occurrence.
     author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
+    /// The first message's time, for the day separators. The header's time is
+    /// NOT this: it describes the first message still rendered, which a
+    /// pending delete can change (see [`header_time_labels`]).
     first_time: DateTime<Utc>,
-    /// True if any message in this group carried a sender timestamp later than
-    /// when we received it, by more than [`CLOCK_SKEW_TOLERANCE_SECS`], and was
-    /// therefore clamped back to its arrival time.
-    time_clamped: bool,
-    /// Propagation delay for the first message in the group (shown in header)
-    first_delay_secs: Option<i64>,
     messages: Vec<GroupedMessage>,
 }
 
@@ -290,7 +287,6 @@ struct GroupedMessage {
     /// message and was clamped back to that arrival time. (It is clamped to
     /// ARRIVAL, not to "now": see [`MessageClock`] for why the render's wall
     /// clock cannot be the target.)
-    #[allow(dead_code)]
     time_clamped: bool,
     id: String,
     message_id: MessageId,
@@ -299,8 +295,7 @@ struct GroupedMessage {
     /// What the reply-quote strip should render, already resolved against live
     /// room state — see [`ReplyStrip`] and [`resolve_reply_strip`].
     reply_strip: ReplyStrip,
-    /// Propagation delay in seconds (send → receive), if known and significant
-    #[allow(dead_code)]
+    /// Propagation delay in seconds (send → receive), if known.
     receive_delay_secs: Option<i64>,
 }
 
@@ -821,9 +816,6 @@ fn group_messages(
 
         if should_group {
             if let Some(DisplayItem::Messages(ref mut group)) = items.last_mut() {
-                if time_clamped {
-                    group.time_clamped = true;
-                }
                 group.messages.push(grouped_message);
             }
         } else {
@@ -849,8 +841,6 @@ fn group_messages(
                 author_impersonation,
                 is_self,
                 first_time: message_time,
-                time_clamped,
-                first_delay_secs: receive_delay_secs,
                 messages: vec![grouped_message],
             }));
         }
@@ -861,6 +851,65 @@ fn group_messages(
     prune_message_html_cache(&seen_message_ids);
 
     items
+}
+
+/// What a message's time shows, wherever it shows: beside the author's name on
+/// a group's first row, or in a continuation row's gutter. Both go through
+/// [`time_labels`], so the two places never describe a message differently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimeLabels {
+    /// `HH:MM` in the viewer's timezone, marked `~` when clamped.
+    shown: String,
+    /// The tooltip: the full local date and time, then why it may be off.
+    title: String,
+    /// The shown time in RFC 3339 (UTC), for `<time datetime>`.
+    datetime: String,
+    /// The sender's clock ran ahead, so the time shown is the arrival time.
+    clamped: bool,
+}
+
+/// The labels for one message shown at `time`: `clamped` when the sender's
+/// timestamp was pulled back to its arrival, `delay_secs` the propagation
+/// delay when it is known.
+fn time_labels(time: DateTime<Utc>, clamped: bool, delay_secs: Option<i64>) -> TimeLabels {
+    let ms = time.timestamp_millis();
+    let full = format_utc_as_full_datetime(ms);
+    let title = if clamped {
+        format!(
+            "{full} (sender's clock may be ahead of yours — their timestamp was later \
+             than when this message reached you, so the time shown is when it \
+             arrived)"
+        )
+    } else if let Some(secs) = delay_secs {
+        format!("{full} (received after {} delay)", format_delay(secs))
+    } else {
+        full
+    };
+    let local = format_utc_as_local_time(ms);
+    TimeLabels {
+        shown: if clamped { format!("~{local}") } else { local },
+        title,
+        datetime: time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        clamped,
+    }
+}
+
+/// One message's own time, clamp and delay: a continuation row's gutter time.
+fn row_time_labels(message: &GroupedMessage) -> TimeLabels {
+    time_labels(
+        message.time,
+        message.time_clamped,
+        message.receive_delay_secs,
+    )
+}
+
+/// The time beside a group's author name: the first message it RENDERS, not
+/// the group. A later message's clamp is that message's own, and a pending
+/// delete (`pending_effects.rs`, applied after grouping) can remove the first
+/// message, so nothing cached at grouping describes the header. `None` only
+/// for an empty group, which is never rendered.
+fn header_time_labels(group: &MessageGroup) -> Option<TimeLabels> {
+    group.messages.first().map(row_time_labels)
 }
 
 /// A join notice's names (shown in the secondary colour) and the text after
@@ -3937,24 +3986,7 @@ fn MessageGroupComponent(
     // second popover — the single-popover guarantee comes from the z-order, not
     // a shared signal (#402).
     let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
-    let timestamp_ms = group.first_time.timestamp_millis();
-    let time_str = format_utc_as_local_time(timestamp_ms);
-    let delay_suffix = group
-        .first_delay_secs
-        .map(|s| format!(" (received after {} delay)", format_delay(s)));
-    let full_time_str = if group.time_clamped {
-        format!(
-            "{} (sender's clock may be ahead of yours — their timestamp was later \
-             than when this message reached you, so the time shown is when it \
-             arrived)",
-            format_utc_as_full_datetime(timestamp_ms)
-        )
-    } else if let Some(ref suffix) = delay_suffix {
-        format!("{}{}", format_utc_as_full_datetime(timestamp_ms), suffix)
-    } else {
-        format_utc_as_full_datetime(timestamp_ms)
-    };
-    let time_clamped = group.time_clamped;
+    let header_time = header_time_labels(&group);
     let is_self = group.is_self;
 
     // Whether the kebab action menu should open above (true) or below (false)
@@ -4169,7 +4201,7 @@ fn MessageGroupComponent(
                         let is_first = idx == 0;
                         let has_reactions = !msg.reactions.is_empty();
                         let reply_strip_val = msg.reply_strip.clone();
-                        let row_time_ms = msg.time.timestamp_millis();
+                        let row_time = row_time_labels(&msg);
 
                         rsx! {
                             // One row per message (`.msg-row` in main.css): the
@@ -4198,11 +4230,13 @@ fn MessageGroupComponent(
                                             "{author_initials}"
                                         }
                                     } else {
-                                        span {
+                                        time {
                                             "data-testid": "message-gutter-time",
                                             class: "msg-gutter-time",
-                                            title: format_utc_as_full_datetime(row_time_ms),
-                                            {format_utc_as_local_time(row_time_ms)}
+                                            class: if row_time.clamped { "italic" },
+                                            datetime: "{row_time.datetime}",
+                                            title: "{row_time.title}",
+                                            "{row_time.shown}"
                                         }
                                     }
                                 }
@@ -4267,11 +4301,15 @@ fn MessageGroupComponent(
                                                     span { "aria-hidden": "true", class: "cursor-default", title: warning.tooltip(), "Similar name" }
                                                 }
                                             }
-                                            span {
-                                                class: "text-xs text-text-muted cursor-default tabular-nums",
-                                                class: if time_clamped { "italic opacity-70" },
-                                                title: "{full_time_str}",
-                                                if time_clamped { "~{time_str}" } else { "{time_str}" }
+                                            if let Some(header_time) = header_time.as_ref() {
+                                                time {
+                                                    "data-testid": "message-header-time",
+                                                    class: "text-xs text-text-muted cursor-default tabular-nums",
+                                                    class: if header_time.clamped { "italic opacity-70" },
+                                                    datetime: "{header_time.datetime}",
+                                                    title: "{header_time.title}",
+                                                    "{header_time.shown}"
+                                                }
                                             }
                                         }
                                     }
@@ -6872,7 +6910,10 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped, "a future timestamp must be flagged clamped");
+        assert!(
+            g.messages[0].time_clamped,
+            "a future timestamp must be flagged clamped"
+        );
         assert_eq!(
             g.messages[0].time, first_seen,
             "the clamp target must be when we first saw the message, not the \
@@ -6945,7 +6986,7 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped);
+        assert!(g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, now);
     }
 
@@ -6982,7 +7023,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            g.time_clamped,
+            g.messages[0].time_clamped,
             "a send time an hour after arrival is skew, even though it is in \
              the past relative to this render"
         );
@@ -7021,7 +7062,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            !g.time_clamped,
+            !g.messages[0].time_clamped,
             "a few seconds of clock skew is normal and must not put a \
              \"sender's clock may be wrong\" marker on the message"
         );
@@ -7062,7 +7103,7 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(!g.time_clamped);
+        assert!(!g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, sent);
     }
 
@@ -7148,5 +7189,261 @@ mod group_messages_clock_tests {
             newest_key(&after).as_ref(),
             false
         ));
+    }
+
+    /// One same-author run: each message from `alice`, with the sender's
+    /// time and when this client first saw it, both relative to `base`.
+    fn timed_run(
+        owner_id: MemberId,
+        alice: &SigningKey,
+        base: DateTime<Utc>,
+        times: &[(i64, i64)],
+    ) -> (MessagesV1, ReceiveTimes, Vec<MessageId>) {
+        let mut receive_times = ReceiveTimes::new();
+        let mut ids = Vec::new();
+        let messages = times
+            .iter()
+            .map(|&(sent, received)| {
+                let msg = message_at(owner_id, alice, base + chrono::Duration::seconds(sent));
+                receive_times.insert(
+                    msg.id().0 .0,
+                    (base + chrono::Duration::seconds(received)).timestamp_millis() as f64,
+                );
+                ids.push(msg.id());
+                msg
+            })
+            .collect();
+        (state(messages), receive_times, ids)
+    }
+
+    fn rfc3339(time: DateTime<Utc>) -> String {
+        time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    const CLAMP_NOTE: &str = "sender's clock may be ahead of yours";
+
+    fn header_of(group: &MessageGroup) -> TimeLabels {
+        header_time_labels(group).expect("a rendered group has a first message")
+    }
+
+    /// The header beside the name describes the group's FIRST message, not
+    /// the group: a later message from a fast clock must not mark the first
+    /// one's time as clamped. The continuation row says so itself.
+    #[test]
+    fn a_clamped_later_message_does_not_mark_the_header_clamped() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let base = at(1_700_000_000_000);
+        // Accurate, 2s in transit; then an hour ahead, pulled back to arrival.
+        let (messages, receive_times, _) =
+            timed_run(owner_id, &alice, base, &[(-120, -118), (3600, -60)]);
+
+        let items = group(
+            &messages,
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            base,
+        );
+        let g = only_group(&items);
+        assert_eq!(g.messages.len(), 2, "premise: one group of two");
+        assert!(g.messages[1].time_clamped, "premise: the second is clamped");
+
+        let header = header_of(g);
+        assert!(!header.clamped, "the accurate first message is not clamped");
+        assert!(!header.shown.starts_with('~'), "no clamp mark: {header:?}");
+        assert!(!header.title.contains(CLAMP_NOTE), "{header:?}");
+        assert!(
+            header.title.ends_with(" (received after 2s delay)"),
+            "{header:?}"
+        );
+        assert_eq!(
+            header.datetime,
+            rfc3339(base - chrono::Duration::seconds(120))
+        );
+
+        let second = row_time_labels(&g.messages[1]);
+        assert!(second.clamped, "the continuation carries its own clamp");
+        assert!(second.shown.starts_with('~'), "{second:?}");
+        assert!(second.title.contains(CLAMP_NOTE), "{second:?}");
+        assert_eq!(
+            second.datetime,
+            rfc3339(base - chrono::Duration::seconds(60))
+        );
+    }
+
+    /// The other order: a clamped first message marks the header, and an
+    /// accurate continuation is neither marked nor explained as clamped.
+    #[test]
+    fn an_accurate_continuation_after_a_clamped_first_message_is_its_own() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let base = at(1_700_000_000_000);
+        let (messages, receive_times, _) =
+            timed_run(owner_id, &alice, base, &[(3600, -120), (-60, -53)]);
+
+        let items = group(
+            &messages,
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            base,
+        );
+        let g = only_group(&items);
+        assert_eq!(g.messages.len(), 2, "premise: one group of two");
+
+        let header = header_of(g);
+        assert!(
+            header.clamped && header.shown.starts_with('~'),
+            "{header:?}"
+        );
+        assert!(header.title.contains(CLAMP_NOTE), "{header:?}");
+        assert_eq!(
+            header.datetime,
+            rfc3339(base - chrono::Duration::seconds(120))
+        );
+
+        let second = row_time_labels(&g.messages[1]);
+        assert!(
+            !second.clamped && !second.shown.starts_with('~'),
+            "{second:?}"
+        );
+        assert!(!second.title.contains(CLAMP_NOTE), "{second:?}");
+        assert!(
+            second.title.ends_with(" (received after 7s delay)"),
+            "{second:?}"
+        );
+        assert_eq!(
+            second.datetime,
+            rfc3339(base - chrono::Duration::seconds(60))
+        );
+    }
+
+    /// Each row explains its own propagation delay; the header's is the first
+    /// message's only.
+    #[test]
+    fn each_message_shows_its_own_receive_delay() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let base = at(1_700_000_000_000);
+        let (messages, receive_times, _) =
+            timed_run(owner_id, &alice, base, &[(-120, -118), (-60, -49)]);
+
+        let items = group(
+            &messages,
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            base,
+        );
+        let g = only_group(&items);
+        assert_eq!(g.messages.len(), 2, "premise: one group of two");
+
+        let header = header_of(g);
+        assert!(
+            header.title.ends_with(" (received after 2s delay)"),
+            "{header:?}"
+        );
+        let second = row_time_labels(&g.messages[1]);
+        assert!(
+            second.title.ends_with(" (received after 11s delay)"),
+            "{second:?}"
+        );
+        assert_eq!(
+            row_time_labels(&g.messages[0]),
+            header,
+            "the header and the first row's labels are one formatter's"
+        );
+    }
+
+    /// An own delete still being signed removes the group's first message
+    /// after grouping (`pending_effects.rs`). The header then describes the
+    /// message now first, not the removed one; when the delete fails and its
+    /// effect goes, the next pass shows the original first message again.
+    #[test]
+    fn a_pending_delete_of_the_first_message_moves_the_header_to_the_next() {
+        let owner = signing_key(1);
+        let me = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let my_id = member_id_of(&me);
+        let base = at(1_700_000_000_000);
+        // A clamped first message, then an accurate one 7s in transit, so the
+        // header's clamp and delay both change with the first message.
+        let (messages, receive_times, ids) =
+            timed_run(owner_id, &me, base, &[(3600, -120), (-60, -53)]);
+        let member_info = info(&me, "Me");
+        let pass = |effects: &[outbox::PendingEffect]| {
+            let mut items = group_messages(
+                &messages,
+                &member_info,
+                Some(my_id),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &ImpersonationChecker::default(),
+                owner_id,
+                MessageClock {
+                    receive_times: &receive_times,
+                    fallback_now: base,
+                },
+            );
+            apply_pending_effects(&mut items, effects, my_id, &HashMap::new());
+            items
+        };
+        let committed = pass(&[]);
+        let first = only_group(&committed);
+        assert_eq!(first.messages.len(), 2, "premise: one group of two");
+        let original = header_of(first);
+        assert!(original.clamped, "premise: {original:?}");
+
+        let deleting = pass(&[outbox::PendingEffect::Delete {
+            target: ids[0].clone(),
+        }]);
+        let g = only_group(&deleting);
+        assert_eq!(g.messages.len(), 1, "premise: the first message is hidden");
+        let header = header_of(g);
+        assert!(
+            !header.clamped && !header.shown.starts_with('~'),
+            "{header:?}"
+        );
+        assert!(
+            header.title.ends_with(" (received after 7s delay)"),
+            "{header:?}"
+        );
+        assert_eq!(
+            header.datetime,
+            rfc3339(base - chrono::Duration::seconds(60))
+        );
+
+        let rolled_back = pass(&[]);
+        assert_eq!(
+            header_of(only_group(&rolled_back)),
+            original,
+            "the failed delete's rollback restores the first message's time"
+        );
+    }
+
+    #[test]
+    fn time_labels_mark_only_a_clamped_time_and_explain_a_delay() {
+        let t = at(1_700_000_000_000);
+        let plain = time_labels(t, false, None);
+        assert_eq!(plain.shown, format_utc_as_local_time(t.timestamp_millis()));
+        assert_eq!(
+            plain.title,
+            format_utc_as_full_datetime(t.timestamp_millis())
+        );
+        assert_eq!(plain.datetime, "2023-11-14T22:13:20.000Z");
+        let delayed = time_labels(t, false, Some(90));
+        assert_eq!(delayed.shown, plain.shown);
+        assert_eq!(
+            delayed.title,
+            format!("{} (received after 1m delay)", plain.title)
+        );
+        let clamped = time_labels(t, true, None);
+        assert_eq!(clamped.shown, format!("~{}", plain.shown));
+        assert!(clamped.title.starts_with(&plain.title) && clamped.title.contains(CLAMP_NOTE));
     }
 }
