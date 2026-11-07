@@ -109,6 +109,43 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
+/// The signed message in the room history holding `text` (a pending send is
+/// a `pending-message`, not one of these).
+export function committedRow(page: Page, text: string): Locator {
+  return page.getByTestId("conversation-history").getByTestId("message-row").filter({ hasText: text });
+}
+
+/// Type `text` into the composer and press Enter. Returns the row it commits
+/// to; the caller waits for whichever state it is testing (pending, failed or
+/// committed).
+export async function submitMessage(page: Page, text: string): Promise<Locator> {
+  const input = page.getByTestId("message-input");
+  await input.fill(text);
+  await input.press("Enter");
+  return committedRow(page, text);
+}
+
+/// Focus `target` as a keyboard user would, so it is `:focus-visible`. A key
+/// press first, so a scripted focus counts as keyboard focus (WebKit's Tab
+/// skips buttons).
+export async function keyboardFocus(page: Page, target: Locator) {
+  await page.keyboard.press("Escape");
+  await target.focus();
+  if (!(await target.evaluate((el) => el.matches(":focus-visible")))) {
+    await page.keyboard.press("Shift+Tab");
+    await page.keyboard.press("Tab");
+  }
+  await expect
+    .poll(() => target.evaluate((el) => el === document.activeElement && el.matches(":focus-visible")), {
+      message: "premise: keyboard focus",
+    })
+    .toBe(true);
+}
+
+/// A signed message's footer controls, in footer order. Edit and Delete are
+/// on your own messages only.
+export const FOOTER_CONTROLS = ["message-react-button", "message-reply-button", "message-edit-button", "message-delete-button"];
+
 // The edit form on an own message, through its footer Edit. Returns the edit
 // textarea. Without a `message`, the first own message is scrolled into view
 // first; a given `message` is used from wherever it already is.
@@ -174,14 +211,10 @@ export async function effectiveBackground(el: Locator): Promise<number[]> {
   return base;
 }
 
-/// The element's computed text colour, as `resolveColor` returns it.
-export async function colourOf(locator: Locator): Promise<number[]> {
-  return resolveColor(locator.page(), await locator.evaluate((el) => getComputedStyle(el).color));
-}
-
-/// Whether there is no hover pointer at all.
-export function touchOnly(page: Page): Promise<boolean> {
-  return page.evaluate(() => window.matchMedia("(hover: none)").matches);
+/// The element's computed text colour (or, given "backgroundColor", its own
+/// background), as `resolveColor` returns it.
+export async function colourOf(locator: Locator, property: "color" | "backgroundColor" = "color"): Promise<number[]> {
+  return resolveColor(locator.page(), await locator.evaluate((el, p) => getComputedStyle(el)[p], property));
 }
 
 /// Whether a finger can be the pointer: the same query as main.css. Message

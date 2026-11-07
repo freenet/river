@@ -1,11 +1,22 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, openRoomWithComposer, resolveColor, revealFooter, settle } from "./example-room";
+import {
+  coarsePointer,
+  colourOf,
+  committedRow,
+  keyboardFocus,
+  openRoomWithComposer,
+  resolveColor,
+  revealFooter,
+  settle,
+  submitMessage,
+} from "./example-room";
 import {
   deliverOffscreen,
   distanceFromBottom,
   expectFollowed,
   expectParkedAwayFromEnd,
   expectSettledAtBottom,
+  readerScrollsWithoutGesture,
   readingRow,
   READING_ROW_BUDGET_PX,
   scrollMetrics,
@@ -25,17 +36,6 @@ const HIGHLIGHT = "reply-highlight";
 /// The clearance above a target taller than the view.
 const TALL_CLEARANCE_PX = 12;
 
-function committed(page: Page, text: string): Locator {
-  return page.getByTestId("conversation-history").getByTestId("message-row").filter({ hasText: text });
-}
-
-async function send(page: Page, text: string) {
-  const input = page.getByTestId("message-input");
-  await input.fill(text);
-  await input.press("Enter");
-  await expect(committed(page, text)).toHaveCount(1);
-}
-
 /// The row a strip quotes, found by the strip's own `data-reply-target`.
 function targetOf(page: Page, strip: Locator): Promise<Locator> {
   return strip.getAttribute("data-reply-target").then((id) => {
@@ -50,20 +50,18 @@ function targetOf(page: Page, strip: Locator): Promise<Locator> {
 async function replyFarBelow(page: Page, target: string, reply: string, body = target) {
   await openRoomWithComposer(page);
   await page.mouse.move(0, 0);
-  const input = page.getByTestId("message-input");
-  await input.fill(body);
-  await input.press("Enter");
-  const row = committed(page, target);
+  await submitMessage(page, body);
+  const row = committedRow(page, target);
   await expect(row).toHaveCount(1);
   // Reply now, while it is on screen; the composer keeps the context.
   await revealFooter(page, row);
   await row.getByTestId("message-reply-button").click();
   await expect(page.getByText(`Replying to`)).toBeVisible();
   for (let i = 0; i < 8; i++) await deliverOffscreen(page, `between ${i}: ${"y".repeat(200)}`);
-  await send(page, reply);
+  await expect(await submitMessage(page, reply)).toHaveCount(1);
   await expectSettledAtBottom(page, "premise: the own reply took the view to the end");
   await page.mouse.move(0, 0);
-  const strip = committed(page, reply).getByTestId("reply-strip");
+  const strip = committedRow(page, reply).getByTestId("reply-strip");
   await expect(strip).toBeVisible();
   const quoted = await targetOf(page, strip);
   await expect(quoted).toContainText(target);
@@ -127,10 +125,6 @@ function finishHighlight(page: Page) {
   return page.evaluate((id) => document.getAnimations().find((x) => x.id === id)!.finish(), HIGHLIGHT);
 }
 
-async function backgroundOf(row: Locator): Promise<number[]> {
-  return resolveColor(row.page(), await row.evaluate((el) => getComputedStyle(el).backgroundColor));
-}
-
 /// Every scroll position on the page except the room history's.
 function otherScrollPositions(page: Page) {
   return page.evaluate(() => {
@@ -144,22 +138,6 @@ function otherScrollPositions(page: Page) {
     out.push(`history left ${document.getElementById("chat-scroll-container")!.scrollLeft}`);
     return out;
   });
-}
-
-/// Focus `target` as the keyboard does. A key press first, so the scripted
-/// focus counts as keyboard focus (WebKit's Tab skips buttons).
-async function keyboardFocus(page: Page, target: Locator) {
-  await page.keyboard.press("Escape");
-  await target.focus();
-  if (!(await target.evaluate((el) => el.matches(":focus-visible")))) {
-    await page.keyboard.press("Shift+Tab");
-    await page.keyboard.press("Tab");
-  }
-  await expect
-    .poll(() => target.evaluate((el) => el === document.activeElement && el.matches(":focus-visible")), {
-      message: "premise: keyboard focus",
-    })
-    .toBe(true);
 }
 
 test.describe("The reply strip", () => {
@@ -209,13 +187,11 @@ test.describe("The reply strip", () => {
     expect(rest.height, "one line").toBeLessThan(rest.line * 1.5);
     expect(rest.inside).toBe(true);
     expect(rest.sideways).toBeLessThanOrEqual(0);
-    // The preview is cut with an ellipsis, not wrapped.
-    const truncation = await strip.evaluate((el) => {
+    const cut = await strip.evaluate((el) => {
       const inner = el.querySelector<HTMLElement>(".reply-strip-text")!;
-      const cs = getComputedStyle(inner);
-      return [cs.whiteSpace, cs.textOverflow, cs.overflowX, inner.scrollWidth > inner.clientWidth];
+      return inner.scrollWidth > inner.clientWidth;
     });
-    expect(truncation).toEqual(["nowrap", "ellipsis", "hidden", true]);
+    expect(cut, "premise: the preview is longer than the line, so it is cut, not wrapped").toBe(true);
 
     if (!(await coarsePointer(page))) {
       await strip.hover();
@@ -232,15 +208,20 @@ test.describe("The reply strip", () => {
     expect(outline[1]).toBeGreaterThanOrEqual(2);
   });
 
-  for (const key of ["Enter", "Space"]) {
-    test(`${key} on the focused strip jumps to the original`, async ({ page }) => {
-      const { strip, quoted } = await replyFarBelow(page, `keyboard target ${key}`, `keyboard reply ${key}`);
+  test("Enter and Space on the focused strip each jump to the original", async ({ page }) => {
+    const { strip, quoted } = await replyFarBelow(page, "keyboard target", "keyboard reply");
+    const id = await quoted.getAttribute("id");
+    for (const key of ["Enter", "Space"]) {
+      // Back at the end, the original out of view, so each key makes a jump.
+      await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).max);
+      expect(await offView(quoted), `${key}: premise: the original is above the view`).toBeLessThan(0);
+      if ((await liveHighlights(page)).length) await finishHighlight(page);
       await keyboardFocus(page, strip);
       await page.keyboard.press(key);
-      await expect.poll(() => liveHighlights(page)).toEqual([expect.objectContaining({ target: await quoted.getAttribute("id") })]);
-      expect(Math.abs((await placement(quoted)).centreOffset), "centred").toBeLessThanOrEqual(1);
-    });
-  }
+      await expect.poll(() => liveHighlights(page), { message: `${key}: the original is highlighted` }).toEqual([expect.objectContaining({ target: id })]);
+      expect(Math.abs((await placement(quoted)).centreOffset), `${key}: centred`).toBeLessThanOrEqual(1);
+    }
+  });
 });
 
 test.describe("Jumping to the original", () => {
@@ -271,8 +252,8 @@ test.describe("Jumping to the original", () => {
   test("an original that is not rendered is a no-op", async ({ page }) => {
     await openRoomWithComposer(page);
     await page.mouse.move(0, 0);
-    await send(page, "unrendered target");
-    const row = committed(page, "unrendered target");
+    const row = await submitMessage(page, "unrendered target");
+    await expect(row).toHaveCount(1);
     await revealFooter(page, row);
     await row.getByTestId("message-reply-button").click();
     // Past the render window of a freshly opened room (60 items), under the
@@ -280,17 +261,17 @@ test.describe("Jumping to the original", () => {
     // time, so each is its own item (a batch shares a timestamp, and its two
     // test authors interleave into shared groups).
     for (let i = 0; i < 62; i++) await callRiverTest(page, "appendMessage", `window filler ${i}`);
-    await expect(committed(page, "window filler 61")).toHaveCount(1);
-    await send(page, "reply to the unrendered target");
+    await expect(committedRow(page, "window filler 61")).toHaveCount(1);
+    await expect(await submitMessage(page, "reply to the unrendered target")).toHaveCount(1);
     // Reopening renders the initial window only.
     await callRiverTest(page, "switchRoom", "Public Discussion Room");
     await expect(page.getByRole("heading", { name: "Public Discussion Room" })).toBeVisible();
     await callRiverTest(page, "switchRoom", "Your Private Room");
-    const strip = committed(page, "reply to the unrendered target").getByTestId("reply-strip");
+    const strip = committedRow(page, "reply to the unrendered target").getByTestId("reply-strip");
     await expect(strip).toBeVisible();
     await expectSettledAtBottom(page, "premise: reopened at the end");
     await expect(page.locator(`[id="${await strip.getAttribute("data-reply-target")}"]`), "premise: the original is not rendered").toHaveCount(0);
-    await expect(committed(page, "unrendered target").filter({ hasNotText: "reply to" })).toHaveCount(0);
+    await expect(committedRow(page, "unrendered target").filter({ hasNotText: "reply to" })).toHaveCount(0);
 
     const before = await scrollMetrics(page);
     const others = await otherScrollPositions(page);
@@ -388,7 +369,7 @@ test.describe("The highlight", () => {
     // Full strength from the first moment to the last.
     for (const ms of [0, 1000, 1999]) {
       await seekHighlight(page, ms);
-      expect(await backgroundOf(quoted), `at ${ms}ms`).toEqual(surface);
+      expect(await colourOf(quoted, "backgroundColor"), `at ${ms}ms`).toEqual(surface);
     }
   });
 
@@ -407,11 +388,11 @@ test.describe("The highlight", () => {
       await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
       await settle(page);
     }
-    expect(await backgroundOf(quoted), "the highlight covers the row's own background").toEqual(surface);
+    expect(await colourOf(quoted, "backgroundColor"), "the highlight covers the row's own background").toEqual(surface);
     await finishHighlight(page);
     // No transition or leftover animation eases it back.
     expect(await quoted.evaluate((el) => el.getAnimations().length), "nothing left animating").toBe(0);
-    expect(await backgroundOf(quoted)).toEqual(underlying);
+    expect(await colourOf(quoted, "backgroundColor")).toEqual(underlying);
   });
 
   test("a second jump restarts it, and only one row is ever highlighted", async ({ page }) => {

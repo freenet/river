@@ -1,6 +1,14 @@
 import { test, expect, CDPSession, Locator, Page } from "@playwright/test";
-import { coarsePointer, nextFrames, openRoomWithComposer, revealFooter, settle } from "./example-room";
+import { coarsePointer, committedRow, nextFrames, openRoomWithComposer, revealFooter, settle, submitMessage } from "./example-room";
 import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import {
+  expectAtReact,
+  expectEveryEmojiUsable,
+  expectInvokerUncovered,
+  measurePicker,
+  placement,
+  PICKER_GAP,
+} from "./reaction-picker-geometry";
 import { callRiverTest } from "./river-test";
 
 // The conversation's one reaction picker: a native `popover="auto"`, opened
@@ -24,17 +32,6 @@ function isOpen(page: Page): Promise<boolean> {
     const p = document.querySelector(sel);
     return !!p && p.matches(":popover-open");
   }, PICKER);
-}
-
-function committed(page: Page, text: string): Locator {
-  return page.getByTestId("conversation-history").getByTestId("message-row").filter({ hasText: text });
-}
-
-async function send(page: Page, text: string) {
-  const input = page.getByTestId("message-input");
-  await input.fill(text);
-  await input.press("Enter");
-  await expect(committed(page, text)).toHaveCount(1);
 }
 
 /// The row whose React has `aria-expanded="true"`, by id; none when closed.
@@ -74,65 +71,16 @@ async function openWithPointer(page: Page, row: Locator) {
   await expectOpenFor(page, row);
 }
 
-type Box = { left: number; right: number; top: number; bottom: number };
-
-/// The open picker, the React it hangs from, the viewport, and whether each
-/// emoji is the element a press at its centre lands on.
-function measure(page: Page, row: Locator) {
-  return row.evaluate((el, sel) => {
-    const box = (e: Element): Box => {
-      const r = e.getBoundingClientRect();
-      return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
-    };
-    const p = document.querySelector(sel)!;
-    const react = el.querySelector('[data-testid="message-react-button"]')!;
-    const buttons = Array.from(p.querySelectorAll("button")).map((b) => {
-      const r = b.getBoundingClientRect();
-      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      return {
-        emoji: (b.textContent || "").trim(),
-        inside: r.left >= -0.5 && r.top >= -0.5 && r.right <= innerWidth + 0.5 && r.bottom <= innerHeight + 0.5,
-        hit: !!at && (at === b || b.contains(at)),
-      };
-    });
-    return { picker: box(p), react: box(react), vw: innerWidth, vh: innerHeight, buttons };
-  }, PICKER);
-}
-type Measured = Awaited<ReturnType<typeof measure>>;
-
-const GAP = 4;
-
-/// Where the picker sits against its React: below or above it (4px apart),
-/// and its right edge on React's right edge or its left edge on React's left.
-function placement(m: Measured) {
-  const { picker: p, react: r } = m;
-  const near = (a: number, b: number) => Math.abs(a - b) <= 1;
-  return {
-    block: near(p.top, r.bottom + GAP) ? "below" : near(p.bottom, r.top - GAP) ? "above" : `off (${p.top}..${p.bottom} vs ${r.top}..${r.bottom})`,
-    inline: near(p.right, r.right) ? "end" : near(p.left, r.left) ? "start" : `off (${p.left}..${p.right} vs ${r.left}..${r.right})`,
-  };
-}
-
-function expectEveryEmojiUsable(m: Measured) {
-  expect(m.buttons.length, "the picker has its emoji").toBe(16);
-  const outside = m.buttons.find((b) => !b.inside);
-  expect(outside, `${outside?.emoji} is outside the viewport`).toBeUndefined();
-  const covered = m.buttons.find((b) => !b.hit);
-  expect(covered, `${covered?.emoji} is not what a press at its centre lands on`).toBeUndefined();
-}
-
-/// The picker never covers the React it hangs from.
-function expectInvokerUncovered(m: Measured) {
-  const { picker: p, react: r } = m;
-  const overlaps = p.left < r.right && p.right > r.left && p.top < r.bottom && p.bottom > r.top;
-  expect(overlaps, "the picker covers its React").toBe(false);
-}
-
 test.describe("The reaction picker", () => {
   test("is one native popover: Escape and a press outside close it, and the press still lands", async ({ page }) => {
     await openRoomWithComposer(page);
+    await deliver(page, "native other");
     await deliver(page, "native target");
-    const row = committed(page, "native target");
+    // Room below the target, so the picker opens down from it, clear of the
+    // message above.
+    for (let i = 0; i < 3; i++) await deliver(page, `native filler ${i}: ${"n".repeat(200)}`);
+    const [row, other] = [committedRow(page, "native target"), committedRow(page, "native other")];
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
 
     await expect(picker(page), "one picker, mounted closed").toHaveCount(1);
     await expect(picker(page)).toHaveAttribute("popover", "auto");
@@ -149,17 +97,28 @@ test.describe("The reaction picker", () => {
     await expectClosed(page);
     await expect(row.getByTestId("message-react-button")).toBeFocused();
 
-    // A press outside closes it, and reaches what it pressed: the row's own
-    // Reply, beside the picker, starts a reply on that same press.
+    // A press outside closes it, and reaches what it pressed: another
+    // message's Reply starts a reply to that message on that same press, and
+    // nothing is reacted.
     await openWithPointer(page, row);
-    const reply = row.getByTestId("message-reply-button");
-    const box = (await reply.boundingBox())!;
-    const hit = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.closest("button")?.getAttribute("data-testid"), [box.x + box.width / 2, box.y + box.height / 2]);
-    expect(hit, "premise: Reply is uncovered").toBe("message-reply-button");
-    if (await coarsePointer(page)) await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
-    else await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await revealFooter(page, other);
+    const box = (await other.getByTestId("message-reply-button").boundingBox())!;
+    const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
+    const landsOn = () =>
+      page.evaluate(([x, y]) => {
+        const b = document.elementFromPoint(x, y)?.closest("button");
+        return b ? `${b.getAttribute("data-testid")} of ${b.closest('[id^="msg-"]')?.id}` : null;
+      }, [x, y]);
+    await expect
+      .poll(landsOn, { message: "premise: the other message's Reply is uncovered" })
+      .toBe(`message-reply-button of ${await other.getAttribute("id")}`);
+    expect(await isOpen(page), "premise: still open").toBe(true);
+    if (await coarsePointer(page)) await page.touchscreen.tap(x, y);
+    else await page.mouse.click(x, y);
     await expectClosed(page);
     await expect(page.getByTestId("message-composer")).toContainText("Replying to");
+    await expect(page.getByTestId("message-composer")).toContainText("native other");
+    for (const r of [row, other]) await expect(r.getByTestId("reaction-chip"), "nothing was reacted").toHaveCount(0);
 
     // A press on the React it is open for closes it.
     await openWithPointer(page, row);
@@ -172,7 +131,7 @@ test.describe("The reaction picker", () => {
   test("a pick reacts once on its message, closes, and returns focus to React without scrolling", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "pick target");
-    const row = committed(page, "pick target");
+    const row = committedRow(page, "pick target");
     await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
     await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).top - 40);
 
@@ -200,7 +159,7 @@ test.describe("The reaction picker", () => {
   // reaction triggers keeps them. They once lived only in the derived cache,
   // and every one vanished on the first pick. One reaction per member per
   // message: the reader's own 👍 becomes the pick, another member's ❤️ stays.
-  test("a pick on a message that already has reactions keeps the others' reactions", async ({ page }) => {
+  test("a pick on a message that already has reactions keeps the others' reactions", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomWithComposer(page);
     const row = page
       .getByTestId("conversation-history")
@@ -229,7 +188,7 @@ test.describe("The reaction picker", () => {
   test("opening and closing it renders no message group", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "render target");
-    const row = committed(page, "render target");
+    const row = committedRow(page, "render target");
     await settle(page);
     await callRiverTest(page, "takeMessageGroupRenders");
     await openFromKeyboard(page, row);
@@ -245,12 +204,12 @@ test.describe("The reaction picker", () => {
     // Far enough apart that the picker at one never covers the other's React.
     for (let i = 0; i < 2; i++) await deliver(page, `rapid filler ${i}: ${"r".repeat(300)}`);
     await deliver(page, "rapid two");
-    const [one, two] = [committed(page, "rapid one"), committed(page, "rapid two")];
+    const [one, two] = [committedRow(page, "rapid one"), committedRow(page, "rapid two")];
 
     // A press on another React while it is open.
     await openWithPointer(page, one);
     await openWithPointer(page, two);
-    expect(placement(await measure(page, two)).block).not.toContain("off");
+    expect(placement(await measurePicker(two)).block).not.toContain("off");
 
     // Two activations in one task, as fast as anything can: the later wins,
     // and the earlier opening's close does not undo it.
@@ -273,7 +232,7 @@ test.describe("The reaction picker", () => {
   test("a room switch closes it, and a pick queued across the switch does nothing", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "switch target");
-    const row = committed(page, "switch target");
+    const row = committedRow(page, "switch target");
     const id = (await row.getAttribute("id"))!;
 
     // From the keyboard, where nothing presses outside the picker.
@@ -328,8 +287,8 @@ test.describe("The reaction picker", () => {
 
   test("a message deleted while its picker is open takes the picker with it, and a rollback does not reopen it", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomWithComposer(page);
-    await send(page, "doomed target");
-    const row = committed(page, "doomed target");
+    const row = await submitMessage(page, "doomed target");
+    await expect(row).toHaveCount(1);
     await callRiverTest(page, "holdMessageSigning");
     await openFromKeyboard(page, row);
     const signs = await callRiverTest(page, "messageSignsRecorded");
@@ -374,7 +333,7 @@ test.describe("The reaction picker", () => {
       { text: "remount middle", sentSecs: 2, receivedSecs: 0 },
       { text: "remount survivor", sentSecs: 3, receivedSecs: 0 },
     ]);
-    const [lead, middle, survivor] = ["remount lead", "remount middle", "remount survivor"].map((t) => committed(page, t));
+    const [lead, middle, survivor] = ["remount lead", "remount middle", "remount survivor"].map((t) => committedRow(page, t));
     await expect(survivor).toHaveCount(1);
     const keyOf = async (row: Locator) => (await row.getAttribute("id"))!.replace(/^msg-/, "");
     const [leadKey, middleKey, survivorKey] = [await keyOf(lead), await keyOf(middle), await keyOf(survivor)];
@@ -409,9 +368,8 @@ test.describe("The reaction picker", () => {
       });
       expect(replaced, "premise: the survivor's row and React are new elements").toEqual({ sameRow: false, oldConnected: false });
       await expectOpenFor(page, survivor);
-      const m = await measure(page, survivor);
-      expect(placement(m).block, "placed at the new React").not.toContain("off");
-      expect(placement(m).inline, "placed at the new React").not.toContain("off");
+      const m = await measurePicker(survivor);
+      expectAtReact(m, "placed at the new React");
       expectEveryEmojiUsable(m);
       expectInvokerUncovered(m);
     };
@@ -466,7 +424,7 @@ test.describe("The reaction picker", () => {
     test.skip(await coarsePointer(page), "a touch pointer shows the controls at rest");
     await openRoomWithComposer(page);
     await deliver(page, "mouse focus target");
-    const row = committed(page, "mouse focus target");
+    const row = committedRow(page, "mouse focus target");
     const react = row.getByTestId("message-react-button");
     await openWithPointer(page, row);
     const parked = (await scrollMetrics(page)).top;
@@ -514,17 +472,26 @@ test.describe("The reaction picker", () => {
     await expectClosed(page);
   });
 
+  // On a long message React is at its foot, after the body, and the picker
+  // hangs from it there.
   test("a reaction arriving while it is open moves React, and the picker with it", async ({ page }) => {
     await openRoomWithComposer(page);
-    await deliverOffscreen(page, "reflow target");
-    const row = committed(page, "reflow target");
+    await callRiverTest(page, "appendMessage", Array.from({ length: 6 }, (_, i) => `reflow line ${i}`).join("\n\n"));
+    const row = committedRow(page, "reflow line 5");
+    await expect(row).toHaveCount(1);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await openFromKeyboard(page, row);
-    const before = await measure(page, row);
+    const before = await measurePicker(row);
+    const top = await row.evaluate((el) => el.getBoundingClientRect().top);
+    expect(before.react.top - top, "premise: a long body above React").toBeGreaterThan(100);
+    expectAtReact(before);
+    expectEveryEmojiUsable(before);
+    expectInvokerUncovered(before);
     await callRiverTest(page, "addReactionsToNewest", ["🎉", "👀", "🔥"]);
     await expect(row.getByTestId("reaction-chip")).toHaveCount(3);
     await nextFrames(page);
-    const after = await measure(page, row);
+    const after = await measurePicker(row);
     expect(after.react.left - before.react.left, "premise: the chips moved React").toBeGreaterThan(20);
     expect(placement(after)).toEqual(placement(before));
     await expectOpenFor(page, row);
@@ -535,15 +502,15 @@ test.describe("Reaction picker placement", () => {
   test.describe("at 320px", () => {
     test.use({ viewport: { width: 320, height: 700 } });
 
-    test("at a React with no chips it opens toward the free side, and at one at the column's end, back from it", async ({ page }) => {
+    test("at a React with no chips it opens toward the free side, at one at the column's end back from it, and after wrapped chips at React", async ({ page }) => {
       await openRoomWithComposer(page);
       await deliverOffscreen(page, "start edge");
       // Room below it, so only the inline side has to give.
       for (let i = 0; i < 3; i++) await deliverOffscreen(page, `start filler ${i}: ${"s".repeat(200)}`);
-      const start = committed(page, "start edge");
+      const start = committedRow(page, "start edge");
       await start.evaluate((el) => el.scrollIntoView({ block: "center" }));
       await openFromKeyboard(page, start);
-      let m = await measure(page, start);
+      let m = await measurePicker(start);
       expect(m.react.right - m.react.left, "premise").toBeGreaterThan(0);
       expect(m.react.right - (m.picker.right - m.picker.left), "premise: no room back from React").toBeLessThan(0);
       expect(placement(m)).toEqual({ block: "below", inline: "start" });
@@ -551,16 +518,51 @@ test.describe("Reaction picker placement", () => {
       expectInvokerUncovered(m);
       await page.keyboard.press("Escape");
 
-      // Chips put the newest message's React well into the column: it opens
-      // back from React, its right edge on React's.
-      const end = committed(page, "start filler 2");
-      await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂"]);
-      await expect(end.getByTestId("reaction-chip")).toHaveCount(3);
+      // As many chips as fit one line put the newest message's React at the
+      // column's right edge: it opens back from React, its right edge on
+      // React's. The count is measured: a fixed one fits a line in one engine
+      // and wraps in another (WebKit's emoji chips are 3px wider).
+      const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
+      const end = committedRow(page, "start filler 2");
+      const chips = end.getByTestId("reaction-chip");
+      await callRiverTest(page, "addReactionsToNewest", emojis.slice(0, 1));
+      await expect(chips).toHaveCount(1);
+      const fit = await end.evaluate((el) => {
+        const chip = el.querySelector('[data-testid="reaction-chip"]')!.getBoundingClientRect();
+        const react = el.querySelector('[data-testid="message-react-button"]')!.getBoundingClientRect();
+        const footer = el.querySelector('[data-testid="message-footer"]')!.getBoundingClientRect();
+        // Each chip moves React one chip and its gap further right.
+        return Math.floor((footer.right - react.right) / (react.left - chip.left)) + 1;
+      });
+      expect(fit, "chips that fit one line").toBeLessThanOrEqual(emojis.length);
+      await callRiverTest(page, "addReactionsToNewest", emojis.slice(1, fit));
+      await expect(chips).toHaveCount(fit);
+      await end.evaluate((el) => el.scrollIntoView({ block: "center" }));
       await openFromKeyboard(page, end);
-      m = await measure(page, end);
+      m = await measurePicker(end);
+      const footerRight = await end.evaluate((el) => el.querySelector('[data-testid="message-footer"]')!.getBoundingClientRect().right);
+      expect(footerRight - m.react.right, "premise: React at the column's right edge").toBeLessThan(60);
       expect(m.react.right - (m.picker.right - m.picker.left), "premise: room back from React").toBeGreaterThan(0);
       expect(placement(m).inline).toBe("end");
       expect(["below", "above"]).toContain(placement(m).block);
+      expectEveryEmojiUsable(m);
+      expectInvokerUncovered(m);
+      await page.keyboard.press("Escape");
+      await expectClosed(page);
+
+      // Chips that wrap onto several lines: React follows them, and the
+      // picker hangs from it there.
+      await callRiverTest(page, "appendMessage", "wrap target");
+      const wrapped = committedRow(page, "wrap target");
+      await expect(wrapped).toHaveCount(1);
+      await callRiverTest(page, "addReactionsToNewest", emojis);
+      await expect(wrapped.getByTestId("reaction-chip")).toHaveCount(10);
+      await wrapped.evaluate((el) => el.scrollIntoView({ block: "end" }));
+      const lines = await wrapped.getByTestId("reaction-chip").evaluateAll((els) => new Set(els.map((e) => Math.round(e.getBoundingClientRect().top))).size);
+      expect(lines, "premise: the chips wrap").toBeGreaterThan(1);
+      await openFromKeyboard(page, wrapped);
+      m = await measurePicker(wrapped);
+      expectAtReact(m);
       expectEveryEmojiUsable(m);
       expectInvokerUncovered(m);
     });
@@ -572,10 +574,10 @@ test.describe("Reaction picker placement", () => {
     test("at the newest message's React it opens above, and toward the free side", async ({ page }) => {
       await openRoomWithComposer(page);
       await deliver(page, "corner target");
-      const row = committed(page, "corner target");
+      const row = committedRow(page, "corner target");
       await openFromKeyboard(page, row);
-      const m = await measure(page, row);
-      expect(m.vh - m.react.bottom, "premise: no room below React").toBeLessThan(m.picker.bottom - m.picker.top + GAP);
+      const m = await measurePicker(row);
+      expect(m.vh - m.react.bottom, "premise: no room below React").toBeLessThan(m.picker.bottom - m.picker.top + PICKER_GAP);
       expect(m.react.right - (m.picker.right - m.picker.left), "premise: no room back from React").toBeLessThan(0);
       expect(placement(m)).toEqual({ block: "above", inline: "start" });
       expectEveryEmojiUsable(m);
@@ -588,7 +590,7 @@ test.describe("Reaction picker placement", () => {
   test("without anchor positioning it opens centred in the viewport, and still works", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "fallback target");
-    const row = committed(page, "fallback target");
+    const row = committedRow(page, "fallback target");
     const removed = await page.evaluate(() => {
       let n = 0;
       for (const sheet of Array.from(document.styleSheets)) {
@@ -610,7 +612,7 @@ test.describe("Reaction picker placement", () => {
     });
     expect(removed, "premise: the anchored rule was found").toBe(1);
     await openFromKeyboard(page, row);
-    const m = await measure(page, row);
+    const m = await measurePicker(row);
     expect(Math.abs(m.picker.left - (m.vw - m.picker.right)), "centred across").toBeLessThanOrEqual(1);
     expect(Math.abs(m.picker.top - (m.vh - m.picker.bottom)), "centred down").toBeLessThanOrEqual(1);
     expectEveryEmojiUsable(m);
@@ -660,7 +662,7 @@ test.describe("While the reaction picker is open", () => {
     test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
     await openRoomWithComposer(page);
     for (let i = 0; i < 6; i++) await deliver(page, `wheel filler ${i}: ${"w".repeat(200)}`);
-    const row = committed(page, "wheel filler 3");
+    const row = committedRow(page, "wheel filler 3");
     const park = async () => {
       await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
       await settle(page);
@@ -706,7 +708,7 @@ test.describe("While the reaction picker is open", () => {
   test("a wheel with Ctrl down is a zoom and is let through, over the history and over the picker", async ({ page }) => {
     await openRoomWithComposer(page);
     for (let i = 0; i < 6; i++) await deliver(page, `zoom filler ${i}: ${"z".repeat(200)}`);
-    const row = committed(page, "zoom filler 3");
+    const row = committedRow(page, "zoom filler 3");
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await settle(page);
     await openFromKeyboard(page, row);
@@ -733,7 +735,7 @@ test.describe("While the reaction picker is open", () => {
     test.skip(browserName !== "chromium" || test.info().project.name.startsWith("mobile"), "a touchpad pinch needs Chromium's input protocol and a desktop");
     await openRoomWithComposer(page);
     await deliver(page, "pinch anchor");
-    const row = committed(page, "pinch anchor");
+    const row = committedRow(page, "pinch anchor");
     await openFromKeyboard(page, row);
     const view = (await page.locator("#chat-scroll-container").boundingBox())!;
     const [x, y] = [Math.round(view.x + 100), Math.round(view.y + 40)];
@@ -752,17 +754,17 @@ test.describe("While the reaction picker is open", () => {
   test("an arrival is still followed", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "follow anchor");
-    const row = committed(page, "follow anchor");
+    const row = committedRow(page, "follow anchor");
     await openFromKeyboard(page, row);
     await deliver(page, "followed while open");
     await expectFollowed(page, "followed while open", "an arrival follows under the open picker");
     await expectOpenFor(page, row);
   });
 
-  test("an automatic reload waits, and closing it does not release one an unsent message holds", async ({ page }) => {
+  test("an automatic reload waits, and closing it does not release one an unsent message holds", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "reload target");
-    const row = committed(page, "reload target");
+    const row = committedRow(page, "reload target");
     await page.getByTestId("message-input").blur();
     expect(await callRiverTest(page, "userIsBusy"), "premise: idle").toBe(false);
 
@@ -777,17 +779,15 @@ test.describe("While the reaction picker is open", () => {
     // A message still being signed holds a reload whether or not the picker
     // is open, and closing the picker does not let it go.
     await callRiverTest(page, "holdMessageSigning");
-    const input = page.getByTestId("message-input");
-    await input.fill("held while picking");
-    await input.press("Enter");
-    await expect(input).toHaveValue("");
+    const held = await submitMessage(page, "held while picking");
+    await expect(page.getByTestId("pending-message").filter({ hasText: "held while picking" }), "premise: still being signed").toHaveCount(1);
     await openFromKeyboard(page, row);
     await page.keyboard.press("Escape");
     await expectClosed(page);
     await row.getByTestId("message-react-button").blur();
     expect(await callRiverTest(page, "userIsBusy"), "the unsent message still holds it").toBe(true);
     await callRiverTest(page, "releaseMessageSigning");
-    await expect(committed(page, "held while picking")).toHaveCount(1);
+    await expect(held).toHaveCount(1);
     await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "signed: released" }).toBe(false);
   });
 
@@ -798,19 +798,13 @@ test.describe("While the reaction picker is open", () => {
     await page.setViewportSize({ width: 320, height: 700 });
     await openRoomWithComposer(page);
     await deliver(page, "toast target");
-    const row = committed(page, "toast target");
+    const row = committedRow(page, "toast target");
     await callRiverTest(page, "takeToastActionRuns");
 
     await openFromKeyboard(page, row);
     await callRiverTest(page, "showToast", "Thread archived", "Undo");
     const action = page.getByTestId("toast-action");
     await expect(action).toBeVisible();
-    const overlap = await page.evaluate((sel) => {
-      const a = document.querySelector(sel)!.getBoundingClientRect();
-      const b = document.querySelector('[data-testid="toast"]')!.getBoundingClientRect();
-      return Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top)) * Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
-    }, PICKER);
-    test.info().annotations.push({ type: "320px overlap", description: `${overlap}px²` });
     const box = (await action.boundingBox())!;
     const hit = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.getAttribute("data-testid") ?? null, [box.x + box.width / 2, box.y + box.height / 2]);
     expect(hit, "premise: the action is uncovered").toBe("toast-action");
@@ -819,8 +813,6 @@ test.describe("While the reaction picker is open", () => {
     await expectClosed(page);
     expect(await callRiverTest(page, "takeToastActionRuns"), "the action ran once, on that press").toBe(1);
     await expect(action).toHaveCount(0);
-    const focused = await page.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? document.activeElement?.tagName);
-    test.info().annotations.push({ type: "focus after the action", description: String(focused) });
 
     // Covered: move the toast under the open picker. The press lands on the
     // picker; the action is still there once the picker is dismissed.
@@ -945,7 +937,7 @@ async function touchRoom(page: Page, label: string): Promise<Locator> {
   await openRoomWithComposer(page);
   for (let i = 0; i < 6; i++) await deliver(page, `${label} ${i}: ${"t".repeat(200)}`);
   await recordTouch(page);
-  return committed(page, `${label} 3`);
+  return committedRow(page, `${label} 3`);
 }
 
 /// Park the history with `row` centred, with room above for the whole drag
@@ -967,6 +959,21 @@ async function dragStart(page: Page): Promise<[number, number]> {
   const lowerHalf = !p || p.y > view.y + view.height / 2;
   const [x, y] = [Math.round(view.x + 30), Math.round(lowerHalf ? view.y + 40 : view.y + view.height - 40 - DRAG_PX)];
   for (const at of [y, y + DRAG_PX]) expect(await hitAt(page, x, at), `premise: (${x}, ${at}) is on the history`).toBe("history");
+  return [x, y];
+}
+
+/// With the history parked at `row` and its picker open, one finger down on
+/// the history and moved past a tap's slop, not lifted: the picker captures
+/// it, stays open, and the history holds. Returns where the drag started.
+async function startHeldDrag(page: Page, fingers: Fingers, row: Locator): Promise<[number, number]> {
+  const top = await parkTouch(page, row);
+  await openFromKeyboard(page, row);
+  const [x, y] = await dragStart(page);
+  await fingers.press([1, x, y]);
+  await fingers.move({ 1: DRAG_PX / 2 });
+  expect(await pickerCaptures(page), "premise: past a tap's slop, the picker captured the finger").toHaveLength(1);
+  expect(await isOpen(page), "a drag does not close it").toBe(true);
+  expect((await scrollMetrics(page)).top, "held").toBe(top);
   return [x, y];
 }
 
@@ -1004,14 +1011,7 @@ test.describe("A finger on the history and the reaction picker", () => {
   test("a drag under way when it closes keeps no capture, and the next drag scrolls", async ({ page }) => {
     const row = await touchRoom(page, "midway filler");
     await withFingers(page, async (fingers) => {
-      const top = await parkTouch(page, row);
-      await openFromKeyboard(page, row);
-      const [x, y] = await dragStart(page);
-      await fingers.press([1, x, y]);
-      await fingers.move({ 1: DRAG_PX / 2 });
-      expect(await pickerCaptures(page), "premise: past a tap's slop, the picker captured the finger").toHaveLength(1);
-      expect(await isOpen(page), "a drag does not close it").toBe(true);
-      expect((await scrollMetrics(page)).top, "held").toBe(top);
+      await startHeldDrag(page, fingers, row);
 
       await page.keyboard.press("Escape");
       await expectClosed(page);
@@ -1028,12 +1028,8 @@ test.describe("A finger on the history and the reaction picker", () => {
   test("a cancelled drag keeps nothing: the next one is still held, and once it closes one scrolls", async ({ page }) => {
     const row = await touchRoom(page, "cancel filler");
     await withFingers(page, async (fingers) => {
-      const top = await parkTouch(page, row);
-      await openFromKeyboard(page, row);
-      const [x, y] = await dragStart(page);
-      await fingers.press([1, x, y]);
-      await fingers.move({ 1: DRAG_PX / 2 });
-      expect(await pickerCaptures(page), "premise: the picker captured the finger").toHaveLength(1);
+      await startHeldDrag(page, fingers, row);
+      const top = (await scrollMetrics(page)).top;
       await fingers.cancel();
       await settle(page);
       expect(await pickerCaptures(page), "the cancel let go of it").toEqual([]);
@@ -1053,16 +1049,11 @@ test.describe("A finger on the history and the reaction picker", () => {
   test("a second finger joining a drag is neither held nor captured", async ({ page }) => {
     const row = await touchRoom(page, "second filler");
     await withFingers(page, async (fingers) => {
-      await parkTouch(page, row);
-      await openFromKeyboard(page, row);
-      const [x, y] = await dragStart(page);
       await takeTouchMoves(page);
-      await fingers.press([1, x, y]);
-      await fingers.move({ 1: DRAG_PX / 2 });
+      const [x, y] = await startHeldDrag(page, fingers, row);
       const single = await takeTouchMoves(page);
       expect(single.length, "premise: the first finger moved").toBeGreaterThan(0);
       expect(single.every((m) => m.touches === 1 && m.prevented), "one finger: held").toBe(true);
-      expect(await pickerCaptures(page), "premise: the picker captured the first finger").toHaveLength(1);
 
       await fingers.press([2, x + 120, y]);
       expect(await pickerCaptures(page), "a second finger: the first is let go").toEqual([]);
@@ -1237,16 +1228,35 @@ async function expectNothingOpened(page: Page, row: Locator, signs: number) {
 }
 
 test.describe("Without a working Popover API", () => {
-  test("a browser without it gets a disabled React that says why, from the keyboard too, and nothing opens", async ({ page, browserName }) => {
+  // A further simulation, not a run in an old browser: such a browser also
+  // has no built-in rule hiding a closed `[popover]`, so that attribute is
+  // taken off the picker first. Only the stylesheet then keeps the emoji out
+  // of the page, for everything below.
+  test("a browser without it keeps the picker out of the page, gets a disabled React that says why, from the keyboard too, and nothing opens", async ({ page, browserName }) => {
     // WebKit's Tab reaches only text fields; Alt+Tab reaches every control.
     const tab = browserName === "webkit" ? "Alt+Tab" : "Tab";
     await withoutPopoverApi(page);
     await openRoomWithComposer(page);
     await deliver(page, "unsupported target");
-    const row = committed(page, "unsupported target");
+    const row = committedRow(page, "unsupported target");
     const react = row.getByTestId("message-react-button");
     const tip = row.getByTestId("message-react-unavailable");
     await page.getByTestId("message-input").blur();
+    await settle(page);
+    const geometry = () =>
+      page.evaluate(() => {
+        const box = (sel: string) => {
+          const r = document.querySelector(sel)!.getBoundingClientRect();
+          return [r.left, r.top, r.width, r.height].map((v) => Math.round(v));
+        };
+        return { history: box("#chat-scroll-container"), composer: box('[data-testid="message-composer"]') };
+      });
+    const before = await geometry();
+    await picker(page).evaluate((el) => el.removeAttribute("popover"));
+    await nextFrames(page);
+    expect(await picker(page).getAttribute("popover"), "premise: no popover attribute").toBeNull();
+    expect(await picker(page).evaluate((el) => getComputedStyle(el).display), "hidden by the stylesheet").toBe("none");
+    expect(await geometry(), "the history and composer did not move").toEqual(before);
     const signs = await callRiverTest(page, "messageSignsRecorded");
 
     await expect(react).toHaveAttribute("aria-disabled", "true");
@@ -1300,37 +1310,10 @@ test.describe("Without a working Popover API", () => {
     await expectNothingOpened(page, row, signs);
   });
 
-  // A further simulation, not a run in an old browser: such a browser also
-  // has no built-in rule hiding a closed `[popover]`, so that attribute is
-  // taken off the picker. Only the stylesheet then keeps the emoji out of
-  // the page.
-  test("without the browser's own popover hiding, the stylesheet keeps the picker out of the page", async ({ page }) => {
-    await withoutPopoverApi(page);
-    await openRoomWithComposer(page);
-    await deliver(page, "layout target");
-    await settle(page);
-    const geometry = () =>
-      page.evaluate(() => {
-        const box = (sel: string) => {
-          const r = document.querySelector(sel)!.getBoundingClientRect();
-          return [r.left, r.top, r.width, r.height].map((v) => Math.round(v));
-        };
-        return { history: box("#chat-scroll-container"), composer: box('[data-testid="message-composer"]') };
-      });
-    const before = await geometry();
-    await picker(page).evaluate((el) => el.removeAttribute("popover"));
-    await nextFrames(page);
-    expect(await picker(page).getAttribute("popover"), "premise: no popover attribute").toBeNull();
-    expect(await picker(page).evaluate((el) => getComputedStyle(el).display), "hidden by the stylesheet").toBe("none");
-    await expect(picker(page)).toBeHidden();
-    expect(await geometry(), "the history and composer did not move").toEqual(before);
-    await expect(committed(page, "layout target").getByTestId("message-react-button")).toHaveAttribute("aria-disabled", "true");
-  });
-
   test("a popover that throws is undone, says to try again once per press, and a retry opens it", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "throwing target");
-    const row = committed(page, "throwing target");
+    const row = committedRow(page, "throwing target");
     const react = row.getByTestId("message-react-button");
     await page.getByTestId("message-input").blur();
     const signs = await callRiverTest(page, "messageSignsRecorded");
@@ -1378,7 +1361,7 @@ test.describe("Without a working Popover API", () => {
     expect(await toastsSeen(page), "no message after the retry").toHaveLength(2);
   });
 
-  test("a failed re-showing after a remount, a stale press and a superseded one close quietly", async ({ page }) => {
+  test("a failed re-showing after a remount closes quietly, and a later opening works", async ({ page }) => {
     await openRoomWithComposer(page);
     for (let i = 0; i < 4; i++) await deliver(page, `quiet filler ${i}: ${"q".repeat(200)}`);
     // The newest group, as in the remount test above.
@@ -1386,7 +1369,7 @@ test.describe("Without a working Popover API", () => {
       { text: "quiet lead", sentSecs: 1, receivedSecs: 0 },
       { text: "quiet survivor", sentSecs: 2, receivedSecs: 0 },
     ]);
-    const [lead, survivor] = [committed(page, "quiet lead"), committed(page, "quiet survivor")];
+    const [lead, survivor] = [committedRow(page, "quiet lead"), committedRow(page, "quiet survivor")];
     await expect(survivor).toHaveCount(1);
     const groupKey = (row: Locator) => row.evaluate((el) => el.closest(".msg-group")?.getAttribute("data-item-key") ?? null);
     const leadKey = (await lead.getAttribute("id"))!.replace(/^msg-/, "");
@@ -1407,10 +1390,27 @@ test.describe("Without a working Popover API", () => {
     await expectNothingOpened(page, survivor, signs);
     expect(await toastsSeen(page), "the reader pressed nothing: no message").toEqual([]);
 
+    await restoreShowPopover(page);
+    await openFromKeyboard(page, survivor);
+    await page.keyboard.press("Escape");
+    await expectClosed(page);
+  });
+
+  // Dispatch order only, so run once: a press whose message is gone by the
+  // time it runs, and the first of two presses in one task.
+  test("with a popover that throws, a stale press tries nothing and a superseded one gives way to the later press", { tag: "@chromium-only" }, async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliver(page, "dispatch target");
+    const row = committedRow(page, "dispatch target");
+    await page.getByTestId("message-input").blur();
+    const signs = await callRiverTest(page, "messageSignsRecorded");
+    await countToasts(page);
+    await patchShowPopover(page, "always");
+
     // A press whose message is gone by the time it runs (a room switch in
     // the same task) tries nothing and says nothing.
     const attempts = await showAttempts(page);
-    const id = (await survivor.getAttribute("id"))!;
+    const id = (await row.getAttribute("id"))!;
     await page.evaluate((id) => {
       const hooks = (window as unknown as { __riverTest: { switchRoom(n: string): void } }).__riverTest;
       hooks.switchRoom("Team Chat Room");
@@ -1421,7 +1421,7 @@ test.describe("Without a working Popover API", () => {
     expect(await showAttempts(page), "a stale press tries nothing").toBe(attempts);
     expect(await toastsSeen(page), "and says nothing").toEqual([]);
     await callRiverTest(page, "switchRoom", "Your Private Room");
-    await expect(survivor).toHaveCount(1);
+    await expect(row).toHaveCount(1);
 
     // Two presses in one task: the first is superseded before it runs, so
     // only the second tries, and says so once.
@@ -1434,10 +1434,10 @@ test.describe("Without a working Popover API", () => {
     await settle(page);
     expect(await showAttempts(page), "only the later press tried").toBe(attempts + 2);
     expect(await toastsSeen(page)).toEqual([OPEN_FAILED]);
-    await expectNothingOpened(page, survivor, signs);
+    await expectNothingOpened(page, row, signs);
 
     await restoreShowPopover(page);
-    await openFromKeyboard(page, survivor);
+    await openFromKeyboard(page, row);
     await page.keyboard.press("Escape");
     await expectClosed(page);
   });

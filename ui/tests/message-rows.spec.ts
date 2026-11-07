@@ -1,6 +1,7 @@
 import { test, expect, Locator, Page } from "@playwright/test";
 import { clickFooter, coarsePointer, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
-import { deliver, deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import { deliver, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import { expectAtReact, expectEveryEmojiUsable, measurePicker } from "./reaction-picker-geometry";
 import { callRiverTest } from "./river-test";
 
 // Grouped chat rows: an avatar gutter, then one content column for every row.
@@ -431,42 +432,8 @@ test.describe("Avatars", () => {
   });
 });
 
-// React opens the picker at itself: the footer React, after the message's
-// chips.
+// Placement at React is reaction-picker.spec.ts's (reaction-picker-geometry.ts).
 test.describe("The picker opens at React", () => {
-  test("on a long message, at the footer React", async ({ page }) => {
-    await openRoomWithComposer(page);
-    const text = Array.from({ length: 6 }, (_, i) => `picker line ${i}`).join("\n\n");
-    await callRiverTest(page, "appendMessage", text);
-    const row = page.getByTestId("message-row").filter({ hasText: "picker line 5" });
-    await callRiverTest(page, "addReactionsToNewest", ["👍"]);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    await openInlinePicker(page, row);
-    const report = await measurePicker(page);
-    expectPickerAtControl(report);
-    expectEveryEmojiTappable(report);
-  });
-
-  // A reaction arriving while the picker is open adds a chip before React and
-  // moves it; the picker moves with it.
-  test("stays at React when a reaction arrives while it is open", async ({ page }) => {
-    await openRoomWithComposer(page);
-    await deliverOffscreen(page, "reflow probe");
-    const row = page.getByTestId("message-row").filter({ hasText: "reflow probe" });
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    await openInlinePicker(page, row);
-    const before = await measurePicker(page);
-    expectPickerAtControl(before);
-    await callRiverTest(page, "addReactionsToNewest", ["🎉", "👀", "🔥"]);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(3);
-    await nextFrames(page);
-    const after = await measurePicker(page);
-    expect(after.control.left - before.control.left, "premise: the chips moved React").toBeGreaterThan(20);
-    expectPickerAtControl(after);
-  });
-
   // Opened upward, it stays upward and at React when a reaction moves React.
   test("opened upward, stays at React when a reaction arrives", async ({ page }) => {
     await openRoomWithComposer(page);
@@ -474,39 +441,15 @@ test.describe("The picker opens at React", () => {
     const row = page.getByTestId("message-row").filter({ hasText: "upward reflow probe" });
     await expect(row).toBeInViewport();
     await openInlinePicker(page, row);
-    const before = await measurePicker(page);
-    expect(before.picker.bottom, "premise: it opened upward").toBeLessThanOrEqual(before.control.top + 0.5);
+    const before = await measurePicker(row);
+    expect(before.picker.bottom, "premise: it opened upward").toBeLessThanOrEqual(before.react.top + 0.5);
     await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
     await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
     await nextFrames(page);
-    const after = await measurePicker(page);
-    expect(after.control.left - before.control.left, "premise: the chip moved React").toBeGreaterThan(20);
-    expectPickerAtControl(after);
-    expect(after.picker.bottom).toBeLessThanOrEqual(after.control.top + 0.5);
-  });
-});
-
-// Chips that wrap onto several lines at 320px: the picker still opens at the
-// control, and every emoji in it takes a tap.
-test.describe("Reaction row that wraps, at 320px", () => {
-  test.use({ viewport: { width: 320, height: 700 } });
-
-  test("the picker opens at React and every emoji is tappable", async ({ page }) => {
-    await openRoomWithComposer(page);
-    await callRiverTest(page, "appendMessage", "wrap target");
-    const row = page.getByTestId("message-row").filter({ hasText: "wrap target" });
-    await expect(row).toBeVisible();
-    await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"]);
-    const chips = row.getByTestId("reaction-chip");
-    await expect(chips).toHaveCount(10);
-    await row.evaluate((el) => el.scrollIntoView({ block: "end" }));
-    const lines = new Set((await chips.evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().top)))));
-    expect(lines.size, "premise: the chips wrap").toBeGreaterThan(1);
-
-    await openInlinePicker(page, row);
-    const report = await measurePicker(page);
-    expectPickerAtControl(report);
-    expectEveryEmojiTappable(report);
+    const after = await measurePicker(row);
+    expect(after.react.left - before.react.left, "premise: the chip moved React").toBeGreaterThan(20);
+    expectAtReact(after);
+    expect(after.picker.bottom).toBeLessThanOrEqual(after.react.top + 0.5);
   });
 });
 
@@ -570,14 +513,15 @@ test.describe("Join notices and date separators", () => {
 });
 
 // The narrowest supported width: a long message, a long link, a reply and a
-// reaction row must wrap inside the content column, and the controls must stay
-// on screen. Regression (#212): a long unbreakable URL must wrap rather than
-// widen the row or the page. The example data carries that URL and a reply
-// quoting it, whose strip preview must stay in the column too.
+// reaction row must wrap inside the content column (the footer controls'
+// reach at 320px is message-action-buttons.spec.ts's). Regression (#212): a
+// long unbreakable URL must wrap rather than widen the row or the page. The
+// example data carries that URL and a reply quoting it, whose strip preview
+// must stay in the column too.
 test.describe("Message rows at 320px", () => {
   test.use({ viewport: { width: 320, height: 700 } });
 
-  test("nothing overflows the column and the controls stay reachable", async ({ page }) => {
+  test("nothing overflows the column", async ({ page }) => {
     const { own } = await openRoomWithPairs(page);
     // The example room's fixtures: a long unbreakable link and a reply quoting it.
     await expect(page.getByTestId("message-body").filter({ hasText: "longlongurlpath" }).first()).toBeAttached();
@@ -614,104 +558,8 @@ test.describe("Message rows at 320px", () => {
     expect(report.bad).toEqual([]);
     expect(report.docOverflow).toBeLessThanOrEqual(0);
     expect(report.scrollerOverflow).toBeLessThanOrEqual(0);
-
-    // The newest own message's footer controls stay inside its content
-    // column, so inside the scroller.
-    const row = own.getByTestId("message-row").last();
-    await revealFooter(page, row);
-    const content = (await row.getByTestId("message-content").boundingBox())!;
-    for (const id of ["message-react-button", "message-reply-button", "message-edit-button", "message-delete-button"]) {
-      const control = row.getByTestId(id);
-      const b = (await control.boundingBox())!;
-      expect(b.x, id).toBeGreaterThanOrEqual(content.x - 0.5);
-      expect(b.x + b.width, id).toBeLessThanOrEqual(content.x + content.width + 0.5);
-      await control.click({ trial: true });
-    }
   });
 });
-
-// The picker opens at the React control it was opened from (anchored, in the
-// top layer), inside the viewport. Each case checks every emoji is inside the
-// viewport and takes a tap at its centre.
-type PickerReport = Awaited<ReturnType<typeof measurePicker>>;
-
-/// The open picker, the reaction line and the footer React it was opened
-/// from (the expanded one), with no click in between: a click elsewhere would
-/// close it.
-async function measurePicker(page: Page) {
-  await expect(page.getByTestId("emoji-picker")).toBeVisible();
-  return page.evaluate(() => {
-    const box = (e: Element) => {
-      const r = e.getBoundingClientRect();
-      return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
-    };
-    const picker = document.querySelector('[data-testid="emoji-picker"]')!;
-    const control = document.querySelector('[data-testid="message-react-button"][aria-expanded="true"]')!;
-    const row = control.closest('[id^="msg-"]')!;
-    const line = row.querySelector('[data-testid="message-reaction-row"]')!;
-    const buttons = Array.from(picker.querySelectorAll("button")).map((b) => {
-      const r = b.getBoundingClientRect();
-      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      return {
-        emoji: (b.textContent || "").trim(),
-        inside: r.left >= -0.5 && r.right <= innerWidth + 0.5 && r.top >= -0.5 && r.bottom <= innerHeight + 0.5,
-        hit: at !== null && (at === b || b.contains(at)),
-      };
-    });
-    return { line: box(line), control: box(control), picker: box(picker), buttons };
-  });
-}
-
-function expectEveryEmojiTappable(report: PickerReport) {
-  expect(report.buttons.length, "the picker has emoji").toBeGreaterThan(0);
-  const outside = report.buttons.find((b) => !b.inside);
-  expect(outside, `${outside?.emoji} is outside the viewport (picker ${report.picker.left}..${report.picker.right} x ${report.picker.top}..${report.picker.bottom})`).toBeUndefined();
-  const covered = report.buttons.find((b) => !b.hit);
-  expect(covered, `${covered?.emoji} is not the element a tap at its centre lands on`).toBeUndefined();
-}
-
-/// The picker sits at the control it was opened from: its right edge on the
-/// control's, or (flipped, where that does not fit) its left edge on the
-/// control's; and 4px below or above the control.
-function expectPickerAtControl(report: PickerReport) {
-  const { picker: p, control: c } = report;
-  const sideways = Math.abs(p.right - c.right) <= 1 || Math.abs(p.left - c.left) <= 1;
-  expect(sideways, `picker ${p.left}..${p.right}, control ${c.left}..${c.right}`).toBe(true);
-  const below = Math.abs(p.top - (c.bottom + 4)) <= 1;
-  const above = Math.abs(p.bottom - (c.top - 4)) <= 1;
-  expect(below || above, `picker ${p.top}..${p.bottom}, control ${c.top}..${c.bottom}`).toBe(true);
-}
-
-/// The newest message, "picker edge", with as many reaction chips as fit on one
-/// line before React, so React sits at the column's right edge, where the
-/// picker opens. The count is measured: a fixed one fits a line in one engine
-/// and wraps in another (WebKit's emoji chips are 3px wider).
-async function nearEdgeRow(page: Page): Promise<Locator> {
-  const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
-  await openRoomWithComposer(page);
-  await deliverOffscreen(page, "picker edge");
-  const row = page.getByTestId("message-row").filter({ hasText: "picker edge" });
-  const chips = row.getByTestId("reaction-chip");
-  await callRiverTest(page, "addReactionsToNewest", emojis.slice(0, 1));
-  await expect(chips).toHaveCount(1);
-  const fit = await row.evaluate((el) => {
-    const chip = el.querySelector('[data-testid="reaction-chip"]')!.getBoundingClientRect();
-    const react = el.querySelector('[data-testid="message-react-button"]')!.getBoundingClientRect();
-    const footer = el.querySelector('[data-testid="message-footer"]')!.getBoundingClientRect();
-    // Each chip moves React one chip and its gap further right.
-    return Math.floor((footer.right - react.right) / (react.left - chip.left)) + 1;
-  });
-  expect(fit, "chips that fit one line").toBeLessThanOrEqual(emojis.length);
-  await callRiverTest(page, "addReactionsToNewest", emojis.slice(1, fit));
-  await expect(chips).toHaveCount(fit);
-  await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-  const room = await row.evaluate((el) => {
-    const react = el.querySelector('[data-testid="message-react-button"]')!.getBoundingClientRect();
-    return el.querySelector('[data-testid="message-footer"]')!.getBoundingClientRect().right - react.right;
-  });
-  expect(room, "premise: React at the column's right edge").toBeLessThan(60);
-  return row;
-}
 
 /// The scroll offsets a reveal must leave alone: the history's horizontal
 /// one, the app root's and the page's (all `overflow: hidden`).
@@ -751,30 +599,6 @@ test.describe("Revealing a popover on a short phone view", () => {
   });
 });
 
-test.describe("Reaction picker at 320px", () => {
-  test.use({ viewport: { width: 320, height: 700 } });
-
-  test("on a row of chips to the right edge, the picker opens at React and every emoji is tappable", async ({ page }) => {
-    const row = await nearEdgeRow(page);
-    await openInlinePicker(page, row);
-    const report = await measurePicker(page);
-    expectPickerAtControl(report);
-    expectEveryEmojiTappable(report);
-  });
-
-  test("on a row with no chips, the picker opens at React and every emoji is tappable", async ({ page }) => {
-    await openRoomWithComposer(page);
-    await deliverOffscreen(page, "picker start");
-    const row = page.getByTestId("message-row").filter({ hasText: "picker start" });
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    await openInlinePicker(page, row);
-    const report = await measurePicker(page);
-    expectPickerAtControl(report);
-    expectEveryEmojiTappable(report);
-  });
-});
-
 // #791 review: the picker opened from the keyboard reports no click
 // position, so its place must come from the control. The newest message, at
 // the bottom of the view, has no room for the picker below its React.
@@ -793,10 +617,10 @@ test("the picker opened from the keyboard at the bottom of the view opens upward
   await page.mouse.move(0, 0);
   await row.getByTestId("message-react-button").focus();
   await page.keyboard.press("Enter");
-  const report = await measurePicker(page);
-  expect(report.picker.bottom, "the picker opens above the control").toBeLessThanOrEqual(report.control.top + 0.5);
-  expectPickerAtControl(report);
-  expectEveryEmojiTappable(report);
+  const report = await measurePicker(row);
+  expect(report.picker.bottom, "the picker opens above the control").toBeLessThanOrEqual(report.react.top + 0.5);
+  expectAtReact(report);
+  expectEveryEmojiUsable(report);
 });
 
 // The hover band (fine pointers only): hovering anywhere in a message row

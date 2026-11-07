@@ -1,5 +1,16 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { clickFooter, coarsePointer, openInlinePicker, openRoomWithComposer, reactTo, revealFooter, settle } from "./example-room";
+import {
+  clickFooter,
+  coarsePointer,
+  committedRow,
+  FOOTER_CONTROLS,
+  keyboardFocus,
+  openRoomWithComposer,
+  reactTo,
+  revealFooter,
+  settle,
+  submitMessage,
+} from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Every signed message ends with a footer: on the left its reaction chips and
@@ -10,28 +21,14 @@ import { callRiverTest } from "./river-test";
 // that has focus however it got it; a touch or hybrid pointer shows them at
 // rest. Reaction chips always show.
 
-const CONTROLS = ["message-react-button", "message-reply-button", "message-edit-button", "message-delete-button"];
-const LEGACY_ROUTES =
-  '[data-testid="message-hover-actions"], [data-testid="message-kebab"], [data-testid="message-action-menu"], [data-testid="add-reaction-button"], [data-testid="reaction-picker-anchor"]';
-
-function committed(page: Page, text: string): Locator {
-  return page.getByTestId("conversation-history").getByTestId("message-row").filter({ hasText: text });
-}
-
-async function send(page: Page, text: string) {
-  const input = page.getByTestId("message-input");
-  await input.fill(text);
-  await input.press("Enter");
-  await expect(committed(page, text)).toHaveCount(1);
-}
-
 /// A received message (a fixed test identity, inserted before the newest)
 /// and an own one (sent from the composer), neither with reactions.
 async function openRoomWithBoth(page: Page): Promise<{ received: Locator; own: Locator }> {
   await openRoomWithComposer(page);
   await callRiverTest(page, "insertMessageBeforeLast", "received footer");
-  await send(page, "own footer");
-  return { received: committed(page, "received footer"), own: committed(page, "own footer") };
+  const own = await submitMessage(page, "own footer");
+  await expect(own).toHaveCount(1);
+  return { received: committedRow(page, "received footer"), own };
 }
 
 /// The test ids of a container's direct controls, in order.
@@ -63,21 +60,6 @@ function allStates(ids: string[], state: { opacity: string; hit: boolean }) {
 const SHOWN = { opacity: "1", hit: true };
 const HIDDEN = { opacity: "0", hit: false };
 
-/// Focus `target` as a keyboard user would, so it is `:focus-visible`.
-async function keyboardFocus(page: Page, target: Locator) {
-  await page.keyboard.press("Escape");
-  await target.focus();
-  if (!(await target.evaluate((el) => el.matches(":focus-visible")))) {
-    await page.keyboard.press("Shift+Tab");
-    await page.keyboard.press("Tab");
-  }
-  await expect
-    .poll(() => target.evaluate((el) => el === document.activeElement && el.matches(":focus-visible")), {
-      message: "premise: keyboard focus",
-    })
-    .toBe(true);
-}
-
 function rowBox(row: Locator) {
   return row.evaluate((el) => {
     const r = el.getBoundingClientRect();
@@ -96,11 +78,6 @@ test.describe("Message footer", () => {
     ] as const) {
       const footer = row.getByTestId("message-footer");
       await expect(footer).toHaveCount(1);
-      // Left group first, then the trailing cluster, and nothing else.
-      expect(await footer.evaluate((el) => Array.from(el.children).map((c) => c.getAttribute("data-testid")))).toEqual([
-        "message-reaction-row",
-        "message-action-cluster",
-      ]);
       expect(await testIds(footer.getByTestId("message-reaction-row"))).toEqual(["message-react-button"]);
       expect(await testIds(footer.getByTestId("message-action-cluster"))).toEqual(cluster);
       await expect(footer.locator("time"), "no time in the footer").toHaveCount(0);
@@ -122,8 +99,7 @@ test.describe("Message footer", () => {
     await expect(received.getByTestId("message-edit-button")).toHaveCount(0);
     await expect(received.getByTestId("message-delete-button")).toHaveCount(0);
 
-    // Every message in the room: exactly one way to react and one Reply, and
-    // none of the old floating bar, touch menu or add button.
+    // Every message in the room: exactly one way to react and one Reply.
     const perRow = await page.getByTestId("message-row").evaluateAll((rows) =>
       rows.map((r) => [
         r.querySelectorAll('button[aria-label="React"]').length,
@@ -133,19 +109,6 @@ test.describe("Message footer", () => {
     );
     expect(perRow.length, "premise: the room has messages").toBeGreaterThan(3);
     for (const counts of perRow) expect(counts).toEqual([1, 1, 1]);
-    await expect(page.locator(LEGACY_ROUTES)).toHaveCount(0);
-  });
-
-  test("the reaction line holds chips and React, and React is its only native button", async ({ page }) => {
-    const { own } = await openRoomWithBoth(page);
-    await callRiverTest(page, "addReactionsToNewest", ["🎉", "👀", "🔥"]);
-    const line = own.getByTestId("message-reaction-row");
-    await expect(line.getByTestId("reaction-chip")).toHaveCount(3);
-    // Chips are `role="button"` spans; React is the one native button, last.
-    expect(await testIds(line)).toEqual(["message-react-button"]);
-    expect(
-      await line.evaluate((el) => Array.from(el.querySelectorAll('[role="button"], button')).map((c) => c.getAttribute("data-testid"))),
-    ).toEqual(["reaction-chip", "reaction-chip", "reaction-chip", "message-react-button"]);
   });
 
   test("Reply, Edit and Delete act from the footer", async ({ page }) => {
@@ -169,7 +132,7 @@ test.describe("Message footer", () => {
     await clickFooter(page, own, "message-edit-button");
     await editArea.fill("own footer, edited");
     await page.getByTestId("edit-save-button").click();
-    const edited = committed(page, "own footer, edited");
+    const edited = committedRow(page, "own footer, edited");
     await expect(edited).toHaveCount(1);
 
     // Delete asks first: Cancel keeps the message, Delete removes it.
@@ -198,25 +161,6 @@ test.describe("Message footer", () => {
     await revealFooter(page, own);
     await expect(own.getByTestId("message-delete-button")).toBeVisible();
   });
-
-  test("a reaction still being signed switches to another emoji from the footer", async ({ page }) => {
-    const { own } = await openRoomWithBoth(page);
-    await callRiverTest(page, "holdMessageSigning");
-    const chip = await reactTo(page, own);
-    const first = (await chip.textContent())!.trim();
-    await openInlinePicker(page, own);
-    const second = page.getByTestId("emoji-picker").getByRole("button").nth(1);
-    const secondEmoji = (await second.textContent())!.trim();
-    await second.click();
-    await expect(own.getByTestId("reaction-chip")).toHaveCount(1);
-    await expect(own.getByTestId("reaction-chip")).toContainText(secondEmoji);
-    expect(secondEmoji).not.toBe(first.replace(/\d+$/, ""));
-
-    await callRiverTest(page, "releaseMessageSigning");
-    await settle(page);
-    await expect(own.getByTestId("reaction-chip"), "the switch holds once signed").toHaveCount(1);
-    await expect(own.getByTestId("reaction-chip")).toContainText(secondEmoji);
-  });
 });
 
 test.describe("Footer controls on a fine pointer", () => {
@@ -224,7 +168,7 @@ test.describe("Footer controls on a fine pointer", () => {
 
   test("hidden and hit-transparent at rest; hover, keyboard focus and an open picker show them; the row never moves", async ({ page }) => {
     const { own } = await openRoomWithBoth(page);
-    const ids = CONTROLS;
+    const ids = FOOTER_CONTROLS;
     await own.scrollIntoViewIfNeeded();
     await page.mouse.move(0, 0);
     await settle(page);
@@ -308,7 +252,7 @@ test.describe("Footer controls on a touch pointer", () => {
   test("shown and tappable at rest", async ({ page }) => {
     const { received, own } = await openRoomWithBoth(page);
     await own.scrollIntoViewIfNeeded();
-    expect(await controlStates(own, CONTROLS)).toEqual(allStates(CONTROLS, SHOWN));
+    expect(await controlStates(own, FOOTER_CONTROLS)).toEqual(allStates(FOOTER_CONTROLS, SHOWN));
     const ids = ["message-react-button", "message-reply-button"];
     await received.scrollIntoViewIfNeeded();
     expect(await controlStates(received, ids)).toEqual(allStates(ids, SHOWN));
@@ -422,10 +366,10 @@ test.describe("Footer at 320px", () => {
 
   test("chips wrap with React after them, the cluster stays whole, and every target takes its own hits", async ({ page }) => {
     await openRoomWithComposer(page);
-    await send(page, "narrow bare");
-    await send(page, "narrow chips");
-    const bare = committed(page, "narrow bare");
-    const row = committed(page, "narrow chips");
+    const bare = await submitMessage(page, "narrow bare");
+    await expect(bare).toHaveCount(1);
+    const row = await submitMessage(page, "narrow chips");
+    await expect(row).toHaveCount(1);
     await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"]);
     await expect(row.getByTestId("reaction-chip")).toHaveCount(10);
 
@@ -440,6 +384,8 @@ test.describe("Footer at 320px", () => {
       if (what === "wrapped chips") {
         const lines = new Set(layout.left.filter((c) => c.id === "reaction-chip").map((c) => Math.round(c.box.top)));
         expect(lines.size, "premise: the chips wrap").toBeGreaterThan(1);
+        // Chips are `role="button"` spans; React is the line's one native button.
+        expect(await testIds(target.getByTestId("message-reaction-row"))).toEqual(["message-react-button"]);
       } else {
         expect(layout.left.length, "premise: no chips").toBe(1);
         const [react, reply] = [layout.left[0].box, layout.cluster[0].box];

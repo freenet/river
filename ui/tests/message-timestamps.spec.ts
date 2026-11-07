@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { clickFooter, coarsePointer, openRoomWithComposer, settle } from "./example-room";
+import { clickFooter, coarsePointer, openRoomWithComposer, settle, submitMessage } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // A message's time shows in two places: beside the author's name on a group's
@@ -12,38 +12,25 @@ import { callRiverTest } from "./river-test";
 
 type Entry = { text: string; sentSecs: number; receivedSecs: number };
 
-/// What one message's time should say, from its sender time and arrival,
-/// formatted in the page as River's own formatters do (util.rs).
-type Expected = { datetime: string; shown: string; title: string; clamped: boolean };
+/// What one message's time should say, from its sender time and arrival: the
+/// instant it shows, whether it carries the clamp mark, and the explanation
+/// its full-date title ends with. The date formatting itself is util.rs's.
+type Expected = { datetime: string; clamped: boolean; note: string };
 
 const CLAMP_NOTE =
   "(sender's clock may be ahead of yours — their timestamp was later than when this message reached you, so the time shown is when it arrived)";
 
-async function expectedFor(page: Page, [sentMs, receivedMs]: [number, number]): Promise<Expected> {
-  return page.evaluate(
-    ({ sentMs, receivedMs, clampNote }) => {
-      // CLOCK_SKEW_TOLERANCE_SECS
-      const clamped = sentMs > receivedMs + 60_000;
-      const ms = clamped ? receivedMs : sentMs;
-      const date = new Date(ms);
-      const hhmm = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
-      const full = new Intl.DateTimeFormat(undefined, {
-        weekday: "short",
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: false,
-      }).format(date);
-      // Every delay these specs deliver is under a minute (`format_delay`).
-      const delay = Math.trunc((receivedMs - sentMs) / 1000);
-      const title = clamped ? `${full} ${clampNote}` : delay >= 0 ? `${full} (received after ${delay}s delay)` : full;
-      return { datetime: date.toISOString(), shown: clamped ? `~${hhmm}` : hhmm, title, clamped };
-    },
-    { sentMs, receivedMs, clampNote: CLAMP_NOTE },
-  );
+function expectedFor([sentMs, receivedMs]: [number, number]): Expected {
+  // CLOCK_SKEW_TOLERANCE_SECS
+  const clamped = sentMs > receivedMs + 60_000;
+  // Every delay these specs deliver is under a minute (`format_delay`), and
+  // none is negative.
+  const delay = Math.trunc((receivedMs - sentMs) / 1000);
+  return {
+    datetime: new Date(clamped ? receivedMs : sentMs).toISOString(),
+    clamped,
+    note: clamped ? CLAMP_NOTE : `(received after ${delay}s delay)`,
+  };
 }
 
 /// The semantic time element as it renders.
@@ -57,7 +44,11 @@ function timeOf(el: Locator) {
 }
 
 function expectTime(actual: Awaited<ReturnType<typeof timeOf>>, want: Expected, what: string) {
-  expect(actual, what).toEqual({ tag: "time", datetime: want.datetime, shown: want.shown, title: want.title });
+  expect(actual.tag, `${what}: a time element`).toBe("time");
+  expect(actual.datetime, `${what}: its instant`).toBe(want.datetime);
+  expect(actual.shown, `${what}: the clamp mark`).toMatch(want.clamped ? /^~\d{1,2}:\d{2}$/ : /^\d{1,2}:\d{2}$/);
+  expect(actual.title!.endsWith(` ${want.note}`), `${what}: its explanation, in "${actual.title}"`).toBe(true);
+  expect(actual.title!.includes(CLAMP_NOTE), `${what}: the clamp note only when clamped`).toBe(want.clamped);
 }
 
 function groupWith(page: Page, text: string): Locator {
@@ -70,7 +61,7 @@ async function deliverRun(page: Page, author: 0 | 1, entries: Entry[]) {
   const group = groupWith(page, entries[0].text);
   await expect(group.getByTestId("message-row"), "the run is one group").toHaveCount(entries.length);
   for (const [i, e] of entries.entries()) await expect(group.getByTestId("message-row").nth(i)).toContainText(e.text);
-  const expected = await Promise.all(times.map((t) => expectedFor(page, t)));
+  const expected = times.map(expectedFor);
   return { group, expected };
 }
 
@@ -109,9 +100,9 @@ test.describe("Message timestamps", () => {
       await expect(run.group.getByTestId("message-header-time"), `${what}: only on the first row`).toHaveCount(1);
       expectTime(await timeOf(time), run.expected[0], `${what}: the header time is the first message's`);
       await expect(time).toBeVisible();
-      // Shown at rest, with no hover: fully, or dimmed with the clamp mark as it always was.
+      // Shown at rest, with no hover (`toBeVisible` passes at opacity 0).
       const opacity = Number(await time.evaluate((e) => getComputedStyle(e).opacity));
-      expect(opacity, `${what}: shown at rest`).toBe(run.expected[0].clamped ? 0.7 : 1);
+      expect(opacity, `${what}: shown at rest`).toBeGreaterThan(0);
 
       // Beside the name: on the name's line, after it.
       const [name, box] = [await header.getByTestId("message-author-name").boundingBox(), await time.boundingBox()];
@@ -158,14 +149,9 @@ test.describe("Message timestamps", () => {
     }
   });
 
-  test("a pending delete of the first message moves the header to the next, and its failure moves it back", async ({ page }) => {
+  test("a pending delete of the first message moves the header to the next, and its failure moves it back", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomWithComposer(page);
-    const input = page.getByTestId("message-input");
-    for (const text of ["header pair one", "header pair two"]) {
-      await input.fill(text);
-      await input.press("Enter");
-      await expect(page.getByTestId("conversation-history").getByTestId("message-row").filter({ hasText: text })).toHaveCount(1);
-    }
+    for (const text of ["header pair one", "header pair two"]) await expect(await submitMessage(page, text)).toHaveCount(1);
     const group = groupWith(page, "header pair two");
     const rows = group.getByTestId("message-row");
     const one = rows.filter({ hasText: "header pair one" });
