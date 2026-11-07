@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// item: alternation makes messages == items, so the count is a guarantee
 /// rather than a hope.
 ///
-/// Sized to more than THREE windows (188 + the 13 standard messages = 201), so
+/// Sized to more than THREE windows (188 + the 16 standard messages = 204), so
 /// the backfill-paging spec takes several growth steps to exhaust the room and
 /// the #505 blocker-2 scenario (arrivals widening the rendered window past one
 /// whole growth step) is reachable with a single batched delivery. The room's
@@ -55,7 +55,7 @@ const DEEP_ROOM_MAX_RECENT_MESSAGES: usize = 300;
 /// cap pruning.
 const DEEP_ROOM_LONG_RETENTION: usize = 1_000;
 
-/// Fillers for the AT-CAP fixture room: 148 + the 13 standard messages lands
+/// Fillers for the AT-CAP fixture room: 148 + the 16 standard messages lands
 /// exactly on that room's `max_recent_messages`
 /// ([`AT_CAP_MAX_RECENT_MESSAGES`]), so every delivered arrival drains the
 /// oldest message — the steady state of every busy production room, and the
@@ -77,10 +77,11 @@ const AT_CAP_FILLER_MESSAGES: usize = 148;
 ///
 /// Tracks the seeded total exactly: [`AT_CAP_FILLER_MESSAGES`] plus the
 /// standard block. It went 160 -> 161 when #489's guaranteed impostor message
-/// was added to that block — `at_cap_room_is_exactly_at_its_message_cap` is
+/// was added to that block, and 161 -> 164 when the seeded reactions became
+/// three signed reaction messages — `at_cap_room_is_exactly_at_its_message_cap` is
 /// what catches the drift, so bump this rather than shrinking the fillers
 /// (they must stay an EVEN count to keep the same-author pairing).
-const AT_CAP_MAX_RECENT_MESSAGES: usize = 161;
+const AT_CAP_MAX_RECENT_MESSAGES: usize = 164;
 
 /// Messages in the standard fixture block every room ends with.
 const STANDARD_FIXTURE_MESSAGES: usize = AT_CAP_MAX_RECENT_MESSAGES - AT_CAP_FILLER_MESSAGES;
@@ -910,33 +911,47 @@ fn add_example_messages(
     // Add reactions to messages from OTHER members (not owner)
     // Rule: One reaction per user per message
     // In "Your Private Room" the owner IS self, so this shows self reacting to others
-    let non_owner_messages: Vec<_> = messages
+    //
+    // Each reaction is a signed reaction message, as on the network. Every
+    // applied delta rebuilds `actions_state` from these messages, so a
+    // reaction written only into that cache would vanish on the first
+    // reaction anyone makes.
+    let non_owner_message_ids: Vec<_> = messages
         .messages
         .iter()
         .filter(|m| m.message.author != *owner_id)
+        .map(|m| m.id())
+        .take(2)
         .collect();
 
-    // Get a non-owner member ID for multi-user reaction demo
-    let other_member_id = member_keys.keys().find(|id| *id != owner_id).cloned();
+    // Get a non-owner member for the multi-user reaction demo
+    let other_member = member_keys.iter().find(|(id, _)| *id != owner_id);
 
-    if non_owner_messages.len() >= 1 {
+    let mut reactions: Vec<(MessageId, &str, MemberId, &SigningKey)> = Vec::new();
+    if let Some(first) = non_owner_message_ids.first() {
         // First non-owner message: owner reacts with thumbs up, other member with heart
-        let msg_id = non_owner_messages[0].id();
-        let mut reactions = HashMap::new();
-        reactions.insert("👍".to_string(), vec![*owner_id]);
-        if let Some(other_id) = other_member_id {
-            reactions.insert("❤️".to_string(), vec![other_id]);
+        reactions.push((first.clone(), "👍", *owner_id, owner_key));
+        if let Some((other_id, other_key)) = other_member {
+            reactions.push((first.clone(), "❤️", *other_id, other_key));
         }
-        messages.actions_state.reactions.insert(msg_id, reactions);
     }
-
-    if non_owner_messages.len() >= 2 {
+    if let Some(second) = non_owner_message_ids.get(1) {
         // Second non-owner message: owner reacts with celebration
-        let msg_id = non_owner_messages[1].id();
-        let mut reactions = HashMap::new();
-        reactions.insert("🎉".to_string(), vec![*owner_id]);
-        messages.actions_state.reactions.insert(msg_id, reactions);
+        reactions.push((second.clone(), "🎉", *owner_id, owner_key));
     }
+    for (target, emoji, author, signing_key) in reactions {
+        current_time_ms += 30_000;
+        messages.messages.push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: *owner_id,
+                author,
+                time: get_time_from_millis(current_time_ms),
+                content: RoomMessageBody::reaction(target, emoji.to_string()),
+            },
+            signing_key,
+        ));
+    }
+    messages.rebuild_actions_state();
 
     room_state.recent_messages = messages;
 }
@@ -1161,6 +1176,30 @@ mod tests {
 
     /// The tall-head room must sit at its cap with its tall rows oldest, so a
     /// burst of arrivals drains exactly those rows and the history shrinks.
+    /// Seeded reactions must be backed by signed reaction messages. Every
+    /// applied delta rebuilds `actions_state` from the action messages, so a
+    /// reaction written only into that cache vanished the first time anyone
+    /// reacted in the example app.
+    #[test]
+    fn seeded_reactions_survive_a_rebuild_from_signed_actions() {
+        for self_is in [SelfIs::Owner, SelfIs::Member, SelfIs::Observer] {
+            let room = create_room(
+                &"Reaction Room".to_string(),
+                self_is,
+                None,
+                HistoryDepth::Standard,
+            );
+            let mut messages = room.room_data.room_state.recent_messages.clone();
+            let seeded = messages.actions_state.reactions.clone();
+            assert_eq!(seeded.len(), 2, "premise: two messages carry reactions");
+            messages.rebuild_actions_state();
+            assert_eq!(
+                messages.actions_state.reactions, seeded,
+                "a rebuild must reproduce every seeded reaction"
+            );
+        }
+    }
+
     #[test]
     fn tall_head_room_drains_tall_rows_first() {
         let room = create_room(

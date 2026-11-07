@@ -995,7 +995,12 @@ fn push_test_body(
     let messages = &mut room.room_state.recent_messages.messages;
     let at = match delivery {
         Delivery::Append => messages.len(),
-        Delivery::BeforeLast => messages.len().saturating_sub(1),
+        // Before the last RENDERED message: the example rooms end with
+        // reaction action messages, which render no row.
+        Delivery::BeforeLast => messages
+            .iter()
+            .rposition(|m| !m.message.content.is_action())
+            .unwrap_or(0),
     };
     messages.insert(at, message);
 }
@@ -1109,7 +1114,9 @@ fn add_reactions_to_newest(emojis: Vec<String>) {
             .room_state
             .recent_messages
             .messages
-            .last()
+            .iter()
+            .rev()
+            .find(|m| !m.message.content.is_action())
             .map(|m| m.id())
         else {
             web_sys::console::error_1(&"__riverTest.addReactionsToNewest: no messages".into());

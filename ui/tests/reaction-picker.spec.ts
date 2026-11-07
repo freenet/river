@@ -194,6 +194,36 @@ test.describe("The reaction picker", () => {
     await page.keyboard.press("Escape");
   });
 
+  // The seeded reactions are signed reaction messages, so the rebuild a new
+  // reaction triggers keeps them. They once lived only in the derived cache,
+  // and every one vanished on the first pick. One reaction per member per
+  // message: the reader's own 👍 becomes the pick, another member's ❤️ stays.
+  test("a pick on a message that already has reactions keeps the others' reactions", async ({ page }) => {
+    await openRoomWithComposer(page);
+    const row = page
+      .getByTestId("conversation-history")
+      .getByTestId("message-row")
+      .filter({ has: page.getByTestId("reaction-chip").filter({ hasText: "❤️" }) });
+    await expect(row, "premise: one seeded message carries 👍 and ❤️").toHaveCount(1);
+    const chips = row.getByTestId("reaction-chip");
+    await expect(chips).toHaveCount(2);
+    await expect(chips.filter({ hasText: "👍" }), "premise: the reader's own 👍").toHaveCount(1);
+
+    await row.scrollIntoViewIfNeeded();
+    await revealFooter(page, row);
+    await row.getByTestId("message-react-button").click();
+    const fresh = picker(page).getByRole("button").filter({ hasNotText: /👍|❤️/ }).first();
+    const emoji = (await fresh.textContent())!.trim();
+    await fresh.click();
+
+    await expect(chips.filter({ hasText: emoji })).toHaveCount(1);
+    await expect(chips.filter({ hasText: "❤️" }), "another member's reaction stays").toHaveCount(1);
+    await expect(chips.filter({ hasText: "👍" }), "the reader's own reaction is switched").toHaveCount(0);
+    await expect(chips).toHaveCount(2);
+    // Another seeded message's reaction is untouched too.
+    await expect(page.getByTestId("reaction-chip").filter({ hasText: "🎉" })).toHaveCount(1);
+  });
+
   test("opening and closing it renders no message group", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "render target");
