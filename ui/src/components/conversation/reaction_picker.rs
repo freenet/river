@@ -16,13 +16,15 @@
 //! when the pick runs ([`target_is_live`]), so a pick queued before a room
 //! switch, or before its message was deleted, does nothing.
 //!
-//! While it is open the reader's wheel and touch scrolling are held off
-//! everywhere, over the picker too (it does not scroll, and a wheel there
-//! would scroll the history), as the full-screen backdrop it replaced did. A
-//! zoom is not held: a wheel with Ctrl down (Ctrl+wheel, or a touchpad
-//! pinch) still reaches the browser, and keyboard zoom is never touched. Only
-//! those input events are held: arrivals, following, the end hold and reads
-//! go on underneath (history-scrolling.md).
+//! While it is open the reader's wheel and one-finger touch scrolling are
+//! held off everywhere, over the picker too (it does not scroll, and a wheel
+//! there would scroll the history), as the full-screen backdrop it replaced
+//! did. A zoom is not held: a wheel with Ctrl down (Ctrl+wheel, or a touchpad
+//! pinch) and a touch with a second finger down (a pinch) still reach the
+//! browser, and keyboard zoom is never touched. Only those input events are
+//! held: arrivals, following, the end hold and reads go on underneath
+//! (history-scrolling.md). Closing lets go of all of it at once, a finger the
+//! picker captured included.
 
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::ReactionOwnersPopover;
@@ -328,6 +330,7 @@ pub(super) fn ReactionPicker(
             crate::util::signal_guard::schedule_nudge();
         }
     }
+    // Unmounted open: nothing held or captured outlives it.
     use_drop(|| {
         hold_scrolling(false);
         clear_anchor();
@@ -342,13 +345,19 @@ pub(super) fn ReactionPicker(
             // Closing with focus inside (a pick from the keyboard, Escape on
             // an emoji): back to the React it opened from, without scrolling,
             // if that is still there. Synchronous, before the browser would
-            // focus whatever had focus when it opened.
+            // focus whatever had focus when it opened. The input hold goes
+            // here too, however it closes (a pick, Escape, a press outside,
+            // another React), with any finger it captured: `toggle` comes a
+            // task later.
             onbeforetoggle: move |e: Event<ToggleData>| {
                 if new_state(&e).as_deref() == Some("closed") {
                     return_focus(surfaces);
+                    hold_scrolling(false);
                 }
             },
             ontoggle: move |_| {
+                // Whatever it is now: toggles are coalesced, so a close and a
+                // reopen in one task (another React) arrive as one.
                 let open = is_open();
                 hold_scrolling(open);
                 if !open {
@@ -559,97 +568,258 @@ mod dom {
         }
     }
 
-    /// Hold the reader's wheel and touch scrolling while the picker is open,
-    /// wherever it lands, the picker included: the picker has no scrollport,
-    /// so a wheel let through over it scrolls the history. A wheel with Ctrl
-    /// down is a zoom (Ctrl+wheel, a touchpad pinch) and is let through;
-    /// keyboard zoom has no listener here. Programmatic scrolling (following
-    /// an arrival, the end hold) is untouched.
+    /// Every event kind the hold listens to, added and removed together.
+    const HELD_KINDS: [&str; 7] = [
+        "wheel",
+        "touchmove",
+        "pointerdown",
+        "pointermove",
+        "pointerup",
+        "pointercancel",
+        "lostpointercapture",
+    ];
+
+    /// Hold the reader's wheel and one-finger touch scrolling while the
+    /// picker is open, wherever it lands, the picker included: the picker has
+    /// no scrollport, so a wheel let through over it scrolls the history. A
+    /// zoom is let through: a wheel with Ctrl down (Ctrl+wheel, a touchpad
+    /// pinch), and a touch with more than one finger down (a pinch), from the
+    /// moment the second finger lands until every finger has lifted. Keyboard
+    /// zoom has no listener here. Programmatic scrolling (following an
+    /// arrival, the end hold) is untouched.
     ///
     /// A finger dragged outside the picker scrolls nothing, and must not close
     /// it either: the old backdrop took no click from a drag. The browser
     /// closes a `popover="auto"` when a press starts and ends outside it, so
-    /// once a touch press has moved past a tap's slop its pointer is captured
-    /// to the picker, and the press ends there. A tap still closes it.
+    /// once a one-finger press has moved past a tap's slop its pointer is
+    /// captured to the picker, and the press ends there. A tap still closes
+    /// it. A second finger landing lets that capture go.
+    ///
+    /// Off is complete whatever the bookkeeping says, so it is safe from the
+    /// closing `beforetoggle`, the `toggle` after it and teardown alike: the
+    /// listeners are removed, a capture the picker took is released, and no
+    /// press or contact is remembered. Should a removal fail, the listener
+    /// left behind holds nothing while the picker is closed
+    /// (`on_held_input`).
     pub(super) fn hold_scrolling(on: bool) {
-        if BLOCKING.with(|b| b.get()) == on {
+        if on && BLOCKING.with(|b| b.get()) {
             return;
         }
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        BLOCKER.with(|blocker| {
-            let mut blocker = blocker.borrow_mut();
-            let callback = blocker.get_or_insert_with(|| Closure::new(on_held_input));
-            let function: &js_sys::Function = callback.as_ref().unchecked_ref();
-            for kind in ["wheel", "touchmove", "pointerdown", "pointermove"] {
-                if on {
-                    let options = web_sys::AddEventListenerOptions::new();
-                    options.set_capture(true);
-                    options.set_passive(false);
-                    let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
-                        kind, function, &options,
-                    );
-                } else {
-                    let _ =
-                        window.remove_event_listener_with_callback_and_bool(kind, function, true);
+        if let Some(window) = web_sys::window() {
+            BLOCKER.with(|blocker| {
+                let mut blocker = blocker.borrow_mut();
+                if !on && blocker.is_none() {
+                    return;
                 }
-            }
-        });
+                let callback = blocker.get_or_insert_with(|| Closure::new(on_held_input));
+                let function: &js_sys::Function = callback.as_ref().unchecked_ref();
+                for kind in HELD_KINDS {
+                    if on {
+                        let options = web_sys::AddEventListenerOptions::new();
+                        options.set_capture(true);
+                        options.set_passive(false);
+                        let _ = window
+                            .add_event_listener_with_callback_and_add_event_listener_options(
+                                kind, function, &options,
+                            );
+                    } else {
+                        let _ = window
+                            .remove_event_listener_with_callback_and_bool(kind, function, true);
+                    }
+                }
+            });
+        }
         BLOCKING.with(|b| b.set(on));
+        if !on {
+            release_capture();
+        }
         TOUCH_PRESS.with(|p| p.set(None));
+        CONTACTS.with(|c| c.borrow_mut().clear());
+        MULTI_TOUCH.with(|m| m.set(false));
     }
 
     thread_local! {
-        /// The touch or pen press under way while the picker is open: its
-        /// pointer id and where it started.
+        /// The one-finger touch or pen press under way while the picker is
+        /// open: its pointer id and where it started. Gone once it is
+        /// captured, ends, or a second finger lands.
         static TOUCH_PRESS: std::cell::Cell<Option<(i32, f64, f64)>> =
             const { std::cell::Cell::new(None) };
+        /// The touch and pen contacts down, by pointer id.
+        static CONTACTS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+        /// Whether a second contact has landed since none was down: a pinch,
+        /// let through until every finger has lifted.
+        static MULTI_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The pointer the picker captured, and the picker it was captured
+        /// to (kept, so teardown can release it after the element is gone).
+        static CAPTURED: RefCell<Option<(web_sys::HtmlElement, i32)>> =
+            const { RefCell::new(None) };
     }
 
     /// How far a finger may wander and still be a tap, in CSS px.
     const TAP_SLOP_PX: f64 = 10.0;
 
     fn on_held_input(event: web_sys::Event) {
-        match event.type_().as_str() {
-            "wheel" | "touchmove" => {
+        let kind = event.type_();
+        let pointer = event.dyn_ref::<web_sys::PointerEvent>();
+        let contact = pointer.filter(|p| matches!(p.pointer_type().as_str(), "touch" | "pen"));
+        // Bookkeeping only, open or not: a contact ending, or the picker's
+        // capture going. Completion releases a capture by itself, so it is
+        // only forgotten here, after the release has gone to the picker.
+        match kind.as_str() {
+            "pointerup" | "pointercancel" => {
+                if let Some(contact) = contact {
+                    contact_ended(contact.pointer_id());
+                }
+                return;
+            }
+            "lostpointercapture" => {
+                // The picker's own loss only: taking a finger from the
+                // element it was pressed on (a touch's implicit capture)
+                // fires one there too.
+                let from_picker = event
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+                    .is_some_and(|el| {
+                        CAPTURED.with(|c| c.borrow().as_ref().is_some_and(|(p, _)| *p == el))
+                    });
+                if let (Some(pointer), true) = (pointer, from_picker) {
+                    forget_capture(pointer.pointer_id());
+                }
+                return;
+            }
+            _ => {}
+        }
+        // A listener left attached after the picker closed (its removal
+        // failed) holds nothing: no input is cancelled, nothing captured.
+        if !is_open() {
+            return;
+        }
+        match kind.as_str() {
+            "wheel" => {
                 if event.cancelable() && !is_zoom(&event) {
                     event.prevent_default();
                 }
             }
-            kind => {
-                let Some(pointer) = event.dyn_ref::<web_sys::PointerEvent>() else {
+            "touchmove" => {
+                if touches(&event) > 1 {
+                    multi_touch();
+                }
+                if event.cancelable() && !MULTI_TOUCH.with(|m| m.get()) {
+                    event.prevent_default();
+                }
+            }
+            "pointerdown" => {
+                let Some(contact) = contact else {
                     return;
                 };
-                if !matches!(pointer.pointer_type().as_str(), "touch" | "pen") {
+                let id = contact.pointer_id();
+                let down = CONTACTS.with(|c| {
+                    let mut c = c.borrow_mut();
+                    if !c.contains(&id) {
+                        c.push(id);
+                    }
+                    c.len()
+                });
+                if down > 1 || !contact.is_primary() {
+                    multi_touch();
                     return;
                 }
-                let (id, x, y) = (
-                    pointer.pointer_id(),
-                    f64::from(pointer.client_x()),
-                    f64::from(pointer.client_y()),
-                );
-                if kind == "pointerdown" {
-                    let over_picker = event
-                        .target()
-                        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-                        .and_then(|el| el.closest(&format!("#{PICKER_ID}")).ok().flatten())
-                        .is_some();
-                    TOUCH_PRESS.with(|p| p.set((!over_picker).then_some((id, x, y))));
+                let over_picker = event
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .and_then(|el| el.closest(&format!("#{PICKER_ID}")).ok().flatten())
+                    .is_some();
+                let press = (!over_picker && !MULTI_TOUCH.with(|m| m.get())).then(|| {
+                    (
+                        id,
+                        f64::from(contact.client_x()),
+                        f64::from(contact.client_y()),
+                    )
+                });
+                TOUCH_PRESS.with(|p| p.set(press));
+            }
+            "pointermove" => {
+                let Some(contact) = contact else {
                     return;
-                }
+                };
                 let Some((pressed, x0, y0)) = TOUCH_PRESS.with(|p| p.get()) else {
                     return;
                 };
+                let (id, x, y) = (
+                    contact.pointer_id(),
+                    f64::from(contact.client_x()),
+                    f64::from(contact.client_y()),
+                );
                 if pressed != id || (x - x0).hypot(y - y0) <= TAP_SLOP_PX {
                     return;
                 }
                 TOUCH_PRESS.with(|p| p.set(None));
-                if let Some(p) = picker() {
-                    let _ = p.set_pointer_capture(id);
-                }
+                capture(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// A second finger: a pinch. Nothing is held or captured until every
+    /// finger has lifted.
+    fn multi_touch() {
+        MULTI_TOUCH.with(|m| m.set(true));
+        TOUCH_PRESS.with(|p| p.set(None));
+        release_capture();
+    }
+
+    fn contact_ended(id: i32) {
+        let none_left = CONTACTS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.retain(|&down| down != id);
+            c.is_empty()
+        });
+        if none_left {
+            MULTI_TOUCH.with(|m| m.set(false));
+        }
+        TOUCH_PRESS.with(|p| {
+            if p.get().is_some_and(|(pressed, ..)| pressed == id) {
+                p.set(None);
+            }
+        });
+        forget_capture(id);
+    }
+
+    /// Capture `id` to the picker, remembering it only if the capture took.
+    fn capture(id: i32) {
+        let Some(p) = picker() else {
+            return;
+        };
+        if p.set_pointer_capture(id).is_ok() && p.has_pointer_capture(id) {
+            CAPTURED.with(|c| *c.borrow_mut() = Some((p, id)));
+        }
+    }
+
+    /// Release the capture the picker took, if it still holds it.
+    fn release_capture() {
+        if let Some((p, id)) = CAPTURED.with(|c| c.borrow_mut().take()) {
+            if p.has_pointer_capture(id) {
+                let _ = p.release_pointer_capture(id);
             }
         }
+    }
+
+    fn forget_capture(id: i32) {
+        CAPTURED.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.as_ref().is_some_and(|(_, captured)| *captured == id) {
+                *c = None;
+            }
+        });
+    }
+
+    /// How many fingers a touch event says are down.
+    fn touches(event: &web_sys::Event) -> u32 {
+        js_sys::Reflect::get(event, &"touches".into())
+            .and_then(|list| js_sys::Reflect::get(&list, &"length".into()))
+            .ok()
+            .and_then(|n| n.as_f64())
+            .map_or(0, |n| n as u32)
     }
 
     /// A wheel with Ctrl down: the browser zooms on it (Ctrl+wheel, and a

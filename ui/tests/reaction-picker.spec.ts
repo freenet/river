@@ -1,4 +1,4 @@
-import { test, expect, Locator, Page } from "@playwright/test";
+import { test, expect, CDPSession, Locator, Page } from "@playwright/test";
 import { coarsePointer, nextFrames, openRoomWithComposer, revealFooter, settle } from "./example-room";
 import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
@@ -8,9 +8,10 @@ import { callRiverTest } from "./river-test";
 // `.reaction-picker` in main.css). The browser closes it on Escape and on a
 // press outside it, which still reaches what was pressed; a pick, a room
 // switch and its message leaving the history close it too. While it is open
-// the reader's wheel and touch scrolling are held off, over the picker too,
-// as the full-screen backdrop it replaced did, but a zoom is not and arrivals
-// are still followed.
+// the reader's wheel and one-finger touch scrolling are held off, over the
+// picker too, as the full-screen backdrop it replaced did, but a zoom (a Ctrl
+// wheel, a pinch) is not, arrivals are still followed, and closing lets go of
+// all of it.
 
 const PICKER = '[data-testid="emoji-picker"]';
 
@@ -590,34 +591,6 @@ test.describe("While the reaction picker is open", () => {
     expect(await page.evaluate(() => window.visualViewport!.scale), "the page zoomed").toBeGreaterThan(1.5);
   });
 
-  test("a touch drag does not scroll the history; closing it lets it again", async ({ page, browserName }) => {
-    test.skip(browserName !== "chromium", "a real touch drag needs Chromium's input protocol");
-    await openRoomWithComposer(page);
-    for (let i = 0; i < 6; i++) await deliver(page, `drag filler ${i}: ${"d".repeat(200)}`);
-    const row = committed(page, "drag filler 3");
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    await settle(page);
-    await openFromKeyboard(page, row);
-    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
-    const p = (await picker(page).boundingBox())!;
-    const y = Math.round(p.y > view.y + view.height / 2 ? view.y + 40 : view.y + view.height - 120);
-    const cdp = await page.context().newCDPSession(page);
-    const drag = () =>
-      cdp.send("Input.synthesizeScrollGesture", { x: Math.round(view.x + 30), y, yDistance: 80, gestureSourceType: "touch", speed: 800 });
-
-    const before = (await scrollMetrics(page)).top;
-    await drag();
-    await settle(page);
-    expect((await scrollMetrics(page)).top, "open: the drag scrolled nothing").toBe(before);
-    expect(await isOpen(page)).toBe(true);
-
-    await page.keyboard.press("Escape");
-    await expectClosed(page);
-    await drag();
-    await settle(page);
-    expect((await scrollMetrics(page)).top, "closed: the drag scrolls").toBeLessThan(before);
-  });
-
   test("an arrival is still followed", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliver(page, "follow anchor");
@@ -706,5 +679,313 @@ test.describe("While the reaction picker is open", () => {
     await expectClosed(page);
     await action.click();
     expect(await callRiverTest(page, "takeToastActionRuns"), "the action ran once, after the picker closed").toBe(1);
+  });
+});
+
+const DRAG_PX = 80;
+
+type Finger = { x: number; y: number };
+
+/// Fingers on the screen, through Chromium's input protocol: the browser
+/// hit-tests them, fires pointer and touch events, captures and scrolls as it
+/// does for a real finger. Spelled out as touchStart, touchMove a frame apart,
+/// touchEnd: `Input.synthesizeScrollGesture` with a touch source fires no
+/// touchmove and scrolls nothing in Linux headless Chromium (CI), picker open
+/// or not.
+class Fingers {
+  private down = new Map<number, Finger>();
+  constructor(readonly cdp: CDPSession) {}
+
+  private send(type: "touchStart" | "touchMove" | "touchEnd" | "touchCancel") {
+    const touchPoints = type === "touchEnd" || type === "touchCancel" ? [] : [...this.down].map(([id, p]) => ({ id, x: p.x, y: p.y }));
+    return this.cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
+  }
+
+  get anyDown(): boolean {
+    return this.down.size > 0;
+  }
+
+  /// Put fingers down, together.
+  async press(...fingers: [number, number, number][]) {
+    for (const [id, x, y] of fingers) this.down.set(id, { x, y });
+    await this.send("touchStart");
+  }
+
+  /// Move each finger by its own vertical distance, in steps a frame apart.
+  async move(dys: Record<number, number>, steps = 10) {
+    const from = new Map([...this.down].map(([id, p]) => [id, { ...p }]));
+    for (let i = 1; i <= steps; i++) {
+      for (const [id, dy] of Object.entries(dys)) this.down.get(Number(id))!.y = from.get(Number(id))!.y + (dy * i) / steps;
+      await this.send("touchMove");
+      await new Promise((r) => setTimeout(r, 16));
+    }
+  }
+
+  /// Every finger lifts.
+  async lift() {
+    this.down.clear();
+    await this.send("touchEnd");
+  }
+
+  /// The browser cancels every finger.
+  async cancel() {
+    this.down.clear();
+    await this.send("touchCancel");
+  }
+
+  /// One finger, down at (x, y), dragged `dy` and lifted.
+  async drag(x: number, y: number, dy = DRAG_PX) {
+    await this.press([1, x, y]);
+    await this.move({ 1: dy });
+    await this.lift();
+  }
+}
+
+/// Run `body` with fingers on `page`, every one lifted and the session
+/// detached afterwards, whatever happens.
+async function withFingers(page: Page, body: (fingers: Fingers) => Promise<void>) {
+  const cdp = await page.context().newCDPSession(page);
+  const fingers = new Fingers(cdp);
+  try {
+    await body(fingers);
+  } finally {
+    if (fingers.anyDown) await fingers.cancel().catch(() => {});
+    await cdp.detach();
+  }
+}
+
+/// Record the touch pointers pressed and every touchmove as the page last
+/// sees it (window, bubbling): how many fingers it had and whether it was
+/// cancelled.
+function recordTouch(page: Page) {
+  return page.evaluate(() => {
+    const w = window as unknown as { __touch: { ids: Set<number>; moves: { touches: number; prevented: boolean }[] } };
+    w.__touch = { ids: new Set(), moves: [] };
+    addEventListener("pointerdown", (e) => e.pointerType === "touch" && w.__touch.ids.add(e.pointerId), { capture: true, passive: true });
+    addEventListener("touchmove", (e) => w.__touch.moves.push({ touches: e.touches.length, prevented: e.defaultPrevented }), { passive: true });
+  });
+}
+
+/// The touch pointers the picker holds captured now.
+function pickerCaptures(page: Page): Promise<number[]> {
+  return page.evaluate((sel) => {
+    const p = document.querySelector(sel)!;
+    const w = window as unknown as { __touch: { ids: Set<number> } };
+    return [...w.__touch.ids].filter((id) => p.hasPointerCapture(id));
+  }, PICKER);
+}
+
+/// The touchmoves recorded since the last call.
+function takeTouchMoves(page: Page): Promise<{ touches: number; prevented: boolean }[]> {
+  return page.evaluate(() => {
+    const w = window as unknown as { __touch: { moves: { touches: number; prevented: boolean }[] } };
+    return w.__touch.moves.splice(0);
+  });
+}
+
+async function touchRoom(page: Page, label: string): Promise<Locator> {
+  await openRoomWithComposer(page);
+  for (let i = 0; i < 6; i++) await deliver(page, `${label} ${i}: ${"t".repeat(200)}`);
+  await recordTouch(page);
+  return committed(page, `${label} 3`);
+}
+
+/// Park the history with `row` centred, with room above for the whole drag
+/// (a finger moving down scrolls toward older messages), and return where it
+/// is.
+async function parkTouch(page: Page, row: Locator): Promise<number> {
+  await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await settle(page);
+  const top = (await scrollMetrics(page)).top;
+  expect(top, "premise: room for the whole drag").toBeGreaterThan(DRAG_PX + 20);
+  return top;
+}
+
+/// Where a drag starts: in the history, its whole path clear of the picker
+/// (if open) and the composer.
+async function dragStart(page: Page): Promise<[number, number]> {
+  const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+  const p = (await isOpen(page)) ? await picker(page).boundingBox() : null;
+  const lowerHalf = !p || p.y > view.y + view.height / 2;
+  const [x, y] = [Math.round(view.x + 30), Math.round(lowerHalf ? view.y + 40 : view.y + view.height - 40 - DRAG_PX)];
+  for (const at of [y, y + DRAG_PX]) expect(await hitAt(page, x, at), `premise: (${x}, ${at}) is on the history`).toBe("history");
+  return [x, y];
+}
+
+/// A one-finger drag at the drag start, settled; how far the history moved.
+async function dragMoves(page: Page, fingers: Fingers): Promise<number> {
+  const [x, y] = await dragStart(page);
+  const before = (await scrollMetrics(page)).top;
+  await fingers.drag(x, y);
+  await settle(page);
+  return (await scrollMetrics(page)).top - before;
+}
+
+test.describe("A finger on the history and the reaction picker", () => {
+  test.skip(({ browserName }) => browserName !== "chromium", "real touch input needs Chromium's input protocol");
+
+  test("a one-finger drag scrolls the history closed, not open, and again once it closes", async ({ page }) => {
+    const row = await touchRoom(page, "drag filler");
+    await withFingers(page, async (fingers) => {
+      await parkTouch(page, row);
+      expect(await dragMoves(page, fingers), "premise: closed, the drag scrolls the history").toBeLessThan(-20);
+
+      await parkTouch(page, row);
+      await openFromKeyboard(page, row);
+      expect(await dragMoves(page, fingers), "open: the drag scrolled nothing").toBe(0);
+      expect(await isOpen(page), "a completed drag is not a tap: still open").toBe(true);
+      expect(await pickerCaptures(page), "the drag's end let go of its capture").toEqual([]);
+
+      await page.keyboard.press("Escape");
+      await expectClosed(page);
+      await parkTouch(page, row);
+      expect(await dragMoves(page, fingers), "closed again: the drag scrolls").toBeLessThan(-20);
+    });
+  });
+
+  test("a drag under way when it closes keeps no capture, and the next drag scrolls", async ({ page }) => {
+    const row = await touchRoom(page, "midway filler");
+    await withFingers(page, async (fingers) => {
+      const top = await parkTouch(page, row);
+      await openFromKeyboard(page, row);
+      const [x, y] = await dragStart(page);
+      await fingers.press([1, x, y]);
+      await fingers.move({ 1: DRAG_PX / 2 });
+      expect(await pickerCaptures(page), "premise: past a tap's slop, the picker captured the finger").toHaveLength(1);
+      expect(await isOpen(page), "a drag does not close it").toBe(true);
+      expect((await scrollMetrics(page)).top, "held").toBe(top);
+
+      await page.keyboard.press("Escape");
+      await expectClosed(page);
+      expect(await pickerCaptures(page), "closing let go of the finger it captured").toEqual([]);
+      await fingers.lift();
+      await settle(page);
+      await expectClosed(page);
+
+      await parkTouch(page, row);
+      expect(await dragMoves(page, fingers), "a fresh drag scrolls").toBeLessThan(-20);
+    });
+  });
+
+  test("a cancelled drag keeps nothing: the next one is still held, and once it closes one scrolls", async ({ page }) => {
+    const row = await touchRoom(page, "cancel filler");
+    await withFingers(page, async (fingers) => {
+      const top = await parkTouch(page, row);
+      await openFromKeyboard(page, row);
+      const [x, y] = await dragStart(page);
+      await fingers.press([1, x, y]);
+      await fingers.move({ 1: DRAG_PX / 2 });
+      expect(await pickerCaptures(page), "premise: the picker captured the finger").toHaveLength(1);
+      await fingers.cancel();
+      await settle(page);
+      expect(await pickerCaptures(page), "the cancel let go of it").toEqual([]);
+      expect(await isOpen(page), "a cancel does not close it").toBe(true);
+      expect((await scrollMetrics(page)).top).toBe(top);
+
+      expect(await dragMoves(page, fingers), "open: the next drag is held").toBe(0);
+      expect(await isOpen(page)).toBe(true);
+
+      await page.keyboard.press("Escape");
+      await expectClosed(page);
+      await parkTouch(page, row);
+      expect(await dragMoves(page, fingers), "closed: a drag scrolls").toBeLessThan(-20);
+    });
+  });
+
+  test("a second finger joining a drag is neither held nor captured", async ({ page }) => {
+    const row = await touchRoom(page, "second filler");
+    await withFingers(page, async (fingers) => {
+      await parkTouch(page, row);
+      await openFromKeyboard(page, row);
+      const [x, y] = await dragStart(page);
+      await takeTouchMoves(page);
+      await fingers.press([1, x, y]);
+      await fingers.move({ 1: DRAG_PX / 2 });
+      const single = await takeTouchMoves(page);
+      expect(single.length, "premise: the first finger moved").toBeGreaterThan(0);
+      expect(single.every((m) => m.touches === 1 && m.prevented), "one finger: held").toBe(true);
+      expect(await pickerCaptures(page), "premise: the picker captured the first finger").toHaveLength(1);
+
+      await fingers.press([2, x + 120, y]);
+      expect(await pickerCaptures(page), "a second finger: the first is let go").toEqual([]);
+      await fingers.move({ 1: -DRAG_PX / 2, 2: DRAG_PX / 2 });
+      const pinch = await takeTouchMoves(page);
+      expect(pinch.length, "premise: both fingers moved").toBeGreaterThan(0);
+      expect(pinch.filter((m) => m.touches === 2 && !m.prevented).length, "two fingers: let through").toBe(pinch.length);
+      expect(await pickerCaptures(page), "neither finger captured").toEqual([]);
+      await fingers.lift();
+      await settle(page);
+      // Whether the browser zooms on a pinch whose first touchmoves were held
+      // is its own business; a pinch from the start is checked below.
+      const scale = await page.evaluate(() => window.visualViewport!.scale);
+      test.info().annotations.push({ type: "after the joined pinch", description: `scale ${scale}, open ${await isOpen(page)}` });
+      if (scale !== 1) await fingers.cdp.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+
+      if (await isOpen(page)) await page.keyboard.press("Escape");
+      await expectClosed(page);
+      await parkTouch(page, row);
+      expect(await dragMoves(page, fingers), "closed: a drag scrolls").toBeLessThan(-20);
+    });
+  });
+
+  test("a pinch zooms while it is open", async ({ page }) => {
+    const row = await touchRoom(page, "pinch filler");
+    await withFingers(page, async (fingers) => {
+      const scale = () => page.evaluate(() => window.visualViewport!.scale);
+      const pinchAt = async ([x, y]: [number, number]) => {
+        await fingers.press([1, x, y], [2, x, y + 40]);
+        await fingers.move({ 1: -60, 2: 60 }, 12);
+        await fingers.lift();
+        await settle(page);
+      };
+      await parkTouch(page, row);
+      await pinchAt(await dragStart(page));
+      expect(await scale(), "premise: closed, the pinch zooms").toBeGreaterThan(1.2);
+      await fingers.cdp.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 });
+      await expect.poll(scale, { message: "premise: zoom reset" }).toBeCloseTo(1, 1);
+
+      await parkTouch(page, row);
+      await openFromKeyboard(page, row);
+      await pinchAt(await dragStart(page));
+      expect(await scale(), "open: the pinch zooms").toBeGreaterThan(1.2);
+    });
+  });
+
+  // Simulated: the hold's listeners fail to come off when it closes. Left
+  // attached, they hold nothing while the picker is closed.
+  test("a hold whose listeners fail to come off holds nothing once it closes", async ({ page }) => {
+    const row = await touchRoom(page, "detach filler");
+    const kinds = ["wheel", "touchmove", "pointerdown", "pointermove", "pointerup", "pointercancel", "lostpointercapture"];
+    try {
+      await withFingers(page, async (fingers) => {
+        await parkTouch(page, row);
+        await openFromKeyboard(page, row);
+        await page.evaluate((kinds) => {
+          const w = window as unknown as { __kept: number };
+          w.__kept = 0;
+          const remove = EventTarget.prototype.removeEventListener;
+          window.removeEventListener = function (this: Window, type: string, ...rest: unknown[]) {
+            if (kinds.includes(type)) {
+              w.__kept++;
+              return;
+            }
+            return (remove as (...a: unknown[]) => void).call(this, type, ...rest);
+          } as typeof window.removeEventListener;
+        }, kinds);
+        await page.keyboard.press("Escape");
+        await expectClosed(page);
+        await settle(page);
+        expect(await page.evaluate(() => (window as unknown as { __kept: number }).__kept), "premise: the hold's removals were refused").toBeGreaterThan(0);
+
+        await parkTouch(page, row);
+        expect(await dragMoves(page, fingers), "closed, listeners still on: the drag scrolls").toBeLessThan(-20);
+        if (!test.info().project.name.startsWith("mobile")) {
+          const [x, y] = await dragStart(page);
+          expect(await wheelCancelled(page, x, y, false), "closed, listeners still on: a wheel is let through").toBe(false);
+        }
+      });
+    } finally {
+      await page.evaluate(() => delete (window as unknown as { removeEventListener?: unknown }).removeEventListener).catch(() => {});
+    }
   });
 });
