@@ -138,6 +138,16 @@ state, that result is returned without a confirming pass: the bound is a
 safety net, not a guarantee. No measured input has needed it. `verify` itself stays as it is:
 tightening it would make the migration PUT reject states rooms hold today.
 
+The contract's `validate_state` (not `verify`, which also runs on partial
+states during a field apply) additionally requires a whole state to be a
+cleanup fixpoint, compared as encoded bytes (`require_cleanup_fixpoint`;
+struct `==` is wrong because `MessagesV1::actions_state` is `#[serde(skip)]`).
+So every state a peer holds is canonical, and clients send
+`ChatRoomStateV1::normalized` in every whole-state PUT. An incoming whole
+state in an UPDATE, or a PUT to a peer that already holds the room, is merged
+before anything is validated, so a non-canonical input is not refused there;
+the merge result is canonical because the merge ends in cleanup.
+
 One limit, which predates #703: the contract does not apply an empty delta,
 so a state stored by a full-state PUT that holds records the rules drop (for
 example a member an owner ban removes) stays as stored until a non-empty

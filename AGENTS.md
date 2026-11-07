@@ -389,7 +389,10 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
 
 **Because all state is cryptographically self-authorized, contract migration is permissionless:**
 - ANY node (not just the room owner) can GET state from the old contract key and PUT it to the
-  new contract key. The new contract validates all signatures and accepts it.
+  new contract key. The new contract validates all signatures and accepts it, provided the state
+  is in canonical form: `validate_state` accepts only states `post_apply_cleanup` leaves
+  unchanged (compared as bytes), so a client sends `ChatRoomStateV1::normalized(&params)`,
+  never raw old bytes, in any whole-state PUT. Every state a peer holds is then canonical.
 - The room owner does NOT need to be online or take any special action.
 - The `OptionalUpgradeV1` pointer on the old contract is a courtesy for clients still running
   old versions — it tells them where the new contract lives. But updated clients already know
@@ -455,8 +458,9 @@ mechanism (30000403 and earlier) have none of it and need one manual reload.
 - Never change serialization format of existing fields
 - If a breaking change is truly needed, create a V2 type with explicit migration (separate project)
 
-This ensures any client can re-PUT old state bytes and the new WASM's `validate_state()` accepts it,
-which is critical for the permissionless contract migration system described above.
+This ensures any client can re-PUT old state, normalized by `ChatRoomStateV1::normalized`, and
+the new WASM's `validate_state()` accepts it, which is critical for the permissionless contract
+migration system described above.
 
 ## Contract `Summary` / `Delta` Determinism
 
