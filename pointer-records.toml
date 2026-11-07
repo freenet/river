@@ -74,9 +74,9 @@ wasm_path = "ui/public/contracts/room_contract.wasm"
 # (author_verifying_key ‖ app_id); recorded here so a human can check it and
 # so the gate can catch a derivation that has drifted.
 pointer_key = "Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az"
-version = 8
-code_hash = "abd7eb678d92237e0a5235858f0102a1273d30b5eee1fe8c00b5023412eafea0"
-state = "00000008abd7eb678d92237e0a5235858f0102a1273d30b5eee1fe8c00b5023412eafea0b7e9990757d7a6e722a1a31ceab26891131971c228f030a3d525f080079c48a2f1d36ebf5ee475d06ef95653d4d5c1a78d776e55d75d58ed280a1fed349dab0d"
+version = 9
+code_hash = "d401c3fa150c546355ca180630a75da01ed9f427d35f9fe6d5aa3ab664a08c37"
+state = "00000009d401c3fa150c546355ca180630a75da01ed9f427d35f9fe6d5aa3ab664a08c37cbbf6dcdd2178eb495f4ecbdb67511d007f0b720d67153427637f0fe81ec0738d6cae707fff76e593d0e076ba98758939a7a5c1468d2d48e40803733211c280d"
 
 [[record]]
 app_id = "river.chat-delegate"
