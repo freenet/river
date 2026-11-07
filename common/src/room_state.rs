@@ -208,6 +208,27 @@ use crate::room_state::message::MessagesV1;
 use crate::room_state::secret::RoomSecretsV1;
 use crate::room_state::upgrade::OptionalUpgradeV1;
 use crate::room_state::version::StateVersion;
+
+/// Why [`ChatRoomStateV1::validate_whole_state`] refused a state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WholeStateError {
+    /// `verify` refused it.
+    Verify(String),
+    /// Cleanup failed on it.
+    Cleanup(String),
+    /// Cleanup would change it: it is not in canonical form.
+    NotNormalized,
+}
+
+impl std::fmt::Display for WholeStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verify(e) => write!(f, "State verification failed: {e}"),
+            Self::Cleanup(e) => write!(f, "State cleanup failed: {e}"),
+            Self::NotNormalized => write!(f, "State is not normalized: cleanup would change it"),
+        }
+    }
+}
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
@@ -598,6 +619,40 @@ impl ChatRoomStateV1 {
         let mut out = self.clone();
         out.post_apply_cleanup(parameters)?;
         Ok(out)
+    }
+
+    /// The room contract's whole-state check: `verify`, then that cleanup
+    /// leaves `bytes` (the encoding of `self` as received) unchanged.
+    ///
+    /// Both run under ONE ban-signature memo scope, so a ban signature `verify`
+    /// checked is not checked again by cleanup. The memo is keyed on the
+    /// signature, the verifying key and every signed field of the ban, and it
+    /// is cleared when this call returns.
+    ///
+    /// The fixpoint is compared on the encoded BYTES, never on the decoded
+    /// struct with `==`: `MessagesV1::actions_state` is a `#[serde(skip)]`
+    /// cache, so a decoded state holds it empty and cleanup rebuilds it, and
+    /// struct equality would refuse every room that has message actions.
+    /// Comparing bytes also refuses a non-canonical encoding.
+    pub fn validate_whole_state(
+        &self,
+        parameters: &ChatRoomParametersV1,
+        bytes: &[u8],
+    ) -> Result<(), WholeStateError> {
+        crate::room_state::ban::signature_memo::active_while(|| {
+            self.verify(self, parameters)
+                .map_err(WholeStateError::Verify)?;
+            let cleaned = self
+                .normalized(parameters)
+                .map_err(WholeStateError::Cleanup)?;
+            let mut out = Vec::with_capacity(bytes.len());
+            ciborium::ser::into_writer(&cleaned, &mut out)
+                .map_err(|e| WholeStateError::Cleanup(e.to_string()))?;
+            if out != bytes {
+                return Err(WholeStateError::NotNormalized);
+            }
+            Ok(())
+        })
     }
 
     /// Post-apply cleanup: prune members who have no recent messages, clean up

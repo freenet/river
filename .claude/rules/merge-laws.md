@@ -140,8 +140,10 @@ tightening it would make the migration PUT reject states rooms hold today.
 
 The contract's `validate_state` (not `verify`, which also runs on partial
 states during a field apply) additionally requires a whole state to be a
-cleanup fixpoint, compared as encoded bytes (`require_cleanup_fixpoint`;
-struct `==` is wrong because `MessagesV1::actions_state` is `#[serde(skip)]`).
+cleanup fixpoint, compared as encoded bytes
+(`ChatRoomStateV1::validate_whole_state`, which runs `verify` and the cleanup
+under one ban-signature memo scope; struct `==` is wrong because
+`MessagesV1::actions_state` is `#[serde(skip)]`).
 So every state a peer holds is canonical, and clients send
 `ChatRoomStateV1::normalized` in every whole-state PUT. An incoming whole
 state in an UPDATE, or a PUT to a peer that already holds the room, is merged

@@ -9,35 +9,6 @@ use river_core::ChatRoomStateV1;
 // NOTE: Crypto helper modules intentionally not compiled by default.
 // They are retained under examples/docs to avoid accidental inclusion.
 
-/// `validate_state` accepts only states that cleanup leaves unchanged, so
-/// every state a peer holds is canonical. Every merge and delta apply ends in
-/// `post_apply_cleanup`, so a state a peer produced already is; clients send
-/// `ChatRoomStateV1::normalized` in whole-state PUTs.
-///
-/// The comparison is on the encoded BYTES, never on the decoded struct with
-/// `==`: `MessagesV1::actions_state` is a `#[serde(skip)]` cache, so a decoded
-/// state holds it empty and cleanup rebuilds it, and struct equality would
-/// refuse every room that has message actions. Comparing bytes also refuses a
-/// non-canonical encoding of an otherwise canonical state.
-///
-/// Checked here, not in `ComposableState::verify`, which also runs on partial
-/// states while a delta's fields are applied.
-pub fn require_cleanup_fixpoint(
-    bytes: &[u8],
-    state: &ChatRoomStateV1,
-    parameters: &ChatRoomParametersV1,
-) -> Result<(), String> {
-    let cleaned = state
-        .normalized(parameters)
-        .map_err(|e| format!("State cleanup failed: {e}"))?;
-    let mut out = Vec::with_capacity(bytes.len());
-    into_writer(&cleaned, &mut out).map_err(|e| e.to_string())?;
-    if out != bytes {
-        return Err("State is not normalized: cleanup would change it".to_string());
-    }
-    Ok(())
-}
-
 #[allow(dead_code)]
 struct Contract;
 
@@ -59,13 +30,18 @@ impl ContractInterface for Contract {
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        chat_state.verify(&chat_state, &parameters).map_err(|e| {
-            ContractError::InvalidUpdateWithInfo {
-                reason: format!("State verification failed: {}", e),
-            }
-        })?;
-        require_cleanup_fixpoint(bytes, &chat_state, &parameters)
-            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
+        // `verify`, and then that cleanup leaves the state unchanged, so every
+        // state a peer holds is canonical (`validate_whole_state` explains the
+        // byte comparison and the shared signature memo). Every merge and
+        // delta apply ends in cleanup, so a state a peer produced already is;
+        // clients send `ChatRoomStateV1::normalized` in whole-state PUTs. Not
+        // in `ComposableState::verify`, which also runs on partial states
+        // while a delta's fields are applied.
+        chat_state
+            .validate_whole_state(&parameters, bytes)
+            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                reason: e.to_string(),
+            })?;
         Ok(ValidateResult::Valid)
     }
 
