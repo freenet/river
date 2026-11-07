@@ -5,7 +5,8 @@
 //! closes it on Escape and on a press outside it; a pick, a room switch and the
 //! message leaving the history close it here. Placement is CSS anchor
 //! positioning (`.reaction-picker` in `main.css`): the open React carries
-//! `anchor-name`, set here when it opens.
+//! `anchor-name`, set here when it opens, and moved to the new React when
+//! the message's row remounts (its group re-keyed) with the picker open.
 //!
 //! What the picker is for is a [`ReactionTarget`]: the room and which showing
 //! of it, the message, and the reader's current reaction on it. It lives in
@@ -117,6 +118,31 @@ impl ReactionSurfaces {
         }
     }
 
+    /// `row`'s React unmounted, while the picker was open for `opening` (or
+    /// for something unknown, if the target could not be read then). Nothing
+    /// is done unless that opening is still the current one. If its message
+    /// is still in the history with a React, its row remounted: the picker
+    /// moves to the new React, with the focus the old one had. Otherwise the
+    /// picker closes. From a deferred callback only.
+    fn invoker_dropped(self, row: &str, opening: Option<ReactionTarget>, had_focus: bool) {
+        // `try_peek`: the whole conversation may have unmounted with it.
+        let Some(target) = self.target.try_peek().ok().and_then(|t| t.clone()) else {
+            return;
+        };
+        let still_current = target.row == row
+            && opening
+                .as_ref()
+                .is_none_or(|opening| opening.same_opening(&target));
+        if !still_current {
+            return;
+        }
+        if target_is_live(&target) {
+            rebind_picker(&target.row, had_focus);
+        } else {
+            self.close_now();
+        }
+    }
+
     /// Close whichever group's reactor list is open. A list its group has
     /// already closed, or a group no longer mounted, is left alone.
     fn close_owner_list_now(mut self) {
@@ -211,20 +237,24 @@ pub(super) fn ReactionInvoker(
     // The message leaving the history (deleted, even optimistically, or out
     // of the rendered range) takes its picker with it. A rollback renders a
     // new invoker with nothing open: the picker is not reopened, and a pick
-    // queued meanwhile finds no target.
+    // queued meanwhile finds no target. Its row only remounting (its group
+    // lost its first message, and with it its key) leaves a new React for the
+    // same message: the picker stays open and moves to it.
     {
         let row = row.clone();
         use_drop(move || {
-            crate::util::defer(move || {
-                let mine = surfaces
-                    .target
-                    .peek()
-                    .as_ref()
-                    .is_some_and(|target| target.row == row);
-                if mine {
-                    surfaces.close_now();
-                }
-            });
+            // The opening this React was for, taken now, while its element is
+            // still the one in the document: what runs later acts on that
+            // opening only, never on one made since.
+            let opening = match surfaces.target.try_peek() {
+                Ok(target) => match target.as_ref() {
+                    Some(target) if target.row == row => Some(target.clone()),
+                    _ => return,
+                },
+                Err(_) => None,
+            };
+            let had_focus = react_has_focus(&row);
+            crate::util::defer(move || surfaces.invoker_dropped(&row, opening, had_focus));
         });
     }
     let press_row = row.clone();
@@ -530,6 +560,69 @@ mod dom {
         }
     }
 
+    /// Whether `row`'s React, as the document has it now, has focus.
+    pub(super) fn react_has_focus(row: &str) -> bool {
+        let active = document().and_then(|d| d.active_element());
+        match (active, react_button(row)) {
+            (Some(active), Some(button)) => active.is_same_node(Some(&button)),
+            _ => false,
+        }
+    }
+
+    /// The open picker's React was replaced by a new element for the same row
+    /// (its group remounted): hang the picker from the new one. Showing it
+    /// again is the only way to make the new React its invoker, so what that
+    /// undoes is put back at once: focus inside the picker stays where it
+    /// was, and the input hold the close let go is taken again. Focus the old
+    /// React had (`had_focus`, lost to the body when it left the document)
+    /// goes to the new one first, so the showing records it as where focus
+    /// returns when the picker closes; neither focus scrolls. Toggles are
+    /// coalesced, and the `toggle` cleanup checks again when it runs, so it
+    /// finds the picker open.
+    pub(super) fn rebind_picker(row: &str, had_focus: bool) {
+        let Some(p) = picker() else {
+            return;
+        };
+        if !p.matches(":popover-open").unwrap_or(false) {
+            return;
+        }
+        let Some(button) = react_button(row) else {
+            return;
+        };
+        if ANCHORED.with(|a| a.borrow().as_ref() == Some(&button)) {
+            return;
+        }
+        let Some(doc) = document() else {
+            return;
+        };
+        let active = doc.active_element();
+        let inside = active
+            .clone()
+            .filter(|active| p.contains(Some(active)))
+            .and_then(|active| active.dyn_into::<web_sys::HtmlElement>().ok());
+        let lost = active.is_none_or(|active| {
+            doc.body()
+                .is_some_and(|body| active.is_same_node(Some(&body)))
+        });
+        if had_focus && lost {
+            focus_without_scrolling(&button);
+        }
+        show_picker_at(row);
+        if !p.matches(":popover-open").unwrap_or(false) {
+            return;
+        }
+        hold_scrolling(true);
+        if let Some(inside) = inside {
+            focus_without_scrolling(&inside);
+        }
+    }
+
+    fn focus_without_scrolling(el: &web_sys::HtmlElement) {
+        let options = web_sys::FocusOptions::new();
+        options.set_prevent_scroll(true);
+        let _ = el.focus_with_options(&options);
+    }
+
     /// Focus inside the closing picker goes back to the React it is open for,
     /// without scrolling, if that is still live; else it is let go, never sent
     /// to a React that has left.
@@ -555,11 +648,7 @@ mod dom {
             .filter(super::target_is_live)
             .and_then(|target| react_button(&target.row));
         match live {
-            Some(button) => {
-                let options = web_sys::FocusOptions::new();
-                options.set_prevent_scroll(true);
-                let _ = button.focus_with_options(&options);
-            }
+            Some(button) => focus_without_scrolling(&button),
             None => {
                 if let Some(active) = active.dyn_ref::<web_sys::HtmlElement>() {
                     let _ = active.blur();
@@ -835,7 +924,10 @@ mod dom {
 #[cfg(target_arch = "wasm32")]
 pub(crate) use dom::is_open;
 #[cfg(target_arch = "wasm32")]
-use dom::{clear_anchor, hide_picker, hold_scrolling, return_focus, show_picker_at};
+use dom::{
+    clear_anchor, hide_picker, hold_scrolling, react_has_focus, rebind_picker, return_focus,
+    show_picker_at,
+};
 
 #[cfg(target_arch = "wasm32")]
 fn react_button_exists(row: &str) -> bool {
@@ -858,6 +950,10 @@ mod native {
     pub(super) fn hide_picker() {}
     pub(super) fn clear_anchor() {}
     pub(super) fn show_picker_at(_row: &str) {}
+    pub(super) fn rebind_picker(_row: &str, _had_focus: bool) {}
+    pub(super) fn react_has_focus(_row: &str) -> bool {
+        false
+    }
     pub(super) fn return_focus(_surfaces: ReactionSurfaces) {}
     pub(super) fn hold_scrolling(_on: bool) {}
     pub(super) fn react_button_exists(_row: &str) -> bool {
@@ -872,8 +968,8 @@ mod native {
 pub(crate) use native::is_open;
 #[cfg(not(target_arch = "wasm32"))]
 use native::{
-    clear_anchor, hide_picker, hold_scrolling, now_ms, react_button_exists, return_focus,
-    show_picker_at,
+    clear_anchor, hide_picker, hold_scrolling, now_ms, react_button_exists, react_has_focus,
+    rebind_picker, return_focus, show_picker_at,
 };
 
 #[cfg(test)]

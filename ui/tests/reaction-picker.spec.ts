@@ -356,6 +356,108 @@ test.describe("The reaction picker", () => {
     expect(await callRiverTest(page, "messageSignsRecorded"), "only the delete was signed").toBe(signs + 1);
   });
 
+  // A group is keyed by its first message, so removing that message remounts
+  // every row after it: the target's row comes back as a new element with a
+  // new React. The picker stays open for it, hangs from the new React, keeps
+  // the focus it had (inside the picker, or on React), is what Tab and a pick
+  // return to, and the input hold stays on.
+  test("its message's group remounting keeps it open at the new React, and a pick acts once there", async ({ page, browserName }) => {
+    // WebKit's Tab reaches only text fields; Alt+Tab reaches every control.
+    const [tab, backTab] = browserName === "webkit" ? ["Alt+Tab", "Alt+Shift+Tab"] : ["Tab", "Shift+Tab"];
+    await openRoomWithComposer(page);
+    for (let i = 0; i < 4; i++) await deliver(page, `remount filler ${i}: ${"m".repeat(200)}`);
+    // Stamped just ahead of the fillers, so the run is the newest group: a
+    // group sorted above later messages is moved by the next render, which
+    // loses focus on its own.
+    await callRiverTest(page, "deliverTimedMessages", 0, [
+      { text: "remount lead", sentSecs: 1, receivedSecs: 0 },
+      { text: "remount middle", sentSecs: 2, receivedSecs: 0 },
+      { text: "remount survivor", sentSecs: 3, receivedSecs: 0 },
+    ]);
+    const [lead, middle, survivor] = ["remount lead", "remount middle", "remount survivor"].map((t) => committed(page, t));
+    await expect(survivor).toHaveCount(1);
+    const keyOf = async (row: Locator) => (await row.getAttribute("id"))!.replace(/^msg-/, "");
+    const [leadKey, middleKey, survivorKey] = [await keyOf(lead), await keyOf(middle), await keyOf(survivor)];
+    const groupKey = (row: Locator) => row.evaluate((el) => el.closest(".msg-group")?.getAttribute("data-item-key") ?? null);
+    for (const row of [lead, middle, survivor]) expect(await groupKey(row), "premise: one group, keyed by its first message").toBe(leadKey);
+    expect(
+      await survivor.evaluate((el) => !el.closest(".msg-group")!.nextElementSibling?.querySelector('[data-testid="message-row"]')),
+      "premise: the newest group",
+    ).toBe(true);
+
+    const emoji = picker(page).getByRole("button").first();
+    const liveReactFocused = () =>
+      survivor.evaluate((el) => {
+        const react = el.querySelector('[data-testid="message-react-button"]');
+        return !!react && react.isConnected && document.activeElement === react;
+      });
+    /// Remove the group's first message, with no press anywhere, and check
+    /// the survivor's row and React came back as new elements.
+    const remountBy = async (gone: Locator, text: string, newKey: string) => {
+      await survivor.evaluate((el) => {
+        const w = window as unknown as { __oldRow: Element; __oldReact: Element };
+        w.__oldRow = el;
+        w.__oldReact = el.querySelector('[data-testid="message-react-button"]')!;
+      });
+      await callRiverTest(page, "removeMessages", text);
+      await expect(gone).toHaveCount(0);
+      await expect.poll(() => groupKey(survivor), { message: "the group is keyed by its new first message" }).toBe(newKey);
+      await settle(page);
+      const replaced = await survivor.evaluate((el) => {
+        const w = window as unknown as { __oldRow: Element; __oldReact: Element };
+        return { sameRow: el === w.__oldRow, oldConnected: w.__oldReact.isConnected };
+      });
+      expect(replaced, "premise: the survivor's row and React are new elements").toEqual({ sameRow: false, oldConnected: false });
+      await expectOpenFor(page, survivor);
+      const m = await measure(page, survivor);
+      expect(placement(m).block, "placed at the new React").not.toContain("off");
+      expect(placement(m).inline, "placed at the new React").not.toContain("off");
+      expectEveryEmojiUsable(m);
+      expectInvokerUncovered(m);
+    };
+
+    await openFromKeyboard(page, survivor);
+    // Into the picker from React: the picker follows React in the tab order.
+    await page.keyboard.press(tab);
+    await expect(emoji, "premise: Tab from React enters the picker").toBeFocused();
+    const signs = await callRiverTest(page, "messageSignsRecorded");
+
+    // Focus inside the picker stays there.
+    await remountBy(lead, "remount lead", middleKey);
+    await expect(emoji, "focus stays on the emoji it was on").toBeFocused();
+    await page.keyboard.press(backTab);
+    expect(await liveReactFocused(), "back out of the picker: the new React").toBe(true);
+
+    // Focus on React goes to the new React.
+    await remountBy(middle, "remount middle", survivorKey);
+    expect(await liveReactFocused(), "focus moves to the new React").toBe(true);
+    await page.keyboard.press(tab);
+    await expect(emoji, "and Tab from it enters the picker").toBeFocused();
+
+    // Still held: a wheel over the history moves nothing.
+    if (!(await coarsePointer(page))) {
+      const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+      const [x, y] = [view.x + 30, view.y + 30];
+      expect(await hitAt(page, x, y), "premise: the history point hits the history").toBe("history");
+      expect((await scrollMetrics(page)).top, "premise: room for the wheel").toBeGreaterThan(WHEEL_DELTA + 20);
+      const before = (await scrollMetrics(page)).top;
+      await wheelAt(page, x, y);
+      expect((await scrollMetrics(page)).top, "the wheel is still held").toBe(before);
+      await expectOpenFor(page, survivor);
+    }
+
+    const parked = (await scrollMetrics(page)).top;
+    const picked = (await emoji.textContent())!.trim();
+    await page.keyboard.press("Enter");
+    await expectClosed(page);
+    await expect(survivor.getByTestId("reaction-chip")).toHaveCount(1);
+    await expect(survivor.getByTestId("reaction-chip")).toContainText(picked);
+    await settle(page);
+    expect(await callRiverTest(page, "messageSignsRecorded"), "one pick, signed once").toBe(signs + 1);
+    expect(await liveReactFocused(), "focus goes back to the new React").toBe(true);
+    expect((await scrollMetrics(page)).top, "nothing scrolled").toBeCloseTo(parked, 0);
+  });
+
   test("a reaction arriving while it is open moves React, and the picker with it", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliverOffscreen(page, "reflow target");
