@@ -7858,28 +7858,66 @@ mod migration_recovery_tests {
 
     /// Every whole-state PUT of the room contract sends the state normalized
     /// by `ChatRoomStateV1::normalized`: `validate_state` accepts only states
-    /// cleanup leaves unchanged, so a peer that does not hold the room yet
-    /// refuses a stored snapshot cleanup would still change.
+    /// cleanup leaves unchanged. For each of the four PUT sites (and there
+    /// are exactly four), the binding serialized into the `WrappedState` is
+    /// the one `.normalized(` produced, and where the site strips the upgrade
+    /// pointer, it normalizes AFTER the strip (the strip's output is what is
+    /// sent).
     #[test]
     fn every_room_contract_put_sends_a_normalized_state() {
-        let src = include_str!("api.rs");
-        for fn_name in [
-            "pub async fn create_room(",
-            "pub async fn republish_room(",
-            "async fn put_room_state(",
-            "async fn migrate_room_to_new_contract(",
+        let full = include_str!("api.rs");
+        let src = full
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("api.rs has production code before its tests");
+        assert_eq!(
+            src.matches("ContractRequest::Put {").count(),
+            4,
+            "a room-contract PUT site was added or removed; pin it here"
+        );
+        for (fn_name, var, strips) in [
+            ("pub async fn create_room(", "room_state", false),
+            ("pub async fn republish_room(", "room_state", true),
+            ("async fn put_room_state(", "state_to_put", true),
+            (
+                "async fn migrate_room_to_new_contract(",
+                "state_to_put",
+                true,
+            ),
         ] {
             let start = src
                 .find(fn_name)
                 .unwrap_or_else(|| panic!("`{fn_name}` must exist"));
-            let put_at = src[start..]
-                .find("ContractRequest::Put")
-                .map(|off| start + off)
-                .unwrap_or_else(|| panic!("`{fn_name}` has no ContractRequest::Put"));
+            let body = &src[start..];
+            let put = body
+                .find("ContractRequest::Put {")
+                .unwrap_or_else(|| panic!("`{fn_name}` has no PUT"));
+            let body = &body[..put];
+            let compact: String = body.split_whitespace().collect();
+            let binding = format!("let{var}={var}.normalized(");
+            let normalized = compact.find(&binding).unwrap_or_else(|| {
+                panic!("`{fn_name}` does not rebind `{var}` to its normalized form")
+            });
+            let serialized = compact
+                .rfind(&format!("into_writer(&{var},"))
+                .unwrap_or_else(|| panic!("`{fn_name}` does not serialize `{var}`"));
             assert!(
-                src[start..put_at].contains(".normalized("),
-                "`{fn_name}` PUTs a room state without normalizing it first"
+                normalized < serialized,
+                "`{fn_name}` serializes `{var}` before normalizing it"
             );
+            assert!(
+                !compact[normalized + binding.len()..serialized].contains(&format!("let{var}=")),
+                "`{fn_name}` rebinds `{var}` between normalizing and serializing it"
+            );
+            if strips {
+                let strip = compact
+                    .find("strip_upgrade_pointer_for_forward_put(")
+                    .unwrap_or_else(|| panic!("`{fn_name}` does not strip the pointer"));
+                assert!(
+                    strip < normalized,
+                    "`{fn_name}` normalizes before stripping the upgrade pointer"
+                );
+            }
         }
     }
 

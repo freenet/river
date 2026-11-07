@@ -101,7 +101,15 @@ pub(crate) fn compute_update_data(
         let delta = state.delta(baseline, params, &summary)?;
         Some(UpdateData::Delta(to_cbor_vec(&delta).into()))
     } else {
-        Some(UpdateData::State(to_cbor_vec(&state).into()))
+        // A full state is validated before it is merged, so it must be the
+        // normalized one (`whole_state_put_bytes`).
+        match crate::util::whole_state_put_bytes(&params.owner, &state) {
+            Ok(bytes) => Some(UpdateData::State(bytes.into())),
+            Err(e) => {
+                error!("not sending a full-state update: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -567,7 +575,7 @@ impl RoomSynchronizer {
 pub(crate) fn seed_put_request(
     owner_vk: &VerifyingKey,
     state: &ChatRoomStateV1,
-) -> ContractRequest<'static> {
+) -> Result<ContractRequest<'static>, String> {
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
     let parameters = ChatRoomParametersV1 { owner: *owner_vk };
     let parameters = Parameters::from(to_cbor_vec(&parameters));
@@ -582,14 +590,14 @@ pub(crate) fn seed_put_request(
     let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(
         owner_vk,
         &strip_upgrade_pointer(state),
-    ));
-    ContractRequest::Put {
+    )?);
+    Ok(ContractRequest::Put {
         contract: contract_container,
         state: wrapped_state,
         related_contracts: Default::default(),
         subscribe: true,
         blocking_subscribe: false,
-    }
+    })
 }
 
 /// The older key a room `merge_from_source` reported as re-keyed must merge
@@ -1110,7 +1118,14 @@ impl RoomSynchronizer {
 
                 info!("Subscribing to room: {:?}", MemberId::from(*owner_vk));
 
-                let client_request = ClientRequest::ContractOp(seed_put_request(owner_vk, state));
+                let put_request = match seed_put_request(owner_vk, state) {
+                    Ok(put_request) => put_request,
+                    Err(e) => {
+                        error!("Not seeding room {:?}: {e}", MemberId::from(*owner_vk));
+                        continue;
+                    }
+                };
+                let client_request = ClientRequest::ContractOp(put_request);
 
                 info!(
                     "Sending PutRequest for room {:?} with contract ID: {}",
@@ -1179,6 +1194,12 @@ impl RoomSynchronizer {
             let params = ChatRoomParametersV1 { owner: room_vk };
             let removed = crate::signing::remove_unverifiable_messages(&mut state, &params);
             if removed > 0 {
+                // Removing messages bypasses cleanup; normalize so the
+                // stored and sent state stays canonical.
+                match state.normalized(&params) {
+                    Ok(normalized) => state = normalized,
+                    Err(e) => error!("cleanup after removing messages failed: {e}"),
+                }
                 warn!(
                     "Removed {} message(s) with invalid signatures before sync for room {:?}",
                     removed,
@@ -1921,6 +1942,60 @@ mod tests {
         state.recent_messages.messages.push(authorized);
     }
 
+    /// A local snapshot with its messages out of order: `verify` accepts it,
+    /// cleanup sorts it.
+    fn unsorted_room() -> (ChatRoomStateV1, ChatRoomParametersV1) {
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        let (mut state, params, owner_sk) = create_test_room();
+        state.configuration = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: params.owner_id(),
+                ..Default::default()
+            },
+            &owner_sk,
+        );
+        for (secs, text) in [(20, "second"), (10, "first")] {
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: params.owner_id(),
+                        author: params.owner_id(),
+                        content: RoomMessageBody::public(text.to_string()),
+                        time: SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + secs),
+                    },
+                    &owner_sk,
+                ));
+        }
+        state.verify(&state, &params).unwrap();
+        (state, params)
+    }
+
+    /// `whole_state_put_bytes` sends the normalized state, not the raw one.
+    #[test]
+    fn whole_state_put_bytes_sends_the_normalized_state() {
+        let (raw, params) = unsorted_room();
+        let bytes = crate::util::whole_state_put_bytes(&params.owner, &raw).unwrap();
+        assert_ne!(bytes, to_cbor_vec(&raw), "the raw state was sent");
+        assert_eq!(bytes, to_cbor_vec(&raw.normalized(&params).unwrap()));
+    }
+
+    /// A full-state UPDATE (no baseline) carries the normalized state:
+    /// freenet-core validates it before merging.
+    #[test]
+    fn a_full_state_update_carries_the_normalized_state() {
+        let (raw, params) = unsorted_room();
+        let Some(UpdateData::State(bytes)) = compute_update_data(&raw, None, &params) else {
+            panic!("expected a full-state update");
+        };
+        assert_eq!(
+            bytes.as_ref(),
+            to_cbor_vec(&strip_upgrade_pointer(&raw).normalized(&params).unwrap()).as_slice()
+        );
+    }
+
     /// An incoming state under an older configuration with a higher
     /// `max_user_bans`, into a local state already on the lowered cap: within
     /// one delta's bound it merges and the lowered cap keeps what it keeps;
@@ -2248,7 +2323,7 @@ mod tests {
         let owner = params.owner;
         let expected_id = *owner_vk_to_contract_key(&owner).id();
 
-        match seed_put_request(&owner, &state) {
+        match seed_put_request(&owner, &state).expect("a test room normalizes") {
             ContractRequest::Put {
                 contract,
                 state: put_state,

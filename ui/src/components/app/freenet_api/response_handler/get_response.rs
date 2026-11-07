@@ -4,7 +4,7 @@ use crate::components::app::freenet_api::backward_probe::{
 };
 use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::error_report::{
-    ErrorReport, LABEL_DISCONNECTED, LABEL_ROOM_FULL,
+    ErrorReport, LABEL_DISCONNECTED, LABEL_INVALID_OPERATION, LABEL_ROOM_FULL,
 };
 use crate::components::app::freenet_api::response_handler::update_notification::{
     clear_upgrade_target, follow_upgrade_pointer_if_needed, upgrade_target_owner,
@@ -775,20 +775,26 @@ pub async fn handle_get_response(
                 WrappedContract::new(Arc::new(contract_code), parameters),
             ));
 
-            let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(
-                &owner_vk,
-                &retrieved_state_for_put,
-            ));
+            let put_bytes = crate::util::whole_state_put_bytes(&owner_vk, &retrieved_state_for_put);
 
-            let put_request = ContractRequest::Put {
-                contract: contract_container,
-                state: wrapped_state,
-                related_contracts: Default::default(),
-                subscribe: true,
-                blocking_subscribe: false,
-            };
-
-            let put_result = if let Some(web_api) = WEB_API.write().as_mut() {
+            let put_result = if let Err(e) = &put_bytes {
+                error!(
+                    "Not PUTting invited room {:?}: {e}",
+                    MemberId::from(owner_vk)
+                );
+                Err(ErrorReport::new(
+                    LABEL_INVALID_OPERATION,
+                    "Couldn't publish this room: its state could not be normalized",
+                    e.clone(),
+                ))
+            } else if let Some(web_api) = WEB_API.write().as_mut() {
+                let put_request = ContractRequest::Put {
+                    contract: contract_container,
+                    state: WrappedState::new(put_bytes.expect("checked above")),
+                    related_contracts: Default::default(),
+                    subscribe: true,
+                    blocking_subscribe: false,
+                };
                 match web_api.send(ClientRequest::ContractOp(put_request)).await {
                     Ok(_) => {
                         info!(
@@ -1212,20 +1218,23 @@ pub async fn handle_get_response(
                     WrappedContract::new(Arc::new(contract_code), parameters),
                 ));
 
-                let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(
-                    &owner_vk,
-                    &retrieved_state_for_put,
-                ));
+                let put_bytes =
+                    crate::util::whole_state_put_bytes(&owner_vk, &retrieved_state_for_put);
 
-                let put_request = ContractRequest::Put {
-                    contract: contract_container,
-                    state: wrapped_state,
-                    related_contracts: Default::default(),
-                    subscribe: true,
-                    blocking_subscribe: false,
-                };
-
-                let put_succeeded = if let Some(web_api) = WEB_API.write().as_mut() {
+                let put_succeeded = if let Err(e) = &put_bytes {
+                    error!(
+                        "Not PUTting imported room {:?}: {e}",
+                        MemberId::from(owner_vk)
+                    );
+                    false
+                } else if let Some(web_api) = WEB_API.write().as_mut() {
+                    let put_request = ContractRequest::Put {
+                        contract: contract_container,
+                        state: WrappedState::new(put_bytes.expect("checked above")),
+                        related_contracts: Default::default(),
+                        subscribe: true,
+                        blocking_subscribe: false,
+                    };
                     match web_api.send(ClientRequest::ContractOp(put_request)).await {
                         Ok(_) => {
                             info!(
@@ -1685,7 +1694,16 @@ async fn put_state_to_current_key(
     let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
         WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
     ));
-    let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(&owner_vk, &state));
+    let wrapped_state = match crate::util::whole_state_put_bytes(&owner_vk, &state) {
+        Ok(bytes) => WrappedState::new(bytes),
+        Err(e) => {
+            error!(
+                "Backward probe: not PUTting {label} state for room {:?}: {e}",
+                MemberId::from(owner_vk)
+            );
+            return;
+        }
+    };
 
     let put_request = ContractRequest::Put {
         contract: contract_container,
@@ -2844,5 +2862,39 @@ mod tests {
             handler.contains("ContractResponse::NotFound{instance_id}=>{handle_get_not_found(instance_id).await;"),
             "handle_api_response must route NotFound to handle_get_not_found"
         );
+    }
+
+    /// Every whole-state PUT in this file sends the normalized state:
+    /// `validate_state` accepts only states cleanup leaves unchanged. There
+    /// are exactly three PUT sites, and each builds its `WrappedState` from
+    /// `whole_state_put_bytes`, never from `to_cbor_vec` of a raw state.
+    #[test]
+    fn every_whole_state_put_sends_the_normalized_state() {
+        let full = include_str!("get_response.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("get_response.rs must have production code before `mod tests`");
+        let puts: Vec<usize> = src
+            .match_indices("ContractRequest::Put {")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            puts.len(),
+            3,
+            "a PUT site was added or removed; pin it here"
+        );
+        let mut prev = 0;
+        for put in puts {
+            let block = &src[prev..put];
+            let normalized = block
+                .rfind("crate::util::whole_state_put_bytes(")
+                .expect("a PUT site does not normalize its state");
+            assert!(
+                !block[normalized..].contains("WrappedState::new(to_cbor_vec("),
+                "a PUT site wraps a raw state"
+            );
+            prev = put + 1;
+        }
     }
 }

@@ -399,25 +399,22 @@ pub fn strip_upgrade_pointer(
     cleaned
 }
 
-/// The bytes of a whole-state PUT of `state` to the room `owner_vk` owns:
-/// the state normalized by `ChatRoomStateV1::normalized`, which the room
-/// contract's `validate_state` requires (a peer that does not hold the room
-/// yet refuses a state cleanup would still change). If cleanup fails, the
-/// state is sent as it is and the failure is logged; the peer then decides.
+/// The bytes of a whole state sent to the room `owner_vk` owns, as a PUT or
+/// as a full-state UPDATE: the state normalized by
+/// `ChatRoomStateV1::normalized`. The room contract's `validate_state`
+/// accepts only states cleanup leaves unchanged, and freenet-core validates
+/// every incoming whole state before it merges it, so a raw local snapshot
+/// cleanup would still change is refused on every path. A failed cleanup is
+/// an error: the caller does not send, as riverctl does not.
 pub fn whole_state_put_bytes(
     owner_vk: &VerifyingKey,
     state: &river_core::room_state::ChatRoomStateV1,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, String> {
     let parameters = ChatRoomParametersV1 { owner: *owner_vk };
-    match state.normalized(&parameters) {
-        Ok(normalized) => to_cbor_vec(&normalized),
-        Err(e) => {
-            dioxus::logger::tracing::error!(
-                "room state cleanup failed before a PUT, sending it unnormalized: {e}"
-            );
-            to_cbor_vec(state)
-        }
-    }
+    state
+        .normalized(&parameters)
+        .map(|normalized| to_cbor_vec(&normalized))
+        .map_err(|e| format!("room state cleanup failed: {e}"))
 }
 
 pub fn from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
