@@ -277,9 +277,16 @@ test.describe("Footer controls on a fine pointer", () => {
     const row = page.getByTestId("message-row").filter({ has: page.getByTestId("reply-strip") }).first();
     await row.scrollIntoViewIfNeeded();
     const strip = row.getByTestId("reply-strip");
-    // A mouse click focuses the strip (a tabindex="0" button).
+    // A mouse click focuses the strip, a native button, in Chromium; WebKit
+    // focuses no button on a click, so there the focus comes from script
+    // right after it. Either way it is not keyboard focus.
     await strip.click();
-    await expect.poll(() => strip.evaluate((el) => el === document.activeElement), { message: "premise: the click focused the strip" }).toBe(true);
+    if (!(await strip.evaluate((el) => el === document.activeElement))) await strip.evaluate((el) => (el as HTMLElement).focus());
+    await expect
+      .poll(() => strip.evaluate((el) => el === document.activeElement && !el.matches(":focus-visible")), {
+        message: "premise: the strip has focus, not keyboard focus",
+      })
+      .toBe(true);
     await page.mouse.move(0, 0);
     await expect.poll(() => controlStates(row, ["message-reply-button"]), { message: "pointer gone, focus from a mouse click" }).toEqual(
       allStates(["message-reply-button"], HIDDEN),

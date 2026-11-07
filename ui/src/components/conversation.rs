@@ -48,6 +48,7 @@ pub(crate) use self::outbox_commit::{
 mod pending_effects;
 mod pending_sends;
 mod reaction_picker;
+mod reply_highlight;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::reaction_picker::is_open as reaction_picker_is_open;
 mod seal;
@@ -4403,12 +4404,10 @@ fn MessageGroupComponent(
                                                 {
                                                         match reply_strip_inner {
                                                             ReplyStrip::NotAReply => rsx! {},
-                                                            // Deliberately inert — no `role`/`tabindex`/
-                                                            // `onclick` — because there is no original
-                                                            // message to scroll to. It therefore carries
-                                                            // its own class rather than `reply-strip`,
-                                                            // whose hover/focus-expand rules assume a
-                                                            // focusable element with ellipsized text.
+                                                            // Deliberately inert, not a button, because
+                                                            // there is no original message to jump to. It
+                                                            // therefore carries its own class rather than
+                                                            // `reply-strip`, the button's.
                                                             //
                                                             // The wording stays neutral: absence cannot
                                                             // distinguish a ban from an ordinary aged-out
@@ -4425,47 +4424,27 @@ fn MessageGroupComponent(
                                                                 }
                                                             },
                                                             ReplyStrip::Quote { author, preview, target_id } => {
-                                                                let target_id_str = format!("{:?}", target_id.0);
-                                                                // Clone the target id so we can own one copy in the
-                                                                // onclick handler and one in the onkeydown handler.
-                                                                let target_id_for_key = target_id_str.clone();
+                                                                let target_row = format!("msg-{:?}", target_id.0);
+                                                                // A native button: Enter and Space fire its
+                                                                // click. Its name is the quote; the title
+                                                                // says what it does. One line, cut with an
+                                                                // ellipsis (`.reply-strip` in main.css).
                                                                 rsx! {
-                                                                    div {
+                                                                    button {
+                                                                        r#type: "button",
                                                                         "data-testid": "reply-strip",
-                                                                        class: "reply-strip min-w-0 w-full max-w-[76ch] text-[13px] leading-[18px] mb-[3px] rounded-sm cursor-pointer text-text-quote",
-                                                                        title: "Scroll to original message (Enter or Space to activate)",
-                                                                        role: "button",
-                                                                        tabindex: "0",
-                                                                        "aria-label": "Scroll to the message this is a reply to",
-                                                                        onclick: move |_| {
-                                                                            if let Some(window) = web_sys::window() {
-                                                                                if let Some(doc) = window.document() {
-                                                                                    if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
-                                                                                        el.scroll_into_view();
-                                                                                        let _ = el.class_list().add_1("reply-highlight");
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                        onkeydown: move |e: KeyboardEvent| {
-                                                                            // Activate the same scroll-to-original
-                                                                            // behaviour via Enter or Space so keyboard
-                                                                            // users can reach it without a mouse.
-                                                                            if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
-                                                                                e.prevent_default();
-                                                                                if let Some(window) = web_sys::window() {
-                                                                                    if let Some(doc) = window.document() {
-                                                                                        if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
-                                                                                            el.scroll_into_view();
-                                                                                            let _ = el.class_list().add_1("reply-highlight");
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                        span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5", {line_icon(REPLY_ICON_PATH, 13)} }
-                                                                        span { class: "font-bold text-text-secondary mr-1.5", "{author}" }
-                                                                        span { "{preview}" }
+                                                                        "data-reply-target": "{target_row}",
+                                                                        class: "reply-strip block min-w-0 w-full max-w-[76ch] text-left text-[13px] leading-[18px] mb-[3px] rounded-sm cursor-pointer text-text-quote",
+                                                                        title: "Jump to the original message",
+                                                                        // DOM only (`reply_highlight.rs`): it
+                                                                        // writes no signal, so needs no `defer`.
+                                                                        onclick: move |_| reply_highlight::jump_to_reply_target(&target_row),
+                                                                        span { class: "reply-strip-text",
+                                                                            span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5", {line_icon(REPLY_ICON_PATH, 13)} }
+                                                                            span { class: "font-bold text-text-secondary mr-1", "{author}" }
+                                                                            " "
+                                                                            span { "{preview}" }
+                                                                        }
                                                                     }
                                                                 }
                                                             }
