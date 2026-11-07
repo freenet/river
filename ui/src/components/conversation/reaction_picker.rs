@@ -17,9 +17,12 @@
 //! switch, or before its message was deleted, does nothing.
 //!
 //! While it is open the reader's wheel and touch scrolling are held off
-//! everywhere but over the picker, as the full-screen backdrop it replaced
-//! did. Only those input events are held: arrivals, following, the end hold
-//! and reads go on underneath (history-scrolling.md).
+//! everywhere, over the picker too (it does not scroll, and a wheel there
+//! would scroll the history), as the full-screen backdrop it replaced did. A
+//! zoom is not held: a wheel with Ctrl down (Ctrl+wheel, or a touchpad
+//! pinch) still reaches the browser, and keyboard zoom is never touched. Only
+//! those input events are held: arrivals, following, the end hold and reads
+//! go on underneath (history-scrolling.md).
 
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::ReactionOwnersPopover;
@@ -557,8 +560,11 @@ mod dom {
     }
 
     /// Hold the reader's wheel and touch scrolling while the picker is open,
-    /// except over the picker itself. Programmatic scrolling (following an
-    /// arrival, the end hold) is untouched.
+    /// wherever it lands, the picker included: the picker has no scrollport,
+    /// so a wheel let through over it scrolls the history. A wheel with Ctrl
+    /// down is a zoom (Ctrl+wheel, a touchpad pinch) and is let through;
+    /// keyboard zoom has no listener here. Programmatic scrolling (following
+    /// an arrival, the end hold) is untouched.
     ///
     /// A finger dragged outside the picker scrolls nothing, and must not close
     /// it either: the old backdrop took no click from a drag. The browser
@@ -605,14 +611,9 @@ mod dom {
     const TAP_SLOP_PX: f64 = 10.0;
 
     fn on_held_input(event: web_sys::Event) {
-        let over_picker = event
-            .target()
-            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-            .and_then(|el| el.closest(&format!("#{PICKER_ID}")).ok().flatten())
-            .is_some();
         match event.type_().as_str() {
             "wheel" | "touchmove" => {
-                if !over_picker && event.cancelable() {
+                if event.cancelable() && !is_zoom(&event) {
                     event.prevent_default();
                 }
             }
@@ -629,6 +630,11 @@ mod dom {
                     f64::from(pointer.client_y()),
                 );
                 if kind == "pointerdown" {
+                    let over_picker = event
+                        .target()
+                        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                        .and_then(|el| el.closest(&format!("#{PICKER_ID}")).ok().flatten())
+                        .is_some();
                     TOUCH_PRESS.with(|p| p.set((!over_picker).then_some((id, x, y))));
                     return;
                 }
@@ -644,6 +650,15 @@ mod dom {
                 }
             }
         }
+    }
+
+    /// A wheel with Ctrl down: the browser zooms on it (Ctrl+wheel, and a
+    /// touchpad pinch arrives as one), so it is never held.
+    fn is_zoom(event: &web_sys::Event) -> bool {
+        event.type_() == "wheel"
+            && event
+                .dyn_ref::<web_sys::MouseEvent>()
+                .is_some_and(web_sys::MouseEvent::ctrl_key)
     }
 }
 

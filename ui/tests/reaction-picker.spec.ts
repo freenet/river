@@ -8,8 +8,9 @@ import { callRiverTest } from "./river-test";
 // `.reaction-picker` in main.css). The browser closes it on Escape and on a
 // press outside it, which still reaches what was pressed; a pick, a room
 // switch and its message leaving the history close it too. While it is open
-// the reader's wheel and touch scrolling are held off, as the full-screen
-// backdrop it replaced did, but arrivals are still followed.
+// the reader's wheel and touch scrolling are held off, over the picker too,
+// as the full-screen backdrop it replaced did, but a zoom is not and arrivals
+// are still followed.
 
 const PICKER = '[data-testid="emoji-picker"]';
 
@@ -460,27 +461,76 @@ test.describe("Reaction picker placement", () => {
   });
 });
 
+const WHEEL_DELTA = 200;
+
+/// What a press at (x, y) lands in: the picker, the history, or neither.
+function hitAt(page: Page, x: number, y: number): Promise<string> {
+  return page.evaluate(
+    ([x, y, sel]) => {
+      const at = document.elementFromPoint(x, y);
+      if (at?.closest(sel)) return "picker";
+      if (at?.closest("#chat-scroll-container")) return "history";
+      return `elsewhere (${at?.tagName}.${at?.className})`;
+    },
+    [x, y, PICKER] as const,
+  );
+}
+
+/// A real wheel upward at (x, y), settled.
+async function wheelAt(page: Page, x: number, y: number) {
+  await page.mouse.move(x, y);
+  await page.mouse.wheel(0, -WHEEL_DELTA);
+  await settle(page);
+}
+
+/// Whether a synthetic, cancelable wheel dispatched where (x, y) lands was
+/// cancelled: the hold's handler contract, not the browser's scroll or zoom.
+function wheelCancelled(page: Page, x: number, y: number, ctrlKey: boolean): Promise<boolean> {
+  return page.evaluate(
+    ([x, y, ctrlKey]) => {
+      const at = document.elementFromPoint(x, y)!;
+      const wheel = new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: y, ctrlKey, bubbles: true, cancelable: true });
+      return !at.dispatchEvent(wheel);
+    },
+    [x, y, ctrlKey] as const,
+  );
+}
+
 test.describe("While the reaction picker is open", () => {
-  test("the reader's wheel does not scroll the history; closing it lets it again", async ({ page }) => {
+  test("the reader's wheel scrolls the history neither over it nor over the picker; closing it lets it again", async ({ page }) => {
     test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
     await openRoomWithComposer(page);
     for (let i = 0; i < 6; i++) await deliver(page, `wheel filler ${i}: ${"w".repeat(200)}`);
     const row = committed(page, "wheel filler 3");
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    await settle(page);
-    await openWithPointer(page, row);
-    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
-    const p = (await picker(page).boundingBox())!;
-    const y = p.y > view.y + view.height / 2 ? view.y + 30 : view.y + view.height - 30;
+    const park = async () => {
+      await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+      await settle(page);
+      const top = (await scrollMetrics(page)).top;
+      expect(top, "premise: room for the whole wheel delta upward").toBeGreaterThan(WHEEL_DELTA + 20);
+      return top;
+    };
 
-    for (const [where, x, at] of [
-      ["over the history", view.x + 30, y],
-      ["over the picker", p.x + p.width / 2, p.y + p.height / 2],
+    // Before opening, the same wheel at the same point scrolls the history.
+    const parked = await park();
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [view.x + 30, view.y + 30];
+    expect(await hitAt(page, x, y), "premise: the history point hits the history").toBe("history");
+    await wheelAt(page, x, y);
+    expect((await scrollMetrics(page)).top, "premise: unheld, the wheel scrolls the history").toBeLessThan(parked);
+
+    const top = await park();
+    await openWithPointer(page, row);
+    const p = (await picker(page).boundingBox())!;
+    const [px, py] = [p.x + p.width / 2, p.y + p.height / 2];
+    expect(await hitAt(page, x, y), "premise: the history point is not under the picker").toBe("history");
+    expect(await hitAt(page, px, py), "premise: the picker point hits the picker").toBe("picker");
+    expect((await scrollMetrics(page)).top, "premise: opening scrolled nothing").toBe(top);
+    for (const [where, wx, wy] of [
+      ["over the history", x, y],
+      ["over the picker", px, py],
     ] as const) {
       const before = (await scrollMetrics(page)).top;
-      await page.mouse.move(x, at);
-      await page.mouse.wheel(0, -200);
-      await settle(page);
+      await wheelAt(page, wx, wy);
       expect((await scrollMetrics(page)).top, `${where}: the history did not move`).toBe(before);
       expect(await isOpen(page), `${where}: still open`).toBe(true);
     }
@@ -488,10 +538,56 @@ test.describe("While the reaction picker is open", () => {
     await page.keyboard.press("Escape");
     await expectClosed(page);
     const before = (await scrollMetrics(page)).top;
-    await page.mouse.move(view.x + 30, y);
-    await page.mouse.wheel(0, -200);
-    await settle(page);
+    await wheelAt(page, x, y);
     expect((await scrollMetrics(page)).top, "closed: the wheel scrolls").toBeLessThan(before);
+  });
+
+  // The handler's contract, not proof of a zoom: a plain wheel is cancelled
+  // wherever it lands, a Ctrl wheel (Ctrl+wheel, a touchpad pinch) is not.
+  test("a wheel with Ctrl down is a zoom and is let through, over the history and over the picker", async ({ page }) => {
+    await openRoomWithComposer(page);
+    for (let i = 0; i < 6; i++) await deliver(page, `zoom filler ${i}: ${"z".repeat(200)}`);
+    const row = committed(page, "zoom filler 3");
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await settle(page);
+    await openFromKeyboard(page, row);
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const p = (await picker(page).boundingBox())!;
+    const points = {
+      history: [view.x + 30, view.y + 30],
+      picker: [p.x + p.width / 2, p.y + p.height / 2],
+    } as const;
+    for (const [where, [x, y]] of Object.entries(points)) {
+      expect(await hitAt(page, x, y), `premise: the ${where} point hits the ${where}`).toBe(where);
+      expect(await wheelCancelled(page, x, y, false), `${where}: a plain wheel is held`).toBe(true);
+      expect(await wheelCancelled(page, x, y, true), `${where}: a Ctrl wheel is let through`).toBe(false);
+    }
+    expect(await isOpen(page), "still open").toBe(true);
+
+    await page.keyboard.press("Escape");
+    await expectClosed(page);
+    const [x, y] = points.history;
+    expect(await wheelCancelled(page, x, y, false), "closed: a plain wheel is let through").toBe(false);
+  });
+
+  test("a touchpad pinch over the history still zooms", async ({ page, browserName }) => {
+    test.skip(browserName !== "chromium" || test.info().project.name.startsWith("mobile"), "a touchpad pinch needs Chromium's input protocol and a desktop");
+    await openRoomWithComposer(page);
+    await deliver(page, "pinch anchor");
+    const row = committed(page, "pinch anchor");
+    await openFromKeyboard(page, row);
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [Math.round(view.x + 100), Math.round(view.y + 40)];
+    expect(await hitAt(page, x, y), "premise: the pinch is over the history").toBe("history");
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      // A touchpad pinch reaches the page as wheel events with Ctrl down.
+      await cdp.send("Input.synthesizePinchGesture", { x, y, scaleFactor: 2, gestureSourceType: "mouse" });
+    } finally {
+      await cdp.detach();
+    }
+    await settle(page);
+    expect(await page.evaluate(() => window.visualViewport!.scale), "the page zoomed").toBeGreaterThan(1.5);
   });
 
   test("a touch drag does not scroll the history; closing it lets it again", async ({ page, browserName }) => {

@@ -101,9 +101,14 @@ Current behavior:
   closes, but those arrivals count as read without having been on screen
   unobstructed.
 - While the reaction picker is open the reader's own wheel and touch
-  scrolling are held off, as its old full-screen backdrop did, but only those
-  input events: arrivals, following, the end hold and reads go on
-  (`conversation/reaction_picker.rs`).
+  scrolling are held off wherever they land, over the picker too (it has no
+  scrollport, so a wheel let through there scrolls the history), as its old
+  full-screen backdrop did, but only those input events: arrivals,
+  following, the end hold and reads go on, and programmatic scrolling is
+  untouched (`conversation/reaction_picker.rs`). A zoom is not held: a wheel
+  with Ctrl down (Ctrl+wheel, or a touchpad pinch, which reaches the page as
+  one) and keyboard zoom still reach the browser, and the layout change a
+  zoom makes is not a scroll the hold prevents.
 
 Known limitations:
 
