@@ -9,6 +9,31 @@ use river_core::ChatRoomStateV1;
 // NOTE: Crypto helper modules intentionally not compiled by default.
 // They are retained under examples/docs to avoid accidental inclusion.
 
+/// A stored or PUT state must be one `post_apply_cleanup` leaves as it is.
+/// Every merge and delta apply ends in that cleanup, so an honest state
+/// already is one; a state that is not would be changed by the next merge on
+/// some peers and not others. Compared as bytes: the cleaned state must
+/// re-encode to exactly the bytes given, which also refuses a non-canonical
+/// encoding (and ignores `#[serde(skip)]` caches, which cleanup rebuilds).
+/// Checked here rather than in `ComposableState::verify`, which also runs on
+/// partial states while a delta's fields are applied.
+pub fn require_cleanup_fixpoint(
+    bytes: &[u8],
+    state: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+) -> Result<(), String> {
+    let mut cleaned = state.clone();
+    cleaned
+        .post_apply_cleanup(parameters)
+        .map_err(|e| format!("State cleanup failed: {e}"))?;
+    let mut out = Vec::with_capacity(bytes.len());
+    into_writer(&cleaned, &mut out).map_err(|e| e.to_string())?;
+    if out != bytes {
+        return Err("State is not normalized: cleanup would change it".to_string());
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 struct Contract;
 
@@ -30,12 +55,14 @@ impl ContractInterface for Contract {
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        chat_state
-            .verify(&chat_state, &parameters)
-            .map(|_| ValidateResult::Valid)
-            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+        chat_state.verify(&chat_state, &parameters).map_err(|e| {
+            ContractError::InvalidUpdateWithInfo {
                 reason: format!("State verification failed: {}", e),
-            })
+            }
+        })?;
+        require_cleanup_fixpoint(bytes, &chat_state, &parameters)
+            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
+        Ok(ValidateResult::Valid)
     }
 
     fn update_state(
@@ -413,5 +440,160 @@ mod tests {
             out.new_state.expect("a new state").as_ref(),
             cbor!(&expected).as_slice()
         );
+    }
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let b: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect();
+        b.try_into().unwrap()
+    }
+
+    /// Spike: captured live v1 states (RIVER_V1_STATES, comma separated;
+    /// owner key RIVER_V1_OWNER_HEX) pass `verify` and the cleanup-fixpoint
+    /// rule, through the contract's own `validate_state`.
+    #[test]
+    #[ignore = "reads RIVER_V1_STATES; run by hand"]
+    fn live_states_pass_the_fixpoint_rule() {
+        let owner = ed25519_dalek::VerifyingKey::from_bytes(&hex32(
+            &std::env::var("RIVER_V1_OWNER_HEX").unwrap(),
+        ))
+        .unwrap();
+        let parameters = ChatRoomParametersV1 { owner };
+        for path in std::env::var("RIVER_V1_STATES").unwrap().split(',') {
+            let bytes = std::fs::read(path).unwrap();
+            let s: ChatRoomStateV1 = from_reader(&bytes[..]).unwrap();
+            let verify = s.verify(&s, &parameters);
+            let mut cleaned = s.clone();
+            let t = std::time::Instant::now();
+            cleaned.post_apply_cleanup(&parameters).unwrap();
+            let cleanup_ms = t.elapsed().as_secs_f64() * 1e3;
+            let mut diff = vec![];
+            macro_rules! d {
+                ($f:ident) => {
+                    if cleaned.$f != s.$f {
+                        diff.push(stringify!($f));
+                    }
+                };
+            }
+            d!(configuration);
+            d!(bans);
+            d!(members);
+            d!(member_info);
+            d!(secrets);
+            d!(recent_messages);
+            d!(upgrade);
+            d!(ban_evidence);
+            d!(direct_messages);
+            let r = Contract::validate_state(
+                Parameters::from(cbor!(&parameters)),
+                State::from(bytes.clone()),
+                RelatedContracts::default(),
+            );
+            let bytes_fixpoint = cbor!(&cleaned) == bytes;
+            println!(
+                "{path}: {} bytes members={} msgs={} verify={:?} bytes_fixpoint={bytes_fixpoint} struct_diff(incl. serde-skip caches)={diff:?} native_cleanup_ms={cleanup_ms:.1} validate={r:?}",
+                bytes.len(),
+                s.members.members.len(),
+                s.recent_messages.messages.len(),
+                verify.is_ok()
+            );
+            assert!(verify.is_ok());
+            assert!(r.is_ok(), "{path} refused: {r:?}");
+        }
+    }
+
+    /// Spike: the raw fuzz pairs that do not converge under gossip
+    /// (RIVER_RAW_DIR/<pair>/{a,b,params}.cbor) are refused by
+    /// `validate_state`, a merge of them is accepted, and their normalized
+    /// forms converge in a few exchanges.
+    #[test]
+    #[ignore = "reads RIVER_RAW_DIR; run by hand"]
+    fn raw_non_fixpoint_states_are_refused() {
+        let dir = std::env::var("RIVER_RAW_DIR").unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut refused = 0;
+        let mut total = 0;
+        for n in names {
+            let rd = |f: &str| std::fs::read(format!("{dir}/{n}/{f}.cbor")).unwrap();
+            let pbytes = rd("params");
+            let parameters: ChatRoomParametersV1 = from_reader(&pbytes[..]).unwrap();
+            let validate = |b: &[u8]| {
+                Contract::validate_state(
+                    Parameters::from(pbytes.clone()),
+                    State::from(b.to_vec()),
+                    RelatedContracts::default(),
+                )
+            };
+            let merge = |x: &[u8], y: &[u8]| -> Vec<u8> {
+                Contract::update_state(
+                    Parameters::from(pbytes.clone()),
+                    State::from(x.to_vec()),
+                    vec![UpdateData::State(State::from(y.to_vec()))],
+                )
+                .unwrap()
+                .new_state
+                .unwrap()
+                .as_ref()
+                .to_vec()
+            };
+            let (a, b) = (rd("a"), rd("b"));
+            let mut line = format!("{n}:");
+            for (name, x) in [("a", &a), ("b", &b)] {
+                total += 1;
+                let st: ChatRoomStateV1 = from_reader(&x[..]).unwrap();
+                let v = st.verify(&st, &parameters).is_ok();
+                let r = validate(x);
+                if r.is_err() {
+                    refused += 1;
+                }
+                line += &format!(
+                    " {name}: verify_ok={v} validate={}",
+                    if r.is_ok() { "Valid" } else { "REFUSED" }
+                );
+            }
+            // A merge output is always accepted.
+            let ab = merge(&a, &b);
+            let ba = merge(&b, &a);
+            line += &format!(
+                " | merge(a,b) valid={} merge(b,a) valid={}",
+                validate(&ab).is_ok(),
+                validate(&ba).is_ok()
+            );
+            // Raw gossip (what two peers holding the raw states would do).
+            let gossip = |mut x: Vec<u8>, mut y: Vec<u8>| -> Option<usize> {
+                for round in 1..=8 {
+                    let nx = merge(&x, &y);
+                    let ny = merge(&y, &nx);
+                    x = nx;
+                    y = ny;
+                    if x == y {
+                        return Some(round);
+                    }
+                }
+                None
+            };
+            let norm = |x: &[u8]| -> Vec<u8> {
+                let mut s: ChatRoomStateV1 = from_reader(x).unwrap();
+                s.post_apply_cleanup(&parameters).unwrap();
+                cbor!(&s)
+            };
+            let (an, bn) = (norm(&a), norm(&b));
+            line += &format!(
+                " | raw gossip converges at round {:?}; normalized: a'/b' valid={}/{} gossip converges at round {:?}",
+                gossip(a.clone(), b.clone()),
+                validate(&an).is_ok(),
+                validate(&bn).is_ok(),
+                gossip(an.clone(), bn.clone())
+            );
+            println!("{line}");
+            assert!(validate(&ab).is_ok() && validate(&ba).is_ok());
+        }
+        println!("refused {refused} of {total} raw states");
     }
 }
