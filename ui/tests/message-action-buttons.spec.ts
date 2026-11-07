@@ -245,16 +245,12 @@ test.describe("Footer controls on a fine pointer", () => {
     expect(await controlStates(own, ids)).toEqual(allStates(ids, SHOWN));
     expect(await rowBox(own)).toEqual(rest);
 
-    // An open picker keeps them shown after the pointer leaves the row. Its
-    // dismiss backdrop sits inside the row, so take it out of hit-testing or
-    // the row would simply be hovered.
+    // An open picker keeps them shown after the pointer leaves the row and
+    // focus leaves it.
     await page.keyboard.press("Enter");
     await expect(page.getByTestId("emoji-picker")).toBeVisible();
     await expect(own.getByTestId("message-react-button")).toHaveAttribute("aria-expanded", "true");
-    await own.evaluate((el) => {
-      for (const b of Array.from(el.querySelectorAll<HTMLElement>(".fixed.inset-0"))) b.style.pointerEvents = "none";
-      (document.activeElement as HTMLElement | null)?.blur();
-    });
+    await own.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await page.mouse.move(0, 0);
     expect(await own.evaluate((el) => el.matches(":hover")), "premise: the row is not hovered").toBe(false);
     expect(await own.evaluate((el) => el.matches(":has(:focus-visible)")), "premise: nothing focused in it").toBe(false);
@@ -445,8 +441,7 @@ test.describe("Footer at 320px", () => {
     await clickFooter(page, row, "message-react-button");
     await expect(page.getByTestId("emoji-picker")).toBeVisible();
     await page.keyboard.press("Escape");
-    await page.mouse.click(2, 2);
-    await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
+    await expect(page.getByTestId("emoji-picker")).toBeHidden();
     await clickFooter(page, row, "message-reply-button");
     await expect(page.getByTestId("message-composer")).toContainText("Replying to");
   });

@@ -47,8 +47,10 @@ pub(crate) use self::outbox_commit::{
 };
 mod pending_effects;
 mod pending_sends;
+mod reaction_picker;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use self::reaction_picker::is_open as reaction_picker_is_open;
 mod seal;
-use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
     complete_scroll_request, correct_view_after_patch, follow_arrival_at_end,
@@ -66,6 +68,7 @@ use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
 use self::pending_sends::PendingSends;
+use self::reaction_picker::{ReactionInvoker, ReactionPicker, ReactionSurfaces};
 use self::seal::SealInput;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
@@ -1465,6 +1468,9 @@ pub fn Conversation() -> Element {
     // during render; the signals (`window_items`, `opening_snap_done`) still
     // reset in the effect, so this render substitutes `INITIAL_WINDOW_ITEMS`
     // below and keeps the sentinel unmounted until they catch up.
+    // The reaction picker's target and the open reactor list, shared by
+    // every message group without being read by them (`reaction_picker.rs`).
+    let reaction_surfaces = reaction_picker::use_reaction_surfaces();
     let room_changed_this_render = {
         // `Option<Option<..>>` so the very first render (no room recorded yet)
         // also counts as a change and starts from a clean window.
@@ -1492,6 +1498,10 @@ pub fn Conversation() -> Element {
             reader_position
                 .room_epoch
                 .set(reader_position.room_epoch.get().wrapping_add(1));
+            // A picker opened in the old room is for nothing here: a pick
+            // queued in it now does nothing, and it closes.
+            reaction_picker::note_room_shown(room);
+            crate::util::defer(move || reaction_surfaces.close_if_stale());
             // The old room's hold and range end with it.
             reader_position.forget_range();
             reader_position.window_rendered.set(0);
@@ -3033,6 +3043,7 @@ pub fn Conversation() -> Element {
                                                                 on_edit: on_group_edit,
                                                                 on_reply: on_group_reply,
                                                                 author_hue: author_hue,
+                                                                reactions: reaction_surfaces,
                                                                 }
                                                             }
                                                         }
@@ -3148,6 +3159,9 @@ pub fn Conversation() -> Element {
                     }
                 }
             }
+
+            // The one reaction picker, opened by a message's footer React.
+            ReactionPicker { surfaces: reaction_surfaces, on_react: on_group_react }
 
             // Message input or status
             {
@@ -3599,19 +3613,6 @@ fn reaction_owners_popover_at(
     }
 }
 
-/// Where the inline emoji picker opens, set when it opens (#402) and again
-/// when its group renders while it is open, in px from its containing block,
-/// the message content.
-#[derive(Clone, Copy, PartialEq)]
-struct PickerPlacement {
-    /// Opens upward: `y_px` is then where its bottom edge sits, else its top.
-    above: bool,
-    /// CSS `right`: puts the picker's right edge at the control that opened it.
-    x_px: f64,
-    /// From the content's top, so content growing below never moves it.
-    y_px: f64,
-}
-
 /// The centre of the element with this id, in client coordinates.
 fn element_centre(id: &str) -> Option<(f64, f64)> {
     let element = web_sys::window()?.document()?.get_element_by_id(id)?;
@@ -3755,9 +3756,6 @@ fn reveal_shift(top: f64, bottom: f64, view_top: f64, view_bottom: f64, margin: 
     }
 }
 
-/// The inline picker's height: 16 emoji in four rows of four, plus padding.
-const INLINE_PICKER_HEIGHT_PX: f64 = 140.0;
-
 fn chat_scrollport_bounds() -> (f64, f64) {
     web_sys::window()
         .and_then(|w| w.document())
@@ -3767,92 +3765,6 @@ fn chat_scrollport_bounds() -> (f64, f64) {
             (rect.top(), rect.bottom())
         })
         .unwrap_or((60.0, 600.0))
-}
-
-/// The space between the inline picker and the control it opens at.
-const PICKER_GAP_PX: f64 = 4.0;
-
-/// The inline picker's width before it is laid out: four emoji buttons, their
-/// gaps and padding, about as wide as engines draw it. Only used to keep it
-/// inside the scroller; once it is open its own width is measured.
-const INLINE_PICKER_WIDTH_PX: f64 = 190.0;
-
-/// Where `msg-{msg_id}`'s inline picker opens: at its footer React, the
-/// control that opens it, measured from the layout, never from a click (a key
-/// press reports no position).
-///
-/// - Its right edge lines up with React's right edge, kept inside the chat
-///   scroller.
-/// - It opens just below React, or just above it when it does not fit below
-///   inside the scroller and there is more room above
-///   ([`vertical_placement_from`]); `keep_side` keeps the side it opened on
-///   when it is placed again.
-/// - Kept inside the scroller by its own measured width once it is open (an
-///   emoji's width differs between engines), else [`INLINE_PICKER_WIDTH_PX`].
-///
-/// `None` when React cannot be measured (a row being edited has none): it
-/// then opens below the message content.
-fn inline_picker_placement(msg_id: &str, keep_side: Option<bool>) -> Option<PickerPlacement> {
-    let document = web_sys::window()?.document()?;
-    let row = document.get_element_by_id(&format!("msg-{msg_id}"))?;
-    let content = row
-        .query_selector("[data-testid=\"message-content\"]")
-        .ok()??
-        .get_bounding_client_rect();
-    let react = row
-        .query_selector("[data-testid=\"message-react-button\"]")
-        .ok()??
-        .get_bounding_client_rect();
-    if react.width() <= 0.0 || react.height() <= 0.0 {
-        return None;
-    }
-    let scroller = document
-        .get_element_by_id("chat-scroll-container")?
-        .get_bounding_client_rect();
-    let width = document
-        .get_element_by_id(&format!("emoji-picker-{msg_id}"))
-        .map(|picker| picker.get_bounding_client_rect().width())
-        .filter(|width| *width > 0.0)
-        .unwrap_or(INLINE_PICKER_WIDTH_PX);
-    Some(placement_at(
-        (react.top(), react.bottom(), react.right()),
-        (content.top(), content.right()),
-        (scroller.left(), scroller.right()),
-        width,
-        |top, bottom| {
-            keep_side.unwrap_or_else(|| {
-                vertical_placement_from(top, bottom, INLINE_PICKER_HEIGHT_PX + PICKER_GAP_PX).0
-            })
-        },
-    ))
-}
-
-/// [`inline_picker_placement`]'s arithmetic, pure for native tests, in
-/// client coordinates: the trigger as `(top, bottom, right)`, the content
-/// as `(top, right)`; `width` is the picker's; `opens_above` decides the side
-/// from the trigger's `top..bottom`.
-fn placement_at(
-    trigger: (f64, f64, f64),
-    content: (f64, f64),
-    scroller: (f64, f64),
-    width: f64,
-    opens_above: impl Fn(f64, f64) -> bool,
-) -> PickerPlacement {
-    const EDGE_PX: f64 = 4.0;
-    let (t_top, t_bottom, t_right) = trigger;
-    let (c_top, c_right) = content;
-    let (s_left, s_right) = scroller;
-    let right = t_right.min(s_right - EDGE_PX).max(s_left + EDGE_PX + width);
-    let above = opens_above(t_top, t_bottom);
-    PickerPlacement {
-        above,
-        x_px: c_right - right,
-        y_px: if above {
-            t_top - c_top - PICKER_GAP_PX
-        } else {
-            t_bottom - c_top + PICKER_GAP_PX
-        },
-    }
 }
 
 /// A ⚠ or 🛡 beside a name, its tooltip also its accessible label.
@@ -3964,62 +3876,20 @@ fn MessageGroupComponent(
     /// `None` for the neutral disc (no salt yet, or an author the room no
     /// longer lists).
     author_hue: Option<u16>,
+    /// The conversation's reaction picker and open reactor list, passed on
+    /// to the footers and never read here, so the picker opening or closing
+    /// renders no group (#830).
+    reactions: ReactionSurfaces,
 ) -> Element {
     #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
     crate::test_hooks::note_message_group_render();
-    // Per-group: at most one picker per group, and while a picker is open its
-    // raised (z-[60]) backdrop covers every other group's footer controls, so
-    // tapping one dismisses the picker rather than stacking a second popover —
-    // the single-popover guarantee comes from the z-order, not a shared signal
-    // (#402).
-    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
     let header_time = header_time_labels(&group);
     let is_self = group.is_self;
 
-    let mut picker_placement: Signal<Option<PickerPlacement>> = use_signal(|| None);
+    // This group's open reactor list. At most one list or picker is open in
+    // the conversation: opening a list closes the picker and is recorded in
+    // `reactions`, so that opening the picker closes the list.
     let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
-    // Measures the control now, then places and opens the picker in one deferred
-    // step (.claude/rules/dioxus-signal-safety.md). The footer React, the only
-    // way in, comes through here.
-    let open_inline_picker = move |msg_id: &str| {
-        request_reveal(format!("emoji-picker-{msg_id}"));
-        let placement = inline_picker_placement(msg_id, None);
-        let picker_id = format!("inline-{msg_id}");
-        crate::util::defer(move || {
-            picker_placement.set(placement);
-            open_emoji_picker.set(Some(picker_id));
-            // One popover at a time: React can be reached from the keyboard
-            // while a reactor list is open.
-            open_reaction_owners.set(None);
-        });
-    };
-    // React sits after the message's chips in its footer, so a reaction
-    // arriving or an edit while the picker is open moves it. Each render of
-    // this group while it is open places the picker at React again, on the
-    // side it opened, after the render's patch. A placement that did not
-    // change is not written, so this settles after one pass.
-    if let Some(open_id) = open_emoji_picker
-        .peek()
-        .as_deref()
-        .and_then(|id| id.strip_prefix("inline-"))
-        .map(str::to_string)
-    {
-        let side = (*picker_placement.peek()).map(|p| p.above);
-        crate::util::defer(move || {
-            let still_open = open_emoji_picker
-                .peek()
-                .as_deref()
-                .and_then(|id| id.strip_prefix("inline-"))
-                == Some(open_id.as_str());
-            if !still_open {
-                return;
-            }
-            let placement = inline_picker_placement(&open_id, side);
-            if placement.is_some() && *picker_placement.peek() != placement {
-                picker_placement.set(placement);
-            }
-        });
-    }
     {
         let live_owner_keys: HashSet<String> = group
             .messages
@@ -4089,6 +3959,11 @@ fn MessageGroupComponent(
                     let Some((key, message_id)) = previous else {
                         return;
                     };
+                    // Closed because the picker opened (React from the
+                    // keyboard): focus stays where the reader put it.
+                    if reaction_picker_is_open() {
+                        return;
+                    }
                     if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
                         focus_without_scrolling(&chip);
                         return;
@@ -4241,8 +4116,6 @@ fn MessageGroupComponent(
                                 }
                                 div {
                                     "data-testid": "message-content",
-                                    // `relative`: the inline picker's containing
-                                    // block.
                                     class: "msg-content relative min-w-0",
                                     if is_first {
                                         div {
@@ -4622,7 +4495,6 @@ fn MessageGroupComponent(
                                     {
                                         let msg_id_for_inline = msg.id.clone();
                                         let msg_id_react = msg.message_id.clone();
-                                        let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
                                         // A row being edited has the form's own buttons.
                                         let show_actions = editing_message.read().as_ref() != Some(&msg.id);
                                         let msg_id_for_react = msg.id.clone();
@@ -4648,7 +4520,7 @@ fn MessageGroupComponent(
                                                 None
                                             }
                                         });
-                                        let user_reaction_for_picker = user_reaction.clone();
+                                        let msg_id_for_invoker = msg.message_id.clone();
 
                                         rsx! {
                                             div {
@@ -4852,7 +4724,7 @@ fn MessageGroupComponent(
                                                                                 if already_open {
                                                                                     open_reaction_owners.set(None);
                                                                                 } else {
-                                                                                    open_emoji_picker.set(None);
+                                                                                    reactions.owner_list_opened(open_reaction_owners);
                                                                                     open_reaction_owners.set(Some(popover));
                                                                                 }
                                                                             });
@@ -4867,8 +4739,13 @@ fn MessageGroupComponent(
                                                                     onkeydown: move |e: KeyboardEvent| {
                                                                         let key = e.key();
                                                                         if key == Key::Escape {
-                                                                            e.prevent_default();
-                                                                            crate::util::defer(move || open_reaction_owners.set(None));
+                                                                            // Only this chip's own list: an Escape
+                                                                            // with none open is left to close the
+                                                                            // reaction picker.
+                                                                            if owners_open {
+                                                                                e.prevent_default();
+                                                                                crate::util::defer(move || open_reaction_owners.set(None));
+                                                                            }
                                                                             return;
                                                                         }
                                                                         // A `role="button"` answers Enter and Space.
@@ -4890,7 +4767,7 @@ fn MessageGroupComponent(
                                                                             y,
                                                                         );
                                                                         crate::util::defer(move || {
-                                                                            open_emoji_picker.set(None);
+                                                                            reactions.owner_list_opened(open_reaction_owners);
                                                                             open_reaction_owners.set(Some(popover));
                                                                         });
                                                                     },
@@ -4902,19 +4779,11 @@ fn MessageGroupComponent(
                                                     })
                                                 }
                                                 if show_actions {
-                                                    button {
-                                                        r#type: "button",
-                                                        "data-testid": "message-react-button",
-                                                        class: "msg-action",
-                                                        title: "React",
-                                                        "aria-label": "React",
-                                                        "aria-haspopup": "true",
-                                                        "aria-expanded": "{is_inline_picker_open}",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            open_inline_picker(&msg_id_for_react);
-                                                        },
-                                                        {line_icon(REACT_ICON_PATH, 18)}
+                                                    ReactionInvoker {
+                                                        surfaces: reactions,
+                                                        row: msg_id_for_react,
+                                                        message: msg_id_for_invoker,
+                                                        current: user_reaction,
                                                     }
                                                 }
                                             }
@@ -4976,75 +4845,6 @@ fn MessageGroupComponent(
                                                 }
                                             }
                                             }
-                                            // The picker and its backdrop, over the message content, placed at
-                                            // React (`inline_picker_placement`) and placed again when the group
-                                            // renders while it is open, so it follows React along its line. Raised
-                                            // (z-[60]) above Latest (z-30) and every other row. (#402)
-                                            if is_inline_picker_open {
-                                                div {
-                                                    class: "absolute inset-0 z-[60] pointer-events-none",
-                                                    // Invisible backdrop: a click anywhere else closes the picker.
-                                                    div {
-                                                        class: "fixed inset-0 z-40 pointer-events-auto",
-                                                        onclick: move |_| crate::util::defer(move || open_emoji_picker.set(None)),
-                                                    }
-                                                    // Inline emoji picker; placed by `open_inline_picker`.
-                                                    div {
-                                                        "data-testid": "emoji-picker",
-                                                        id: "emoji-picker-{msg_id_for_inline}",
-                                                        // It opens at the control that opened it, which
-                                                        // can sit at the view's edge: bring it into
-                                                        // view, only as far as needed, or the reader
-                                                        // sees nothing open and the invisible backdrop
-                                                        // takes their next click
-                                                        // (`reveal_once_in_history`).
-                                                        onmounted: {
-                                                            let picker_id = format!("emoji-picker-{msg_id_for_inline}");
-                                                            move |_| reveal_once_in_history(picker_id.clone())
-                                                        },
-                                                        class: "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid pointer-events-auto",
-                                                        style: {
-                                                            let place = match *picker_placement.read() {
-                                                                Some(p) if p.above => format!(
-                                                                    "right: {}px; bottom: calc(100% - {}px);",
-                                                                    p.x_px, p.y_px,
-                                                                ),
-                                                                Some(p) => format!("right: {}px; top: {}px;", p.x_px, p.y_px),
-                                                                None => "left: 0; top: 100%; margin-top: 4px;".to_string(),
-                                                            };
-                                                            format!("grid-template-columns: repeat(4, 1fr); gap: 2px; {place}")
-                                                        },
-                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                        {FREQUENT_EMOJIS.iter().map(|emoji| {
-                                                            let emoji_str = emoji.to_string();
-                                                            let msg_id = msg_id_react.clone();
-                                                            let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
-                                                            rsx! {
-                                                                button {
-                                                                    key: "{emoji}",
-                                                                    class: format!(
-                                                                        "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
-                                                                        if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
-                                                                    ),
-                                                                    title: if is_current {
-                                                                        format!("Remove {} reaction", emoji)
-                                                                    } else {
-                                                                        format!("React with {}", emoji)
-                                                                    },
-                                                                    onclick: move |_| {
-                                                                        let (id, emoji) = (msg_id.clone(), emoji_str.clone());
-                                                                        crate::util::defer(move || {
-                                                                            on_react.call((id, emoji));
-                                                                            open_emoji_picker.set(None);
-                                                                        });
-                                                                    },
-                                                                    "{emoji}"
-                                                                }
-                                                            }
-                                                        })}
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                 }
@@ -5064,12 +4864,12 @@ mod tests {
     /// re-mount, and another popover's mount does not use up the request.
     #[test]
     fn a_reveal_is_taken_once_per_opening() {
-        request_reveal("emoji-picker-a".into());
+        request_reveal("edit-form-a".into());
         assert!(!take_reveal("edit-form-b"), "another element's mount");
-        assert!(take_reveal("emoji-picker-a"), "the first mount");
-        assert!(!take_reveal("emoji-picker-a"), "a re-mount");
-        request_reveal("emoji-picker-a".into());
-        assert!(take_reveal("emoji-picker-a"), "a new opening");
+        assert!(take_reveal("edit-form-a"), "the first mount");
+        assert!(!take_reveal("edit-form-a"), "a re-mount");
+        request_reveal("edit-form-a".into());
+        assert!(take_reveal("edit-form-a"), "a new opening");
     }
 
     /// The reveal scrolls only as far as needed, and never past the top.
@@ -5114,67 +4914,6 @@ mod tests {
             placement_within(100.0, 100.0, 100.0, 100.0, 140.0),
             (false, 1.0)
         );
-    }
-
-    /// The inline picker opens at the control that opened it: its right edge
-    /// on the control's, just below it or just above it, as offsets from the
-    /// message content (its containing block), kept inside the scroller.
-    #[test]
-    fn the_picker_opens_at_its_control() {
-        // Content from y=180 with its right edge at 920; scroller 0..1000.
-        let content = (180.0, 920.0);
-        let at = |trigger, above| {
-            placement_at(
-                trigger,
-                content,
-                (0.0, 1000.0),
-                INLINE_PICKER_WIDTH_PX,
-                move |_, _| above,
-            )
-        };
-        let below = at((200.0, 228.0, 900.0), false);
-        assert!(!below.above);
-        assert_eq!(below.x_px, 920.0 - 900.0, "right edge on the control's");
-        assert_eq!(below.y_px, 228.0 - 180.0 + 4.0, "top 4px under the control");
-        let above = at((200.0, 228.0, 900.0), true);
-        assert!(above.above);
-        assert_eq!(
-            above.y_px,
-            200.0 - 180.0 - 4.0,
-            "bottom 4px over the control"
-        );
-        // A control past the scroller's right edge: the picker stays 4px inside.
-        assert_eq!(at((200.0, 228.0, 1100.0), false).x_px, 920.0 - 996.0);
-        // A control near the left edge: the picker's left stays 4px inside.
-        assert_eq!(
-            at((200.0, 228.0, 100.0), false).x_px,
-            920.0 - (4.0 + INLINE_PICKER_WIDTH_PX)
-        );
-        // By the picker's own width, once measured.
-        assert_eq!(
-            placement_at(
-                (200.0, 228.0, 100.0),
-                content,
-                (0.0, 1000.0),
-                210.0,
-                |_, _| false
-            )
-            .x_px,
-            920.0 - (4.0 + 210.0)
-        );
-        // The side comes from the control's own top and bottom.
-        let seen = std::cell::Cell::new((0.0, 0.0));
-        placement_at(
-            (200.0, 228.0, 900.0),
-            content,
-            (0.0, 1000.0),
-            170.0,
-            |t, b| {
-                seen.set((t, b));
-                false
-            },
-        );
-        assert_eq!(seen.get(), (200.0, 228.0));
     }
 
     #[test]

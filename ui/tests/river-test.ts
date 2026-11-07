@@ -76,6 +76,8 @@ type RiverTestHooks = {
   showRoomSyncError(label: ReportLabel, summary: string, detail: string, failBannerRead: boolean): void;
   // Room banner sync-status reads that failed since the last call (the count restarts at 0).
   takeBannerReadFailures(): number;
+  // The automatic generation reload's busy check, the production predicate.
+  userIsBusy(): Promise<boolean>;
 };
 
 export type SyncStatus = "connected" | "connecting" | "disconnected" | "error" | `error:${string}`;

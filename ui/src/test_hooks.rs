@@ -804,6 +804,21 @@ pub fn install_test_hooks() {
             .into_js_value(),
     );
 
+    // The automatic generation reload's busy check, the production predicate.
+    // Resolved from inside `defer`: it reads global signals, which need the
+    // Dioxus runtime a raw JS call does not have.
+    set_hook(
+        "userIsBusy",
+        Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
+            js_sys::Promise::new(&mut |resolve, _reject| {
+                crate::util::defer(move || {
+                    let busy = crate::components::app::freenet_api::generation_watch::user_is_busy_for_test();
+                    let _ = resolve.call1(&JsValue::NULL, &JsValue::from_bool(busy));
+                });
+            })
+        })
+        .into_js_value(),
+    );
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 

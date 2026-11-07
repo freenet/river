@@ -630,14 +630,14 @@ test.describe("Message rows at 320px", () => {
   });
 });
 
-// The inline picker opens at the React control, and the scroller clips its
-// sides. Each case checks every emoji is inside the scroller and takes a tap
-// at its centre.
+// The picker opens at the React control it was opened from (anchored, in the
+// top layer), inside the viewport. Each case checks every emoji is inside the
+// viewport and takes a tap at its centre.
 type PickerReport = Awaited<ReturnType<typeof measurePicker>>;
 
-/// The open picker, the reaction line, the footer React it was opened from
-/// and the scroller, with no click in between: a click elsewhere would close
-/// it.
+/// The open picker, the reaction line and the footer React it was opened
+/// from (the expanded one), with no click in between: a click elsewhere would
+/// close it.
 async function measurePicker(page: Page) {
   await expect(page.getByTestId("emoji-picker")).toBeVisible();
   return page.evaluate(() => {
@@ -645,42 +645,40 @@ async function measurePicker(page: Page) {
       const r = e.getBoundingClientRect();
       return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
     };
-    const scroller = box(document.getElementById("chat-scroll-container")!);
     const picker = document.querySelector('[data-testid="emoji-picker"]')!;
-    const row = picker.closest('[id^="msg-"]')!;
+    const control = document.querySelector('[data-testid="message-react-button"][aria-expanded="true"]')!;
+    const row = control.closest('[id^="msg-"]')!;
     const line = row.querySelector('[data-testid="message-reaction-row"]')!;
-    const control = row.querySelector('[data-testid="message-react-button"]')!;
     const buttons = Array.from(picker.querySelectorAll("button")).map((b) => {
       const r = b.getBoundingClientRect();
       const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
       return {
         emoji: (b.textContent || "").trim(),
-        inside: r.left >= scroller.left - 0.5 && r.right <= scroller.right + 0.5 &&
-          r.top >= scroller.top - 0.5 && r.bottom <= scroller.bottom + 0.5,
+        inside: r.left >= -0.5 && r.right <= innerWidth + 0.5 && r.top >= -0.5 && r.bottom <= innerHeight + 0.5,
         hit: at !== null && (at === b || b.contains(at)),
       };
     });
-    return { scroller, line: box(line), control: box(control), picker: box(picker), buttons };
+    return { line: box(line), control: box(control), picker: box(picker), buttons };
   });
 }
 
 function expectEveryEmojiTappable(report: PickerReport) {
   expect(report.buttons.length, "the picker has emoji").toBeGreaterThan(0);
   const outside = report.buttons.find((b) => !b.inside);
-  expect(outside, `${outside?.emoji} is clipped by the scroller (picker ${report.picker.left}..${report.picker.right} x ${report.picker.top}..${report.picker.bottom}, scroller ${report.scroller.left}..${report.scroller.right} x ${report.scroller.top}..${report.scroller.bottom})`).toBeUndefined();
+  expect(outside, `${outside?.emoji} is outside the viewport (picker ${report.picker.left}..${report.picker.right} x ${report.picker.top}..${report.picker.bottom})`).toBeUndefined();
   const covered = report.buttons.find((b) => !b.hit);
   expect(covered, `${covered?.emoji} is not the element a tap at its centre lands on`).toBeUndefined();
 }
 
 /// The picker sits at the control it was opened from: its right edge on the
-/// control's (or 4px inside the scroller, where the control is not), and
-/// just below or just above the control.
+/// control's, or (flipped, where that does not fit) its left edge on the
+/// control's; and 4px below or above the control.
 function expectPickerAtControl(report: PickerReport) {
-  const { picker: p, control: c, scroller: s } = report;
-  const right = Math.max(Math.min(c.right, s.right - 4), s.left + 4 + (p.right - p.left));
-  expect(Math.abs(p.right - right), `picker right ${p.right}, control right ${c.right}`).toBeLessThanOrEqual(1);
-  const below = p.top >= c.bottom - 0.5 && p.top <= c.bottom + 6;
-  const above = p.bottom <= c.top + 0.5 && p.bottom >= c.top - 6;
+  const { picker: p, control: c } = report;
+  const sideways = Math.abs(p.right - c.right) <= 1 || Math.abs(p.left - c.left) <= 1;
+  expect(sideways, `picker ${p.left}..${p.right}, control ${c.left}..${c.right}`).toBe(true);
+  const below = Math.abs(p.top - (c.bottom + 4)) <= 1;
+  const above = Math.abs(p.bottom - (c.top - 4)) <= 1;
   expect(below || above, `picker ${p.top}..${p.bottom}, control ${c.top}..${c.bottom}`).toBe(true);
 }
 
@@ -745,8 +743,7 @@ test.describe("Revealing a popover on a short phone view", () => {
     await nextFrames(page);
     expect(await strayScroll(page), "picker").toEqual(NO_STRAY_SCROLL);
     await page.keyboard.press("Escape");
-    await page.mouse.click(2, 2);
-    await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
+    await expect(page.getByTestId("emoji-picker")).toBeHidden();
 
     await openOwnMessageEdit(page);
     await nextFrames(page);
@@ -953,9 +950,8 @@ test.describe("Message row hover band", () => {
   });
 });
 
-// React on a message taller than the view: the picker opens at React, and
-// opening brings it into view wherever that is, so the next click is the
-// reader's pick, not swallowed by the invisible backdrop.
+// React on a message taller than the view: the picker opens at React, inside
+// the viewport, and takes the next click. Opening it never moves the history.
 test.describe("React on a tall message", () => {
   test("the picker opens in view and takes the next click", async ({ page }) => {
     await openRoomWithComposer(page);
@@ -973,12 +969,12 @@ test.describe("React on a tall message", () => {
     const geometry = () =>
       page.evaluate(() => {
         const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
-        const p = document.querySelector('[data-testid="emoji-picker"]')?.getBoundingClientRect();
+        const p = document.querySelector('[data-testid="emoji-picker"]:popover-open')?.getBoundingClientRect();
         const anchorEl = Array.from(document.querySelectorAll('[data-testid="message-row"]'))
           .find((r) => r.textContent!.includes("tall paragraph 59"))!
           .querySelector('[data-testid="message-footer"]')!
           .getBoundingClientRect();
-        return { view: [c.top, c.bottom], picker: p ? [p.top, p.bottom] : null, anchorTop: anchorEl.top };
+        return { view: [c.top, c.bottom], viewport: innerHeight, picker: p ? [p.top, p.bottom] : null, anchorTop: anchorEl.top };
       });
     expect((await geometry()).anchorTop, "premise: the message's foot is below the view").toBeGreaterThan((await geometry()).view[1]);
 
@@ -988,12 +984,11 @@ test.describe("React on a tall message", () => {
     await expect
       .poll(async () => {
         const g = await geometry();
-        return !!g.picker && g.picker[0] >= g.view[0] - 1 && g.picker[1] <= g.view[1] + 1;
-      }, { message: "the picker is wholly inside the history's view" })
+        return !!g.picker && g.picker[0] >= -1 && g.picker[1] <= g.viewport + 1;
+      }, { message: "the picker is wholly inside the viewport" })
       .toBe(true);
-    // Opened once, revealed once: with the picker open, the reader moves up,
-    // and a re-render of that row (a reaction added) and an arrival leave
-    // the view where the reader put it.
+    // With the picker open, the reader moves up, and a re-render of that row
+    // (a reaction added) leaves the view where the reader put it.
     const scroller = page.locator("#chat-scroll-container");
     await scroller.evaluate((c) => (c.scrollTop -= 160));
     await page.waitForTimeout(150);
@@ -1006,7 +1001,7 @@ test.describe("React on a tall message", () => {
     await page.keyboard.press("Escape");
   });
 
-  test("the picker takes the next click after the reveal", async ({ page }) => {
+  test("the picker takes the next click", async ({ page }) => {
     await openRoomWithComposer(page);
     const text = Array.from({ length: 40 }, (_, i) => `tall ${i}`).join("\n\n") + "\n\ntall paragraph 59";
     await callRiverTest(page, "appendMessage", text);
@@ -1020,7 +1015,7 @@ test.describe("React on a tall message", () => {
     const picker = page.getByTestId("emoji-picker");
     await expect(picker).toBeVisible();
     await picker.getByRole("button").first().click();
-    await expect(picker).toHaveCount(0);
+    await expect(picker).toBeHidden();
     await expect(row.getByTestId("reaction-chip"), "the click reacted").toHaveCount(1);
   });
 });

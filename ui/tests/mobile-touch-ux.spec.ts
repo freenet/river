@@ -86,7 +86,7 @@ test.describe("Message footer on touch (#402.1)", () => {
     }
   });
 
-  test("while the picker is open, a tap on another message's control only closes it", async ({ page }) => {
+  test("while the picker is open, a tap on another message's control closes it and reaches the control", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
@@ -98,10 +98,9 @@ test.describe("Message footer on touch (#402.1)", () => {
     await first.getByTestId("message-react-button").click();
     await expect(page.getByTitle(/^React with/).first()).toBeVisible({ timeout: 5_000 });
 
-    // The picker's raised backdrop covers every other row's controls, so a
-    // tap at another message's Reply lands on it and closes the picker; no
-    // second action starts from that tap. Dispatched at the coordinate,
-    // since Playwright refuses to click an obscured element.
+    // The picker is a native popover with no backdrop: a tap outside it
+    // closes it and still reaches what it tapped, here another message's
+    // Reply, which starts a reply on that same tap. Nothing is reacted.
     const other = rows.nth((await rows.count()) - 2);
     const box = await other.getByTestId("message-reply-button").boundingBox();
     expect(box).not.toBeNull();
@@ -110,12 +109,12 @@ test.describe("Message footer on touch (#402.1)", () => {
       const el = document.elementFromPoint(x, y);
       return { picker: !!el?.closest('[data-testid="emoji-picker"]'), reply: !!el?.closest('[data-testid="message-reply-button"]') };
     }, [x, y]);
-    expect(at, "premise: the tap lands outside the picker, over the other Reply").toEqual({ picker: false, reply: false });
+    expect(at, "premise: the tap lands outside the picker, on the other Reply").toEqual({ picker: false, reply: true });
     const chips = await page.getByTestId("reaction-chip").count();
     await page.mouse.click(x, y);
-    await expect(page.getByTitle(/^React with/)).toHaveCount(0);
+    await expect(page.getByTestId("emoji-picker")).toBeHidden();
     expect(await page.getByTestId("reaction-chip").count(), "nothing was reacted").toBe(chips);
-    await expect(page.getByTitle("Cancel reply")).toHaveCount(0);
+    await expect(page.getByTitle("Cancel reply")).toHaveCount(1);
   });
 });
 

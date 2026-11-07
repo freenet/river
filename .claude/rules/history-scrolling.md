@@ -100,6 +100,10 @@ Current behavior:
   reaction picker. The reader is at the end anyway when the dialog
   closes, but those arrivals count as read without having been on screen
   unobstructed.
+- While the reaction picker is open the reader's own wheel and touch
+  scrolling are held off, as its old full-screen backdrop did, but only those
+  input events: arrivals, following, the end hold and reads go on
+  (`conversation/reaction_picker.rs`).
 
 Known limitations:
 

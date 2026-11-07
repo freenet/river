@@ -275,6 +275,60 @@
     }
 }
 
+/* The reaction picker (`conversation/reaction_picker.rs`): one native
+ * `popover="auto"` for the whole history, in the top layer, so no z-index
+ * applies to it. Nothing here sets its `display`: closed, the UA hides it.
+ *
+ * Without anchor positioning it keeps the UA's `inset: 0` and this
+ * `margin: auto`, centred in the viewport. */
+.reaction-picker {
+    margin: auto;
+    padding: 6px;
+    border: 1px solid var(--color-border);
+    border-radius: 0.75rem;
+    background: var(--color-panel);
+    color: var(--color-text);
+    box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+    overflow: visible;
+}
+
+/* At the React it was opened from (`anchor-name` set on it when it opens):
+ * just below it, its right edge on React's, or flipped to fit the viewport,
+ * above it and/or extending right from React's left edge. Its own size, no
+ * entry animation. */
+@supports (position-area: block-end) {
+    .reaction-picker {
+        position-anchor: --reaction-picker;
+        inset: auto;
+        margin: 4px 0 0;
+        position-area: block-end span-inline-start;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    }
+}
+
+.reaction-picker-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 2px;
+}
+
+.reaction-picker-emoji {
+    padding: 0.25rem;
+    border-radius: 0.25rem;
+    font-size: 1.25rem;
+    line-height: 1;
+    transition: background-color 0.15s;
+}
+
+.reaction-picker-emoji:hover {
+    background-color: var(--color-surface);
+}
+
+.reaction-picker-emoji--current {
+    background-color: color-mix(in srgb, var(--color-accent) 20%, transparent);
+    box-shadow: 0 0 0 2px var(--color-accent);
+}
+
 /* Join notices: one quiet line, the icon in the avatar gutter. */
 .msg-event {
     display: grid;
