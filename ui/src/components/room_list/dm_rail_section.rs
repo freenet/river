@@ -18,12 +18,11 @@
 //! on a touch device (`@media (hover: none)`) `.dm-archive-btn` in
 //! `main.css` forces it fully visible with a 44px tap target, because
 //! the `group-hover` reveal Tailwind emits is itself wrapped in
-//! `@media (hover: hover)` and can never fire there. This mirrors the
-//! `.hover-actions` / `.touch-actions` split #402 introduced for the
-//! message action bar. Archived threads stay out of the rail until
-//! either side sends a new DM. The "Archived (N)" link at the bottom of
-//! the section lists currently-archived threads and offers per-row
-//! Un-archive, closing #266.
+//! `@media (hover: hover)` and can never fire there. A message's footer
+//! actions (`.msg-action`) follow the same rule. Archived threads stay
+//! out of the rail until either side sends a new DM. The "Archived (N)"
+//! link at the bottom of the section lists currently-archived threads and
+//! offers per-row Un-archive, closing #266.
 //!
 //! Hidden when empty so the rail doesn't show an empty section on first
 //! load. Sorts unread threads first, then by most-recent message time.

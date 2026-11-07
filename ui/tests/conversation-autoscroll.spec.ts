@@ -280,7 +280,7 @@ test.describe("Layout-only growth does not move the view (#486)", () => {
 //
 // The fixture: `?deep-history-room=1` adds a room of 188 alternating-author
 // messages (alternation makes messages == display items, so >60 items is a
-// guarantee) plus the 13 standard fixture messages, 201 in all. The default
+// guarantee) plus the 16 standard fixture messages, 204 in all. The default
 // fixture is untouched; the describes above still exercise the small-room path.
 test.describe("Windowed history keeps the reader's place through arrivals (#501)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
@@ -805,12 +805,12 @@ function observeRowCounts(page: Page, { returnToEnd = false } = {}): Promise<num
   }, returnToEnd);
 }
 
-/// The Deep History Room fixture: 188 fillers + 13 standard messages, capped
+/// The Deep History Room fixture: 188 fillers + 16 standard messages, capped
 /// at DEEP_ROOM_MAX_RECENT_MESSAGES.
-const DEEP_ROOM_SEEDED = 201;
+const DEEP_ROOM_SEEDED = 204;
 const DEEP_ROOM_CAP = 300;
 /// A burst that passes the render ceiling from the room's opening window: its
-/// prune (201 + 200 - 300 = 101 messages) stays above that window's start.
+/// prune (204 + 200 - 300 = 104 messages) stays above that window's start.
 const CEILING_BURST = 200;
 
 /// Park in the Deep History Room, then send a 200-message burst that passes

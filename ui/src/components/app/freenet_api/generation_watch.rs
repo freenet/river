@@ -1000,6 +1000,8 @@ pub fn is_watched(id: &ContractInstanceId) -> bool {
     WATCHED.iter().any(|w| &w.pointer_id == id)
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub use runtime::user_is_busy_for_test;
 pub use runtime::{
     is_reloading, mark_ready, note_sync_queued, on_connected, on_disconnected, on_page_visible,
     reload_now, snooze, UPDATE_NOTICE,
@@ -1081,6 +1083,8 @@ mod runtime {
     /// Deliberately broad. Every modal in this app renders a full-screen
     /// `fixed inset-0` overlay only while it is open, so any visible overlay
     /// means a dialog, picker or menu is up (with whatever is typed in it).
+    /// The reaction picker, a native popover with no overlay, is checked on
+    /// its own.
     /// Beyond that: unsent text in the room composer, a message being edited,
     /// any focused text field with something in it, and an invitation being
     /// accepted.
@@ -1107,6 +1111,12 @@ mod runtime {
         // shown for a retry): it lives only in memory, and the composer is
         // already empty, so nothing above sees it. Held like a draft.
         if crate::components::conversation::outbox_has_unsent() {
+            return true;
+        }
+        // The reaction picker: a native popover in the top layer, with no
+        // overlay for the check below to see. Only while it is open; the
+        // element stays mounted closed.
+        if crate::components::conversation::reaction_picker_is_open() {
             return true;
         }
         if let Ok(overlays) = document.query_selector_all(".fixed.inset-0") {
@@ -1142,6 +1152,12 @@ mod runtime {
                 })
             })
             .unwrap_or(true)
+    }
+
+    /// [`user_is_busy`] for the example build's test hooks.
+    #[cfg(all(feature = "example-data", feature = "no-sync"))]
+    pub fn user_is_busy_for_test() -> bool {
+        user_is_busy()
     }
 
     /// A room sync was just queued (`mark_needs_sync`): usually the reader
@@ -3006,6 +3022,10 @@ mod tests {
         assert!(
             busy.contains("outbox_has_unsent()"),
             "an unsent message must hold an automatic reload, as a draft does"
+        );
+        assert!(
+            busy.contains("reaction_picker_is_open()"),
+            "an open reaction picker (a popover, no overlay) must hold it too"
         );
         let flush_at = code.find("async fn reload_after_flush(").expect("flush");
         let flush = &code[flush_at..];

@@ -144,8 +144,8 @@ export async function openRoomAtBottom(page: Page, roomName: string, path = "/")
   await page.goto(path);
   await waitForApp(page);
   await selectRoom(page, roomName);
-  // Off the history: a pointer left over it by the room-list click expands any
-  // reply strip it hovers (main.css), and that reflow is not followed.
+  // Off the history: a pointer left over it by the room-list click would
+  // leave a hover band and footer controls on whatever row it lands on.
   await page.mouse.move(0, 0);
   // Asserted since a hidden panel would make every geometry read return 0.
   await expect(page.locator("#chat-scroll-container")).toBeVisible({ timeout: 5_000 });

@@ -96,10 +96,14 @@ Current behavior:
   (`reader_moved_up_since`) is the latch that caused #508.
 - The history follows under every dialog and popover, a DM thread over the
   room included, and is read under all of them except that DM thread: member
-  info, room settings, invite and ban dialogs, the message action menu and
-  the reaction picker. The reader is at the end anyway when the dialog
+  info, room settings, invite and ban dialogs, a reactor list and the
+  reaction picker. The reader is at the end anyway when the dialog
   closes, but those arrivals count as read without having been on screen
   unobstructed.
+- While the reaction picker is open the reader's own wheel and touch
+  scrolling are held off, as its old full-screen backdrop did, but only those
+  input events: arrivals, following, the end hold and reads go on
+  (`conversation/reaction_picker.rs`).
 
 Known limitations:
 
@@ -167,6 +171,15 @@ Known limitations:
   as the preferred fallback. The reading row is the first row whose top lies
   inside the view, else the row the view's top cuts through (a message
   taller than the view, not the row starting below the fold).
+- A reply strip's jump (`conversation/reply_highlight.rs`) is not a
+  request: it sets the history's `scrollTop` once, centring the quoted row
+  (or putting the top of one taller than the view 12px below the view's
+  top), and then counts as a reader's own scroll. Away from the end it
+  releases the end hold, and its settle records the reading position;
+  arrivals follow only by the rule above. It scrolls nothing outside the
+  history, and a quoted message that is not rendered is left alone (no
+  paging). The highlight is a two-second Web Animations API animation on the
+  whole row; it changes no height.
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.

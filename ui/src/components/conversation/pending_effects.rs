@@ -128,8 +128,6 @@ mod tests {
             author_impersonation: None,
             is_self: true,
             first_time: DateTime::<Utc>::UNIX_EPOCH,
-            time_clamped: false,
-            first_delay_secs: None,
             messages,
         })]
     }

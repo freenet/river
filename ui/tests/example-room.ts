@@ -109,21 +109,15 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
-// The edit form on an own message: its kebab on touch, its hover actions
-// otherwise (freenet/river#402). Returns the edit textarea. Without a
-// `message`, the first own message is scrolled into view first; a given
-// `message` is used from wherever it already is.
+// The edit form on an own message, through its footer Edit. Returns the edit
+// textarea. Without a `message`, the first own message is scrolled into view
+// first; a given `message` is used from wherever it already is.
 export async function openOwnMessageEdit(page: Page, message?: Locator): Promise<Locator> {
   const ownRow = message ?? page.locator('[id^="msg-"][data-message-self="true"]').first();
   await expect(ownRow).toBeVisible();
   if (!message) await ownRow.scrollIntoViewIfNeeded();
-  if (await touchOnly(page)) {
-    await ownRow.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: /edit/i }).click();
-  } else {
-    await ownRow.getByTestId("message-body").hover();
-    await ownRow.getByRole("button", { name: /edit/i }).click();
-  }
+  await revealFooter(page, ownRow);
+  await ownRow.getByTestId("message-edit-button").click();
   const editArea = page.locator('textarea[id^="edit-msg-"]');
   await expect(editArea).toBeVisible({ timeout: 5_000 });
   return editArea;
@@ -185,28 +179,35 @@ export async function colourOf(locator: Locator): Promise<number[]> {
   return resolveColor(locator.page(), await locator.evaluate((el) => getComputedStyle(el).color));
 }
 
-/// Whether there is no hover pointer, so rows show the kebab, not the hover bar.
+/// Whether there is no hover pointer at all.
 export function touchOnly(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none)").matches);
 }
 
-/// Whether a finger can be the pointer: the same query as main.css.
+/// Whether a finger can be the pointer: the same query as main.css. Message
+/// footer controls then show at rest; otherwise only on the row's hover or
+/// keyboard focus.
 export function coarsePointer(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
 }
 
-/// Open `row`'s inline reaction picker through its React action, the only
-/// way in: the hover bar's on a hover pointer, the kebab menu's on touch.
+/// Show `row`'s footer controls (React, Reply, Edit, Delete): a fine pointer
+/// hovers the row, as a reader does; a touch or hybrid pointer already shows
+/// them.
+export async function revealFooter(page: Page, row: Locator) {
+  if (!(await coarsePointer(page))) await row.hover({ position: { x: 4, y: 4 } });
+}
+
+/// Click one of `row`'s footer controls by its test id, revealing it first.
+export async function clickFooter(page: Page, row: Locator, testid: string) {
+  await revealFooter(page, row);
+  await row.getByTestId(testid).click();
+}
+
+/// Open `row`'s inline reaction picker through its footer React, the only
+/// way in.
 export async function openInlinePicker(page: Page, row: Locator) {
-  if (await touchOnly(page)) {
-    await row.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: "React" }).click();
-  } else {
-    // From the row's top left: the next row's hover bar floats over this
-    // row's last line.
-    await row.hover({ position: { x: 4, y: 4 } });
-    await row.getByTestId("message-hover-actions").getByRole("button", { name: "React" }).click();
-  }
+  await clickFooter(page, row, "message-react-button");
 }
 
 /// React to `row` with the picker's first emoji. Expects the row to end with

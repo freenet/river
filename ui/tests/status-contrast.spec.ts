@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { colourOf, contrast, effectiveBackground, over, resolveColor, selectRoom, waitForApp } from "./example-room";
+import { clickFooter, colourOf, contrast, effectiveBackground, over, resolveColor, selectRoom, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
 import { DM_PEER } from "./dm-thread";
 
@@ -107,8 +107,7 @@ for (const scheme of ["light", "dark"] as const) {
       await open(page, "Your Private Room");
       const own = page.locator('[data-testid="message-row"][data-message-self="true"]').last();
       await own.scrollIntoViewIfNeeded();
-      await own.hover({ position: { x: 4, y: 4 } });
-      await own.getByTestId("message-hover-actions").getByRole("button", { name: "Delete message" }).click();
+      await clickFooter(page, own, "message-delete-button");
       await page.mouse.move(0, 0);
       await expectReadable(page.getByText("This action cannot be undone.", { exact: false }), "the delete note");
       await expectReadable(page.getByRole("button", { name: "Delete", exact: true }), "Delete on its fill");

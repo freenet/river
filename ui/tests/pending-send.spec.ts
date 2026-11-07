@@ -41,6 +41,41 @@ test("a sent message shows at once, pending, and commits once when signed", asyn
   await expect(committed(page, "pending until signed")).toBeInViewport();
 });
 
+// Footer actions (React, Reply, Edit, Delete) act on a signed message. A
+// row still being signed keeps "Sending…", a failed one Retry and Discard,
+// and neither has a footer; once signed, the one message has its footer.
+const FOOTER_CONTROLS =
+  '[data-testid="message-footer"], [data-testid="message-react-button"], [data-testid="message-reply-button"], [data-testid="message-edit-button"], [data-testid="message-delete-button"]';
+
+test("an unsigned send has no footer, and once signed the one message has its own", async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "holdMessageSigning");
+  await send(page, "footer once signed");
+  const row = pending(page).filter({ hasText: "footer once signed" });
+  await expect(row.getByTestId("pending-message-status")).toHaveText("Sending…");
+  await expect(row.locator(FOOTER_CONTROLS)).toHaveCount(0);
+
+  await callRiverTest(page, "releaseMessageSigning");
+  const signed = committed(page, "footer once signed");
+  await expect(signed).toHaveCount(1);
+  await expect(pending(page)).toHaveCount(0);
+  await expect(signed.getByTestId("message-footer")).toHaveCount(1);
+  for (const id of ["message-react-button", "message-reply-button", "message-edit-button", "message-delete-button"]) {
+    await expect(signed.getByTestId(id), id).toHaveCount(1);
+  }
+});
+
+test("a failed send keeps Retry and Discard and has no footer", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "failNextMessageSign");
+  await send(page, "failed, no footer");
+  const row = pending(page).filter({ hasText: "failed, no footer" });
+  await expect(row).toHaveAttribute("data-pending-state", "failed");
+  await expect(row.getByTestId("pending-message-retry")).toBeVisible();
+  await expect(row.getByTestId("pending-message-discard")).toBeVisible();
+  await expect(row.locator(FOOTER_CONTROLS)).toHaveCount(0);
+});
+
 test("messages commit in the order they were sent, whatever order they are signed in", { tag: "@chromium-only" }, async ({
   page,
 }) => {

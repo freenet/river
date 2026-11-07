@@ -1,12 +1,12 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, selectRoom, touchOnly, waitForApp } from "./example-room";
+import { clickFooter, coarsePointer, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
 import { deliver, deliverOffscreen, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
 // Grouped chat rows: an avatar gutter, then one content column for every row.
-// A group shows its avatar and header once, on its first row. On a hover
-// pointer the action bar floats over a row's top right, so no gutter is kept
-// for it; touch keeps a kebab in a narrow right gutter.
+// A group shows its avatar and header once, on its first row. Each message
+// ends with a footer of its reactions and actions
+// (message-action-buttons.spec.ts), so no right gutter is kept for controls.
 
 /// The history item (a group of one author's rows) holding `text`.
 function groupWith(page: Page, text: string): Locator {
@@ -431,39 +431,10 @@ test.describe("Avatars", () => {
   });
 });
 
-// React has one way in per pointer: the hover bar's React with a mouse, the
-// kebab menu's React on touch. A faint "+" after a message's reaction chips
-// was a second way; Ian found two controls for one action untidy
-// (2026-10-25), so it was removed. Its element stays only as the inert
-// reference the picker is measured against when no control can be, so it
-// must never show or take a tap.
-test.describe("Reaction row", () => {
-  test("a message with reactions shows no add-reaction control after its chips", async ({ page }) => {
-    const { own } = await openRoomWithPairs(page);
-    const row = own.getByTestId("message-row").last();
-    await reactTo(page, row);
-    if (!(await coarsePointer(page))) await row.hover({ position: { x: 4, y: 4 } });
-
-    const anchor = row.getByTestId("reaction-picker-anchor");
-    await expect(anchor).toBeAttached();
-    await expect(anchor).toBeHidden();
-    const m = await anchor.evaluate((el) => {
-      const r = el.getBoundingClientRect();
-      return { w: r.width, h: r.height, events: getComputedStyle(el.parentElement!).pointerEvents, text: el.textContent };
-    });
-    expect(m).toEqual({ w: 0, h: 0, events: "none", text: "" });
-    // The reaction line holds the chips and nothing else a reader can press.
-    const reactionRow = row.getByTestId("message-reaction-row");
-    await expect(reactionRow.getByTestId("reaction-chip")).toHaveCount(1);
-    await expect(reactionRow.locator('button:not([data-testid="reaction-chip"]):visible')).toHaveCount(0);
-  });
-});
-
-// React opens the picker at the control that was pressed (the hover bar's
-// React, or on touch the kebab whose menu holds it), not at the foot of the
-// message where the chips are.
+// React opens the picker at itself: the footer React, after the message's
+// chips.
 test.describe("The picker opens at React", () => {
-  test("on a long message, beside the React control at its top", async ({ page }) => {
+  test("on a long message, at the footer React", async ({ page }) => {
     await openRoomWithComposer(page);
     const text = Array.from({ length: 6 }, (_, i) => `picker line ${i}`).join("\n\n");
     await callRiverTest(page, "appendMessage", text);
@@ -473,14 +444,12 @@ test.describe("The picker opens at React", () => {
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await openInlinePicker(page, row);
     const report = await measurePicker(page);
-    expect(report.anchor.top - report.control.bottom, "premise: the chips sit well below the control").toBeGreaterThan(100);
     expectPickerAtControl(report);
     expectEveryEmojiTappable(report);
   });
 
-  // The picker is placed in the box that also places React, so a message
-  // reflowing under it (here, its first reaction arriving, which adds the
-  // chip line and moves the end of the chips) leaves it at the control.
+  // A reaction arriving while the picker is open adds a chip before React and
+  // moves it; the picker moves with it.
   test("stays at React when a reaction arrives while it is open", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliverOffscreen(page, "reflow probe");
@@ -494,14 +463,12 @@ test.describe("The picker opens at React", () => {
     await expect(row.getByTestId("reaction-chip")).toHaveCount(3);
     await nextFrames(page);
     const after = await measurePicker(page);
-    expect(after.anchor.left - before.anchor.left, "premise: the chips moved the end of the reaction line").toBeGreaterThan(20);
+    expect(after.control.left - before.control.left, "premise: the chips moved React").toBeGreaterThan(20);
     expectPickerAtControl(after);
   });
 
-  // Opening upward its bottom edge is placed from the content's top, so the
-  // chip line growing below the text does not push it down onto React.
+  // Opened upward, it stays upward and at React when a reaction moves React.
   test("opened upward, stays at React when a reaction arrives", async ({ page }) => {
-    test.skip(await touchOnly(page), "the hover bar's React; the kebab case opens the same way");
     await openRoomWithComposer(page);
     await deliver(page, "upward reflow probe");
     const row = page.getByTestId("message-row").filter({ hasText: "upward reflow probe" });
@@ -513,9 +480,7 @@ test.describe("The picker opens at React", () => {
     await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
     await nextFrames(page);
     const after = await measurePicker(page);
-    // Relative to React: the view may follow the growth and scroll.
-    const below = (r: PickerReport) => r.anchor.bottom - r.control.top;
-    expect(below(after) - below(before), "premise: the chip line grew below React").toBeGreaterThan(10);
+    expect(after.control.left - before.control.left, "premise: the chip moved React").toBeGreaterThan(20);
     expectPickerAtControl(after);
     expect(after.picker.bottom).toBeLessThanOrEqual(after.control.top + 0.5);
   });
@@ -650,34 +615,29 @@ test.describe("Message rows at 320px", () => {
     expect(report.docOverflow).toBeLessThanOrEqual(0);
     expect(report.scrollerOverflow).toBeLessThanOrEqual(0);
 
-    // The newest own message's controls stay inside the scroller: the hover
-    // bar over the row, the touch kebab in the gutter past the content.
+    // The newest own message's footer controls stay inside its content
+    // column, so inside the scroller.
     const row = own.getByTestId("message-row").last();
+    await revealFooter(page, row);
     const content = (await row.getByTestId("message-content").boundingBox())!;
-    const scroller = (await page.locator("#chat-scroll-container").boundingBox())!;
-    const kebab = row.getByTestId("message-kebab");
-    if (await touchOnly(page)) {
-      const b = (await kebab.boundingBox())!;
-      expect(b.x).toBeGreaterThanOrEqual(content.x + content.width - 0.5);
-      expect(b.x + b.width).toBeLessThanOrEqual(scroller.x + scroller.width + 0.5);
-      await kebab.click({ trial: true });
-    } else {
-      await row.hover();
-      const b = (await row.getByTestId("message-hover-actions").boundingBox())!;
-      expect(b.x).toBeGreaterThanOrEqual(scroller.x - 0.5);
-      expect(b.x + b.width).toBeLessThanOrEqual(scroller.x + scroller.width + 0.5);
+    for (const id of ["message-react-button", "message-reply-button", "message-edit-button", "message-delete-button"]) {
+      const control = row.getByTestId(id);
+      const b = (await control.boundingBox())!;
+      expect(b.x, id).toBeGreaterThanOrEqual(content.x - 0.5);
+      expect(b.x + b.width, id).toBeLessThanOrEqual(content.x + content.width + 0.5);
+      await control.click({ trial: true });
     }
   });
 });
 
-// The inline picker opens at the React control, and the scroller clips its
-// sides. Each case checks every emoji is inside the scroller and takes a tap
-// at its centre.
+// The picker opens at the React control it was opened from (anchored, in the
+// top layer), inside the viewport. Each case checks every emoji is inside the
+// viewport and takes a tap at its centre.
 type PickerReport = Awaited<ReturnType<typeof measurePicker>>;
 
-/// The open picker, the reaction row's anchor wrapper, the control it was
-/// opened from and the scroller, with no click in between: a
-/// click elsewhere would close it.
+/// The open picker, the reaction line and the footer React it was opened
+/// from (the expanded one), with no click in between: a click elsewhere would
+/// close it.
 async function measurePicker(page: Page) {
   await expect(page.getByTestId("emoji-picker")).toBeVisible();
   return page.evaluate(() => {
@@ -685,54 +645,47 @@ async function measurePicker(page: Page) {
       const r = e.getBoundingClientRect();
       return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
     };
-    const scroller = box(document.getElementById("chat-scroll-container")!);
     const picker = document.querySelector('[data-testid="emoji-picker"]')!;
-    // The control React was taken from: the hover bar's button, or on touch
-    // (where the bar is not displayed) the kebab.
-    const row = picker.closest('[id^="msg-"]')!;
-    const anchorEl = row.querySelector('[data-testid="reaction-picker-anchor"]')!;
-    const control = [
-      row.querySelector('[data-testid="message-hover-actions"] button[aria-label="React"]'),
-      row.querySelector('[data-testid="message-kebab"]'),
-    ].find((el) => el && el.getBoundingClientRect().width > 0)!;
+    const control = document.querySelector('[data-testid="message-react-button"][aria-expanded="true"]')!;
+    const row = control.closest('[id^="msg-"]')!;
+    const line = row.querySelector('[data-testid="message-reaction-row"]')!;
     const buttons = Array.from(picker.querySelectorAll("button")).map((b) => {
       const r = b.getBoundingClientRect();
       const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
       return {
         emoji: (b.textContent || "").trim(),
-        inside: r.left >= scroller.left - 0.5 && r.right <= scroller.right + 0.5 &&
-          r.top >= scroller.top - 0.5 && r.bottom <= scroller.bottom + 0.5,
+        inside: r.left >= -0.5 && r.right <= innerWidth + 0.5 && r.top >= -0.5 && r.bottom <= innerHeight + 0.5,
         hit: at !== null && (at === b || b.contains(at)),
       };
     });
-    return { scroller, anchor: box(anchorEl.parentElement!), control: box(control), picker: box(picker), buttons };
+    return { line: box(line), control: box(control), picker: box(picker), buttons };
   });
 }
 
 function expectEveryEmojiTappable(report: PickerReport) {
   expect(report.buttons.length, "the picker has emoji").toBeGreaterThan(0);
   const outside = report.buttons.find((b) => !b.inside);
-  expect(outside, `${outside?.emoji} is clipped by the scroller (picker ${report.picker.left}..${report.picker.right} x ${report.picker.top}..${report.picker.bottom}, scroller ${report.scroller.left}..${report.scroller.right} x ${report.scroller.top}..${report.scroller.bottom})`).toBeUndefined();
+  expect(outside, `${outside?.emoji} is outside the viewport (picker ${report.picker.left}..${report.picker.right} x ${report.picker.top}..${report.picker.bottom})`).toBeUndefined();
   const covered = report.buttons.find((b) => !b.hit);
   expect(covered, `${covered?.emoji} is not the element a tap at its centre lands on`).toBeUndefined();
 }
 
 /// The picker sits at the control it was opened from: its right edge on the
-/// control's (or 4px inside the scroller, where the control is not), and
-/// just below or just above the control.
+/// control's, or (flipped, where that does not fit) its left edge on the
+/// control's; and 4px below or above the control.
 function expectPickerAtControl(report: PickerReport) {
-  const { picker: p, control: c, scroller: s } = report;
-  const right = Math.max(Math.min(c.right, s.right - 4), s.left + 4 + (p.right - p.left));
-  expect(Math.abs(p.right - right), `picker right ${p.right}, control right ${c.right}`).toBeLessThanOrEqual(1);
-  const below = p.top >= c.bottom - 0.5 && p.top <= c.bottom + 6;
-  const above = p.bottom <= c.top + 0.5 && p.bottom >= c.top - 6;
+  const { picker: p, control: c } = report;
+  const sideways = Math.abs(p.right - c.right) <= 1 || Math.abs(p.left - c.left) <= 1;
+  expect(sideways, `picker ${p.left}..${p.right}, control ${c.left}..${c.right}`).toBe(true);
+  const below = Math.abs(p.top - (c.bottom + 4)) <= 1;
+  const above = Math.abs(p.bottom - (c.top - 4)) <= 1;
   expect(below || above, `picker ${p.top}..${p.bottom}, control ${c.top}..${c.bottom}`).toBe(true);
 }
 
 /// The newest message, "picker edge", with as many reaction chips as fit on one
-/// line, so the chips run to the column's right edge, under where the picker
-/// opens. The count is measured: a fixed one fits a line in one engine and
-/// wraps in another (WebKit's emoji chips are 3px wider).
+/// line before React, so React sits at the column's right edge, where the
+/// picker opens. The count is measured: a fixed one fits a line in one engine
+/// and wraps in another (WebKit's emoji chips are 3px wider).
 async function nearEdgeRow(page: Page): Promise<Locator> {
   const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
   await openRoomWithComposer(page);
@@ -743,15 +696,20 @@ async function nearEdgeRow(page: Page): Promise<Locator> {
   await expect(chips).toHaveCount(1);
   const fit = await row.evaluate((el) => {
     const chip = el.querySelector('[data-testid="reaction-chip"]')!.getBoundingClientRect();
-    const anchorEl = el.querySelector('[data-testid="reaction-picker-anchor"]')!.getBoundingClientRect();
-    const line = el.querySelector('[data-testid="message-reaction-row"]')!.getBoundingClientRect();
-    // Each chip moves the anchor one chip and its gap further right.
-    return Math.floor((line.right - anchorEl.right) / (anchorEl.left - chip.left)) + 1;
+    const react = el.querySelector('[data-testid="message-react-button"]')!.getBoundingClientRect();
+    const footer = el.querySelector('[data-testid="message-footer"]')!.getBoundingClientRect();
+    // Each chip moves React one chip and its gap further right.
+    return Math.floor((footer.right - react.right) / (react.left - chip.left)) + 1;
   });
   expect(fit, "chips that fit one line").toBeLessThanOrEqual(emojis.length);
   await callRiverTest(page, "addReactionsToNewest", emojis.slice(1, fit));
   await expect(chips).toHaveCount(fit);
   await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+  const room = await row.evaluate((el) => {
+    const react = el.querySelector('[data-testid="message-react-button"]')!.getBoundingClientRect();
+    return el.querySelector('[data-testid="message-footer"]')!.getBoundingClientRect().right - react.right;
+  });
+  expect(room, "premise: React at the column's right edge").toBeLessThan(60);
   return row;
 }
 
@@ -785,8 +743,7 @@ test.describe("Revealing a popover on a short phone view", () => {
     await nextFrames(page);
     expect(await strayScroll(page), "picker").toEqual(NO_STRAY_SCROLL);
     await page.keyboard.press("Escape");
-    await page.mouse.click(2, 2);
-    await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
+    await expect(page.getByTestId("emoji-picker")).toBeHidden();
 
     await openOwnMessageEdit(page);
     await nextFrames(page);
@@ -816,37 +773,25 @@ test.describe("Reaction picker at 320px", () => {
     expectPickerAtControl(report);
     expectEveryEmojiTappable(report);
   });
-
-  // #791 review: the kebab's React lost its test when the gutter moved.
-  test("the kebab's React opens the picker at the kebab", async ({ page }) => {
-    test.skip(!(await touchOnly(page)), "the kebab is the touch path");
-    const row = await nearEdgeRow(page);
-    await row.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: "React" }).click();
-    const report = await measurePicker(page);
-    expectPickerAtControl(report);
-    expectEveryEmojiTappable(report);
-  });
 });
 
 // #791 review: the picker opened from the keyboard reports no click
 // position, so its place must come from the control. The newest message, at
 // the bottom of the view, has no room for the picker below its React.
 test("the picker opened from the keyboard at the bottom of the view opens upward", async ({ page }) => {
-  test.skip(await touchOnly(page), "no hover bar, so no keyboard path, on touch");
   await openRoomWithComposer(page);
   await deliver(page, "keyboard picker");
   const row = page.getByTestId("message-row").filter({ hasText: "keyboard picker" });
   await expect(row).toBeInViewport();
   const room = await row.evaluate((el) => {
-    const r = el.querySelector('[data-testid="message-hover-actions"] button[aria-label="React"]')!.getBoundingClientRect();
+    const r = el.querySelector('[data-testid="message-react-button"]')!.getBoundingClientRect();
     const s = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
     return { below: s.bottom - r.bottom, above: r.top - s.top };
   });
   expect(room.below, "premise: no room below for the picker").toBeLessThan(140);
   expect(room.above, "premise: room above").toBeGreaterThan(140);
   await page.mouse.move(0, 0);
-  await row.getByTestId("message-hover-actions").getByRole("button", { name: "React" }).focus();
+  await row.getByTestId("message-react-button").focus();
   await page.keyboard.press("Enter");
   const report = await measurePicker(page);
   expect(report.picker.bottom, "the picker opens above the control").toBeLessThanOrEqual(report.control.top + 0.5);
@@ -930,7 +875,7 @@ test.describe("Message row hover band", () => {
           // A cross-origin sheet; the app ships none.
         }
       }
-      return out.filter((s) => /\.msg-row(\[[^\]]*\])?:hover(?![\w-])/.test(s) && !s.includes(".hover-actions") && !s.includes(".msg-gutter-time"));
+      return out.filter((s) => /\.msg-row(\[[^\]]*\])?:hover(?![\w-])/.test(s) && !s.includes(".msg-action") && !s.includes(".msg-gutter-time"));
     });
     expect(selectors.length, "premise: the hover band rules were found").toBeGreaterThanOrEqual(2);
     for (const s of selectors) expect(s, "a hover band rule names :has()").not.toContain(":has(");
@@ -1005,74 +950,8 @@ test.describe("Message row hover band", () => {
   });
 });
 
-// The hover bar is invisible at rest AND takes no hits, or it would take
-// clicks meant for whatever is under it (Latest, the row above). Hovering its
-// row, or keyboard focus inside the row, shows it and makes it clickable.
-test.describe("Hover bar", () => {
-  test("idle it takes no hits; hover or keyboard focus reveals it", async ({ page }) => {
-    const touch = await touchOnly(page);
-    const { received } = await openRoomWithPairs(page);
-    const row = received.getByTestId("message-row").nth(1);
-    const bar = row.getByTestId("message-hover-actions");
-    if (touch) {
-      // No hover pointer: the bar is not displayed at all; the kebab replaces it.
-      await expect(bar).toBeHidden();
-      await expect(row.getByTestId("message-kebab")).toBeVisible();
-      return;
-    }
-    const state = () =>
-      bar.evaluate(async (el) => {
-        await Promise.all(el.getAnimations().map((a) => a.finished));
-        const r = el.getBoundingClientRect();
-        const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-        return { opacity: getComputedStyle(el).opacity, events: getComputedStyle(el).pointerEvents, hit: !!at && el.contains(at) };
-      });
-
-    await row.scrollIntoViewIfNeeded();
-    await page.mouse.move(0, 0);
-    expect(await state(), "idle").toEqual({ opacity: "0", events: "none", hit: false });
-
-    await row.getByTestId("message-body").hover();
-    await expect.poll(state, { message: "hovered" }).toEqual({ opacity: "1", events: "auto", hit: true });
-
-    await page.mouse.move(0, 0);
-    await expect.poll(state).toEqual({ opacity: "0", events: "none", hit: false });
-    // Focus the bar's first button, where Tab lands from the row's content,
-    // as a keyboard user does.
-    await keyboardFocus(page, bar.getByRole("button", { name: "React" }));
-    await expect.poll(state, { message: "focus within the row" }).toMatchObject({ opacity: "1", events: "auto" });
-    expect(await bar.getByRole("button", { name: "React" }).evaluate((el) => el === document.activeElement)).toBe(true);
-  });
-  test("a mouse click inside the row does not keep the bar after the pointer leaves", async ({ page }) => {
-    test.skip(await touchOnly(page), "no hover bar on touch");
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    const row = page.getByTestId("message-row").filter({ has: page.getByTestId("reply-strip") }).first();
-    await row.scrollIntoViewIfNeeded();
-    const bar = row.getByTestId("message-hover-actions");
-    const strip = row.getByTestId("reply-strip");
-    const state = () =>
-      bar.evaluate(async (el) => {
-        await Promise.all(el.getAnimations().map((a) => a.finished));
-        return { opacity: getComputedStyle(el).opacity, events: getComputedStyle(el).pointerEvents };
-      });
-    // A mouse click focuses the strip (it is a tabindex="0" button).
-    await strip.click();
-    await expect.poll(() => strip.evaluate((el) => el === document.activeElement), { message: "premise: the click focused the strip" }).toBe(true);
-    await page.mouse.move(0, 0);
-    await expect.poll(state, { message: "pointer gone, focus from a mouse click" }).toEqual({ opacity: "0", events: "none" });
-    // The same focus from the keyboard does reveal it.
-    await strip.evaluate((el) => (el as HTMLElement).blur());
-    await keyboardFocus(page, strip);
-    await expect.poll(() => strip.evaluate((el) => el.matches(":focus-visible")), { message: "premise: keyboard focus" }).toBe(true);
-    await expect.poll(state, { message: "keyboard focus in the row" }).toEqual({ opacity: "1", events: "auto" });
-  });
-});
-
-// React on a message taller than the view: the picker opens at React, and
-// opening brings it into view wherever that is, so the next click is the
-// reader's pick, not swallowed by the invisible backdrop.
+// React on a message taller than the view: the picker opens at React, inside
+// the viewport, and takes the next click. Opening it never moves the history.
 test.describe("React on a tall message", () => {
   test("the picker opens in view and takes the next click", async ({ page }) => {
     await openRoomWithComposer(page);
@@ -1090,12 +969,12 @@ test.describe("React on a tall message", () => {
     const geometry = () =>
       page.evaluate(() => {
         const c = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
-        const p = document.querySelector('[data-testid="emoji-picker"]')?.getBoundingClientRect();
+        const p = document.querySelector('[data-testid="emoji-picker"]:popover-open')?.getBoundingClientRect();
         const anchorEl = Array.from(document.querySelectorAll('[data-testid="message-row"]'))
           .find((r) => r.textContent!.includes("tall paragraph 59"))!
-          .querySelector('[data-testid="reaction-picker-anchor"]')!
-          .parentElement!.getBoundingClientRect();
-        return { view: [c.top, c.bottom], picker: p ? [p.top, p.bottom] : null, anchorTop: anchorEl.top };
+          .querySelector('[data-testid="message-footer"]')!
+          .getBoundingClientRect();
+        return { view: [c.top, c.bottom], viewport: innerHeight, picker: p ? [p.top, p.bottom] : null, anchorTop: anchorEl.top };
       });
     expect((await geometry()).anchorTop, "premise: the message's foot is below the view").toBeGreaterThan((await geometry()).view[1]);
 
@@ -1105,12 +984,11 @@ test.describe("React on a tall message", () => {
     await expect
       .poll(async () => {
         const g = await geometry();
-        return !!g.picker && g.picker[0] >= g.view[0] - 1 && g.picker[1] <= g.view[1] + 1;
-      }, { message: "the picker is wholly inside the history's view" })
+        return !!g.picker && g.picker[0] >= -1 && g.picker[1] <= g.viewport + 1;
+      }, { message: "the picker is wholly inside the viewport" })
       .toBe(true);
-    // Opened once, revealed once: with the picker open, the reader moves up,
-    // and a re-render of that row (a reaction added) and an arrival leave
-    // the view where the reader put it.
+    // With the picker open, the reader moves up, and a re-render of that row
+    // (a reaction added) leaves the view where the reader put it.
     const scroller = page.locator("#chat-scroll-container");
     await scroller.evaluate((c) => (c.scrollTop -= 160));
     await page.waitForTimeout(150);
@@ -1123,7 +1001,7 @@ test.describe("React on a tall message", () => {
     await page.keyboard.press("Escape");
   });
 
-  test("the picker takes the next click after the reveal", async ({ page }) => {
+  test("the picker takes the next click", async ({ page }) => {
     await openRoomWithComposer(page);
     const text = Array.from({ length: 40 }, (_, i) => `tall ${i}`).join("\n\n") + "\n\ntall paragraph 59";
     await callRiverTest(page, "appendMessage", text);
@@ -1137,35 +1015,20 @@ test.describe("React on a tall message", () => {
     const picker = page.getByTestId("emoji-picker");
     await expect(picker).toBeVisible();
     await picker.getByRole("button").first().click();
-    await expect(picker).toHaveCount(0);
+    await expect(picker).toBeHidden();
     await expect(row.getByTestId("reaction-chip"), "the click reacted").toHaveCount(1);
   });
 });
 
-/// Focus `target` as a keyboard user would, so it is `:focus-visible`. A key
-/// press then a scripted focus does it in Chromium and WebKit (which does not
-/// Tab to every control); Firefox needs a real Tab, so step off and back.
-async function keyboardFocus(page: Page, target: Locator) {
-  await page.keyboard.press("Escape");
-  await target.focus();
-  if (!(await target.evaluate((el) => el.matches(":focus-visible")))) {
-    await page.keyboard.press("Shift+Tab");
-    await page.keyboard.press("Tab");
-  }
-  await expect.poll(() => target.evaluate((el) => el === document.activeElement && el.matches(":focus-visible")), {
-    message: "premise: keyboard focus",
-  }).toBe(true);
-}
-
-// A row's resting controls (the hover bar on a hover pointer, the kebab on
-// touch) can share Latest's corner. They paint under Latest, so a row at the
-// bottom of the view never takes Latest's click.
+// A row's footer actions (shown at rest on touch, on hover otherwise) can
+// share Latest's corner. They paint under Latest, so a row at the bottom of
+// the view never takes Latest's click.
 test.describe("Latest over row controls", () => {
   test("a row control aligned with Latest never takes its click", async ({ page }) => {
-    const touch = await touchOnly(page);
+    const touch = await coarsePointer(page);
     await page.setViewportSize(touch ? { width: 390, height: 800 } : { width: 1024, height: 800 });
     await openRoomWithComposer(page);
-    const control = touch ? '[data-testid="message-kebab"]' : '[data-testid="message-hover-actions"]';
+    const control = '[data-testid="message-action-cluster"]';
     await readerLeavesTheEnd(page);
     const latest = page.getByTestId("scroll-to-bottom");
     await expect(latest).toBeVisible();
@@ -1195,19 +1058,18 @@ test.describe("Latest over row controls", () => {
   });
 });
 
-// The hover bar ends at the text measure, not the row's far edge, so it
-// stays next to the message it acts on: in the centred column (where the
-// row's content is the measure) and wherever a row is wider than that (here
-// forced, by lifting the column's cap).
+// The footer's trailing actions end at the text measure, not the row's far
+// edge, so they stay next to the message they act on: in the centred column
+// (where the row's content is the measure) and wherever a row is wider than
+// that (here forced, by lifting the column's cap).
 for (const wide of [false, true]) {
-  test(`the hover bar ends at the text column on a wide window${wide ? ", in a row wider than the measure" : ""}`, async ({ page }) => {
-    test.skip(await touchOnly(page), "touch has no hover bar");
+  test(`the footer actions end at the text column on a wide window${wide ? ", in a row wider than the measure" : ""}`, async ({ page }) => {
     await page.setViewportSize({ width: 1920, height: 900 });
     const { received } = await openRoomWithPairs(page);
     if (wide) await page.addStyleTag({ content: ".conversation-column { max-width: none !important; }" });
     const row = received.getByTestId("message-row").last();
-    await row.hover();
-    const bar = (await row.getByTestId("message-hover-actions").boundingBox())!;
+    await revealFooter(page, row);
+    const cluster = (await row.getByTestId("message-action-cluster").boundingBox())!;
     const m = await row.evaluate((el) => {
       const body = el.querySelector('[data-testid="message-body"]')!;
       const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
@@ -1217,7 +1079,7 @@ for (const wide of [false, true]) {
       };
     });
     if (wide) expect(m.contentRight - m.measureRight, "premise: the row is wider than the text measure").toBeGreaterThan(100);
-    expect(Math.abs(bar.x + bar.width - m.measureRight), "bar's right edge at the measure").toBeLessThanOrEqual(1);
+    expect(Math.abs(cluster.x + cluster.width - m.measureRight), "the cluster's right edge at the measure").toBeLessThanOrEqual(1);
   });
 }
 
@@ -1304,13 +1166,7 @@ test("Reply quotes the message as plain text", async ({ page }) => {
   await callRiverTest(page, "appendMessage", "**reply probe** with [a link](https://example.com/x)");
   const row = page.getByTestId("message-row").filter({ hasText: "reply probe" }).last();
   await expect(row).toBeVisible();
-  if (await touchOnly(page)) {
-    await row.getByTestId("message-kebab").click();
-    await page.getByTestId("message-action-menu").getByRole("button", { name: "Reply" }).click();
-  } else {
-    await row.getByTestId("message-body").hover();
-    await row.getByRole("button", { name: "Reply" }).click();
-  }
+  await clickFooter(page, row, "message-reply-button");
   const composer = page.getByTestId("message-composer");
   await expect(composer).toContainText("Replying to");
   await expect(composer).toContainText("reply probe with a link");

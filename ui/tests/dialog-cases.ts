@@ -1,5 +1,6 @@
 import { expect, Locator, Page } from "@playwright/test";
 import { callRiverTest } from "./river-test";
+import { clickFooter } from "./example-room";
 
 // The dialogs a viewer can reach from the example data, each with how to
 // open it from a room, its title, and its primary action where it has a
@@ -122,8 +123,7 @@ export const DIALOG_CASES: DialogCase[] = [
     open: async (p) => {
       const own = p.locator('[data-testid="message-row"][data-message-self="true"]').last();
       await own.scrollIntoViewIfNeeded();
-      await own.hover({ position: { x: 4, y: 4 } });
-      await own.getByTestId("message-hover-actions").getByRole("button", { name: "Delete message" }).click();
+      await clickFooter(p, own, "message-delete-button");
     },
     title: (p) => p.getByRole("heading", { name: /Delete Message/ }),
   },
