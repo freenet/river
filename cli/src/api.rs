@@ -3015,6 +3015,11 @@ impl ApiClient {
         ));
 
         // Create wrapped state using ciborium
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged.
+        let room_state = room_state
+            .normalized(&parameters)
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let state_bytes = {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&room_state, &mut buf)
@@ -3181,6 +3186,13 @@ impl ApiClient {
         // going through `ensure_room_migrated`, so it is another poisoning
         // choke point (freenet/river#427 P2-3).
         let room_state = strip_upgrade_pointer_for_forward_put(&room_state);
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged, and a stored snapshot need not be one.
+        let room_state = room_state
+            .normalized(&ChatRoomParametersV1 {
+                owner: *room_owner_key,
+            })
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let state_bytes = {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&room_state, &mut buf)
@@ -3802,6 +3814,11 @@ impl ApiClient {
         // current contract: carrying it forward poisons the current generation
         // with a pointer to an older one (freenet/river#427).
         let state_to_put = strip_upgrade_pointer_for_forward_put(room_state);
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged, and a recovered state need not be one.
+        let state_to_put = state_to_put
+            .normalized(&parameters)
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let mut state_bytes = Vec::new();
         ciborium::ser::into_writer(&state_to_put, &mut state_bytes)
             .map_err(|e| anyhow!("Failed to serialize room state: {e}"))?;
@@ -4697,6 +4714,13 @@ impl ApiClient {
         // contract: carrying it forward poisons the new generation with a
         // pointer to an older one (freenet/river#427).
         let state_to_put = strip_upgrade_pointer_for_forward_put(room_state);
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged, and a migrated state need not be one.
+        let state_to_put = state_to_put
+            .normalized(&ChatRoomParametersV1 {
+                owner: *room_owner_key,
+            })
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let state_bytes = {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&state_to_put, &mut buf)
@@ -7828,6 +7852,33 @@ mod migration_recovery_tests {
                 "`{fn_name}` PUTs the room contract without first checking \
                  `{gate}`; a stale riverctl would publish its own bundled code onto a \
                  generation River has moved past"
+            );
+        }
+    }
+
+    /// Every whole-state PUT of the room contract sends the state normalized
+    /// by `ChatRoomStateV1::normalized`: `validate_state` accepts only states
+    /// cleanup leaves unchanged, so a peer that does not hold the room yet
+    /// refuses a stored snapshot cleanup would still change.
+    #[test]
+    fn every_room_contract_put_sends_a_normalized_state() {
+        let src = include_str!("api.rs");
+        for fn_name in [
+            "pub async fn create_room(",
+            "pub async fn republish_room(",
+            "async fn put_room_state(",
+            "async fn migrate_room_to_new_contract(",
+        ] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("`{fn_name}` must exist"));
+            let put_at = src[start..]
+                .find("ContractRequest::Put")
+                .map(|off| start + off)
+                .unwrap_or_else(|| panic!("`{fn_name}` has no ContractRequest::Put"));
+            assert!(
+                src[start..put_at].contains(".normalized("),
+                "`{fn_name}` PUTs a room state without normalizing it first"
             );
         }
     }

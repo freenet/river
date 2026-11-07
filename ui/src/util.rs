@@ -399,6 +399,27 @@ pub fn strip_upgrade_pointer(
     cleaned
 }
 
+/// The bytes of a whole-state PUT of `state` to the room `owner_vk` owns:
+/// the state normalized by `ChatRoomStateV1::normalized`, which the room
+/// contract's `validate_state` requires (a peer that does not hold the room
+/// yet refuses a state cleanup would still change). If cleanup fails, the
+/// state is sent as it is and the failure is logged; the peer then decides.
+pub fn whole_state_put_bytes(
+    owner_vk: &VerifyingKey,
+    state: &river_core::room_state::ChatRoomStateV1,
+) -> Vec<u8> {
+    let parameters = ChatRoomParametersV1 { owner: *owner_vk };
+    match state.normalized(&parameters) {
+        Ok(normalized) => to_cbor_vec(&normalized),
+        Err(e) => {
+            dioxus::logger::tracing::error!(
+                "room state cleanup failed before a PUT, sending it unnormalized: {e}"
+            );
+            to_cbor_vec(state)
+        }
+    }
+}
+
 pub fn from_cbor_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
     ciborium::de::from_reader(data).unwrap()
 }

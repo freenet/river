@@ -577,7 +577,12 @@ pub(crate) fn seed_put_request(
     // Strip any absorbed upgrade pointer before this FORWARD seed PUT onto the
     // current contract, so an imported room that carried a backward pointer
     // does not poison the current generation (freenet/river#427 P2-2).
-    let wrapped_state = WrappedState::new(to_cbor_vec(&strip_upgrade_pointer(state)));
+    // Normalized: `validate_state` accepts only states cleanup leaves
+    // unchanged, and a local snapshot need not be one.
+    let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(
+        owner_vk,
+        &strip_upgrade_pointer(state),
+    ));
     ContractRequest::Put {
         contract: contract_container,
         state: wrapped_state,

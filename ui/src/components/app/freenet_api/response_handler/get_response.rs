@@ -775,7 +775,10 @@ pub async fn handle_get_response(
                 WrappedContract::new(Arc::new(contract_code), parameters),
             ));
 
-            let wrapped_state = WrappedState::new(to_cbor_vec(&retrieved_state_for_put));
+            let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(
+                &owner_vk,
+                &retrieved_state_for_put,
+            ));
 
             let put_request = ContractRequest::Put {
                 contract: contract_container,
@@ -1209,7 +1212,10 @@ pub async fn handle_get_response(
                     WrappedContract::new(Arc::new(contract_code), parameters),
                 ));
 
-                let wrapped_state = WrappedState::new(to_cbor_vec(&retrieved_state_for_put));
+                let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(
+                    &owner_vk,
+                    &retrieved_state_for_put,
+                ));
 
                 let put_request = ContractRequest::Put {
                     contract: contract_container,
@@ -1679,7 +1685,7 @@ async fn put_state_to_current_key(
     let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
         WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
     ));
-    let wrapped_state = WrappedState::new(to_cbor_vec(&state));
+    let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(&owner_vk, &state));
 
     let put_request = ContractRequest::Put {
         contract: contract_container,
