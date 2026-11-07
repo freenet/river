@@ -121,16 +121,32 @@ impl ReactionSurfaces {
     /// remembered so that opening the picker closes it. From a deferred
     /// callback only.
     pub(super) fn owner_list_opened(mut self, list: Signal<Option<ReactionOwnersPopover>>) {
-        self.close_now();
+        self.close();
         self.open_owner_list.set(Some(list));
     }
 
-    /// Close the picker. From a deferred callback only. Hidden before the
-    /// target is cleared, so the focus return sees what it was for.
-    fn close_now(mut self) {
+    /// Close the picker and let go of everything an opening took. Every
+    /// close ends here: an explicit one, an opening that could not show it
+    /// and a rebind that failed. In order:
+    ///
+    /// 1. hidden while the target is still set, so the closing
+    ///    `beforetoggle` returns focus to the React it was for;
+    /// 2. the anchor taken off and the input hold (and any capture) let go
+    ///    now, not left to a `toggle` that does not come for a picker that
+    ///    never opened or had already closed;
+    /// 3. the target cleared, if there is one.
+    ///
+    /// From a deferred callback only. The target is read and written
+    /// fallibly: the conversation may have unmounted by the time this runs.
+    fn close(self) {
         hide_picker();
-        if self.target.peek().is_some() {
-            self.target.set(None);
+        clear_anchor();
+        hold_scrolling(false);
+        let mut target = self.target;
+        if target.try_peek().is_ok_and(|target| target.is_some()) {
+            if let Ok(mut target) = target.try_write() {
+                *target = None;
+            }
         }
     }
 
@@ -144,18 +160,7 @@ impl ReactionSurfaces {
             .as_ref()
             .is_some_and(|target| !target_is_live(target));
         if stale {
-            self.close_now();
-        }
-    }
-
-    /// Nothing is open after all: let go of the target, the anchor and the
-    /// input hold, without touching the popover (it is already closed). From
-    /// a deferred callback only.
-    fn unwind(mut self) {
-        clear_anchor();
-        hold_scrolling(false);
-        if self.target.peek().is_some() {
-            self.target.set(None);
+            self.close();
         }
     }
 
@@ -178,11 +183,8 @@ impl ReactionSurfaces {
         if !still_current {
             return;
         }
-        if !target_is_live(&target) {
-            self.close_now();
-        } else if !rebind_picker(&target.row, had_focus) {
-            self.close_now();
-            self.unwind();
+        if !target_is_live(&target) || !rebind_picker(&target.row, had_focus) {
+            self.close();
         }
     }
 
@@ -355,7 +357,7 @@ pub(super) fn ReactionInvoker(
                 // A pointer press on React while its picker is open closes
                 // it. A key press keeps it open.
                 if take_press_while_open(&row) {
-                    crate::util::defer(move || surfaces.close_now());
+                    crate::util::defer(move || surfaces.close());
                     return;
                 }
                 let (room, visit) = shown_room();
@@ -406,10 +408,13 @@ fn open_for(mut surfaces: ReactionSurfaces, target: ReactionTarget, activation: 
     if surfaces.target.peek().as_ref() != Some(&target) {
         surfaces.target.set(Some(target.clone()));
     }
+    // Not open (no popovers, the React or the picker gone, or showing
+    // failed): undo the commit, and close a picker still open from an
+    // earlier React (`Gone` returns before touching it).
     match show_picker_at(&target.row) {
         Shown::Open => {}
         outcome => {
-            surfaces.unwind();
+            surfaces.close();
             if outcome == Shown::Failed {
                 crate::components::toast::show_toast(OPEN_FAILED_MESSAGE, None);
             }
@@ -460,7 +465,7 @@ pub(super) fn ReactionPicker(
             let left_chat =
                 last_view.replace(Some(view)) == Some(MobileView::Chat) && view != MobileView::Chat;
             if left_chat {
-                crate::util::defer(move || surfaces.close_now());
+                crate::util::defer(move || surfaces.close());
             }
         }
         Err(_) => {
@@ -505,11 +510,7 @@ pub(super) fn ReactionPicker(
                     // may have opened it for another message.
                     crate::util::defer(move || {
                         if !is_open() {
-                            clear_anchor();
-                            let mut target = surfaces.target;
-                            if target.peek().is_some() {
-                                target.set(None);
-                            }
+                            surfaces.close();
                         }
                     });
                 }
@@ -563,7 +564,7 @@ fn pick(
     if target_is_live(&target) {
         on_react.call((target.message.clone(), emoji));
     }
-    surfaces.close_now();
+    surfaces.close();
 }
 
 fn new_state(e: &Event<ToggleData>) -> Option<String> {
