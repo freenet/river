@@ -124,7 +124,9 @@ jobs:
               echo "   riverctl embeds the WASM to compute the contract key."
               echo "   If the UI is published with new WASM but riverctl isn't, they'll target different contracts."
               echo ""
-              echo "   To fix: bump the version in cli/Cargo.toml and run 'cargo make publish-all'"
+              echo "   To fix: bump the version in cli/Cargo.toml. After merge, publish the UI with"
+              echo "   'cargo make publish-river' and push the 'riverctl-v<version>' tag, which publishes"
+              echo "   river-core and then riverctl (see .claude/rules/river-publish.md)."
               echo "   See: https://github.com/freenet/river — Feb 2026 incident"
               exit 1
             else

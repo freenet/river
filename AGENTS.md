@@ -392,7 +392,8 @@ Both the UI and riverctl detect this automatically via `regenerate_contract_key(
   new contract key. The new contract validates all signatures and accepts it, provided the state
   is in canonical form: `validate_state` accepts only states `post_apply_cleanup` leaves
   unchanged (compared as bytes), so a client sends `ChatRoomStateV1::normalized(&params)`,
-  never raw old bytes, in any whole-state PUT. Every state a peer holds is then canonical.
+  never raw old bytes, in any whole-state PUT or full-state UPDATE (freenet-core validates
+  every incoming whole state before merging it). Every state a peer holds is then canonical.
 - The room owner does NOT need to be online or take any special action.
 - The `OptionalUpgradeV1` pointer on the old contract is a courtesy for clients still running
   old versions — it tells them where the new contract lives. But updated clients already know
