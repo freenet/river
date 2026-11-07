@@ -1147,3 +1147,298 @@ test.describe("A finger on the history and the reaction picker", () => {
     }
   });
 });
+
+// The picker is a native popover or nothing (reaction_picker.rs). Simulated:
+// every engine this suite runs has the Popover API, so it is taken away, or
+// made to throw, in the page.
+
+const UNAVAILABLE = "Update your browser to add reactions.";
+const OPEN_FAILED = "Couldn’t open reactions. Try again.";
+
+/// Before the app loads: no `showPopover`, as in a browser without popovers.
+async function withoutPopoverApi(page: Page) {
+  await page.addInitScript(() => {
+    Object.defineProperty(HTMLElement.prototype, "showPopover", { value: undefined, configurable: true, writable: true });
+  });
+}
+
+/// From now on every `showPopover` call is counted, and throws while
+/// `__showThrows` is "always", or only when given options while it is
+/// "options". `restoreShowPopover` puts the browser's own back.
+function patchShowPopover(page: Page, mode: "always" | "options") {
+  return page.evaluate((mode) => {
+    const w = window as unknown as { __realShow?: (this: HTMLElement, ...a: unknown[]) => void; __showAttempts: number; __showThrows: string };
+    w.__realShow ??= HTMLElement.prototype.showPopover;
+    w.__showAttempts ??= 0;
+    w.__showThrows = mode;
+    HTMLElement.prototype.showPopover = function (this: HTMLElement, ...args: unknown[]) {
+      w.__showAttempts++;
+      if (w.__showThrows === "always" || args.length > 0) throw new DOMException("simulated", "NotSupportedError");
+      return w.__realShow!.call(this);
+    } as typeof HTMLElement.prototype.showPopover;
+  }, mode);
+}
+
+function restoreShowPopover(page: Page) {
+  return page.evaluate(() => {
+    HTMLElement.prototype.showPopover = (window as unknown as { __realShow: typeof HTMLElement.prototype.showPopover }).__realShow;
+  });
+}
+
+function showAttempts(page: Page): Promise<number> {
+  return page.evaluate(() => (window as unknown as { __showAttempts?: number }).__showAttempts ?? 0);
+}
+
+/// Record every toast card that mounts from now on. The card is keyed by its
+/// toast's id, so each `show_toast` mounts one, even with the same message.
+async function countToasts(page: Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as { __toasts: Element[] };
+    w.__toasts = [];
+    new MutationObserver((records) => {
+      for (const r of records)
+        for (const n of Array.from(r.addedNodes)) {
+          if (!(n instanceof Element)) continue;
+          const card = n.matches('[data-testid="toast"]') ? n : n.querySelector('[data-testid="toast"]');
+          if (card) w.__toasts.push(card);
+        }
+    }).observe(document.querySelector('[data-testid="toast-host"]')!, { childList: true, subtree: true });
+  });
+}
+
+function toastsSeen(page: Page): Promise<string[]> {
+  return page.evaluate(() =>
+    (window as unknown as { __toasts: Element[] }).__toasts.map((t) => t.querySelector('[data-testid="toast-message"]')?.textContent?.trim() ?? ""),
+  );
+}
+
+/// How many Reacts carry the picker's anchor name.
+function anchoredReacts(page: Page): Promise<number> {
+  return page.evaluate(
+    () => Array.from(document.querySelectorAll<HTMLElement>('[data-testid="message-react-button"]')).filter((b) => b.style.getPropertyValue("anchor-name") !== "").length,
+  );
+}
+
+/// Nothing an opening commits is left: the picker closed and hidden, no React
+/// expanded or anchoring it, no input held, nothing making the app busy, and
+/// nothing signed.
+async function expectNothingOpened(page: Page, row: Locator, signs: number) {
+  expect(await isOpen(page), "the picker is not open").toBe(false);
+  await expect(picker(page)).toBeHidden();
+  expect(await expandedRows(page), "no React is expanded").toEqual([]);
+  expect(await anchoredReacts(page), "no React anchors the picker").toBe(0);
+  const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+  const [x, y] = [view.x + 30, view.y + 30];
+  expect(await hitAt(page, x, y), "premise: the history point hits the history").toBe("history");
+  expect(await wheelCancelled(page, x, y, false), "no input is held").toBe(false);
+  expect(await callRiverTest(page, "userIsBusy"), "not busy").toBe(false);
+  expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signs);
+  await expect(row.getByTestId("reaction-chip"), "no reaction").toHaveCount(0);
+}
+
+test.describe("Without a working Popover API", () => {
+  test("a browser without it gets a disabled React that says why, from the keyboard too, and nothing opens", async ({ page, browserName }) => {
+    // WebKit's Tab reaches only text fields; Alt+Tab reaches every control.
+    const tab = browserName === "webkit" ? "Alt+Tab" : "Tab";
+    await withoutPopoverApi(page);
+    await openRoomWithComposer(page);
+    await deliver(page, "unsupported target");
+    const row = committed(page, "unsupported target");
+    const react = row.getByTestId("message-react-button");
+    const tip = row.getByTestId("message-react-unavailable");
+    await page.getByTestId("message-input").blur();
+    const signs = await callRiverTest(page, "messageSignsRecorded");
+
+    await expect(react).toHaveAttribute("aria-disabled", "true");
+    await expect(react).toHaveAccessibleName("React");
+    await expect(react, "the explanation is React's description").toHaveAccessibleDescription(UNAVAILABLE);
+    await expect(react, "nothing to expand").not.toHaveAttribute("aria-expanded");
+    await expect(react, "no popup to announce").not.toHaveAttribute("aria-haspopup");
+    await expect(picker(page), "the picker is still mounted, closed").toHaveCount(1);
+    await expect(picker(page)).toBeHidden();
+    await expect(tip, "the explanation is not painted at rest").toBeHidden();
+
+    // From the keyboard: Tab from the control before it lands on it, which
+    // shows it and its explanation; Enter and Space open nothing.
+    await page.mouse.move(0, 0);
+    await react.evaluate((el) => {
+      const focusable = Array.from(document.querySelectorAll<HTMLElement>("button, a[href], input, textarea, select, [tabindex]")).filter(
+        (e) => e.tabIndex >= 0 && !(e as HTMLButtonElement).disabled && e.getClientRects().length > 0,
+      );
+      focusable[focusable.indexOf(el as HTMLElement) - 1].focus();
+    });
+    await page.keyboard.press(tab);
+    await expect(react, "Tab reaches it").toBeFocused();
+    await expect(tip, "keyboard focus shows why").toBeVisible();
+    await expect(tip).toHaveText(UNAVAILABLE);
+    await expect.poll(() => react.evaluate((el) => getComputedStyle(el).opacity), { message: "focused, it shows" }).toBe("1");
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Space");
+    await settle(page);
+    await expect(react, "focus stays on it").toBeFocused();
+    await expectNothingOpened(page, row, signs);
+
+    // A pointer press opens nothing either. Pressed by position, not by an
+    // automation click, which would wait for it to be enabled.
+    await react.blur();
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await settle(page);
+    await revealFooter(page, row);
+    const { x, y, lands } = await react.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const [x, y] = [r.left + r.width / 2, r.top + r.height / 2];
+      return { x, y, lands: el.contains(document.elementFromPoint(x, y)) };
+    });
+    expect(lands, "premise: the press lands on React").toBe(true);
+    if (await coarsePointer(page)) await page.touchscreen.tap(x, y);
+    else {
+      await page.mouse.click(x, y);
+      await expect(tip, "hovered, it says why").toBeVisible();
+    }
+    await settle(page);
+    await react.blur();
+    await expectNothingOpened(page, row, signs);
+  });
+
+  // A further simulation, not a run in an old browser: such a browser also
+  // has no built-in rule hiding a closed `[popover]`, so that attribute is
+  // taken off the picker. Only the stylesheet then keeps the emoji out of
+  // the page.
+  test("without the browser's own popover hiding, the stylesheet keeps the picker out of the page", async ({ page }) => {
+    await withoutPopoverApi(page);
+    await openRoomWithComposer(page);
+    await deliver(page, "layout target");
+    await settle(page);
+    const geometry = () =>
+      page.evaluate(() => {
+        const box = (sel: string) => {
+          const r = document.querySelector(sel)!.getBoundingClientRect();
+          return [r.left, r.top, r.width, r.height].map((v) => Math.round(v));
+        };
+        return { history: box("#chat-scroll-container"), composer: box('[data-testid="message-composer"]') };
+      });
+    const before = await geometry();
+    await picker(page).evaluate((el) => el.removeAttribute("popover"));
+    await nextFrames(page);
+    expect(await picker(page).getAttribute("popover"), "premise: no popover attribute").toBeNull();
+    expect(await picker(page).evaluate((el) => getComputedStyle(el).display), "hidden by the stylesheet").toBe("none");
+    await expect(picker(page)).toBeHidden();
+    expect(await geometry(), "the history and composer did not move").toEqual(before);
+    await expect(committed(page, "layout target").getByTestId("message-react-button")).toHaveAttribute("aria-disabled", "true");
+  });
+
+  test("a popover that throws is undone, says to try again once per press, and a retry opens it", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliver(page, "throwing target");
+    const row = committed(page, "throwing target");
+    const react = row.getByTestId("message-react-button");
+    await page.getByTestId("message-input").blur();
+    const signs = await callRiverTest(page, "messageSignsRecorded");
+    await countToasts(page);
+    await patchShowPopover(page, "always");
+    await expect(react, "a browser with popovers: React is enabled").not.toHaveAttribute("aria-disabled");
+
+    await page.mouse.move(0, 0);
+    await react.focus();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => toastsSeen(page), { message: "one message for the press" }).toEqual([OPEN_FAILED]);
+    expect(await showAttempts(page), "premise: both ways of showing it were tried").toBe(2);
+    await settle(page);
+    await expectNothingOpened(page, row, signs);
+    await expect(react, "focus stays on React, for a retry").toBeFocused();
+    await expect(react, "and React stays enabled").not.toHaveAttribute("aria-disabled");
+    await expect(page.getByTestId("toast-message")).toHaveText(OPEN_FAILED);
+
+    // A second press: one more message, not one per attempt.
+    await page.keyboard.press("Enter");
+    await expect.poll(() => showAttempts(page)).toBe(4);
+    await settle(page);
+    expect(await toastsSeen(page), "one message per press").toEqual([OPEN_FAILED, OPEN_FAILED]);
+    await expectNothingOpened(page, row, signs);
+
+    // An engine that only rejects the `source` option: the plain call opens
+    // it, with no message.
+    await patchShowPopover(page, "options");
+    await page.keyboard.press("Enter");
+    await expectOpenFor(page, row);
+    expect(await toastsSeen(page), "the fallback opening says nothing").toHaveLength(2);
+    await page.keyboard.press("Escape");
+    await expectClosed(page);
+
+    // Restored: a retry from where focus was left opens it, and a pick acts.
+    await restoreShowPopover(page);
+    await expect(react).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expectOpenFor(page, row);
+    await picker(page).getByRole("button").first().focus();
+    await page.keyboard.press("Enter");
+    await expectClosed(page);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+    expect(await callRiverTest(page, "messageSignsRecorded"), "one pick, signed once").toBe(signs + 1);
+    expect(await toastsSeen(page), "no message after the retry").toHaveLength(2);
+  });
+
+  test("a failed re-showing after a remount, a stale press and a superseded one close quietly", async ({ page }) => {
+    await openRoomWithComposer(page);
+    for (let i = 0; i < 4; i++) await deliver(page, `quiet filler ${i}: ${"q".repeat(200)}`);
+    // The newest group, as in the remount test above.
+    await callRiverTest(page, "deliverTimedMessages", 0, [
+      { text: "quiet lead", sentSecs: 1, receivedSecs: 0 },
+      { text: "quiet survivor", sentSecs: 2, receivedSecs: 0 },
+    ]);
+    const [lead, survivor] = [committed(page, "quiet lead"), committed(page, "quiet survivor")];
+    await expect(survivor).toHaveCount(1);
+    const groupKey = (row: Locator) => row.evaluate((el) => el.closest(".msg-group")?.getAttribute("data-item-key") ?? null);
+    const leadKey = (await lead.getAttribute("id"))!.replace(/^msg-/, "");
+    expect(await groupKey(survivor), "premise: one group, keyed by the lead").toBe(leadKey);
+    await page.getByTestId("message-input").blur();
+    const signs = await callRiverTest(page, "messageSignsRecorded");
+    await countToasts(page);
+
+    // Remounted with the picker open, and showing it at the new React throws.
+    await openFromKeyboard(page, survivor);
+    await patchShowPopover(page, "always");
+    await callRiverTest(page, "removeMessages", "quiet lead");
+    await expect(lead).toHaveCount(0);
+    await expect.poll(() => groupKey(survivor), { message: "premise: the group re-keyed" }).not.toBe(leadKey);
+    await expect.poll(() => showAttempts(page), { message: "premise: it tried to show it at the new React" }).toBeGreaterThan(0);
+    await settle(page);
+    await expectClosed(page);
+    await expectNothingOpened(page, survivor, signs);
+    expect(await toastsSeen(page), "the reader pressed nothing: no message").toEqual([]);
+
+    // A press whose message is gone by the time it runs (a room switch in
+    // the same task) tries nothing and says nothing.
+    const attempts = await showAttempts(page);
+    const id = (await survivor.getAttribute("id"))!;
+    await page.evaluate((id) => {
+      const hooks = (window as unknown as { __riverTest: { switchRoom(n: string): void } }).__riverTest;
+      hooks.switchRoom("Team Chat Room");
+      document.querySelector<HTMLElement>(`[id="${id}"] [data-testid="message-react-button"]`)!.click();
+    }, id);
+    await expect(page.locator(`[id="${id}"]`)).toHaveCount(0);
+    await settle(page);
+    expect(await showAttempts(page), "a stale press tries nothing").toBe(attempts);
+    expect(await toastsSeen(page), "and says nothing").toEqual([]);
+    await callRiverTest(page, "switchRoom", "Your Private Room");
+    await expect(survivor).toHaveCount(1);
+
+    // Two presses in one task: the first is superseded before it runs, so
+    // only the second tries, and says so once.
+    await page.evaluate((id) => {
+      const react = document.querySelector<HTMLElement>(`[id="${id}"] [data-testid="message-react-button"]`)!;
+      react.click();
+      react.click();
+    }, id);
+    await expect.poll(() => toastsSeen(page)).toEqual([OPEN_FAILED]);
+    await settle(page);
+    expect(await showAttempts(page), "only the later press tried").toBe(attempts + 2);
+    expect(await toastsSeen(page)).toEqual([OPEN_FAILED]);
+    await expectNothingOpened(page, survivor, signs);
+
+    await restoreShowPopover(page);
+    await openFromKeyboard(page, survivor);
+    await page.keyboard.press("Escape");
+    await expectClosed(page);
+  });
+});

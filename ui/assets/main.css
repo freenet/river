@@ -214,6 +214,26 @@
     box-shadow: inset 0 0 0 2px var(--color-link);
 }
 
+/* A React that cannot open (a browser without native popovers): the same
+ * cell, still focusable and with its ring, explained by its tooltip card on
+ * hover and keyboard focus, but drawn unavailable, with no hover fill. */
+.msg-action[aria-disabled="true"] {
+    cursor: not-allowed;
+    color: var(--color-text-muted);
+}
+
+.msg-action[aria-disabled="true"]:hover::before {
+    background-color: transparent;
+}
+
+.msg-action > .tooltip-host {
+    display: inline-flex;
+}
+
+.msg-action[aria-disabled="true"] svg {
+    opacity: 0.5;
+}
+
 /* A fine pointer shows the controls only while their row is hovered: at rest
  * they are invisible AND take no hits, though they keep their place and stay
  * in the tab order. A touch or hybrid pointer (`any-pointer: coarse`) shows
@@ -284,11 +304,18 @@
 
 /* The reaction picker (`conversation/reaction_picker.rs`): one native
  * `popover="auto"` for the whole history, in the top layer, so no z-index
- * applies to it. Nothing here sets its `display`: closed, the UA hides it.
+ * applies to it.
+ *
+ * Hidden unless it is an open popover. The base rule hides it, and only the
+ * separate `:popover-open` rule after it shows it: a browser without native
+ * popovers cannot parse that selector, drops that rule alone, and keeps the
+ * picker hidden rather than laying the emoji out in the page. Keep the two
+ * apart; a selector list would drop both.
  *
  * Without anchor positioning it keeps the UA's `inset: 0` and this
  * `margin: auto`, centred in the viewport. */
 .reaction-picker {
+    display: none;
     margin: auto;
     padding: 6px;
     border: 1px solid var(--color-border);
@@ -297,6 +324,10 @@
     color: var(--color-text);
     box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
     overflow: visible;
+}
+
+.reaction-picker:popover-open {
+    display: block;
 }
 
 /* At the React it was opened from (`anchor-name` set on it when it opens):

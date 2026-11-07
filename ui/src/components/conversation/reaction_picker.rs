@@ -26,6 +26,14 @@
 //! held: arrivals, following, the end hold and reads go on underneath
 //! (history-scrolling.md). Closing lets go of all of it at once, a finger the
 //! picker captured included.
+//!
+//! The picker is a native popover or nothing: there is no fallback picker. A
+//! browser without the Popover API ([`popover_supported`]) gets a disabled
+//! React that says why, and the picker stays hidden (`main.css` shows it only
+//! while `:popover-open`). Where the API exists but showing the picker still
+//! throws, the opening is undone (no target, anchor or hold is left) and the
+//! reader is told to try again, once per press; a target gone by the time the
+//! opening runs, or an opening a later press superseded, does nothing.
 
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::ReactionOwnersPopover;
@@ -44,6 +52,29 @@ pub(super) const PICKER_ID: &str = "reaction-picker";
 /// against (`main.css`).
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const ANCHOR_NAME: &str = "--reaction-picker";
+
+/// What an unavailable React says, to every reader.
+const UNSUPPORTED_EXPLANATION: &str = "Update your browser to add reactions.";
+
+/// The toast after a press that could not show the picker.
+const OPEN_FAILED_MESSAGE: &str = "Couldn\u{2019}t open reactions. Try again.";
+
+/// How showing the picker went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Shown {
+    /// Open, at the React.
+    Open,
+    /// This browser has no native popovers; nothing was touched.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Unsupported,
+    /// The picker or the React is not in the document; nothing to show.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Gone,
+    /// Both ways of showing it threw (or left it closed). The anchor it set
+    /// is taken off again.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Failed,
+}
 
 /// What the picker is open for.
 #[derive(Clone, Debug, PartialEq)]
@@ -118,12 +149,24 @@ impl ReactionSurfaces {
         }
     }
 
+    /// Nothing is open after all: let go of the target, the anchor and the
+    /// input hold, without touching the popover (it is already closed). From
+    /// a deferred callback only.
+    fn unwind(mut self) {
+        clear_anchor();
+        hold_scrolling(false);
+        if self.target.peek().is_some() {
+            self.target.set(None);
+        }
+    }
+
     /// `row`'s React unmounted, while the picker was open for `opening` (or
     /// for something unknown, if the target could not be read then). Nothing
     /// is done unless that opening is still the current one. If its message
     /// is still in the history with a React, its row remounted: the picker
-    /// moves to the new React, with the focus the old one had. Otherwise the
-    /// picker closes. From a deferred callback only.
+    /// moves to the new React, with the focus the old one had. Otherwise, or
+    /// if showing it at the new React fails, the picker closes, silently: the
+    /// reader pressed nothing. From a deferred callback only.
     fn invoker_dropped(self, row: &str, opening: Option<ReactionTarget>, had_focus: bool) {
         // `try_peek`: the whole conversation may have unmounted with it.
         let Some(target) = self.target.try_peek().ok().and_then(|t| t.clone()) else {
@@ -136,10 +179,11 @@ impl ReactionSurfaces {
         if !still_current {
             return;
         }
-        if target_is_live(&target) {
-            rebind_picker(&target.row, had_focus);
-        } else {
+        if !target_is_live(&target) {
             self.close_now();
+        } else if !rebind_picker(&target.row, had_focus) {
+            self.close_now();
+            self.unwind();
         }
     }
 
@@ -257,6 +301,39 @@ pub(super) fn ReactionInvoker(
             crate::util::defer(move || surfaces.invoker_dropped(&row, opening, had_focus));
         });
     }
+    // No native popovers: a React that cannot open says so, to the pointer
+    // (the tooltip card), the keyboard (it stays focusable, `aria-disabled`
+    // rather than `disabled`, and its card shows on keyboard focus) and a
+    // screen reader (`aria-describedby`). It has no press or click handler,
+    // so nothing it does can open, anchor or hold anything.
+    if !popover_supported() {
+        let tip_id = format!("react-unavailable-{row}");
+        return rsx! {
+            button {
+                r#type: "button",
+                "data-testid": "message-react-button",
+                class: "msg-action",
+                "aria-label": "React",
+                "aria-disabled": "true",
+                "aria-describedby": "{tip_id}",
+                span {
+                    class: "tooltip-host",
+                    style: "anchor-name: --{tip_id};",
+                    {line_icon(REACT_ICON_PATH, 18)}
+                    span {
+                        id: "{tip_id}",
+                        role: "tooltip",
+                        class: "tooltip-card",
+                        style: "position-anchor: --{tip_id};",
+                        "data-testid": "message-react-unavailable",
+                        span { class: "tooltip-box",
+                            span { class: "tooltip-text", "{UNSUPPORTED_EXPLANATION}" }
+                        }
+                    }
+                }
+            }
+        };
+    }
     let press_row = row.clone();
     rsx! {
         button {
@@ -270,6 +347,8 @@ pub(super) fn ReactionInvoker(
             "aria-expanded": "{expanded}",
             onpointerdown: move |_| record_press(&press_row, surfaces),
             onclick: move |_| {
+                // Every press supersedes an opening still waiting to run.
+                let activation = next_activation();
                 // A press on React while its picker is open closes it, as the
                 // old backdrop did. A key press keeps it open, as it did.
                 if take_press_while_open(&row) {
@@ -283,25 +362,55 @@ pub(super) fn ReactionInvoker(
                     message: message.clone(),
                     current: current.clone(),
                 };
-                crate::util::defer(move || open_for(surfaces, target));
+                crate::util::defer(move || open_for(surfaces, target, activation));
             },
             {line_icon(REACT_ICON_PATH, 18)}
         }
     }
 }
 
-/// Open the picker for `target`, or move it there. The target is committed
-/// before the picker shows, so nothing ever shows the previous one. From a
-/// deferred callback only.
-fn open_for(mut surfaces: ReactionSurfaces, target: ReactionTarget) {
-    if !target_is_live(&target) {
+thread_local! {
+    /// How many React presses there have been: an opening runs only if no
+    /// press came after the one that asked for it.
+    static ACTIVATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn next_activation() -> u64 {
+    ACTIVATIONS.with(|a| {
+        let next = a.get().wrapping_add(1);
+        a.set(next);
+        next
+    })
+}
+
+fn is_latest_activation(activation: u64) -> bool {
+    ACTIVATIONS.with(Cell::get) == activation
+}
+
+/// Open the picker for `target`, or move it there, for press `activation`.
+/// The target is committed before the picker shows, so nothing ever shows the
+/// previous one. Nothing at all is done for a browser without native
+/// popovers, a target that has gone, or a press a later one superseded. If
+/// the picker then cannot be shown, what was committed for it is undone, and
+/// a browser that has popovers but threw says so, once. From a deferred
+/// callback only.
+fn open_for(mut surfaces: ReactionSurfaces, target: ReactionTarget, activation: u64) {
+    if !is_latest_activation(activation) || !popover_supported() || !target_is_live(&target) {
         return;
     }
     surfaces.close_owner_list_now();
     if surfaces.target.peek().as_ref() != Some(&target) {
         surfaces.target.set(Some(target.clone()));
     }
-    show_picker_at(&target.row);
+    match show_picker_at(&target.row) {
+        Shown::Open => {}
+        outcome => {
+            surfaces.unwind();
+            if outcome == Shown::Failed {
+                crate::components::toast::show_toast(OPEN_FAILED_MESSAGE, None);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -529,17 +638,45 @@ mod dom {
         }
     }
 
+    /// Whether this browser has native popovers: `showPopover` and
+    /// `hidePopover` to call, and a `:popover-open` it can match (the
+    /// selector `main.css` shows the picker with). Asked afresh each time.
+    pub(super) fn popover_supported() -> bool {
+        let Some(window) = web_sys::window() else {
+            return false;
+        };
+        let prototype = js_sys::Reflect::get(&window, &"HTMLElement".into())
+            .and_then(|class| js_sys::Reflect::get(&class, &"prototype".into()));
+        let callable = |name: &str| {
+            prototype
+                .as_ref()
+                .ok()
+                .and_then(|proto| js_sys::Reflect::get(proto, &name.into()).ok())
+                .is_some_and(|f| f.is_function())
+        };
+        let selector = document()
+            .and_then(|d| d.document_element())
+            .is_some_and(|root| root.matches(":popover-open").is_ok());
+        callable("showPopover") && callable("hidePopover") && selector
+    }
+
     /// Hang the picker from `row`'s React and show it, with that React as its
     /// invoker (`source`): its contents follow the React in the tab order, and
-    /// a press on it is not a press outside.
-    pub(super) fn show_picker_at(row: &str) {
+    /// a press on it is not a press outside. An engine that has popovers but
+    /// rejects the `source` option is shown it without one. If that throws
+    /// too, the anchor is taken off again and nothing is left open.
+    pub(super) fn show_picker_at(row: &str) -> super::Shown {
+        use super::Shown;
+        if !popover_supported() {
+            return Shown::Unsupported;
+        }
         let (Some(p), Some(button)) = (picker(), react_button(row)) else {
-            return;
+            return Shown::Gone;
         };
         let same = ANCHORED.with(|a| a.borrow().as_ref() == Some(&button));
         let open = p.matches(":popover-open").unwrap_or(false);
         if open && same {
-            return;
+            return Shown::Open;
         }
         if open {
             // Shown from another React: shown again, so the invoker is this one.
@@ -555,8 +692,12 @@ mod dom {
             .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
             .map(|f| f.call1(&p, &options).is_ok())
             .unwrap_or(false);
-        if !shown {
-            let _ = p.show_popover();
+        let shown = shown || p.show_popover().is_ok();
+        if shown && p.matches(":popover-open").unwrap_or(false) {
+            Shown::Open
+        } else {
+            clear_anchor();
+            Shown::Failed
         }
     }
 
@@ -579,21 +720,25 @@ mod dom {
     /// returns when the picker closes; neither focus scrolls. Toggles are
     /// coalesced, and the `toggle` cleanup checks again when it runs, so it
     /// finds the picker open.
-    pub(super) fn rebind_picker(row: &str, had_focus: bool) {
+    ///
+    /// Whether the picker is left open at `row`'s React. When not (it had
+    /// closed already, the React is gone, or showing it again failed), the
+    /// caller closes it, with no message: the reader did not ask for this.
+    pub(super) fn rebind_picker(row: &str, had_focus: bool) -> bool {
         let Some(p) = picker() else {
-            return;
+            return false;
         };
         if !p.matches(":popover-open").unwrap_or(false) {
-            return;
+            return false;
         }
         let Some(button) = react_button(row) else {
-            return;
+            return false;
         };
         if ANCHORED.with(|a| a.borrow().as_ref() == Some(&button)) {
-            return;
+            return true;
         }
         let Some(doc) = document() else {
-            return;
+            return false;
         };
         let active = doc.active_element();
         let inside = active
@@ -607,14 +752,14 @@ mod dom {
         if had_focus && lost {
             focus_without_scrolling(&button);
         }
-        show_picker_at(row);
-        if !p.matches(":popover-open").unwrap_or(false) {
-            return;
+        if show_picker_at(row) != super::Shown::Open {
+            return false;
         }
         hold_scrolling(true);
         if let Some(inside) = inside {
             focus_without_scrolling(&inside);
         }
+        true
     }
 
     fn focus_without_scrolling(el: &web_sys::HtmlElement) {
@@ -925,8 +1070,8 @@ mod dom {
 pub(crate) use dom::is_open;
 #[cfg(target_arch = "wasm32")]
 use dom::{
-    clear_anchor, hide_picker, hold_scrolling, react_has_focus, rebind_picker, return_focus,
-    show_picker_at,
+    clear_anchor, hide_picker, hold_scrolling, popover_supported, react_has_focus, rebind_picker,
+    return_focus, show_picker_at,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -943,14 +1088,21 @@ fn now_ms() -> f64 {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use super::ReactionSurfaces;
+    use super::{ReactionSurfaces, Shown};
     pub(crate) fn is_open() -> bool {
         false
     }
+    pub(super) fn popover_supported() -> bool {
+        true
+    }
     pub(super) fn hide_picker() {}
     pub(super) fn clear_anchor() {}
-    pub(super) fn show_picker_at(_row: &str) {}
-    pub(super) fn rebind_picker(_row: &str, _had_focus: bool) {}
+    pub(super) fn show_picker_at(_row: &str) -> Shown {
+        Shown::Open
+    }
+    pub(super) fn rebind_picker(_row: &str, _had_focus: bool) -> bool {
+        true
+    }
     pub(super) fn react_has_focus(_row: &str) -> bool {
         false
     }
@@ -968,8 +1120,8 @@ mod native {
 pub(crate) use native::is_open;
 #[cfg(not(target_arch = "wasm32"))]
 use native::{
-    clear_anchor, hide_picker, hold_scrolling, now_ms, react_button_exists, react_has_focus,
-    rebind_picker, return_focus, show_picker_at,
+    clear_anchor, hide_picker, hold_scrolling, now_ms, popover_supported, react_button_exists,
+    react_has_focus, rebind_picker, return_focus, show_picker_at,
 };
 
 #[cfg(test)]
