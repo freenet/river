@@ -138,6 +138,32 @@ state, that result is returned without a confirming pass: the bound is a
 safety net, not a guarantee. No measured input has needed it. `verify` itself stays as it is:
 tightening it would make the migration PUT reject states rooms hold today.
 
+The contract's `validate_state` (not `verify`, which also runs on partial
+states during a field apply) additionally requires a whole state to be a
+cleanup fixpoint, compared as encoded bytes
+(`ChatRoomStateV1::validate_whole_state`, which runs `verify` and the cleanup
+under one ban-signature memo scope; struct `==` is wrong because
+`MessagesV1::actions_state` is `#[serde(skip)]`).
+So every state a peer holds is canonical, and clients send
+`ChatRoomStateV1::normalized` in every whole-state PUT and full-state UPDATE:
+freenet-core validates every incoming whole state before it merges it (UPDATE
+as well as PUT), so a non-canonical whole state is refused on every path.
+Deltas are not affected: the receiver applies them and then runs cleanup.
+
+Two refusal modes follow from comparing against cleanup's output, and both
+must stay unreachable for honest states:
+- **Cleanup that has not converged.** Cleanup runs at most
+  `MAX_CLEANUP_PASSES` passes. A state whose last pass still changed it is
+  returned unconfirmed; it is a merge OUTPUT that validate then refuses
+  (before this check, the next merge finished the job). The fork fuzz records
+  the largest pass count it sees and CI asserts the bound is never reached
+  (`fork_merge_closure_test.rs`).
+- **An encoding change.** The comparison is on ciborium's bytes, so a ciborium
+  (or serde attribute) change that re-encodes an existing state differently
+  would refuse every state stored before it. Treat any change to the encoding
+  of `ChatRoomStateV1` or its parts as a re-key that needs every stored state
+  re-encoded, and check the captured-state fixtures still pass.
+
 One limit, which predates #703: the contract does not apply an empty delta,
 so a state stored by a full-state PUT that holds records the rules drop (for
 example a member an owner ban removes) stays as stored until a non-empty

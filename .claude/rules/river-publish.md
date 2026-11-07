@@ -217,12 +217,15 @@ workspace version.
 ### Local `cargo make publish-all` (legacy / fallback)
 
 `cargo make publish-all` still exists and publishes UI + bumps + `cargo publish`
-riverctl from your laptop. Prefer the tag-triggered CI path above for riverctl —
-it publishes from main under review and keeps crates.io and GitHub in sync. Use
-`publish-all` only for the coupled UI+riverctl WASM-change case when you
-specifically need to drive the Freenet publish and the CLI publish together
-locally; even then, consider publishing the UI locally and releasing riverctl via
-the tag.
+riverctl from your laptop. Do not use it for a release that changes
+`river-core`: it never publishes `river-core`, so the riverctl it publishes
+depends on a `river-core` version crates.io does not have, and it bumps the
+riverctl version again on top of the one the PR already bumped. Use the
+tag-triggered CI path above for riverctl, which publishes `river-core` first,
+from main under review, and keeps crates.io and GitHub in sync. For a room
+contract re-key the order is: `cargo make publish-river` (UI), then the
+`riverctl-v<version>` tag, then `cargo make publish-pointer-records` about two
+minutes after the UI publish (Step 7).
 
 ## How Delegate Migration Works
 
@@ -570,7 +573,7 @@ skill covers the call-site swap, the dual-running period and the parity test.
 - **Wrong hash algorithm**: BLAKE3 not SHA256 for CodeHash
 - **Forgetting migration**: Users lose all room data
 - **Computing key AFTER changes**: Must run `add-migration` BEFORE changes alter the WASM
-- **Not republishing riverctl**: Use `cargo make publish-all` when the room-contract WASM changes (riverctl does not embed the chat delegate)
+- **Not republishing riverctl**: when the room-contract WASM changes, release riverctl too (riverctl does not embed the chat delegate). Bump `cli/Cargo.toml` (and river-core, if it changed) in the PR, then after the UI publish push the `riverctl-v<version>` tag, which publishes river-core before riverctl. Do NOT use `cargo make publish-all` for that: it bumps riverctl a second time, commits on local `main`, and `cargo publish`es riverctl without river-core, which fails whenever riverctl pins a river-core version crates.io does not have yet
 - **Parameters file**: Always use `published-contract/webapp.parameters` (committed) — determines contract ID
 
 ## Contract ID

@@ -1030,6 +1030,106 @@ mod tests {
         );
     }
 
+    /// The memo answers only for the exact (signature, key, signed fields) it
+    /// recorded: with a good signature memoized, a ban with a different
+    /// signature, a different signed field, or checked against another key is
+    /// still verified, and refused.
+    #[test]
+    fn a_memoized_good_signature_does_not_pass_a_bad_one() {
+        let owner_sk = SigningKey::from_bytes(&[5u8; 32]);
+        let other_sk = SigningKey::from_bytes(&[6u8; 32]);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let ban_at = |secs: u64, target: u8| UserBan {
+            owner_member_id: owner_id,
+            banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            banned_user: MemberId::from(&SigningKey::from_bytes(&[target; 32]).verifying_key()),
+        };
+        let good = AuthorizedUserBan::new(ban_at(10, 7), owner_id, &owner_sk);
+        let other_good = AuthorizedUserBan::new(ban_at(11, 8), owner_id, &owner_sk);
+        signature_memo::active_while(|| {
+            assert!(good.verify_signature(&owner_sk.verifying_key()).is_ok());
+            // Same signed fields, another ban's signature.
+            let mut wrong_sig = good.clone();
+            wrong_sig.signature = other_good.signature;
+            assert!(wrong_sig
+                .verify_signature(&owner_sk.verifying_key())
+                .is_err());
+            // Same signature, one signed field changed.
+            let mut wrong_field = good.clone();
+            wrong_field.ban.banned_at += Duration::from_secs(1);
+            assert!(wrong_field
+                .verify_signature(&owner_sk.verifying_key())
+                .is_err());
+            // Same ban, checked against another key.
+            assert!(good.verify_signature(&other_sk.verifying_key()).is_err());
+            // And the good one still answers from the memo.
+            assert!(good.verify_signature(&owner_sk.verifying_key()).is_ok());
+        });
+    }
+
+    /// `validate_whole_state` runs `verify` and cleanup under one memo scope:
+    /// a forged ban next to a genuine one by the same issuer is still refused,
+    /// and the memo does not outlive the call.
+    #[test]
+    fn validate_whole_state_refuses_a_forged_ban_beside_a_genuine_one() {
+        use crate::room_state::configuration::Configuration;
+        let owner_sk = SigningKey::from_bytes(&[5u8; 32]);
+        let owner_id: MemberId = owner_sk.verifying_key().into();
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let target = |b: u8| MemberId::from(&SigningKey::from_bytes(&[b; 32]).verifying_key());
+        let ban = |secs: u64, t: u8| {
+            AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                    banned_user: target(t),
+                },
+                owner_id,
+                &owner_sk,
+            )
+        };
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            bans: BansV1(vec![ban(10, 7), ban(11, 8)]),
+            ..Default::default()
+        };
+        state.post_apply_cleanup(&params).unwrap();
+        let encode = |s: &ChatRoomStateV1| {
+            let mut v = vec![];
+            ciborium::ser::into_writer(s, &mut v).unwrap();
+            v
+        };
+        assert_eq!(state.validate_whole_state(&params, &encode(&state)), Ok(()));
+        let key = |b: &AuthorizedUserBan| {
+            (
+                b.signature.to_bytes(),
+                owner_sk.verifying_key().to_bytes(),
+                b.ban.owner_member_id,
+                b.ban.banned_at,
+                b.ban.banned_user,
+            )
+        };
+        assert_eq!(
+            signature_memo::lookup(&key(&state.bans.0[0])),
+            None,
+            "the memo is cleared when the call returns"
+        );
+        let mut forged = state.clone();
+        forged.bans.0[1].signature = forged.bans.0[0].signature;
+        assert!(matches!(
+            forged.validate_whole_state(&params, &encode(&forged)),
+            Err(crate::room_state::WholeStateError::Verify(_))
+        ));
+    }
+
     /// `BansV1::verify` rejects more bans than `max_user_bans` before
     /// checking any signature.
     #[test]

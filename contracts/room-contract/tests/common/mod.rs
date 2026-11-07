@@ -149,13 +149,21 @@ pub async fn deploy_room_contract(
     let contract_key = container.key();
     println!("River contract loaded with key: {:?}", contract_key);
 
+    // Sent normalized, as clients do: `validate_state` accepts only states
+    // cleanup leaves unchanged.
+    let initial_room_state = initial_room_state
+        .normalized(parameters)
+        .map_err(|e| anyhow::anyhow!("State normalization failed: {}", e))?;
     let mut state_bytes = Vec::new();
     ciborium::ser::into_writer(&initial_room_state, &mut state_bytes)?;
 
+    // Compared as bytes: the decoded state's `#[serde(skip)]` message-actions
+    // cache is empty, so struct equality would not hold.
     let deserialized_state: ChatRoomStateV1 = ciborium::de::from_reader(state_bytes.as_slice())
         .map_err(|e| anyhow::anyhow!("State deserialization failed: {}", e))?;
-
-    if deserialized_state != initial_room_state {
+    let mut round_trip = Vec::new();
+    ciborium::ser::into_writer(&deserialized_state, &mut round_trip)?;
+    if round_trip != state_bytes {
         return Err(anyhow::anyhow!("Deserialized state doesn't match original"));
     }
 

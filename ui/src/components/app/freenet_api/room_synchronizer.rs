@@ -81,11 +81,14 @@ fn merge_incoming_state(
     local.merge_through_summary(params, incoming)
 }
 
+/// What to send for `state` against `baseline`: `Ok(None)` when there is
+/// nothing to send, `Err` when the full state could not be normalized (the
+/// caller sends nothing and does NOT advance its baseline).
 pub(crate) fn compute_update_data(
     state: &ChatRoomStateV1,
     baseline: Option<&ChatRoomStateV1>,
     params: &ChatRoomParametersV1,
-) -> Option<UpdateData<'static>> {
+) -> Result<Option<UpdateData<'static>>, String> {
     // Sanitize the upgrade pointer OUT of every generic sync write
     // (freenet/river#427 P2-2). The ONLY legitimate upgrade publish is the
     // owner's pointer on the OLD contract, sent via a dedicated path in
@@ -98,11 +101,32 @@ pub(crate) fn compute_update_data(
     let state = strip_upgrade_pointer(state);
     if let Some(baseline) = baseline {
         let summary = outbound_summary(baseline, params);
-        let delta = state.delta(baseline, params, &summary)?;
-        Some(UpdateData::Delta(to_cbor_vec(&delta).into()))
+        Ok(state
+            .delta(baseline, params, &summary)
+            .map(|delta| UpdateData::Delta(to_cbor_vec(&delta).into())))
     } else {
-        Some(UpdateData::State(to_cbor_vec(&state).into()))
+        // A full state is validated before it is merged, so it must be the
+        // normalized one (`whole_state_put_bytes`).
+        crate::util::whole_state_put_bytes(&params.owner, &state)
+            .map(|bytes| Some(UpdateData::State(bytes.into())))
     }
+}
+
+/// The state `process_rooms` sends for a room, and what it sends: `state`
+/// normalized ONCE, and the update computed from that same value. The caller
+/// persists the returned state to ROOMS and, after a successful send, stores
+/// it as the room's baseline, so later deltas are computed against exactly
+/// what was sent. `Err` when cleanup failed: send nothing, keep the baseline.
+pub(crate) fn prepare_room_update(
+    state: &ChatRoomStateV1,
+    baseline: Option<&ChatRoomStateV1>,
+    params: &ChatRoomParametersV1,
+) -> Result<(ChatRoomStateV1, Option<UpdateData<'static>>), String> {
+    let normalized = state
+        .normalized(params)
+        .map_err(|e| format!("room state cleanup failed: {e}"))?;
+    let data = compute_update_data(&normalized, baseline, params)?;
+    Ok((normalized, data))
 }
 
 /// The baseline summary for an OUTGOING update, with every retention horizon
@@ -567,7 +591,7 @@ impl RoomSynchronizer {
 pub(crate) fn seed_put_request(
     owner_vk: &VerifyingKey,
     state: &ChatRoomStateV1,
-) -> ContractRequest<'static> {
+) -> Result<ContractRequest<'static>, String> {
     let contract_code = ContractCode::from(ROOM_CONTRACT_WASM);
     let parameters = ChatRoomParametersV1 { owner: *owner_vk };
     let parameters = Parameters::from(to_cbor_vec(&parameters));
@@ -577,14 +601,19 @@ pub(crate) fn seed_put_request(
     // Strip any absorbed upgrade pointer before this FORWARD seed PUT onto the
     // current contract, so an imported room that carried a backward pointer
     // does not poison the current generation (freenet/river#427 P2-2).
-    let wrapped_state = WrappedState::new(to_cbor_vec(&strip_upgrade_pointer(state)));
-    ContractRequest::Put {
+    // Normalized: `validate_state` accepts only states cleanup leaves
+    // unchanged, and a local snapshot need not be one.
+    let wrapped_state = WrappedState::new(crate::util::whole_state_put_bytes(
+        owner_vk,
+        &strip_upgrade_pointer(state),
+    )?);
+    Ok(ContractRequest::Put {
         contract: contract_container,
         state: wrapped_state,
         related_contracts: Default::default(),
         subscribe: true,
         blocking_subscribe: false,
-    }
+    })
 }
 
 /// The older key a room `merge_from_source` reported as re-keyed must merge
@@ -1105,7 +1134,25 @@ impl RoomSynchronizer {
 
                 info!("Subscribing to room: {:?}", MemberId::from(*owner_vk));
 
-                let client_request = ClientRequest::ContractOp(seed_put_request(owner_vk, state));
+                let put_request = match seed_put_request(owner_vk, state) {
+                    Ok(put_request) => put_request,
+                    Err(e) => {
+                        error!("Not seeding room {:?}: {e}", MemberId::from(*owner_vk));
+                        let owner_vk = *owner_vk;
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.update_sync_status(
+                                &owner_vk,
+                                RoomSyncStatus::Error(ErrorReport::new(
+                                    super::error_report::LABEL_INVALID_OPERATION,
+                                    "Couldn't publish this room: its state could not be normalized",
+                                    e,
+                                )),
+                            );
+                        });
+                        continue;
+                    }
+                };
+                let client_request = ClientRequest::ContractOp(put_request);
 
                 info!(
                     "Sending PutRequest for room {:?} with contract ID: {}",
@@ -1174,6 +1221,8 @@ impl RoomSynchronizer {
             let params = ChatRoomParametersV1 { owner: room_vk };
             let removed = crate::signing::remove_unverifiable_messages(&mut state, &params);
             if removed > 0 {
+                // Removing messages bypasses cleanup; `prepare_room_update`
+                // below normalizes before anything is sent or stored.
                 warn!(
                     "Removed {} message(s) with invalid signatures before sync for room {:?}",
                     removed,
@@ -1224,8 +1273,35 @@ impl RoomSynchronizer {
 
             let contract_key = owner_vk_to_contract_key(&room_vk);
 
-            let update_data = match compute_update_data(&state, last_synced_state.as_ref(), &params)
-            {
+            // Normalize once: the state sent, the state persisted and the
+            // baseline stored after the send are this one value.
+            let (normalized, update_data) =
+                match prepare_room_update(&state, last_synced_state.as_ref(), &params) {
+                    Ok(prepared) => prepared,
+                    Err(e) => {
+                        error!("Not syncing room {:?}: {e}", MemberId::from(room_vk));
+                        SYNC_INFO.with_mut(|sync_info| {
+                            sync_info.update_sync_status(
+                                &room_vk,
+                                RoomSyncStatus::Error(ErrorReport::new(
+                                    super::error_report::LABEL_INVALID_OPERATION,
+                                    "Couldn't sync this room: its state could not be normalized",
+                                    e,
+                                )),
+                            );
+                        });
+                        continue;
+                    }
+                };
+            if to_cbor_vec(&normalized) != to_cbor_vec(&state) {
+                ROOMS.with_mut(|rooms| {
+                    if let Some(rd) = rooms.map.get_mut(&room_vk) {
+                        rd.room_state = normalized.clone();
+                    }
+                });
+            }
+            let state = normalized;
+            let update_data = match update_data {
                 Some(data) => {
                     match &data {
                         UpdateData::Delta(d) => info!(
@@ -1916,6 +1992,109 @@ mod tests {
         state.recent_messages.messages.push(authorized);
     }
 
+    /// A local snapshot with its messages out of order: `verify` accepts it,
+    /// cleanup sorts it.
+    fn unsorted_room() -> (ChatRoomStateV1, ChatRoomParametersV1) {
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        let (mut state, params, owner_sk) = create_test_room();
+        state.configuration = AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: params.owner_id(),
+                ..Default::default()
+            },
+            &owner_sk,
+        );
+        for (secs, text) in [(20, "second"), (10, "first")] {
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: params.owner_id(),
+                        author: params.owner_id(),
+                        content: RoomMessageBody::public(text.to_string()),
+                        time: SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + secs),
+                    },
+                    &owner_sk,
+                ));
+        }
+        state.verify(&state, &params).unwrap();
+        (state, params)
+    }
+
+    /// `whole_state_put_bytes` sends the normalized state, not the raw one.
+    #[test]
+    fn whole_state_put_bytes_sends_the_normalized_state() {
+        let (raw, params) = unsorted_room();
+        let bytes = crate::util::whole_state_put_bytes(&params.owner, &raw).unwrap();
+        assert_ne!(bytes, to_cbor_vec(&raw), "the raw state was sent");
+        assert_eq!(bytes, to_cbor_vec(&raw.normalized(&params).unwrap()));
+    }
+
+    /// `process_rooms` stores as the baseline the state `prepare_room_update`
+    /// returns, so the baseline is byte-identical to the full state it sent,
+    /// and the next delta against it carries only what is new.
+    #[test]
+    fn the_stored_baseline_is_the_state_that_was_sent() {
+        let (raw, params) = unsorted_room();
+        let (baseline, data) = prepare_room_update(&raw, None, &params).unwrap();
+        let Some(UpdateData::State(sent)) = data else {
+            panic!("expected a full-state update");
+        };
+        assert_eq!(sent.as_ref(), to_cbor_vec(&baseline).as_slice());
+        assert_ne!(
+            to_cbor_vec(&raw),
+            to_cbor_vec(&baseline),
+            "the raw state was kept"
+        );
+        let (_, next) = prepare_room_update(&baseline, Some(&baseline), &params).unwrap();
+        assert!(
+            next.is_none(),
+            "nothing new to send against the stored baseline"
+        );
+    }
+
+    /// `process_rooms` sends, persists and stores as the baseline the one
+    /// value `prepare_room_update` returned (source pin: the store after the
+    /// send must use the rebound, normalized `state`).
+    #[test]
+    fn process_rooms_uses_one_normalized_state() {
+        let src = include_str!("room_synchronizer.rs");
+        let body: String = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let prepare = body
+            .find("matchprepare_room_update(&state,last_synced_state.as_ref(),&params)")
+            .expect("process_rooms must prepare the update from the room state");
+        let rebind = body[prepare..]
+            .find("letstate=normalized;")
+            .map(|i| prepare + i)
+            .expect("process_rooms must continue with the normalized state");
+        let stored = body[rebind..]
+            .find("sync_info.state_updated(&room_vk,state.clone());")
+            .expect("the baseline must be stored after the send");
+        assert!(stored > 0);
+    }
+
+    /// A full-state UPDATE (no baseline) carries the normalized state:
+    /// freenet-core validates it before merging.
+    #[test]
+    fn a_full_state_update_carries_the_normalized_state() {
+        let (raw, params) = unsorted_room();
+        let Some(UpdateData::State(bytes)) = compute_update_data(&raw, None, &params).unwrap()
+        else {
+            panic!("expected a full-state update");
+        };
+        assert_eq!(
+            bytes.as_ref(),
+            to_cbor_vec(&strip_upgrade_pointer(&raw).normalized(&params).unwrap()).as_slice()
+        );
+    }
+
     /// An incoming state under an older configuration with a higher
     /// `max_user_bans`, into a local state already on the lowered cap: within
     /// one delta's bound it merges and the lowered cap keeps what it keeps;
@@ -1997,14 +2176,14 @@ mod tests {
     #[test]
     fn no_baseline_returns_full_state() {
         let (state, params, _) = create_test_room();
-        let result = compute_update_data(&state, None, &params);
+        let result = compute_update_data(&state, None, &params).unwrap();
         assert!(matches!(result, Some(UpdateData::State(_))));
     }
 
     #[test]
     fn identical_states_returns_none() {
         let (state, params, _) = create_test_room();
-        let result = compute_update_data(&state, Some(&state), &params);
+        let result = compute_update_data(&state, Some(&state), &params).unwrap();
         assert!(result.is_none());
     }
 
@@ -2016,7 +2195,7 @@ mod tests {
         let mut current = state;
         add_message(&mut current, &owner_sk, "hello");
 
-        let result = compute_update_data(&current, Some(&baseline), &params);
+        let result = compute_update_data(&current, Some(&baseline), &params).unwrap();
         assert!(matches!(result, Some(UpdateData::Delta(_))));
     }
 
@@ -2031,8 +2210,12 @@ mod tests {
         let mut current = state;
         add_message(&mut current, &owner_sk, "new message");
 
-        let delta = compute_update_data(&current, Some(&baseline), &params).unwrap();
-        let full = compute_update_data(&current, None, &params).unwrap();
+        let delta = compute_update_data(&current, Some(&baseline), &params)
+            .unwrap()
+            .unwrap();
+        let full = compute_update_data(&current, None, &params)
+            .unwrap()
+            .unwrap();
 
         let delta_size = match &delta {
             UpdateData::Delta(d) => d.as_ref().len(),
@@ -2077,6 +2260,7 @@ mod tests {
         current.upgrade = owner_upgrade_pointer(&owner_sk, [9u8; 32]);
 
         let data = compute_update_data(&current, Some(&baseline), &params)
+            .unwrap()
             .expect("a changed state must yield an update");
         let UpdateData::Delta(bytes) = data else {
             panic!("expected a delta");
@@ -2101,7 +2285,9 @@ mod tests {
         add_message(&mut current, &owner_sk, "hello");
         current.upgrade = owner_upgrade_pointer(&owner_sk, [9u8; 32]);
 
-        let data = compute_update_data(&current, None, &params).expect("full state");
+        let data = compute_update_data(&current, None, &params)
+            .unwrap()
+            .expect("full state");
         let UpdateData::State(bytes) = data else {
             panic!("expected a full state");
         };
@@ -2243,7 +2429,7 @@ mod tests {
         let owner = params.owner;
         let expected_id = *owner_vk_to_contract_key(&owner).id();
 
-        match seed_put_request(&owner, &state) {
+        match seed_put_request(&owner, &state).expect("a test room normalizes") {
             ContractRequest::Put {
                 contract,
                 state: put_state,
@@ -3152,6 +3338,7 @@ mod tests {
         );
 
         let update = compute_update_data(&current, Some(&baseline), &params)
+            .unwrap()
             .expect("a locally-retained message must produce an outgoing update");
 
         let bytes = match update {
@@ -3298,6 +3485,7 @@ mod tests {
         );
 
         let update = compute_update_data(&current, Some(&baseline), &params)
+            .unwrap()
             .expect("a locally-retained DM must produce an outgoing update");
         let bytes = match update {
             UpdateData::Delta(d) => d.into_bytes(),
@@ -3399,6 +3587,7 @@ mod tests {
         current.direct_messages.messages.push(newer.clone());
 
         let update = compute_update_data(&current, Some(&baseline), &params)
+            .unwrap()
             .expect("a newly composed DM must produce an outgoing update");
         let bytes = match update {
             UpdateData::Delta(d) => d.into_bytes(),

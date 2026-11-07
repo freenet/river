@@ -614,7 +614,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.12.1",
  "rand 0.8.6",
  "river-core",
  "serde",
@@ -1927,7 +1927,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2099,7 +2099,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2334,33 +2334,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "freenet-migrate"
-version = "0.6.0"
+name = "freenet-macros"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "099e0ac5fed5bdd30f35d1d10a881b292ac221f2880debc470c299983f343075"
+checksum = "6447ac80d17ad1a22d87f470d1c170ca3cfa976a433883de6472c1ede381e525"
 dependencies = [
- "blake3",
- "bs58",
- "ciborium",
- "ed25519-dalek",
- "freenet-scaffold",
- "freenet-stdlib 0.8.5",
- "serde",
- "serde_with",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
 name = "freenet-migrate"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9b6177524a7d4800bb8854fbfa6361ef81ac9c98919d03ed74174972f061b8c"
+checksum = "f8a9080605f4d95ccad29ea82487956818867271a5e83bfe3e55ef31f4f54a5a"
 dependencies = [
  "blake3",
  "bs58",
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.12.1",
  "serde",
  "serde_with",
 ]
@@ -2458,9 +2453,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.5"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62aeba7634d1ae5c2d02f78db33ee40442511858275be5be2099d24a13b2559"
+checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
 dependencies = [
  "bincode",
  "blake3",
@@ -2469,7 +2464,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flatbuffers 24.12.23",
- "freenet-macros 0.2.0",
+ "freenet-macros 0.3.1",
  "futures",
  "js-sys",
  "semver",
@@ -4007,7 +4002,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4511,7 +4506,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4843,7 +4838,7 @@ dependencies = [
 
 [[package]]
 name = "river-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -4857,7 +4852,7 @@ dependencies = [
  "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-scaffold-macro",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.12.1",
  "hex",
  "proptest",
  "rand 0.8.6",
@@ -4870,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "river-ui"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -4881,10 +4876,10 @@ dependencies = [
  "dioxus",
  "dioxus-free-icons",
  "ed25519-dalek",
- "freenet-migrate 0.7.0",
+ "freenet-migrate",
  "freenet-migrate-build",
  "freenet-scaffold",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.12.1",
  "futures",
  "futures-timer",
  "getrandom 0.2.17",
@@ -4912,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.2.24"
+version = "0.2.25"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4927,9 +4922,9 @@ dependencies = [
  "dialoguer",
  "directories 5.0.1",
  "ed25519-dalek",
- "freenet-migrate 0.6.0",
+ "freenet-migrate",
  "freenet-scaffold",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.12.1",
  "freenet-test-network",
  "fs2",
  "futures",
@@ -4962,7 +4957,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet",
  "freenet-scaffold",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.12.1",
  "once_cell",
  "rand 0.8.6",
  "river-core",
@@ -5023,7 +5018,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5641,7 +5636,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6913,7 +6908,7 @@ dependencies = [
  "byteorder",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib 0.12.1",
  "rand 0.8.6",
  "river-core",
  "tar",
@@ -7009,7 +7004,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
