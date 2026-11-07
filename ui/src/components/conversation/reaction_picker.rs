@@ -19,13 +19,12 @@
 //!
 //! While it is open the reader's wheel and one-finger touch scrolling are
 //! held off everywhere, over the picker too (it does not scroll, and a wheel
-//! there would scroll the history), as the full-screen backdrop it replaced
-//! did. A zoom is not held: a wheel with Ctrl down (Ctrl+wheel, or a touchpad
-//! pinch) and a touch with a second finger down (a pinch) still reach the
-//! browser, and keyboard zoom is never touched. Only those input events are
-//! held: arrivals, following, the end hold and reads go on underneath
-//! (history-scrolling.md). Closing lets go of all of it at once, a finger the
-//! picker captured included.
+//! there would scroll the history). A zoom is not held: a wheel with Ctrl down
+//! (Ctrl+wheel, or a touchpad pinch) and a touch with a second finger down (a
+//! pinch) still reach the browser, and keyboard zoom is never touched. Only
+//! those input events are held: arrivals, following, the end hold and reads go
+//! on underneath (history-scrolling.md). Closing lets go of all of it at once,
+//! a finger the picker captured included.
 //!
 //! The picker is a native popover or nothing: there is no fallback picker. A
 //! browser without the Popover API ([`popover_supported`]) gets a disabled
@@ -36,7 +35,7 @@
 //! opening runs, or an opening a later press superseded, does nothing.
 
 use super::emoji_picker::FREQUENT_EMOJIS;
-use super::ReactionOwnersPopover;
+use super::{now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW};
 use crate::components::icons::{line_icon, REACT_ICON_PATH};
 use dioxus::prelude::*;
@@ -46,7 +45,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 /// The picker element's id.
-pub(super) const PICKER_ID: &str = "reaction-picker";
+const PICKER_ID: &str = "reaction-picker";
 
 /// The anchor name the open React carries and `.reaction-picker` positions
 /// against (`main.css`).
@@ -61,7 +60,7 @@ const OPEN_FAILED_MESSAGE: &str = "Couldn\u{2019}t open reactions. Try again.";
 
 /// How showing the picker went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Shown {
+enum Shown {
     /// Open, at the React.
     Open,
     /// This browser has no native popovers; nothing was touched.
@@ -78,7 +77,7 @@ pub(super) enum Shown {
 
 /// What the picker is open for.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct ReactionTarget {
+struct ReactionTarget {
     /// The room, and which showing of it ([`note_room_shown`]): a pick made
     /// for one showing never acts in a later one, even of the same room.
     room: Option<VerifyingKey>,
@@ -128,7 +127,7 @@ impl ReactionSurfaces {
 
     /// Close the picker. From a deferred callback only. Hidden before the
     /// target is cleared, so the focus return sees what it was for.
-    pub(super) fn close_now(mut self) {
+    fn close_now(mut self) {
         hide_picker();
         if self.target.peek().is_some() {
             self.target.set(None);
@@ -188,16 +187,20 @@ impl ReactionSurfaces {
     }
 
     /// Close whichever group's reactor list is open. A list its group has
-    /// already closed, or a group no longer mounted, is left alone.
+    /// already closed, or a group no longer mounted, is left alone: a write
+    /// notifies its subscribers even when it changes nothing, so it is only
+    /// taken for a list still open, and fallibly, since the group's signal
+    /// may be gone.
     fn close_owner_list_now(mut self) {
         let Some(mut list) = self.open_owner_list.take() else {
             return;
         };
-        if let Ok(mut open) = list.try_write() {
-            if open.is_some() {
+        let open = list.try_peek().is_ok_and(|open| open.is_some());
+        if open {
+            if let Ok(mut open) = list.try_write() {
                 *open = None;
             }
-        };
+        }
     }
 }
 
@@ -349,15 +352,16 @@ pub(super) fn ReactionInvoker(
             onclick: move |_| {
                 // Every press supersedes an opening still waiting to run.
                 let activation = next_activation();
-                // A press on React while its picker is open closes it, as the
-                // old backdrop did. A key press keeps it open, as it did.
+                // A pointer press on React while its picker is open closes
+                // it. A key press keeps it open.
                 if take_press_while_open(&row) {
                     crate::util::defer(move || surfaces.close_now());
                     return;
                 }
+                let (room, visit) = shown_room();
                 let target = ReactionTarget {
-                    room: shown_room().0,
-                    visit: shown_room().1,
+                    room,
+                    visit,
                     row: row.clone(),
                     message: message.clone(),
                     current: current.clone(),
@@ -419,9 +423,6 @@ thread_local! {
     static PRESSED_WHILE_OPEN: std::cell::RefCell<Option<(String, f64)>> =
         const { std::cell::RefCell::new(None) };
 }
-
-/// A press older than this belongs to another gesture.
-const PRESS_FRESH_MS: f64 = 1500.0;
 
 fn record_press(row: &str, surfaces: ReactionSurfaces) {
     let open_here = is_open()
@@ -583,6 +584,7 @@ fn new_state(e: &Event<ToggleData>) -> Option<String> {
 
 #[cfg(target_arch = "wasm32")]
 mod dom {
+    use super::super::focus_without_scrolling;
     use super::{ReactionSurfaces, ANCHOR_NAME, PICKER_ID};
     use dioxus::prelude::ReadableExt;
     use std::cell::RefCell;
@@ -762,12 +764,6 @@ mod dom {
         true
     }
 
-    fn focus_without_scrolling(el: &web_sys::HtmlElement) {
-        let options = web_sys::FocusOptions::new();
-        options.set_prevent_scroll(true);
-        let _ = el.focus_with_options(&options);
-    }
-
     /// Focus inside the closing picker goes back to the React it is open for,
     /// without scrolling, if that is still live; else it is let go, never sent
     /// to a React that has left.
@@ -793,7 +789,9 @@ mod dom {
             .filter(super::target_is_live)
             .and_then(|target| react_button(&target.row));
         match live {
-            Some(button) => focus_without_scrolling(&button),
+            Some(button) => {
+                focus_without_scrolling(&button);
+            }
             None => {
                 if let Some(active) = active.dyn_ref::<web_sys::HtmlElement>() {
                     let _ = active.blur();
@@ -822,12 +820,11 @@ mod dom {
     /// zoom has no listener here. Programmatic scrolling (following an
     /// arrival, the end hold) is untouched.
     ///
-    /// A finger dragged outside the picker scrolls nothing, and must not close
-    /// it either: the old backdrop took no click from a drag. The browser
-    /// closes a `popover="auto"` when a press starts and ends outside it, so
-    /// once a one-finger press has moved past a tap's slop its pointer is
-    /// captured to the picker, and the press ends there. A tap still closes
-    /// it. A second finger landing lets that capture go.
+    /// A finger dragged outside the picker scrolls nothing, and does not close
+    /// it either; a tap outside does. The browser closes a `popover="auto"`
+    /// when a press starts and ends outside it, so once a one-finger press has
+    /// moved past a tap's slop its pointer is captured to the picker, and the
+    /// press ends there. A second finger landing lets that capture go.
     ///
     /// Off is complete whatever the bookkeeping says, so it is safe from the
     /// closing `beforetoggle`, the `toggle` after it and teardown alike: the
@@ -1058,11 +1055,10 @@ mod dom {
 
     /// A wheel with Ctrl down: the browser zooms on it (Ctrl+wheel, and a
     /// touchpad pinch arrives as one), so it is never held.
-    fn is_zoom(event: &web_sys::Event) -> bool {
-        event.type_() == "wheel"
-            && event
-                .dyn_ref::<web_sys::MouseEvent>()
-                .is_some_and(web_sys::MouseEvent::ctrl_key)
+    fn is_zoom(wheel: &web_sys::Event) -> bool {
+        wheel
+            .dyn_ref::<web_sys::MouseEvent>()
+            .is_some_and(web_sys::MouseEvent::ctrl_key)
     }
 }
 
@@ -1079,17 +1075,10 @@ fn react_button_exists(row: &str) -> bool {
     dom::react_button(row).is_some()
 }
 
-#[cfg(target_arch = "wasm32")]
-fn now_ms() -> f64 {
-    web_sys::window()
-        .and_then(|window| window.performance())
-        .map_or(0.0, |performance| performance.now())
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::{ReactionSurfaces, Shown};
-    pub(crate) fn is_open() -> bool {
+    pub(super) fn is_open() -> bool {
         false
     }
     pub(super) fn popover_supported() -> bool {
@@ -1111,16 +1100,10 @@ mod native {
     pub(super) fn react_button_exists(_row: &str) -> bool {
         true
     }
-    pub(super) fn now_ms() -> f64 {
-        0.0
-    }
 }
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(unused_imports)]
-pub(crate) use native::is_open;
-#[cfg(not(target_arch = "wasm32"))]
 use native::{
-    clear_anchor, hide_picker, hold_scrolling, now_ms, popover_supported, react_button_exists,
+    clear_anchor, hide_picker, hold_scrolling, is_open, popover_supported, react_button_exists,
     react_has_focus, rebind_picker, return_focus, show_picker_at,
 };
 

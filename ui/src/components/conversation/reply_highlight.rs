@@ -40,7 +40,7 @@ pub(super) fn jump_to_reply_target(row_id: &str) {
     };
     let (Some(row), Some(history)) = (
         document.get_element_by_id(row_id),
-        document.get_element_by_id("chat-scroll-container"),
+        super::history_scroll::ROOM_HISTORY.container(),
     ) else {
         return;
     };
@@ -60,10 +60,10 @@ pub(super) fn jump_to_reply_target(row_id: &str) {
     .round();
     if shift != 0.0 {
         // Instant, as every other move of the history is.
-        let opts = web_sys::ScrollToOptions::new();
-        opts.set_top(history.scroll_top() as f64 + shift);
-        opts.set_behavior(web_sys::ScrollBehavior::Instant);
-        history.scroll_to_with_scroll_to_options(&opts);
+        crate::components::scroll_to_latest::scroll_instant_to(
+            &history,
+            history.scroll_top() as f64 + shift,
+        );
     }
     restart_highlight(&row);
 }

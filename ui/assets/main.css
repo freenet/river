@@ -538,10 +538,11 @@
 
 /* The reply strip: a native button (`conversation.rs`) that jumps to the
  * quoted message and highlights its row (`conversation/reply_highlight.rs`,
- * a Web Animations API animation, so no rule here). Always one line, the preview cut with an ellipsis, hovered
- * or focused alike: the strip is a way to the original, not a preview of it.
- * The truncation sits on the inner span, so it does not depend on how an
- * engine lays out a button's own contents. */
+ * a Web Animations API animation, so no rule here). Always one line, the
+ * preview cut with an ellipsis, hovered or focused alike: the strip is a way
+ * to the original, not a preview of it. The truncation sits on the inner
+ * span, so it does not depend on how an engine lays out a button's own
+ * contents. */
 .reply-strip-text {
     display: block;
     white-space: nowrap;

@@ -1001,7 +1001,7 @@ pub fn is_watched(id: &ContractInstanceId) -> bool {
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-pub use runtime::user_is_busy_for_test;
+pub(crate) use runtime::user_is_busy_for_test;
 pub use runtime::{
     is_reloading, mark_ready, note_sync_queued, on_connected, on_disconnected, on_page_visible,
     reload_now, snooze, UPDATE_NOTICE,
@@ -1156,7 +1156,7 @@ mod runtime {
 
     /// [`user_is_busy`] for the example build's test hooks.
     #[cfg(all(feature = "example-data", feature = "no-sync"))]
-    pub fn user_is_busy_for_test() -> bool {
+    pub(crate) fn user_is_busy_for_test() -> bool {
         user_is_busy()
     }
 

@@ -1,9 +1,9 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
-//! INBOUND messages (also with chosen sender and arrival times), remove messages, drive the no-room screen's load states,
-//! complete an own DM while another thread is open, put reactions on the
-//! newest message, count message group renders, make the room banner's
-//! sync-status read fail once, and hold or fail the signing of own messages
-//! (the chat delegate's round trip).
+//! INBOUND messages (also with chosen sender and arrival times), remove
+//! messages, drive the no-room screen's load states, complete an own DM while
+//! another thread is open, put reactions on the newest message, count message
+//! group renders, make the room banner's sync-status read fail once, and hold
+//! or fail the signing of own messages (the chat delegate's round trip).
 //!
 //! The composer is not a substitute: an own send is an explicit request to go
 //! to the newest message, so a message sent through the UI
@@ -978,18 +978,12 @@ fn push_test_body(
     delivery: Delivery,
 ) {
     let (sk, nickname) = test_author(delivery);
-    let author = MemberId::from(&sk.verifying_key());
     admit_with_nickname(room, room_key, &sk, nickname);
-
-    let time = crate::util::get_current_system_time();
-    let message = AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: MemberId::from(room_key),
-            author,
-            content,
-            time,
-        },
+    let message = signed_message(
+        room_key,
         &sk,
+        content,
+        crate::util::get_current_system_time(),
     );
 
     let messages = &mut room.room_state.recent_messages.messages;
@@ -1003,6 +997,24 @@ fn push_test_body(
             .unwrap_or(0),
     };
     messages.insert(at, message);
+}
+
+/// `content` from `sk`, stamped `time`, signed for `room_key`'s room.
+fn signed_message(
+    room_key: &VerifyingKey,
+    sk: &SigningKey,
+    content: RoomMessageBody,
+    time: std::time::SystemTime,
+) -> AuthorizedMessageV1 {
+    AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: MemberId::from(room_key),
+            author: MemberId::from(&sk.verifying_key()),
+            content,
+            time,
+        },
+        sk,
+    )
 }
 
 /// One message `deliverTimedMessages` delivers: its text, the sender's
@@ -1029,22 +1041,16 @@ fn deliver_timed(sk: &SigningKey, nickname: &str, messages: Vec<TimedMessage>) {
     let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
         return;
     };
-    let author = MemberId::from(&sk.verifying_key());
     let signed: Vec<(AuthorizedMessageV1, i64)> = messages
         .into_iter()
         .map(|message| {
             let time = std::time::UNIX_EPOCH
                 + std::time::Duration::from_millis(message.sent_ms.max(0) as u64);
-            let signed = AuthorizedMessageV1::new(
-                MessageV1 {
-                    room_owner: MemberId::from(&room_key),
-                    author,
-                    content: RoomMessageBody::public(message.text),
-                    time,
-                },
-                sk,
-            );
-            (signed, message.received_ms)
+            let content = RoomMessageBody::public(message.text);
+            (
+                signed_message(&room_key, sk, content, time),
+                message.received_ms,
+            )
         })
         .collect();
     crate::components::app::receive_times::RECEIVE_TIMES.with_mut(|times| {

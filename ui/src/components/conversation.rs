@@ -3649,18 +3649,13 @@ fn focus_without_scrolling(element: &web_sys::Element) -> bool {
 /// scrollport), and its max height: the space on that side less the 8px gap
 /// each way, so an `overflow-y-auto` popover scrolls instead of clipping (#402).
 fn vertical_placement(y: f64, height: f64) -> (bool, f64) {
-    vertical_placement_from(y, y, height)
+    let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+    placement_within(scroll_top, scroll_bottom, y, y, height)
 }
 
 /// [`vertical_placement`] for a popover hung off an element spanning viewport
-/// `top..bottom`: it opens below from `bottom`, or above from `top`.
-fn vertical_placement_from(top: f64, bottom: f64, height: f64) -> (bool, f64) {
-    let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
-    placement_within(scroll_top, scroll_bottom, top, bottom, height)
-}
-
-/// [`vertical_placement_from`] inside a scrollport spanning
-/// `scroll_top..scroll_bottom`, pure for native tests.
+/// `top..bottom` (it opens below from `bottom`, or above from `top`), inside a
+/// scrollport spanning `scroll_top..scroll_bottom`. Pure for native tests.
 fn placement_within(
     scroll_top: f64,
     scroll_bottom: f64,
@@ -3675,10 +3670,10 @@ fn placement_within(
 }
 
 thread_local! {
-    /// The popover (an inline picker or an edit form, by element id) whose
-    /// next mount brings it into the history's view. Set when it opens and
-    /// taken by its first mount, so a later re-mount (a re-render, a group
-    /// re-key) never moves the reader again.
+    /// The edit form (by element id) whose next mount brings it into the
+    /// history's view. Set when it opens and taken by its first mount, so a
+    /// later re-mount (a re-render, a group re-key) never moves the reader
+    /// again.
     static REVEAL_ON_MOUNT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -4472,11 +4467,13 @@ fn MessageGroupComponent(
                                     // controls show. Their handlers are this group's, and
                                     // Conversation's stable `use_callback`s (#830).
                                     {
-                                        let msg_id_for_inline = msg.id.clone();
+                                        // `msg.id` is the row's DOM id suffix (`msg-{id}`);
+                                        // `msg.message_id` is the signed message's id.
+                                        let row_id_for_chips = msg.id.clone();
                                         let msg_id_react = msg.message_id.clone();
                                         // A row being edited has the form's own buttons.
                                         let show_actions = editing_message.read().as_ref() != Some(&msg.id);
-                                        let msg_id_for_react = msg.id.clone();
+                                        let row_for_invoker = msg.id.clone();
                                         let msg_id_str_for_edit = msg.id.clone();
                                         let msg_id_for_delete = msg.message_id.clone();
                                         let msg_id_for_reply = msg.message_id.clone();
@@ -4555,7 +4552,7 @@ fn MessageGroupComponent(
                                                         } else {
                                                             names_str
                                                         };
-                                                        let owners_key = format!("{msg_id_for_inline}:{emoji}");
+                                                        let owners_key = format!("{row_id_for_chips}:{emoji}");
                                                         let (
                                                             owners_open,
                                                             owners_above,
@@ -4581,8 +4578,8 @@ fn MessageGroupComponent(
                                                         let chip_pressed_with_click = chip_pressed_with.clone();
                                                         let chip_pressed_with_down = chip_pressed_with.clone();
                                                         let chip_pressed_with_cancel = chip_pressed_with.clone();
-                                                        let msg_id_for_owners = msg_id_for_inline.clone();
-                                                        let msg_id_for_owners_key = msg_id_for_inline.clone();
+                                                        let row_id_for_owners = row_id_for_chips.clone();
+                                                        let row_id_for_owners_key = row_id_for_chips.clone();
                                                         let chip_id = reaction_chip_id(&owners_key);
                                                         let chip_id_for_key = chip_id.clone();
                                                         let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
@@ -4691,7 +4688,7 @@ fn MessageGroupComponent(
                                                                         if gesture_opens_owner_list(pressed_with.as_deref()) {
                                                                             let popover = reaction_owners_popover_at(
                                                                                 owners_key_for_click.clone(),
-                                                                                msg_id_for_owners.clone(),
+                                                                                row_id_for_owners.clone(),
                                                                                 click_x,
                                                                                 click_y,
                                                                             );
@@ -4741,7 +4738,7 @@ fn MessageGroupComponent(
                                                                         let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
                                                                         let popover = reaction_owners_popover_at(
                                                                             owners_key_for_key.clone(),
-                                                                            msg_id_for_owners_key.clone(),
+                                                                            row_id_for_owners_key.clone(),
                                                                             x,
                                                                             y,
                                                                         );
@@ -4760,7 +4757,7 @@ fn MessageGroupComponent(
                                                 if show_actions {
                                                     ReactionInvoker {
                                                         surfaces: reactions,
-                                                        row: msg_id_for_react,
+                                                        row: row_for_invoker,
                                                         message: msg_id_for_invoker,
                                                         current: user_reaction,
                                                     }

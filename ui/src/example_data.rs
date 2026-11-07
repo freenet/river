@@ -1174,8 +1174,6 @@ mod tests {
         );
     }
 
-    /// The tall-head room must sit at its cap with its tall rows oldest, so a
-    /// burst of arrivals drains exactly those rows and the history shrinks.
     /// Seeded reactions must be backed by signed reaction messages. Every
     /// applied delta rebuilds `actions_state` from the action messages, so a
     /// reaction written only into that cache vanished the first time anyone
@@ -1200,6 +1198,8 @@ mod tests {
         }
     }
 
+    /// The tall-head room must sit at its cap with its tall rows oldest, so a
+    /// burst of arrivals drains exactly those rows and the history shrinks.
     #[test]
     fn tall_head_room_drains_tall_rows_first() {
         let room = create_room(
