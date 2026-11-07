@@ -151,7 +151,19 @@ pub mod cleanup_counters {
 }
 
 /// The most passes one `post_apply_cleanup` runs (see its FIXPOINT note).
-const MAX_CLEANUP_PASSES: usize = 3;
+/// A cleanup still changing the state on its last pass returns a result the
+/// contract's `validate_state` then refuses; `fork_merge_closure_test`
+/// asserts no generated merge or apply reaches it.
+pub const MAX_CLEANUP_PASSES: usize = 3;
+
+/// What [`ChatRoomStateV1::post_apply_cleanup_counted`] ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupPasses {
+    /// Passes run, the confirming pass included.
+    pub passes: usize,
+    /// Whether the last pass changed nothing, so the result is a fixpoint.
+    pub confirmed: bool,
+}
 
 /// Whether every cleanup runs all of its passes, as the worst case does:
 /// under the cost tests, and under `--cfg river_force_all_cleanup_passes` for
@@ -216,6 +228,8 @@ pub enum WholeStateError {
     Verify(String),
     /// Cleanup failed on it.
     Cleanup(String),
+    /// The cleaned state could not be encoded for the comparison.
+    Encode(String),
     /// Cleanup would change it: it is not in canonical form.
     NotNormalized,
 }
@@ -225,6 +239,7 @@ impl std::fmt::Display for WholeStateError {
         match self {
             Self::Verify(e) => write!(f, "State verification failed: {e}"),
             Self::Cleanup(e) => write!(f, "State cleanup failed: {e}"),
+            Self::Encode(e) => write!(f, "Cleaned state could not be encoded: {e}"),
             Self::NotNormalized => write!(f, "State is not normalized: cleanup would change it"),
         }
     }
@@ -605,16 +620,13 @@ impl ChatRoomStateV1 {
     ///
     /// `validate_state` accepts only states that cleanup leaves unchanged
     /// (compared as encoded bytes), so every state a peer stores is canonical.
-    /// A client therefore sends this, never its raw local snapshot, in any
-    /// whole-state PUT: a local snapshot can be one cleanup would still change
-    /// (an edit applied directly, or a state written by an older build), and a
-    /// peer that does not yet hold the room would refuse it.
-    ///
-    /// Scope of the guarantee: an incoming whole state sent as an UPDATE (or as
-    /// a PUT to a peer that already holds the room) is merged before anything
-    /// is validated, and only the merge result is checked. Such an input is not
-    /// refused even when it is not canonical; the state the peer then holds is,
-    /// because every merge ends in cleanup.
+    /// freenet-core validates every incoming whole state before it merges it,
+    /// for an UPDATE as well as a PUT, so a whole state cleanup would still
+    /// change is refused on every path. A client therefore sends this, never
+    /// its raw local snapshot, in any whole-state PUT or full-state UPDATE: a
+    /// local snapshot can be one cleanup would still change (an edit applied
+    /// directly, or a state written by an older build). Deltas need no
+    /// normalizing: the receiver applies them and then runs cleanup.
     pub fn normalized(&self, parameters: &ChatRoomParametersV1) -> Result<Self, String> {
         let mut out = self.clone();
         out.post_apply_cleanup(parameters)?;
@@ -647,7 +659,7 @@ impl ChatRoomStateV1 {
                 .map_err(WholeStateError::Cleanup)?;
             let mut out = Vec::with_capacity(bytes.len());
             ciborium::ser::into_writer(&cleaned, &mut out)
-                .map_err(|e| WholeStateError::Cleanup(e.to_string()))?;
+                .map_err(|e| WholeStateError::Encode(e.to_string()))?;
             if out != bytes {
                 return Err(WholeStateError::NotNormalized);
             }
@@ -688,6 +700,18 @@ impl ChatRoomStateV1 {
     /// pruned (orphaning their DMs). See
     /// `direct_messages.rs` module docs, "Interaction with bans".
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        self.post_apply_cleanup_counted(parameters).map(|_| ())
+    }
+
+    /// [`Self::post_apply_cleanup`], reporting how many passes it ran and
+    /// whether the last one confirmed the result (changed nothing). A result
+    /// that is not confirmed was cut off by `MAX_CLEANUP_PASSES`, and the
+    /// contract's `validate_state` would refuse it, so tests assert it never
+    /// happens.
+    pub fn post_apply_cleanup_counted(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+    ) -> Result<CleanupPasses, String> {
         crate::room_state::ban::signature_memo::active_while(|| {
             // FIXPOINT: a pass is followed by another on its result, and the
             // result stands once a pass changes nothing, so that state is one
@@ -714,9 +738,10 @@ impl ChatRoomStateV1 {
             }
             #[cfg(any(test, river_cleanup_counters))]
             cleanup_counters::set_cleanup_passes(passes, last_changed);
-            #[cfg(not(any(test, river_cleanup_counters)))]
-            let _ = last_changed;
-            Ok(())
+            Ok(CleanupPasses {
+                passes,
+                confirmed: !last_changed,
+            })
         })
     }
 
