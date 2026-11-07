@@ -9,6 +9,35 @@ use river_core::ChatRoomStateV1;
 // NOTE: Crypto helper modules intentionally not compiled by default.
 // They are retained under examples/docs to avoid accidental inclusion.
 
+/// `validate_state` accepts only states that cleanup leaves unchanged, so
+/// every state a peer holds is canonical. Every merge and delta apply ends in
+/// `post_apply_cleanup`, so a state a peer produced already is; clients send
+/// `ChatRoomStateV1::normalized` in whole-state PUTs.
+///
+/// The comparison is on the encoded BYTES, never on the decoded struct with
+/// `==`: `MessagesV1::actions_state` is a `#[serde(skip)]` cache, so a decoded
+/// state holds it empty and cleanup rebuilds it, and struct equality would
+/// refuse every room that has message actions. Comparing bytes also refuses a
+/// non-canonical encoding of an otherwise canonical state.
+///
+/// Checked here, not in `ComposableState::verify`, which also runs on partial
+/// states while a delta's fields are applied.
+pub fn require_cleanup_fixpoint(
+    bytes: &[u8],
+    state: &ChatRoomStateV1,
+    parameters: &ChatRoomParametersV1,
+) -> Result<(), String> {
+    let cleaned = state
+        .normalized(parameters)
+        .map_err(|e| format!("State cleanup failed: {e}"))?;
+    let mut out = Vec::with_capacity(bytes.len());
+    into_writer(&cleaned, &mut out).map_err(|e| e.to_string())?;
+    if out != bytes {
+        return Err("State is not normalized: cleanup would change it".to_string());
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 struct Contract;
 
@@ -30,12 +59,14 @@ impl ContractInterface for Contract {
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        chat_state
-            .verify(&chat_state, &parameters)
-            .map(|_| ValidateResult::Valid)
-            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+        chat_state.verify(&chat_state, &parameters).map_err(|e| {
+            ContractError::InvalidUpdateWithInfo {
                 reason: format!("State verification failed: {}", e),
-            })
+            }
+        })?;
+        require_cleanup_fixpoint(bytes, &chat_state, &parameters)
+            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
+        Ok(ValidateResult::Valid)
     }
 
     fn update_state(
@@ -413,5 +444,159 @@ mod tests {
             out.new_state.expect("a new state").as_ref(),
             cbor!(&expected).as_slice()
         );
+    }
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let b: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect();
+        b.try_into().unwrap()
+    }
+
+    fn validate(parameters: &ChatRoomParametersV1, bytes: Vec<u8>) -> Result<(), String> {
+        Contract::validate_state(
+            Parameters::from(cbor!(parameters)),
+            State::from(bytes),
+            RelatedContracts::default(),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+    }
+
+    /// Captured room states pass `validate_state`, cleanup-fixpoint rule
+    /// included. Reads `RIVER_V1_STATES` (comma-separated CBOR state files)
+    /// and `RIVER_V1_OWNER_HEX` (the room owner's verifying key, hex); skips
+    /// when they are unset, so it runs by hand against fetched live states.
+    #[test]
+    fn captured_states_pass_validate() {
+        let (Ok(paths), Ok(owner)) = (
+            std::env::var("RIVER_V1_STATES"),
+            std::env::var("RIVER_V1_OWNER_HEX"),
+        ) else {
+            eprintln!("skipped: RIVER_V1_STATES / RIVER_V1_OWNER_HEX unset");
+            return;
+        };
+        let parameters = ChatRoomParametersV1 {
+            owner: ed25519_dalek::VerifyingKey::from_bytes(&hex32(&owner)).unwrap(),
+        };
+        for path in paths.split(',') {
+            let bytes = std::fs::read(path).unwrap();
+            let state: ChatRoomStateV1 = from_reader(&bytes[..]).unwrap();
+            let t = std::time::Instant::now();
+            let r = validate(&parameters, bytes.clone());
+            println!(
+                "{path}: {} bytes, {} members, {} messages, validate {:?} in {:.1} ms",
+                bytes.len(),
+                state.members.members.len(),
+                state.recent_messages.messages.len(),
+                r,
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            assert!(r.is_ok(), "{path}: {r:?}");
+        }
+    }
+
+    /// Two owner messages, which `verify` accepts in either order, while
+    /// cleanup sorts them by `(time, id)`.
+    fn room_with_two_messages() -> (ChatRoomParametersV1, ChatRoomStateV1) {
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let owner_sk = SigningKey::from_bytes(&[7; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let parameters = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let mut state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        for secs in [20, 10] {
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner_id,
+                        author: owner_id,
+                        content: RoomMessageBody::public(format!("at {secs}")),
+                        time: std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + secs),
+                    },
+                    &owner_sk,
+                ));
+        }
+        (parameters, state)
+    }
+
+    /// A state `verify` accepts but cleanup would still change is refused,
+    /// and its normalized form, as a client sends it, is accepted.
+    #[test]
+    fn a_state_cleanup_would_change_is_refused() {
+        let (parameters, raw) = room_with_two_messages();
+        raw.verify(&raw, &parameters)
+            .expect("verify accepts the unsorted messages");
+        let err = validate(&parameters, cbor!(&raw)).unwrap_err();
+        assert!(err.contains("not normalized"), "{err}");
+        let normalized = raw.normalized(&parameters).unwrap();
+        assert_ne!(cbor!(&normalized), cbor!(&raw));
+        validate(&parameters, cbor!(&normalized)).expect("the normalized state is accepted");
+    }
+
+    /// The comparison is on bytes: a canonical state whose `#[serde(skip)]`
+    /// message-actions cache is empty (as every decoded state's is) passes,
+    /// even though cleanup rebuilds that cache. Struct `==` would refuse it.
+    #[test]
+    fn the_fixpoint_rule_ignores_the_skipped_actions_cache() {
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        let (parameters, raw) = room_with_two_messages();
+        let mut state = raw.normalized(&parameters).unwrap();
+        let owner_sk = SigningKey::from_bytes(&[7; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let target = state.recent_messages.messages[0].id();
+        state
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: owner_id,
+                    author: owner_id,
+                    content: RoomMessageBody::edit(target, "edited".to_string()),
+                    time: std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_700_000_030),
+                },
+                &owner_sk,
+            ));
+        let state = state.normalized(&parameters).unwrap();
+        let bytes = cbor!(&state);
+        let decoded: ChatRoomStateV1 = from_reader(&bytes[..]).unwrap();
+        let cleaned = decoded.normalized(&parameters).unwrap();
+        assert_ne!(
+            cleaned, decoded,
+            "cleanup rebuilds the skipped cache, so the structs differ"
+        );
+        validate(&parameters, bytes).expect("the bytes are a fixpoint");
+    }
+
+    /// A non-canonical encoding of a canonical state is refused.
+    #[test]
+    fn a_non_canonical_encoding_is_refused() {
+        let (parameters, raw) = room_with_two_messages();
+        let canonical = cbor!(&raw.normalized(&parameters).unwrap());
+        validate(&parameters, canonical.clone()).unwrap();
+        // ciborium writes a map header as a single byte for short maps; the
+        // same map with a one-byte-length header (0xb8 n) decodes to the same
+        // state and is not the canonical encoding.
+        assert!((0xa0..0xb8).contains(&canonical[0]));
+        let mut longer = vec![0xb8, canonical[0] - 0xa0];
+        longer.extend_from_slice(&canonical[1..]);
+        let decoded: ChatRoomStateV1 = from_reader(&longer[..]).unwrap();
+        assert_eq!(cbor!(&decoded), canonical);
+        assert!(validate(&parameters, longer).is_err());
     }
 }

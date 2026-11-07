@@ -579,6 +579,27 @@ impl ChatRoomStateV1 {
         std::borrow::Cow::Owned(merged)
     }
 
+    /// This state as `post_apply_cleanup` leaves it: the canonical form the
+    /// room contract's `validate_state` requires of a whole state.
+    ///
+    /// `validate_state` accepts only states that cleanup leaves unchanged
+    /// (compared as encoded bytes), so every state a peer stores is canonical.
+    /// A client therefore sends this, never its raw local snapshot, in any
+    /// whole-state PUT: a local snapshot can be one cleanup would still change
+    /// (an edit applied directly, or a state written by an older build), and a
+    /// peer that does not yet hold the room would refuse it.
+    ///
+    /// Scope of the guarantee: an incoming whole state sent as an UPDATE (or as
+    /// a PUT to a peer that already holds the room) is merged before anything
+    /// is validated, and only the merge result is checked. Such an input is not
+    /// refused even when it is not canonical; the state the peer then holds is,
+    /// because every merge ends in cleanup.
+    pub fn normalized(&self, parameters: &ChatRoomParametersV1) -> Result<Self, String> {
+        let mut out = self.clone();
+        out.post_apply_cleanup(parameters)?;
+        Ok(out)
+    }
+
     /// Post-apply cleanup: prune members who have no recent messages, clean up
     /// member_info for pruned members, remove orphaned bans, and sweep
     /// direct messages whose participants are no longer in the room.

@@ -269,3 +269,54 @@ fn the_owners_secret_blob_survives_cleanup_and_merges() {
     c.post_apply_cleanup(&p).unwrap();
     assert_eq!(owner_blobs(&c), 1, "cleanup keeps the owner's blob");
 }
+
+/// `ChatRoomStateV1::normalized`, which clients send in whole-state PUTs,
+/// returns the cleanup fixpoint of a state cleanup would still change, leaves
+/// the original untouched, and is idempotent on its own output.
+#[test]
+fn normalized_returns_a_cleanup_fixpoint() {
+    let owner = sk(1);
+    let oid = id(&owner);
+    let p = ChatRoomParametersV1 {
+        owner: owner.verifying_key(),
+    };
+    let mut raw = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: oid,
+                ..Default::default()
+            },
+            &owner,
+        ),
+        ..Default::default()
+    };
+    // Out of `(time, id)` order: `verify` accepts it, cleanup sorts it.
+    raw.recent_messages = MessagesV1 {
+        messages: vec![msg(oid, &owner, 20), msg(oid, &owner, 10)],
+        ..Default::default()
+    };
+    raw.verify(&raw, &p).unwrap();
+    let before = ser(&raw);
+
+    let n = raw.normalized(&p).unwrap();
+    assert_eq!(ser(&raw), before, "the original is not modified");
+    assert_ne!(ser(&n), before, "the raw state was not a fixpoint");
+    let times: Vec<_> = n
+        .recent_messages
+        .messages
+        .iter()
+        .map(|m| m.message.time)
+        .collect();
+    assert_eq!(times, vec![at(10), at(20)]);
+
+    let mut again = n.clone();
+    again.post_apply_cleanup(&p).unwrap();
+    assert_eq!(ser(&again), ser(&n), "the result is a cleanup fixpoint");
+    assert_eq!(ser(&n.normalized(&p).unwrap()), ser(&n), "idempotent");
+}
+
+fn ser(s: &ChatRoomStateV1) -> Vec<u8> {
+    let mut v = vec![];
+    ciborium::ser::into_writer(s, &mut v).unwrap();
+    v
+}

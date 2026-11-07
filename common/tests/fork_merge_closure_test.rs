@@ -38,9 +38,28 @@ thread_local! {
 /// a pass-1/pass-2 difference (the next merge runs cleanup again), which is
 /// why this is checked after EVERY apply and merge rather than inferred from
 /// convergence (#702 review round 5).
+/// Spike counters for the validate-time fixpoint rule: every apply and merge
+/// output checked, and those a validate that requires
+/// `cleanup(S) == S` (structural equality, as the contract checks) refuses.
+static FIXPOINT_CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FIXPOINT_REFUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn report_fixpoint_counters(test: &str) {
+    eprintln!(
+        "B1-FIXPOINT {test}: cumulative outputs_checked={} refused={}",
+        FIXPOINT_CHECKS.load(std::sync::atomic::Ordering::Relaxed),
+        FIXPOINT_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
 fn check_idempotent(s: &ChatRoomStateV1, p: &ChatRoomParametersV1, what: &str) {
     let mut again = s.clone();
-    let _ = again.post_apply_cleanup(p);
+    let cleanup_ok = again.post_apply_cleanup(p).is_ok();
+    FIXPOINT_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cleanup_ok || again != *s {
+        FIXPOINT_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("B1-FIXPOINT refused output after {what}");
+    }
     if ser(&again) != ser(s) {
         NOT_IDEMPOTENT.with(|v| v.borrow_mut().push(what.to_string()));
     }
@@ -1284,6 +1303,7 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
             Ending::SilentlyDiverged => out.silent.push(format!("seed {seed} shape {shape}")),
         }
     }
+    report_fixpoint_counters(&format!("{mode:?}"));
     out
 }
 
