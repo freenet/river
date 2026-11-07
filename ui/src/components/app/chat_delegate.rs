@@ -6705,13 +6705,15 @@ mod tests {
     ///
     /// Updated for V38 (freenet-stdlib 0.8.5 -> 0.12.1, river-core 0.3.1 ->
     /// 0.4.0): the delegate is rebuilt against the new stdlib. V38
-    /// (`da47cbd9…`) is the outgoing generation.
+    /// (`da47cbd9…`) is the outgoing generation. The same release adds the
+    /// room contract's whole-state check (`validate_whole_state`) to
+    /// river-core, which the delegate also links.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "b703ec558d52c0901cc438a548b8cc5d802c1016076e2a07df256c5e06b8e056",
+            "264a93013e97a464109a63ebfbe84a98e61e81f691f905b142eb1417e9da9329",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
