@@ -1392,7 +1392,11 @@ pub(crate) fn local_state_ahead(
     owner_vk: &ed25519_dalek::VerifyingKey,
 ) -> bool {
     let params = ChatRoomParametersV1 { owner: *owner_vk };
-    compute_update_data(local, Some(network), &params).is_some()
+    // With a baseline only a delta is computed, which cannot fail.
+    matches!(
+        compute_update_data(local, Some(network), &params),
+        Ok(Some(_))
+    )
 }
 
 /// Re-seed `owner_vk`'s room with a full PUT after its code-free subscribe GET
@@ -2866,8 +2870,11 @@ mod tests {
 
     /// Every whole-state PUT in this file sends the normalized state:
     /// `validate_state` accepts only states cleanup leaves unchanged. There
-    /// are exactly three PUT sites, and each builds its `WrappedState` from
-    /// `whole_state_put_bytes`, never from `to_cbor_vec` of a raw state.
+    /// are exactly three PUT sites. Inside each `ContractRequest::Put { .. }`
+    /// literal, `state:` is either `WrappedState::new(` of the bytes
+    /// `whole_state_put_bytes` returned (`put_bytes`), or a `wrapped_state`
+    /// binding that was built from `whole_state_put_bytes` in the same
+    /// function.
     #[test]
     fn every_whole_state_put_sends_the_normalized_state() {
         let full = include_str!("get_response.rs");
@@ -2875,8 +2882,9 @@ mod tests {
             .split("mod tests {")
             .next()
             .expect("get_response.rs must have production code before `mod tests`");
-        let puts: Vec<usize> = src
-            .match_indices("ContractRequest::Put {")
+        let compact: String = src.split_whitespace().collect();
+        let puts: Vec<usize> = compact
+            .match_indices("ContractRequest::Put{")
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
@@ -2884,17 +2892,40 @@ mod tests {
             3,
             "a PUT site was added or removed; pin it here"
         );
-        let mut prev = 0;
         for put in puts {
-            let block = &src[prev..put];
-            let normalized = block
-                .rfind("crate::util::whole_state_put_bytes(")
-                .expect("a PUT site does not normalize its state");
-            assert!(
-                !block[normalized..].contains("WrappedState::new(to_cbor_vec("),
-                "a PUT site wraps a raw state"
-            );
-            prev = put + 1;
+            let literal = &compact[put..];
+            let literal = &literal[..literal.find("};").expect("the PUT literal closes")];
+            let state = literal
+                .split("state:")
+                .nth(1)
+                .expect("the PUT literal sets `state`");
+            let state = &state[..state.find(",related_contracts").expect("`state` ends")];
+            match state {
+                "WrappedState::new(put_bytes.expect(\"checkedabove\"))" => {
+                    let before = &compact[..put];
+                    let bound = before
+                        .rfind("letput_bytes=")
+                        .expect("`put_bytes` is bound before the PUT");
+                    assert!(
+                        before[bound..]
+                            .starts_with("letput_bytes=crate::util::whole_state_put_bytes("),
+                        "`put_bytes` is not the normalized bytes"
+                    );
+                }
+                "wrapped_state" => {
+                    let before = &compact[..put];
+                    let bound = before
+                        .rfind("letwrapped_state=")
+                        .expect("`wrapped_state` is bound before the PUT");
+                    assert!(
+                        before[bound..].starts_with(
+                            "letwrapped_state=matchcrate::util::whole_state_put_bytes("
+                        ),
+                        "`wrapped_state` is not built from the normalized bytes"
+                    );
+                }
+                other => panic!("a PUT sends a state that is not the normalized bytes: {other}"),
+            }
         }
     }
 }
