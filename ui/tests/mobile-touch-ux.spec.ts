@@ -1,10 +1,11 @@
 import { test, expect, Page } from "@playwright/test";
-import { touchOnly, waitForApp, selectRoom } from "./example-room";
+import { coarsePointer, waitForApp, selectRoom } from "./example-room";
 import { AT_BOTTOM_EPSILON_PX } from "./history-geometry";
 
 // Coverage for freenet/river#402 — mobile / touch UX improvements:
-//   1. Touch-accessible message action menu (kebab), since the hover action
-//      bar can never appear on a device without a hover pointer.
+//   1. Touch-accessible message actions: each message's footer shows React,
+//      Reply, Edit and Delete at rest where a finger can be the pointer
+//      (message-action-buttons.spec.ts has the rest of the footer).
 //   2. Header hamburger spacing: see room-header-layout.spec.ts.
 //   3. A scroll-to-latest button shown whenever the newest message's bottom
 //      is off screen, plus a jump to the newest message on room switch.
@@ -65,239 +66,56 @@ async function scrollUpUntilButtonVisible(page: Page) {
   await expect(button).toBeVisible({ timeout: 12_000 });
 }
 
-test.describe("Message action kebab menu (#402.1)", () => {
-  test("kebab visibility follows hover capability", async ({ page }) => {
+test.describe("Message footer on touch (#402.1)", () => {
+  test("footer actions show at rest where a finger can be the pointer, and wait for hover where not", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
 
-    const kebab = page.locator('[data-testid="message-kebab"]').first();
-    // Every message renders a kebab element; whether it is *displayed* is a
-    // pure-CSS decision keyed on `@media (hover: none)`.
-    await expect(kebab).toHaveCount(1);
-
-    if (await touchOnly(page)) {
-      await expect(kebab).toBeVisible();
-    } else {
-      // On a device with a hover pointer the kebab stays display:none — the
-      // desktop hover action bar is used instead.
-      await expect(kebab).toBeHidden();
+    const ownRow = page.locator('[id^="msg-"][data-message-self="true"]').last();
+    await ownRow.scrollIntoViewIfNeeded();
+    await page.mouse.move(0, 0);
+    const opacity = (id: string) =>
+      ownRow.getByTestId(id).evaluate(async (el) => {
+        await Promise.all(el.getAnimations().map((a) => a.finished));
+        return getComputedStyle(el).opacity;
+      });
+    const expected = (await coarsePointer(page)) ? "1" : "0";
+    for (const id of ["message-react-button", "message-reply-button", "message-edit-button", "message-delete-button"]) {
+      expect(await opacity(id), id).toBe(expected);
     }
   });
 
-  test("kebab opens a menu with Reply / Edit / Delete on own messages", async ({
-    page,
-  }) => {
+  test("while the picker is open, a tap on another message's control only closes it", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
+    test.skip(!(await coarsePointer(page)), "footer actions show at rest only where a finger can be the pointer");
 
-    // This flow only applies where the kebab is actually usable (touch).
-    test.skip(
-      !(await touchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
+    const rows = page.locator('[id^="msg-"]');
+    const first = rows.last();
+    await first.scrollIntoViewIfNeeded();
+    await first.getByTestId("message-react-button").click();
+    await expect(page.getByTitle(/^React with/).first()).toBeVisible({ timeout: 5_000 });
 
-    // An own message. Its row carries the kebab that must expose Edit +
-    // Delete as well as Reply.
-    const ownRow = page.locator('[id^="msg-"][data-message-self="true"]').first();
-    await expect(ownRow).toBeVisible();
-    const ownKebab = ownRow.locator('[data-testid="message-kebab"]');
-    await ownKebab.click();
-
-    const menu = page.locator('[data-testid="message-action-menu"]');
-    await expect(menu).toBeVisible();
-    await expect(menu.getByRole("button", { name: "Reply" })).toBeVisible();
-    await expect(menu.getByRole("button", { name: "Edit" })).toBeVisible();
-    await expect(menu.getByRole("button", { name: "Delete" })).toBeVisible();
-
-    // Tapping anywhere else (a real viewport coordinate far from the menu, NOT
-    // the backdrop's own local origin) dismisses the menu — this verifies the
-    // fixed backdrop actually covers the viewport, not just the kebab box.
-    const vp = page.viewportSize();
-    const box = await menu.boundingBox();
-    const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
-    await page.mouse.click(farX, 5);
-    await expect(menu).toBeHidden();
-  });
-
-  test("Reply from the kebab opens the composer reply preview", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    test.skip(
-      !(await touchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
-
-    const kebab = page.locator('[data-testid="message-kebab"]').first();
-    await kebab.click();
-    await page
-      .locator('[data-testid="message-action-menu"]')
-      .getByRole("button", { name: "Reply" })
-      .click();
-
-    // The composer shows a reply-preview strip (with a "Cancel reply" button)
-    // once a reply target is set.
-    await expect(page.getByTitle("Cancel reply")).toBeVisible({ timeout: 5_000 });
-  });
-
-  test("React from the kebab opens the emoji picker and closes the menu", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    test.skip(
-      !(await touchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
-
-    const menu = page.locator('[data-testid="message-action-menu"]');
-    await page.locator('[data-testid="message-kebab"]').first().click();
-    await menu.getByRole("button", { name: "React" }).click();
-
-    // The action menu closes and the emoji picker (emoji buttons titled
-    // "React with …") opens.
-    await expect(menu).toBeHidden();
-    await expect(page.getByTitle(/^React with/).first()).toBeVisible({
-      timeout: 5_000,
-    });
-
-    // While the picker is open its raised backdrop covers the kebabs, so a tap
-    // at a kebab lands on that backdrop and dismisses the picker (the two
-    // popovers can't stack). No action menu opens from that same tap.
-    const kbox = await page
-      .locator('[data-testid="message-kebab"]')
-      .first()
-      .boundingBox();
-    expect(kbox).not.toBeNull();
-    if (kbox) {
-      await page.mouse.click(kbox.x + kbox.width / 2, kbox.y + kbox.height / 2);
-    }
+    // The picker's raised backdrop covers every other row's controls, so a
+    // tap at another message's Reply lands on it and closes the picker; no
+    // second action starts from that tap. Dispatched at the coordinate,
+    // since Playwright refuses to click an obscured element.
+    const other = rows.nth((await rows.count()) - 2);
+    const box = await other.getByTestId("message-reply-button").boundingBox();
+    expect(box).not.toBeNull();
+    const [x, y] = [box!.x + box!.width / 2, box!.y + box!.height / 2];
+    const at = await page.evaluate(([x, y]) => {
+      const el = document.elementFromPoint(x, y);
+      return { picker: !!el?.closest('[data-testid="emoji-picker"]'), reply: !!el?.closest('[data-testid="message-reply-button"]') };
+    }, [x, y]);
+    expect(at, "premise: the tap lands outside the picker, over the other Reply").toEqual({ picker: false, reply: false });
+    const chips = await page.getByTestId("reaction-chip").count();
+    await page.mouse.click(x, y);
     await expect(page.getByTitle(/^React with/)).toHaveCount(0);
-    await expect(menu).toBeHidden();
-  });
-
-  test("menu stays on-screen and dismisses via a far tap (narrow phone)", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    test.skip(
-      !(await touchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
-
-    const vp = page.viewportSize();
-    // Both an own (4-row menu) and a received (2-row menu) message: both
-    // menus must stay within the viewport.
-    for (const sel of [
-      '[id^="msg-"][data-message-self="true"]',
-      '[id^="msg-"][data-message-self="false"]',
-    ]) {
-      const row = page.locator(sel).first();
-      if ((await row.count()) === 0) continue;
-      await row.locator('[data-testid="message-kebab"]').click();
-      const menu = page.locator('[data-testid="message-action-menu"]');
-      await expect(menu).toBeVisible();
-
-      const box = await menu.boundingBox();
-      expect(box).not.toBeNull();
-      if (box && vp) {
-        expect(box.x).toBeGreaterThanOrEqual(-1);
-        expect(box.x + box.width).toBeLessThanOrEqual(vp.width + 1);
-      }
-      // The menu content (first action) must be fully on-screen, not clipped by
-      // the scroll container's overflow-x-hidden backstop.
-      const replyBox = await menu
-        .getByRole("button", { name: "Reply" })
-        .boundingBox();
-      if (replyBox && vp) {
-        expect(replyBox.x).toBeGreaterThanOrEqual(-1);
-        expect(replyBox.x + replyBox.width).toBeLessThanOrEqual(vp.width + 1);
-      }
-      // Opening the menu must not introduce a horizontal page scrollbar.
-      const hScroll = await page.evaluate(
-        () =>
-          document.documentElement.scrollWidth >
-          document.documentElement.clientWidth
-      );
-      expect(hScroll).toBe(false);
-
-      // Dismiss via a far viewport tap before the next iteration.
-      const farX = box && vp && box.x > vp.width / 2 ? 5 : (vp?.width ?? 100) - 5;
-      await page.mouse.click(farX, 5);
-      await expect(menu).toBeHidden();
-    }
-  });
-
-  test("menu is capped to the scrollport height on a short viewport", async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width: 500, height: 340 });
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    test.skip(
-      !(await touchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
-
-    // Own message (4-row menu) opened on a short scrollport: the menu must be
-    // capped to the available space (and scroll internally) rather than extend
-    // past the scroll container with actions unreachable.
-    await page
-      .locator('[id^="msg-"][data-message-self="true"]')
-      .first()
-      .locator('[data-testid="message-kebab"]')
-      .click();
-    const menu = page.locator('[data-testid="message-action-menu"]');
-    await expect(menu).toBeVisible();
-
-    const box = await menu.boundingBox();
-    const scrollportH = await page.evaluate(() => {
-      const el = document.getElementById("chat-scroll-container");
-      return el ? el.clientHeight : 0;
-    });
-    expect(box).not.toBeNull();
-    if (box) {
-      // Fits within the scrollport (a few px slack), so nothing is clipped away.
-      expect(box.height).toBeLessThanOrEqual(scrollportH + 4);
-    }
-  });
-
-  test("never more than one menu open at a time", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    test.skip(
-      !(await touchOnly(page)),
-      "kebab menu is touch-only; desktop uses the hover action bar"
-    );
-
-    const menus = page.locator('[data-testid="message-action-menu"]');
-    const kebabs = page.locator('[data-testid="message-kebab"]');
-
-    // Open the first message's menu.
-    await kebabs.nth(0).click();
-    await expect(menus).toHaveCount(1);
-
-    // While a menu is open its wrapper is raised (z-[60]) so its full-viewport
-    // backdrop covers every other kebab. A tap at a later message's kebab
-    // therefore lands on the backdrop (Playwright's .click() would refuse the
-    // obscured element, so dispatch at the coordinate) and dismisses the menu —
-    // never two open, and the menu's own rows can't be intercepted by a sibling
-    // kebab. A second tap would then open that message's menu.
-    const box = await kebabs.nth(2).boundingBox();
-    expect(box).not.toBeNull();
-    if (box) {
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-    }
-    await expect(menus).toHaveCount(0);
+    expect(await page.getByTestId("reaction-chip").count(), "nothing was reacted").toBe(chips);
+    await expect(page.getByTitle("Cancel reply")).toHaveCount(0);
   });
 });
 

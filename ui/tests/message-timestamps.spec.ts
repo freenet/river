@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { coarsePointer, openRoomWithComposer, settle, touchOnly } from "./example-room";
+import { clickFooter, coarsePointer, openRoomWithComposer, settle } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // A message's time shows in two places: beside the author's name on a group's
@@ -181,13 +181,7 @@ test.describe("Message timestamps", () => {
 
     await callRiverTest(page, "holdMessageSigning");
     await one.scrollIntoViewIfNeeded();
-    if (await touchOnly(page)) {
-      await one.getByTestId("message-kebab").click();
-      await page.getByTestId("message-action-menu").getByRole("button", { name: /delete/i }).click();
-    } else {
-      await one.hover({ position: { x: 4, y: 4 } });
-      await one.getByTestId("message-hover-actions").getByRole("button", { name: "Delete message" }).click();
-    }
+    await clickFooter(page, one, "message-delete-button");
     await page.getByRole("button", { name: "Delete", exact: true }).click();
     await expect(one, "the delete shows while its signature is held").toHaveCount(0);
     await expect(header(), "the header moves to the message now first").toHaveAttribute("datetime", second!);

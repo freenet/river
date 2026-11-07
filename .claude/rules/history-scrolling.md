@@ -96,8 +96,8 @@ Current behavior:
   (`reader_moved_up_since`) is the latch that caused #508.
 - The history follows under every dialog and popover, a DM thread over the
   room included, and is read under all of them except that DM thread: member
-  info, room settings, invite and ban dialogs, the message action menu and
-  the reaction picker. The reader is at the end anyway when the dialog
+  info, room settings, invite and ban dialogs, a reactor list and the
+  reaction picker. The reader is at the end anyway when the dialog
   closes, but those arrivals count as read without having been on screen
   unobstructed.
 

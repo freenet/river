@@ -25,13 +25,6 @@
     }
 }
 
-@media (min-width: 768px) and (hover: none) {
-    .conversation-column {
-        /* Rows keep a 40px right gutter for the kebab on touch. */
-        --conversation-row-pad: 40px;
-    }
-}
-
 /* Message history. A row is a grid: the avatar gutter, then the content
  * column. A body's text starts at the same edge as a header's name, so what
  * tells a real header from a body that imitates one (`**Name** 🛡`) is the
@@ -60,7 +53,7 @@
     --msg-gutter: 60px;
     display: grid;
     grid-template-columns: var(--msg-gutter) minmax(0, 1fr);
-    /* No right gutter on a hover pointer: the hover bar floats over the row. */
+    /* No right gutter for controls: they sit in the row's footer. */
     padding: 2px 24px 2px 0;
     transition: background-color 0.15s;
 }
@@ -136,65 +129,117 @@
     text-underline-offset: 2px;
 }
 
-/* The floating hover bar: at the row's top right, over the row above it,
- * so no gutter is reserved for it. Idle, it is invisible AND takes no hits,
- * so it never covers Latest (z-30); it rests at z-20, under Latest and the
- * z-40 dismiss backdrops. Keyboard focus inside the row reveals it too
- * (below). */
-/* Pinned to the right edge of the text column, not the row: rows span the
- * panel but text stops at the body's 76ch measure, so on a wide window a bar
- * at the row's edge sat far from the message. `ch` is font-relative, so the
- * bar takes the body's 15px size (its buttons are fixed-size icons). Where
- * the column is narrower than the measure, the bar sits at its edge. */
-.hover-actions {
-    position: absolute;
-    font-size: 15px;
-    right: max(0px, calc(100% - 76ch));
-    top: -1.125rem;
-    z-index: 20;
+/* A message's footer: its reaction chips and React on the left, then Reply,
+ * and Edit and Delete on your own, as one trailing cluster. Its line is kept
+ * for every message, with or without reactions and whether or not the
+ * controls show, so showing them never moves anything. In flow, under the
+ * message: nothing overlaps it, and it never covers Latest (z-30) or another
+ * row.
+ *
+ * The chips wrap, React after them; the cluster wraps as a unit onto its own
+ * line when it does not fit beside them, kept 16px clear on a shared line.
+ * Its right edge is the body's 76ch measure (`ch` at the body's 15px), so on
+ * a wide row the actions stay by the text they act on. */
+.msg-footer {
     display: flex;
-    gap: 2px;
-    padding: 3px;
-    background-color: var(--color-panel);
-    border: 1px solid var(--color-border-hover);
-    border-radius: 0.5rem;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.1s;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 16px;
+    row-gap: 2px;
+    min-height: 28px;
+    margin-top: 2px;
+    max-width: 76ch;
+    font-size: 15px;
 }
 
-.hover-actions button {
-    width: 30px;
+.msg-reaction-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+}
+
+.msg-action-cluster {
+    display: flex;
+    flex: none;
+    gap: 2px;
+    margin-left: auto;
+}
+
+/* Each control's whole box is its target: a square 28px cell. Its rounded
+ * fill and focus ring are drawn by `::before`, because a rounded box does not
+ * take hits in its corners. */
+.msg-action {
+    position: relative;
+    width: 28px;
     height: 28px;
+    flex: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: 0.375rem;
+    border-radius: 0;
     color: var(--color-text-muted);
 }
 
-.hover-actions button:hover,
-.hover-actions button:focus-visible {
-    background-color: var(--color-surface);
+.msg-action::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 0.375rem;
+}
+
+.msg-action > svg {
+    position: relative;
+}
+
+.msg-action:hover,
+.msg-action:focus-visible,
+.msg-action[aria-expanded="true"] {
     color: var(--color-text);
 }
 
-@media (hover: hover) {
-    .msg-row:hover .hover-actions {
+.msg-action:hover::before,
+.msg-action:focus-visible::before,
+.msg-action[aria-expanded="true"]::before {
+    background-color: var(--color-surface);
+}
+
+/* Transparent, so forced-colours mode still draws a ring. */
+.msg-action:focus-visible {
+    outline: 2px solid transparent;
+}
+
+.msg-action:focus-visible::before {
+    box-shadow: inset 0 0 0 2px var(--color-link);
+}
+
+/* A fine pointer shows the controls only while their row is hovered: at rest
+ * they are invisible AND take no hits, though they keep their place and stay
+ * in the tab order. A touch or hybrid pointer (`any-pointer: coarse`) shows
+ * them at rest, as it does every hover-only control. The chips always show. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
+    .msg-action {
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.1s;
+    }
+
+    .msg-row:hover .msg-action {
         opacity: 1;
         pointer-events: auto;
     }
 }
 
-/* Keyboard focus inside the row reveals the bar too. `:focus-visible`, not
- * `:focus-within`: a mouse click on a chip or a reply strip focuses it, and
- * `:focus-within` would keep the bar shown and clickable over the row above
- * after the pointer had left. A separate rule, so a browser that does not
- * know `:has()` drops only this one and keeps the hover reveal; such a
- * browser has no keyboard-only reveal (an accepted trade-off). */
-@media (hover: hover) {
-    .msg-row:has(:focus-visible) .hover-actions {
+/* Keyboard focus inside the row shows them too, and so does an open control
+ * (the picker, a reactor list). `:focus-visible`, not `:focus-within`: a
+ * mouse click on a chip or a reply strip focuses it, and `:focus-within`
+ * would keep them shown after the pointer had left. A separate rule, so a
+ * browser that does not know `:has()` drops only this one and keeps the
+ * hover reveal. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
+    .msg-row:has(:focus-visible) .msg-action,
+    .msg-row:has([aria-expanded="true"]) .msg-action {
         opacity: 1;
         pointer-events: auto;
     }
@@ -321,7 +366,7 @@
     }
 }
 
-/* A DM thread's rows: the room's row, without the kebab gutter (a DM has no
+/* A DM thread's rows: the room's row, with no footer (a DM has no
  * per-message actions). */
 .msg-row.dm-row {
     padding-right: 20px;
@@ -354,18 +399,7 @@
     cursor: inherit;
 }
 
-/* Touch: the kebab sits in a narrow right gutter, and there is no hover time
- * or hover bar. */
-@media (hover: none) {
-    .msg-row {
-        padding-right: 40px;
-    }
-
-    .hover-actions {
-        display: none;
-    }
-}
-
+/* Touch: no hover time. */
 @media (hover: none), (any-pointer: coarse) {
     .msg-gutter-time {
         display: none;
@@ -450,32 +484,9 @@
     outline-offset: 1px;
 }
 
-/* Touch-only message action affordance (freenet/river#402).
- *
- * The per-message hover action bar (`.hover-actions` above) reveals only
- * under `@media (hover: hover)` and is `display: none` under `(hover: none)`.
- * On a touch device (phone, tablet) there is no hover pointer, so that bar
- * can NEVER appear and touch users would have no way to reach reply / edit /
- * delete / react.
- *
- * `.touch-actions` is the exact complement: hidden by default (so mouse users
- * keep the clean hover-reveal desktop UI) and shown only where `hover: none`
- * matches — i.e. precisely the devices where the hover bar cannot appear. It
- * decorates the always-visible kebab (⋮) button that opens the touch action
- * menu. */
-.touch-actions {
-    display: none;
-}
-
-@media (hover: none) {
-    .touch-actions {
-        display: flex;
-    }
-}
-
 /* DM-rail Archive ✕ — touch reveal (freenet/river#462).
  *
- * Same failure mode as #402 above: the archive button in the Direct Messages
+ * Same failure mode as #402 (a hover-only control unreachable on touch): the archive button in the Direct Messages
  * rail (`dm_rail_section.rs`) is `opacity-0` and reveals via Tailwind
  * `group-hover:opacity-100`, which Tailwind v4 wraps in `@media (hover: hover)`.
  * On a touch device that reveal can never fire, so before this rule the button

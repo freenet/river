@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { coarsePointer, openInlinePicker, selectRoom, settle, touchOnly, waitForApp } from "./example-room";
+import { coarsePointer, openInlinePicker, selectRoom, settle, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -104,15 +104,12 @@ async function removeOwnReaction(page: Page, chip: Locator) {
     await expect(chip).toHaveCount(0);
     // The chip that opened the list is gone, so focus stays on the reaction
     // line rather than going nowhere: another chip while one remains, else
-    // the message's React action (the kebab on touch, the hover bar's React
-    // otherwise).
+    // the message's footer React.
     const message = page.locator(`[id="${messageId}"]`);
     const nearest =
       (await message.getByTestId("reaction-chip").count()) > 0
         ? message.getByTestId("reaction-chip").first()
-        : (await touchOnly(page))
-          ? message.getByTestId("message-kebab")
-          : message.getByTestId("message-hover-actions").getByRole("button", { name: "React" });
+        : message.getByTestId("message-react-button");
     await expect(nearest).toBeFocused();
   } else {
     await expect(owners).toHaveCount(0);
@@ -220,7 +217,6 @@ test.describe("Reaction owner list (#714)", () => {
       await page.mouse.click(8, 8);
       await expect(owners).toHaveCount(0);
       await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
-      await expect(page.getByTestId("message-action-menu")).toHaveCount(0);
 
       await pressChip(own);
       await expect(owners).toBeVisible();
@@ -294,6 +290,37 @@ test.describe("Reaction removed from the owner list", () => {
     await expect(own).toHaveCount(0);
     await expect(chips).toHaveCount(1);
     await expect(chips.first()).toBeFocused();
+  });
+});
+
+// Removing the message's last reaction from the list leaves no chip to go back
+// to: focus goes to the message's footer React, which is always there, and
+// without moving the history (only an arrival moves the view).
+test.describe("Last reaction removed from the owner list", () => {
+  test("focus goes to the footer React and the history stays put", async ({ page }) => {
+    test.skip(!(await coarsePointer(page)), "the list opens only on a coarse pointer");
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+    const chip = await addOwnReaction(page);
+    const messageId = await chip.evaluate((el) => el.closest('[id^="msg-"]')!.id);
+    const message = page.locator(`[id="${messageId}"]`);
+    await expect(message.getByTestId("reaction-chip"), "premise: the message's only chip").toHaveCount(1);
+
+    await pressChip(chip);
+    const owners = page.getByTestId("reaction-owners");
+    await expect(owners).toBeVisible();
+    // Park the message out of view, so a focus that scrolled would show.
+    await scrollChipOutOfView(page, chip);
+    const parked = await historyScrollTop(page);
+    // A click with no scroll of its own (Playwright's would scroll to it).
+    await owners.getByTestId("reaction-remove").evaluate((el) => (el as HTMLElement).click());
+    await expect(chip).toHaveCount(0);
+    await expect(owners).toHaveCount(0);
+    await expect(message.getByTestId("message-react-button")).toBeFocused();
+    await settle(page);
+    expect(await historyScrollTop(page), "the history did not move").toBeCloseTo(parked, 0);
   });
 });
 
