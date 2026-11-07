@@ -217,7 +217,13 @@
 /* A fine pointer shows the controls only while their row is hovered: at rest
  * they are invisible AND take no hits, though they keep their place and stay
  * in the tab order. A touch or hybrid pointer (`any-pointer: coarse`) shows
- * them at rest, as it does every hover-only control. The chips always show. */
+ * them at rest, as it does every hover-only control. The chips always show.
+ *
+ * A control with focus shows however it got it, off hover too, until focus
+ * leaves it: a mouse pick returns focus to React from script, which is not
+ * `:focus-visible`, and a focused control must not be invisible. Only that
+ * control shows, not the row's others, and its ring stays on
+ * `:focus-visible`. */
 @media (hover: hover) and (not (any-pointer: coarse)) {
     .msg-action {
         opacity: 0;
@@ -225,7 +231,8 @@
         transition: opacity 0.1s;
     }
 
-    .msg-row:hover .msg-action {
+    .msg-row:hover .msg-action,
+    .msg-action:focus {
         opacity: 1;
         pointer-events: auto;
     }

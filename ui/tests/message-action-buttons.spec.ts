@@ -6,8 +6,9 @@ import { callRiverTest } from "./river-test";
 // its one React, then a trailing cluster of Reply, and Edit and Delete on your
 // own messages. The footer's line is kept for every message, so showing its
 // controls never moves anything. A fine pointer shows them while the row is
-// hovered, holds keyboard focus or has its picker open; a touch or hybrid
-// pointer shows them at rest. Reaction chips always show.
+// hovered, holds keyboard focus or has its picker open, and shows a control
+// that has focus however it got it; a touch or hybrid pointer shows them at
+// rest. Reaction chips always show.
 
 const CONTROLS = ["message-react-button", "message-reply-button", "message-edit-button", "message-delete-button"];
 const LEGACY_ROUTES =
@@ -265,6 +266,9 @@ test.describe("Footer controls on a fine pointer", () => {
   test("reaction chips show at rest", async ({ page }) => {
     const { own } = await openRoomWithBoth(page);
     const chip = await reactTo(page, own);
+    // The pick returned focus to React where the engine focuses on a click,
+    // and a focused React stays shown; at rest is with focus gone too.
+    await own.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await page.mouse.move(0, 0);
     await settle(page);
     expect(await chip.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");

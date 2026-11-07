@@ -458,6 +458,62 @@ test.describe("The reaction picker", () => {
     expect((await scrollMetrics(page)).top, "nothing scrolled").toBeCloseTo(parked, 0);
   });
 
+  // After a mouse pick, focus goes back to React from script, which is not
+  // keyboard focus: React must not then be a focused control nobody can see.
+  // It stays shown and usable until focus leaves it, with no ring; the row's
+  // other actions keep their hover reveal.
+  test("a mouse pick leaves the React it returns focus to shown and usable after the pointer leaves", async ({ page }) => {
+    test.skip(await coarsePointer(page), "a touch pointer shows the controls at rest");
+    await openRoomWithComposer(page);
+    await deliver(page, "mouse focus target");
+    const row = committed(page, "mouse focus target");
+    const react = row.getByTestId("message-react-button");
+    await openWithPointer(page, row);
+    const parked = (await scrollMetrics(page)).top;
+    await picker(page).getByRole("button").first().click();
+    await expectClosed(page);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+
+    await page.mouse.move(0, 0);
+    await settle(page);
+    expect(await row.evaluate((el) => el.matches(":hover")), "premise: the row is not hovered").toBe(false);
+    const state = (testid: string) =>
+      row.evaluate(async (el, testid) => {
+        const b = el.querySelector(`[data-testid="${testid}"]`) as HTMLElement;
+        await Promise.all(b.getAnimations().map((a) => a.finished));
+        const r = b.getBoundingClientRect();
+        const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return {
+          focused: document.activeElement === b,
+          keyboardFocus: b.matches(":focus-visible"),
+          opacity: getComputedStyle(b).opacity,
+          hit: !!at && b.contains(at),
+        };
+      }, testid);
+    const returned = await state("message-react-button");
+    test.info().annotations.push({ type: "focus after a mouse pick", description: returned.focused ? "on React" : "not on React" });
+    expect((await scrollMetrics(page)).top, "nothing scrolled").toBeCloseTo(parked, 0);
+    if (!returned.focused) {
+      // WebKit focuses no button on a click, so no focus is returned; React
+      // keeps the hover reveal.
+      expect(returned, "unfocused, React is hidden at rest").toEqual({ focused: false, keyboardFocus: false, opacity: "0", hit: false });
+      return;
+    }
+    expect(returned, "focused React is shown and takes hits, without a ring").toEqual({ focused: true, keyboardFocus: false, opacity: "1", hit: true });
+    expect(await state("message-reply-button"), "the other actions are not revealed by it").toMatchObject({ opacity: "0", hit: false });
+    const height = () => row.evaluate((el) => el.getBoundingClientRect().height);
+    const shownHeight = await height();
+    await revealFooter(page, row);
+    expect(await height(), "showing it moved nothing").toBe(shownHeight);
+    await page.mouse.move(0, 0);
+
+    // It is the React it looks like: Enter opens its picker again.
+    await page.keyboard.press("Enter");
+    await expectOpenFor(page, row);
+    await page.keyboard.press("Escape");
+    await expectClosed(page);
+  });
+
   test("a reaction arriving while it is open moves React, and the picker with it", async ({ page }) => {
     await openRoomWithComposer(page);
     await deliverOffscreen(page, "reflow target");
