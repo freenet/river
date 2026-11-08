@@ -187,16 +187,21 @@ fn request_grant_paced(
     let deadline = now() + created.expires_in + pacing.margin;
     waiting(&created.approve_url);
     let poll = format!("{ROUTE_REQUEST}/{}", created.request_id);
-    // When polls started failing to reach the node, and whether any ever did.
-    let mut failing_since: Option<Instant> = None;
-    let mut ever_failed = false;
+    // Since when polls have been failing to reach the node, and the last failure.
+    let mut failing: Option<(Instant, String)> = None;
     loop {
         if now() >= deadline {
-            return GrantOutcome::Expired;
+            // A node that was down when the request ran out is reported as that.
+            return match failing {
+                Some((_, e)) => GrantOutcome::Unreachable(e),
+                None => GrantOutcome::Expired,
+            };
         }
+        // Whether this is the first answer after polls failed.
+        let after_failure;
         let reply = match http.get(&poll) {
             Ok(r) => {
-                failing_since = None;
+                after_failure = failing.take().is_some();
                 r
             }
             // The node may be restarting. The request id still names the same request, so
@@ -204,11 +209,11 @@ fn request_grant_paced(
             // another page). A longer one is reported as the node being gone, not left on
             // the approval screen until the request expires.
             Err(e) => {
-                ever_failed = true;
-                let since = *failing_since.get_or_insert_with(now);
+                let since = failing.as_ref().map_or_else(now, |(at, _)| *at);
                 if now().saturating_duration_since(since) >= pacing.outage {
                     return GrantOutcome::Unreachable(e);
                 }
+                failing = Some((since, e));
                 sleep(pacing.pause);
                 continue;
             }
@@ -227,9 +232,10 @@ fn request_grant_paced(
             // grant limit, the grant not stored yet, or too many polls at once across every
             // client of the node: the request is kept, so poll again after a pause.
             (202, _) | (409, _) | (429, _) | (503, _) => sleep(pacing.pause),
-            // After the node was unreachable, an unknown request means it restarted and forgot
-            // it: that is the node's doing, not an unanswered page.
-            (404, _) if ever_failed => {
+            // The first answer after the node was unreachable saying the request is unknown
+            // means it restarted and forgot it: the node's doing, not an unanswered page. A 404
+            // later on is the request expiring as usual.
+            (404, _) if after_failure => {
                 return GrantOutcome::Unreachable("Freenet restarted".into());
             }
             (404, _) => return GrantOutcome::Expired,
@@ -716,6 +722,43 @@ mod tests {
         let (outcome, gets) = run_clocked(Err("gone"));
         assert_eq!(outcome, GrantOutcome::Unreachable("gone".into()));
         assert_eq!(gets, 3);
+    }
+
+    /// A blip that the node answered through, and then a natural expiry: that is an expiry.
+    #[test]
+    fn an_expiry_after_an_earlier_blip_is_an_expiry() {
+        let (outcome, _, _) = run(vec![
+            Ok((200, CREATED)),
+            Err("reset"),
+            Ok((202, PENDING)),
+            Ok((404, r#"{"error":"unknown or expired request"}"#)),
+        ]);
+        assert_eq!(outcome, GrantOutcome::Expired);
+    }
+
+    /// The node went down shortly before the request ran out: that is the node being gone.
+    #[test]
+    fn a_node_down_when_the_request_runs_out_is_unreachable() {
+        // 600 s request, 30 s margin, polls every 30 s, outage limit 60 s: answers until 570 s,
+        // fails at 600 s, and the deadline (630 s) comes before the outage limit.
+        let mut script = vec![Ok((200, CREATED))];
+        script.extend(std::iter::repeat_n(Ok((202, PENDING)), 20));
+        script.extend(std::iter::repeat_n(Err("gone"), 5));
+        let http = Scripted::new(script);
+        let clock = std::cell::Cell::new(Instant::now());
+        let outcome = request_grant_paced(
+            &http,
+            AUTHORITY,
+            &mut |_| {},
+            &GrantPacing {
+                pause: Duration::from_secs(30),
+                margin: Duration::from_secs(30),
+                outage: Duration::from_secs(60),
+            },
+            &mut |d| clock.set(clock.get() + d),
+            &|| clock.get(),
+        );
+        assert_eq!(outcome, GrantOutcome::Unreachable("gone".into()));
     }
 
     /// A node that was unreachable and then forgets the request has restarted: that is not an

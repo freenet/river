@@ -19,6 +19,8 @@
 //!   named on screen and asked again with its own backoff. A late answer to an earlier ask
 //!   can leave the node notifying twice; applying the same update twice changes nothing,
 //!   since a room's state merges idempotently. Left and re-keyed rooms are no longer asked for.
+//!   This client API has no unsubscribe, so each ask's listener on the node stays registered
+//!   until the connection closes; a reconnect starts with none.
 //! - **New and left rooms.** The stored rooms are read again periodically while connected, so
 //!   a room joined or left in the browser shows up here without a restart. A read that finds
 //!   no store or no rooms at all keeps the list shown: that is a store that went away, not a
@@ -258,6 +260,8 @@ pub(super) fn run(
                     // Another window saved a newer grant; try that one.
                     token = Some(newer);
                     unconfirmed = false;
+                    read_first_retry = false;
+                    early_read = pace.early_read;
                     continue;
                 }
                 if unconfirmed {

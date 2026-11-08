@@ -922,6 +922,8 @@ impl Drop for Running {
             }
             if h.is_finished() {
                 let _ = h.join();
+            } else if !std::thread::panicking() {
+                panic!("the session did not stop when asked");
             }
         }
     }
@@ -1264,8 +1266,9 @@ fn an_unanswered_ping_ends_the_connection() {
     session.wait_until("a reconnect", || {
         node.with(|w| w.connections.len() > before)
     });
-    // The idle check (50 ms) and the pong deadline (100 ms) both had to pass.
-    assert!(stalled.elapsed() >= Duration::from_millis(150));
+    // At least the pong deadline passed. (A ping sent just before the stall can expire as
+    // early as `pong_wait` after it, so nothing longer can be asserted.)
+    assert!(stalled.elapsed() >= Duration::from_millis(100));
     node.with(|w| w.stall_live = false);
 }
 
@@ -1402,4 +1405,26 @@ fn a_notification_marks_the_room_followed() {
     session.wait_rooms("A is followed", |_, issues, _| {
         issues.not_following.is_empty()
     });
+}
+
+/// A shown room whose stored copy can't be merged on a reload is named as not updated.
+#[test]
+fn a_stored_copy_that_cannot_be_merged_is_named() {
+    let mut rooms = Rooms::default();
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    rooms.replace(loaded(vec![a.stored()]));
+    let mut bad = a.stored();
+    // An upgrade pointer signed by someone other than the owner: the merge refuses it.
+    bad.room_state.upgrade = river_core::room_state::upgrade::OptionalUpgradeV1(Some(
+        river_core::room_state::upgrade::AuthorizedUpgradeV1::new(
+            river_core::room_state::upgrade::UpgradeV1 {
+                owner_member_id: MemberId::from(&a.vk()),
+                version: 1,
+                new_chatroom_address: blake3::Hash::from([0; 32]),
+            },
+            &SigningKey::from_bytes(&[99; 32]),
+        ),
+    ));
+    assert!(rooms.replace(loaded(vec![bad])).is_empty());
+    assert_eq!(rooms.issues().not_updated, ["A"]);
 }

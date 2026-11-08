@@ -325,6 +325,8 @@ impl NodeSocket {
 }
 
 /// Whether `t` is a token68 (RFC 7235): letters, digits, `-._~+/`, then optional `=` padding.
+/// The node's grant tokens are base58, whose alphabet is a subset of this, so every token the
+/// node issues passes; this only refuses what no node could have issued.
 fn is_token68(t: &str) -> bool {
     let body = t.trim_end_matches('=');
     !body.is_empty()
