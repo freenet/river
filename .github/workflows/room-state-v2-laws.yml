@@ -1,0 +1,44 @@
+# The room state v2 merge laws at full size. A pull request runs them at CI
+# size (build.yml), and a sample can pass a rule that the full size fails, so
+# these run weekly and on demand. Tests only: no publish step and no secrets.
+name: Room state v2 laws at full size
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: 8388608
+
+jobs:
+  laws:
+    # Ubicloud, NOT a GitHub-hosted larger runner. See build.yml.
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 360
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@1.94.1
+
+    - name: Prefetch dependencies
+      run: cargo fetch --locked
+
+    - name: Laws at model size
+      run: cargo test --release -p river-core --lib --features room-state-v2 room_state_v2::tests::laws -- --ignored --nocapture --test-threads 1
+
+    - name: Rule families, every triple
+      run: cargo test --release -p river-core --lib --features room-state-v2 room_state_v2::tests::rule_families -- --ignored --nocapture --test-threads 1
+
+    - name: Real path at size
+      run: cargo test --release -p river-core --lib --features room-state-v2 room_state_v2::tests::real -- --ignored --nocapture --test-threads 1
+
+    - name: Ceilings
+      run: cargo test --release -p river-core --lib --features room-state-v2 _at_the_ceilings -- --ignored --nocapture --test-threads 1

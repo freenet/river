@@ -25,9 +25,13 @@ migration entry, **users lose all room data**.
 - Run `add-migration` BEFORE your changes alter the WASM (stash changes first if needed)
 - **Single source of truth**: `legacy_delegates.toml` — never manually edit byte arrays
 - **Both steps use BLAKE3**: `code_hash = BLAKE3(wasm)`, `delegate_key = BLAKE3(code_hash)` — NOT SHA256
-- **Publish both UI and riverctl** when the ROOM-CONTRACT WASM changes:
-  `cargo make publish-all`. riverctl embeds only `room_contract.wasm`, so a
-  delegate-only re-key (e.g. freenet/river#757) publishes the UI alone.
+- **Publish both UI and riverctl** when the ROOM-CONTRACT WASM changes: the
+  UI with `cargo make publish-river`, riverctl by pushing its
+  `riverctl-v<version>` tag (the version bump lands in the PR; the tag
+  workflow publishes river-core first). Not `cargo make publish-all`, which
+  bumps riverctl again and never publishes river-core (see river-publish.md).
+  riverctl embeds only `room_contract.wasm`, so a delegate-only re-key (e.g.
+  freenet/river#757) publishes the UI alone.
 
 ## Single Source of Truth: `legacy_delegates.toml`
 

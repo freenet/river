@@ -1,0 +1,16 @@
+[package]
+name = "host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+river-core = { path = "../../../common", features = ["room-state-v2-client"] }
+# The wasmtime freenet-core's Cargo.lock resolves (47.0.3 at c86c91e1d).
+wasmtime = { version = "=47.0.3", default-features = false, features = ["async", "cranelift", "runtime", "std", "parallel-compilation"] }
+anyhow = "1"
+ed25519-dalek = { version = "2.1.1", default-features = false }
+# The contract's own interface, to call the built contract as freenet-core does.
+freenet-stdlib = { version = "0.12.1" }
+bincode = "1"
+ciborium = "0.2.2"

@@ -1,0 +1,45 @@
+# Measures room state v2's validate_state and merge on the WASM build, under
+# the wasmtime configuration freenet-core runs contracts with. Its own
+# workspace, so it never touches the River workspace's Cargo.lock (which pins
+# the published contract and delegate WASM). See README.md.
+[workspace]
+members = ["guest", "host"]
+resolver = "2"
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+# The host (state builder and wasmtime) is built with this profile; the
+# guest uses `release`, as the room contract does.
+[profile.host]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+
+# The signature and hash crates at opt-level 3, as the v2 room contract is
+# built (1.5x faster signature checks than "z"); everything else "z".
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
+
+# The same guest with opt-level 3 instead of the room contract's "z", to
+# show what the profile costs.
+[profile.guest-o3]
+inherits = "release"
+opt-level = 3
+
+# The guest with its function names kept, for `PROFILE=perfmap` with
+# `perf record`.
+[profile.guest-prof]
+inherits = "release"
+strip = false
