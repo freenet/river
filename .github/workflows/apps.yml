@@ -3,25 +3,33 @@ name: Native apps
 # River's native apps (apps/) are a separate Cargo workspace with their own
 # lockfile and toolchain pin, so build.yml never compiles them. This workflow
 # does: format, clippy, unit tests, and a headless render of every screen
-# (setup and chat). river-app compiles in ui/assets/river_logo.svg, so that
-# file is in both path lists too.
+# (setup, rooms and chat). river-app depends on river-core (common/) and
+# compiles in two files from ui/ (the logo and the chat delegate WASM, whose
+# hash is the delegate key it reads rooms from), so those are in both path
+# lists too.
 #
 # GitHub-hosted ubuntu-latest, which is free on this public repo (see the
 # runs-on comment in build.yml for why larger runners are not used).
 
 on:
-  # When the apps start depending on river-core, add 'common/**' to both path
-  # lists, or a change there that breaks the apps won't run this workflow.
   pull_request:
     paths:
       - 'apps/**'
+      - 'common/**'
+      # river-core inherits its dependency versions from the root manifest.
+      - 'Cargo.toml'
       - 'ui/assets/river_logo.svg'
+      - 'ui/public/contracts/chat_delegate.wasm'
       - '.github/workflows/apps.yml'
   push:
     branches: [main]
     paths:
       - 'apps/**'
+      - 'common/**'
+      # river-core inherits its dependency versions from the root manifest.
+      - 'Cargo.toml'
       - 'ui/assets/river_logo.svg'
+      - 'ui/public/contracts/chat_delegate.wasm'
       - '.github/workflows/apps.yml'
   workflow_dispatch:
 

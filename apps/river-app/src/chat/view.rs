@@ -10,7 +10,7 @@ use super::conversation::{avatar, conversation};
 use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
-use super::{Chat, Source};
+use super::{Chat, LinkStatus, Source};
 use crate::RiverApp;
 
 /// Below this window width the members panel gives way to the conversation, as the web UI
@@ -47,7 +47,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         })
         .child(rooms(chat, logo, narrow, &p));
     let Some(room) = chat.room() else {
-        return screen.child(no_rooms(&p));
+        return screen.child(no_rooms(chat.source, &p));
     };
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     if chat.members_shown(narrow) {
@@ -193,21 +193,22 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette) -> El {
         .child(vline(p))
 }
 
-/// Where the rooms come from, at the foot of the room list. When the app reads rooms from the
-/// node, its connection state (connected, reconnecting, disconnected) belongs here, as the web
-/// UI's connection pill does.
+/// Where the rooms come from, at the foot of the room list, and for rooms from the node the
+/// connection's state, as the web UI's connection pill shows it.
 fn source_status(source: Source, p: &Palette) -> El {
-    match source {
-        Source::Example => row().key("source-status").px(4.0).child(
-            label(
-                "Example rooms, not connected to Freenet",
-                st::SMALL,
-                p.text_muted,
-            )
-            .wrap()
-            .w_full(),
+    let (text, color) = match source {
+        Source::Example => ("Example rooms, not connected to Freenet", p.text_muted),
+        Source::Node(LinkStatus::Loading) => ("Catching up with Freenet…", p.text_muted),
+        Source::Node(LinkStatus::Live) => ("Connected to Freenet", p.text_muted),
+        Source::Node(LinkStatus::Reconnecting) => (
+            "Connection to Freenet lost. Reconnecting…",
+            p.text_secondary,
         ),
-    }
+    };
+    row()
+        .key("source-status")
+        .px(4.0)
+        .child(label(text, st::SMALL, color).wrap().w_full())
 }
 
 /// About how many characters of 12 point text fit in a room row's second line.
@@ -284,7 +285,14 @@ fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
     }
 }
 
-fn no_rooms(p: &Palette) -> El {
+fn no_rooms(source: Source, p: &Palette) -> El {
+    let hint = match source {
+        Source::Example => "Create a room, or enter an invite code to join one.",
+        // This app can't create or join rooms yet; the web UI can.
+        Source::Node(_) => {
+            "Rooms you create or join in River in your browser, on this computer, show up here."
+        }
+    };
     col()
         .key("no-rooms")
         .grow(1.0)
@@ -292,11 +300,7 @@ fn no_rooms(p: &Palette) -> El {
         .center()
         .gap(8.0)
         .child(label("No rooms yet", st::TITLE, p.text))
-        .child(label(
-            "Create a room, or enter an invite code to join one.",
-            st::BODY,
-            p.text_secondary,
-        ))
+        .child(label(hint, st::BODY, p.text_secondary))
 }
 
 // Members -------------------------------------------------------------------------------------

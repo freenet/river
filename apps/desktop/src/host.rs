@@ -109,6 +109,10 @@ impl NodeHost for DesktopHost {
         classify(self.ask_node(), find_installed().is_some())
     }
 
+    fn config_dir(&self) -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("", "Freenet", "River").map(|d| d.config_dir().to_owned())
+    }
+
     fn can_install(&self) -> bool {
         release::asset_name(release::MIN_INSTALL_VERSION).is_ok()
     }

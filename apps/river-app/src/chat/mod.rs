@@ -1,9 +1,10 @@
 //! The chat screen: rooms on the left, the open room's conversation in the middle, its members
 //! on the right.
 //!
-//! Nothing here talks to a node yet. The rooms come from a [`Source`], and today the only source
-//! is [`Source::Example`], the built-in example data. Selecting a room, sending a message and
-//! showing or hiding the members panel all work, in memory.
+//! The rooms come from a [`Source`]: the built-in example data ([`Source::Example`]), where
+//! sending works in memory, or the user's real rooms read from the node ([`Source::Node`], see
+//! `crate::rooms`), which are read-only for now. Selecting a room and showing or hiding the
+//! members panel work either way.
 
 mod conversation;
 pub mod example;
@@ -26,6 +27,61 @@ pub use view::{NARROW_WIDTH, view};
 pub enum Source {
     /// Built-in example rooms. Nothing is read from or sent to Freenet.
     Example,
+    /// The user's rooms, read from the local node. Nothing is sent yet.
+    Node(LinkStatus),
+}
+
+impl Source {
+    /// Whether messages can be sent from this screen.
+    pub fn can_send(self) -> bool {
+        matches!(self, Source::Example)
+    }
+}
+
+/// The connection to the node behind [`Source::Node`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkStatus {
+    /// The stored rooms are shown; the network's latest is still being fetched.
+    Loading,
+    /// Subscribed: new messages arrive as they are sent.
+    Live,
+    /// The connection was lost. The rooms shown are as last seen; River is reconnecting.
+    Reconnecting,
+}
+
+/// Where the user had read a room up to, kept for rooms read from the node (which this app
+/// does not write back): the time of the newest message then, and how many messages had that
+/// exact time, so messages arriving later in the same minute still count as unread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadMark {
+    time: u32,
+    at_time: usize,
+}
+
+impl ReadMark {
+    fn of(room: &Room) -> Option<ReadMark> {
+        let time = room.last_message()?.time;
+        let at_time = room.messages.iter().filter(|m| m.time == time).count();
+        Some(ReadMark { time, at_time })
+    }
+
+    /// Messages from others after this mark.
+    fn unread(self, room: &Room) -> usize {
+        let mut same = 0;
+        let mut count = 0;
+        for m in &room.messages {
+            let after = if m.time == self.time {
+                same += 1;
+                same > self.at_time
+            } else {
+                m.time > self.time
+            };
+            if after && m.author != room.me {
+                count += 1;
+            }
+        }
+        count
+    }
 }
 
 pub struct Chat {
@@ -53,9 +109,14 @@ pub struct Chat {
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
     pub day_zero: i64,
     /// The time a message sent now is stamped with, in message time's minutes.
-    // TODO: a fixed time for example data; it goes once the app reads real rooms and stamps
-    // messages with the clock.
+    /// Example data uses a fixed time; rooms read from the node use the clock
+    /// ([`Chat::show_node_rooms`]).
     pub now: u32,
+    /// Where each room was read up to on this device, by room key (rooms from the node only).
+    read: HashMap<String, ReadMark>,
+    /// Whether rooms from the node have been shown yet, so the room the web UI had open opens
+    /// only the first time.
+    node_rooms_shown: bool,
 }
 
 impl Chat {
@@ -73,6 +134,8 @@ impl Chat {
             today,
             day_zero,
             now,
+            read: HashMap::new(),
+            node_rooms_shown: false,
         };
         chat.set_rooms(rooms);
         chat
@@ -127,6 +190,45 @@ impl Chat {
         }
     }
 
+    /// Show the user's rooms as read from the node, replacing what is shown. `open` is the room
+    /// the web UI had open, opened the first time rooms arrive. `now` is the current time in
+    /// message time (local minutes since 1970-01-01), which also sets today.
+    ///
+    /// A room's unread count comes from the node until the room is opened here; after that it
+    /// counts from where it was read on this device, since this app does not write the read
+    /// position back yet.
+    pub fn show_node_rooms(
+        &mut self,
+        mut rooms: Vec<Room>,
+        open: Option<&str>,
+        status: LinkStatus,
+        now: u32,
+    ) {
+        self.source = Source::Node(status);
+        self.now = now;
+        self.day_zero = 0;
+        self.today = now / model::MINUTES_PER_DAY;
+        for room in &mut rooms {
+            if let Some(mark) = self.read.get(&room.key) {
+                room.unread = mark.unread(room);
+            }
+        }
+        let first = !self.node_rooms_shown && !rooms.is_empty();
+        self.set_rooms(rooms);
+        if first {
+            self.node_rooms_shown = true;
+            if let Some(open) = open {
+                self.select(open);
+            }
+        }
+        // The open room is being read.
+        if let Some(room) = self.room()
+            && let Some(mark) = ReadMark::of(room)
+        {
+            self.read.insert(room.key.clone(), mark);
+        }
+    }
+
     /// Change the rooms in place, then settle the open room as [`Chat::set_rooms`] does.
     pub fn edit_rooms(&mut self, f: impl FnOnce(&mut Vec<Room>)) {
         let mut rooms = std::mem::take(&mut self.rooms);
@@ -150,6 +252,9 @@ impl Chat {
             return;
         };
         room.unread = 0;
+        if let Some(mark) = ReadMark::of(room) {
+            self.read.insert(key.to_owned(), mark);
+        }
         if key == self.selected {
             return;
         }
@@ -175,6 +280,9 @@ impl Chat {
     /// Send what the composer holds to the open room. Blank text sends nothing; otherwise the
     /// composer clears (keeping focus, so the next message can be typed straight away).
     pub fn send(&mut self) -> bool {
+        if !self.source.can_send() {
+            return false;
+        }
         let text = self.composer.text.trim().to_owned();
         if text.is_empty() {
             return false;
