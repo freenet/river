@@ -518,6 +518,12 @@ fn a_new_room_reads_back_as_itself() {
 /// A join of a public room, run up to the slot read it sends after reading the room: the work,
 /// the room's owner and slot key, and the invitee's identity.
 fn joining_to_slot(w: &mut Work) -> (VerifyingKey, Vec<u8>, SigningKey) {
+    joining_to_slot_with(w, false)
+}
+
+/// The same, with the room as read already holding the invitee as a member when
+/// `already_member` (another tab accepted the same invitation and joined).
+fn joining_to_slot_with(w: &mut Work, already_member: bool) -> (VerifyingKey, Vec<u8>, SigningKey) {
     let owner_sk = SigningKey::from_bytes(&[60; 32]);
     let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
     let room = LiveRoom::new(stored(&plan.room));
@@ -528,24 +534,49 @@ fn joining_to_slot(w: &mut Work) -> (VerifyingKey, Vec<u8>, SigningKey) {
     };
     let owner = owner_sk.verifying_key();
     let key = crate::rooms::create::contract_key(&owner);
-    let mut state_bytes = Vec::new();
-    ciborium::ser::into_writer(&plan.room.room_state, &mut state_bytes).unwrap();
-    assert!(w.on_contract(&ContractResponse::GetResponse {
-        key,
-        contract: None,
-        state: WrappedState::new(state_bytes),
-    }));
+    let mut state = plan.room.room_state.clone();
+    if already_member {
+        state.members.members.push(inv.invitee.clone());
+    }
+    get_answer(w, key, &state);
     let slot = room_storage_key(&owner);
     expect_read(w, &slot);
     (owner, slot, inv.invitee_signing_key)
 }
 
-/// A browser tab accepted the same invitation and stored the room first: this join sends
-/// nothing (that tab has joined), and only opens the room.
+fn get_answer(
+    w: &mut Work,
+    key: freenet_stdlib::prelude::ContractKey,
+    state: &river_core::room_state::ChatRoomStateV1,
+) {
+    let mut state_bytes = Vec::new();
+    ciborium::ser::into_writer(state, &mut state_bytes).unwrap();
+    assert!(w.on_contract(&ContractResponse::GetResponse {
+        key,
+        contract: None,
+        state: WrappedState::new(state_bytes),
+    }));
+}
+
+/// The join event's time in an UPDATE.
+fn join_time(r: &ClientRequest<'_>) -> SystemTime {
+    let ClientRequest::ContractOp(ContractRequest::Update { data, .. }) = r else {
+        panic!("an UPDATE, got {r:?}");
+    };
+    let UpdateData::Delta(d) = data else {
+        panic!("a delta");
+    };
+    let d: river_core::room_state::ChatRoomStateV1Delta =
+        ciborium::de::from_reader(d.as_ref()).unwrap();
+    d.recent_messages.unwrap()[0].message.time
+}
+
+/// A browser tab accepted the same invitation and joined first: the room as read already has
+/// the invitee, so this join sends nothing and only opens the room.
 #[test]
-fn a_join_someone_else_already_stored_sends_no_second_join() {
+fn a_join_the_room_already_has_sends_nothing() {
     let mut w = Work::default();
-    let (owner, slot, me) = joining_to_slot(&mut w);
+    let (owner, slot, me) = joining_to_slot_with(&mut w, true);
     // The tab's copy: the same identity, other bytes.
     let mut theirs =
         crate::rooms::create::new_room(SigningKey::from_bytes(&[61; 32]), "T", "T", false)
@@ -582,7 +613,7 @@ fn a_join_whose_own_store_landed_still_sends_the_join() {
 /// Try again on a join that failed before its UPDATE was taken reads the room again, so the
 /// join is built against the room as it is now, with the time it is sent.
 #[test]
-fn trying_a_join_again_reads_the_room_again() {
+fn trying_a_join_again_after_its_update_sends_the_same_join() {
     let mut w = Work::default();
     let (_, slot, _) = joining_to_slot(&mut w);
     w.on_delegate(&read_answer(&slot, None, 0));
@@ -591,7 +622,9 @@ fn trying_a_join_again_reads_the_room_again() {
         &slot,
         CasStoreResult::Stored { generation: 1 },
     ));
-    let ClientRequest::ContractOp(ContractRequest::Update { key, .. }) = next(&mut w) else {
+    let sent = next(&mut w);
+    let first = join_time(&sent);
+    let ClientRequest::ContractOp(ContractRequest::Update { key, .. }) = sent else {
         panic!("an UPDATE");
     };
     let refused: ClientError =
@@ -603,10 +636,79 @@ fn trying_a_join_again_reads_the_room_again() {
     assert!(w.on_error(&refused, false, &|_| false));
     let id = w.views()[0].id;
     assert!(w.retry(id));
-    assert!(matches!(
-        next(&mut w),
-        ClientRequest::ContractOp(ContractRequest::Get { .. })
-    ));
+    // The same join (same message id), not a second join event.
+    let again = next(&mut w);
+    assert_eq!(join_time(&again), first);
+}
+
+/// The slot store landed but its answer was lost, and the join failed there; the user tries
+/// again. Who stored the slot does not matter: the room, read again, lacks the invitee, so the
+/// join goes out, built now, with a fresh time.
+#[test]
+fn a_join_retried_after_its_store_landed_still_sends_the_join() {
+    let mut w = Work::default();
+    let (owner, slot, _) = joining_to_slot(&mut w);
+    w.on_delegate(&read_answer(&slot, None, 0));
+    let landed = expect_store(&mut w, &slot, 0);
+    let StoredRoomSlot::Present(earlier) = decode_room_slot(&landed).unwrap() else {
+        panic!("present");
+    };
+    let earlier_time = earlier
+        .room_state
+        .recent_messages
+        .messages
+        .iter()
+        .map(|m| m.message.time)
+        .max()
+        .unwrap();
+    // No answer: the store fails (as after the reconnects run out); then Try again.
+    let refused: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::Missing(crate::rooms::delegate::chat_delegate_key().clone()),
+    ))
+    .into();
+    assert!(w.on_error(&refused, false, &|_| false));
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(w.retry(w.views()[0].id));
+    // The room is read again, as it was before (without the invitee).
+    let ClientRequest::ContractOp(ContractRequest::Get { .. }) = next(&mut w) else {
+        panic!("the room is read again");
+    };
+    let key = crate::rooms::create::contract_key(&owner);
+    let mut state = earlier.room_state.clone();
+    state.members.members.clear();
+    state.recent_messages.messages.retain(|m| {
+        m.message.content != river_core::room_state::message::RoomMessageBody::join_event()
+    });
+    state.member_info.member_info.retain(|i| {
+        i.member_info.member_id
+            == earlier
+                .room_state
+                .configuration
+                .configuration
+                .owner_member_id
+    });
+    get_answer(&mut w, key, &state);
+    // The slot holds the earlier store's bytes: already stored, and the join still goes out.
+    expect_read(&mut w, &slot);
+    w.on_delegate(&read_answer(&slot, Some(landed), 1));
+    let update = next(&mut w);
+    assert!(join_time(&update) > earlier_time, "a fresh join time");
+}
+
+/// A join that failed with Try again blocks a second paste of the same invitation.
+#[test]
+fn a_failed_join_waiting_for_try_again_blocks_a_second_one() {
+    let mut w = Work::default();
+    let (_, slot, _) = joining_to_slot(&mut w);
+    w.on_delegate(&read_answer(&slot, None, 0));
+    expect_store(&mut w, &slot, 0);
+    w.on_delegate(&store_answer(&slot, CasStoreResult::Failed("busy".into())));
+    let link = w_link(&w);
+    w.join(&link, "Bea", &|_| false);
+    let views = w.views();
+    assert!(
+        matches!(&views[1].state, WorkState::Failed { why, retry: false } if why.contains("Try again"))
+    );
 }
 
 #[test]
@@ -621,7 +723,7 @@ fn a_room_just_joined_is_not_joined_again() {
     w.join(&link, "Bea", &|_| false);
     let views = w.views();
     assert!(
-        matches!(&views[1].state, WorkState::Failed { why, .. } if why.contains("already joining"))
+        matches!(&views[1].state, WorkState::Failed { why, .. } if why.contains("just joined"))
     );
     // A finished task's row can be put away.
     assert!(w.dismiss(views[0].id));
@@ -696,4 +798,14 @@ fn a_room_list_that_keeps_changing_fails_after_the_web_uis_number_of_attempts() 
         ));
     }
     assert!(matches!(state(&w), WorkState::Failed { retry: true, .. }));
+}
+
+/// Another invitation into the room `joining_to_slot` joins (its owner is fixed).
+fn w_link(_: &Work) -> String {
+    let plan =
+        crate::rooms::create::new_room(SigningKey::from_bytes(&[60; 32]), "Open", "Olive", false)
+            .unwrap();
+    invitation(&LiveRoom::new(stored(&plan.room)), "http://x/")
+        .unwrap()
+        .1
 }

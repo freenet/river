@@ -395,8 +395,8 @@ fn an_invitee_already_in_the_room_is_not_added_twice() {
         now(),
     )
     .unwrap();
-    // Nothing to send: no second join event, and no version-0 nickname record replacing the
-    // one the room has.
+    // Nothing to send: no second join event, no version-0 nickname record replacing the one
+    // the room has, and no invite chain re-added.
     assert!(plan.delta.is_none());
     assert_eq!(
         plan.room.self_member_info.as_ref(),
@@ -436,10 +436,13 @@ fn a_blob_that_does_not_decrypt_falls_back_to_the_invitations_secret() {
     let (inv, _) = invitation(&room, WEB_APP).unwrap();
     // A blob for the invitee whose ciphertext is garbage.
     let me = MemberId::from(&inv.invitee_signing_key.verifying_key());
-    let mut bad = state.secrets.encrypted_secrets[0].clone();
-    bad.secret.member_id = me;
-    bad.secret.ciphertext = vec![1, 2, 3];
-    state.secrets.encrypted_secrets.push(bad);
+    let mut bad = state.secrets.encrypted_secrets[0].secret.clone();
+    bad.member_id = me;
+    bad.ciphertext = vec![1, 2, 3];
+    // Signed by the owner, so the room itself takes it: only its ciphertext is damaged.
+    state.secrets.encrypted_secrets.push(
+        river_core::room_state::secret::AuthorizedEncryptedSecretForMember::new(bad, &f.owner),
+    );
     assert!(current_secret_from_state(&state, &inv.invitee_signing_key).is_none());
     let plan = join(
         &inv,
@@ -447,12 +450,16 @@ fn a_blob_that_does_not_decrypt_falls_back_to_the_invitations_secret() {
         &state,
         contract_key(&f.owner.verifying_key()),
         now(),
-    );
-    // The room may refuse the forged blob on apply; either way nothing panicked, and if it
-    // took the join, the nickname is sealed.
-    if let Ok(plan) = plan {
-        assert!(plan.delta.unwrap().member_info.is_some());
-    }
+    )
+    .expect("the join goes ahead");
+    let delta = plan.delta.expect("something to send");
+    let info = &delta.member_info.as_ref().expect("a nickname record")[0];
+    let nickname = river_core::ecies::unseal_bytes_with_secrets(
+        &info.member_info.preferred_nickname,
+        &std::collections::HashMap::from([(0, SECRET)]),
+    )
+    .expect("sealed under the invitation's secret");
+    assert_eq!(nickname, b"Bea");
 }
 
 #[test]

@@ -10673,6 +10673,10 @@ mod stored_rooms_drift {
             "http://h/?x=1",
             "http://h/#?invitation=abc",
             "?invitation=%zz",
+            "http://h/?invitation=abc%",
+            "http://h/?invitation=abc%4",
+            "http://h/?invitation=%C3%A9t%C3%A9",
+            "http://h/?invitation=%E2%82",
             "",
         ] {
             assert_eq!(

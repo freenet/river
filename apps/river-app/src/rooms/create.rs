@@ -442,10 +442,12 @@ pub fn join(
             return Err(JoinRefusal::for_now("This room is full."));
         }
         adding.push(invitation.invitee.clone());
-    }
-    for m in &invite_chain {
-        if !present.contains(&m.member.id()) {
-            adding.push(m.clone());
+        // The invite chain the room lacks, only for a new member: a member already in the room
+        // is not re-added at all.
+        for m in &invite_chain {
+            if !present.contains(&m.member.id()) {
+                adding.push(m.clone());
+            }
         }
     }
     let join_event = AuthorizedMessageV1::new(

@@ -177,10 +177,6 @@ struct Task {
     failed: Option<(String, bool)>,
     /// Whether the stored rooms were asked to be read again for this task's finishing.
     reload_asked: bool,
-    /// Whether this task's own store put the room in the store. A join that finds the room
-    /// already stored under this identity by someone else (a browser tab that accepted the same
-    /// invitation) sends nothing: that tab has joined.
-    stored_by_us: bool,
 }
 
 impl Task {
@@ -195,7 +191,6 @@ impl Task {
             conflicts: 0,
             failed: None,
             reload_asked: false,
-            stored_by_us: false,
         }
     }
 
@@ -258,9 +253,12 @@ impl Task {
             (Kind::Create(_), Step::Slot) => Step::Put,
             (Kind::Create(_), Step::Put) => Step::Meta,
             (Kind::Join { .. }, Step::Get) => Step::Slot,
-            // Nothing to send (already a member), or another writer stored and joined.
+            // Nothing to send: the room, read just before, already has the invitee as a member
+            // (another tab that accepted the same invitation, or an invitation accepted twice).
+            // That is decided from the room alone, as the web UI's `build_state_for_put` does,
+            // never from who stored the slot.
             (Kind::Join { plan, .. }, Step::Slot)
-                if !self.stored_by_us || plan.as_ref().is_none_or(|p| p.delta.is_none()) =>
+                if plan.as_ref().is_none_or(|p| p.delta.is_none()) =>
             {
                 Step::Meta
             }
@@ -294,13 +292,7 @@ impl Task {
         let over_tombstone = matches!(self.kind, Kind::Join { .. });
         match reconcile_new_room(value, room, over_tombstone) {
             NewRoomWrite::Store(bytes) => Ok(Some(bytes)),
-            NewRoomWrite::AlreadyStored => {
-                // This task's own earlier store, whose answer was lost, holds exactly its bytes.
-                if value.is_some() && encode_new_room(room).ok().as_deref() == value {
-                    self.stored_by_us = true;
-                }
-                Ok(None)
-            }
+            NewRoomWrite::AlreadyStored => Ok(None),
             NewRoomWrite::Refuse(why) => Err(why),
         }
     }
@@ -371,13 +363,28 @@ impl Work {
                     .into(),
             );
         }
-        // One working or just finished: a second join would send a second join event.
-        if self
+        // Another join of this room, working, finished, or failed with Try again: a second one
+        // would send a second join event.
+        let earlier = self
             .tasks
             .iter()
-            .any(|t| t.owner() == Some(invitation.room) && (t.running() || t.step == Step::Done))
-        {
-            return self.refuse(WHAT, "You're already joining this room.".into());
+            .filter(|t| t.owner() == Some(invitation.room))
+            .find_map(|t| {
+                if t.step == Step::Done && t.failed.is_none() {
+                    Some("You have just joined this room.")
+                } else if t.running() {
+                    Some("You're already joining this room.")
+                } else if matches!(t.failed, Some((_, true))) {
+                    Some(
+                        "You're already joining this room: use Try again on it, or dismiss it \
+                         first.",
+                    )
+                } else {
+                    None
+                }
+            });
+        if let Some(why) = earlier {
+            return self.refuse(WHAT, why.into());
         }
         self.push(
             Kind::Join {
@@ -402,10 +409,12 @@ impl Work {
         t.conflicts = 0;
         t.out = None;
         t.phase = Phase::Read;
-        // A join not yet sent reads the room again, so what it sends is built against the room
-        // as it is now, with the time it is sent.
+        // A join that failed before its UPDATE reads the room again, so what it sends is built
+        // against the room as it is now, with the time it is sent. One that failed at its UPDATE
+        // sends the same join again: the node may hold it, and the same message id cannot show
+        // twice.
         if let Kind::Join { plan, .. } = &mut t.kind
-            && matches!(t.step, Step::Get | Step::Slot | Step::Update)
+            && matches!(t.step, Step::Get | Step::Slot)
         {
             *plan = None;
             t.step = Step::Get;
@@ -563,12 +572,7 @@ impl Work {
                 if k.as_bytes() == key.as_slice() =>
             {
                 match result {
-                    CasStoreResult::Stored { .. } => {
-                        if t.step == Step::Slot {
-                            t.stored_by_us = true;
-                        }
-                        t.advance()
-                    }
+                    CasStoreResult::Stored { .. } => t.advance(),
                     // Another writer stored first: read what it stored and work from that.
                     CasStoreResult::Conflict { .. } => {
                         t.out = None;

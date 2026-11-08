@@ -242,9 +242,10 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
   (`src/chat/`) shows them; snapshots and tests use built-in example data
   (`chat::Source::Example`). Its colours and sizes follow the web UI in `ui/`.
   It depends on `river-core` (`common/`) by path, with the client-only
-  features `ecies-randomized`, `ecies-client`, `mentions`, `stored-rooms` and `invitation`, so a
-  change under `common/` (or to the root `Cargo.toml`, which river-core inherits
-  versions from) runs `apps.yml`. It compiles in three `ui/` files with
+  features `ecies-randomized`, `ecies-client`, `mentions`, `stored-rooms`
+  and `invitation`, so a change under `common/` (or to the root `Cargo.toml`,
+  which river-core inherits versions from) runs `apps.yml`. It compiles in
+  three `ui/` files with
   `include_bytes!`: the logo `ui/assets/river_logo.svg`, the chat delegate
   `ui/public/contracts/chat_delegate.wasm`, whose hash is the delegate key it
   reads rooms from, and the room contract `ui/public/contracts/room_contract.wasm`,
@@ -341,8 +342,8 @@ Changes to `apps/Cargo.toml` and `apps/Cargo.lock` cannot alter the key:
 the WASM is built from the root workspace with the root `Cargo.lock`, and the
 apps' lockfile is never consulted there, even though `apps/river-app` depends
 on `river-core` by path (see the note in `apps/Cargo.toml`). Any client-only
-feature it enables (`stored-rooms`, `invitation`, `ecies-client`, ...) must stay off for the room-contract
-and chat-delegate builds.
+feature it enables (`stored-rooms`, `invitation`, `ecies-client`, ...) must
+stay off for the room-contract and chat-delegate builds.
 
 The full workflow — `cargo make add-migration` BEFORE rebuilding, the
 two single-source-of-truth TOMLs, CI validation, and the key files —
