@@ -25,6 +25,13 @@
 //!   a room joined or left in the browser shows up here without a restart. A read that finds
 //!   no store or no rooms at all keeps the list shown: that is a store that went away, not a
 //!   user who left every room (leaving keeps a tombstone under the room's key).
+//! - **Sending.** What the user does in a room arrives as a [`Command`] and is shown at once,
+//!   marked as on its way, then sent as an UPDATE, one per room at a time ([`super::outbox`]
+//!   has the details and what it mirrors in the web UI). The node's answer decides: taken,
+//!   refused (shown as not sent, with the node's reason), or unanswered for
+//!   [`Pace::update_wait`] (the same). What was out when the connection dropped goes again on
+//!   the next one. Commands that arrive while disconnected are shown and wait; commands that
+//!   arrive before the rooms were first read wait for them.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -33,6 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -41,7 +49,7 @@ use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, DelegateError,
     ErrorKind, HostResponse, RequestError,
 };
-use freenet_stdlib::prelude::{ContractInstanceId, UpdateData};
+use freenet_stdlib::prelude::{ContractInstanceId, StateDelta, UpdateData};
 use river_core::chat_delegate::{ChatDelegateResponseMsg, LIST_REFUSED_MARKER};
 use river_core::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
 use river_core::stored_rooms::{
@@ -51,6 +59,7 @@ use river_core::stored_rooms::{
 
 use super::delegate::{self, Read};
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
+use super::outbox::{Command, Outbox};
 use super::room::{LiveRoom, local_minutes};
 use super::socket::{NodeSocket, SocketError, TokenVerdict, token_verdict};
 use super::token::TokenStore;
@@ -69,7 +78,8 @@ pub(super) struct Pace {
     /// one read-first retry.
     pub early_read: Duration,
     pub early_read_retry: Duration,
-    /// How often a subscribed connection wakes to check the limits below.
+    /// How often a subscribed connection wakes to check the limits below and to take what
+    /// the user did, so this is also how long a sent message can wait to go out.
     pub tick: Duration,
     /// How long the node may be silent before River pings it, and how long the pong may take.
     pub idle_check: Duration,
@@ -83,6 +93,8 @@ pub(super) struct Pace {
     pub resubscribe_max: Duration,
     /// How often the stored rooms are read again while connected.
     pub refresh: Duration,
+    /// How long the node may take to answer an update before the message counts as not sent.
+    pub update_wait: Duration,
     /// How long the chat delegate gets to answer a read. The web UI allows 10 seconds per
     /// request (first-time WASM compilation can be slow); a whole read gets a little more.
     pub delegate_deadline: Duration,
@@ -97,13 +109,14 @@ impl Default for Pace {
             stable: Duration::from_secs(30),
             early_read: Duration::from_millis(300),
             early_read_retry: Duration::from_secs(2),
-            tick: Duration::from_secs(5),
+            tick: Duration::from_millis(100),
             idle_check: Duration::from_secs(60),
             pong_wait: Duration::from_secs(20),
             catch_up: Duration::from_secs(45),
             resubscribe_first: Duration::from_secs(5),
             resubscribe_max: Duration::from_secs(300),
             refresh: Duration::from_secs(60),
+            update_wait: Duration::from_secs(60),
             delegate_deadline: Duration::from_secs(20),
             grant: GrantPacing::default(),
         }
@@ -185,6 +198,7 @@ pub(super) fn run(
     report: &dyn Fn(RoomsUpdate),
     pace: &Pace,
     stop: &dyn Fn() -> bool,
+    commands: &Receiver<Command>,
 ) -> Access {
     let store = config_dir.map(TokenStore::in_dir);
     let http = NodeHttp::new(&format!("http://{authority}"));
@@ -232,7 +246,9 @@ pub(super) fn run(
                     GrantOutcome::Refused(m) => return Access::Refused(m),
                     GrantOutcome::Unreachable(e) => {
                         rooms.lost(&e, report);
-                        pause(&mut backoff, pace, stop);
+                        pause(&mut backoff, pace, stop, &mut || {
+                            rooms.idle(commands, report)
+                        });
                         continue;
                     }
                 }
@@ -249,6 +265,7 @@ pub(super) fn run(
             early_read,
             pace,
             stop,
+            commands,
         );
         if stop() {
             return Access::Connecting;
@@ -296,7 +313,7 @@ pub(super) fn run(
                 read_first_retry = false;
                 early_read = pace.early_read;
                 rooms.lost(&err.to_string(), report);
-                pause(&mut backoff, pace, stop);
+                pause(&mut backoff, pace, stop, &mut || rooms.idle(commands, report));
             }
         }
     }
@@ -304,10 +321,11 @@ pub(super) fn run(
 
 const REFUSED_PREFIX: &str = "River's storage on this computer refused";
 
-/// Wait out the backoff (waking early to stop), then double it.
-fn pause(backoff: &mut Duration, pace: &Pace, stop: &dyn Fn() -> bool) {
+/// Wait out the backoff (waking early to stop, and to call `idle`), then double it.
+fn pause(backoff: &mut Duration, pace: &Pace, stop: &dyn Fn() -> bool, idle: &mut dyn FnMut()) {
     let until = Instant::now() + *backoff;
     while Instant::now() < until && !stop() {
+        idle();
         thread::sleep((until - Instant::now()).min(Duration::from_millis(20)));
     }
     *backoff = (*backoff * 2).min(pace.backoff_max);
@@ -335,6 +353,7 @@ fn follow(
     early_read: Duration,
     pace: &Pace,
     stop: &dyn Fn() -> bool,
+    commands: &Receiver<Command>,
 ) -> Ended {
     let mut socket = match NodeSocket::connect(authority, token) {
         Ok(s) => s,
@@ -355,7 +374,10 @@ fn follow(
         early_read,
         pace,
         stop,
+        commands,
     );
+    // Updates belong to the connection: what was out goes again on the next one.
+    rooms.outbox.requeue();
     Ended {
         error,
         connected: true,
@@ -451,6 +473,7 @@ fn follow_on(
     early_read: Duration,
     pace: &Pace,
     stop: &dyn Fn() -> bool,
+    commands: &Receiver<Command>,
 ) -> SocketError {
     let connected_at = Instant::now();
     if let Err(e) = socket.read_early(early_read) {
@@ -505,6 +528,13 @@ fn follow_on(
         if let Err(e) = subs.ask_due(socket) {
             return e;
         }
+        // What the user did, then the updates it makes.
+        let mut changed = rooms.take_commands(commands);
+        changed |= rooms.outbox.expire(pace.update_wait);
+        match rooms.send_updates(socket) {
+            Ok(failed) => changed |= failed,
+            Err(e) => return e,
+        }
         // Read the stored rooms again now and then, for rooms joined or left elsewhere.
         if let Some((_, started)) = &reload
             && started.elapsed() >= pace.delegate_deadline
@@ -528,16 +558,21 @@ fn follow_on(
             Err(SocketError::Timeout) => None,
             Err(e) => return e,
         };
-        let mut changed = false;
         match response {
             None => {}
+            Some(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key,
+                ..
+            }))) => {
+                changed |= rooms.update_answered(key.id(), Ok(()));
+            }
             Some(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
                 state,
                 ..
             }))) => {
                 subs.answered(key.id());
-                changed = rooms.following(key.id(), true);
+                changed |= rooms.following(key.id(), true);
                 changed |= rooms.merge_bytes(key.id(), state.as_ref());
             }
             // A notification shows the subscription is in place, whatever came of its ask.
@@ -546,7 +581,7 @@ fn follow_on(
                 update,
             }))) => {
                 subs.answered(key.id());
-                changed = rooms.following(key.id(), true);
+                changed |= rooms.following(key.id(), true);
                 changed |= rooms.apply_update(key.id(), &update);
             }
             // The network has no copy. The web UI would seed one with a PUT; this app only
@@ -555,7 +590,7 @@ fn follow_on(
                 instance_id,
             }))) => {
                 subs.failed(instance_id, pace);
-                changed = rooms.following(&instance_id, false);
+                changed |= rooms.following(&instance_id, false);
             }
             Some(Ok(other)) => {
                 if let Some((loader, _)) = &mut reload {
@@ -586,10 +621,12 @@ fn follow_on(
                 }
             }
             Some(Err(e)) => {
-                if let Some(id) = failed_contract(&e) {
+                if let Some((id, cause)) = failed_update(&e) {
+                    changed |= rooms.update_answered(&id, Err(cause));
+                } else if let Some(id) = failed_contract(&e) {
                     // A subscribe GET that failed: the room stays on its copy, asked again.
                     subs.failed(id, pace);
-                    changed = rooms.following(&id, false);
+                    changed |= rooms.following(&id, false);
                 } else if reload.is_some() {
                     match delegate_error(&e) {
                         // The store went away: keep the list shown (see the module docs).
@@ -616,6 +653,26 @@ fn follow_on(
         if changed {
             rooms.report(status, report);
         }
+    }
+}
+
+/// The room contract and the node's reason, when an update failed.
+fn failed_update(e: &ClientError) -> Option<(ContractInstanceId, String)> {
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Update {
+            key,
+            cause,
+        })) => {
+            // The node's own text; kept short for the screen.
+            let short: String = cause.chars().take(200).collect();
+            let cause = if short.len() < cause.len() {
+                format!("{short}…")
+            } else {
+                short
+            };
+            Some((*key.id(), cause))
+        }
+        _ => None,
     }
 }
 
@@ -863,6 +920,10 @@ struct Rooms {
     not_updated: HashSet<VerifyingKey>,
     /// Rooms not subscribed to yet.
     not_following: HashSet<VerifyingKey>,
+    /// What the user sent that the node has not taken yet.
+    outbox: Outbox,
+    /// Commands that arrived before the rooms were first read.
+    waiting: Vec<Command>,
 }
 
 impl Rooms {
@@ -935,7 +996,85 @@ impl Rooms {
         self.store_missing = loaded.store_missing;
         self.unreadable = loaded.unreadable;
         self.loaded = true;
+        self.outbox.keep_rooms(&shown);
+        for room in &self.list {
+            self.outbox.reconcile(room);
+        }
         new_ids
+    }
+
+    /// Take what the user did since the last call. True when it changed what shows.
+    fn take_commands(&mut self, commands: &Receiver<Command>) -> bool {
+        self.waiting.extend(commands.try_iter());
+        if !self.loaded || self.waiting.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for command in std::mem::take(&mut self.waiting) {
+            match self.list.iter().find(|r| r.key() == command.room) {
+                Some(room) => changed |= self.outbox.command(room, command.action),
+                // Left, in the browser, before this arrived.
+                None => eprintln!("River: a command for a room no longer shown was dropped"),
+            }
+        }
+        changed
+    }
+
+    /// While disconnected: take what the user did and show it. It is sent on reconnecting.
+    fn idle(&mut self, commands: &Receiver<Command>, report: &dyn Fn(RoomsUpdate)) {
+        if self.take_commands(commands) {
+            self.report(LinkStatus::Reconnecting, report);
+        }
+    }
+
+    /// Send each room's next update, if it has one and none is out. `Ok(true)` when an entry
+    /// failed before it could be sent.
+    fn send_updates(&mut self, socket: &mut NodeSocket) -> Result<bool, SocketError> {
+        if self.outbox.is_empty() {
+            return Ok(false);
+        }
+        let mut changed = false;
+        for room in &self.list {
+            let Some(delta) = self.outbox.next_update(room, Instant::now(), &mut changed) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if let Err(e) = ciborium::ser::into_writer(&delta, &mut bytes) {
+                // Not expected for River's own types; the entry fails visibly.
+                self.outbox
+                    .answered(&room.stored.owner_vk, Err(format!("it could not be encoded: {e}")));
+                changed = true;
+                continue;
+            }
+            let update = ContractRequest::Update {
+                key: room.stored.contract_key,
+                data: UpdateData::Delta(StateDelta::from(bytes)),
+            };
+            socket.send(&ClientRequest::ContractOp(update))?;
+        }
+        Ok(changed)
+    }
+
+    /// The node answered the update in flight for the room under contract `id`. Taken: its
+    /// messages join the room's copy at once, so they show as sent. True when that changed
+    /// what shows.
+    fn update_answered(&mut self, id: &ContractInstanceId, result: Result<(), String>) -> bool {
+        let Some(room) = self.list.iter_mut().find(|r| r.contract_id() == *id) else {
+            return false;
+        };
+        let refused = result.is_err();
+        match self.outbox.answered(&room.stored.owner_vk, result) {
+            Some(messages) => {
+                let delta = super::outbox::delta(room, &messages);
+                if let Err(e) = room.apply_delta(delta) {
+                    // Taken by the node: the network brings it in with the next update.
+                    eprintln!("River: a sent message was not applied here: {e}");
+                }
+                self.outbox.reconcile(room);
+                true
+            }
+            None => refused,
+        }
     }
 
     fn contract_ids(&self) -> Vec<ContractInstanceId> {
@@ -976,13 +1115,14 @@ impl Rooms {
     }
 
     fn merge_bytes(&mut self, id: &ContractInstanceId, bytes: &[u8]) -> bool {
-        let Some(room) = self.by_contract(id) else {
+        let Some(room) = self.list.iter_mut().find(|r| r.contract_id() == *id) else {
             return false;
         };
         let result = ciborium::de::from_reader::<ChatRoomStateV1, _>(bytes)
             .map_err(|e| format!("unreadable state: {e}"))
             .and_then(|incoming| room.merge_state(&incoming));
-        self.outcome(id, result)
+        let sent = self.outbox.reconcile(room);
+        self.outcome(id, result) | sent
     }
 
     fn apply_update(&mut self, id: &ContractInstanceId, update: &UpdateData<'_>) -> bool {
@@ -990,13 +1130,14 @@ impl Rooms {
             UpdateData::State(state) => self.merge_bytes(id, state.as_ref()),
             UpdateData::StateAndDelta { state, .. } => self.merge_bytes(id, state.as_ref()),
             UpdateData::Delta(delta) => {
-                let Some(room) = self.by_contract(id) else {
+                let Some(room) = self.list.iter_mut().find(|r| r.contract_id() == *id) else {
                     return false;
                 };
                 let result = ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(delta.as_ref())
                     .map_err(|e| format!("unreadable delta: {e}"))
                     .and_then(|delta| room.apply_delta(delta));
-                self.outcome(id, result)
+                let sent = self.outbox.reconcile(room);
+                self.outcome(id, result) | sent
             }
             // Related-contract updates, and variants newer than this stdlib.
             _ => false,
@@ -1004,7 +1145,10 @@ impl Rooms {
     }
 
     fn views(&self) -> Vec<Room> {
-        self.list.iter().map(|r| r.view(&local_minutes)).collect()
+        self.list
+            .iter()
+            .map(|r| self.outbox.view(r, &local_minutes))
+            .collect()
     }
 
     fn names(&self, set: &HashSet<VerifyingKey>) -> Vec<String> {

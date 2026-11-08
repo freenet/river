@@ -22,6 +22,8 @@
 //! and `mentions`: the room-contract and chat-delegate WASM builds do not
 //! enable it, so their bytes and keys are unchanged.
 
+use crate::room_state::member::AuthorizedMember;
+use crate::room_state::member_info::AuthorizedMemberInfo;
 use crate::room_state::message::MessageId;
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -88,6 +90,20 @@ pub struct StoredRoom {
     /// version the room state holds no owner-signed blob for.
     #[serde(default)]
     pub invitation_secrets: BTreeMap<u32, [u8; 32]>,
+    /// The owner-signed record that admitted the local user, kept so a member
+    /// the room pruned for inactivity can re-add themselves when they next
+    /// send (the web UI's `build_rejoin_delta`). `None` for the owner and in
+    /// older blobs.
+    #[serde(default)]
+    pub self_authorized_member: Option<AuthorizedMember>,
+    /// The local user's invite ancestry up to the owner, re-added with them
+    /// when they rejoin.
+    #[serde(default)]
+    pub invite_chain: Vec<AuthorizedMember>,
+    /// The local user's last published nickname record, republished when they
+    /// rejoin.
+    #[serde(default)]
+    pub self_member_info: Option<AuthorizedMemberInfo>,
 }
 
 impl StoredRoom {

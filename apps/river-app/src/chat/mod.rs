@@ -2,9 +2,10 @@
 //! on the right.
 //!
 //! The rooms come from a [`Source`]: the built-in example data ([`Source::Example`]), where
-//! sending works in memory, or the user's real rooms read from the node ([`Source::Node`], see
-//! `crate::rooms`), which are read-only for now. Selecting a room and showing or hiding the
-//! members panel work either way.
+//! sending, replying, editing, deleting and reacting work in memory, or the user's real rooms
+//! read from the node ([`Source::Node`], see `crate::rooms`), where each of those becomes a
+//! [`Command`] for the background work, which sends it and shows it on its way. Selecting a
+//! room and showing or hiding the members panel work either way.
 
 mod conversation;
 pub mod example;
@@ -19,6 +20,8 @@ use std::collections::HashMap;
 
 use rune::TextEdit;
 
+use crate::rooms::{Action, Command};
+
 pub use model::{Member, Message, Reaction, ReplyTo, Role, Room};
 pub use view::{NARROW_WIDTH, view};
 
@@ -27,16 +30,26 @@ pub use view::{NARROW_WIDTH, view};
 pub enum Source {
     /// Built-in example rooms. Nothing is read from or sent to Freenet.
     Example,
-    /// The user's rooms, read from the local node. Nothing is sent yet.
+    /// The user's rooms, read from the local node. What the user does is sent to it.
     Node(LinkStatus),
 }
 
-impl Source {
-    /// Whether messages can be sent from this screen.
-    pub fn can_send(self) -> bool {
-        matches!(self, Source::Example)
-    }
+/// What the composer is doing besides writing a new message.
+#[derive(Clone, Debug, Default)]
+pub enum Mode {
+    #[default]
+    Write,
+    /// The next message replies to the message keyed so.
+    Reply(String),
+    /// The composer holds the text of your message keyed so; sending saves it. `draft` is what
+    /// the composer held before, given back afterwards.
+    Edit { key: String, draft: TextEdit },
+    /// Asking whether to delete your message keyed so.
+    Delete(String),
 }
+
+/// Where commands for the node go.
+pub type Sink = Box<dyn Fn(Command)>;
 
 /// The connection to the node behind [`Source::Node`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +132,13 @@ pub struct Chat {
     node_rooms_shown: bool,
     /// What the rooms from the node are missing, for the room list and the empty screen.
     pub issues: crate::rooms::Issues,
+    /// Replying, editing or deleting in the open room.
+    pub mode: Mode,
+    /// The message (by key) whose reaction picker is open.
+    pub picker: Option<String>,
+    /// Commands for the node, when there is no sink (tests); with one they go straight to it.
+    pub outgoing: Vec<Command>,
+    sink: Option<Sink>,
 }
 
 impl Chat {
@@ -139,6 +159,10 @@ impl Chat {
             read: HashMap::new(),
             node_rooms_shown: false,
             issues: Default::default(),
+            mode: Mode::Write,
+            picker: None,
+            outgoing: Vec::new(),
+            sink: None,
         };
         chat.set_rooms(rooms);
         chat
@@ -261,6 +285,8 @@ impl Chat {
         if key == self.selected {
             return;
         }
+        // A reply, edit or deletion belongs to the room it was started in.
+        self.cancel();
         if self.selected.is_empty() {
             // Nothing was open, so what the composer holds belongs to no room yet: keep it,
             // unless it is empty and this room has a draft.
@@ -282,21 +308,194 @@ impl Chat {
     }
     /// Send what the composer holds to the open room. Blank text sends nothing; otherwise the
     /// composer clears (keeping focus, so the next message can be typed straight away).
+    ///
+    /// In a reply or an edit it sends that instead; while a deletion is being asked about it
+    /// sends nothing.
     pub fn send(&mut self) -> bool {
-        if !self.source.can_send() {
-            return false;
-        }
         let text = self.composer.text.trim().to_owned();
-        if text.is_empty() {
+        if text.is_empty() || matches!(self.mode, Mode::Delete(_)) {
             return false;
         }
-        let now = self.now;
-        let Some(room) = self.room_mut() else {
+        let Some(room) = self.actionable() else {
             return false;
         };
-        room.send(&text, now);
+        let key = room.key.clone();
+        let now = self.now;
+        match (self.source, std::mem::take(&mut self.mode)) {
+            (_, Mode::Delete(_)) => unreachable!("checked above"),
+            (source, Mode::Edit { key: target, draft }) => {
+                match source {
+                    Source::Example => {
+                        if let Some(room) = self.room_mut() {
+                            room.edit(&target, &text);
+                        }
+                    }
+                    Source::Node(_) => self.emit(key, Action::Edit { target, text }),
+                }
+                self.composer = draft;
+                self.composer.focused = true;
+                return true;
+            }
+            (Source::Example, Mode::Reply(target)) => {
+                if let Some(room) = self.room_mut() {
+                    room.reply(&text, now, &target);
+                }
+            }
+            (Source::Example, Mode::Write) => {
+                if let Some(room) = self.room_mut() {
+                    room.send(&text, now);
+                }
+            }
+            (Source::Node(_), Mode::Reply(target)) => self.emit(
+                key,
+                Action::Send {
+                    text,
+                    reply_to: Some(target),
+                },
+            ),
+            (Source::Node(_), Mode::Write) => self.emit(
+                key,
+                Action::Send {
+                    text,
+                    reply_to: None,
+                },
+            ),
+        }
         self.composer.clear();
         true
+    }
+
+    /// Send commands for the node to `sink` from now on.
+    pub fn set_sink(&mut self, sink: Sink) {
+        self.sink = Some(sink);
+    }
+
+    fn emit(&mut self, room: String, action: Action) {
+        let command = Command { room, action };
+        match &self.sink {
+            Some(sink) => sink(command),
+            None => self.outgoing.push(command),
+        }
+    }
+
+    /// The open room, if the user can act in it now.
+    fn actionable(&self) -> Option<&Room> {
+        self.room().filter(|r| r.send_block.is_none())
+    }
+
+    /// Your message keyed `target` in the open room, if it can be changed now (not one still
+    /// on its way).
+    fn own_sent(&self, target: &str) -> Option<&model::Message> {
+        let room = self.actionable()?;
+        room.message_by_key(target)
+            .filter(|m| m.author == room.me && m.pending.is_none())
+    }
+
+    /// Reply to the message keyed `target` with the next message.
+    pub fn start_reply(&mut self, target: &str) {
+        if self.actionable().is_none() {
+            return;
+        }
+        self.cancel();
+        self.mode = Mode::Reply(target.to_owned());
+        self.composer.focused = true;
+    }
+
+    /// Edit your message keyed `target` in the composer.
+    pub fn start_edit(&mut self, target: &str) {
+        let Some(text) = self.own_sent(target).map(|m| m.text.clone()) else {
+            return;
+        };
+        self.cancel();
+        let mut editing = TextEdit::new(&text);
+        editing.focused = true;
+        let draft = std::mem::replace(&mut self.composer, editing);
+        self.mode = Mode::Edit {
+            key: target.to_owned(),
+            draft,
+        };
+    }
+
+    /// Ask whether to delete your message keyed `target`.
+    pub fn ask_delete(&mut self, target: &str) {
+        if self.own_sent(target).is_none() {
+            return;
+        }
+        self.cancel();
+        self.mode = Mode::Delete(target.to_owned());
+    }
+
+    /// Delete the message the user was asked about.
+    pub fn confirm_delete(&mut self) {
+        let Mode::Delete(target) = std::mem::take(&mut self.mode) else {
+            return;
+        };
+        let Some(room) = self.actionable() else {
+            return;
+        };
+        let key = room.key.clone();
+        match self.source {
+            Source::Example => {
+                if let Some(room) = self.room_mut() {
+                    room.delete(&target);
+                }
+            }
+            Source::Node(_) => self.emit(key, Action::Delete { target }),
+        }
+    }
+
+    /// Stop replying, editing or deleting; an edit gives the composer its draft back.
+    pub fn cancel(&mut self) {
+        if let Mode::Edit { draft, .. } = std::mem::take(&mut self.mode) {
+            self.composer = draft;
+        }
+        self.picker = None;
+    }
+
+    /// Open or close the reaction picker on the message keyed `target`.
+    pub fn toggle_picker(&mut self, target: &str) {
+        self.picker = match &self.picker {
+            Some(k) if k == target => None,
+            _ if self.actionable().is_some() => Some(target.to_owned()),
+            _ => None,
+        };
+    }
+
+    /// React to the message keyed `target` with `emoji`; the same emoji as yours removes it.
+    pub fn react(&mut self, target: &str, emoji: &str) {
+        self.picker = None;
+        let Some(room) = self.actionable() else {
+            return;
+        };
+        let key = room.key.clone();
+        match self.source {
+            Source::Example => {
+                if let Some(room) = self.room_mut() {
+                    room.react(target, emoji);
+                }
+            }
+            Source::Node(_) => self.emit(
+                key,
+                Action::React {
+                    target: target.to_owned(),
+                    emoji: emoji.to_owned(),
+                },
+            ),
+        }
+    }
+
+    /// Send a failed message or action in the open room again.
+    pub fn retry(&mut self, entry: u64) {
+        if let Some(key) = self.room().map(|r| r.key.clone()) {
+            self.emit(key, Action::Retry { entry });
+        }
+    }
+
+    /// Drop a failed message or action in the open room.
+    pub fn discard(&mut self, entry: u64) {
+        if let Some(key) = self.room().map(|r| r.key.clone()) {
+            self.emit(key, Action::Discard { entry });
+        }
     }
 
     /// Show or hide the members panel, in the layout the window is in now.

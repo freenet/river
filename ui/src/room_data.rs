@@ -10307,6 +10307,7 @@ mod tests {
 #[cfg(test)]
 mod stored_rooms_drift {
     use super::*;
+    use river_core::room_state::member::Member;
     use river_core::stored_rooms::{
         decode_room_slot, decode_rooms_meta, parse_room_storage_key, StoredRoomSlot,
     };
@@ -10336,6 +10337,28 @@ mod stored_rooms_drift {
         // Fields the reader skips are set too, so an unknown field is
         // exercised.
         room.previous_contract_key = Some(room.contract_key);
+        // What a pruned member rejoins with (`build_rejoin_delta`).
+        let owner_id = MemberId::from(&owner_vk);
+        let me = SigningKey::from_bytes(&[12u8; 32]);
+        let admitted = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: me.verifying_key(),
+            },
+            &owner_sk,
+        );
+        room.self_authorized_member = Some(admitted.clone());
+        room.invite_chain = vec![admitted];
+        room.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: MemberId::from(&me.verifying_key()),
+                version: 3,
+                preferred_nickname: SealedBytes::public(b"Ada".to_vec()),
+                deputies: Vec::new(),
+            },
+            &me,
+        ));
         room
     }
 
@@ -10359,6 +10382,11 @@ mod stored_rooms_drift {
         assert!(read.last_read_message_id.is_some());
         assert_eq!(read.self_nickname, room.self_nickname);
         assert_eq!(read.invitation_secrets, room.invitation_secrets);
+        assert!(read.self_authorized_member.is_some());
+        assert_eq!(read.self_authorized_member, room.self_authorized_member);
+        assert_eq!(read.invite_chain, room.invite_chain);
+        assert!(read.self_member_info.is_some());
+        assert_eq!(read.self_member_info, room.self_member_info);
     }
 
     /// A slot the web UI wrote with only the required fields (as a room joined

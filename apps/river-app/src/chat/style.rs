@@ -30,6 +30,8 @@ pub struct Palette {
     /// The accent at 15% over the conversation column (badges, own reactions).
     pub accent_soft: Color,
     pub accent_line: Color,
+    /// Text that says something failed (the web UI's `--color-danger-text`).
+    pub danger: Color,
 }
 
 fn hex(s: &str) -> Color {
@@ -66,6 +68,7 @@ pub fn palette() -> Palette {
         accent: hex("#97b2e1"),
         accent_soft: hex("#282c34"),
         accent_line: hex("#5d6f8f"),
+        danger: hex("#f97066"),
     }
 }
 

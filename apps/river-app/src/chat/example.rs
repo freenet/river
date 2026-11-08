@@ -47,12 +47,14 @@ impl Builder {
         let id = self.messages.len() as u32 + 1;
         self.messages.push(Message {
             id,
+            key: id.to_string(),
             author,
             time,
             text: text.into(),
             reply_to: None,
             reactions: Vec::new(),
             edited: false,
+            pending: None,
         });
         self.messages.last_mut().unwrap()
     }
@@ -166,6 +168,8 @@ fn town_square() -> Room {
         messages: b.messages,
         me: ME,
         unread: 0,
+        send_block: None,
+        notices: Vec::new(),
     }
 }
 
@@ -210,6 +214,8 @@ fn design_crew() -> Room {
         messages: b.messages,
         me: ME,
         unread: 2,
+        send_block: None,
+        notices: Vec::new(),
     }
 }
 
@@ -244,6 +250,8 @@ fn rust_help() -> Room {
         messages: b.messages,
         me: ME,
         unread: 2,
+        send_block: None,
+        notices: Vec::new(),
     }
 }
 
@@ -267,6 +275,8 @@ fn family() -> Room {
         messages: b.messages,
         me: ME,
         unread: 0,
+        send_block: None,
+        notices: Vec::new(),
     }
 }
 
@@ -280,6 +290,8 @@ fn book_club() -> Room {
         messages: Vec::new(),
         me: ME,
         unread: 0,
+        send_block: None,
+        notices: Vec::new(),
     }
 }
 

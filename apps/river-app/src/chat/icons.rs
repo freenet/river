@@ -55,3 +55,15 @@ pub static SMILE: Icon = Icon {
     view: 16.0,
     body: r#"<circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 9.5a3 3 0 0 0 5 0" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="6" cy="6.5" r=".9" fill="currentColor"/><circle cx="10" cy="6.5" r=".9" fill="currentColor"/>"#,
 };
+
+pub static EDIT: Icon = Icon {
+    name: "river-edit",
+    view: 16.0,
+    body: r#"<path d="M10.5 2.5 13.5 5.5 5.5 13.5H2.5V10.5Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M9 4l3 3" stroke="currentColor" stroke-width="1.4"/>"#,
+};
+
+pub static TRASH: Icon = Icon {
+    name: "river-trash",
+    view: 16.0,
+    body: r#"<path d="M2.5 4.5h11M6.5 4.5V3h3v1.5M4 4.5l.7 9h6.6l.7-9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};

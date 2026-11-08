@@ -205,6 +205,9 @@ impl Fixture {
             last_read_message_id: None,
             self_nickname: Some("Mia".into()),
             invitation_secrets: BTreeMap::new(),
+            self_authorized_member: None,
+            invite_chain: Vec::new(),
+            self_member_info: None,
         }
     }
 }

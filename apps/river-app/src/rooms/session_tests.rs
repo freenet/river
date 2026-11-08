@@ -1,4 +1,5 @@
 use super::*;
+use crate::rooms::outbox::Action;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
@@ -510,6 +511,22 @@ struct World {
     /// How many grant requests to answer "node not ready" before taking one.
     grant_not_ready: usize,
     on_connect: Option<OnConnect>,
+    /// Every UPDATE received: the contract and its delta.
+    updates: Vec<(ContractKey, ChatRoomStateV1Delta)>,
+    /// How UPDATEs are answered.
+    update_play: UpdatePlay,
+}
+
+/// How the fake node answers an UPDATE.
+#[derive(Clone, Debug, Default)]
+enum UpdatePlay {
+    /// `UpdateResponse`, as the node does when the contract took it.
+    #[default]
+    Accept,
+    /// The node's update error with this cause.
+    Refuse(&'static str),
+    /// No answer at all.
+    Ignore,
 }
 
 impl World {
@@ -789,7 +806,31 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                 None => {}
             }
         }
-        other => panic!("the app must only read, but sent {other:?}"),
+        // The one write the app makes: a room contract UPDATE carrying a delta.
+        ClientRequest::ContractOp(ContractRequest::Update {
+            key,
+            data: UpdateData::Delta(delta),
+        }) => {
+            let delta: ChatRoomStateV1Delta = ciborium::de::from_reader(delta.as_ref()).unwrap();
+            w.updates.push((key, delta));
+            match w.update_play.clone() {
+                UpdatePlay::Accept => out.push(encode(Ok(HostResponse::ContractResponse(
+                    ContractResponse::UpdateResponse {
+                        key,
+                        summary: freenet_stdlib::prelude::StateSummary::from(vec![]),
+                    },
+                )))),
+                UpdatePlay::Refuse(cause) => out.push(encode(Err(ErrorKind::RequestError(
+                    RequestError::ContractError(ContractError::Update {
+                        key,
+                        cause: cause.into(),
+                    }),
+                )
+                .into()))),
+                UpdatePlay::Ignore => {}
+            }
+        }
+        other => panic!("the app must only read and UPDATE with a delta, but sent {other:?}"),
     }
     out
 }
@@ -808,6 +849,7 @@ fn quick() -> Pace {
         resubscribe_first: Duration::from_secs(60),
         resubscribe_max: Duration::from_secs(60),
         refresh: Duration::from_secs(3600),
+        update_wait: Duration::from_secs(60),
         delegate_deadline: Duration::from_secs(5),
         grant: GrantPacing {
             pause: Duration::ZERO,
@@ -829,6 +871,7 @@ struct Running {
     updates: Arc<Mutex<Vec<RoomsUpdate>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<Access>>,
+    commands: std::sync::mpsc::Sender<Command>,
 }
 
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -837,6 +880,7 @@ impl Running {
     fn start(node: &FakeNode, dir: &Path, pace: Pace) -> Running {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let (commands, inbox) = std::sync::mpsc::channel();
         let handle = {
             let (updates, stop) = (updates.clone(), stop.clone());
             let authority = node.authority.clone();
@@ -848,6 +892,7 @@ impl Running {
                     &|u| updates.lock().unwrap().push(u),
                     &pace,
                     &|| stop.load(Ordering::Relaxed),
+                    &inbox,
                 )
             })
         };
@@ -855,7 +900,18 @@ impl Running {
             updates,
             stop,
             handle: Some(handle),
+            commands,
         }
+    }
+
+    /// Do something in the room `room`, as the chat screen would.
+    fn act(&self, room: &TestRoom, action: Action) {
+        self.commands
+            .send(Command {
+                room: bs58::encode(room.vk().to_bytes()).into_string(),
+                action,
+            })
+            .unwrap();
     }
 
     fn updates(&self) -> Vec<RoomsUpdate> {
