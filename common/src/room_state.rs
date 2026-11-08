@@ -151,7 +151,19 @@ pub mod cleanup_counters {
 }
 
 /// The most passes one `post_apply_cleanup` runs (see its FIXPOINT note).
-const MAX_CLEANUP_PASSES: usize = 3;
+/// A cleanup still changing the state on its last pass returns a result the
+/// contract's `validate_state` then refuses; `fork_merge_closure_test`
+/// asserts no generated merge or apply reaches it.
+pub const MAX_CLEANUP_PASSES: usize = 3;
+
+/// What [`ChatRoomStateV1::post_apply_cleanup_counted`] ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupPasses {
+    /// Passes run, the confirming pass included.
+    pub passes: usize,
+    /// Whether the last pass changed nothing, so the result is a fixpoint.
+    pub confirmed: bool,
+}
 
 /// Whether every cleanup runs all of its passes, as the worst case does:
 /// under the cost tests, and under `--cfg river_force_all_cleanup_passes` for
@@ -208,6 +220,30 @@ use crate::room_state::message::MessagesV1;
 use crate::room_state::secret::RoomSecretsV1;
 use crate::room_state::upgrade::OptionalUpgradeV1;
 use crate::room_state::version::StateVersion;
+
+/// Why [`ChatRoomStateV1::validate_whole_state`] refused a state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WholeStateError {
+    /// `verify` refused it.
+    Verify(String),
+    /// Cleanup failed on it.
+    Cleanup(String),
+    /// The cleaned state could not be encoded for the comparison.
+    Encode(String),
+    /// Cleanup would change it: it is not in canonical form.
+    NotNormalized,
+}
+
+impl std::fmt::Display for WholeStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verify(e) => write!(f, "State verification failed: {e}"),
+            Self::Cleanup(e) => write!(f, "State cleanup failed: {e}"),
+            Self::Encode(e) => write!(f, "Cleaned state could not be encoded: {e}"),
+            Self::NotNormalized => write!(f, "State is not normalized: cleanup would change it"),
+        }
+    }
+}
 use ed25519_dalek::VerifyingKey;
 use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
@@ -579,6 +615,58 @@ impl ChatRoomStateV1 {
         std::borrow::Cow::Owned(merged)
     }
 
+    /// This state as `post_apply_cleanup` leaves it: the canonical form the
+    /// room contract's `validate_state` requires of a whole state.
+    ///
+    /// `validate_state` accepts only states that cleanup leaves unchanged
+    /// (compared as encoded bytes), so every state a peer stores is canonical.
+    /// freenet-core validates every incoming whole state before it merges it,
+    /// for an UPDATE as well as a PUT, so a whole state cleanup would still
+    /// change is refused on every path. A client therefore sends this, never
+    /// its raw local snapshot, in any whole-state PUT or full-state UPDATE: a
+    /// local snapshot can be one cleanup would still change (an edit applied
+    /// directly, or a state written by an older build). Deltas need no
+    /// normalizing: the receiver applies them and then runs cleanup.
+    pub fn normalized(&self, parameters: &ChatRoomParametersV1) -> Result<Self, String> {
+        let mut out = self.clone();
+        out.post_apply_cleanup(parameters)?;
+        Ok(out)
+    }
+
+    /// The room contract's whole-state check: `verify`, then that cleanup
+    /// leaves `bytes` (the encoding of `self` as received) unchanged.
+    ///
+    /// Both run under ONE ban-signature memo scope, so a ban signature `verify`
+    /// checked is not checked again by cleanup. The memo is keyed on the
+    /// signature, the verifying key and every signed field of the ban, and it
+    /// is cleared when this call returns.
+    ///
+    /// The fixpoint is compared on the encoded BYTES, never on the decoded
+    /// struct with `==`: `MessagesV1::actions_state` is a `#[serde(skip)]`
+    /// cache, so a decoded state holds it empty and cleanup rebuilds it, and
+    /// struct equality would refuse every room that has message actions.
+    /// Comparing bytes also refuses a non-canonical encoding.
+    pub fn validate_whole_state(
+        &self,
+        parameters: &ChatRoomParametersV1,
+        bytes: &[u8],
+    ) -> Result<(), WholeStateError> {
+        crate::room_state::ban::signature_memo::active_while(|| {
+            self.verify(self, parameters)
+                .map_err(WholeStateError::Verify)?;
+            let cleaned = self
+                .normalized(parameters)
+                .map_err(WholeStateError::Cleanup)?;
+            let mut out = Vec::with_capacity(bytes.len());
+            ciborium::ser::into_writer(&cleaned, &mut out)
+                .map_err(|e| WholeStateError::Encode(e.to_string()))?;
+            if out != bytes {
+                return Err(WholeStateError::NotNormalized);
+            }
+            Ok(())
+        })
+    }
+
     /// Post-apply cleanup: prune members who have no recent messages, clean up
     /// member_info for pruned members, remove orphaned bans, and sweep
     /// direct messages whose participants are no longer in the room.
@@ -612,6 +700,18 @@ impl ChatRoomStateV1 {
     /// pruned (orphaning their DMs). See
     /// `direct_messages.rs` module docs, "Interaction with bans".
     pub fn post_apply_cleanup(&mut self, parameters: &ChatRoomParametersV1) -> Result<(), String> {
+        self.post_apply_cleanup_counted(parameters).map(|_| ())
+    }
+
+    /// [`Self::post_apply_cleanup`], reporting how many passes it ran and
+    /// whether the last one confirmed the result (changed nothing). A result
+    /// that is not confirmed was cut off by `MAX_CLEANUP_PASSES`, and the
+    /// contract's `validate_state` would refuse it, so tests assert it never
+    /// happens.
+    pub fn post_apply_cleanup_counted(
+        &mut self,
+        parameters: &ChatRoomParametersV1,
+    ) -> Result<CleanupPasses, String> {
         crate::room_state::ban::signature_memo::active_while(|| {
             // FIXPOINT: a pass is followed by another on its result, and the
             // result stands once a pass changes nothing, so that state is one
@@ -638,9 +738,10 @@ impl ChatRoomStateV1 {
             }
             #[cfg(any(test, river_cleanup_counters))]
             cleanup_counters::set_cleanup_passes(passes, last_changed);
-            #[cfg(not(any(test, river_cleanup_counters)))]
-            let _ = last_changed;
-            Ok(())
+            Ok(CleanupPasses {
+                passes,
+                confirmed: !last_changed,
+            })
         })
     }
 

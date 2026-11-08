@@ -23,7 +23,7 @@ use river_core::room_state::member::{AuthorizedMember, Member, MemberId, Members
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -32,16 +32,81 @@ thread_local! {
     static NOT_IDEMPOTENT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Apply and merge outputs checked against the contract's whole-state
+    /// rule (`validate_whole_state`: cleanup must leave the encoded bytes
+    /// unchanged), and how many of them it would refuse.
+    static FIXPOINT_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static FIXPOINT_REFUSED: Cell<usize> = const { Cell::new(0) };
+    /// Most cleanup passes any apply's or merge's own cleanup ran. Measured
+    /// only under `--cfg river_cleanup_counters` (see `note_cleanup_passes`).
+    static MAX_CLEANUP_PASSES_SEEN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Record the passes the cleanup that just finished ran. Under
+/// `--cfg river_cleanup_counters` this reads the library's counter; CI runs
+/// this test file that way too, so the bound check below is not skipped there.
+fn note_cleanup_passes() {
+    #[cfg(river_cleanup_counters)]
+    {
+        let passes = river_core::room_state::cleanup_counters::read().2;
+        MAX_CLEANUP_PASSES_SEEN.with(|m| m.set(m.get().max(passes)));
+    }
+}
+
+/// Reset the per-run counters (see [`assert_no_refusals`]).
+fn reset_fixpoint_counters() {
+    FIXPOINT_CHECKS.with(|c| c.set(0));
+    FIXPOINT_REFUSED.with(|c| c.set(0));
+    MAX_CLEANUP_PASSES_SEEN.with(|c| c.set(0));
+    #[cfg(river_cleanup_counters)]
+    river_core::room_state::cleanup_counters::reset();
+}
+
+/// The contract's `validate_state` refuses a state cleanup would still
+/// change, so it would refuse its own output if an apply or merge ever
+/// produced one. Assert none did, and (under the counters cfg) that no
+/// cleanup reached `MAX_CLEANUP_PASSES` with its last pass still changing
+/// the state.
+fn assert_no_refusals(what: &str) {
+    let checks = FIXPOINT_CHECKS.with(|c| c.get());
+    let refused = FIXPOINT_REFUSED.with(|c| c.get());
+    let max_passes = MAX_CLEANUP_PASSES_SEEN.with(|c| c.get());
+    eprintln!(
+        "{what}: {checks} apply/merge outputs checked, {refused} not a cleanup fixpoint; \
+         most cleanup passes {max_passes} (0 = not measured) of {}",
+        river_core::room_state::MAX_CLEANUP_PASSES
+    );
+    assert!(checks > 0, "{what}: no outputs were checked");
+    assert_eq!(
+        refused, 0,
+        "{what}: validate_state would refuse merge outputs"
+    );
+    #[cfg(river_cleanup_counters)]
+    {
+        assert!(max_passes > 0, "{what}: the pass counter did not run");
+        assert_eq!(
+            river_core::room_state::cleanup_counters::bound_reached(),
+            0,
+            "{what}: a cleanup reached MAX_CLEANUP_PASSES without converging"
+        );
+    }
+}
+
 /// `post_apply_cleanup` must be a fixpoint on every state a peer can hold:
 /// Freenet runs it a variable number of times, and full-state PUTs bypass it,
 /// so `cleanup(S) != S` for a stored `S` diverges peers. Repeated gossip hides
 /// a pass-1/pass-2 difference (the next merge runs cleanup again), which is
 /// why this is checked after EVERY apply and merge rather than inferred from
-/// convergence (#702 review round 5).
+/// convergence (#702 review round 5). The contract's `validate_state` now
+/// refuses such a state too, so the same check counts what it would refuse.
 fn check_idempotent(s: &ChatRoomStateV1, p: &ChatRoomParametersV1, what: &str) {
+    note_cleanup_passes();
     let mut again = s.clone();
-    let _ = again.post_apply_cleanup(p);
-    if ser(&again) != ser(s) {
+    let cleanup_ok = again.post_apply_cleanup(p).is_ok();
+    FIXPOINT_CHECKS.with(|c| c.set(c.get() + 1));
+    if !cleanup_ok || ser(&again) != ser(s) {
+        FIXPOINT_REFUSED.with(|c| c.set(c.get() + 1));
         NOT_IDEMPOTENT.with(|v| v.borrow_mut().push(what.to_string()));
     }
     // A state an apply or merge produced is normalized, so merging it with
@@ -1223,6 +1288,7 @@ fn hold_different_records_for_one_member(a: &ChatRoomStateV1, b: &ChatRoomStateV
 }
 
 fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
+    reset_fixpoint_counters();
     let mut out = Failures::default();
     for &(seed, shape) in seeds {
         drain_not_idempotent();
@@ -1284,6 +1350,7 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
             Ending::SilentlyDiverged => out.silent.push(format!("seed {seed} shape {shape}")),
         }
     }
+    assert_no_refusals(&format!("{mode:?}"));
     out
 }
 

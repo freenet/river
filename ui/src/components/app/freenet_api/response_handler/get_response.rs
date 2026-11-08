@@ -4,7 +4,7 @@ use crate::components::app::freenet_api::backward_probe::{
 };
 use crate::components::app::freenet_api::error::SynchronizerError;
 use crate::components::app::freenet_api::error_report::{
-    ErrorReport, LABEL_DISCONNECTED, LABEL_ROOM_FULL,
+    ErrorReport, LABEL_DISCONNECTED, LABEL_INVALID_OPERATION, LABEL_ROOM_FULL,
 };
 use crate::components::app::freenet_api::response_handler::update_notification::{
     clear_upgrade_target, follow_upgrade_pointer_if_needed, upgrade_target_owner,
@@ -775,17 +775,26 @@ pub async fn handle_get_response(
                 WrappedContract::new(Arc::new(contract_code), parameters),
             ));
 
-            let wrapped_state = WrappedState::new(to_cbor_vec(&retrieved_state_for_put));
+            let put_bytes = crate::util::whole_state_put_bytes(&owner_vk, &retrieved_state_for_put);
 
-            let put_request = ContractRequest::Put {
-                contract: contract_container,
-                state: wrapped_state,
-                related_contracts: Default::default(),
-                subscribe: true,
-                blocking_subscribe: false,
-            };
-
-            let put_result = if let Some(web_api) = WEB_API.write().as_mut() {
+            let put_result = if let Err(e) = &put_bytes {
+                error!(
+                    "Not PUTting invited room {:?}: {e}",
+                    MemberId::from(owner_vk)
+                );
+                Err(ErrorReport::new(
+                    LABEL_INVALID_OPERATION,
+                    "Couldn't publish this room: its state could not be normalized",
+                    e.clone(),
+                ))
+            } else if let Some(web_api) = WEB_API.write().as_mut() {
+                let put_request = ContractRequest::Put {
+                    contract: contract_container,
+                    state: WrappedState::new(put_bytes.expect("checked above")),
+                    related_contracts: Default::default(),
+                    subscribe: true,
+                    blocking_subscribe: false,
+                };
                 match web_api.send(ClientRequest::ContractOp(put_request)).await {
                     Ok(_) => {
                         info!(
@@ -1209,17 +1218,23 @@ pub async fn handle_get_response(
                     WrappedContract::new(Arc::new(contract_code), parameters),
                 ));
 
-                let wrapped_state = WrappedState::new(to_cbor_vec(&retrieved_state_for_put));
+                let put_bytes =
+                    crate::util::whole_state_put_bytes(&owner_vk, &retrieved_state_for_put);
 
-                let put_request = ContractRequest::Put {
-                    contract: contract_container,
-                    state: wrapped_state,
-                    related_contracts: Default::default(),
-                    subscribe: true,
-                    blocking_subscribe: false,
-                };
-
-                let put_succeeded = if let Some(web_api) = WEB_API.write().as_mut() {
+                let put_succeeded = if let Err(e) = &put_bytes {
+                    error!(
+                        "Not PUTting imported room {:?}: {e}",
+                        MemberId::from(owner_vk)
+                    );
+                    false
+                } else if let Some(web_api) = WEB_API.write().as_mut() {
+                    let put_request = ContractRequest::Put {
+                        contract: contract_container,
+                        state: WrappedState::new(put_bytes.expect("checked above")),
+                        related_contracts: Default::default(),
+                        subscribe: true,
+                        blocking_subscribe: false,
+                    };
                     match web_api.send(ClientRequest::ContractOp(put_request)).await {
                         Ok(_) => {
                             info!(
@@ -1377,7 +1392,11 @@ pub(crate) fn local_state_ahead(
     owner_vk: &ed25519_dalek::VerifyingKey,
 ) -> bool {
     let params = ChatRoomParametersV1 { owner: *owner_vk };
-    compute_update_data(local, Some(network), &params).is_some()
+    // With a baseline only a delta is computed, which cannot fail.
+    matches!(
+        compute_update_data(local, Some(network), &params),
+        Ok(Some(_))
+    )
 }
 
 /// Re-seed `owner_vk`'s room with a full PUT after its code-free subscribe GET
@@ -1679,7 +1698,16 @@ async fn put_state_to_current_key(
     let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
         WrappedContract::new(Arc::new(contract_code), Parameters::from(params_bytes)),
     ));
-    let wrapped_state = WrappedState::new(to_cbor_vec(&state));
+    let wrapped_state = match crate::util::whole_state_put_bytes(&owner_vk, &state) {
+        Ok(bytes) => WrappedState::new(bytes),
+        Err(e) => {
+            error!(
+                "Backward probe: not PUTting {label} state for room {:?}: {e}",
+                MemberId::from(owner_vk)
+            );
+            return;
+        }
+    };
 
     let put_request = ContractRequest::Put {
         contract: contract_container,
@@ -2838,5 +2866,66 @@ mod tests {
             handler.contains("ContractResponse::NotFound{instance_id}=>{handle_get_not_found(instance_id).await;"),
             "handle_api_response must route NotFound to handle_get_not_found"
         );
+    }
+
+    /// Every whole-state PUT in this file sends the normalized state:
+    /// `validate_state` accepts only states cleanup leaves unchanged. There
+    /// are exactly three PUT sites. Inside each `ContractRequest::Put { .. }`
+    /// literal, `state:` is either `WrappedState::new(` of the bytes
+    /// `whole_state_put_bytes` returned (`put_bytes`), or a `wrapped_state`
+    /// binding that was built from `whole_state_put_bytes` in the same
+    /// function.
+    #[test]
+    fn every_whole_state_put_sends_the_normalized_state() {
+        let full = include_str!("get_response.rs");
+        let src = full
+            .split("mod tests {")
+            .next()
+            .expect("get_response.rs must have production code before `mod tests`");
+        let compact: String = src.split_whitespace().collect();
+        let puts: Vec<usize> = compact
+            .match_indices("ContractRequest::Put{")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            puts.len(),
+            3,
+            "a PUT site was added or removed; pin it here"
+        );
+        for put in puts {
+            let literal = &compact[put..];
+            let literal = &literal[..literal.find("};").expect("the PUT literal closes")];
+            let state = literal
+                .split("state:")
+                .nth(1)
+                .expect("the PUT literal sets `state`");
+            let state = &state[..state.find(",related_contracts").expect("`state` ends")];
+            match state {
+                "WrappedState::new(put_bytes.expect(\"checkedabove\"))" => {
+                    let before = &compact[..put];
+                    let bound = before
+                        .rfind("letput_bytes=")
+                        .expect("`put_bytes` is bound before the PUT");
+                    assert!(
+                        before[bound..]
+                            .starts_with("letput_bytes=crate::util::whole_state_put_bytes("),
+                        "`put_bytes` is not the normalized bytes"
+                    );
+                }
+                "wrapped_state" => {
+                    let before = &compact[..put];
+                    let bound = before
+                        .rfind("letwrapped_state=")
+                        .expect("`wrapped_state` is bound before the PUT");
+                    assert!(
+                        before[bound..].starts_with(
+                            "letwrapped_state=matchcrate::util::whole_state_put_bytes("
+                        ),
+                        "`wrapped_state` is not built from the normalized bytes"
+                    );
+                }
+                other => panic!("a PUT sends a state that is not the normalized bytes: {other}"),
+            }
+        }
     }
 }

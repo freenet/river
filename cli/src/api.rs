@@ -3015,6 +3015,11 @@ impl ApiClient {
         ));
 
         // Create wrapped state using ciborium
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged.
+        let room_state = room_state
+            .normalized(&parameters)
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let state_bytes = {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&room_state, &mut buf)
@@ -3181,6 +3186,13 @@ impl ApiClient {
         // going through `ensure_room_migrated`, so it is another poisoning
         // choke point (freenet/river#427 P2-3).
         let room_state = strip_upgrade_pointer_for_forward_put(&room_state);
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged, and a stored snapshot need not be one.
+        let room_state = room_state
+            .normalized(&ChatRoomParametersV1 {
+                owner: *room_owner_key,
+            })
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let state_bytes = {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&room_state, &mut buf)
@@ -3802,6 +3814,11 @@ impl ApiClient {
         // current contract: carrying it forward poisons the current generation
         // with a pointer to an older one (freenet/river#427).
         let state_to_put = strip_upgrade_pointer_for_forward_put(room_state);
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged, and a recovered state need not be one.
+        let state_to_put = state_to_put
+            .normalized(&parameters)
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let mut state_bytes = Vec::new();
         ciborium::ser::into_writer(&state_to_put, &mut state_bytes)
             .map_err(|e| anyhow!("Failed to serialize room state: {e}"))?;
@@ -4697,6 +4714,13 @@ impl ApiClient {
         // contract: carrying it forward poisons the new generation with a
         // pointer to an older one (freenet/river#427).
         let state_to_put = strip_upgrade_pointer_for_forward_put(room_state);
+        // Normalized: `validate_state` accepts only states cleanup leaves
+        // unchanged, and a migrated state need not be one.
+        let state_to_put = state_to_put
+            .normalized(&ChatRoomParametersV1 {
+                owner: *room_owner_key,
+            })
+            .map_err(|e| anyhow!("Failed to normalize room state: {e}"))?;
         let state_bytes = {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&state_to_put, &mut buf)
@@ -7829,6 +7853,71 @@ mod migration_recovery_tests {
                  `{gate}`; a stale riverctl would publish its own bundled code onto a \
                  generation River has moved past"
             );
+        }
+    }
+
+    /// Every whole-state PUT of the room contract sends the state normalized
+    /// by `ChatRoomStateV1::normalized`: `validate_state` accepts only states
+    /// cleanup leaves unchanged. For each of the four PUT sites (and there
+    /// are exactly four), the binding serialized into the `WrappedState` is
+    /// the one `.normalized(` produced, and where the site strips the upgrade
+    /// pointer, it normalizes AFTER the strip (the strip's output is what is
+    /// sent).
+    #[test]
+    fn every_room_contract_put_sends_a_normalized_state() {
+        let full = include_str!("api.rs");
+        let src = full
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("api.rs has production code before its tests");
+        assert_eq!(
+            src.matches("ContractRequest::Put {").count(),
+            4,
+            "a room-contract PUT site was added or removed; pin it here"
+        );
+        for (fn_name, var, strips) in [
+            ("pub async fn create_room(", "room_state", false),
+            ("pub async fn republish_room(", "room_state", true),
+            ("async fn put_room_state(", "state_to_put", true),
+            (
+                "async fn migrate_room_to_new_contract(",
+                "state_to_put",
+                true,
+            ),
+        ] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("`{fn_name}` must exist"));
+            let body = &src[start..];
+            let put = body
+                .find("ContractRequest::Put {")
+                .unwrap_or_else(|| panic!("`{fn_name}` has no PUT"));
+            let body = &body[..put];
+            let compact: String = body.split_whitespace().collect();
+            let binding = format!("let{var}={var}.normalized(");
+            let normalized = compact.find(&binding).unwrap_or_else(|| {
+                panic!("`{fn_name}` does not rebind `{var}` to its normalized form")
+            });
+            let serialized = compact
+                .rfind(&format!("into_writer(&{var},"))
+                .unwrap_or_else(|| panic!("`{fn_name}` does not serialize `{var}`"));
+            assert!(
+                normalized < serialized,
+                "`{fn_name}` serializes `{var}` before normalizing it"
+            );
+            assert!(
+                !compact[normalized + binding.len()..serialized].contains(&format!("let{var}=")),
+                "`{fn_name}` rebinds `{var}` between normalizing and serializing it"
+            );
+            if strips {
+                let strip = compact
+                    .find("strip_upgrade_pointer_for_forward_put(")
+                    .unwrap_or_else(|| panic!("`{fn_name}` does not strip the pointer"));
+                assert!(
+                    strip < normalized,
+                    "`{fn_name}` normalizes before stripping the upgrade pointer"
+                );
+            }
         }
     }
 

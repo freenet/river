@@ -523,8 +523,9 @@ const CHAT_DELEGATE_NONCE_KEY: &str = "river_chat_delegate_nonce_v1";
 /// stdlib pre-0.8, ~April 2026, before #4143/#4144); every release from ~0.2.60
 /// onward ignores it. There is no protocol-version handshake and the
 /// `RegisterDelegate` bincode layout is byte-identical from stdlib v0.1.22
-/// through 0.8.3 (verified for freenet/river#394), so a stdlib-0.8 River client
-/// CAN connect to and register a delegate on such an ancient node — the residual
+/// through 0.8.3 (verified for freenet/river#394), and still through 0.12.1
+/// (stdlib 0.9.0 removed only the last `DelegateRequest` variant), so a River
+/// client CAN connect to and register a delegate on such an ancient node — the residual
 /// is reachable at the protocol level, NOT gated out by wire incompatibility. In
 /// practice it needs a very old, non-auto-updated peer that the live ~0.2.9x
 /// fleet almost certainly no longer contains. For that residual node the
@@ -6701,12 +6702,18 @@ mod tests {
     /// caps decided after removals): the delegate links the room-state code
     /// it changes, and the river-core 0.3.0 -> 0.3.1 bump moves it
     /// regardless. V37 (`0fc3625e…`) is the outgoing generation.
+    ///
+    /// Updated for V38 (freenet-stdlib 0.8.5 -> 0.12.1, river-core 0.3.1 ->
+    /// 0.4.0): the delegate is rebuilt against the new stdlib. V38
+    /// (`da47cbd9…`) is the outgoing generation. The same release adds the
+    /// room contract's whole-state check (`validate_whole_state`) to
+    /// river-core, which the delegate also links.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "da47cbd9e5264828b80d229a292e23e05951737844cd289c8f53e99bf55e0848",
+            "264a93013e97a464109a63ebfbe84a98e61e81f691f905b142eb1417e9da9329",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"

@@ -187,6 +187,18 @@ jobs:
       # newly-added file. The named steps are kept for failure attribution.
       run: cargo test -p river-core --tests
 
+    - name: Test fork merges never hit the cleanup pass bound
+      env:
+        RUST_MIN_STACK: 8388608
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target/cleanup-counters
+      # The room contract's validate_state refuses a state cleanup would still
+      # change, so a merge whose cleanup stops at MAX_CLEANUP_PASSES without
+      # converging would be refused. `--cfg river_cleanup_counters` compiles
+      # the pass counter this test asserts on; it is not in any published
+      # build. Own target dir so the changed RUSTFLAGS do not invalidate the
+      # main one.
+      run: RUSTFLAGS="--cfg river_cleanup_counters" cargo test -p river-core --test fork_merge_closure_test
+
     - name: Test riverctl (CLI crate unit tests, incl. #292 recovery)
       env:
         RUST_MIN_STACK: 8388608
