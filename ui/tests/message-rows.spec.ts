@@ -603,6 +603,24 @@ test.describe("Revealing a popover on a short phone view", () => {
   });
 });
 
+// The anchored picker's half of the same check, where it exists: a touch
+// tablet's width, short.
+test.describe("Revealing the picker on a short wide view", () => {
+  test.use({ viewport: { width: 834, height: 480 } });
+
+  test("the picker scrolls nothing sideways or outside the history", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await page.addStyleTag({ content: '[data-testid="emoji-picker"] { min-width: 1100px; min-height: 700px; }' });
+    const row = page.getByTestId("message-row").last();
+    await openInlinePicker(page, row);
+    await expect(page.getByTestId("emoji-picker")).toBeVisible();
+    await nextFrames(page);
+    expect(await strayScroll(page), "picker").toEqual(NO_STRAY_SCROLL);
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("emoji-picker")).toBeHidden();
+  });
+});
+
 // #791 review: the picker opened from the keyboard reports no click
 // position, so its place must come from the control. The newest message, at
 // the bottom of the view, has no room for the picker below its React.
@@ -888,6 +906,47 @@ test.describe("Latest over row controls", () => {
     // Playwright refuses the click if the control would take it there.
     await latest.click({ position: { x: (left + right) / 2 - l.x, y: (top + bottom) / 2 - l.y } });
     await expect(latest).toBeHidden();
+  });
+});
+
+// At phone width the footer keeps only the +, at the row's left, and the
+// row's actions entry is a 1px button at its top right until it has keyboard
+// focus. Neither may take Latest's click: the entry is scrolled under
+// Latest's centre, and the + shown to stay clear of it.
+test.describe("Latest over row controls at phone width", () => {
+  test.use({ viewport: { width: 390, height: 800 } });
+
+  test("neither the + nor the actions entry takes Latest's click", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await readerLeavesTheEnd(page);
+    const latest = page.getByTestId("scroll-to-bottom");
+    await expect(latest).toBeVisible();
+    const l = (await latest.boundingBox())!;
+    // Every +: clear of Latest across, whatever height it is scrolled to.
+    const reacts = await page.getByTestId("message-react-button").evaluateAll((bs) => bs.map((b) => b.getBoundingClientRect().right));
+    expect(reacts.length).toBeGreaterThan(0);
+    for (const right of reacts) expect(right, "a + ends left of Latest").toBeLessThan(l.x);
+    // An entry scrolled under Latest's centre.
+    const { id, target } = await page.evaluate(() => {
+      const scroller = document.getElementById("chat-scroll-container")!;
+      const lb = document.querySelector('[data-testid="scroll-to-bottom"]')!.getBoundingClientRect();
+      const mid = scroller.getBoundingClientRect().top + scroller.clientHeight / 2;
+      const rows = [...document.querySelectorAll<HTMLElement>('[data-testid="message-row"]')];
+      const dist = (r: HTMLElement) => Math.abs(r.getBoundingClientRect().top - mid);
+      const row = rows.reduce((a, b) => (dist(b) < dist(a) ? b : a));
+      const c = row.querySelector('[data-testid="mobile-message-actions-entry"]')!.getBoundingClientRect();
+      return { id: row.id, target: scroller.scrollTop + c.top + c.height / 2 - (lb.top + lb.height / 2) };
+    });
+    await readerScrollsWithoutGesture(page, target);
+    const entry = page.locator(`[id="${id}"]`).getByTestId("mobile-message-actions-entry");
+    const e = (await entry.boundingBox())!;
+    const overlapsDown = Math.min(e.y + e.height, l.y + l.height) - Math.max(e.y, l.y);
+    expect(overlapsDown, "premise: the entry is at Latest's height").toBeGreaterThan(0);
+    const at = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.closest('[data-testid="scroll-to-bottom"]') !== null, [l.x + l.width / 2, l.y + l.height / 2]);
+    expect(at, "Latest's centre is Latest's").toBe(true);
+    await latest.click();
+    await expect(latest).toBeHidden();
+    await expect(page.getByTestId("mobile-message-actions-sheet")).toBeHidden();
   });
 });
 

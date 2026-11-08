@@ -379,3 +379,18 @@ export async function openMessageActions(page: Page, row: Locator) {
   const id = (await row.getAttribute("id"))!.replace(/^msg-/, "");
   await expect(sheet).toHaveAttribute("data-target-row", id);
 }
+
+/// Whether a one- (or two-) finger `touchmove` at the point is cancelled,
+/// dispatched on whatever is there, as the browser would.
+export function touchmovePrevented(page: Page, x: number, y: number, fingers = 1): Promise<boolean> {
+  return page.evaluate(
+    ({ x, y, fingers }) => {
+      const target = document.elementFromPoint(x, y)!;
+      const e = new Event("touchmove", { bubbles: true, cancelable: true });
+      Object.defineProperty(e, "touches", { value: { length: fingers } });
+      target.dispatchEvent(e);
+      return e.defaultPrevented;
+    },
+    { x, y, fingers },
+  );
+}

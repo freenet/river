@@ -580,6 +580,34 @@ test.describe("Reaction picker placement", () => {
     });
   });
 
+  // React at the window's left edge, with no room back from it, is no
+  // longer reachable by layout at 48rem and wider (the rooms rail is there);
+  // the rail is taken out here so the start-side fallback stays covered.
+  test.describe("with no room back from React", () => {
+    test.use({ viewport: { width: 900, height: 700 } });
+
+    test("it opens from React's left edge toward the free side", async ({ page }) => {
+      await openRoomWithComposer(page);
+      // The rooms rail out, and the column against the window's left edge.
+      await page.evaluate(() => {
+        let rail: Element | null = document.querySelector('[data-testid="room-list"]');
+        while (rail && rail.parentElement && !rail.parentElement.classList.contains("app-root")) rail = rail.parentElement;
+        (rail as HTMLElement).style.setProperty("display", "none", "important");
+      });
+      await page.addStyleTag({ content: ".conversation-column { margin-inline: 0 !important; }" });
+      await deliverOffscreen(page, "start edge desktop");
+      for (let i = 0; i < 3; i++) await deliverOffscreen(page, `start desktop filler ${i}: ${"s".repeat(200)}`);
+      const start = committedRow(page, "start edge desktop");
+      await start.evaluate((el) => el.scrollIntoView({ block: "center" }));
+      await openFromKeyboard(page, start);
+      const m = await measurePicker(start);
+      expect(m.react.right - (m.picker.right - m.picker.left), "premise: no room back from React").toBeLessThan(0);
+      expect(placement(m)).toEqual({ block: "below", inline: "start" });
+      expectEveryEmojiUsable(m);
+      expectInvokerUncovered(m);
+    });
+  });
+
   test.describe("in a short landscape view", () => {
     test.use({ viewport: { width: 800, height: 360 } });
 
@@ -834,6 +862,29 @@ test.describe("While the reaction picker is open", () => {
     await wheelAt(page, x, y);
     expect((await scrollMetrics(page)).top, "held: the history did not move").toBe(before);
     expect(await isOpen(page), "still open").toBe(true);
+  });
+
+  // #863 with a desktop width: its React stops being laid out (its row
+  // collapsed here; the narrow-window version of this now closes the picker
+  // at 48rem instead). A zoom is let through and closes nothing; the next
+  // plain wheel is let through and closes it.
+  test("once its React is no longer laid out, a zoom closes nothing and the next wheel is let through and closes it", async ({ page }) => {
+    test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await openRoomWithComposer(page);
+    await deliver(page, "collapsed anchor");
+    const row = committedRow(page, "collapsed anchor");
+    await openFromKeyboard(page, row);
+    await page.addStyleTag({ content: '.msg-group:has([data-testid="message-react-button"][aria-expanded="true"]) { display: none !important; }' });
+    await nextFrames(page);
+    expect(await row.evaluate((el) => el.getBoundingClientRect().height), "premise: its row is not laid out").toBe(0);
+    expect(await isOpen(page), "premise: hiding it alone does not close it").toBe(true);
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [view.x + 30, view.y + 30];
+    expect(await wheelCancelled(page, x, y, true), "a zoom is let through").toBe(false);
+    expect(await isOpen(page), "a zoom does not close it").toBe(true);
+    expect(await wheelCancelled(page, x, y, false), "the wheel is not cancelled").toBe(false);
+    await expectClosed(page);
   });
 
   // Below 48rem the React is the mobile popup's, so narrowing the window

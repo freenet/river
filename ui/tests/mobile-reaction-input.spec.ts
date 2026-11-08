@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { committedRow, keyboardFocus, openRoomWithComposer, press, settle } from "./example-room";
+import { committedRow, keyboardFocus, openRoomWithComposer, press, settle, touchmovePrevented } from "./example-room";
 import { deliver } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
@@ -350,6 +350,115 @@ test.describe("The mobile reaction popup", () => {
     await expect(row.getByTestId("message-react-unavailable")).toHaveCount(1);
     await page.setViewportSize({ width: 390, height: 760 });
     await expect(react).not.toHaveAttribute("aria-disabled");
+  });
+
+
+  test("the Enter that confirms a WebKit conversion after its composition ends does not submit", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await openPopup(page, row);
+    await typeEmoji(page, "😂");
+    // WebKit's order: compositionend first, then the confirming Enter, which
+    // says isComposing: false and keyCode 229.
+    await page.evaluate(() => {
+      const field = document.getElementById("mobile-reaction-input")!;
+      const ime = () => {
+        const e = new KeyboardEvent("keydown", { key: "Enter", isComposing: false, bubbles: true, cancelable: true });
+        Object.defineProperty(e, "keyCode", { get: () => 229 });
+        return e;
+      };
+      field.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      field.dispatchEvent(new CompositionEvent("compositionend", { data: "😂", bubbles: true }));
+      field.dispatchEvent(ime());
+      // A 229 keydown a task later is still the input method's.
+      setTimeout(() => field.dispatchEvent(ime()), 20);
+    });
+    await settle(page);
+    await expect(popup(page), "the conversion's Enter did not submit").toBeVisible();
+    await expect(chips(row)).toHaveCount(0);
+    await page.keyboard.press("Enter");
+    await expect(popup(page)).toBeHidden();
+    await expect(chips(row)).toHaveCount(1);
+  });
+
+  test("one-finger touch is held outside the panel, not inside it or for a pinch; every close path lets go", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    const history = async () => {
+      const v = (await page.locator("#chat-scroll-container").boundingBox())!;
+      return { x: v.x + 40, y: v.y + 30 };
+    };
+    const closes: [string, () => Promise<void>][] = [
+      ["Close", () => press(page, page.getByTestId("mobile-reaction-close"))],
+      ["Escape", () => page.keyboard.press("Escape")],
+      ["backdrop", async () => {
+        const p = await history();
+        if (test.info().project.use.hasTouch) await page.touchscreen.tap(p.x, p.y);
+        else await page.mouse.click(p.x, p.y);
+      }],
+      ["a palette pick", async () => {
+        await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
+        await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button").first());
+      }],
+      ["48rem", async () => {
+        await page.setViewportSize({ width: 768, height: 760 });
+        await expect(popup(page)).toBeHidden();
+        await page.setViewportSize({ width: 390, height: 760 });
+      }],
+    ];
+    for (const [how, close] of closes) {
+      await openPopup(page, row);
+      const h = await history();
+      expect(await touchmovePrevented(page, h.x, h.y), `${how}: a finger over the history is held`).toBe(true);
+      expect(await touchmovePrevented(page, h.x, h.y, 2), `${how}: a pinch is not`).toBe(false);
+      const panel = (await page.locator("#mobile-reaction-popup .mobile-sheet-panel").boundingBox())!;
+      expect(await touchmovePrevented(page, panel.x + panel.width / 2, panel.y + 6), `${how}: the panel scrolls`).toBe(false);
+      await close();
+      await expect(popup(page)).toBeHidden();
+      await settle(page);
+      const after = await history();
+      expect(await touchmovePrevented(page, after.x, after.y), `closed by ${how}: let go`).toBe(false);
+    }
+    await openPopup(page, row);
+    await callRiverTest(page, "removeMessages", "react target");
+    await expect(popup(page)).toBeHidden();
+    const after = await history();
+    expect(await touchmovePrevented(page, after.x, after.y), "closed by its message leaving: let go").toBe(false);
+  });
+
+  test("leaving the chat panel or a re-key closes it, and a submit queued across the re-key does nothing", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await openPopup(page, row);
+    await callRiverTest(page, "setMobileView", "rooms");
+    await expect(popup(page)).toBeHidden();
+    await callRiverTest(page, "setMobileView", "chat");
+    await settle(page);
+    await expect(popup(page), "coming back reopens nothing").toBeHidden();
+
+    await openPopup(page, row);
+    await typeEmoji(page, "🔥");
+    const signs = await callRiverTest(page, "messageSignsRecorded");
+    await page.evaluate(() => {
+      (window as unknown as { __riverTest: { rekeyCurrentRoom(): void } }).__riverTest.rekeyCurrentRoom();
+      document.querySelector<HTMLElement>('[data-testid="mobile-reaction-submit"]')!.click();
+    });
+    await settle(page);
+    await expect(popup(page)).toBeHidden();
+    await expect(chips(row), "no reaction from the earlier generation's opening").toHaveCount(0);
+    expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signs);
+    await openPopup(page, row);
+  });
+
+  test("a reaction from the popup that cannot be signed is rolled back, and says so", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await callRiverTest(page, "holdMessageSigning");
+    await openPopup(page, row);
+    await typeEmoji(page, "🔥");
+    await press(page, page.getByTestId("mobile-reaction-submit"));
+    await expect(chips(row), "shown while its signature is held").toHaveCount(1);
+    await callRiverTest(page, "failNextMessageSign");
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect(chips(row), "rolled back").toHaveCount(0);
+    await expect(page.getByTestId("toast-message")).toHaveText("Your reaction could not be sent");
+    await expect(popup(page), "nothing reopens").toBeHidden();
   });
 
   test("opening and closing it renders no message group", async ({ page }) => {
