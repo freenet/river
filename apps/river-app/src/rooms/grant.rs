@@ -189,6 +189,10 @@ fn request_grant_paced(
     let poll = format!("{ROUTE_REQUEST}/{}", created.request_id);
     // Since when polls have been failing to reach the node, and the last failure.
     let mut failing: Option<(Instant, String)> = None;
+    // Polls failed, and the node has not yet shown it still holds the request (a 202). A
+    // restarting node can answer 409, 429 or 503 before it forgets the request, so only a
+    // 202 clears this.
+    let mut may_have_restarted = false;
     loop {
         if now() >= deadline {
             // A node that was down when the request ran out is reported as that.
@@ -197,11 +201,9 @@ fn request_grant_paced(
                 None => GrantOutcome::Expired,
             };
         }
-        // Whether this is the first answer after polls failed.
-        let after_failure;
         let reply = match http.get(&poll) {
             Ok(r) => {
-                after_failure = failing.take().is_some();
+                failing = None;
                 r
             }
             // The node may be restarting. The request id still names the same request, so
@@ -214,6 +216,7 @@ fn request_grant_paced(
                     return GrantOutcome::Unreachable(e);
                 }
                 failing = Some((since, e));
+                may_have_restarted = true;
                 sleep(pacing.pause);
                 continue;
             }
@@ -231,11 +234,15 @@ fn request_grant_paced(
             // Still pending (the node normally holds this answer for up to 30 seconds), at the
             // grant limit, the grant not stored yet, or too many polls at once across every
             // client of the node: the request is kept, so poll again after a pause.
-            (202, _) | (409, _) | (429, _) | (503, _) => sleep(pacing.pause),
-            // The first answer after the node was unreachable saying the request is unknown
-            // means it restarted and forgot it: the node's doing, not an unanswered page. A 404
-            // later on is the request expiring as usual.
-            (404, _) if after_failure => {
+            (202, _) => {
+                may_have_restarted = false;
+                sleep(pacing.pause);
+            }
+            (409, _) | (429, _) | (503, _) => sleep(pacing.pause),
+            // After the node was unreachable, and before it showed it still holds the request,
+            // "unknown request" means it restarted and forgot it: the node's doing, not an
+            // unanswered page. A 404 once it has answered 202 is the request expiring as usual.
+            (404, _) if may_have_restarted => {
                 return GrantOutcome::Unreachable("Freenet restarted".into());
             }
             (404, _) => return GrantOutcome::Expired,
@@ -722,6 +729,21 @@ mod tests {
         let (outcome, gets) = run_clocked(Err("gone"));
         assert_eq!(outcome, GrantOutcome::Unreachable("gone".into()));
         assert_eq!(gets, 3);
+    }
+
+    /// A restarting node can answer "not ready" before it forgets the request: still a restart.
+    #[test]
+    fn an_unknown_request_after_an_outage_and_a_not_ready_is_a_restart() {
+        let (outcome, _, _) = run(vec![
+            Ok((200, CREATED)),
+            Err("reset"),
+            Ok((503, r#"{"error":"node not ready"}"#)),
+            Ok((404, r#"{"error":"unknown or expired request"}"#)),
+        ]);
+        assert!(
+            matches!(outcome, GrantOutcome::Unreachable(_)),
+            "{outcome:?}"
+        );
     }
 
     /// A blip that the node answered through, and then a natural expiry: that is an expiry.
