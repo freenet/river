@@ -103,7 +103,7 @@ pub(super) fn run(
     let mut backoff = BACKOFF_FIRST;
     report(RoomsUpdate::Access(Access::Connecting));
     loop {
-        let (current, fresh) = match token.clone().or_else(|| store.as_ref()?.load()) {
+        let (current, mut fresh) = match token.clone().or_else(|| store.as_ref()?.load()) {
             Some(t) => (t, false),
             None => {
                 let outcome = request_grant(&http, &mut |url| {
@@ -135,7 +135,14 @@ pub(super) fn run(
             }
         };
         token = Some(current.clone());
-        let err = follow(authority, &current, &mut rooms, report, &mut backoff);
+        let err = follow(
+            authority,
+            &current,
+            &mut rooms,
+            report,
+            &mut backoff,
+            &mut fresh,
+        );
         match token_verdict(&err) {
             TokenVerdict::Discard => {
                 token = None;
@@ -143,8 +150,8 @@ pub(super) fn run(
                     store.discard();
                 }
                 if fresh {
-                    // A token the node just issued names nothing: asking again would only
-                    // open another approval page.
+                    // A token the node just issued names nothing before it was ever used:
+                    // asking again would only open another approval page.
                     return Access::Refused(
                         "Freenet didn't accept the permission it just gave River. Try again."
                             .into(),
@@ -180,12 +187,14 @@ fn pause(backoff: &mut Duration) {
 }
 
 /// Connect, read the rooms, then follow them until the connection fails. Returns why.
+/// `fresh` is cleared once the token has been used to read the rooms.
 fn follow(
     authority: &str,
     token: &GrantToken,
     rooms: &mut Rooms,
     report: &dyn Fn(RoomsUpdate),
     backoff: &mut Duration,
+    fresh: &mut bool,
 ) -> SocketError {
     let mut socket = match NodeSocket::connect(authority, token) {
         Ok(s) => s,
@@ -195,6 +204,7 @@ fn follow(
         return e;
     }
     *backoff = BACKOFF_FIRST;
+    *fresh = false;
     rooms.report(LinkStatus::Loading, report);
     report(RoomsUpdate::Access(Access::Ready));
     for id in rooms.contract_ids() {
