@@ -36,7 +36,6 @@ mod history_scroll;
 mod history_window;
 mod markdown;
 mod mention;
-mod message_actions;
 mod message_input;
 mod not_member_notification;
 mod outbox;
@@ -48,8 +47,11 @@ pub(crate) use self::outbox_commit::{
 };
 mod pending_effects;
 mod pending_sends;
+mod reaction_picker;
+mod reply_highlight;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use self::reaction_picker::is_open as reaction_picker_is_open;
 mod seal;
-use self::emoji_picker::FREQUENT_EMOJIS;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
     complete_scroll_request, correct_view_after_patch, follow_arrival_at_end,
@@ -67,14 +69,13 @@ use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
 use self::pending_sends::PendingSends;
+use self::reaction_picker::{ReactionInvoker, ReactionPicker, ReactionSurfaces};
 use self::seal::SealInput;
 use crate::components::conversation::message_input::MessageInput;
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
-use dioxus_free_icons::icons::fa_solid_icons::{
-    FaEllipsisVertical, FaFaceSmile, FaPenToSquare, FaReply, FaTrashCan, FaTriangleExclamation,
-};
+use dioxus_free_icons::icons::fa_solid_icons::FaTriangleExclamation;
 use dioxus_free_icons::Icon;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfoV1};
@@ -267,13 +268,10 @@ struct MessageGroup {
     /// `a_shield_and_a_warning_can_both_render` pins the co-occurrence.
     author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
+    /// The first message's time, for the day separators. The header's time is
+    /// NOT this: it describes the first message still rendered, which a
+    /// pending delete can change (see [`header_time_labels`]).
     first_time: DateTime<Utc>,
-    /// True if any message in this group carried a sender timestamp later than
-    /// when we received it, by more than [`CLOCK_SKEW_TOLERANCE_SECS`], and was
-    /// therefore clamped back to its arrival time.
-    time_clamped: bool,
-    /// Propagation delay for the first message in the group (shown in header)
-    first_delay_secs: Option<i64>,
     messages: Vec<GroupedMessage>,
 }
 
@@ -290,7 +288,6 @@ struct GroupedMessage {
     /// message and was clamped back to that arrival time. (It is clamped to
     /// ARRIVAL, not to "now": see [`MessageClock`] for why the render's wall
     /// clock cannot be the target.)
-    #[allow(dead_code)]
     time_clamped: bool,
     id: String,
     message_id: MessageId,
@@ -299,8 +296,7 @@ struct GroupedMessage {
     /// What the reply-quote strip should render, already resolved against live
     /// room state — see [`ReplyStrip`] and [`resolve_reply_strip`].
     reply_strip: ReplyStrip,
-    /// Propagation delay in seconds (send → receive), if known and significant
-    #[allow(dead_code)]
+    /// Propagation delay in seconds (send → receive), if known.
     receive_delay_secs: Option<i64>,
 }
 
@@ -821,9 +817,6 @@ fn group_messages(
 
         if should_group {
             if let Some(DisplayItem::Messages(ref mut group)) = items.last_mut() {
-                if time_clamped {
-                    group.time_clamped = true;
-                }
                 group.messages.push(grouped_message);
             }
         } else {
@@ -849,8 +842,6 @@ fn group_messages(
                 author_impersonation,
                 is_self,
                 first_time: message_time,
-                time_clamped,
-                first_delay_secs: receive_delay_secs,
                 messages: vec![grouped_message],
             }));
         }
@@ -861,6 +852,65 @@ fn group_messages(
     prune_message_html_cache(&seen_message_ids);
 
     items
+}
+
+/// What a message's time shows, wherever it shows: beside the author's name on
+/// a group's first row, or in a continuation row's gutter. Both go through
+/// [`time_labels`], so the two places never describe a message differently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimeLabels {
+    /// `HH:MM` in the viewer's timezone, marked `~` when clamped.
+    shown: String,
+    /// The tooltip: the full local date and time, then why it may be off.
+    title: String,
+    /// The shown time in RFC 3339 (UTC), for `<time datetime>`.
+    datetime: String,
+    /// The sender's clock ran ahead, so the time shown is the arrival time.
+    clamped: bool,
+}
+
+/// The labels for one message shown at `time`: `clamped` when the sender's
+/// timestamp was pulled back to its arrival, `delay_secs` the propagation
+/// delay when it is known.
+fn time_labels(time: DateTime<Utc>, clamped: bool, delay_secs: Option<i64>) -> TimeLabels {
+    let ms = time.timestamp_millis();
+    let full = format_utc_as_full_datetime(ms);
+    let title = if clamped {
+        format!(
+            "{full} (sender's clock may be ahead of yours — their timestamp was later \
+             than when this message reached you, so the time shown is when it \
+             arrived)"
+        )
+    } else if let Some(secs) = delay_secs {
+        format!("{full} (received after {} delay)", format_delay(secs))
+    } else {
+        full
+    };
+    let local = format_utc_as_local_time(ms);
+    TimeLabels {
+        shown: if clamped { format!("~{local}") } else { local },
+        title,
+        datetime: time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        clamped,
+    }
+}
+
+/// One message's own time, clamp and delay: a continuation row's gutter time.
+fn row_time_labels(message: &GroupedMessage) -> TimeLabels {
+    time_labels(
+        message.time,
+        message.time_clamped,
+        message.receive_delay_secs,
+    )
+}
+
+/// The time beside a group's author name: the first message it RENDERS, not
+/// the group. A later message's clamp is that message's own, and a pending
+/// delete (`pending_effects.rs`, applied after grouping) can remove the first
+/// message, so nothing cached at grouping describes the header. `None` only
+/// for an empty group, which is never rendered.
+fn header_time_labels(group: &MessageGroup) -> Option<TimeLabels> {
+    group.messages.first().map(row_time_labels)
 }
 
 /// A join notice's names (shown in the secondary colour) and the text after
@@ -1419,6 +1469,9 @@ pub fn Conversation() -> Element {
     // during render; the signals (`window_items`, `opening_snap_done`) still
     // reset in the effect, so this render substitutes `INITIAL_WINDOW_ITEMS`
     // below and keeps the sentinel unmounted until they catch up.
+    // The reaction picker's target and the open reactor list, shared by
+    // every message group without being read by them (`reaction_picker.rs`).
+    let reaction_surfaces = reaction_picker::use_reaction_surfaces();
     let room_changed_this_render = {
         // `Option<Option<..>>` so the very first render (no room recorded yet)
         // also counts as a change and starts from a clean window.
@@ -1446,6 +1499,10 @@ pub fn Conversation() -> Element {
             reader_position
                 .room_epoch
                 .set(reader_position.room_epoch.get().wrapping_add(1));
+            // A picker opened in the old room is for nothing here: a pick
+            // queued in it now does nothing, and it closes.
+            reaction_picker::note_room_shown(room);
+            crate::util::defer(move || reaction_surfaces.close_if_stale());
             // The old room's hold and range end with it.
             reader_position.forget_range();
             reader_position.window_rendered.set(0);
@@ -1490,10 +1547,6 @@ pub fn Conversation() -> Element {
         });
     }
 
-    // Which message's touch action menu (kebab) is open, by message ID string.
-    // Owned by Conversation (not per message group) so only ONE menu is open at
-    // a time across the whole history — opening one closes any other (#402).
-    let open_action_menu: Signal<Option<String>> = use_signal(|| None);
     let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
 
     // State for delete confirmation modal
@@ -2990,8 +3043,8 @@ pub fn Conversation() -> Element {
                                                                 on_request_delete: on_group_request_delete,
                                                                 on_edit: on_group_edit,
                                                                 on_reply: on_group_reply,
-                                                                open_action_menu: open_action_menu,
                                                                 author_hue: author_hue,
+                                                                reactions: reaction_surfaces,
                                                                 }
                                                             }
                                                         }
@@ -3107,6 +3160,9 @@ pub fn Conversation() -> Element {
                     }
                 }
             }
+
+            // The one reaction picker, opened by a message's footer React.
+            ReactionPicker { surfaces: reaction_surfaces, on_react: on_group_react }
 
             // Message input or status
             {
@@ -3558,19 +3614,6 @@ fn reaction_owners_popover_at(
     }
 }
 
-/// Where the inline emoji picker opens, set when it opens (#402), in px from
-/// its containing block: the message content, which places the hover bar and
-/// the kebab too, so the offsets hold while the message reflows below them.
-#[derive(Clone, Copy, PartialEq)]
-struct PickerPlacement {
-    /// Opens upward: `y_px` is then where its bottom edge sits, else its top.
-    above: bool,
-    /// CSS `right`: puts the picker's right edge at the control that opened it.
-    x_px: f64,
-    /// From the content's top, so content growing below never moves it.
-    y_px: f64,
-}
-
 /// The centre of the element with this id, in client coordinates.
 fn element_centre(id: &str) -> Option<(f64, f64)> {
     let element = web_sys::window()?.document()?.get_element_by_id(id)?;
@@ -3606,18 +3649,13 @@ fn focus_without_scrolling(element: &web_sys::Element) -> bool {
 /// scrollport), and its max height: the space on that side less the 8px gap
 /// each way, so an `overflow-y-auto` popover scrolls instead of clipping (#402).
 fn vertical_placement(y: f64, height: f64) -> (bool, f64) {
-    vertical_placement_from(y, y, height)
+    let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
+    placement_within(scroll_top, scroll_bottom, y, y, height)
 }
 
 /// [`vertical_placement`] for a popover hung off an element spanning viewport
-/// `top..bottom`: it opens below from `bottom`, or above from `top`.
-fn vertical_placement_from(top: f64, bottom: f64, height: f64) -> (bool, f64) {
-    let (scroll_top, scroll_bottom) = chat_scrollport_bounds();
-    placement_within(scroll_top, scroll_bottom, top, bottom, height)
-}
-
-/// [`vertical_placement_from`] inside a scrollport spanning
-/// `scroll_top..scroll_bottom`, pure for native tests.
+/// `top..bottom` (it opens below from `bottom`, or above from `top`), inside a
+/// scrollport spanning `scroll_top..scroll_bottom`. Pure for native tests.
 fn placement_within(
     scroll_top: f64,
     scroll_bottom: f64,
@@ -3632,10 +3670,10 @@ fn placement_within(
 }
 
 thread_local! {
-    /// The popover (an inline picker or an edit form, by element id) whose
-    /// next mount brings it into the history's view. Set when it opens and
-    /// taken by its first mount, so a later re-mount (a re-render, a group
-    /// re-key) never moves the reader again.
+    /// The edit form (by element id) whose next mount brings it into the
+    /// history's view. Set when it opens and taken by its first mount, so a
+    /// later re-mount (a re-render, a group re-key) never moves the reader
+    /// again.
     static REVEAL_ON_MOUNT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -3714,9 +3752,6 @@ fn reveal_shift(top: f64, bottom: f64, view_top: f64, view_bottom: f64, margin: 
     }
 }
 
-/// The inline picker's height: 16 emoji in four rows of four, plus padding.
-const INLINE_PICKER_HEIGHT_PX: f64 = 140.0;
-
 fn chat_scrollport_bounds() -> (f64, f64) {
     web_sys::window()
         .and_then(|w| w.document())
@@ -3726,94 +3761,6 @@ fn chat_scrollport_bounds() -> (f64, f64) {
             (rect.top(), rect.bottom())
         })
         .unwrap_or((60.0, 600.0))
-}
-
-/// The space between the inline picker and the control it opens at.
-const PICKER_GAP_PX: f64 = 4.0;
-
-/// The inline picker's width: four emoji buttons, their gaps and padding.
-/// Only used to keep it inside the scroller.
-const INLINE_PICKER_WIDTH_PX: f64 = 170.0;
-
-/// Where `msg-{msg_id}`'s inline picker opens: at the control that opened
-/// it, measured when it opens, never from a click (a key press reports no
-/// position). That control is the hover bar's React, or on touch, where the
-/// bar is not displayed, the kebab whose menu holds React.
-///
-/// - Its right edge lines up with the control's right edge, kept inside the
-///   chat scroller.
-/// - It opens just below the control, or just above it when it does not fit
-///   below inside the scroller and there is more room above
-///   ([`vertical_placement_from`]).
-///
-/// With neither control measurable it opens from the anchor at the foot of
-/// the message. Unmeasurable entirely (`None`), it opens below the message
-/// content.
-fn inline_picker_placement(msg_id: &str) -> Option<PickerPlacement> {
-    let measure = || {
-        let document = web_sys::window()?.document()?;
-        let row = document.get_element_by_id(&format!("msg-{msg_id}"))?;
-        let content = row
-            .query_selector("[data-testid=\"message-content\"]")
-            .ok()??
-            .get_bounding_client_rect();
-        let anchor = row
-            .query_selector("[data-testid=\"reaction-picker-anchor\"]")
-            .ok()??
-            .parent_element()?
-            .get_bounding_client_rect();
-        let trigger = [
-            "[data-testid=\"message-hover-actions\"] button[aria-label=\"React\"]",
-            "[data-testid=\"message-kebab\"]",
-        ]
-        .iter()
-        .filter_map(|selector| row.query_selector(selector).ok().flatten())
-        .map(|el| el.get_bounding_client_rect())
-        .find(|r| r.width() > 0.0 && r.height() > 0.0)
-        .map(|r| (r.top(), r.bottom(), r.right()))
-        .unwrap_or((anchor.top(), anchor.bottom(), anchor.right()));
-        let scroller = document
-            .get_element_by_id("chat-scroll-container")?
-            .get_bounding_client_rect();
-        Some(placement_at(
-            trigger,
-            (content.top(), content.right()),
-            (scroller.left(), scroller.right()),
-            |top, bottom| {
-                vertical_placement_from(top, bottom, INLINE_PICKER_HEIGHT_PX + PICKER_GAP_PX).0
-            },
-        ))
-    };
-    measure()
-}
-
-/// [`inline_picker_placement`]'s arithmetic, pure for native tests, in
-/// client coordinates: the trigger as `(top, bottom, right)`, the content
-/// as `(top, right)`; `opens_above` decides the side from the trigger's
-/// `top..bottom`.
-fn placement_at(
-    trigger: (f64, f64, f64),
-    content: (f64, f64),
-    scroller: (f64, f64),
-    opens_above: impl Fn(f64, f64) -> bool,
-) -> PickerPlacement {
-    const EDGE_PX: f64 = 4.0;
-    let (t_top, t_bottom, t_right) = trigger;
-    let (c_top, c_right) = content;
-    let (s_left, s_right) = scroller;
-    let right = t_right
-        .min(s_right - EDGE_PX)
-        .max(s_left + EDGE_PX + INLINE_PICKER_WIDTH_PX);
-    let above = opens_above(t_top, t_bottom);
-    PickerPlacement {
-        above,
-        x_px: c_right - right,
-        y_px: if above {
-            t_top - c_top - PICKER_GAP_PX
-        } else {
-            t_bottom - c_top + PICKER_GAP_PX
-        },
-    }
 }
 
 /// A ⚠ or 🛡 beside a name, its tooltip also its accessible label.
@@ -3921,73 +3868,24 @@ fn MessageGroupComponent(
     on_request_delete: EventHandler<MessageId>,
     on_edit: EventHandler<(MessageId, String)>,
     on_reply: EventHandler<ReplyContext>,
-    // Shared across all groups so only one action menu is open at a time (#402).
-    open_action_menu: Signal<Option<String>>,
     /// The author's avatar hue under this viewer's salt for the room, or
     /// `None` for the neutral disc (no salt yet, or an author the room no
     /// longer lists).
     author_hue: Option<u16>,
+    /// The conversation's reaction picker and open reactor list, passed on
+    /// to the footers and never read here, so the picker opening or closing
+    /// renders no group (#830).
+    reactions: ReactionSurfaces,
 ) -> Element {
-    let mut open_action_menu = open_action_menu;
     #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
     crate::test_hooks::note_message_group_render();
-    // Per-group: at most one picker per group, and while a picker is open its
-    // raised (z-[60]) backdrop covers every other group's kebabs and React
-    // buttons, so tapping one dismisses the picker rather than stacking a
-    // second popover — the single-popover guarantee comes from the z-order, not
-    // a shared signal (#402).
-    let mut open_emoji_picker: Signal<Option<String>> = use_signal(|| None);
-    let timestamp_ms = group.first_time.timestamp_millis();
-    let time_str = format_utc_as_local_time(timestamp_ms);
-    let delay_suffix = group
-        .first_delay_secs
-        .map(|s| format!(" (received after {} delay)", format_delay(s)));
-    let full_time_str = if group.time_clamped {
-        format!(
-            "{} (sender's clock may be ahead of yours — their timestamp was later \
-             than when this message reached you, so the time shown is when it \
-             arrived)",
-            format_utc_as_full_datetime(timestamp_ms)
-        )
-    } else if let Some(ref suffix) = delay_suffix {
-        format!("{}{}", format_utc_as_full_datetime(timestamp_ms), suffix)
-    } else {
-        format_utc_as_full_datetime(timestamp_ms)
-    };
-    let time_clamped = group.time_clamped;
+    let header_time = header_time_labels(&group);
     let is_self = group.is_self;
 
-    // Whether the kebab action menu should open above (true) or below (false)
-    // the kebab. Set from the tap position so the menu for a message near the
-    // bottom of the viewport flips upward instead of being clipped by the
-    // composer — mirrors `PickerPlacement::above` for the emoji picker (#402).
-    let mut menu_show_above: Signal<bool> = use_signal(|| false);
-
-    // Max height (px) for the kebab action menu, measured at tap time as the
-    // actual space available on the chosen side within the chat scrollport. The
-    // menu is `overflow-y-auto`, so on a very short/landscape viewport where it
-    // fits neither side fully it scrolls internally instead of being clipped by
-    // the scroll container with Edit/Delete unreachable (#402).
-    let mut menu_max_h: Signal<f64> = use_signal(|| 0.0);
-
-    let mut picker_placement: Signal<Option<PickerPlacement>> = use_signal(|| None);
+    // This group's open reactor list. At most one list or picker is open in
+    // the conversation: opening a list closes the picker and is recorded in
+    // `reactions`, so that opening the picker closes the list.
     let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
-    // Measures the control now, then places and opens the picker in one deferred
-    // step (.claude/rules/dioxus-signal-safety.md). Every open path
-    // (the hover bar's React, the kebab's React) comes through here.
-    let open_inline_picker = move |msg_id: &str| {
-        request_reveal(format!("emoji-picker-{msg_id}"));
-        let placement = inline_picker_placement(msg_id);
-        let picker_id = format!("inline-{msg_id}");
-        crate::util::defer(move || {
-            picker_placement.set(placement);
-            open_emoji_picker.set(Some(picker_id));
-            open_action_menu.set(None);
-            // One popover at a time: React can be reached from the keyboard
-            // while a reactor list is open.
-            open_reaction_owners.set(None);
-        });
-    };
     {
         let live_owner_keys: HashSet<String> = group
             .messages
@@ -4057,24 +3955,29 @@ fn MessageGroupComponent(
                     let Some((key, message_id)) = previous else {
                         return;
                     };
+                    // Closed because the picker opened (React from the
+                    // keyboard): focus stays where the reader put it.
+                    if reaction_picker_is_open() {
+                        return;
+                    }
                     if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
                         focus_without_scrolling(&chip);
                         return;
                     }
                     // The chip is gone: Remove took the only reaction with that
                     // emoji. Focus stays on the reaction line: another chip
-                    // while one remains, else the message's React action
-                    // (the kebab on touch, the hover bar's React otherwise).
-                    // Each is tried until one actually holds focus, since a
-                    // hidden one refuses it. If the message is
-                    // gone too, focus stays where the browser put it.
+                    // while one remains, else the message's footer React,
+                    // which every message has. Each is tried until one
+                    // actually holds focus (a row being edited has no React).
+                    // If the message is gone too, focus stays where the
+                    // browser put it. Never scrolling: only an arrival moves
+                    // the history.
                     let Some(row) = document.get_element_by_id(&format!("msg-{message_id}")) else {
                         return;
                     };
                     for selector in [
                         "[data-testid=\"reaction-chip\"]",
-                        "[data-testid=\"message-kebab\"]",
-                        "[data-testid=\"message-hover-actions\"] button",
+                        "[data-testid=\"message-react-button\"]",
                     ] {
                         let Some(control) = row.query_selector(selector).ok().flatten() else {
                             continue;
@@ -4167,9 +4070,8 @@ fn MessageGroupComponent(
             {
                 group.messages.into_iter().enumerate().map(move |(idx, msg)| {
                         let is_first = idx == 0;
-                        let has_reactions = !msg.reactions.is_empty();
                         let reply_strip_val = msg.reply_strip.clone();
-                        let row_time_ms = msg.time.timestamp_millis();
+                        let row_time = row_time_labels(&msg);
 
                         rsx! {
                             // One row per message (`.msg-row` in main.css): the
@@ -4198,19 +4100,18 @@ fn MessageGroupComponent(
                                             "{author_initials}"
                                         }
                                     } else {
-                                        span {
+                                        time {
                                             "data-testid": "message-gutter-time",
                                             class: "msg-gutter-time",
-                                            title: format_utc_as_full_datetime(row_time_ms),
-                                            {format_utc_as_local_time(row_time_ms)}
+                                            class: if row_time.clamped { "italic" },
+                                            datetime: "{row_time.datetime}",
+                                            title: "{row_time.title}",
+                                            "{row_time.shown}"
                                         }
                                     }
                                 }
                                 div {
                                     "data-testid": "message-content",
-                                    // `relative` anchors the hover bar (over its
-                                    // top right) and the kebab (just past its
-                                    // right edge, in the touch gutter).
                                     class: "msg-content relative min-w-0",
                                     if is_first {
                                         div {
@@ -4267,11 +4168,15 @@ fn MessageGroupComponent(
                                                     span { "aria-hidden": "true", class: "cursor-default", title: warning.tooltip(), "Similar name" }
                                                 }
                                             }
-                                            span {
-                                                class: "text-xs text-text-muted cursor-default tabular-nums",
-                                                class: if time_clamped { "italic opacity-70" },
-                                                title: "{full_time_str}",
-                                                if time_clamped { "~{time_str}" } else { "{time_str}" }
+                                            if let Some(header_time) = header_time.as_ref() {
+                                                time {
+                                                    "data-testid": "message-header-time",
+                                                    class: "text-xs text-text-muted cursor-default tabular-nums",
+                                                    class: if header_time.clamped { "italic opacity-70" },
+                                                    datetime: "{header_time.datetime}",
+                                                    title: "{header_time.title}",
+                                                    "{header_time.shown}"
+                                                }
                                             }
                                         }
                                     }
@@ -4494,12 +4399,10 @@ fn MessageGroupComponent(
                                                 {
                                                         match reply_strip_inner {
                                                             ReplyStrip::NotAReply => rsx! {},
-                                                            // Deliberately inert — no `role`/`tabindex`/
-                                                            // `onclick` — because there is no original
-                                                            // message to scroll to. It therefore carries
-                                                            // its own class rather than `reply-strip`,
-                                                            // whose hover/focus-expand rules assume a
-                                                            // focusable element with ellipsized text.
+                                                            // Deliberately inert, not a button, because
+                                                            // there is no original message to jump to. It
+                                                            // therefore carries its own class rather than
+                                                            // `reply-strip`, the button's.
                                                             //
                                                             // The wording stays neutral: absence cannot
                                                             // distinguish a ban from an ordinary aged-out
@@ -4511,52 +4414,32 @@ fn MessageGroupComponent(
                                                                     class: "reply-strip-unavailable min-w-0 w-full max-w-[76ch] text-[13px] leading-[18px] mb-[3px] italic text-text-quote",
                                                                     // The arrow is decorative; the sentence
                                                                     // after it is what a screen reader needs.
-                                                                    span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5 not-italic", {line_icon(REPLY_ICON_PATH, 13)} }
+                                                                    span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5 not-italic", {line_icon(REPLY_TARGET_ICON_PATH, 13)} }
                                                                     "Original message unavailable"
                                                                 }
                                                             },
                                                             ReplyStrip::Quote { author, preview, target_id } => {
-                                                                let target_id_str = format!("{:?}", target_id.0);
-                                                                // Clone the target id so we can own one copy in the
-                                                                // onclick handler and one in the onkeydown handler.
-                                                                let target_id_for_key = target_id_str.clone();
+                                                                let target_row = format!("msg-{:?}", target_id.0);
+                                                                // A native button: Enter and Space fire its
+                                                                // click. Its name is the quote; the title
+                                                                // says what it does. One line, cut with an
+                                                                // ellipsis (`.reply-strip` in main.css).
                                                                 rsx! {
-                                                                    div {
+                                                                    button {
+                                                                        r#type: "button",
                                                                         "data-testid": "reply-strip",
-                                                                        class: "reply-strip min-w-0 w-full max-w-[76ch] text-[13px] leading-[18px] mb-[3px] rounded-sm cursor-pointer text-text-quote",
-                                                                        title: "Scroll to original message (Enter or Space to activate)",
-                                                                        role: "button",
-                                                                        tabindex: "0",
-                                                                        "aria-label": "Scroll to the message this is a reply to",
-                                                                        onclick: move |_| {
-                                                                            if let Some(window) = web_sys::window() {
-                                                                                if let Some(doc) = window.document() {
-                                                                                    if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_str)) {
-                                                                                        el.scroll_into_view();
-                                                                                        let _ = el.class_list().add_1("reply-highlight");
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                        onkeydown: move |e: KeyboardEvent| {
-                                                                            // Activate the same scroll-to-original
-                                                                            // behaviour via Enter or Space so keyboard
-                                                                            // users can reach it without a mouse.
-                                                                            if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
-                                                                                e.prevent_default();
-                                                                                if let Some(window) = web_sys::window() {
-                                                                                    if let Some(doc) = window.document() {
-                                                                                        if let Some(el) = doc.get_element_by_id(&format!("msg-{}", target_id_for_key)) {
-                                                                                            el.scroll_into_view();
-                                                                                            let _ = el.class_list().add_1("reply-highlight");
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        },
-                                                                        span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5", {line_icon(REPLY_ICON_PATH, 13)} }
-                                                                        span { class: "font-bold text-text-secondary mr-1.5", "{author}" }
-                                                                        span { "{preview}" }
+                                                                        "data-reply-target": "{target_row}",
+                                                                        class: "reply-strip block min-w-0 w-full max-w-[76ch] text-left text-[13px] leading-[18px] mb-[3px] rounded-sm cursor-pointer text-text-quote",
+                                                                        title: "Jump to the original message",
+                                                                        // DOM only (`reply_highlight.rs`): it
+                                                                        // writes no signal, so needs no `defer`.
+                                                                        onclick: move |_| reply_highlight::jump_to_reply_target(&target_row),
+                                                                        span { class: "reply-strip-text",
+                                                                            span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5", {line_icon(REPLY_TARGET_ICON_PATH, 13)} }
+                                                                            span { class: "font-bold text-text-secondary mr-1", "{author}" }
+                                                                            " "
+                                                                            span { "{preview}" }
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -4578,248 +4461,28 @@ fn MessageGroupComponent(
                                             }
                                         }
                                     }
-                                    // Hover action bar: React and Reply for all, Edit and
-                                    // Delete for own (`.hover-actions` in main.css). Not
-                                    // rendered while the row is being edited.
-                                    if editing_message.read().as_ref() != Some(&msg.id) {
-                                        {
-                                            let msg_id_str_for_edit = msg.id.clone();
-                                            let msg_id_for_react = msg.id.clone();
-                                            let msg_id_for_delete = msg.message_id.clone();
-                                            let msg_id_for_reply = msg.message_id.clone();
-                                            let current_text = msg.content_text.clone();
-                                            // Built on click, not per render: it parses the
-                                            // message's markdown.
-                                            let reply_preview_source = msg.content_text.clone();
-                                            let reply_preview_names = preview_names.clone();
-                                            let reply_author_name = group.author_name.clone();
-                                            rsx! {
-                                                div {
-                                                    // Hidden and hit-transparent until its row is hovered
-                                                    // or holds focus: a touch tap can't fire an invisible
-                                                    // action (#402) and an idle bar never covers Latest.
-                                                    // It and the closed kebab are z-20, under Latest (z-30)
-                                                    // and backdrops (z-40).
-                                                    "data-testid": "message-hover-actions",
-                                                    class: "hover-actions",
-                                                    button {
-                                                        r#type: "button",
-                                                        title: "React",
-                                                        "aria-label": "React",
-                                                        onclick: move |e: MouseEvent| {
-                                                            e.stop_propagation();
-                                                            open_inline_picker(&msg_id_for_react);
-                                                        },
-                                                        {line_icon(REACT_ICON_PATH, 18)}
-                                                    }
-                                                    button {
-                                                        r#type: "button",
-                                                        title: "Reply",
-                                                        "aria-label": "Reply",
-                                                        onclick: move |_| {
-                                                            let ctx = ReplyContext {
-                                                                message_id: msg_id_for_reply.clone(),
-                                                                author_name: reply_author_name.clone(),
-                                                                content_preview: reply_preview(
-                                                                    &reply_preview_source,
-                                                                    &reply_preview_names,
-                                                                ),
-                                                            };
-                                                            crate::util::defer(move || on_reply.call(ctx));
-                                                        },
-                                                        {line_icon(REPLY_ICON_PATH, 18)}
-                                                    }
-                                                    if is_self {
-                                                        button {
-                                                            r#type: "button",
-                                                            title: "Edit message",
-                                                            "aria-label": "Edit message",
-                                                            onclick: move |_| {
-                                                                let (t, id) = (current_text.clone(), msg_id_str_for_edit.clone());
-                                                                crate::util::defer(move || {
-                                                                    edit_text.set(t);
-                                                                    request_reveal(format!("edit-form-{id}"));
-                                                                    editing_message.set(Some(id));
-                                                                });
-                                                            },
-                                                            {line_icon(EDIT_ICON_PATH, 17)}
-                                                        }
-                                                        button {
-                                                            r#type: "button",
-                                                            title: "Delete message",
-                                                            "aria-label": "Delete message",
-                                                            onclick: move |_| {
-                                                                let id = msg_id_for_delete.clone();
-                                                                crate::util::defer(move || on_request_delete.call(id));
-                                                            },
-                                                            {line_icon(DELETE_ICON_PATH, 17)}
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Touch-only kebab action menu (#402). The hover
-                                    // action bar above is `display: none` where there is
-                                    // no hover pointer (main.css), so it can never appear
-                                    // on a touch device. `.touch-actions` (main.css) reveals
-                                    // this kebab only where there is no hover pointer;
-                                    // tapping it opens a menu with the same Reply / React /
-                                    // Edit / Delete actions.
+                                    // The footer: the reaction chips and React, then Reply,
+                                    // and Edit and Delete on your own (`.msg-footer` in
+                                    // main.css). Its line is kept whether or not the
+                                    // controls show. Their handlers are this group's, and
+                                    // Conversation's stable `use_callback`s (#830).
                                     {
-                                        let msg_id_kebab = msg.id.clone();
-                                        let msg_id_kebab_toggle = msg.id.clone();
-                                        let msg_id_menu_reply = msg.message_id.clone();
-                                        let msg_id_menu_delete = msg.message_id.clone();
-                                        let msg_id_menu_edit = msg.id.clone();
-                                        let msg_id_menu_react = msg.id.clone();
-                                        let edit_text_kebab = msg.content_text.clone();
-                                        let reply_author_kebab = group.author_name.clone();
-                                        let reply_preview_source_kebab = msg.content_text.clone();
-                                        let reply_preview_names_kebab = preview_names.clone();
-                                        let menu_open = open_action_menu.read().as_deref()
-                                            == Some(msg_id_kebab.as_str());
-                                        rsx! {
-                                            div {
-                                                // Positioned in the row's right gutter with
-                                                // `left-full` (NOT `translate`): a transform
-                                                // would become the containing block for the `fixed`
-                                                // dismiss backdrop below, shrinking it to this element
-                                                // instead of the viewport (#402).
-                                                // Closed, it is z-20 like the hover bar. Raise the OPEN
-                                                // wrapper above sibling kebabs: later ones paint above an open popover, so
-                                                // without this a nearby message's kebab could sit over the
-                                                // menu rows and steal the tap. `z-[60]` lifts the whole
-                                                // open popover+backdrop above them (and its backdrop then
-                                                // covers those kebabs, so a tap on one just dismisses). (#402)
-                                                class: format!(
-                                                    "touch-actions absolute top-1 left-full ml-1 {}",
-                                                    if menu_open { "z-[60]" } else { "z-20" },
-                                                ),
-                                                // Kebab toggle button
-                                                button {
-                                                    // Bare in its own gutter, so it does not compete with
-                                                    // the message; the press shows the surface.
-                                                    class: "flex items-center justify-center w-8 h-8 rounded-full text-text-muted active:bg-surface aria-expanded:bg-surface",
-                                                    "aria-label": "Message actions",
-                                                    "aria-haspopup": "menu",
-                                                    "aria-expanded": "{menu_open}",
-                                                    "data-testid": "message-kebab",
-                                                    onclick: move |e: MouseEvent| {
-                                                        e.stop_propagation();
-                                                        let is_open = open_action_menu.peek().as_deref()
-                                                            == Some(msg_id_kebab_toggle.as_str());
-                                                        if is_open {
-                                                            crate::util::defer(move || open_action_menu.set(None));
-                                                        } else {
-                                                            // An own menu (4 rows) is taller than a received one
-                                                            // (2 rows), so it flips up sooner.
-                                                            let menu_height = if is_self { 200.0 } else { 110.0 };
-                                                            let (above, max_h) =
-                                                                vertical_placement(e.client_coordinates().y, menu_height);
-                                                            let id = msg_id_kebab_toggle.clone();
-                                                            // Defer signal writes out of the event handler per
-                                                            // .claude/rules/dioxus-signal-safety.md (Firefox-mobile
-                                                            // re-entrant borrow crashes).
-                                                            crate::util::defer(move || {
-                                                                menu_show_above.set(above);
-                                                                menu_max_h.set(max_h);
-                                                                // Dismiss any open reaction picker so the two
-                                                                // popovers can't stack (#402).
-                                                                open_emoji_picker.set(None);
-                                                                open_action_menu.set(Some(id));
-                                                            });
-                                                        }
-                                                    },
-                                                    Icon { icon: FaEllipsisVertical, width: 16, height: 16 }
-                                                }
-                                                // Action menu popover + dismiss backdrop. The backdrop is
-                                                // `fixed inset-0` (covers the viewport now that no transformed
-                                                // ancestor clips it) so a tap anywhere else dismisses.
-                                                if menu_open {
-                                                    div {
-                                                        class: "fixed inset-0 z-40",
-                                                        onclick: move |_| crate::util::defer(move || open_action_menu.set(None)),
-                                                    }
-                                                    div {
-                                                        // Opens leftward from the right-gutter kebab;
-                                                        // `max-w` clamps it to the viewport at 320px.
-                                                        class: format!(
-                                                            "absolute z-50 right-0 min-w-[8rem] max-w-[calc(100vw-1rem)] overflow-y-auto bg-panel rounded-lg shadow-lg border border-border py-1 flex flex-col {}",
-                                                            if *menu_show_above.read() { "bottom-full mb-1" } else { "top-full mt-1" },
-                                                        ),
-                                                        style: format!("max-height: {}px", *menu_max_h.read()),
-                                                        "data-testid": "message-action-menu",
-                                                        button {
-                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                            onclick: move |_| {
-                                                                let id = msg_id_menu_reply.clone();
-                                                                let author = reply_author_kebab.clone();
-                                                                let preview = reply_preview(
-                                                                    &reply_preview_source_kebab,
-                                                                    &reply_preview_names_kebab,
-                                                                );
-                                                                crate::util::defer(move || {
-                                                                    on_reply.call(ReplyContext {
-                                                                        message_id: id,
-                                                                        author_name: author,
-                                                                        content_preview: preview,
-                                                                    });
-                                                                    open_action_menu.set(None);
-                                                                });
-                                                            },
-                                                            Icon { icon: FaReply, width: 14, height: 14 }
-                                                            "Reply"
-                                                        }
-                                                        button {
-                                                            class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                            onclick: move |_| {
-                                                                // Placed at this message's kebab, like every
-                                                                // other open path at its control (#402).
-                                                                open_inline_picker(&msg_id_menu_react);
-                                                            },
-                                                            Icon { icon: FaFaceSmile, width: 14, height: 14 }
-                                                            "React"
-                                                        }
-                                                        if is_self {
-                                                            button {
-                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-text hover:bg-surface text-left",
-                                                                onclick: move |_| {
-                                                                    let t = edit_text_kebab.clone();
-                                                                    let id = msg_id_menu_edit.clone();
-                                                                    crate::util::defer(move || {
-                                                                        edit_text.set(t);
-                                                                        request_reveal(format!("edit-form-{id}"));
-                                                                        editing_message.set(Some(id));
-                                                                        open_action_menu.set(None);
-                                                                    });
-                                                                },
-                                                                Icon { icon: FaPenToSquare, width: 14, height: 14 }
-                                                                "Edit"
-                                                            }
-                                                            button {
-                                                                class: "flex items-center gap-2 px-3 py-2 text-sm text-danger hover:bg-error-bg text-left",
-                                                                onclick: move |_| {
-                                                                    let id = msg_id_menu_delete.clone();
-                                                                    crate::util::defer(move || {
-                                                                        on_request_delete.call(id);
-                                                                        open_action_menu.set(None);
-                                                                    });
-                                                                },
-                                                                Icon { icon: FaTrashCan, width: 14, height: 14 }
-                                                                "Delete"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Reactions display with inline add button
-                                    {
-                                        let msg_id_for_inline = msg.id.clone();
+                                        // `msg.id` is the row's DOM id suffix (`msg-{id}`);
+                                        // `msg.message_id` is the signed message's id.
+                                        let row_id_for_chips = msg.id.clone();
                                         let msg_id_react = msg.message_id.clone();
-                                        let is_inline_picker_open = open_emoji_picker.read().as_ref() == Some(&format!("inline-{}", msg_id_for_inline));
+                                        // A row being edited has the form's own buttons.
+                                        let show_actions = editing_message.read().as_ref() != Some(&msg.id);
+                                        let row_for_invoker = msg.id.clone();
+                                        let msg_id_str_for_edit = msg.id.clone();
+                                        let msg_id_for_delete = msg.message_id.clone();
+                                        let msg_id_for_reply = msg.message_id.clone();
+                                        let current_text = msg.content_text.clone();
+                                        // Built on click, not per render: it parses the
+                                        // message's markdown.
+                                        let reply_preview_source = msg.content_text.clone();
+                                        let reply_preview_names = preview_names.clone();
+                                        let reply_author_name = group.author_name.clone();
 
                                         // Find user's current reaction on this message (if any)
                                         // No known identity ⇒ no reaction is ours,
@@ -4833,16 +4496,17 @@ fn MessageGroupComponent(
                                                 None
                                             }
                                         });
-                                        let user_reaction_for_picker = user_reaction.clone();
+                                        let msg_id_for_invoker = msg.message_id.clone();
 
                                         rsx! {
                                             div {
+                                                "data-testid": "message-footer",
+                                                class: "msg-footer",
+                                            div {
                                                 "data-testid": "message-reaction-row",
-                                                // A message with no reactions has no reaction line.
-                                                // Either way an inert anchor sits at its end. The
-                                                // picker is opened by the hover bar's React or the
-                                                // kebab's React, and opens at that control.
-                                                class: if has_reactions { "flex flex-wrap items-center gap-[5px] mt-[5px] mb-0.5" } else { "flex h-0" },
+                                                // The chips, then React: the message's one way
+                                                // into the picker, which opens at it.
+                                                class: "msg-reaction-row",
                                                 // Existing reactions (clickable to toggle if user has reacted)
                                                 {
                                                     let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
@@ -4888,7 +4552,7 @@ fn MessageGroupComponent(
                                                         } else {
                                                             names_str
                                                         };
-                                                        let owners_key = format!("{msg_id_for_inline}:{emoji}");
+                                                        let owners_key = format!("{row_id_for_chips}:{emoji}");
                                                         let (
                                                             owners_open,
                                                             owners_above,
@@ -4914,8 +4578,8 @@ fn MessageGroupComponent(
                                                         let chip_pressed_with_click = chip_pressed_with.clone();
                                                         let chip_pressed_with_down = chip_pressed_with.clone();
                                                         let chip_pressed_with_cancel = chip_pressed_with.clone();
-                                                        let msg_id_for_owners = msg_id_for_inline.clone();
-                                                        let msg_id_for_owners_key = msg_id_for_inline.clone();
+                                                        let row_id_for_owners = row_id_for_chips.clone();
+                                                        let row_id_for_owners_key = row_id_for_chips.clone();
                                                         let chip_id = reaction_chip_id(&owners_key);
                                                         let chip_id_for_key = chip_id.clone();
                                                         let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
@@ -5024,7 +4688,7 @@ fn MessageGroupComponent(
                                                                         if gesture_opens_owner_list(pressed_with.as_deref()) {
                                                                             let popover = reaction_owners_popover_at(
                                                                                 owners_key_for_click.clone(),
-                                                                                msg_id_for_owners.clone(),
+                                                                                row_id_for_owners.clone(),
                                                                                 click_x,
                                                                                 click_y,
                                                                             );
@@ -5036,8 +4700,7 @@ fn MessageGroupComponent(
                                                                                 if already_open {
                                                                                     open_reaction_owners.set(None);
                                                                                 } else {
-                                                                                    open_emoji_picker.set(None);
-                                                                                    open_action_menu.set(None);
+                                                                                    reactions.owner_list_opened(open_reaction_owners);
                                                                                     open_reaction_owners.set(Some(popover));
                                                                                 }
                                                                             });
@@ -5052,8 +4715,13 @@ fn MessageGroupComponent(
                                                                     onkeydown: move |e: KeyboardEvent| {
                                                                         let key = e.key();
                                                                         if key == Key::Escape {
-                                                                            e.prevent_default();
-                                                                            crate::util::defer(move || open_reaction_owners.set(None));
+                                                                            // Only this chip's own list: an Escape
+                                                                            // with none open is left to close the
+                                                                            // reaction picker.
+                                                                            if owners_open {
+                                                                                e.prevent_default();
+                                                                                crate::util::defer(move || open_reaction_owners.set(None));
+                                                                            }
                                                                             return;
                                                                         }
                                                                         // A `role="button"` answers Enter and Space.
@@ -5070,13 +4738,12 @@ fn MessageGroupComponent(
                                                                         let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
                                                                         let popover = reaction_owners_popover_at(
                                                                             owners_key_for_key.clone(),
-                                                                            msg_id_for_owners_key.clone(),
+                                                                            row_id_for_owners_key.clone(),
                                                                             x,
                                                                             y,
                                                                         );
                                                                         crate::util::defer(move || {
-                                                                            open_emoji_picker.set(None);
-                                                                            open_action_menu.set(None);
+                                                                            reactions.owner_list_opened(open_reaction_owners);
                                                                             open_reaction_owners.set(Some(popover));
                                                                         });
                                                                     },
@@ -5087,93 +4754,72 @@ fn MessageGroupComponent(
                                                         }
                                                     })
                                                 }
-                                                // The picker's fallback anchor, after the chips: what
-                                                // `inline_picker_placement` measures when no control
-                                                // can be. It takes no hits.
-                                                div {
-                                                    // `self-stretch`: as tall as the chip line, so the
-                                                    // fallback opens below or above the chips, not over
-                                                    // them. In a row with no reactions the line is 0.
-                                                    class: "relative inline-flex items-center self-stretch pointer-events-none",
-                                                    // Not a control: React is the hover bar's button,
-                                                    // or the kebab menu's on touch, so a message has
-                                                    // one way in.
-                                                    span {
-                                                        "data-testid": "reaction-picker-anchor",
-                                                        "aria-hidden": "true",
-                                                        class: "invisible inline-block h-0 w-0 overflow-hidden",
+                                                if show_actions {
+                                                    ReactionInvoker {
+                                                        surfaces: reactions,
+                                                        row: row_for_invoker,
+                                                        message: msg_id_for_invoker,
+                                                        current: user_reaction,
                                                     }
                                                 }
                                             }
-                                            // The picker and its backdrop, over the message content. That box also
-                                            // places the hover bar and the kebab, so the picker opened at one stays
-                                            // there when the message reflows under it (a reaction or an edit arriving).
-                                            // Raised above the closed z-20 kebabs and hover bars of other rows so none
-                                            // paints over the grid and takes a tap (as the action menu's z-[60]). (#402)
-                                            if is_inline_picker_open {
+                                            // Reply, Edit and Delete: one unit, which wraps
+                                            // onto its own line when it does not fit.
+                                            if show_actions {
                                                 div {
-                                                    class: "absolute inset-0 z-[60] pointer-events-none",
-                                                    // Invisible backdrop: a click anywhere else closes the picker.
-                                                    div {
-                                                        class: "fixed inset-0 z-40 pointer-events-auto",
-                                                        onclick: move |_| crate::util::defer(move || open_emoji_picker.set(None)),
-                                                    }
-                                                    // Inline emoji picker; placed by `open_inline_picker`.
-                                                    div {
-                                                        "data-testid": "emoji-picker",
-                                                        id: "emoji-picker-{msg_id_for_inline}",
-                                                        // It opens at the control that opened it, which
-                                                        // can sit at the view's edge: bring it into
-                                                        // view, only as far as needed, or the reader
-                                                        // sees nothing open and the invisible backdrop
-                                                        // takes their next click
-                                                        // (`reveal_once_in_history`).
-                                                        onmounted: {
-                                                            let picker_id = format!("emoji-picker-{msg_id_for_inline}");
-                                                            move |_| reveal_once_in_history(picker_id.clone())
-                                                        },
-                                                        class: "absolute p-1.5 bg-panel rounded-xl shadow-xl border border-border z-50 grid pointer-events-auto",
-                                                        style: {
-                                                            let place = match *picker_placement.read() {
-                                                                Some(p) if p.above => format!(
-                                                                    "right: {}px; bottom: calc(100% - {}px);",
-                                                                    p.x_px, p.y_px,
+                                                    "data-testid": "message-action-cluster",
+                                                    class: "msg-action-cluster",
+                                                    button {
+                                                        r#type: "button",
+                                                        "data-testid": "message-reply-button",
+                                                        class: "msg-action",
+                                                        title: "Reply",
+                                                        "aria-label": "Reply",
+                                                        onclick: move |_| {
+                                                            let ctx = ReplyContext {
+                                                                message_id: msg_id_for_reply.clone(),
+                                                                author_name: reply_author_name.clone(),
+                                                                content_preview: reply_preview(
+                                                                    &reply_preview_source,
+                                                                    &reply_preview_names,
                                                                 ),
-                                                                Some(p) => format!("right: {}px; top: {}px;", p.x_px, p.y_px),
-                                                                None => "left: 0; top: 100%; margin-top: 4px;".to_string(),
                                                             };
-                                                            format!("grid-template-columns: repeat(4, 1fr); gap: 2px; {place}")
+                                                            crate::util::defer(move || on_reply.call(ctx));
                                                         },
-                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                        {FREQUENT_EMOJIS.iter().map(|emoji| {
-                                                            let emoji_str = emoji.to_string();
-                                                            let msg_id = msg_id_react.clone();
-                                                            let is_current = user_reaction_for_picker.as_ref() == Some(&emoji_str);
-                                                            rsx! {
-                                                                button {
-                                                                    key: "{emoji}",
-                                                                    class: format!(
-                                                                        "p-1 rounded hover:bg-surface transition-colors text-xl leading-none {}",
-                                                                        if is_current { "bg-accent/20 ring-2 ring-accent" } else { "" }
-                                                                    ),
-                                                                    title: if is_current {
-                                                                        format!("Remove {} reaction", emoji)
-                                                                    } else {
-                                                                        format!("React with {}", emoji)
-                                                                    },
-                                                                    onclick: move |_| {
-                                                                        let (id, emoji) = (msg_id.clone(), emoji_str.clone());
-                                                                        crate::util::defer(move || {
-                                                                            on_react.call((id, emoji));
-                                                                            open_emoji_picker.set(None);
-                                                                        });
-                                                                    },
-                                                                    "{emoji}"
-                                                                }
-                                                            }
-                                                        })}
+                                                        {line_icon(REPLY_ICON_PATH, 18)}
+                                                    }
+                                                    if is_self {
+                                                        button {
+                                                            r#type: "button",
+                                                            "data-testid": "message-edit-button",
+                                                            class: "msg-action",
+                                                            title: "Edit message",
+                                                            "aria-label": "Edit message",
+                                                            onclick: move |_| {
+                                                                let (t, id) = (current_text.clone(), msg_id_str_for_edit.clone());
+                                                                crate::util::defer(move || {
+                                                                    edit_text.set(t);
+                                                                    request_reveal(format!("edit-form-{id}"));
+                                                                    editing_message.set(Some(id));
+                                                                });
+                                                            },
+                                                            {line_icon(EDIT_ICON_PATH, 17)}
+                                                        }
+                                                        button {
+                                                            r#type: "button",
+                                                            "data-testid": "message-delete-button",
+                                                            class: "msg-action",
+                                                            title: "Delete message",
+                                                            "aria-label": "Delete message",
+                                                            onclick: move |_| {
+                                                                let id = msg_id_for_delete.clone();
+                                                                crate::util::defer(move || on_request_delete.call(id));
+                                                            },
+                                                            {line_icon(DELETE_ICON_PATH, 17)}
+                                                        }
                                                     }
                                                 }
+                                            }
                                             }
                                         }
                                     }
@@ -5194,12 +4840,12 @@ mod tests {
     /// re-mount, and another popover's mount does not use up the request.
     #[test]
     fn a_reveal_is_taken_once_per_opening() {
-        request_reveal("emoji-picker-a".into());
+        request_reveal("edit-form-a".into());
         assert!(!take_reveal("edit-form-b"), "another element's mount");
-        assert!(take_reveal("emoji-picker-a"), "the first mount");
-        assert!(!take_reveal("emoji-picker-a"), "a re-mount");
-        request_reveal("emoji-picker-a".into());
-        assert!(take_reveal("emoji-picker-a"), "a new opening");
+        assert!(take_reveal("edit-form-a"), "the first mount");
+        assert!(!take_reveal("edit-form-a"), "a re-mount");
+        request_reveal("edit-form-a".into());
+        assert!(take_reveal("edit-form-a"), "a new opening");
     }
 
     /// The reveal scrolls only as far as needed, and never past the top.
@@ -5244,41 +4890,6 @@ mod tests {
             placement_within(100.0, 100.0, 100.0, 100.0, 140.0),
             (false, 1.0)
         );
-    }
-
-    /// The inline picker opens at the control that opened it: its right edge
-    /// on the control's, just below it or just above it, as offsets from the
-    /// message content (its containing block), kept inside the scroller.
-    #[test]
-    fn the_picker_opens_at_its_control() {
-        // Content from y=180 with its right edge at 920; scroller 0..1000.
-        let content = (180.0, 920.0);
-        let at = |trigger, above| placement_at(trigger, content, (0.0, 1000.0), move |_, _| above);
-        let below = at((200.0, 228.0, 900.0), false);
-        assert!(!below.above);
-        assert_eq!(below.x_px, 920.0 - 900.0, "right edge on the control's");
-        assert_eq!(below.y_px, 228.0 - 180.0 + 4.0, "top 4px under the control");
-        let above = at((200.0, 228.0, 900.0), true);
-        assert!(above.above);
-        assert_eq!(
-            above.y_px,
-            200.0 - 180.0 - 4.0,
-            "bottom 4px over the control"
-        );
-        // A control past the scroller's right edge: the picker stays 4px inside.
-        assert_eq!(at((200.0, 228.0, 1100.0), false).x_px, 920.0 - 996.0);
-        // A control near the left edge: the picker's left stays 4px inside.
-        assert_eq!(
-            at((200.0, 228.0, 100.0), false).x_px,
-            920.0 - (4.0 + INLINE_PICKER_WIDTH_PX)
-        );
-        // The side comes from the control's own top and bottom.
-        let seen = std::cell::Cell::new((0.0, 0.0));
-        placement_at((200.0, 228.0, 900.0), content, (0.0, 1000.0), |t, b| {
-            seen.set((t, b));
-            false
-        });
-        assert_eq!(seen.get(), (200.0, 228.0));
     }
 
     #[test]
@@ -6872,7 +6483,10 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped, "a future timestamp must be flagged clamped");
+        assert!(
+            g.messages[0].time_clamped,
+            "a future timestamp must be flagged clamped"
+        );
         assert_eq!(
             g.messages[0].time, first_seen,
             "the clamp target must be when we first saw the message, not the \
@@ -6945,7 +6559,7 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(g.time_clamped);
+        assert!(g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, now);
     }
 
@@ -6982,7 +6596,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            g.time_clamped,
+            g.messages[0].time_clamped,
             "a send time an hour after arrival is skew, even though it is in \
              the past relative to this render"
         );
@@ -7021,7 +6635,7 @@ mod group_messages_clock_tests {
         let g = only_group(&items);
 
         assert!(
-            !g.time_clamped,
+            !g.messages[0].time_clamped,
             "a few seconds of clock skew is normal and must not put a \
              \"sender's clock may be wrong\" marker on the message"
         );
@@ -7062,7 +6676,7 @@ mod group_messages_clock_tests {
         );
         let g = only_group(&items);
 
-        assert!(!g.time_clamped);
+        assert!(!g.messages[0].time_clamped);
         assert_eq!(g.messages[0].time, sent);
     }
 
@@ -7148,5 +6762,261 @@ mod group_messages_clock_tests {
             newest_key(&after).as_ref(),
             false
         ));
+    }
+
+    /// One same-author run: each message from `alice`, with the sender's
+    /// time and when this client first saw it, both relative to `base`.
+    fn timed_run(
+        owner_id: MemberId,
+        alice: &SigningKey,
+        base: DateTime<Utc>,
+        times: &[(i64, i64)],
+    ) -> (MessagesV1, ReceiveTimes, Vec<MessageId>) {
+        let mut receive_times = ReceiveTimes::new();
+        let mut ids = Vec::new();
+        let messages = times
+            .iter()
+            .map(|&(sent, received)| {
+                let msg = message_at(owner_id, alice, base + chrono::Duration::seconds(sent));
+                receive_times.insert(
+                    msg.id().0 .0,
+                    (base + chrono::Duration::seconds(received)).timestamp_millis() as f64,
+                );
+                ids.push(msg.id());
+                msg
+            })
+            .collect();
+        (state(messages), receive_times, ids)
+    }
+
+    fn rfc3339(time: DateTime<Utc>) -> String {
+        time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    const CLAMP_NOTE: &str = "sender's clock may be ahead of yours";
+
+    fn header_of(group: &MessageGroup) -> TimeLabels {
+        header_time_labels(group).expect("a rendered group has a first message")
+    }
+
+    /// The header beside the name describes the group's FIRST message, not
+    /// the group: a later message from a fast clock must not mark the first
+    /// one's time as clamped. The continuation row says so itself.
+    #[test]
+    fn a_clamped_later_message_does_not_mark_the_header_clamped() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let base = at(1_700_000_000_000);
+        // Accurate, 2s in transit; then an hour ahead, pulled back to arrival.
+        let (messages, receive_times, _) =
+            timed_run(owner_id, &alice, base, &[(-120, -118), (3600, -60)]);
+
+        let items = group(
+            &messages,
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            base,
+        );
+        let g = only_group(&items);
+        assert_eq!(g.messages.len(), 2, "premise: one group of two");
+        assert!(g.messages[1].time_clamped, "premise: the second is clamped");
+
+        let header = header_of(g);
+        assert!(!header.clamped, "the accurate first message is not clamped");
+        assert!(!header.shown.starts_with('~'), "no clamp mark: {header:?}");
+        assert!(!header.title.contains(CLAMP_NOTE), "{header:?}");
+        assert!(
+            header.title.ends_with(" (received after 2s delay)"),
+            "{header:?}"
+        );
+        assert_eq!(
+            header.datetime,
+            rfc3339(base - chrono::Duration::seconds(120))
+        );
+
+        let second = row_time_labels(&g.messages[1]);
+        assert!(second.clamped, "the continuation carries its own clamp");
+        assert!(second.shown.starts_with('~'), "{second:?}");
+        assert!(second.title.contains(CLAMP_NOTE), "{second:?}");
+        assert_eq!(
+            second.datetime,
+            rfc3339(base - chrono::Duration::seconds(60))
+        );
+    }
+
+    /// The other order: a clamped first message marks the header, and an
+    /// accurate continuation is neither marked nor explained as clamped.
+    #[test]
+    fn an_accurate_continuation_after_a_clamped_first_message_is_its_own() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let base = at(1_700_000_000_000);
+        let (messages, receive_times, _) =
+            timed_run(owner_id, &alice, base, &[(3600, -120), (-60, -53)]);
+
+        let items = group(
+            &messages,
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            base,
+        );
+        let g = only_group(&items);
+        assert_eq!(g.messages.len(), 2, "premise: one group of two");
+
+        let header = header_of(g);
+        assert!(
+            header.clamped && header.shown.starts_with('~'),
+            "{header:?}"
+        );
+        assert!(header.title.contains(CLAMP_NOTE), "{header:?}");
+        assert_eq!(
+            header.datetime,
+            rfc3339(base - chrono::Duration::seconds(120))
+        );
+
+        let second = row_time_labels(&g.messages[1]);
+        assert!(
+            !second.clamped && !second.shown.starts_with('~'),
+            "{second:?}"
+        );
+        assert!(!second.title.contains(CLAMP_NOTE), "{second:?}");
+        assert!(
+            second.title.ends_with(" (received after 7s delay)"),
+            "{second:?}"
+        );
+        assert_eq!(
+            second.datetime,
+            rfc3339(base - chrono::Duration::seconds(60))
+        );
+    }
+
+    /// Each row explains its own propagation delay; the header's is the first
+    /// message's only.
+    #[test]
+    fn each_message_shows_its_own_receive_delay() {
+        let owner = signing_key(1);
+        let alice = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let base = at(1_700_000_000_000);
+        let (messages, receive_times, _) =
+            timed_run(owner_id, &alice, base, &[(-120, -118), (-60, -49)]);
+
+        let items = group(
+            &messages,
+            &info(&alice, "Alice"),
+            owner_id,
+            &receive_times,
+            base,
+        );
+        let g = only_group(&items);
+        assert_eq!(g.messages.len(), 2, "premise: one group of two");
+
+        let header = header_of(g);
+        assert!(
+            header.title.ends_with(" (received after 2s delay)"),
+            "{header:?}"
+        );
+        let second = row_time_labels(&g.messages[1]);
+        assert!(
+            second.title.ends_with(" (received after 11s delay)"),
+            "{second:?}"
+        );
+        assert_eq!(
+            row_time_labels(&g.messages[0]),
+            header,
+            "the header and the first row's labels are one formatter's"
+        );
+    }
+
+    /// An own delete still being signed removes the group's first message
+    /// after grouping (`pending_effects.rs`). The header then describes the
+    /// message now first, not the removed one; when the delete fails and its
+    /// effect goes, the next pass shows the original first message again.
+    #[test]
+    fn a_pending_delete_of_the_first_message_moves_the_header_to_the_next() {
+        let owner = signing_key(1);
+        let me = signing_key(2);
+        let owner_id = member_id_of(&owner);
+        let my_id = member_id_of(&me);
+        let base = at(1_700_000_000_000);
+        // A clamped first message, then an accurate one 7s in transit, so the
+        // header's clamp and delay both change with the first message.
+        let (messages, receive_times, ids) =
+            timed_run(owner_id, &me, base, &[(3600, -120), (-60, -53)]);
+        let member_info = info(&me, "Me");
+        let pass = |effects: &[outbox::PendingEffect]| {
+            let mut items = group_messages(
+                &messages,
+                &member_info,
+                Some(my_id),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &ImpersonationChecker::default(),
+                owner_id,
+                MessageClock {
+                    receive_times: &receive_times,
+                    fallback_now: base,
+                },
+            );
+            apply_pending_effects(&mut items, effects, my_id, &HashMap::new());
+            items
+        };
+        let committed = pass(&[]);
+        let first = only_group(&committed);
+        assert_eq!(first.messages.len(), 2, "premise: one group of two");
+        let original = header_of(first);
+        assert!(original.clamped, "premise: {original:?}");
+
+        let deleting = pass(&[outbox::PendingEffect::Delete {
+            target: ids[0].clone(),
+        }]);
+        let g = only_group(&deleting);
+        assert_eq!(g.messages.len(), 1, "premise: the first message is hidden");
+        let header = header_of(g);
+        assert!(
+            !header.clamped && !header.shown.starts_with('~'),
+            "{header:?}"
+        );
+        assert!(
+            header.title.ends_with(" (received after 7s delay)"),
+            "{header:?}"
+        );
+        assert_eq!(
+            header.datetime,
+            rfc3339(base - chrono::Duration::seconds(60))
+        );
+
+        let rolled_back = pass(&[]);
+        assert_eq!(
+            header_of(only_group(&rolled_back)),
+            original,
+            "the failed delete's rollback restores the first message's time"
+        );
+    }
+
+    #[test]
+    fn time_labels_mark_only_a_clamped_time_and_explain_a_delay() {
+        let t = at(1_700_000_000_000);
+        let plain = time_labels(t, false, None);
+        assert_eq!(plain.shown, format_utc_as_local_time(t.timestamp_millis()));
+        assert_eq!(
+            plain.title,
+            format_utc_as_full_datetime(t.timestamp_millis())
+        );
+        assert_eq!(plain.datetime, "2023-11-14T22:13:20.000Z");
+        let delayed = time_labels(t, false, Some(90));
+        assert_eq!(delayed.shown, plain.shown);
+        assert_eq!(
+            delayed.title,
+            format!("{} (received after 1m delay)", plain.title)
+        );
+        let clamped = time_labels(t, true, None);
+        assert_eq!(clamped.shown, format!("~{}", plain.shown));
+        assert!(clamped.title.starts_with(&plain.title) && clamped.title.contains(CLAMP_NOTE));
     }
 }

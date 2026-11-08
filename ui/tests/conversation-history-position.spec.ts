@@ -377,11 +377,11 @@ test.describe("Reading position across a hidden chat panel (A03)", () => {
     await readerScrollsWithoutGesture(page, 1_000);
     const row = await readingRow(page, "history filler");
     expect(row, "premise: a filler row is fully in view").not.toBeNull();
-    // 201 seeded + 200 arrivals against a cap of 300 prunes the oldest 101.
+    // 204 seeded + 200 arrivals against a cap of 300 prunes the oldest 104.
     expect(
       Number(/history filler (\d+)/.exec(row!.text)![1]),
       "premise: the reader's message survives the prune",
-    ).toBeGreaterThanOrEqual(101);
+    ).toBeGreaterThanOrEqual(104);
 
     await hideChatBehindMembers(page);
     await callRiverTest(page, "appendMessages", 200);

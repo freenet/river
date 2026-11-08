@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod node;
+pub mod rooms;
 pub mod setup;
 
 use rune::{AppHandle, AppSpec, Cx, El, Tx, col, el, row, text};
@@ -12,15 +13,21 @@ use rune_kit::{Button, ButtonVariant, Kit};
 
 pub use chat::Chat;
 pub use node::{InstallStep, MANUAL_INSTALL_URL, NodeHost, NodeProbe};
+pub use rooms::{Access, RoomsUpdate};
 pub use setup::{Controller, Setup};
 
 pub struct RiverApp {
     pub setup: Setup,
-    /// The chat screen, shown once setup reaches [`Setup::Connected`]. It holds example data
-    /// for now ([`chat::Source::Example`]): nothing is read from or sent to the node yet.
+    /// The chat screen, shown once setup reaches [`Setup::Connected`] and the rooms are read
+    /// ([`Access::Ready`]). Example data in snapshots and tests ([`chat::Source::Example`]);
+    /// the user's rooms from the node in the live app ([`chat::Source::Node`]).
     pub chat: Chat,
+    /// Getting at the user's rooms once the node answers: the screens before the chat.
+    pub access: Access,
     /// `None` in headless snapshots and tests, where nothing runs in the background.
     ctl: Option<Controller>,
+    /// Reads the rooms from the node. `None` in headless snapshots and tests.
+    link: Option<rooms::Link>,
     /// River's logo, rasterized once by [`load_logo`]. `None` until then, and in tests, which
     /// draw an empty square in its place.
     logo: Option<Logo>,
@@ -59,26 +66,82 @@ fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
 }
 
 impl RiverApp {
-    /// A window with nothing running behind it, for snapshots and tests.
+    /// A window with nothing running behind it, for snapshots and tests. It shows the example
+    /// rooms.
     pub fn detached() -> Self {
         RiverApp {
             setup: Setup::Checking,
-            // TODO: example rooms; this goes once the app reads real rooms from the node.
             chat: Chat::example(),
+            access: Access::Example,
             ctl: None,
+            link: None,
             logo: None,
         }
     }
 
-    /// The live app: starts checking for a node straight away.
-    pub fn attached(ctl: Controller) -> Self {
+    /// The live app: starts checking for a node straight away, and reads the user's rooms
+    /// through `link` once one answers.
+    pub fn attached(ctl: Controller, link: rooms::Link) -> Self {
         ctl.check();
         RiverApp {
             setup: Setup::Checking,
-            // TODO: example rooms; this goes once the app reads real rooms from the node.
-            chat: Chat::example(),
+            chat: Chat::new(
+                chat::Source::Node(chat::LinkStatus::Loading),
+                Vec::new(),
+                0,
+                0,
+                0,
+            ),
+            access: Access::Connecting,
             ctl: Some(ctl),
+            link: Some(link),
             logo: None,
+        }
+    }
+
+    /// Take a new setup state. Reaching a node starts reading the rooms.
+    pub fn set_setup(&mut self, setup: Setup) {
+        let connected = matches!(setup, Setup::Connected { .. });
+        self.setup = setup;
+        if connected && let Some(link) = &self.link {
+            link.start();
+        }
+    }
+
+    /// Take an update from the rooms link. The approval page opens when the wait for it
+    /// starts.
+    pub fn apply_rooms(&mut self, update: RoomsUpdate, tx: &mut Tx) {
+        match update {
+            RoomsUpdate::Access(access) => {
+                if let Access::WaitingForApproval { approve_url } = &access
+                    && self.access != access
+                {
+                    let _ = tx.open_url(approve_url);
+                }
+                self.access = access;
+            }
+            RoomsUpdate::Rooms {
+                rooms,
+                open,
+                status,
+                now,
+                issues,
+            } => {
+                self.chat.issues = issues;
+                self.chat
+                    .show_node_rooms(rooms, open.as_deref(), status, now);
+            }
+            RoomsUpdate::Status(status) => {
+                if let chat::Source::Node(_) = self.chat.source {
+                    self.chat.source = chat::Source::Node(status);
+                }
+            }
+        }
+    }
+
+    fn retry_rooms(&mut self) {
+        if let Some(link) = &self.link {
+            link.start();
         }
     }
 
@@ -156,6 +219,72 @@ pub const SCENES: &[Scene] = &[
     ("chat-narrow-members", |s| {
         connect(s);
         s.chat.members_overlay = true;
+    }),
+    // Rooms read from the node: none yet, and a lost connection.
+    ("chat-no-rooms", |s| {
+        connect(s);
+        s.chat = Chat::new(
+            chat::Source::Node(chat::LinkStatus::Live),
+            Vec::new(),
+            0,
+            0,
+            0,
+        );
+    }),
+    ("chat-connection-lost", |s| {
+        connect(s);
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
+    }),
+    // Getting at the rooms, once a node answered.
+    ("rooms-connecting", |s| {
+        connect(s);
+        s.access = Access::Connecting;
+    }),
+    ("rooms-waiting-for-approval", |s| {
+        connect(s);
+        s.access = Access::WaitingForApproval {
+            approve_url: "http://127.0.0.1:7509/v1/app-grants/approve/example".into(),
+        };
+    }),
+    ("rooms-denied", |s| {
+        connect(s);
+        s.access = Access::NotApproved { expired: false };
+    }),
+    ("rooms-expired", |s| {
+        connect(s);
+        s.access = Access::NotApproved { expired: true };
+    }),
+    ("rooms-unsupported", |s| {
+        connect(s);
+        s.access = Access::Unsupported;
+    }),
+    ("rooms-refused", |s| {
+        connect(s);
+        s.access = Access::Refused(
+            "Freenet won't let River use its permission over this connection. River has to \
+             reach Freenet directly on this computer, at 127.0.0.1:7509."
+                .into(),
+        );
+    }),
+    ("rooms-unreachable", |s| {
+        connect(s);
+        s.access = Access::Unreachable("Connection refused".into());
+    }),
+    ("rooms-permission-removed", |s| {
+        connect(s);
+        s.access = Access::PermissionRemoved;
+    }),
+    // The node has no chat delegate under the key this build carries.
+    ("chat-no-store", |s| {
+        connect(s);
+        s.chat = Chat::new(
+            chat::Source::Node(chat::LinkStatus::Live),
+            Vec::new(),
+            0,
+            0,
+            0,
+        );
+        s.chat.issues.store_missing = true;
     }),
 ];
 
@@ -258,7 +387,10 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
             None,
             vec![retry_button(&k), manual_install_button(&k)],
         ),
-        Setup::Connected { .. } => return chat::view(&s.chat, logo, cx),
+        Setup::Connected { .. } => match &s.access {
+            Access::Example | Access::Ready => return chat::view(&s.chat, logo, cx),
+            access => rooms_panel(t, access, &k),
+        },
     };
     col()
         .key("root")
@@ -268,6 +400,103 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
         .padding(24.0)
         .fill(palette.rail)
         .child(body)
+}
+
+/// The screens between reaching the node and showing the rooms.
+fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
+    match access {
+        Access::Example | Access::Ready | Access::Connecting => panel(
+            t,
+            "Opening your rooms…",
+            "River is reading your rooms from Freenet.",
+            None,
+            vec![],
+        ),
+        Access::WaitingForApproval { approve_url } => {
+            let url = approve_url.clone();
+            panel(
+                t,
+                "Allow River to open your rooms",
+                "Freenet keeps your rooms for River in your browser. A Freenet page has opened \
+                 in your browser asking whether this app may use them too. Choose Allow there.",
+                None,
+                vec![
+                    Button::new("Open the page again")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press_tx(move |_: &mut RiverApp, tx: &mut Tx| {
+                            let _ = tx.open_url(&url);
+                        })
+                        .build(k)
+                        .key("approve"),
+                ],
+            )
+        }
+        Access::NotApproved { expired } => panel(
+            t,
+            if *expired {
+                "The request to open your rooms expired"
+            } else {
+                "River wasn't allowed to open your rooms"
+            },
+            if *expired {
+                "Freenet's page in your browser wasn't answered in time. Ask again for a new one."
+            } else {
+                "Freenet's page in your browser was answered with Deny. To see your rooms here, \
+                 ask again and choose Allow."
+            },
+            None,
+            vec![ask_again_button(k)],
+        ),
+        Access::PermissionRemoved => panel(
+            t,
+            "River's permission was removed",
+            "River no longer has Freenet's permission to open your rooms: it was revoked on \
+             Freenet's Apps and permissions page, or Freenet lost it. Ask again to see your \
+             rooms here.",
+            None,
+            vec![ask_again_button(k)],
+        ),
+        Access::Unsupported => panel(
+            t,
+            "Freenet needs an update",
+            "To open your rooms, River needs Freenet 0.2.156 or newer. Update it (run \
+             `freenet update`, or install the latest from freenet.org), then try again.",
+            None,
+            vec![rooms_retry_button(k), manual_install_button(k)],
+        ),
+        Access::Refused(message) => panel(
+            t,
+            "River can't open your rooms",
+            message,
+            None,
+            vec![rooms_retry_button(k)],
+        ),
+        // The reason is the node's or the network library's own text; it goes to the log,
+        // and the screen says what it means.
+        Access::Unreachable(_) => panel(
+            t,
+            "Can't reach Freenet",
+            "Freenet on this computer isn't answering River yet. River will keep trying.",
+            None,
+            vec![],
+        ),
+    }
+}
+
+fn ask_again_button(k: &Kit) -> El {
+    Button::new("Ask again")
+        .variant(ButtonVariant::Contrast)
+        .on_press(|s: &mut RiverApp| s.retry_rooms())
+        .build(k)
+        .key("ask-again")
+}
+
+fn rooms_retry_button(k: &Kit) -> El {
+    Button::new("Try again")
+        .variant(ButtonVariant::Contrast)
+        .on_press(|s: &mut RiverApp| s.retry_rooms())
+        .build(k)
+        .key("rooms-retry")
 }
 
 fn install_progress(step: &InstallStep) -> (&'static str, Option<f32>) {
@@ -529,7 +758,9 @@ mod tests {
         let state = RiverApp {
             setup,
             chat: Chat::example(),
+            access: Access::Example,
             ctl: Some(ctl),
+            link: None,
             logo: None,
         };
         let env = Env {
@@ -566,8 +797,8 @@ mod tests {
     /// Fails to compile when a new screen is added, and fails when it has no scene.
     #[test]
     fn every_screen_has_a_scene() {
-        fn screen(s: &Setup) -> &'static str {
-            match s {
+        fn screen(app: &RiverApp) -> &'static str {
+            match &app.setup {
                 Setup::Checking => "checking",
                 Setup::NotInstalled => "not-installed",
                 Setup::Installing(InstallStep::FindingRelease) => "finding-release",
@@ -577,7 +808,17 @@ mod tests {
                 Setup::Installing(InstallStep::WaitingForInstaller) => "waiting-for-installer",
                 Setup::Starting => "starting",
                 Setup::Failed(_) => "failed",
-                Setup::Connected { .. } => "chat",
+                Setup::Connected { .. } => match &app.access {
+                    Access::Example | Access::Ready => "chat",
+                    Access::Connecting => "rooms-connecting",
+                    Access::WaitingForApproval { .. } => "rooms-waiting-for-approval",
+                    Access::NotApproved { expired: false } => "rooms-denied",
+                    Access::NotApproved { expired: true } => "rooms-expired",
+                    Access::Unsupported => "rooms-unsupported",
+                    Access::Refused(_) => "rooms-refused",
+                    Access::Unreachable(_) => "rooms-unreachable",
+                    Access::PermissionRemoved => "rooms-permission-removed",
+                },
             }
         }
         let mut covered: Vec<&str> = SCENES
@@ -585,7 +826,7 @@ mod tests {
             .map(|(name, apply)| {
                 let mut s = RiverApp::detached();
                 apply(&mut s);
-                let shown = screen(&s.setup);
+                let shown = screen(&s);
                 // Variants of one screen share its name as a prefix ("chat-private-room").
                 assert!(
                     *name == shown || name.starts_with(&format!("{shown}-")),
@@ -596,7 +837,7 @@ mod tests {
             .collect();
         covered.sort();
         covered.dedup();
-        assert_eq!(covered.len(), 10, "{covered:?}");
+        assert_eq!(covered.len(), 18, "{covered:?}");
     }
 
     /// The logo is a gradient SVG shared with the web UI; this fails if an edit there breaks
@@ -634,6 +875,102 @@ mod tests {
             .find(|l| l.contains("--snap"))
             .expect("apps.yml renders scenes with --snap");
         assert!(snap.contains("\"${size[@]}\""), "{snap}");
+    }
+
+    fn render_access(access: Access) -> Runtime<RiverApp> {
+        let mut state = RiverApp::detached();
+        state.setup = Setup::Connected {
+            version: "0.2.156".into(),
+        };
+        state.access = access;
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (560.0, 440.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.0);
+        rt
+    }
+
+    #[test]
+    fn each_rooms_screen_offers_the_right_actions() {
+        let url = "http://127.0.0.1:7509/v1/app-grants/approve/x".to_owned();
+        let cases = [
+            (Access::Connecting, &[][..]),
+            (
+                Access::WaitingForApproval {
+                    approve_url: url.clone(),
+                },
+                &["approve"][..],
+            ),
+            (Access::NotApproved { expired: false }, &["ask-again"][..]),
+            (Access::NotApproved { expired: true }, &["ask-again"][..]),
+            (Access::PermissionRemoved, &["ask-again"][..]),
+            (Access::Unsupported, &["rooms-retry", "manual"][..]),
+            (Access::Refused("no".into()), &["rooms-retry"][..]),
+            (Access::Unreachable("down".into()), &[][..]),
+        ];
+        for (access, expected) in cases {
+            let rt = render_access(access.clone());
+            assert!(rt.find("chat").is_none(), "{access:?} shows no chat");
+            for key in ["approve", "ask-again", "rooms-retry", "manual"] {
+                assert_eq!(
+                    rt.find(key).is_some(),
+                    expected.contains(&key),
+                    "{access:?}: button {key}"
+                );
+            }
+        }
+        assert!(render_access(Access::Ready).find("chat").is_some());
+    }
+
+    #[test]
+    fn the_approval_page_opens_once_and_again_on_request() {
+        let url = "http://127.0.0.1:7509/v1/app-grants/approve/x".to_owned();
+        let mut rt = render_access(Access::Connecting);
+        let waiting = Access::WaitingForApproval {
+            approve_url: url.clone(),
+        };
+        let w = waiting.clone();
+        rt.update(move |s, tx| s.apply_rooms(RoomsUpdate::Access(w), tx));
+        rt.frame(1.0 / 60.0);
+        // The same state again (a repeated report) does not open a second tab.
+        rt.update(move |s, tx| s.apply_rooms(RoomsUpdate::Access(waiting), tx));
+        rt.frame(2.0 / 60.0);
+        assert_eq!(rt.take_url_requests(), std::slice::from_ref(&url));
+        let (x, y) = rt.find("approve").expect("the open-again button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(3.0 / 60.0);
+        assert_eq!(rt.take_url_requests(), [url]);
+    }
+
+    #[test]
+    fn node_rooms_replace_the_screen_and_a_lost_connection_keeps_them() {
+        let mut rt = render_access(Access::Connecting);
+        let rooms = chat::example::data().rooms;
+        let first = rooms[1].key.clone();
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Rooms {
+                    rooms,
+                    open: Some(first),
+                    status: chat::LinkStatus::Loading,
+                    now: 29_000_000,
+                    issues: Default::default(),
+                },
+                tx,
+            );
+            s.apply_rooms(RoomsUpdate::Access(Access::Ready), tx);
+            s.apply_rooms(RoomsUpdate::Status(chat::LinkStatus::Reconnecting), tx);
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("chat").is_some());
+        assert!(rt.find("source-status").is_some());
     }
 
     #[test]

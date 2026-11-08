@@ -12,7 +12,7 @@ mod release;
 
 use std::sync::Arc;
 
-use river_app::{Controller, RiverApp};
+use river_app::{Controller, NodeHost, RiverApp};
 
 fn main() {
     // A headless run (`--snap`, `--tree`, `--script`, ...) gets a window with nothing behind
@@ -22,5 +22,12 @@ fn main() {
         return;
     }
     let host = Arc::new(host::DesktopHost::new());
-    river_app::app(move |handle| RiverApp::attached(Controller::new(host, handle))).run();
+    river_app::app(move |handle| {
+        let rooms = handle.clone();
+        let link = river_app::rooms::Link::new(host.config_dir(), move |update| {
+            rooms.update(move |s, tx| s.apply_rooms(update, tx))
+        });
+        RiverApp::attached(Controller::new(host, handle), link)
+    })
+    .run();
 }

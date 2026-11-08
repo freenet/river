@@ -196,8 +196,15 @@ pub fn observe_newest(
 /// would leave the end off screen while it ran.
 #[cfg(target_arch = "wasm32")]
 pub fn scroll_to_end(container: &web_sys::Element) {
+    scroll_instant_to(container, container.scroll_height() as f64);
+}
+
+/// Set `container`'s `scrollTop` to `top` at once, whatever its CSS
+/// `scroll-behavior` says.
+#[cfg(target_arch = "wasm32")]
+pub fn scroll_instant_to(container: &web_sys::Element, top: f64) {
     let opts = web_sys::ScrollToOptions::new();
-    opts.set_top(container.scroll_height() as f64);
+    opts.set_top(top);
     opts.set_behavior(web_sys::ScrollBehavior::Instant);
     container.scroll_to_with_scroll_to_options(&opts);
 }

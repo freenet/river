@@ -6,6 +6,9 @@ export type RoomsLoadState = "loading" | "migrating" | "failed" | "loaded";
 type RiverTestHooks = {
   appendMessage(text: string): void;
   insertMessageBeforeLast(text: string): void;
+  // A run from timed identity 0 or 1, appended at once. Offsets are seconds from
+  // now: the sender's clock and this client's arrival time. Returns [sentMs, receivedMs] per message.
+  deliverTimedMessages(author: 0 | 1, entries: { text: string; sentSecs: number; receivedSecs: number }[]): [number, number][];
   appendMessages(count: number): void;
   // `count` join events from Test Sender A and B, alternating (two fold into one notice).
   appendJoinEvents(count: number): void;
@@ -73,6 +76,8 @@ type RiverTestHooks = {
   showRoomSyncError(label: ReportLabel, summary: string, detail: string, failBannerRead: boolean): void;
   // Room banner sync-status reads that failed since the last call (the count restarts at 0).
   takeBannerReadFailures(): number;
+  // The automatic generation reload's busy check, the production predicate.
+  userIsBusy(): Promise<boolean>;
 };
 
 export type SyncStatus = "connected" | "connecting" | "disconnected" | "error" | `error:${string}`;

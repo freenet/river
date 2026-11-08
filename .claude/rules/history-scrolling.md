@@ -96,10 +96,24 @@ Current behavior:
   (`reader_moved_up_since`) is the latch that caused #508.
 - The history follows under every dialog and popover, a DM thread over the
   room included, and is read under all of them except that DM thread: member
-  info, room settings, invite and ban dialogs, the message action menu and
-  the reaction picker. The reader is at the end anyway when the dialog
+  info, room settings, invite and ban dialogs, a reactor list and the
+  reaction picker. The reader is at the end anyway when the dialog
   closes, but those arrivals count as read without having been on screen
   unobstructed.
+- While the reaction picker is open the reader's own wheel and one-finger
+  touch scrolling are held off wherever they land, over the picker too (it
+  has no scrollport, so a wheel let through there scrolls the history), as
+  its old full-screen backdrop did, but only those input events: arrivals,
+  following, the end hold and reads go on, and programmatic scrolling is
+  untouched (`conversation/reaction_picker.rs`). A zoom is not held: a wheel
+  with Ctrl down (Ctrl+wheel, or a touchpad pinch, which reaches the page as
+  one), a touch with a second finger down (a pinch, until every finger has
+  lifted) and keyboard zoom still reach the browser, and the layout change a
+  zoom makes is not a scroll the hold prevents. Closing the picker, however
+  it closes, releases the hold at once, along with any finger it captured
+  mid-drag. A picker whose React is no longer inside the history's view
+  (arrivals followed past it, or the conversation was hidden) holds nothing:
+  the next wheel or one-finger drag closes it and scrolls as usual.
 
 Known limitations:
 
@@ -167,6 +181,15 @@ Known limitations:
   as the preferred fallback. The reading row is the first row whose top lies
   inside the view, else the row the view's top cuts through (a message
   taller than the view, not the row starting below the fold).
+- A reply strip's jump (`conversation/reply_highlight.rs`) is not a
+  request: it sets the history's `scrollTop` once, centring the quoted row
+  (or putting the top of one taller than the view 12px below the view's
+  top), and then counts as a reader's own scroll. Away from the end it
+  releases the end hold, and its settle records the reading position;
+  arrivals follow only by the rule above. It scrolls nothing outside the
+  history, and a quoted message that is not rendered is left alone (no
+  paging). The highlight is a two-second Web Animations API animation on the
+  whole row; it changes no height.
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.
