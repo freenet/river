@@ -841,6 +841,8 @@ test.describe("While the reaction picker is open", () => {
     expect(await isOpen(page), "premise: hiding the chat alone does not close it").toBe(true);
     const rail = (await page.getByTestId("members-rail").boundingBox())!;
     const [x, y] = [rail.x + rail.width / 2, rail.y + rail.height / 2];
+    expect(await wheelCancelled(page, x, y, true), "a zoom is let through").toBe(false);
+    expect(await isOpen(page), "a zoom does not close it").toBe(true);
     expect(await wheelCancelled(page, x, y, false), "the wheel is not cancelled").toBe(false);
     await expectClosed(page);
   });

@@ -958,7 +958,9 @@ mod dom {
         // A picker whose React has left the history's view (arrivals pushed
         // it out, or the conversation was hidden) is closed by the reader's
         // next scroll, and that scroll goes through. Holding it would leave
-        // the reader unable to scroll back to a picker they cannot see.
+        // the reader unable to scroll back to the message it is for, whether
+        // or not the picker itself is still drawn. A zoom is checked first
+        // and never closes it.
         match kind.as_str() {
             "wheel" => {
                 if is_zoom(&event) {
