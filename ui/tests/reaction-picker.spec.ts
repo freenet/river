@@ -1,6 +1,6 @@
 import { test, expect, CDPSession, Locator, Page } from "@playwright/test";
 import { coarsePointer, committedRow, nextFrames, openRoomWithComposer, revealFooter, settle, submitMessage } from "./example-room";
-import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import { deliver, deliverOffscreen, expectFollowed, hideChatBehindMembers, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import {
   expectAtReact,
   expectEveryEmojiUsable,
@@ -790,6 +790,58 @@ test.describe("While the reaction picker is open", () => {
     const before = (await scrollMetrics(page)).top;
     await wheelAt(page, x, y);
     expect((await scrollMetrics(page)).top, "the wheel scrolled the history").toBeLessThan(before);
+    await expectClosed(page);
+  });
+
+  test("a React only partly inside the history's view still holds the wheel", async ({ page }) => {
+    test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
+    await openRoomWithComposer(page);
+    for (let i = 0; i < 6; i++) await deliver(page, `clipped filler ${i}: ${"p".repeat(200)}`);
+    const row = committedRow(page, "clipped filler 3");
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await settle(page);
+    await openFromKeyboard(page, row);
+    // Programmatic scrolling is not held: put React half below the bottom edge.
+    await row.getByTestId("message-react-button").evaluate((react) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const a = react.getBoundingClientRect();
+      c.scrollTop += a.top - (c.getBoundingClientRect().bottom - a.height / 2);
+    });
+    await settle(page);
+    const straddles = await row.getByTestId("message-react-button").evaluate((react) => {
+      const a = react.getBoundingClientRect();
+      const bottom = document.getElementById("chat-scroll-container")!.getBoundingClientRect().bottom;
+      return a.top < bottom && a.bottom > bottom;
+    });
+    expect(straddles, "premise: React straddles the history's bottom edge").toBe(true);
+    expect(await isOpen(page), "premise: still open").toBe(true);
+
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [view.x + 30, view.y + 30];
+    expect(await hitAt(page, x, y), "premise: the point hits the history").toBe("history");
+    const before = (await scrollMetrics(page)).top;
+    await wheelAt(page, x, y);
+    expect((await scrollMetrics(page)).top, "held: the history did not move").toBe(before);
+    expect(await isOpen(page), "still open").toBe(true);
+  });
+
+  test("once narrowing the window hides the conversation behind the members panel, a wheel is let through and closes it", async ({ page }) => {
+    test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openRoomWithComposer(page);
+    await deliver(page, "hidden anchor");
+    await hideChatBehindMembers(page);
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await expect(page.locator("#chat-scroll-container"), "premise: wide, the chat shows beside the members").toBeVisible();
+    const row = committedRow(page, "hidden anchor");
+    await openFromKeyboard(page, row);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator("#chat-scroll-container"), "premise: narrow again, the chat is hidden").toBeHidden();
+    expect(await isOpen(page), "premise: hiding the chat alone does not close it").toBe(true);
+    const rail = (await page.getByTestId("members-rail").boundingBox())!;
+    const [x, y] = [rail.x + rail.width / 2, rail.y + rail.height / 2];
+    expect(await wheelCancelled(page, x, y, false), "the wheel is not cancelled").toBe(false);
     await expectClosed(page);
   });
 
