@@ -311,7 +311,16 @@ fn narrow_scenes_are_named_narrow() {
         // A narrow window never puts the members panel beside the conversation.
         let beside = rt.find("members").is_some() && rt.find("members-overlay").is_none();
         let is_narrow = name.contains("narrow");
-        assert_eq!(beside, !is_narrow && rt.state.chat.members_open, "{name}");
+        // Only a chat screen with a room open has a members panel.
+        let room_open = matches!(
+            rt.state.access,
+            crate::Access::Example | crate::Access::Ready
+        ) && rt.state.chat.room().is_some();
+        assert_eq!(
+            beside,
+            !is_narrow && room_open && rt.state.chat.members_open,
+            "{name}"
+        );
         narrow += usize::from(is_narrow);
     }
     assert!(narrow > 0, "no scene shows the narrow layout");
@@ -389,4 +398,166 @@ fn widening_closes_the_narrow_members_panel() {
     });
     settle(&mut rt);
     assert_eq!(rt.state.chat.composer.text, "still typing");
+}
+
+// Rooms read from the node ------------------------------------------------------------------
+
+fn node_chat() -> RiverApp {
+    let mut s = connected();
+    s.chat = super::Chat::new(
+        super::Source::Node(super::LinkStatus::Live),
+        Vec::new(),
+        0,
+        0,
+        0,
+    );
+    s
+}
+
+#[test]
+fn rooms_from_the_node_are_read_only() {
+    let mut s = node_chat();
+    s.chat.show_node_rooms(
+        super::example::data().rooms,
+        None,
+        super::LinkStatus::Live,
+        29_000_000,
+    );
+    let mut rt = render(s, WINDOW_SIZE);
+    let before = rt.state.chat.room().unwrap().messages.len();
+    rt.state.chat.composer.replace_text("hello");
+    assert!(!rt.state.chat.send());
+    let (x, y) = rt.find("send").expect("the send button is drawn");
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.chat.room().unwrap().messages.len(), before);
+}
+
+#[test]
+fn node_rooms_open_the_web_uis_room_once_and_use_the_clock() {
+    let mut chat = node_chat().chat;
+    let rooms = super::example::data().rooms;
+    chat.show_node_rooms(
+        rooms.clone(),
+        Some(PRIVATE_ROOM),
+        super::LinkStatus::Loading,
+        3 * 1440 + 5,
+    );
+    assert_eq!(chat.room().unwrap().key, PRIVATE_ROOM);
+    assert_eq!((chat.today, chat.day_zero, chat.now), (3, 0, 3 * 1440 + 5));
+    assert_eq!(chat.source, super::Source::Node(super::LinkStatus::Loading));
+    // The user moves on; a later update does not pull them back.
+    let other = rooms[0].key.clone();
+    chat.select(&other);
+    chat.show_node_rooms(
+        rooms,
+        Some(PRIVATE_ROOM),
+        super::LinkStatus::Live,
+        3 * 1440 + 6,
+    );
+    assert_eq!(chat.room().unwrap().key, other);
+}
+
+#[test]
+fn a_room_read_here_counts_unread_from_where_it_was_read() {
+    let mut chat = node_chat().chat;
+    let mut rooms = super::example::data().rooms;
+    let key = PRIVATE_ROOM.to_owned();
+    let i = rooms.iter().position(|r| r.key == key).unwrap();
+    // The node says 2 unread; reading the room here clears them.
+    rooms[i].unread = 2;
+    chat.show_node_rooms(rooms.clone(), None, super::LinkStatus::Live, 0);
+    chat.select(&key);
+    let other = rooms.iter().find(|r| r.key != key).unwrap().key.clone();
+    chat.select(&other);
+    // The next update still carries the node's stale count of 2: it is not shown again.
+    chat.show_node_rooms(rooms.clone(), None, super::LinkStatus::Live, 0);
+    let unread = |c: &super::Chat| c.rooms().iter().find(|r| r.key == key).unwrap().unread;
+    assert_eq!(unread(&chat), 0);
+    // Two new messages from someone else, one in the same minute as the last read one.
+    let room = &mut rooms[i];
+    let last = room.last_message().unwrap().clone();
+    let someone = room.members.iter().find(|m| m.id != room.me).unwrap().id;
+    for (n, time) in [(1, last.time), (2, last.time + 1)] {
+        room.messages.push(super::Message {
+            id: last.id + n,
+            author: someone,
+            time,
+            text: "new".into(),
+            reply_to: None,
+            reactions: vec![],
+            edited: false,
+        });
+    }
+    // And one of this user's own, which is never unread.
+    room.messages.push(super::Message {
+        id: last.id + 3,
+        author: room.me,
+        time: last.time + 2,
+        text: "mine".into(),
+        reply_to: None,
+        reactions: vec![],
+        edited: false,
+    });
+    chat.show_node_rooms(rooms, None, super::LinkStatus::Live, 0);
+    assert_eq!(unread(&chat), 2);
+}
+
+#[test]
+fn no_node_rooms_says_where_rooms_come_from() {
+    let rt = render(node_chat(), WINDOW_SIZE);
+    assert!(rt.find("no-rooms").is_some());
+    assert!(rt.find("composer").is_none());
+}
+
+#[test]
+fn what_the_node_rooms_are_missing_is_said_in_the_room_list() {
+    let mut s = node_chat();
+    s.chat.show_node_rooms(
+        super::example::data().rooms,
+        None,
+        super::LinkStatus::Live,
+        29_000_000,
+    );
+    let rt = render(s, WINDOW_SIZE);
+    for key in ["not-updated", "not-following", "unreadable"] {
+        assert!(rt.find(key).is_none(), "{key} with nothing to say");
+    }
+    let mut s = node_chat();
+    s.chat.show_node_rooms(
+        super::example::data().rooms,
+        None,
+        super::LinkStatus::Live,
+        29_000_000,
+    );
+    s.chat.issues = crate::rooms::Issues {
+        store_missing: false,
+        not_updated: vec!["Town Square".into()],
+        not_following: vec!["Family".into()],
+        unreadable: 2,
+    };
+    let rt = render(s, WINDOW_SIZE);
+    for key in ["not-updated", "not-following", "unreadable"] {
+        assert!(rt.find(key).is_some(), "{key}");
+    }
+}
+
+#[test]
+fn an_empty_list_says_why_when_the_store_is_missing() {
+    let mut chat = node_chat().chat;
+    let usual = super::view::no_rooms_hint(&chat);
+    chat.issues.store_missing = true;
+    let missing = super::view::no_rooms_hint(&chat);
+    assert_ne!(usual, missing);
+    assert!(missing.contains("older than River on the web"), "{missing}");
+    let rt = render(
+        {
+            let mut s = node_chat();
+            s.chat.issues.store_missing = true;
+            s
+        },
+        WINDOW_SIZE,
+    );
+    assert!(rt.find("no-rooms-hint").is_some());
 }

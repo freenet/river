@@ -60,7 +60,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(host: Arc<dyn NodeHost>, handle: AppHandle<RiverApp>) -> Self {
         Controller::reporting_to(host, move |setup| {
-            handle.update(move |s, _| s.setup = setup)
+            handle.update(move |s, _| s.set_setup(setup))
         })
     }
 

@@ -222,13 +222,23 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
 `.github/workflows/apps.yml` does.
 
 - `apps/river-app`: the UI and setup state machine, shared by every platform.
-  Once setup connects it shows the chat screen (`src/chat/`), which for now
-  runs on built-in example data (`chat::Source::Example`): it does not read
-  or send anything through the node yet. Its colours and sizes follow the web
-  UI in `ui/`. It also compiles in one web UI file, the logo
-  `ui/assets/river_logo.svg` (`include_bytes!` in `apps/river-app/src/lib.rs`),
-  so an edit to that file changes the native app too and runs `apps.yml`.
-  Nothing else under `ui/` is read by `apps/`.
+  Once setup connects it reads the user's rooms from the local node
+  (`src/rooms/`), read-only: it asks the node for the River web app's identity
+  through a user-approved app grant (freenet-core v0.2.156+), reads the rooms
+  the web UI stored in the chat delegate, and subscribes to each room contract.
+  It never PUTs, sends an UPDATE or writes delegate storage. The chat screen
+  (`src/chat/`) shows them; snapshots and tests use built-in example data
+  (`chat::Source::Example`). Its colours and sizes follow the web UI in `ui/`.
+  It depends on `river-core` (`common/`) by path, with the client-only
+  features `ecies`, `mentions` and `stored-rooms`, so a change under `common/`
+  (or to the root `Cargo.toml`, which river-core inherits versions from) runs
+  `apps.yml`. It compiles in two `ui/` files with `include_bytes!`: the logo
+  `ui/assets/river_logo.svg` and the chat delegate
+  `ui/public/contracts/chat_delegate.wasm`, whose hash is the delegate key it
+  reads rooms from. An edit to either runs `apps.yml`; nothing else under `ui/`
+  is read by `apps/`. A test checks that its `freenet-stdlib` (the client
+  API's wire format) is the version river-core resolves to in the root
+  `Cargo.lock`.
 - `apps/desktop`: the desktop shell (binary `river`), including the Freenet
   installer, which verifies the release's signed checksums.
 
@@ -259,7 +269,10 @@ signed release. Leave `MIN_NODE_VERSION`, the oldest running node River
 accepts, alone unless River needs something newer: nodes update over hours to
 days, and raising it early tells people with a working node that theirs is
 too old. The tests derive from both constants, so raising either needs no
-test changes.
+test changes. Reading rooms needs app grants (freenet-core v0.2.156), and
+`MIN_NODE_VERSION` deliberately stays below that: an older node passes setup
+and then shows a "Freenet needs an update" screen for the rooms, which says
+what to do, rather than failing setup for a node that otherwise works.
 
 The installer ties a release's signed checksums to its tag by finding
 `Freenet-<version>.dmg` in them, on every platform (`check_manifest_version`
@@ -311,9 +324,12 @@ Changes to delegate or contract WASM (anything under `delegates/`,
 Cargo.toml/Cargo.lock) alter the delegate/contract key. Without a migration
 entry, **users lose all room data**.
 
-Changes to `apps/Cargo.toml` and `apps/Cargo.lock` cannot alter the key while
-`apps/` depends on no crate in the root workspace (see the note in
-`apps/Cargo.toml`).
+Changes to `apps/Cargo.toml` and `apps/Cargo.lock` cannot alter the key:
+the WASM is built from the root workspace with the root `Cargo.lock`, and the
+apps' lockfile is never consulted there, even though `apps/river-app` depends
+on `river-core` by path (see the note in `apps/Cargo.toml`). Any client-only
+feature it enables (`stored-rooms`, ...) must stay off for the room-contract
+and chat-delegate builds.
 
 The full workflow — `cargo make add-migration` BEFORE rebuilding, the
 two single-source-of-truth TOMLs, CI validation, and the key files —

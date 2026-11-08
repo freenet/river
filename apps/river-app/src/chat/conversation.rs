@@ -364,13 +364,21 @@ fn message_body(m: &Message, p: &Palette) -> El {
 }
 
 fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
-    let has_text = !chat.composer.text.trim().is_empty();
+    let can_send = chat.source.can_send();
+    let has_text = can_send && !chat.composer.text.trim().is_empty();
+    let placeholder = if can_send {
+        format!("Message {}", room.name)
+    } else {
+        // Rooms read from the node are read-only in this version of the app.
+        "Sending from this app is coming soon. Use River in your browser to reply.".to_owned()
+    };
     let field = TextInput::new(&chat.composer)
         .plain()
         .width(None)
         .height(44.0)
         .text_style(st::MESSAGE.lh(24.0))
-        .placeholder(format!("Message {}", room.name))
+        .placeholder(placeholder)
+        .disabled(!can_send)
         .label("Message")
         .on_edit(|s: &mut RiverApp| &mut s.chat.composer)
         .on_submit(|s: &mut RiverApp, _| {
@@ -380,7 +388,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .key("composer-field")
         .grow(1.0)
         .min_w(0.0);
-    let send = row()
+    let mut send = row()
         .key("send")
         .role("button")
         .label("Send")
@@ -394,6 +402,9 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
             s.chat.send();
         })
         .child(icon(&icons::SEND, 20.0).color(if has_text { p.accent } else { p.text_muted }));
+    if !can_send {
+        send = not_yet(send);
+    }
     let emoji = not_yet(
         row()
             .key("emoji")

@@ -49,6 +49,13 @@ pub trait NodeHost: Send + Sync + 'static {
 
     /// Start an installed node that is not running. Runs on a worker thread.
     fn start(&self) -> Result<(), String>;
+
+    /// A directory private to this user where River keeps its settings, including the
+    /// permission the node grants it to open the user's rooms. `None` keeps that permission
+    /// for this run only, so it is asked for again next time.
+    fn config_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// Where to send someone who wants to install Freenet by hand.

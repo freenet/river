@@ -82,6 +82,12 @@ mentions = []
 # `migration` and `mentions`, so the room-contract and chat-delegate WASM
 # (and their keys) stay byte-identical.
 own-purges = []
+# Read-side types for the rooms the web UI stores in the chat delegate
+# (`stored_rooms`), for clients other than the web UI (the native app). Client
+# only, like `migration` and `mentions`: the room-contract and chat-delegate
+# WASM builds do not enable it, so their bytes and keys stay byte-identical. It
+# adds no dependencies.
+stored-rooms = []
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the

@@ -10297,3 +10297,179 @@ mod tests {
         assert_eq!(r2[&a.to_bytes()], current);
     }
 }
+
+/// The native app reads the rooms this file's types write, through its own
+/// read-side copies in `river_core::stored_rooms`. These tests encode REAL
+/// `RoomSlot` / `RoomData` / `RoomsMeta` values with the writer's serde and
+/// decode them with the reader's, so renaming, removing or changing the type of
+/// a field the reader needs fails here rather than making every room vanish
+/// from the native app.
+#[cfg(test)]
+mod stored_rooms_drift {
+    use super::*;
+    use river_core::stored_rooms::{
+        decode_room_slot, decode_rooms_meta, parse_room_storage_key, StoredRoomSlot,
+    };
+
+    fn cbor<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(value, &mut buf).unwrap();
+        buf
+    }
+
+    /// A room with every field the reader reads set to a non-default value.
+    fn full_room() -> RoomData {
+        let owner_sk = SigningKey::from_bytes(&[11u8; 32]);
+        let owner_vk = owner_sk.verifying_key();
+        let mut room = test_minimal_room_data(owner_vk);
+        room.room_state = test_generation_copy(&owner_sk, 2, 10, &["hello", "world"], 0);
+        room.self_sk = Some(SigningKey::from_bytes(&[12u8; 32]));
+        room.self_vk = Some(SigningKey::from_bytes(&[12u8; 32]).verifying_key());
+        room.last_read_message_id = room
+            .room_state
+            .recent_messages
+            .messages
+            .first()
+            .map(|m| m.id());
+        room.self_nickname = Some("Ada".into());
+        room.invitation_secrets = BTreeMap::from([(0, [5u8; 32]), (3, [6u8; 32])]);
+        // Fields the reader skips are set too, so an unknown field is
+        // exercised.
+        room.previous_contract_key = Some(room.contract_key);
+        room
+    }
+
+    #[test]
+    fn a_present_slot_decodes_with_every_field_the_reader_needs() {
+        let room = full_room();
+        let bytes = cbor(&RoomSlot::Present(Box::new(room.clone())));
+        let StoredRoomSlot::Present(read) = decode_room_slot(&bytes).expect("decodes") else {
+            panic!("expected Present");
+        };
+        assert_eq!(read.owner_vk, room.owner_vk);
+        assert_eq!(read.room_state, room.room_state);
+        assert_eq!(
+            read.self_sk.as_ref().map(|k| k.to_bytes()),
+            room.self_sk.as_ref().map(|k| k.to_bytes())
+        );
+        assert_eq!(read.self_vk, room.self_vk);
+        assert_eq!(read.self_verifying_key(), room.self_verifying_key());
+        assert_eq!(read.contract_key, room.contract_key);
+        assert_eq!(read.last_read_message_id, room.last_read_message_id);
+        assert!(read.last_read_message_id.is_some());
+        assert_eq!(read.self_nickname, room.self_nickname);
+        assert_eq!(read.invitation_secrets, room.invitation_secrets);
+    }
+
+    /// A slot the web UI wrote with only the required fields (as a room joined
+    /// long ago looks) still decodes.
+    #[test]
+    fn a_minimal_slot_decodes() {
+        let mut room = test_minimal_room_data(SigningKey::from_bytes(&[13u8; 32]).verifying_key());
+        room.self_sk = None;
+        let bytes = cbor(&RoomSlot::Present(Box::new(room.clone())));
+        let StoredRoomSlot::Present(read) = decode_room_slot(&bytes).expect("decodes") else {
+            panic!("expected Present");
+        };
+        assert!(read.self_sk.is_none());
+        assert_eq!(read.contract_key, room.contract_key);
+    }
+
+    #[test]
+    fn a_tombstone_decodes() {
+        let bytes = cbor(&RoomSlot::Tombstone);
+        assert!(matches!(
+            decode_room_slot(&bytes),
+            Ok(StoredRoomSlot::Tombstone)
+        ));
+    }
+
+    #[test]
+    fn rooms_meta_decodes() {
+        let a = SigningKey::from_bytes(&[21u8; 32]).verifying_key();
+        let b = SigningKey::from_bytes(&[22u8; 32]).verifying_key();
+        let meta = RoomsMeta {
+            current_room_key: Some(b),
+            notification_modes: HashMap::from([(a, NotificationMode::Muted)]),
+            room_order: vec![b, a],
+            identity_sources: vec![(a, [9u8; 32])],
+        };
+        let read = decode_rooms_meta(&cbor(&meta)).expect("decodes");
+        assert_eq!(read.current_room_key, Some(b));
+        assert_eq!(read.room_order, vec![b, a]);
+    }
+
+    /// The reader's storage keys are the writer's.
+    #[test]
+    fn storage_keys_match_the_writer() {
+        use crate::components::app::chat_delegate::{
+            room_storage_key, ROOMS_META_KEY, ROOM_KEY_PREFIX,
+        };
+        let vk = SigningKey::from_bytes(&[31u8; 32]).verifying_key();
+        assert_eq!(
+            river_core::stored_rooms::room_storage_key(&vk),
+            room_storage_key(&vk)
+        );
+        assert_eq!(parse_room_storage_key(&room_storage_key(&vk)), Some(vk));
+        assert_eq!(river_core::stored_rooms::ROOMS_META_KEY, ROOMS_META_KEY);
+        assert_eq!(river_core::stored_rooms::ROOM_KEY_PREFIX, ROOM_KEY_PREFIX);
+    }
+
+    /// A blob an OLD web UI wrote, before the `#[serde(default)]` fields existed: only the
+    /// required fields. Both readers must decode it, and agree.
+    #[test]
+    fn a_blob_without_the_defaulted_fields_decodes_in_both_readers() {
+        #[derive(Serialize)]
+        struct OldRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_sk: SigningKey,
+            contract_key: ContractKey,
+        }
+        #[derive(Serialize)]
+        enum OldRoomSlot {
+            Present(Box<OldRoomData>),
+        }
+        let owner_sk = SigningKey::from_bytes(&[41u8; 32]);
+        let base = test_minimal_room_data(owner_sk.verifying_key());
+        let old = OldRoomSlot::Present(Box::new(OldRoomData {
+            owner_vk: base.owner_vk,
+            room_state: test_generation_copy(&owner_sk, 1, 10, &["old"], 0),
+            self_sk: SigningKey::from_bytes(&[42u8; 32]),
+            contract_key: base.contract_key,
+        }));
+        let bytes = cbor(&old);
+        let RoomSlot::Present(written) = ciborium::de::from_reader::<RoomSlot, _>(&bytes[..])
+            .expect("the web UI reads its old blob")
+        else {
+            panic!("expected Present");
+        };
+        let StoredRoomSlot::Present(read) = decode_room_slot(&bytes).expect("decodes") else {
+            panic!("expected Present");
+        };
+        assert_eq!(read.room_state, written.room_state);
+        assert_eq!(read.contract_key, written.contract_key);
+        assert_eq!(read.self_verifying_key(), written.self_verifying_key());
+        assert_eq!(read.self_vk, None);
+        assert_eq!(read.last_read_message_id, None);
+        assert_eq!(read.self_nickname, None);
+        assert!(read.invitation_secrets.is_empty());
+    }
+
+    /// A blob from a future web UI that no longer stores the private key: the identity comes
+    /// from `self_vk`, in both readers.
+    #[test]
+    fn a_blob_with_only_the_public_identity_decodes_in_both_readers() {
+        let mut room = full_room();
+        room.self_sk = None;
+        let me = SigningKey::from_bytes(&[43u8; 32]).verifying_key();
+        room.self_vk = Some(me);
+        let bytes = cbor(&RoomSlot::Present(Box::new(room.clone())));
+        let StoredRoomSlot::Present(read) = decode_room_slot(&bytes).expect("decodes") else {
+            panic!("expected Present");
+        };
+        assert!(read.self_sk.is_none());
+        assert_eq!(read.self_verifying_key(), Some(me));
+        assert_eq!(read.self_verifying_key(), room.self_verifying_key());
+    }
+}

@@ -10,3 +10,28 @@ publish = false
 [dependencies]
 rune.workspace = true
 rune-kit.workspace = true
+
+# Reading the user's rooms from the local node (src/rooms/). River's own types, with the
+# client-only features the room-contract and chat-delegate WASM builds never enable.
+river-core = { path = "../../common", features = ["ecies", "mentions", "stored-rooms"] }
+# The node's native client protocol is bincode of these types. Pinned to the version the root
+# workspace (and so the web UI) uses, so this app speaks exactly what the web UI speaks.
+# `the_wire_format_is_the_web_uis` (src/rooms/delegate.rs) fails when the lockfiles disagree.
+freenet-stdlib = { version = "=0.8.5", features = ["contract"] }
+freenet-scaffold = "0.2.2"
+ed25519-dalek = "2"
+ciborium = "0.2"
+bincode = "1"
+bs58 = "0.5"
+serde_json = "1"
+# Blocking HTTP (the app grant) and WebSocket (the client API), on worker threads.
+ureq = { version = "2", default-features = false }
+tungstenite = "0.27"
+# Message times in the local time zone.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+blake3 = "1"
+# Encrypting test rooms needs the randomized helpers.
+river-core = { path = "../../common", features = ["ecies-randomized"] }
+serde = { version = "1", features = ["derive"] }
