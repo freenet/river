@@ -567,11 +567,22 @@ fn any_message_time_shows_without_panicking() {
         local_minutes(SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
         0
     );
-    let far = SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 50);
+    // Past what message time can hold (the year 10136) yet inside every platform's
+    // SystemTime (Windows' ends near the year 30828): about the year 10680.
+    let far = SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 38);
     // Clamped to the last representable minute, give or take the local time zone.
     assert!(local_minutes(far) >= u32::MAX - 24 * 60);
     let now = local_minutes(SystemTime::now());
-    assert!(now > 29_000_000 && now < 40_000_000, "{now}");
+    let utc_now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 60;
+    // Local time is within a day of UTC.
+    assert!(
+        u64::from(now).abs_diff(utc_now) <= 24 * 60,
+        "{now} vs {utc_now}"
+    );
 
     let f = Fixture::new();
     let mut state = f.private_state();

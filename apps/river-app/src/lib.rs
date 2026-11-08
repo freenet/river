@@ -471,10 +471,12 @@ fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
             None,
             vec![rooms_retry_button(k)],
         ),
-        Access::Unreachable(why) => panel(
+        // The reason is the node's or the network library's own text; it goes to the log,
+        // and the screen says what it means.
+        Access::Unreachable(_) => panel(
             t,
             "Can't reach Freenet",
-            &format!("{why}. River will keep trying."),
+            "Freenet on this computer isn't answering River yet. River will keep trying.",
             None,
             vec![],
         ),

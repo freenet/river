@@ -210,20 +210,43 @@ fn source_status(chat: &Chat, p: &Palette) -> El {
         .px(4.0)
         .gap(4.0)
         .child(label(text, st::SMALL, color).wrap().w_full());
-    let stale = &chat.issues.not_updated;
-    if !stale.is_empty() {
-        let names = stale.join(", ");
+    let issues = &chat.issues;
+    let mut notes: Vec<(&str, String)> = Vec::new();
+    if !issues.not_updated.is_empty() {
+        notes.push((
+            "not-updated",
+            format!(
+                "Couldn't apply the latest from Freenet to: {}. Showing an older copy.",
+                issues.not_updated.join(", ")
+            ),
+        ));
+    }
+    if !issues.not_following.is_empty() {
+        notes.push((
+            "not-following",
+            format!(
+                "Not getting new messages yet for: {}. River keeps trying.",
+                issues.not_following.join(", ")
+            ),
+        ));
+    }
+    match issues.unreadable {
+        0 => {}
+        1 => notes.push((
+            "unreadable",
+            "One of your rooms couldn't be read on this computer.".into(),
+        )),
+        n => notes.push((
+            "unreadable",
+            format!("{n} of your rooms couldn't be read on this computer."),
+        )),
+    }
+    for (key, note) in notes {
         status = status.child(
-            label(
-                format!(
-                    "Couldn't apply the latest from Freenet to: {names}. Showing an older copy."
-                ),
-                st::SMALL,
-                p.text_secondary,
-            )
-            .key("not-updated")
-            .wrap()
-            .w_full(),
+            label(note, st::SMALL, p.text_secondary)
+                .key(key)
+                .wrap()
+                .w_full(),
         );
     }
     status
@@ -303,8 +326,9 @@ fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
     }
 }
 
-fn no_rooms(chat: &Chat, p: &Palette) -> El {
-    let hint = match chat.source {
+/// What the empty room list says, by where the rooms come from.
+pub(super) fn no_rooms_hint(chat: &Chat) -> &'static str {
+    match chat.source {
         Source::Example => "Create a room, or enter an invite code to join one.",
         // The node has no chat delegate under the key this build carries: River in the browser
         // never ran on this node, or it runs a newer delegate than this build knows (rooms
@@ -319,7 +343,11 @@ fn no_rooms(chat: &Chat, p: &Palette) -> El {
         Source::Node(_) => {
             "Rooms you create or join in River in your browser, on this computer, show up here."
         }
-    };
+    }
+}
+
+fn no_rooms(chat: &Chat, p: &Palette) -> El {
+    let hint = no_rooms_hint(chat);
     col()
         .key("no-rooms")
         .grow(1.0)

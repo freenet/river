@@ -70,24 +70,27 @@ impl LiveRoom {
             == PrivacyMode::Private
     }
 
-    /// Merge a whole room state from the network into the stored copy.
+    /// Merge a whole room state from the network into the stored copy. All or nothing: a
+    /// merge that fails partway leaves the copy as it was.
     pub fn merge_state(&mut self, incoming: &ChatRoomStateV1) -> Result<(), String> {
         let params = self.params();
-        self.stored
-            .room_state
-            .merge_through_summary(&params, incoming)?;
+        let mut next = self.stored.room_state.clone();
+        next.merge_through_summary(&params, incoming)?;
+        self.stored.room_state = next;
         self.refresh();
         Ok(())
     }
 
-    /// Apply a delta from an update notification.
+    /// Apply a delta from an update notification. All or nothing, like
+    /// [`merge_state`](Self::merge_state): the composed `apply_delta` changes fields one by
+    /// one and can fail after some have changed.
     pub fn apply_delta(&mut self, delta: ChatRoomStateV1Delta) -> Result<(), String> {
         let params = self.params();
+        let mut next = self.stored.room_state.clone();
         // The composed `apply_delta` ignores its parent-state argument (see the web UI's
         // `RoomSynchronizer::apply_delta_inner`), so a default stands in for it.
-        self.stored
-            .room_state
-            .apply_delta(&ChatRoomStateV1::default(), &params, &Some(delta))?;
+        next.apply_delta(&ChatRoomStateV1::default(), &params, &Some(delta))?;
+        self.stored.room_state = next;
         self.refresh();
         Ok(())
     }

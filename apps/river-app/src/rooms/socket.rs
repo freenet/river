@@ -38,6 +38,10 @@ const STREAM_TTL: Duration = Duration::from_secs(60);
 /// How long a write may block before the connection counts as gone.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The largest response River puts back together from chunks. A room's state is bounded far
+/// below this by the contract; the bound stops a misbehaving node from filling memory.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// The node's token rejections, as the error text it sends before the close frame starts,
 /// with the close code that follows.
 const TOKEN_REJECTIONS: [(&str, u16); 3] = [
@@ -88,12 +92,15 @@ pub struct NodeSocket {
     chunks: HashMap<u32, Chunks>,
     /// When anything (a response, a pong) last arrived.
     last_heard: Instant,
+    /// Whether anything at all has arrived on this connection.
+    heard_anything: bool,
 }
 
 struct Chunks {
     total: u32,
     parts: Vec<Option<Vec<u8>>>,
     have: u32,
+    bytes: usize,
     started: Instant,
 }
 
@@ -121,7 +128,12 @@ impl NodeSocket {
             .map_err(|e| fail(&e))?;
         let mut bearer: tungstenite::http::HeaderValue = format!("Bearer {}", token.expose())
             .parse()
-            .map_err(|_| SocketError::Failed("the saved grant is not a valid header".into()))?;
+            // A token that can't even be sent names nothing the node could accept: treat it
+            // as the node would, so it is discarded rather than retried forever.
+            .map_err(|_| SocketError::Closed {
+                code: Some(4401),
+                reason: "the saved grant is not a valid header".into(),
+            })?;
         bearer.set_sensitive(true);
         request.headers_mut().insert("Authorization", bearer);
         let (ws, _) = tungstenite::client(request, stream).map_err(|e| match e {
@@ -134,6 +146,7 @@ impl NodeSocket {
             ws,
             chunks: HashMap::new(),
             last_heard: Instant::now(),
+            heard_anything: false,
         })
     }
 
@@ -161,6 +174,24 @@ impl NodeSocket {
     }
 
     /// When anything last arrived from the node, pongs included.
+    pub fn heard_anything(&self) -> bool {
+        self.heard_anything
+    }
+
+    /// Read for up to `wait` before sending anything. The node rejects a bad token as soon as
+    /// the connection opens, with an error and a close, and then drops the connection. A
+    /// request written after that drop is answered with a reset, and on some platforms
+    /// (Windows) a reset discards what had already arrived, rejection included. Reading
+    /// first gets the rejection before anything is written. Nothing else is sent before the
+    /// first request, so a timeout is the normal outcome.
+    pub fn read_early(&mut self, wait: Duration) -> Result<(), SocketError> {
+        self.set_read_timeout(wait)?;
+        match self.recv() {
+            Ok(_) | Err(SocketError::Timeout) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn last_heard(&self) -> Instant {
         self.last_heard
     }
@@ -170,6 +201,7 @@ impl NodeSocket {
         loop {
             let message = self.ws.read().map_err(map_ws_error)?;
             self.last_heard = Instant::now();
+            self.heard_anything = true;
             let bytes = match message {
                 Message::Binary(b) => b.to_vec(),
                 Message::Close(frame) => {
@@ -241,6 +273,7 @@ impl NodeSocket {
             total,
             parts: vec![None; total as usize],
             have: 0,
+            bytes: 0,
             started: Instant::now(),
         });
         if entry.total != total {
@@ -250,6 +283,13 @@ impl NodeSocket {
         if slot.is_none() {
             *slot = Some(data.to_vec());
             entry.have += 1;
+            entry.bytes += data.len();
+            if entry.bytes > MAX_RESPONSE_BYTES {
+                self.chunks.remove(&stream_id);
+                return Err(SocketError::Failed(
+                    "Freenet sent a response larger than River accepts".into(),
+                ));
+            }
         }
         if entry.have < entry.total {
             return Ok(None);
@@ -536,8 +576,14 @@ mod tests {
         let authority = listener.local_addr().unwrap().to_string();
         let server = thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = conn.read(&mut buf).unwrap();
+            // Read the whole upgrade request first: answering before it is read makes
+            // Windows reset the connection, and the reset discards the answer.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                conn.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
             conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
@@ -585,5 +631,18 @@ mod tests {
         assert!(socket.last_heard() > before);
         drop(socket);
         server.join().unwrap();
+    }
+
+    /// A saved token that can't be sent at all is treated as one the node rejected, so it is
+    /// discarded rather than retried forever.
+    #[test]
+    fn a_token_that_cannot_be_a_header_counts_as_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let err = match NodeSocket::connect(&authority, &GrantToken::new("bad\ntoken".into())) {
+            Err(e) => e,
+            Ok(_) => panic!("a newline cannot go in a header"),
+        };
+        assert_eq!(token_verdict(&err), TokenVerdict::Discard);
     }
 }

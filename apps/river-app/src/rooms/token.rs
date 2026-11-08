@@ -36,10 +36,9 @@ impl TokenStore {
         create_private_dir(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
         let err = |e: std::io::Error| format!("couldn't save the Freenet grant: {e}");
         // A name of its own, so two saves at once (two app windows) can't write one file.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let tmp = dir.join(format!(".{FILE_NAME}.{}.{nanos}.tmp", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{FILE_NAME}.{}.{n}.tmp", std::process::id()));
         let mut file = private_file(&tmp).map_err(err)?;
         let written = file
             .write_all(token.expose().as_bytes())
@@ -53,9 +52,17 @@ impl TokenStore {
         Ok(())
     }
 
-    /// Forget the token (the node said it names nothing).
-    pub fn discard(&self) {
-        let _ = fs::remove_file(&self.path);
+    /// Forget `rejected`, which the node said names nothing. The file is removed only if it
+    /// still holds that token: another window may have saved a newer grant in the meantime,
+    /// which is returned to use instead.
+    pub fn discard(&self, rejected: &GrantToken) -> Option<GrantToken> {
+        match self.load() {
+            Some(t) if &t == rejected => {
+                let _ = fs::remove_file(&self.path);
+                None
+            }
+            other => other,
+        }
     }
 }
 
@@ -132,7 +139,13 @@ mod tests {
         assert_eq!(store.load(), Some(GrantToken::new("abc".into())));
         store.save(&GrantToken::new("def".into())).unwrap();
         assert_eq!(store.load(), Some(GrantToken::new("def".into())));
-        store.discard();
+        // A different token on disk is kept, and handed back.
+        assert_eq!(
+            store.discard(&GrantToken::new("abc".into())),
+            Some(GrantToken::new("def".into()))
+        );
+        assert_eq!(store.load(), Some(GrantToken::new("def".into())));
+        assert_eq!(store.discard(&GrantToken::new("def".into())), None);
         assert_eq!(store.load(), None);
         let _ = fs::remove_dir_all(dir.parent().unwrap());
     }

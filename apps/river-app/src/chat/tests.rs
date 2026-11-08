@@ -510,3 +510,54 @@ fn no_node_rooms_says_where_rooms_come_from() {
     assert!(rt.find("no-rooms").is_some());
     assert!(rt.find("composer").is_none());
 }
+
+#[test]
+fn what_the_node_rooms_are_missing_is_said_in_the_room_list() {
+    let mut s = node_chat();
+    s.chat.show_node_rooms(
+        super::example::data().rooms,
+        None,
+        super::LinkStatus::Live,
+        29_000_000,
+    );
+    let rt = render(s, WINDOW_SIZE);
+    for key in ["not-updated", "not-following", "unreadable"] {
+        assert!(rt.find(key).is_none(), "{key} with nothing to say");
+    }
+    let mut s = node_chat();
+    s.chat.show_node_rooms(
+        super::example::data().rooms,
+        None,
+        super::LinkStatus::Live,
+        29_000_000,
+    );
+    s.chat.issues = crate::rooms::Issues {
+        store_missing: false,
+        not_updated: vec!["Town Square".into()],
+        not_following: vec!["Family".into()],
+        unreadable: 2,
+    };
+    let rt = render(s, WINDOW_SIZE);
+    for key in ["not-updated", "not-following", "unreadable"] {
+        assert!(rt.find(key).is_some(), "{key}");
+    }
+}
+
+#[test]
+fn an_empty_list_says_why_when_the_store_is_missing() {
+    let mut chat = node_chat().chat;
+    let usual = super::view::no_rooms_hint(&chat);
+    chat.issues.store_missing = true;
+    let missing = super::view::no_rooms_hint(&chat);
+    assert_ne!(usual, missing);
+    assert!(missing.contains("older than River on the web"), "{missing}");
+    let rt = render(
+        {
+            let mut s = node_chat();
+            s.chat.issues.store_missing = true;
+            s
+        },
+        WINDOW_SIZE,
+    );
+    assert!(rt.find("no-rooms-hint").is_some());
+}

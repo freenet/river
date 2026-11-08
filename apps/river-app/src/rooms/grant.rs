@@ -36,9 +36,6 @@ const REPOLL_PAUSE: Duration = Duration::from_secs(1);
 /// How many times a request that the node could not take right now (`429`, `503`) is retried.
 const REQUEST_RETRIES: u32 = 5;
 
-/// How many polls in a row may fail to reach the node before River gives up on the request.
-const POLL_RETRIES: u32 = 5;
-
 /// A grant token. It is a credential: it opens River's delegate storage, including room
 /// signing keys. It is never printed, so `Debug` hides it and there is no `Display`.
 #[derive(Clone, PartialEq, Eq)]
@@ -119,7 +116,14 @@ pub fn request_grant_with(
     waiting: &mut dyn FnMut(&str),
     pacing: &GrantPacing,
 ) -> GrantOutcome {
-    request_grant_paced(http, authority, waiting, pacing, &mut |d| thread::sleep(d))
+    request_grant_paced(
+        http,
+        authority,
+        waiting,
+        pacing,
+        &mut |d| thread::sleep(d),
+        &Instant::now,
+    )
 }
 
 /// How the grant flow paces itself. Tests shrink these.
@@ -146,6 +150,7 @@ fn request_grant_paced(
     waiting: &mut dyn FnMut(&str),
     pacing: &GrantPacing,
     sleep: &mut dyn FnMut(Duration),
+    now: &dyn Fn() -> Instant,
 ) -> GrantOutcome {
     let body = serde_json::json!({ "app": RIVER_WEB_APP, "client_name": CLIENT_NAME }).to_string();
     let mut tries = 0;
@@ -158,9 +163,15 @@ fn request_grant_paced(
             200 => break reply,
             404 | 405 => return GrantOutcome::Unsupported,
             409 => return GrantOutcome::Refused(grant_limit_message(&reply.body)),
+            // "node not ready" (it answers HTTP before it can take grants) or too many
+            // requests: nothing has opened yet, so this is safe to retry, here and then by
+            // the caller with backoff.
             429 | 503 if tries < REQUEST_RETRIES => {
                 tries += 1;
                 sleep(pacing.pause);
+            }
+            429 | 503 => {
+                return GrantOutcome::Unreachable("Freenet isn't ready for River yet".into());
             }
             status => return GrantOutcome::Refused(refusal(status, &reply.body)),
         }
@@ -170,26 +181,28 @@ fn request_grant_paced(
     };
     // The request is answerable for `expires_in_secs`; past that (and a margin for a slow
     // answer) the node has forgotten it, whatever it says.
-    let deadline = Instant::now() + created.expires_in + pacing.margin;
+    let deadline = now() + created.expires_in + pacing.margin;
     waiting(&created.approve_url);
     let poll = format!("{ROUTE_REQUEST}/{}", created.request_id);
-    let mut failures = 0;
+    let mut last_failure: Option<String> = None;
     loop {
-        if Instant::now() >= deadline {
-            return GrantOutcome::Expired;
+        if now() >= deadline {
+            // A node that stopped answering is reported as that, not as an unanswered page.
+            return match last_failure {
+                Some(e) => GrantOutcome::Unreachable(e),
+                None => GrantOutcome::Expired,
+            };
         }
         let reply = match http.get(&poll) {
             Ok(r) => {
-                failures = 0;
+                last_failure = None;
                 r
             }
             // The node may be restarting. The request id still names the same request, so
-            // keep polling it rather than start over (which would open another page).
+            // keep polling it until it expires rather than start over (which would open
+            // another page).
             Err(e) => {
-                failures += 1;
-                if failures > POLL_RETRIES {
-                    return GrantOutcome::Unreachable(e);
-                }
+                last_failure = Some(e);
                 sleep(pacing.pause);
                 continue;
             }
@@ -418,6 +431,7 @@ mod tests {
         let http = Scripted::new(script);
         let mut opened = Vec::new();
         let mut pauses = 0;
+        let start = Instant::now();
         let outcome = request_grant_paced(
             &http,
             AUTHORITY,
@@ -427,6 +441,7 @@ mod tests {
                 margin: Duration::ZERO,
             },
             &mut |_| pauses += 1,
+            &|| start,
         );
         PAUSES.with(|p| p.set(pauses));
         assert!(
@@ -684,10 +699,10 @@ mod tests {
         );
         assert_eq!(pauses(), 2);
 
-        let mut script = vec![Ok((200, CREATED))];
-        script.extend(std::iter::repeat_n(Err("gone"), POLL_RETRIES as usize + 1));
-        let (outcome, _, _) = run(script);
+        // A node that stays gone is polled until the request expires, then reported as gone.
+        let (outcome, gets) = run_clocked(Err("gone"));
         assert_eq!(outcome, GrantOutcome::Unreachable("gone".into()));
+        assert_eq!(gets, 21);
     }
 
     #[test]
@@ -720,5 +735,58 @@ mod tests {
             .unwrap_err();
         assert!(!err.contains("secret-request-id"), "{err}");
         assert!(!err.contains("127.0.0.1"), "{err}");
+    }
+
+    /// Run against a node that answers every poll with `reply`, on a clock that only moves
+    /// when the flow pauses (30 s a pause, a 600 s request and a 30 s margin). Returns the
+    /// outcome and how many polls were made.
+    fn run_clocked(reply: Result<(u16, &str), &str>) -> (GrantOutcome, usize) {
+        let mut script = vec![Ok((200, CREATED))];
+        script.extend(std::iter::repeat_n(reply, 100));
+        let http = Scripted::new(script);
+        let clock = std::cell::Cell::new(Instant::now());
+        let outcome = request_grant_paced(
+            &http,
+            AUTHORITY,
+            &mut |_| {},
+            &GrantPacing {
+                pause: Duration::from_secs(30),
+                margin: Duration::from_secs(30),
+            },
+            &mut |d| clock.set(clock.get() + d),
+            &|| clock.get(),
+        );
+        let gets = http.calls().iter().filter(|c| c.0 == "GET").count();
+        (outcome, gets)
+    }
+
+    /// Polls run at 0, 30, ..., 600 s; at 630 s (expiry plus margin) River stops.
+    #[test]
+    fn polling_stops_at_the_requests_expiry_plus_the_margin() {
+        let (outcome, gets) = run_clocked(Ok((202, PENDING)));
+        assert_eq!(outcome, GrantOutcome::Expired);
+        assert_eq!(gets, 21);
+    }
+
+    /// A node that is starting ("node not ready") is not a refusal: nothing opened yet, and
+    /// the caller retries with backoff.
+    #[test]
+    fn a_node_not_ready_for_grants_is_retried_not_refused() {
+        let mut script =
+            vec![Ok((503, r#"{"error":"node not ready"}"#)); REQUEST_RETRIES as usize + 1];
+        let (outcome, opened, _) = run(std::mem::take(&mut script));
+        assert!(
+            matches!(outcome, GrantOutcome::Unreachable(_)),
+            "{outcome:?}"
+        );
+        assert!(opened.is_empty());
+        let (outcome, _, _) = run(vec![
+            Ok((429, r#"{"error":"too many"}"#));
+            REQUEST_RETRIES as usize + 1
+        ]);
+        assert!(
+            matches!(outcome, GrantOutcome::Unreachable(_)),
+            "{outcome:?}"
+        );
     }
 }
