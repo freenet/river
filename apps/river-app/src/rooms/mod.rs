@@ -55,6 +55,8 @@ struct Inner {
     /// session running at a time.
     commands: Mutex<Sender<Command>>,
     inbox: Mutex<Receiver<Command>>,
+    /// What the user sent that the node has not taken, kept while no session runs.
+    outbox: Mutex<outbox::Outbox>,
 }
 
 impl Link {
@@ -83,6 +85,7 @@ impl Link {
                 running: AtomicBool::new(false),
                 commands: Mutex::new(tx),
                 inbox: Mutex::new(rx),
+                outbox: Mutex::new(outbox::Outbox::default()),
             }),
         }
     }
@@ -112,6 +115,10 @@ impl Link {
                     .inbox
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut outbox = inner
+                    .outbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 session::run(
                     &inner.authority,
                     inner.config_dir.as_deref(),
@@ -119,6 +126,7 @@ impl Link {
                     &session::Pace::default(),
                     &|| false,
                     &inbox,
+                    &mut outbox,
                 )
             }))
             .unwrap_or_else(|_| {

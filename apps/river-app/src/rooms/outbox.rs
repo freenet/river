@@ -31,11 +31,17 @@
 //!
 //! Where this differs: the web UI marks a room to sync and never hears whether the node took
 //! the update. Here one update per room is out at a time, and its answer decides: an
-//! `UpdateResponse` means sent, an update error means failed, and no answer within
-//! [`super::session::Pace::update_wait`] means failed. A failed send stays on screen marked
-//! "Not sent" with Retry and Discard; a failed edit, deletion or reaction is said above the
-//! composer. Whatever the network later brings in with these messages' ids counts as sent,
-//! whatever the answer was. Nothing here writes the chat delegate's storage, so the web UI's
+//! `UpdateResponse` means sent (if the room then holds the messages), an update error means
+//! failed, and no answer within [`super::session::Pace::update_wait`] is shown as not
+//! confirmed. An answer names only the contract, not the request, so an unconfirmed update
+//! keeps its room's turn until it is answered, the network brings its messages in, it is
+//! discarded, or the connection drops; otherwise its late answer would be taken for the next
+//! update's. Once sent, messages are only ever sent again unchanged (a retry of an unanswered
+//! update, a resend after a reconnect), so the node never gets two copies under two ids; only
+//! a refused one is built again. A send not taken stays on screen marked "Not sent" with
+//! Retry and Discard; an edit, deletion or reaction not taken is said above the composer.
+//! Whatever the network later brings in with these messages' ids counts as sent, whatever the
+//! answer was. Nothing here writes the chat delegate's storage, so the web UI's
 //! after-send bookkeeping (its read position, its stored copy of the room) is not done: the
 //! web UI picks the message up from the network.
 //!
@@ -404,10 +410,20 @@ fn held(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> bool {
 enum Status {
     /// Waiting its turn: one update per room is out at a time.
     Queued,
-    /// Sent to the node at this time; waiting for its answer.
-    InFlight(Instant),
+    /// Sent to the node at `at`, waiting for its answer. `late` once unanswered for
+    /// [`super::session::Pace::update_wait`]: shown as not confirmed, but it keeps its room's
+    /// turn until it is answered, settled by the network, discarded, or the connection drops.
+    /// An answer carries no request id, so while it might still come, the next update of the
+    /// room cannot go out without its answer being taken for this one's.
+    InFlight {
+        at: Instant,
+        late: bool,
+    },
     Failed(String),
 }
+
+const LATE: &str =
+    "Freenet didn't confirm it in time. It may still arrive; if it does, this goes away.";
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -420,6 +436,10 @@ struct Entry {
     time: SystemTime,
     messages: Vec<AuthorizedMessageV1>,
     status: Status,
+    /// These messages went to the node at least once. From then on they are only ever sent
+    /// again as they are, never rebuilt: the node may have taken them, and a rebuilt message
+    /// has a new id, so it would show twice.
+    sent: bool,
 }
 
 impl Entry {
@@ -427,23 +447,63 @@ impl Entry {
         matches!(self.intent, Some(Intent::Text { .. }))
     }
 
-    /// Sealed under a secret version other than `current`.
-    fn stale_sealed(&self, current: Option<u32>) -> bool {
+    /// Sealed under a secret version older than `current` (the web UI only seals forward).
+    fn sealed_before(&self, current: Option<u32>) -> bool {
+        let Some(current) = current else {
+            return false;
+        };
         self.messages
             .iter()
             .filter_map(|m| m.message.content.secret_version())
-            .any(|v| Some(v) != current)
+            .any(|v| v < current)
+    }
+
+    /// Why it is shown as not sent, if it is.
+    fn trouble(&self) -> Option<&str> {
+        match &self.status {
+            Status::Failed(reason) => Some(reason),
+            Status::InFlight { late: true, .. } => Some(LATE),
+            _ => None,
+        }
     }
 }
 
-/// What the user sent that the node has not taken yet, across reconnects.
-#[derive(Default)]
+/// What a message is stamped with. Tests set it.
+pub(super) type Clock = Box<dyn Fn() -> SystemTime + Send>;
+
+/// What the user sent that the node has not taken yet. It outlives a connection, and a
+/// session: the link keeps it while the session is stopped on something that needs the user.
 pub(super) struct Outbox {
     entries: Vec<Entry>,
     next: u64,
+    /// Commands that arrived before the rooms were read.
+    pub waiting: Vec<Command>,
+    clock: Clock,
 }
 
+impl Default for Outbox {
+    fn default() -> Self {
+        Outbox {
+            entries: Vec::new(),
+            next: 0,
+            waiting: Vec::new(),
+            clock: Box::new(SystemTime::now),
+        }
+    }
+}
+
+const IDENTITY_CHANGED: &str =
+    "This room's identity changed after it was written, so it was not sent.";
+
 impl Outbox {
+    #[cfg(test)]
+    pub fn with_clock(clock: Clock) -> Self {
+        Outbox {
+            clock,
+            ..Outbox::default()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -451,29 +511,32 @@ impl Outbox {
     fn add(&mut self, room: &LiveRoom, label: &'static str, intent: Option<Intent>) -> u64 {
         self.next += 1;
         let id = self.next;
-        let time = SystemTime::now();
         let mut entry = Entry {
             id,
             room: room.stored.owner_vk,
             intent,
             label,
             author: None,
-            time,
+            time: (self.clock)(),
             messages: Vec::new(),
             status: Status::Queued,
+            sent: false,
         };
         rebuild(&mut entry, room);
         self.entries.push(entry);
         id
     }
 
-    /// Take a command for `room`. `false` for a command that names something gone.
+    /// Take a command for `room`. `false` for a command that changed nothing.
     pub fn command(&mut self, room: &LiveRoom, action: Action) -> bool {
         let intent = match action {
             Action::Retry { entry } => return self.retry(entry, room),
             Action::Discard { entry } => {
+                // Only what is shown as not sent, and only in the room it was written in.
                 let before = self.entries.len();
-                self.entries.retain(|e| e.id != entry);
+                self.entries.retain(|e| {
+                    e.id != entry || e.room != room.stored.owner_vk || e.trouble().is_none()
+                });
                 return self.entries.len() != before;
             }
             action => self.intent(room, action),
@@ -583,22 +646,35 @@ impl Outbox {
     }
 
     fn retry(&mut self, id: u64, room: &LiveRoom) -> bool {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) else {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && e.room == room.stored.owner_vk)
+        else {
             return false;
         };
-        if !matches!(entry.status, Status::Failed(_)) || entry.intent.is_none() {
+        if entry.intent.is_none() {
             return false;
         }
-        // A retry is a new send, stamped now, as the web UI's `Outbox::retry`.
-        entry.time = SystemTime::now();
-        entry.author = None;
-        entry.status = Status::Queued;
-        rebuild(entry, room);
+        match &entry.status {
+            // Unanswered: the same messages again, which the node may already hold. It goes
+            // first in its room, keeping the place it holds.
+            Status::InFlight { late: true, .. } => entry.status = Status::Queued,
+            // Refused, or never sendable: a new send, stamped now, as the web UI's
+            // `Outbox::retry`. Still as the identity it was written as (`rebuild` checks).
+            Status::Failed(_) => {
+                entry.time = (self.clock)();
+                entry.status = Status::Queued;
+                entry.sent = false;
+                rebuild(entry, room);
+            }
+            _ => return false,
+        }
         true
     }
 
-    /// The update to send next for `room`, if none of its updates is waiting for an answer.
-    /// The entry it carries is then in flight. `changed` is set when an entry failed here.
+    /// The update to send next for `room`, if none of its updates holds its turn. The entry it
+    /// carries is then in flight. `changed` is set when an entry failed here.
     pub fn next_update(
         &mut self,
         room: &LiveRoom,
@@ -609,7 +685,7 @@ impl Outbox {
         if self
             .entries
             .iter()
-            .any(|e| e.room == vk && matches!(e.status, Status::InFlight(_)))
+            .any(|e| e.room == vk && matches!(e.status, Status::InFlight { .. }))
         {
             return None;
         }
@@ -620,74 +696,93 @@ impl Outbox {
                 continue;
             }
             if entry.author.is_some() && entry.author != me {
-                entry.status = Status::Failed(
-                    "This room's identity changed after it was written, so it was not sent.".into(),
-                );
+                entry.status = Status::Failed(IDENTITY_CHANGED.into());
                 *changed = true;
                 continue;
             }
-            if entry.stale_sealed(current) {
-                // Sealed again under the room's current secret, keeping its time.
-                rebuild(entry, room);
-                *changed = true;
-                if entry.status != Status::Queued {
+            if !entry.sent {
+                if entry.sealed_before(current) {
+                    // Sealed again under the room's current secret, keeping its time.
+                    rebuild(entry, room);
+                    *changed = true;
+                    if entry.status != Status::Queued {
+                        continue;
+                    }
+                }
+                if let Err(e) = applied(room, &entry.messages) {
+                    entry.status = Status::Failed(e);
+                    *changed = true;
                     continue;
                 }
             }
-            if let Err(e) = applied(room, &entry.messages) {
-                entry.status = Status::Failed(e);
-                *changed = true;
-                continue;
-            }
-            entry.status = Status::InFlight(now);
+            entry.status = Status::InFlight {
+                at: now,
+                late: false,
+            };
+            entry.sent = true;
             return Some(delta(room, &entry.messages));
         }
         None
     }
 
-    /// The node answered `room`'s update in flight. Taken: the entry, for the caller to apply
-    /// to the room. Refused: the entry fails with the node's reason.
-    pub fn answered(
-        &mut self,
-        room: &VerifyingKey,
-        result: Result<(), String>,
-    ) -> Option<Vec<AuthorizedMessageV1>> {
-        let i = self
-            .entries
-            .iter()
-            .position(|e| e.room == *room && matches!(e.status, Status::InFlight(_)))?;
+    /// The node answered the update holding `room`'s turn. Taken: its messages join the room
+    /// at once, and the entry is done if the room kept them; if it did not (the node answers a
+    /// delta that changed nothing the same way), it fails. Refused: it fails with the node's
+    /// reason. True when that changed anything.
+    pub fn answered(&mut self, room: &mut LiveRoom, result: Result<(), String>) -> bool {
+        let Some(i) = self.entries.iter().position(|e| {
+            e.room == room.stored.owner_vk && matches!(e.status, Status::InFlight { .. })
+        }) else {
+            return false;
+        };
         match result {
-            Ok(()) => Some(self.entries.remove(i).messages),
+            Ok(()) => {
+                let messages = self.entries[i].messages.clone();
+                let kept = match room.apply_delta(delta(room, &messages)) {
+                    Ok(()) => held(room, &messages),
+                    Err(e) => {
+                        eprintln!("River: a message Freenet took was not applied here: {e}");
+                        false
+                    }
+                };
+                if kept {
+                    self.entries.remove(i);
+                } else {
+                    self.entries[i].status = Status::Failed(
+                        "Freenet answered, but the room didn't keep it. You may have been \
+                         removed or banned."
+                            .into(),
+                    );
+                }
+            }
             Err(reason) => {
                 self.entries[i].status = Status::Failed(format!("Freenet refused it: {reason}"));
-                None
             }
         }
+        true
     }
 
-    /// Updates unanswered for `wait` fail. True when any did.
-    pub fn expire(&mut self, wait: Duration) -> bool {
+    /// Updates unanswered for `wait` by `now` are shown as not confirmed (they keep their
+    /// room's turn). True when any newly were.
+    pub fn expire(&mut self, wait: Duration, now: Instant) -> bool {
         let mut any = false;
         for e in &mut self.entries {
-            if let Status::InFlight(at) = e.status
-                && at.elapsed() >= wait
+            if let Status::InFlight { at, late } = &mut e.status
+                && !*late
+                && now.saturating_duration_since(*at) >= wait
             {
-                e.status = Status::Failed(
-                    "Freenet didn't confirm it in time. It may still arrive; if it does, this \
-                     goes away."
-                        .into(),
-                );
+                *late = true;
                 any = true;
             }
         }
         any
     }
 
-    /// The connection is gone: what was in flight goes again on the next one. The same signed
-    /// messages are sent, so one the node did take is not added twice.
+    /// The connection is gone: what was in flight goes again on the next one, as the same
+    /// signed messages, so one the node did take is not added twice.
     pub fn requeue(&mut self) {
         for e in &mut self.entries {
-            if matches!(e.status, Status::InFlight(_)) {
+            if matches!(e.status, Status::InFlight { .. }) {
                 e.status = Status::Queued;
             }
         }
@@ -709,7 +804,7 @@ impl Outbox {
     }
 
     /// `room` with what is on its way applied, which entries show as rows (by message key),
-    /// and the failures with no row to show them on.
+    /// and the troubles with no row to show them on.
     fn overlay(&self, room: &LiveRoom) -> (LiveRoom, HashMap<String, Pending>, Vec<Notice>) {
         let mut shown = room.clone();
         let mut rows = HashMap::new();
@@ -719,12 +814,10 @@ impl Outbox {
             .iter()
             .filter(|e| e.room == room.stored.owner_vk)
         {
-            let failed = match &e.status {
-                Status::Failed(reason) => Some(reason.clone()),
-                _ => None,
-            };
-            // A failed edit, deletion or reaction has no effect to show.
-            let show = e.is_text() || failed.is_none();
+            let trouble = e.trouble().map(str::to_owned);
+            // A failed edit, deletion or reaction has no effect to show. One that is only
+            // unconfirmed may yet land, so its effect shows (and the next reaction counts it).
+            let show = e.is_text() || !matches!(e.status, Status::Failed(_));
             let on_screen = show
                 && !e.messages.is_empty()
                 && match applied(&shown, &e.messages) {
@@ -740,11 +833,11 @@ impl Outbox {
                         message_key(&m.id()),
                         Pending {
                             entry: e.id,
-                            failed: failed.clone(),
+                            failed: trouble.clone(),
                         },
                     );
                 }
-            } else if let Some(reason) = failed {
+            } else if let Some(reason) = trouble {
                 notices.push(Notice {
                     entry: e.id,
                     text: format!("{} couldn't be sent. {reason}", e.label),
@@ -783,9 +876,7 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom) {
     match build(room, intent, entry.time) {
         Ok((author, messages)) => {
             if entry.author.is_some_and(|a| a != author) {
-                entry.status = Status::Failed(
-                    "This room's identity changed after it was written, so it was not sent.".into(),
-                );
+                entry.status = Status::Failed(IDENTITY_CHANGED.into());
                 return;
             }
             entry.author = Some(author);

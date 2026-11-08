@@ -403,7 +403,8 @@ impl Chat {
 
     /// Edit your message keyed `target` in the composer.
     pub fn start_edit(&mut self, target: &str) {
-        let Some(text) = self.own_sent(target).map(|m| m.text.clone()) else {
+        // As written, so the edit keeps the message's mentions.
+        let Some(text) = self.own_sent(target).map(|m| m.source.clone()) else {
             return;
         };
         self.cancel();

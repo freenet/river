@@ -1,5 +1,6 @@
 use super::*;
-use crate::rooms::outbox::Action;
+use crate::rooms::outbox::{Action, Outbox};
+use crate::rooms::room::message_key;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
@@ -878,9 +879,22 @@ const PATIENCE: Duration = Duration::from_secs(20);
 
 impl Running {
     fn start(node: &FakeNode, dir: &Path, pace: Pace) -> Running {
+        Running::start_with(node, dir, pace, Arc::default(), std::sync::mpsc::channel())
+    }
+
+    /// Start with an outbox and a command channel that may outlive this run, as the link's do.
+    fn start_with(
+        node: &FakeNode,
+        dir: &Path,
+        pace: Pace,
+        outbox: Arc<Mutex<Outbox>>,
+        (commands, inbox): (
+            std::sync::mpsc::Sender<Command>,
+            std::sync::mpsc::Receiver<Command>,
+        ),
+    ) -> Running {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (commands, inbox) = std::sync::mpsc::channel();
         let handle = {
             let (updates, stop) = (updates.clone(), stop.clone());
             let authority = node.authority.clone();
@@ -893,6 +907,7 @@ impl Running {
                     &pace,
                     &|| stop.load(Ordering::Relaxed),
                     &inbox,
+                    &mut outbox.lock().unwrap(),
                 )
             })
         };
@@ -1659,4 +1674,191 @@ fn a_command_while_disconnected_shows_at_once_and_goes_out_on_reconnecting() {
     session.wait_until("sent and taken after reconnecting", || {
         delivery_of(&session, "written offline") == Some(None)
     });
+}
+
+fn accepted(room: &TestRoom) -> Message {
+    let answer: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateResponse {
+            key: room.key,
+            summary: freenet_stdlib::prelude::StateSummary::from(vec![]),
+        },
+    ));
+    Message::Binary(bincode::serialize(&answer).unwrap().into())
+}
+
+#[test]
+fn a_late_answer_settles_the_late_update_and_only_then_does_the_next_go() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let pace = Pace {
+        update_wait: Duration::from_millis(100),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-late", pace);
+    session.act(&a, say("first"));
+    session.wait_until(
+        "first shown unconfirmed",
+        || matches!(delivery_of(&session, "first"), Some(Some(p)) if p.failed.is_some()),
+    );
+    session.act(&a, say("second"));
+    session.wait_until(
+        "second shown on its way",
+        || matches!(delivery_of(&session, "second"), Some(Some(p)) if p.failed.is_none()),
+    );
+    // Second waits for first's answer; it has not gone out.
+    assert_eq!(node.with(|w| w.updates.len()), 1);
+    node.with(|w| w.push.push(accepted(&a)));
+    session.wait_until("first sent by its own late answer", || {
+        delivery_of(&session, "first") == Some(None)
+    });
+    session.wait_until("then second goes out", || {
+        node.with(|w| w.updates.len() == 2)
+    });
+    assert!(
+        matches!(delivery_of(&session, "second"), Some(Some(_))),
+        "not yet answered"
+    );
+    node.with(|w| w.push.push(accepted(&a)));
+    session.wait_until("second sent by its own answer", || {
+        delivery_of(&session, "second") == Some(None)
+    });
+}
+
+#[test]
+fn two_rooms_each_have_an_update_out_at_once() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a, &b], "send-two-rooms", quick());
+    session.act(&a, say("in A"));
+    session.act(&b, say("in B"));
+    session.wait_until("both out", || node.with(|w| w.updates.len() == 2));
+    let keys: HashSet<ContractKey> = node.with(|w| w.updates.iter().map(|(k, _)| *k).collect());
+    assert_eq!(keys, HashSet::from([a.key, b.key]));
+    // B's answer settles B, not A.
+    node.with(|w| w.push.push(accepted(&b)));
+    session.wait_until("B settled", || {
+        session.last_rooms().is_some_and(|(rooms, _, _)| {
+            let find = |name: &str, text: &str| {
+                rooms
+                    .iter()
+                    .find(|r| r.name == name)
+                    .and_then(|r| r.messages.iter().find(|m| m.text == text))
+                    .map(|m| m.pending.is_none())
+            };
+            find("B", "in B") == Some(true) && find("A", "in A") == Some(false)
+        })
+    });
+}
+
+#[test]
+fn a_command_sent_before_the_rooms_are_read_waits_for_them() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.add_room(&a));
+    let dir = temp_dir("send-early");
+    save_token(&dir, "kept-token");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Command {
+        room: bs58::encode(a.vk().to_bytes()).into_string(),
+        action: say("before anything"),
+    })
+    .unwrap();
+    let session = Running::start_with(&node, &dir, quick(), Arc::default(), (tx, rx));
+    session.wait_until("sent once the rooms are read", || {
+        delivery_of(&session, "before anything") == Some(None)
+    });
+}
+
+#[test]
+fn edit_react_and_delete_reach_the_node_and_the_screen() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "send-actions", quick());
+    let target = message_key(&a.state.recent_messages.messages[0].id());
+    session.act(
+        &a,
+        Action::Edit {
+            target: target.clone(),
+            text: "a1 fixed".into(),
+        },
+    );
+    session.act(
+        &a,
+        Action::React {
+            target: target.clone(),
+            emoji: "🎉".into(),
+        },
+    );
+    session.wait_until("edited and reacted", || {
+        session.last_rooms().is_some_and(|(rooms, _, _)| {
+            rooms[0].messages.first().is_some_and(|m| {
+                m.text == "a1 fixed" && m.edited && m.reactions.iter().any(|r| r.emoji == "🎉")
+            })
+        })
+    });
+    session.act(&a, Action::Delete { target });
+    session.wait_until("deleted", || {
+        session
+            .last_rooms()
+            .is_some_and(|(rooms, _, _)| rooms[0].messages.is_empty())
+    });
+    let kinds: Vec<u32> = node.with(|w| {
+        w.updates
+            .iter()
+            .flat_map(|(_, d)| d.recent_messages.clone().unwrap())
+            .map(|m| match &m.message.content {
+                RoomMessageBody::Public { data, .. } => {
+                    river_core::room_state::content::ActionContentV1::decode(data)
+                        .unwrap()
+                        .action_type
+                }
+                RoomMessageBody::Private { .. } => panic!("a public room"),
+            })
+            .collect()
+    });
+    use river_core::room_state::content::{
+        ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
+    };
+    assert_eq!(
+        kinds,
+        [ACTION_TYPE_EDIT, ACTION_TYPE_REACTION, ACTION_TYPE_DELETE]
+    );
+}
+
+#[test]
+fn what_was_unsent_when_a_session_stopped_goes_out_in_the_next() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| {
+        w.add_room(&a);
+        w.update_play = UpdatePlay::Ignore;
+    });
+    let dir = temp_dir("send-restart");
+    save_token(&dir, "kept-token");
+    let outbox: Arc<Mutex<Outbox>> = Arc::default();
+    let first = Running::start_with(
+        &node,
+        &dir,
+        quick(),
+        outbox.clone(),
+        std::sync::mpsc::channel(),
+    );
+    first.wait_rooms("live", |r, _, s| r.len() == 1 && s == LinkStatus::Live);
+    first.act(&a, say("survives a stop"));
+    first.wait_until("sent once", || node.with(|w| w.updates.len() == 1));
+    // Stopped (as on a state that needs the user), with no answer yet.
+    drop(first);
+    node.with(|w| w.update_play = UpdatePlay::Accept);
+    let second = Running::start_with(&node, &dir, quick(), outbox, std::sync::mpsc::channel());
+    second.wait_until("shown and sent in the next session", || {
+        delivery_of(&second, "survives a stop") == Some(None)
+    });
+    let (one, two) = node.with(|w| (w.updates[0].1.clone(), w.updates[1].1.clone()));
+    assert_eq!(
+        one.recent_messages, two.recent_messages,
+        "the same message again"
+    );
 }

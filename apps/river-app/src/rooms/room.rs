@@ -94,13 +94,20 @@ impl LiveRoom {
                 .find(|id| r.matches(*id))
                 .map(|id| self.nickname(id, me))
         };
-        let raw = state
-            .recent_messages
-            .effective_text(m)
-            .unwrap_or_else(|| self.body_text(&m.message.content));
+        let raw = self.source_text(m);
         river_core::mention::render_plaintext_transformed(&raw, resolve_mention, |name| {
             clean(&name)
         })
+    }
+
+    /// A message's text as written: edited and decrypted, with mention tokens kept, so an edit
+    /// of it keeps its mentions.
+    pub fn source_text(&self, m: &AuthorizedMessageV1) -> String {
+        self.stored
+            .room_state
+            .recent_messages
+            .effective_text(m)
+            .unwrap_or_else(|| self.body_text(&m.message.content))
     }
 
     /// A member's name as the conversation shows it.
@@ -367,6 +374,7 @@ impl LiveRoom {
                 author: ids.of(m.message.author),
                 time: minutes(m.message.time),
                 text: texts[i].clone(),
+                source: self.source_text(m),
                 reply_to,
                 reactions,
                 edited: state.recent_messages.is_edited(&m.id()),

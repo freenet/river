@@ -652,6 +652,26 @@ fn a_message_on_its_way_and_one_that_failed_say_so() {
 }
 
 #[test]
+fn an_edit_starts_from_the_text_as_written_so_mentions_survive() {
+    let token = "@[Ada](rv:0011223344556677)";
+    let mut rt = node_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        let m = room
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.author == me)
+            .unwrap();
+        m.text = "hi @Ada".into();
+        m.source = format!("hi {token}");
+    });
+    let mine = message_of(&rt, true);
+    rt.state.chat.start_edit(&mine);
+    assert_eq!(rt.state.chat.composer.text, format!("hi {token}"));
+}
+
+#[test]
 fn switching_rooms_ends_a_reply_or_edit() {
     let mut rt = node_rooms(|_| {});
     let mine = message_of(&rt, true);
@@ -758,6 +778,7 @@ fn a_room_read_here_counts_unread_from_where_it_was_read() {
             author: someone,
             time,
             text: "new".into(),
+            source: "new".into(),
             reply_to: None,
             reactions: vec![],
             edited: false,
@@ -771,6 +792,7 @@ fn a_room_read_here_counts_unread_from_where_it_was_read() {
         author: room.me,
         time: last.time + 2,
         text: "mine".into(),
+        source: "mine".into(),
         reply_to: None,
         reactions: vec![],
         edited: false,

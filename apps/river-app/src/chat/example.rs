@@ -51,6 +51,7 @@ impl Builder {
             author,
             time,
             text: text.into(),
+            source: text.into(),
             reply_to: None,
             reactions: Vec::new(),
             edited: false,

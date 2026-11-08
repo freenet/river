@@ -67,6 +67,9 @@ pub struct Message {
     /// day 0 is (`Chat::day_zero`), which the day headings use.
     pub time: u32,
     pub text: String,
+    /// The text as written, which an edit starts from: mention tokens (`@[name](rv:id)`) as
+    /// they are stored, where `text` shows names.
+    pub source: String,
     pub reply_to: Option<ReplyTo>,
     pub reactions: Vec<Reaction>,
     pub edited: bool,
@@ -125,6 +128,7 @@ impl Room {
             author: self.me,
             time,
             text: text.to_owned(),
+            source: text.to_owned(),
             reply_to: None,
             reactions: Vec::new(),
             edited: false,
@@ -162,6 +166,7 @@ impl Room {
         {
             Some(m) => {
                 m.text = text.to_owned();
+                m.source = text.to_owned();
                 m.edited = true;
                 true
             }
@@ -398,6 +403,7 @@ mod tests {
             author,
             time,
             text: String::new(),
+            source: String::new(),
             reply_to: None,
             reactions: vec![],
             edited: false,

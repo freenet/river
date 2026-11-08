@@ -192,6 +192,10 @@ pub enum RoomsUpdate {
     Status(LinkStatus),
 }
 
+/// Run until stopped, or until a state that needs the user. `outbox` is what the user sent
+/// that the node has not taken; it is kept across runs, so a stop does not lose it, and what
+/// was in flight goes again on the next run.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     authority: &str,
     config_dir: Option<&Path>,
@@ -199,13 +203,34 @@ pub(super) fn run(
     pace: &Pace,
     stop: &dyn Fn() -> bool,
     commands: &Receiver<Command>,
+    outbox: &mut Outbox,
+) -> Access {
+    let mut rooms = Rooms {
+        outbox: std::mem::take(outbox),
+        ..Rooms::default()
+    };
+    let end = run_with(
+        authority, config_dir, report, pace, stop, commands, &mut rooms,
+    );
+    rooms.outbox.requeue();
+    *outbox = std::mem::take(&mut rooms.outbox);
+    end
+}
+
+fn run_with(
+    authority: &str,
+    config_dir: Option<&Path>,
+    report: &dyn Fn(RoomsUpdate),
+    pace: &Pace,
+    stop: &dyn Fn() -> bool,
+    commands: &Receiver<Command>,
+    rooms: &mut Rooms,
 ) -> Access {
     let store = config_dir.map(TokenStore::in_dir);
     let http = NodeHttp::new(&format!("http://{authority}"));
     let mut token: Option<GrantToken> = None;
     // The token was issued by the node in this run and the node has not accepted it yet.
     let mut unconfirmed = false;
-    let mut rooms = Rooms::default();
     let mut backoff = pace.backoff_first;
     let mut early_read = pace.early_read;
     // Whether the read-first retry below was just taken.
@@ -258,7 +283,7 @@ pub(super) fn run(
         let ended = follow(
             authority,
             &current,
-            &mut rooms,
+            rooms,
             report,
             &mut backoff,
             &mut unconfirmed,
@@ -532,7 +557,7 @@ fn follow_on(
         }
         // What the user did, then the updates it makes.
         let mut changed = rooms.take_commands(commands);
-        changed |= rooms.outbox.expire(pace.update_wait);
+        changed |= rooms.outbox.expire(pace.update_wait, Instant::now());
         match rooms.send_updates(socket) {
             Ok(failed) => changed |= failed,
             Err(e) => return e,
@@ -924,8 +949,6 @@ struct Rooms {
     not_following: HashSet<VerifyingKey>,
     /// What the user sent that the node has not taken yet.
     outbox: Outbox,
-    /// Commands that arrived before the rooms were first read.
-    waiting: Vec<Command>,
 }
 
 impl Rooms {
@@ -1007,12 +1030,12 @@ impl Rooms {
 
     /// Take what the user did since the last call. True when it changed what shows.
     fn take_commands(&mut self, commands: &Receiver<Command>) -> bool {
-        self.waiting.extend(commands.try_iter());
-        if !self.loaded || self.waiting.is_empty() {
+        self.outbox.waiting.extend(commands.try_iter());
+        if !self.loaded || self.outbox.waiting.is_empty() {
             return false;
         }
         let mut changed = false;
-        for command in std::mem::take(&mut self.waiting) {
+        for command in std::mem::take(&mut self.outbox.waiting) {
             match self.list.iter().find(|r| r.key() == command.room) {
                 Some(room) => changed |= self.outbox.command(room, command.action),
                 // Left, in the browser, before this arrived.
@@ -1036,22 +1059,24 @@ impl Rooms {
             return Ok(false);
         }
         let mut changed = false;
-        for room in &self.list {
+        for i in 0..self.list.len() {
+            let room = &self.list[i];
             let Some(delta) = self.outbox.next_update(room, Instant::now(), &mut changed) else {
                 continue;
             };
+            let key = room.stored.contract_key;
             let mut bytes = Vec::new();
             if let Err(e) = ciborium::ser::into_writer(&delta, &mut bytes) {
                 // Not expected for River's own types; the entry fails visibly.
                 self.outbox.answered(
-                    &room.stored.owner_vk,
+                    &mut self.list[i],
                     Err(format!("it could not be encoded: {e}")),
                 );
                 changed = true;
                 continue;
             }
             let update = ContractRequest::Update {
-                key: room.stored.contract_key,
+                key,
                 data: UpdateData::Delta(StateDelta::from(bytes)),
             };
             socket.send(&ClientRequest::ContractOp(update))?;
@@ -1059,26 +1084,15 @@ impl Rooms {
         Ok(changed)
     }
 
-    /// The node answered the update in flight for the room under contract `id`. Taken: its
-    /// messages join the room's copy at once, so they show as sent. True when that changed
-    /// what shows.
+    /// The node answered the update holding the turn of the room under contract `id`
+    /// ([`Outbox::answered`]). True when that changed what shows.
     fn update_answered(&mut self, id: &ContractInstanceId, result: Result<(), String>) -> bool {
         let Some(room) = self.list.iter_mut().find(|r| r.contract_id() == *id) else {
             return false;
         };
-        let refused = result.is_err();
-        match self.outbox.answered(&room.stored.owner_vk, result) {
-            Some(messages) => {
-                let delta = super::outbox::delta(room, &messages);
-                if let Err(e) = room.apply_delta(delta) {
-                    // Taken by the node: the network brings it in with the next update.
-                    eprintln!("River: a sent message was not applied here: {e}");
-                }
-                self.outbox.reconcile(room);
-                true
-            }
-            None => refused,
-        }
+        let changed = self.outbox.answered(room, result);
+        // Taking them may have settled others the room now holds.
+        self.outbox.reconcile(room) | changed
     }
 
     fn contract_ids(&self) -> Vec<ContractInstanceId> {
