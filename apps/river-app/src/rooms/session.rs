@@ -16,7 +16,9 @@
 //!   reset only once a connection has stayed up for a while, so a node that accepts and then
 //!   drops every connection is not hammered.
 //! - **Subscribing.** A room whose subscribe failed, found nothing, or went unanswered is
-//!   named on screen and asked again with its own backoff.
+//!   named on screen and asked again with its own backoff. A late answer to an earlier ask
+//!   can leave the node notifying twice; applying the same update twice changes nothing,
+//!   since a room's state merges idempotently. Left and re-keyed rooms are no longer asked for.
 //! - **New and left rooms.** The stored rooms are read again periodically while connected, so
 //!   a room joined or left in the browser shows up here without a restart. A read that finds
 //!   no store or no rooms at all keeps the list shown: that is a store that went away, not a
@@ -190,6 +192,8 @@ pub(super) fn run(
     let mut rooms = Rooms::default();
     let mut backoff = pace.backoff_first;
     let mut early_read = pace.early_read;
+    // Whether the read-first retry below was just taken.
+    let mut read_first_retry = false;
     report(RoomsUpdate::Access(Access::Connecting));
     loop {
         if stop() {
@@ -280,10 +284,12 @@ pub(super) fn run(
                 // Nothing was heard on a connection that failed: the node may have rejected
                 // the token and dropped the connection faster than the early read waited. Try
                 // once more at once, reading longer before the first write.
-                if !ended.heard_anything && early_read == pace.early_read {
+                if ended.connected && !ended.heard_anything && !read_first_retry {
+                    read_first_retry = true;
                     early_read = pace.early_read_retry;
                     continue;
                 }
+                read_first_retry = false;
                 early_read = pace.early_read;
                 rooms.lost(&err.to_string(), report);
                 pause(&mut backoff, pace, stop);
@@ -306,6 +312,8 @@ fn pause(backoff: &mut Duration, pace: &Pace, stop: &dyn Fn() -> bool) {
 /// How a connection ended.
 struct Ended {
     error: SocketError,
+    /// Whether the WebSocket connection opened at all.
+    connected: bool,
     /// Whether anything at all arrived on it.
     heard_anything: bool,
 }
@@ -329,6 +337,7 @@ fn follow(
         Err(error) => {
             return Ended {
                 error,
+                connected: false,
                 heard_anything: false,
             };
         }
@@ -345,6 +354,7 @@ fn follow(
     );
     Ended {
         error,
+        connected: true,
         heard_anything: socket.heard_anything(),
     }
 }
@@ -353,8 +363,8 @@ fn follow(
 /// subscribe failed.
 #[derive(Default)]
 struct Subscriptions {
-    /// Asked, no answer yet.
-    pending: HashSet<ContractInstanceId>,
+    /// Asked, no answer yet, with when they were asked.
+    pending: HashMap<ContractInstanceId, Instant>,
     /// Failed or unanswered: how many times, and when to ask again.
     retry: HashMap<ContractInstanceId, (u32, Instant)>,
 }
@@ -368,8 +378,30 @@ impl Subscriptions {
             blocking_subscribe: false,
         };
         socket.send(&ClientRequest::ContractOp(get))?;
-        self.pending.insert(id);
+        self.pending.insert(id, Instant::now());
         Ok(())
+    }
+
+    /// Asks unanswered for `wait` count as failed, whenever they were made. A room that never
+    /// answers is named on screen and asked again later.
+    fn expire(&mut self, wait: Duration, pace: &Pace) -> Vec<ContractInstanceId> {
+        let late: Vec<ContractInstanceId> = self
+            .pending
+            .iter()
+            .filter(|(_, at)| at.elapsed() >= wait)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &late {
+            self.failed(*id, pace);
+        }
+        late
+    }
+
+    /// Forget rooms no longer shown (left, or re-keyed to another contract), so River stops
+    /// asking for them.
+    fn keep_only(&mut self, shown: &[ContractInstanceId]) {
+        self.pending.retain(|id, _| shown.contains(id));
+        self.retry.retain(|id, _| shown.contains(id));
     }
 
     fn answered(&mut self, id: &ContractInstanceId) {
@@ -395,7 +427,7 @@ impl Subscriptions {
         let due: Vec<ContractInstanceId> = self
             .retry
             .iter()
-            .filter(|(id, (_, at))| *at <= now && !self.pending.contains(*id))
+            .filter(|(id, (_, at))| *at <= now && !self.pending.contains_key(*id))
             .map(|(id, _)| *id)
             .collect();
         for id in due {
@@ -504,10 +536,15 @@ fn follow_on(
                 changed = rooms.following(key.id(), true);
                 changed |= rooms.merge_bytes(key.id(), state.as_ref());
             }
+            // A notification shows the subscription is in place, whatever came of its ask.
             Some(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
                 key,
                 update,
-            }))) => changed = rooms.apply_update(key.id(), &update),
+            }))) => {
+                subs.answered(key.id());
+                changed = rooms.following(key.id(), true);
+                changed |= rooms.apply_update(key.id(), &update);
+            }
             // The network has no copy. The web UI would seed one with a PUT; this app only
             // reads, so it keeps showing the stored copy and asks again later.
             Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
@@ -534,6 +571,7 @@ fn follow_on(
                                         return e;
                                     }
                                 }
+                                subs.keep_only(&rooms.contract_ids());
                                 reload = None;
                                 last_read = Instant::now();
                                 changed = true;
@@ -559,15 +597,15 @@ fn follow_on(
                 }
             }
         }
-        // "Catching up" ends when every room has answered, or after a while regardless. Rooms
-        // that never answered are asked again later and named on screen meanwhile.
+        // An ask that went unanswered for the catch-up time counts as failed: named on screen
+        // and asked again later. This holds for every ask, not only the first ones.
+        for id in subs.expire(pace.catch_up, pace) {
+            changed |= rooms.following(&id, false);
+        }
+        // "Catching up" ends when every room has answered, or after a while regardless.
         if status == LinkStatus::Loading
             && (subs.pending.is_empty() || connected_at.elapsed() >= pace.catch_up)
         {
-            for id in std::mem::take(&mut subs.pending) {
-                subs.failed(id, pace);
-                rooms.following(&id, false);
-            }
             status = LinkStatus::Live;
             changed = true;
         }
@@ -853,6 +891,7 @@ impl Rooms {
                     kept.stored.last_read_message_id = slot.last_read_message_id.clone();
                     if let Err(e) = kept.merge_state(&slot.room_state) {
                         eprintln!("River: the stored copy of a room was not merged: {e}");
+                        self.not_updated.insert(vk);
                     }
                     kept
                 }
@@ -993,6 +1032,7 @@ impl Rooms {
 
     /// The connection is gone: keep showing the rooms if there are any, and say so.
     fn lost(&self, why: &str, report: &dyn Fn(RoomsUpdate)) {
+        eprintln!("River: lost the connection to Freenet: {why}");
         if self.loaded {
             report(RoomsUpdate::Status(LinkStatus::Reconnecting));
         } else {

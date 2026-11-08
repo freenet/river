@@ -606,3 +606,30 @@ fn any_message_time_shows_without_panicking() {
     let room = LiveRoom::new(f.stored(state)).view(&local_minutes);
     assert_eq!(room.messages.len(), 3);
 }
+
+/// A merge the room's rules reject leaves the room exactly as it was.
+#[test]
+fn a_rejected_merge_changes_nothing() {
+    let f = Fixture::new();
+    let state = f.private_state();
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let before = live.stored.room_state.clone();
+    let mut incoming = state;
+    incoming
+        .recent_messages
+        .messages
+        .push(text_at(&f, 700, 0, &SECRET, "should not land"));
+    // An upgrade pointer signed by someone other than the owner.
+    incoming.upgrade = river_core::room_state::upgrade::OptionalUpgradeV1(Some(
+        river_core::room_state::upgrade::AuthorizedUpgradeV1::new(
+            river_core::room_state::upgrade::UpgradeV1 {
+                owner_member_id: f.owner_id(),
+                version: 1,
+                new_chatroom_address: blake3::Hash::from([0; 32]),
+            },
+            &SigningKey::from_bytes(&[99; 32]),
+        ),
+    ));
+    assert!(live.merge_state(&incoming).is_err());
+    assert_eq!(live.stored.room_state, before);
+}

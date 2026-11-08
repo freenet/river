@@ -126,14 +126,20 @@ impl NodeSocket {
         let mut request = format!("ws://{authority}{COMMAND_PATH}")
             .into_client_request()
             .map_err(|e| fail(&e))?;
+        // A token that is not a bearer token (RFC 6750 token68: visible ASCII from a small
+        // set) names nothing the node could accept, and some such tokens draw an HTTP 400
+        // rather than a rejection. Treat it as the node would treat a rejected one, so it is
+        // discarded rather than kept for good.
+        let not_a_token = || SocketError::Closed {
+            code: Some(4401),
+            reason: "the saved grant is not a valid token".into(),
+        };
+        if !is_token68(token.expose()) {
+            return Err(not_a_token());
+        }
         let mut bearer: tungstenite::http::HeaderValue = format!("Bearer {}", token.expose())
             .parse()
-            // A token that can't even be sent names nothing the node could accept: treat it
-            // as the node would, so it is discarded rather than retried forever.
-            .map_err(|_| SocketError::Closed {
-                code: Some(4401),
-                reason: "the saved grant is not a valid header".into(),
-            })?;
+            .map_err(|_| not_a_token())?;
         bearer.set_sensitive(true);
         request.headers_mut().insert("Authorization", bearer);
         let (ws, _) = tungstenite::client(request, stream).map_err(|e| match e {
@@ -173,7 +179,7 @@ impl NodeSocket {
             .map_err(map_ws_error)
     }
 
-    /// When anything last arrived from the node, pongs included.
+    /// Whether anything at all has arrived on this connection.
     pub fn heard_anything(&self) -> bool {
         self.heard_anything
     }
@@ -185,13 +191,23 @@ impl NodeSocket {
     /// first gets the rejection before anything is written. Nothing else is sent before the
     /// first request, so a timeout is the normal outcome.
     pub fn read_early(&mut self, wait: Duration) -> Result<(), SocketError> {
-        self.set_read_timeout(wait)?;
-        match self.recv() {
-            Ok(_) | Err(SocketError::Timeout) => Ok(()),
-            Err(e) => Err(e),
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            self.set_read_timeout(left)?;
+            match self.recv() {
+                // Anything else that arrives first is not a rejection; keep reading for one.
+                Ok(_) => {}
+                Err(SocketError::Timeout) => return Ok(()),
+                Err(e) => return Err(e),
+            }
         }
     }
 
+    /// When anything last arrived from the node, pongs included.
     pub fn last_heard(&self) -> Instant {
         self.last_heard
     }
@@ -306,6 +322,15 @@ impl NodeSocket {
     fn streams_in_progress(&self) -> usize {
         self.chunks.len()
     }
+}
+
+/// Whether `t` is a token68 (RFC 7235): letters, digits, `-._~+/`, then optional `=` padding.
+fn is_token68(t: &str) -> bool {
+    let body = t.trim_end_matches('=');
+    !body.is_empty()
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b))
 }
 
 /// The close a token rejection announces, if this error is one.
@@ -639,10 +664,13 @@ mod tests {
     fn a_token_that_cannot_be_a_header_counts_as_rejected() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let authority = listener.local_addr().unwrap().to_string();
-        let err = match NodeSocket::connect(&authority, &GrantToken::new("bad\ntoken".into())) {
-            Err(e) => e,
-            Ok(_) => panic!("a newline cannot go in a header"),
-        };
-        assert_eq!(token_verdict(&err), TokenVerdict::Discard);
+        for bad in ["bad\ntoken", "tökén", "has space", "", "=="] {
+            let err = match NodeSocket::connect(&authority, &GrantToken::new(bad.into())) {
+                Err(e) => e,
+                Ok(_) => panic!("{bad:?} is not a bearer token"),
+            };
+            assert_eq!(token_verdict(&err), TokenVerdict::Discard, "{bad:?}");
+        }
+        assert!(is_token68("abc-DEF_123.~+/=="));
     }
 }

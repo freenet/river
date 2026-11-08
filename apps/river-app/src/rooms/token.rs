@@ -44,6 +44,7 @@ impl TokenStore {
             .write_all(token.expose().as_bytes())
             .and_then(|()| file.sync_all());
         drop(file);
+        let _lock = self.lock(dir);
         if let Err(e) = written.and_then(|()| fs::rename(&tmp, &self.path)) {
             let _ = fs::remove_file(&tmp);
             return Err(err(e));
@@ -56,6 +57,9 @@ impl TokenStore {
     /// still holds that token: another window may have saved a newer grant in the meantime,
     /// which is returned to use instead.
     pub fn discard(&self, rejected: &GrantToken) -> Option<GrantToken> {
+        // Held across the read and the delete, so a save from another window can't land
+        // between them and be deleted.
+        let _lock = self.path.parent().and_then(|dir| self.lock(dir));
         match self.load() {
             Some(t) if &t == rejected => {
                 let _ = fs::remove_file(&self.path);
@@ -64,6 +68,36 @@ impl TokenStore {
             other => other,
         }
     }
+}
+
+impl TokenStore {
+    /// An exclusive advisory lock on the token, released when dropped. `None` if it can't
+    /// be taken; the caller goes ahead unlocked, as before locking existed.
+    fn lock(&self, dir: &Path) -> Option<fs::File> {
+        let file = lock_file(&dir.join(format!(".{FILE_NAME}.lock"))).ok()?;
+        file.lock().ok()?;
+        Some(file)
+    }
+}
+
+#[cfg(unix)]
+fn lock_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn lock_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// Make the rename durable. Best effort, and only meaningful on Unix.

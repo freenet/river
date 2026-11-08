@@ -133,6 +133,8 @@ pub struct GrantPacing {
     pub pause: Duration,
     /// How long past the request's own expiry River keeps polling.
     pub margin: Duration,
+    /// How long polls may fail to reach the node before River reports it unreachable.
+    pub outage: Duration,
 }
 
 impl Default for GrantPacing {
@@ -140,6 +142,7 @@ impl Default for GrantPacing {
         GrantPacing {
             pause: REPOLL_PAUSE,
             margin: Duration::from_secs(30),
+            outage: Duration::from_secs(30),
         }
     }
 }
@@ -184,25 +187,28 @@ fn request_grant_paced(
     let deadline = now() + created.expires_in + pacing.margin;
     waiting(&created.approve_url);
     let poll = format!("{ROUTE_REQUEST}/{}", created.request_id);
-    let mut last_failure: Option<String> = None;
+    // When polls started failing to reach the node, and whether any ever did.
+    let mut failing_since: Option<Instant> = None;
+    let mut ever_failed = false;
     loop {
         if now() >= deadline {
-            // A node that stopped answering is reported as that, not as an unanswered page.
-            return match last_failure {
-                Some(e) => GrantOutcome::Unreachable(e),
-                None => GrantOutcome::Expired,
-            };
+            return GrantOutcome::Expired;
         }
         let reply = match http.get(&poll) {
             Ok(r) => {
-                last_failure = None;
+                failing_since = None;
                 r
             }
             // The node may be restarting. The request id still names the same request, so
-            // keep polling it until it expires rather than start over (which would open
-            // another page).
+            // keep polling it for a short outage rather than start over (which would open
+            // another page). A longer one is reported as the node being gone, not left on
+            // the approval screen until the request expires.
             Err(e) => {
-                last_failure = Some(e);
+                ever_failed = true;
+                let since = *failing_since.get_or_insert_with(now);
+                if now().saturating_duration_since(since) >= pacing.outage {
+                    return GrantOutcome::Unreachable(e);
+                }
                 sleep(pacing.pause);
                 continue;
             }
@@ -221,6 +227,11 @@ fn request_grant_paced(
             // grant limit, the grant not stored yet, or too many polls at once across every
             // client of the node: the request is kept, so poll again after a pause.
             (202, _) | (409, _) | (429, _) | (503, _) => sleep(pacing.pause),
+            // After the node was unreachable, an unknown request means it restarted and forgot
+            // it: that is the node's doing, not an unanswered page.
+            (404, _) if ever_failed => {
+                return GrantOutcome::Unreachable("Freenet restarted".into());
+            }
             (404, _) => return GrantOutcome::Expired,
             (status, _) => return GrantOutcome::Refused(refusal(status, &reply.body)),
         }
@@ -439,6 +450,7 @@ mod tests {
             &GrantPacing {
                 pause: Duration::ZERO,
                 margin: Duration::ZERO,
+                outage: Duration::from_secs(3600),
             },
             &mut |_| pauses += 1,
             &|| start,
@@ -699,10 +711,26 @@ mod tests {
         );
         assert_eq!(pauses(), 2);
 
-        // A node that stays gone is polled until the request expires, then reported as gone.
+        // A node that stays gone past the outage limit (60 s here, polls every 30 s) is
+        // reported as gone, not left on the approval screen until the request expires.
         let (outcome, gets) = run_clocked(Err("gone"));
         assert_eq!(outcome, GrantOutcome::Unreachable("gone".into()));
-        assert_eq!(gets, 21);
+        assert_eq!(gets, 3);
+    }
+
+    /// A node that was unreachable and then forgets the request has restarted: that is not an
+    /// unanswered page.
+    #[test]
+    fn an_unknown_request_after_an_outage_is_a_restart_not_an_expiry() {
+        let (outcome, _, _) = run(vec![
+            Ok((200, CREATED)),
+            Err("reset"),
+            Ok((404, r#"{"error":"unknown or expired request"}"#)),
+        ]);
+        assert!(
+            matches!(outcome, GrantOutcome::Unreachable(_)),
+            "{outcome:?}"
+        );
     }
 
     #[test]
@@ -752,6 +780,7 @@ mod tests {
             &GrantPacing {
                 pause: Duration::from_secs(30),
                 margin: Duration::from_secs(30),
+                outage: Duration::from_secs(60),
             },
             &mut |d| clock.set(clock.get() + d),
             &|| clock.get(),

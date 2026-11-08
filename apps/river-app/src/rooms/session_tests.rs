@@ -507,6 +507,8 @@ struct World {
     drop_live: bool,
     /// Stop reading on the newest connection, so pings go unanswered.
     stall_live: bool,
+    /// How many grant requests to answer "node not ready" before taking one.
+    grant_not_ready: usize,
     on_connect: Option<OnConnect>,
 }
 
@@ -609,7 +611,15 @@ fn fake_node(plays: Vec<Play>) -> FakeNode {
                     parts.next().unwrap_or("")
                 );
                 world.lock().unwrap().http.push(call.clone());
-                let (status, body) = if call.starts_with("POST /v1/app-grants/request") {
+                let not_ready = call.starts_with("POST /v1/app-grants/request") && {
+                    let mut w = world.lock().unwrap();
+                    let n = w.grant_not_ready;
+                    w.grant_not_ready = n.saturating_sub(1);
+                    n > 0
+                };
+                let (status, body) = if not_ready {
+                    (503, r#"{"error":"node not ready"}"#.to_owned())
+                } else if call.starts_with("POST /v1/app-grants/request") {
                     (
                         200,
                         format!(
@@ -802,6 +812,7 @@ fn quick() -> Pace {
         grant: GrantPacing {
             pause: Duration::ZERO,
             margin: Duration::ZERO,
+            outage: Duration::from_secs(60),
         },
     }
 }
@@ -903,7 +914,15 @@ impl Drop for Running {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            // The session notices `stop` within a tick or a pause; don't hang a failing test
+            // on one that doesn't.
+            let deadline = Instant::now() + PATIENCE;
+            while !h.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -951,6 +970,9 @@ fn a_saved_token_the_node_rejects_is_discarded_and_nothing_is_reopened() {
 
 /// The node sends the rejection and drops the connection before reading anything. Writing
 /// first would draw a reset, which on Windows discards the rejection; reading first gets it.
+///
+/// Only Windows loses data to a reset, so on Linux and macOS this passes with or without the
+/// read-first fix: it guards the fix only on the Windows CI job (`other-platforms`).
 #[test]
 fn a_rejection_the_node_drops_the_connection_after_is_still_read() {
     let node = fake_node(vec![Play::RejectThenDrop("AUTH_TOKEN_INVALID", 4401)]);
@@ -1233,8 +1255,17 @@ fn an_unanswered_ping_ends_the_connection() {
     };
     let (session, _dir) = following(&node, &[&a], "pong", pace);
     // The node stops reading: no pong, and no error either. Only the pong deadline notices.
-    node.with(|w| w.stall_live = true);
-    session.wait_until("a reconnect", || node.with(|w| w.connections.len() >= 2));
+    // Count from the stall, so an unrelated earlier reconnect can't pass the test.
+    let before = node.with(|w| {
+        w.stall_live = true;
+        w.connections.len()
+    });
+    let stalled = Instant::now();
+    session.wait_until("a reconnect", || {
+        node.with(|w| w.connections.len() > before)
+    });
+    // The idle check (50 ms) and the pong deadline (100 ms) both had to pass.
+    assert!(stalled.elapsed() >= Duration::from_millis(150));
     node.with(|w| w.stall_live = false);
 }
 
@@ -1268,4 +1299,107 @@ fn the_backoff_starts_over_only_after_a_stable_connection() {
         gap < Duration::from_secs(1),
         "the backoff did not start over: {gap:?}"
     );
+}
+
+/// A node that answers grant requests "not ready" while it starts: River keeps asking,
+/// with backoff, and goes on once the node takes the request.
+#[test]
+fn a_node_not_ready_for_grants_is_asked_again_until_it_is() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| {
+        w.add_room(&a);
+        // More than one request's own retries, so the session's backoff retry is needed.
+        w.grant_not_ready = 8;
+    });
+    let dir = temp_dir("grant-not-ready");
+    let session = Running::start(&node, &dir, quick());
+    session.wait_rooms("the rooms are live", |r, _, s| {
+        r.len() == 1 && s == LinkStatus::Live
+    });
+    node.with(|w| {
+        assert_eq!(w.grant_not_ready, 0);
+        assert_eq!(w.bearers, ["fresh-token"]);
+    });
+    assert_eq!(saved(&dir), Some(GrantToken::new("fresh-token".into())));
+}
+
+/// An ask that goes unanswered after the list is live is still timed out, named and
+/// asked again; and a room that leaves the list is no longer asked for.
+#[test]
+fn late_asks_time_out_and_left_rooms_are_not_asked_for() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let pace = Pace {
+        catch_up: Duration::from_millis(100),
+        resubscribe_first: Duration::from_millis(20),
+        resubscribe_max: Duration::from_millis(20),
+        refresh: Duration::from_millis(30),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a, &b], "late-asks", pace);
+    // B starts finding nothing, then stops answering at all: its asks time out.
+    node.with(|w| w.contracts.get_mut(&b.id()).unwrap().1 = Contract::NotFound);
+    let notification: Result<HostResponse, ClientError> =
+        Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+            instance_id: b.id(),
+        }));
+    node.with(|w| {
+        w.push.push(Message::Binary(
+            bincode::serialize(&notification).unwrap().into(),
+        ))
+    });
+    session.wait_rooms("B is named", |_, issues, _| issues.not_following == ["B"]);
+    node.with(|w| {
+        w.contracts.remove(&b.id());
+    });
+    let asked = node.with(|w| w.subscribes_to(b.id()));
+    session.wait_until("B is asked again after unanswered asks time out", || {
+        node.with(|w| w.subscribes_to(b.id()) >= asked + 2)
+    });
+    // B is left: it drops off the list and is no longer asked for.
+    node.with(|w| {
+        w.slots
+            .insert(room_storage_key(&b.vk()), cbor(&Slot::Tombstone))
+    });
+    session.wait_rooms("B is gone", |r, issues, _| {
+        names(r) == ["A"] && issues.not_following.is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let asked = node.with(|w| w.subscribes_to(b.id()));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(node.with(|w| w.subscribes_to(b.id())), asked);
+}
+
+/// A notification shows the room is followed, even if its ask was counted as failed.
+#[test]
+fn a_notification_marks_the_room_followed() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| {
+        w.add_room(&a);
+        w.contracts.get_mut(&a.id()).unwrap().1 = Contract::NotFound;
+    });
+    let dir = temp_dir("notification-follows");
+    save_token(&dir, "kept-token");
+    let session = Running::start(&node, &dir, quick());
+    session.wait_rooms("A is named", |_, issues, _| issues.not_following == ["A"]);
+    let delta = ChatRoomStateV1Delta {
+        recent_messages: Some(vec![message(&a.owner, SystemTime::now(), "hello")]),
+        ..Default::default()
+    };
+    let note: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateNotification {
+            key: a.key,
+            update: UpdateData::Delta(cbor(&delta).into()),
+        },
+    ));
+    node.with(|w| {
+        w.push
+            .push(Message::Binary(bincode::serialize(&note).unwrap().into()))
+    });
+    session.wait_rooms("A is followed", |_, issues, _| {
+        issues.not_following.is_empty()
+    });
 }
