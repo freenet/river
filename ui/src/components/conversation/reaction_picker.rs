@@ -24,7 +24,9 @@
 //! pinch) still reach the browser, and keyboard zoom is never touched. Only
 //! those input events are held: arrivals, following, the end hold and reads go
 //! on underneath (history-scrolling.md). Closing lets go of all of it at once,
-//! a finger the picker captured included.
+//! a finger the picker captured included. Once its React has left the
+//! history's view (arrivals followed past it, or the conversation was hidden),
+//! the reader's next wheel or drag closes the picker and scrolls instead.
 //!
 //! The picker is a native popover or nothing: there is no fallback picker. A
 //! browser without the Popover API ([`popover_supported`]) gets a disabled
@@ -627,6 +629,27 @@ mod dom {
         picker().is_some_and(|p| p.matches(":popover-open").unwrap_or(false))
     }
 
+    /// Whether the React the picker hangs from is out of the reader's sight:
+    /// gone, not laid out (its conversation hidden), or with no part inside
+    /// the history's visible box.
+    fn anchor_out_of_view() -> bool {
+        let Some(anchor) = ANCHORED.with(|a| a.borrow().clone()) else {
+            return true;
+        };
+        let Some(history) = document().and_then(|d| d.get_element_by_id("chat-scroll-container"))
+        else {
+            return true;
+        };
+        let a = anchor.get_bounding_client_rect();
+        let h = history.get_bounding_client_rect();
+        a.width() <= 0.0
+            || a.height() <= 0.0
+            || a.bottom() <= h.top()
+            || a.top() >= h.bottom()
+            || a.right() <= h.left()
+            || a.left() >= h.right()
+    }
+
     pub(super) fn hide_picker() {
         if let Some(p) = picker() {
             if p.matches(":popover-open").unwrap_or(false) {
@@ -924,6 +947,14 @@ mod dom {
         // A listener left attached after the picker closed (its removal
         // failed) holds nothing: no input is cancelled, nothing captured.
         if !is_open() {
+            return;
+        }
+        // A picker whose React has left the history's view (arrivals pushed
+        // it out, or the conversation was hidden) is closed by the reader's
+        // next scroll, and that scroll goes through. Holding it would leave
+        // the reader unable to scroll back to a picker they cannot see.
+        if matches!(kind.as_str(), "wheel" | "touchmove") && anchor_out_of_view() {
+            hide_picker();
             return;
         }
         match kind.as_str() {
