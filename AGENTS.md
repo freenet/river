@@ -223,14 +223,17 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
 
 - `apps/river-app`: the UI and setup state machine, shared by every platform.
   Once setup connects it reads the user's rooms from the local node
-  (`src/rooms/`), read-only: it asks the node for the River web app's identity
-  through a user-approved app grant (freenet-core v0.2.156+), reads the rooms
-  the web UI stored in the chat delegate, and subscribes to each room contract.
-  It never PUTs, sends an UPDATE or writes delegate storage. The chat screen
+  (`src/rooms/`): it asks the node for the River web app's identity through a
+  user-approved app grant (freenet-core v0.2.156+), reads the rooms the web UI
+  stored in the chat delegate, and subscribes to each room contract. In a room
+  the user can send in it sends messages, replies, edits and deletions of the
+  user's own messages, and reactions, each as a room contract UPDATE built and
+  signed as the web UI does (`src/rooms/outbox.rs`). It never PUTs, never
+  creates, joins or invites, and never writes delegate storage. The chat screen
   (`src/chat/`) shows them; snapshots and tests use built-in example data
   (`chat::Source::Example`). Its colours and sizes follow the web UI in `ui/`.
   It depends on `river-core` (`common/`) by path, with the client-only
-  features `ecies`, `mentions` and `stored-rooms`, so a change under `common/`
+  features `ecies-randomized`, `mentions` and `stored-rooms`, so a change under `common/`
   (or to the root `Cargo.toml`, which river-core inherits versions from) runs
   `apps.yml`. It compiles in two `ui/` files with `include_bytes!`: the logo
   `ui/assets/river_logo.svg` and the chat delegate
