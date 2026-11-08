@@ -866,4 +866,69 @@ mod state_tests {
         assert!(!chat.send());
         assert_eq!(chat.room().unwrap().messages.len(), before);
     }
+
+    fn done(id: u64, room: &str) -> Vec<WorkView> {
+        vec![WorkView {
+            id,
+            what: String::new(),
+            state: WorkState::Done { room: room.into() },
+        }]
+    }
+
+    #[test]
+    fn a_room_just_created_or_joined_opens_once_it_is_in_the_list_and_only_once() {
+        let target = example::PRIVATE_ROOM;
+        let without: Vec<Room> = example::data()
+            .rooms
+            .into_iter()
+            .filter(|r| r.key != target)
+            .collect();
+        let mut chat = Chat::new(Source::Node(LinkStatus::Live), Vec::new(), 0, 0, 0);
+        chat.show_node_rooms(without.clone(), None, LinkStatus::Live, 0);
+        let first = chat.room().unwrap().key.clone();
+        // Finished before the list has it: opens when it arrives.
+        chat.show_work(done(1, target));
+        assert_eq!(chat.room().unwrap().key, first);
+        chat.show_node_rooms(example::data().rooms, None, LinkStatus::Live, 0);
+        assert_eq!(chat.room().unwrap().key, target);
+        // The same report again does not take the user back to it.
+        chat.select(&first);
+        chat.show_work(done(1, target));
+        chat.show_node_rooms(example::data().rooms, None, LinkStatus::Live, 0);
+        assert_eq!(chat.room().unwrap().key, first);
+        // Finished with the room already listed: opens at once.
+        chat.show_work(done(2, target));
+        assert_eq!(chat.room().unwrap().key, target);
+    }
+
+    #[test]
+    fn example_rooms_cannot_be_created_joined_or_invited_to() {
+        let mut chat = Chat::example();
+        chat.open_dialog(DialogKind::Create);
+        assert!(chat.form.open.is_none());
+        chat.invite();
+        assert!(chat.outgoing.is_empty() && chat.invite.is_none());
+    }
+
+    #[test]
+    fn an_invitation_shows_only_in_the_room_it_was_made_for() {
+        let mut chat = Chat::new(
+            Source::Node(LinkStatus::Live),
+            example::data().rooms,
+            0,
+            0,
+            0,
+        );
+        let open = chat.room().unwrap().key.clone();
+        chat.invite();
+        assert_eq!(chat.open_invite(), Some(&InviteState::Making));
+        assert!(chat.invitation_made(open.clone(), Ok("link".into())));
+        assert_eq!(
+            chat.open_invite(),
+            Some(&InviteState::Copied("link".into()))
+        );
+        chat.select(example::PRIVATE_ROOM);
+        assert_eq!(chat.open_invite(), None);
+        assert!(!chat.invitation_made(open, Err("no".into())));
+    }
 }

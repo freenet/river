@@ -1002,4 +1002,203 @@ mod tests {
         let rt = render(Setup::Installing(downloading(50, Some(100))));
         assert!(rt.find("progress-detail").is_some());
     }
+
+    /// The node's rooms, in a window wide enough for the members panel, on a test clipboard.
+    fn node_rooms(board: &rune::clipboard::MemoryClipboard) -> Runtime<RiverApp> {
+        let mut state = RiverApp::detached();
+        state.setup = Setup::Connected {
+            version: "0.2.156".into(),
+        };
+        state.access = Access::Connecting;
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (1280.0, 800.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.use_clipboard(board);
+        rt.frame(0.0);
+        let rooms = chat::example::data().rooms;
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Rooms {
+                    rooms,
+                    open: None,
+                    status: chat::LinkStatus::Live,
+                    now: 29_000_000,
+                    issues: Default::default(),
+                    work: Vec::new(),
+                },
+                tx,
+            );
+            s.apply_rooms(RoomsUpdate::Access(Access::Ready), tx);
+        });
+        settle(&mut rt);
+        rt
+    }
+
+    /// Run frames until motion has stopped, so what is found is where it stays.
+    fn settle(rt: &mut Runtime<RiverApp>) {
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    fn press(rt: &mut Runtime<RiverApp>, key: &str) {
+        let (x, y) = rt.find(key).unwrap_or_else(|| panic!("no {key}"));
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        settle(rt);
+    }
+
+    #[test]
+    fn the_create_dialog_says_what_is_wrong_and_sends_what_is_right() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "create-room");
+        assert!(rt.find("create-room-dialog").is_some());
+        // No name: said in the dialog, nothing sent.
+        press(&mut rt, "form-submit");
+        assert!(rt.find("form-error").is_some());
+        assert!(rt.state.chat.outgoing.is_empty());
+        rt.update(|s, _| {
+            s.chat.form.name.replace_text("Book club");
+            s.chat.form.nickname.replace_text("Ada");
+            s.chat.form.private = true;
+        });
+        press(&mut rt, "form-submit");
+        assert!(rt.find("create-room-dialog").is_none(), "the dialog closes");
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: String::new(),
+                action: rooms::Action::CreateRoom {
+                    name: "Book club".into(),
+                    nickname: "Ada".into(),
+                    private: true,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn the_join_dialog_takes_a_pasted_link_and_refuses_what_is_not_an_invite() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        assert!(rt.find("join-room-dialog").is_some());
+        rt.update(|s, _| {
+            s.chat.form.code.replace_text("not an invite");
+            s.chat.form.nickname.replace_text("Bea");
+        });
+        press(&mut rt, "form-submit");
+        assert!(rt.find("form-error").is_some());
+        assert!(rt.state.chat.outgoing.is_empty());
+        let plan = rooms::create::new_room(
+            ed25519_dalek::SigningKey::from_bytes(&[3; 32]),
+            "Room",
+            "Olive",
+            false,
+        )
+        .unwrap();
+        let room = rooms::room::LiveRoom::new(rooms::work::stored(&plan.room));
+        let (_, link) = rooms::create::invitation(&room, "http://x/").unwrap();
+        let code = link.split_once("?invitation=").unwrap().1.to_owned();
+        let pasted = link.clone();
+        rt.update(move |s, _| s.chat.form.code.replace_text(&pasted));
+        press(&mut rt, "form-submit");
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: String::new(),
+                action: rooms::Action::Join {
+                    code,
+                    nickname: "Bea".into(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn inviting_copies_the_link_and_a_failure_is_said() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let open = rt.state.chat.room().unwrap().key.clone();
+        press(&mut rt, "invite");
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: open.clone(),
+                action: rooms::Action::Invite,
+            }]
+        );
+        assert!(rt.find("invite-status").is_some(), "says it is making one");
+        let room = open.clone();
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Invite {
+                    room,
+                    link: Ok("http://x/?invitation=abc".into()),
+                },
+                tx,
+            )
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(
+            board.text().as_deref().map(String::as_str),
+            Some("http://x/?invitation=abc")
+        );
+        assert!(rt.find("invite-link").is_some());
+        let room = open.clone();
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Invite {
+                    room,
+                    link: Err("This computer doesn't hold your key".into()),
+                },
+                tx,
+            )
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("invite-link").is_none());
+        assert!(rt.find("invite-status").is_some());
+    }
+
+    #[test]
+    fn a_failed_create_shows_why_with_try_again_and_dismiss() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| {
+            s.chat.show_work(vec![rooms::work::WorkView {
+                id: 4,
+                what: "Creating “Book club”".into(),
+                state: rooms::work::WorkState::Failed {
+                    why: "River's storage refused".into(),
+                    retry: true,
+                },
+            }])
+        });
+        settle(&mut rt);
+        assert!(rt.find("work-why").is_some());
+        press(&mut rt, "work-retry-4");
+        press(&mut rt, "work-dismiss-4");
+        let actions: Vec<_> = rt
+            .state
+            .chat
+            .outgoing
+            .iter()
+            .map(|c| c.action.clone())
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                rooms::Action::RetryWork { id: 4 },
+                rooms::Action::DismissWork { id: 4 }
+            ]
+        );
+        assert!(rt.find("work-why").is_none(), "dismissed at once");
+    }
 }

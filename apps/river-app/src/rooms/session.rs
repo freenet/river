@@ -631,10 +631,9 @@ fn follow_on(
             .outbox
             .work
             .next_request(reload.is_some(), Instant::now())
+            && let Err(e) = socket.send(&request)
         {
-            if let Err(e) = socket.send(&request) {
-                return e;
-            }
+            return e;
         }
         // Read the stored rooms again now and then, for rooms joined or left elsewhere.
         if let Some((_, started)) = &reload
@@ -696,8 +695,8 @@ fn follow_on(
                 changed |= rooms.following(key.id(), true);
                 changed |= rooms.apply_update(key.id(), &update);
             }
-            // The network has no copy. The web UI would seed one with a PUT; this app only
-            // reads, so it keeps showing the stored copy and asks again later.
+            // The network has no copy. The web UI would seed one with a PUT; this app PUTs only
+            // a room it has just created, so it keeps showing the stored copy and asks again.
             Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
                 instance_id,
             }))) => {

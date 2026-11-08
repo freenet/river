@@ -87,7 +87,7 @@ fn params_bytes(owner: &VerifyingKey) -> Vec<u8> {
 pub fn contract_key(owner: &VerifyingKey) -> ContractKey {
     ContractKey::from_params_and_code(
         Parameters::from(params_bytes(owner)),
-        &ContractCode::from(ROOM_CONTRACT_WASM),
+        ContractCode::from(ROOM_CONTRACT_WASM),
     )
 }
 

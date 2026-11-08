@@ -50,7 +50,7 @@
 //! room here does not show stays unconfirmed, with why, and is never sent again from here. A
 //! send not taken stays on screen marked "Not sent" with Retry and Discard; an edit, deletion
 //! or reaction not taken is said above the composer. Whatever the network later brings in with these messages' ids counts as sent, whatever the
-//! answer was. Nothing here writes the chat delegate's storage, so the web UI's
+//! answer was. Sending writes nothing to the chat delegate's storage, so the web UI's
 //! after-send bookkeeping (its read position, its stored copy of the room) is not done: the
 //! web UI picks the message up from the network.
 //!

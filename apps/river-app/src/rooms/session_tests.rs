@@ -1,13 +1,14 @@
 use super::*;
 use crate::rooms::outbox::{Action, Outbox};
 use crate::rooms::room::message_key;
+use crate::rooms::work::WorkState;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
     ApplicationMessage, CodeHash, ContractCode, ContractKey, InboundDelegateMsg,
     OutboundDelegateMsg, Parameters, State, StateDelta, WrappedState,
 };
-use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg};
+use river_core::chat_delegate::{CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg};
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::MemberId;
@@ -513,6 +514,10 @@ enum Contract {
 }
 
 type OnConnect = Box<dyn FnMut(usize) + Send>;
+/// Runs before the fake chat delegate takes a CAS store, with the key: another writer (the web
+/// UI) can store first.
+type BeforeCas =
+    Box<dyn FnMut(&mut BTreeMap<Vec<u8>, Vec<u8>>, &mut HashMap<Vec<u8>, u64>, &[u8]) + Send>;
 
 /// Everything the fake node knows and records. Tests change it while the session runs.
 #[derive(Default)]
@@ -542,6 +547,19 @@ struct World {
     updates: Vec<(ContractKey, ChatRoomStateV1Delta)>,
     /// How UPDATEs are answered.
     update_play: UpdatePlay,
+    /// Each delegate key's generation (absent is 0), as the chat delegate keeps it.
+    generations: HashMap<Vec<u8>, u64>,
+    before_cas: Option<BeforeCas>,
+    /// Every CAS store: the key and whether it was taken.
+    cas: Vec<(Vec<u8>, bool)>,
+    /// Every PUT received: the contract.
+    puts: Vec<ContractKey>,
+    /// Take the next CAS store of a room key, but answer nothing (then clear this).
+    silence_first_room_store: bool,
+    /// The reads the last listing's reader still has to make.
+    reads_due: usize,
+    /// Versioned reads and CAS stores that arrived while a reader was still reading.
+    overlaps: usize,
 }
 
 /// How the fake node answers an UPDATE.
@@ -790,8 +808,29 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                 };
                 let read: ChatDelegateRequestMsg =
                     ciborium::de::from_reader(m.payload.as_slice()).unwrap();
-                if matches!(read, ChatDelegateRequestMsg::ListRequest) {
-                    w.lists += 1;
+                match &read {
+                    ChatDelegateRequestMsg::ListRequest => {
+                        w.lists += 1;
+                        // The reader gets every room key and the meta it is told of.
+                        w.reads_due = w
+                            .slots
+                            .keys()
+                            .filter(|k| {
+                                parse_room_storage_key(k).is_some()
+                                    || k.as_slice() == ROOMS_META_KEY
+                            })
+                            .count();
+                    }
+                    ChatDelegateRequestMsg::GetRequest { .. } => {
+                        w.reads_due = w.reads_due.saturating_sub(1)
+                    }
+                    ChatDelegateRequestMsg::GetVersionedRequest { .. }
+                    | ChatDelegateRequestMsg::CasStoreRequest { .. }
+                        if w.reads_due > 0 =>
+                    {
+                        w.overlaps += 1
+                    }
+                    _ => {}
                 }
                 if w.delegate_missing {
                     out.push(encode(Err(missing_delegate())));
@@ -807,7 +846,53 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                             key,
                         }
                     }
-                    other => panic!("the app must only read, but sent {other:?}"),
+                    ChatDelegateRequestMsg::GetVersionedRequest { key } => {
+                        ChatDelegateResponseMsg::GetVersionedResponse {
+                            value: w.slots.get(key.as_bytes()).cloned(),
+                            generation: w.generations.get(key.as_bytes()).copied().unwrap_or(0),
+                            key,
+                        }
+                    }
+                    // The chat delegate's compare-and-swap (`handle_cas_store_request`).
+                    ChatDelegateRequestMsg::CasStoreRequest {
+                        key,
+                        value,
+                        expected_generation,
+                    } => {
+                        if let Some(mut hook) = w.before_cas.take() {
+                            let World {
+                                slots, generations, ..
+                            } = &mut *w;
+                            hook(slots, generations, key.as_bytes());
+                            w.before_cas = Some(hook);
+                        }
+                        let current = w.generations.get(key.as_bytes()).copied().unwrap_or(0);
+                        let taken = current == expected_generation;
+                        w.cas.push((key.as_bytes().to_vec(), taken));
+                        if w.silence_first_room_store
+                            && taken
+                            && parse_room_storage_key(key.as_bytes()).is_some()
+                        {
+                            w.silence_first_room_store = false;
+                            w.slots.insert(key.as_bytes().to_vec(), value);
+                            w.generations.insert(key.as_bytes().to_vec(), current + 1);
+                            continue;
+                        }
+                        let result = if taken {
+                            w.slots.insert(key.as_bytes().to_vec(), value);
+                            w.generations.insert(key.as_bytes().to_vec(), current + 1);
+                            CasStoreResult::Stored {
+                                generation: current + 1,
+                            }
+                        } else {
+                            CasStoreResult::Conflict {
+                                current_generation: current,
+                                current_value: w.slots.get(key.as_bytes()).cloned(),
+                            }
+                        };
+                        ChatDelegateResponseMsg::CasStoreResponse { key, result }
+                    }
+                    other => panic!("the app must only read and CAS-store, but sent {other:?}"),
                 };
                 out.push(encode(Ok(HostResponse::DelegateResponse {
                     key: delegate::chat_delegate_key().clone(),
@@ -833,7 +918,7 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                 None => {}
             }
         }
-        // The one write the app makes: a room contract UPDATE carrying a delta.
+        // A room contract UPDATE carrying a delta.
         ClientRequest::ContractOp(ContractRequest::Update {
             key,
             data: UpdateData::Delta(delta),
@@ -857,7 +942,19 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                 UpdatePlay::Ignore => {}
             }
         }
-        other => panic!("the app must only read and UPDATE with a delta, but sent {other:?}"),
+        // The seed PUT of a room just created: the network now holds it.
+        ClientRequest::ContractOp(ContractRequest::Put {
+            contract, state, ..
+        }) => {
+            let key = contract.key();
+            w.puts.push(key);
+            w.contracts
+                .insert(*key.id(), (key, Contract::State(state.as_ref().to_vec())));
+            out.push(encode(Ok(HostResponse::ContractResponse(
+                ContractResponse::PutResponse { key },
+            ))));
+        }
+        other => panic!("the app must only read, PUT and UPDATE with a delta, but sent {other:?}"),
     }
     out
 }
@@ -2232,4 +2329,412 @@ fn an_answer_owed_too_long_reconnects_and_resends_then_gives_up() {
     assert!(
         node.with(|w| w.connections.len()) as u32 >= super::super::outbox::MAX_FORCED_RECONNECTS
     );
+}
+
+// Creating, joining and inviting ---------------------------------------------------------------
+
+impl Running {
+    /// Something about the room list, as the chat screen sends it (its `room` is empty).
+    fn list(&self, action: Action) {
+        self.commands
+            .send(Command {
+                room: String::new(),
+                action,
+            })
+            .unwrap();
+    }
+
+    fn last_work(&self) -> Vec<WorkView> {
+        self.updates()
+            .into_iter()
+            .rev()
+            .find_map(|u| match u {
+                RoomsUpdate::Rooms { work, .. } => Some(work),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn invites(&self) -> Vec<(String, Result<String, String>)> {
+        self.updates()
+            .into_iter()
+            .filter_map(|u| match u {
+                RoomsUpdate::Invite { room, link } => Some((room, link)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// A `rooms_meta` as a web UI wrote it: a field this app does not know, and room `open` open.
+fn web_ui_meta(open: VerifyingKey, marker: u32) -> Vec<u8> {
+    use ciborium::Value;
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(
+        &Value::Map(vec![
+            (
+                Value::Text("current_room_key".into()),
+                Value::serialized(&open).unwrap(),
+            ),
+            (Value::Text("web_ui_marker".into()), Value::from(marker)),
+        ]),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+fn meta_marker(bytes: &[u8]) -> Option<u32> {
+    let value: ciborium::Value = ciborium::de::from_reader(bytes).ok()?;
+    value.as_map()?.iter().find_map(|(k, v)| {
+        (k.as_text() == Some("web_ui_marker"))
+            .then(|| v.as_integer().and_then(|i| u32::try_from(i).ok()))?
+    })
+}
+
+/// The stored rooms other than `known`, decoded.
+fn stored_besides(w: &World, known: &[VerifyingKey]) -> Vec<StoredRoom> {
+    w.slots
+        .iter()
+        .filter_map(|(k, v)| {
+            let vk = parse_room_storage_key(k)?;
+            if known.contains(&vk) {
+                return None;
+            }
+            match decode_room_slot(v).ok()? {
+                StoredRoomSlot::Present(r) => Some(*r),
+                StoredRoomSlot::Tombstone => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_room_created_here_is_stored_published_and_opened() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| {
+        w.slots
+            .insert(ROOMS_META_KEY.to_vec(), web_ui_meta(a.vk(), 7));
+    });
+    let (session, _dir) = following(&node, &[&a], "create", quick());
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: true,
+    });
+    session.wait_rooms("the new room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club")
+    });
+    let created = node.with(|w| {
+        let created = stored_besides(w, &[a.vk()]);
+        assert_eq!(created.len(), 1);
+        let room = created[0].clone();
+        // Published once, under the new room's own contract, which is the web UI's key for it.
+        assert_eq!(w.puts, [room.contract_key]);
+        assert_eq!(
+            room.contract_key,
+            super::super::create::contract_key(&room.owner_vk)
+        );
+        assert_eq!(room.self_verifying_key(), Some(room.owner_vk));
+        // The web UI opens it next, and nothing else it stored in the meta was lost.
+        let meta = w.slots.get(ROOMS_META_KEY).unwrap();
+        assert_eq!(
+            decode_rooms_meta(meta).unwrap().current_room_key,
+            Some(room.owner_vk)
+        );
+        assert_eq!(meta_marker(meta), Some(7));
+        // Every write was a CAS store that was taken: one for the room, one for the meta.
+        assert_eq!(w.cas.iter().filter(|(_, ok)| *ok).count(), 2);
+        assert_eq!(w.overlaps, 0);
+        room
+    });
+    // Shown as the owner, private, and opened by the screen once (the task said it is done).
+    let (rooms, _, _) = session.last_rooms().unwrap();
+    let shown = rooms.iter().find(|r| r.name == "Book club").unwrap();
+    assert!(shown.private);
+    assert_eq!(
+        shown.key,
+        bs58::encode(created.owner_vk.to_bytes()).into_string()
+    );
+    assert!(session.updates().iter().any(|u| matches!(
+        u,
+        RoomsUpdate::Rooms { work, .. }
+            if work.iter().any(|w| w.state == WorkState::Done { room: shown.key.clone() })
+    )));
+    session.wait_until("the finished task is dropped", || {
+        session.last_work().is_empty()
+    });
+}
+
+/// The web UI stores the meta between this app's read and its store: the store is refused, and
+/// this app reads again and stores what the web UI stored with only the open room changed.
+#[test]
+fn a_meta_the_web_ui_changed_meanwhile_is_read_again_not_overwritten() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let open = a.vk();
+    node.with(|w| {
+        w.slots
+            .insert(ROOMS_META_KEY.to_vec(), web_ui_meta(open, 1));
+        let mut once = true;
+        w.before_cas = Some(Box::new(move |slots, generations, key| {
+            if key == ROOMS_META_KEY && std::mem::take(&mut once) {
+                slots.insert(ROOMS_META_KEY.to_vec(), web_ui_meta(open, 2));
+                *generations.entry(key.to_vec()).or_default() += 1;
+            }
+        }));
+    });
+    let (session, _dir) = following(&node, &[&a], "create-conflict", quick());
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_rooms("the new room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club")
+    });
+    node.with(|w| {
+        let meta_stores: Vec<bool> = w
+            .cas
+            .iter()
+            .filter(|(k, _)| k.as_slice() == ROOMS_META_KEY)
+            .map(|(_, ok)| *ok)
+            .collect();
+        assert_eq!(meta_stores, [false, true], "refused once, then taken");
+        let meta = w.slots.get(ROOMS_META_KEY).unwrap();
+        assert_eq!(meta_marker(meta), Some(2), "the web UI's write is kept");
+        let created = stored_besides(w, &[a.vk()]);
+        assert_eq!(
+            decode_rooms_meta(meta).unwrap().current_room_key,
+            Some(created[0].owner_vk)
+        );
+    });
+}
+
+/// The web UI stores a room under the same key first (it cannot happen for a fresh key, but a
+/// join can meet it): never overwritten, and the user is told.
+#[test]
+fn a_room_the_web_ui_stored_first_is_never_overwritten() {
+    let node = fake_node(vec![]);
+    let room = TestRoom::new(3, "Theirs", 1, &["t1"]);
+    // An invitation into `room`, which the web UI then joins with a different key first.
+    let inviter = LiveRoom::new(room.stored());
+    let (_, link) = super::super::create::invitation(&inviter, "http://x/").unwrap();
+    let real = super::super::create::contract_key(&room.vk());
+    let slot = room_storage_key(&room.vk());
+    let web_ui_copy = room.slot();
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&room.state))));
+        let copy = web_ui_copy.clone();
+        let key = slot.clone();
+        w.before_cas = Some(Box::new(move |slots, generations, k| {
+            if k == key.as_slice() && !slots.contains_key(&key) {
+                slots.insert(key.clone(), copy.clone());
+                *generations.entry(key.clone()).or_default() += 1;
+            }
+        }));
+    });
+    let other = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&other], "join-raced", quick());
+    session.list(Action::Join {
+        code: link,
+        nickname: "Bea".into(),
+    });
+    session.wait_until("the join is refused", || {
+        session.last_work().iter().any(|w| {
+            matches!(&w.state, WorkState::Failed { why, retry: true } if why.contains("already"))
+        })
+    });
+    node.with(|w| {
+        assert_eq!(
+            w.slots.get(&slot),
+            Some(&web_ui_copy),
+            "the web UI's copy stands"
+        );
+        assert!(w.updates.is_empty(), "no join was sent");
+        assert!(w.puts.is_empty());
+    });
+}
+
+#[test]
+fn joining_from_an_invitation_stores_the_room_sends_the_join_and_shows_it() {
+    let node = fake_node(vec![]);
+    let room = TestRoom::new(3, "Garden", 1, &["t1"]);
+    let inviter = LiveRoom::new(room.stored());
+    let (inv, link) = super::super::create::invitation(&inviter, "http://x/").unwrap();
+    let real = super::super::create::contract_key(&room.vk());
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&room.state))));
+        // The user left this room once: its key holds a tombstone.
+        w.slots
+            .insert(room_storage_key(&room.vk()), cbor(&Slot::Tombstone));
+    });
+    let other = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&other], "join", quick());
+    // As pasted: the whole link.
+    session.list(Action::Join {
+        code: format!("  {link}\n"),
+        nickname: "Bea".into(),
+    });
+    session.wait_rooms("the joined room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Garden")
+    });
+    let me = inv.invitee_signing_key.verifying_key();
+    node.with(|w| {
+        let StoredRoomSlot::Present(stored) =
+            decode_room_slot(&w.slots[&room_storage_key(&room.vk())]).unwrap()
+        else {
+            panic!("the tombstone was replaced by the room");
+        };
+        assert_eq!(stored.self_verifying_key(), Some(me));
+        assert_eq!(stored.contract_key, real);
+        assert_eq!(stored.self_nickname.as_deref(), Some("Bea"));
+        // One UPDATE to the room, adding the invitee; no PUT.
+        assert!(w.puts.is_empty());
+        assert_eq!(w.updates.len(), 1);
+        let (key, delta) = &w.updates[0];
+        assert_eq!(*key, real);
+        assert_eq!(
+            delta.members.as_ref().unwrap().added()[0].member.member_vk,
+            me
+        );
+        assert_eq!(w.overlaps, 0);
+    });
+    let (rooms, _, _) = session.last_rooms().unwrap();
+    let garden = rooms.iter().find(|r| r.name == "Garden").unwrap();
+    assert!(
+        garden
+            .members
+            .iter()
+            .any(|m| m.id == garden.me && m.nickname == "Bea")
+    );
+    assert!(garden.send_block.is_none());
+}
+
+#[test]
+fn a_failed_create_is_said_and_try_again_finishes_it() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "create-fails", quick());
+    // The store refuses the first write.
+    node.with(|w| w.delegate_missing = true);
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_until("the failure is shown", || {
+        session
+            .last_work()
+            .iter()
+            .any(|w| matches!(&w.state, WorkState::Failed { retry: true, .. }))
+    });
+    let id = session.last_work()[0].id;
+    assert!(
+        node.with(|w| w.puts.is_empty()),
+        "nothing published before it is stored"
+    );
+    node.with(|w| w.delegate_missing = false);
+    session.list(Action::RetryWork { id });
+    session.wait_rooms("the room is created", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club")
+    });
+    assert_eq!(node.with(|w| w.puts.len()), 1);
+}
+
+/// A store whose answer never comes: the connection is dropped (so the answer can't arrive
+/// late and be taken for another), and on the next one the room is found already stored and
+/// the create goes on without storing it twice.
+#[test]
+fn an_unanswered_store_reconnects_and_the_create_goes_on() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        delegate_deadline: Duration::from_millis(300),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "create-silent", pace);
+    node.with(|w| w.silence_first_room_store = true);
+    session.list(Action::CreateRoom {
+        name: "Quiet".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    // The room can show from the store before the create has finished (a new connection
+    // reads the stored rooms first), so wait for the create itself.
+    session.wait_until("the create finishes", || {
+        node.with(|w| !w.puts.is_empty()) && session.last_work().is_empty()
+    });
+    node.with(|w| {
+        assert!(
+            !w.silence_first_room_store,
+            "the first store went unanswered"
+        );
+        assert!(w.connections.len() >= 2, "it cost a connection");
+        assert_eq!(w.puts.len(), 1);
+        let slot_stores = w
+            .cas
+            .iter()
+            .filter(|(k, ok)| parse_room_storage_key(k).is_some() && *ok)
+            .count();
+        assert_eq!(slot_stores, 1, "stored once");
+    });
+}
+
+#[test]
+fn an_invitation_is_made_for_the_room_and_its_link_reported() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "invite", quick());
+    session.act(&a, Action::Invite);
+    session.wait_until("the invitation is reported", || {
+        !session.invites().is_empty()
+    });
+    let (room, link) = session.invites().remove(0);
+    assert_eq!(room, bs58::encode(a.vk().to_bytes()).into_string());
+    let link = link.unwrap();
+    let prefix = format!(
+        "http://{}/v1/contract/web/{}/?invitation=",
+        node.authority,
+        super::super::grant::RIVER_WEB_APP
+    );
+    let code = link.strip_prefix(&prefix).expect("the web app's link");
+    let inv = river_core::invitation::Invitation::from_encoded_string(code).unwrap();
+    assert_eq!(inv.room, a.vk());
+    inv.invitee.verify_signature(&a.vk()).unwrap();
+    // Nothing was written or sent for it.
+    node.with(|w| assert!(w.cas.is_empty() && w.updates.is_empty() && w.puts.is_empty()));
+}
+
+/// The stored rooms are read again often here; a create still finishes, and its writes never
+/// go out while a read is under way.
+#[test]
+fn creating_while_the_stored_rooms_are_read_often_never_overlaps_a_read() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        refresh: Duration::from_millis(1),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "create-busy", pace);
+    for name in ["One", "Two"] {
+        session.list(Action::CreateRoom {
+            name: name.into(),
+            nickname: "Ada".into(),
+            private: false,
+        });
+    }
+    session.wait_rooms("both rooms are created", |r, _, _| r.len() == 3);
+    node.with(|w| {
+        assert!(
+            w.lists >= 3,
+            "the rooms were read again meanwhile: {}",
+            w.lists
+        );
+        assert_eq!(w.overlaps, 0);
+        assert_eq!(w.puts.len(), 2);
+    });
 }
