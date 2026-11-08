@@ -62,20 +62,24 @@ pub(super) fn open_from_press(surfaces: ReactionSurfaces, opening: MobileOpening
         if closed && dom::closes_from_here() == closes {
             return;
         }
+        let token = opening.token;
         if surfaces.open_mobile(opening) && (!shown || closed) {
-            show_now();
+            show_now(token);
         }
     });
 }
 
 thread_local! {
-    /// The last opening its press showed. The host's fallback never shows
+    /// The last opening shown, by its press or by a fallback. Nothing shows
     /// that one again: closed since, it was dismissed.
     static SHOWN_BY_PRESS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Show the popup and focus its field: the fallback when the press could not.
-fn show_now() {
+/// Show the popup for opening `token` and focus its field: the fallback when
+/// the press could not. Recorded as shown, so an effect run after Escape
+/// closes it never shows it again.
+fn show_now(token: u64) {
+    SHOWN_BY_PRESS.with(|s| s.set(token));
     #[cfg(target_arch = "wasm32")]
     if dom::show_dialog(POPUP_ID) {
         dom::focus_id(POPUP_INPUT_ID);
@@ -144,6 +148,23 @@ fn dismiss(surfaces: ReactionSurfaces) {
     });
 }
 
+/// Whether a keydown belongs to an input method: `keyCode` 229, which WebKit
+/// and Blink give the key that confirms a conversion even after the
+/// composition has ended.
+fn is_ime_key(e: &KeyboardEvent) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        e.data()
+            .downcast::<web_sys::KeyboardEvent>()
+            .is_some_and(|k| k.key_code() == 229)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 /// The conversation's one mobile reaction popup. Rendered once by
 /// `Conversation`, closed until a + opens it below 48rem.
 #[component]
@@ -194,7 +215,7 @@ pub(super) fn MobileReactionPopup(
         if let Some(token) = token {
             let by_press = SHOWN_BY_PRESS.with(|s| s.get()) == token;
             if shown_token.replace(token) != token && !by_press && !dom::dialog_open(POPUP_ID) {
-                show_now();
+                show_now(token);
             }
         }
     });
@@ -272,16 +293,33 @@ pub(super) fn MobileReactionPopup(
                     // The documented exception: a local controlled input's
                     // signal is written synchronously, so a re-render never
                     // writes an older value back over what was typed.
+                    // Only that signal: the explanation's clearing is
+                    // deferred like any other write from a handler.
                     oninput: move |e| {
                         text.set(e.value());
                         if error.peek().is_some() {
-                            error.set(None);
+                            crate::util::defer(move || {
+                                if error.peek().is_some() {
+                                    error.set(None);
+                                }
+                            });
                         }
                     },
                     oncompositionstart: move |_| start.set(true),
-                    oncompositionend: move |_| end.set(false),
+                    // Held a task past the composition's end: WebKit fires
+                    // `compositionend` before the Enter keydown that
+                    // confirmed the conversion, and that keydown says
+                    // `isComposing: false`.
+                    oncompositionend: move |_| {
+                        let end = end.clone();
+                        crate::util::defer(move || end.set(false));
+                    },
                     onkeydown: move |e: KeyboardEvent| {
-                        if e.key() != Key::Enter || e.is_composing() || enter.get() {
+                        if e.key() != Key::Enter
+                            || e.is_composing()
+                            || enter.get()
+                            || is_ime_key(&e)
+                        {
                             return;
                         }
                         e.prevent_default();

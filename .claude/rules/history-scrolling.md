@@ -96,8 +96,9 @@ Current behavior:
   (`reader_moved_up_since`) is the latch that caused #508.
 - The history follows under every dialog and popover, a DM thread over the
   room included, and is read under all of them except that DM thread: member
-  info, room settings, invite and ban dialogs, a reactor list and the
-  reaction picker. The reader is at the end anyway when the dialog
+  info, room settings, invite and ban dialogs, a reactor list, the
+  reaction picker, and below 48rem the mobile actions sheet and reaction
+  popup (`conversation/mobile_surface.rs`). The reader is at the end anyway when the dialog
   closes, but those arrivals count as read without having been on screen
   unobstructed.
 - While the reaction picker is open the reader's own wheel and one-finger
@@ -114,6 +115,19 @@ Current behavior:
   mid-drag. A picker whose React is no longer inside the history's view
   (arrivals followed past it, or the conversation was hidden) holds nothing:
   the next wheel or one-finger drag closes it and scrolls as usual.
+- Below 48rem a row tap opens the mobile actions sheet and the + opens the
+  mobile reaction popup, each a native modal `<dialog>`
+  (`conversation/mobile_surface.rs`). While one is open the reader's wheel
+  and one-finger touch scrolling outside its panel are held off, as the
+  picker holds them, and the panel itself still scrolls and its field still
+  takes selections; a zoom (Ctrl+wheel, a pinch) is not held, nothing is
+  captured, and every close path removes the listeners. Unlike the picker,
+  a modal keeps holding while its message is still rendered, even after
+  arrivals carried that row out of the history's view: only the message
+  leaving the history closes it. Arrivals, following, the end hold and reads
+  go on underneath as under the other dialogs, and opening or closing either
+  never scrolls the history (focus returns to the row's control with
+  `preventScroll`).
 
 Known limitations:
 

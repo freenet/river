@@ -57,6 +57,7 @@ web-sys = { workspace = true, features = [
     "MediaStreamConstraints",
     "MediaStreamTrack",
     "MediaQueryList",
+    "KeyboardEvent",
     "MouseEvent",
     "Performance",
     "PointerEvent",

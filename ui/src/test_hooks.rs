@@ -437,6 +437,42 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Give the current room a new contract key, as a room-contract re-key
+    // does: the same room and messages under another generation. The mobile
+    // message surfaces close on it, and work queued for them does nothing.
+    set_hook(
+        "rekeyCurrentRoom",
+        Closure::<dyn FnMut()>::new(move || {
+            crate::util::defer(|| {
+                with_current_room_mut(|room, room_key| {
+                    use freenet_stdlib::prelude::{ContractCode, ContractKey, Parameters};
+                    let code = ContractCode::from(b"river test re-key".to_vec());
+                    room.contract_key = ContractKey::from_params_and_code(
+                        Parameters::from(room_key.to_bytes().to_vec()),
+                        &code,
+                    );
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
+    // Show one mobile panel ("rooms", "chat" or "members"), as the panel
+    // buttons do, whatever covers them.
+    set_hook(
+        "setMobileView",
+        Closure::<dyn FnMut(String)>::new(move |view: String| {
+            use crate::components::app::{MobileView, MOBILE_VIEW};
+            let view = match view.as_str() {
+                "rooms" => MobileView::Rooms,
+                "members" => MobileView::Members,
+                _ => MobileView::Chat,
+            };
+            crate::util::defer(move || *MOBILE_VIEW.write() = view);
+        })
+        .into_js_value(),
+    );
+
     // Put the current room in the state of a private room whose secret this
     // device does not hold. The conversation then offers no composer and
     // says why. The rendered history does not change, since every example

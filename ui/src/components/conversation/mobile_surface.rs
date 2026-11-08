@@ -424,6 +424,16 @@ fn install_narrow_listener() {
 /// room's generation changing. A room switch closes it from `Conversation`'s
 /// room-change path, and its message leaving the history from the row's
 /// control unmounting. Rendered once by `Conversation`; renders nothing.
+///
+/// It does not watch for an unrelated app modal opening, deliberately: while
+/// a mobile surface is open the rest of the page is inert under its modal
+/// dialog, so no control can open another modal, and the app's other modals
+/// open only from such controls (member info, room settings, invite, ban,
+/// delete confirmation, DM thread). Paths that open one without a press go
+/// through a room switch first (a notification click, an invitation link),
+/// which closes the surface in `Conversation`'s room-change path. A modal
+/// that could open programmatically over an open surface would need closing
+/// here.
 #[component]
 pub(super) fn MobileSurfaceGuard(
     surfaces: ReactionSurfaces,

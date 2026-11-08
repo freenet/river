@@ -40,6 +40,8 @@ pub(super) enum ReactionInputError {
     NotEmoji,
     /// More than one emoji.
     Multiple,
+    /// Longer than any one emoji ([`MAX_REACTION_BYTES`]).
+    TooLong,
 }
 
 impl ReactionInputError {
@@ -51,6 +53,7 @@ impl ReactionInputError {
                 "That isn\u{2019}t an emoji River knows. Choose one from the palette."
             }
             Self::Multiple => "One emoji per reaction.",
+            Self::TooLong => "That\u{2019}s longer than one emoji.",
         }
     }
 }
@@ -61,6 +64,9 @@ pub(super) fn single_emoji(input: &str) -> Result<&str, ReactionInputError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(ReactionInputError::Empty);
+    }
+    if trimmed.len() > MAX_REACTION_BYTES {
+        return Err(ReactionInputError::TooLong);
     }
     let chars: Vec<char> = trimmed.chars().collect();
     let mut at = 0;
@@ -79,6 +85,19 @@ pub(super) fn single_emoji(input: &str) -> Result<&str, ReactionInputError> {
     }
     Ok(trimmed)
 }
+
+/// The most bytes a reaction may have. The longest RGI sequence in Emoji 16.0
+/// (a kiss or couple with two skin tones) is 35 bytes, a subdivision flag 28;
+/// this leaves room for any of them and refuses pasted runs of text.
+pub(super) const MAX_REACTION_BYTES: usize = 64;
+
+/// The most elements a ZWJ sequence may join: the RGI maximum in Emoji 16.0
+/// (families, kisses and couples join four).
+const MAX_ZWJ_ELEMENTS: usize = 4;
+
+/// The black flag, the only base of the subdivision flags (England,
+/// Scotland, Wales: the RGI tag sequences).
+const TAG_BASE: char = '\u{1F3F4}';
 
 const VS16: char = '\u{FE0F}';
 const ZWJ: char = '\u{200D}';
@@ -104,16 +123,27 @@ fn emoji_sequence_len(s: &[char]) -> Option<usize> {
             .filter(|&c| is_regional_indicator(c))
             .map(|_| 2);
     }
-    let mut i = zwj_element_len(s, true)?;
-    // Tag sequence: the element, then tags, then the cancel tag.
-    if s.get(i).copied().is_some_and(is_tag_spec) {
+    // Tag sequence: the black flag alone, a subdivision id in tag letters
+    // and digits (a region and its subdivision, 3 to 7 of them), the cancel
+    // tag. Any other base, or other tag characters, is no flag.
+    if s.get(1).copied().is_some_and(is_tag_spec) {
+        if s[0] != TAG_BASE {
+            return None;
+        }
+        let mut i = 1;
         while s.get(i).copied().is_some_and(is_tag_spec) {
             i += 1;
         }
-        return (s.get(i) == Some(&TAG_END)).then_some(i + 1);
+        return ((4..=8).contains(&i) && s.get(i) == Some(&TAG_END)).then_some(i + 1);
     }
-    // ZWJ sequence: more elements after each joiner.
+    let mut i = zwj_element_len(s, true)?;
+    // ZWJ sequence: more elements after each joiner, up to the RGI maximum.
+    let mut elements = 1;
     while s.get(i) == Some(&ZWJ) {
+        elements += 1;
+        if elements > MAX_ZWJ_ELEMENTS {
+            return None;
+        }
         i += 1;
         i += zwj_element_len(&s[i..], false)?;
     }
@@ -144,8 +174,9 @@ fn is_modifier(c: char) -> bool {
     ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
 }
 
+/// A tag letter (a-z) or tag digit (0-9): what a subdivision id is spelled in.
 fn is_tag_spec(c: char) -> bool {
-    ('\u{E0020}'..='\u{E007E}').contains(&c)
+    ('\u{E0061}'..='\u{E007A}').contains(&c) || ('\u{E0030}'..='\u{E0039}').contains(&c)
 }
 
 fn in_ranges(c: char, ranges: &[(u32, u32)]) -> bool {
@@ -594,6 +625,43 @@ mod tests {
         // No cancel tag, or nothing to tag.
         refuses("🏴\u{E0067}\u{E0062}", NotEmoji);
         refuses("\u{E0067}\u{E007F}", NotEmoji);
+        // Only the black flag takes tags, and only letters and digits.
+        refuses(
+            "😀\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+            NotEmoji,
+        );
+        refuses(
+            "🏳\u{FE0F}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+            NotEmoji,
+        );
+        refuses(
+            "🏴\u{E0047}\u{E0042}\u{E0045}\u{E004E}\u{E0047}\u{E007F}",
+            NotEmoji,
+        ); // capitals
+        refuses("🏴\u{E0020}\u{E0067}\u{E0062}\u{E007F}", NotEmoji); // tag space
+                                                                     // A subdivision id is 3 to 7 tags.
+        refuses("🏴\u{E0067}\u{E0062}\u{E007F}", NotEmoji);
+        refuses(&format!("🏴{}\u{E007F}", "\u{E0061}".repeat(8)), NotEmoji);
+    }
+
+    /// The length and ZWJ caps: every RGI sequence fits, longer runs do not.
+    #[test]
+    fn length_and_join_caps() {
+        // The longest RGI sequences (35 bytes) fit.
+        let kiss = "👩🏻\u{200D}\u{2764}\u{FE0F}\u{200D}💋\u{200D}👨🏼";
+        assert_eq!(kiss.len(), 35);
+        accepts(kiss);
+        accepts("👨\u{200D}👩\u{200D}👧\u{200D}👦");
+        // A fifth element joined is past the RGI maximum.
+        refuses("👨\u{200D}👩\u{200D}👧\u{200D}👦\u{200D}👶", NotEmoji);
+        // Past 64 bytes, whatever it is.
+        refuses(&"👍".repeat(17), TooLong);
+        refuses(&"a".repeat(65), TooLong);
+        assert_eq!(
+            single_emoji(&format!("  {kiss}  ")),
+            Ok(kiss),
+            "whitespace is not counted"
+        );
     }
 
     #[test]

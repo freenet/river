@@ -73,7 +73,7 @@ use self::markdown::{
 };
 use self::mobile_message_actions::{MobileAction, MobileActionsEntry, MobileMessageActionsSheet};
 use self::mobile_reaction_input::MobileReactionPopup;
-use self::mobile_surface::{MobileOpening, MobileSurface, MobileSurfaceGuard};
+use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
@@ -4158,18 +4158,14 @@ fn MessageGroupComponent(
                                     mobile_message_actions::note_row_release(&e, true)
                                 },
                                 onclick: move |e: MouseEvent| {
-                                    if !row_editing
-                                        && mobile_message_actions::row_tap_opens_actions(&e, &tap_row)
-                                    {
-                                        let opening = MobileOpening::new(
-                                            MobileSurface::Actions,
-                                            tap_row.clone(),
-                                            tap_message.clone(),
-                                            is_self,
-                                            None,
-                                        );
-                                        mobile_message_actions::open_actions(reactions, opening);
-                                    }
+                                    mobile_message_actions::row_clicked(
+                                        reactions,
+                                        &e,
+                                        tap_row.clone(),
+                                        tap_message.clone(),
+                                        is_self,
+                                        row_editing,
+                                    );
                                 },
                                 div {
                                     class: "msg-gutter",

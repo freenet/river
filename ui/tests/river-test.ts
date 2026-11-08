@@ -22,6 +22,10 @@ type RiverTestHooks = {
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
+  // The current room under a new contract key, as a room-contract re-key leaves it.
+  rekeyCurrentRoom(): void;
+  // Show one mobile panel, as its buttons do, whatever covers them.
+  setMobileView(view: "rooms" | "chat" | "members"): void;
   // The next own message signature arrives corrupted, so the room does not admit it.
   forgeNextSendSignature(): void;
   // Own-message signing requests wait (a slow chat delegate) until released.
