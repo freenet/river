@@ -2228,6 +2228,19 @@ fn update_failures_that_name_no_update_go_to_the_one_room_that_owes() {
 }
 
 #[test]
+fn the_stored_rooms_are_not_read_while_a_create_or_join_works() {
+    let pace = quick();
+    let mut work = super::super::work::Work::default();
+    assert!(!reload_due(&mut work, Duration::ZERO, &pace));
+    assert!(reload_due(&mut work, pace.refresh, &pace));
+    work.create("Room", "Ada", false);
+    assert!(
+        !reload_due(&mut work, pace.refresh * 2, &pace),
+        "a task is working"
+    );
+}
+
+#[test]
 fn a_failed_subscribe_is_asked_again_only_for_a_room_shown() {
     let a = TestRoom::new(1, "A", 1, &["a1"]);
     let mut rooms = owing(&[&a]);
@@ -2732,8 +2745,8 @@ fn an_invitation_is_made_for_the_room_and_its_link_reported() {
     node.with(|w| assert!(w.cas.is_empty() && w.updates.is_empty() && w.puts.is_empty()));
 }
 
-/// The stored rooms are read again often here; a create still finishes, and its writes never
-/// go out while a read is under way.
+/// The stored rooms are due to be read again all the time here: creates still finish (a read
+/// due never starves them), and their writes never go out while a read is under way.
 #[test]
 fn creating_while_the_stored_rooms_are_read_often_never_overlaps_a_read() {
     let node = fake_node(vec![]);
@@ -2752,11 +2765,10 @@ fn creating_while_the_stored_rooms_are_read_often_never_overlaps_a_read() {
     }
     session.wait_rooms("both rooms are created", |r, _, _| r.len() == 3);
     node.with(|w| {
-        assert!(
-            w.lists >= 3,
-            "the rooms were read again meanwhile: {}",
-            w.lists
-        );
+        // The first read, and at least one more after the creates. Two creates can finish
+        // into one read (the second is still working when the first asks for it), so no more
+        // than that is certain.
+        assert!(w.lists >= 2, "the rooms were read again: {}", w.lists);
         assert_eq!(w.overlaps, 0);
         assert_eq!(w.puts.len(), 2);
     });

@@ -281,6 +281,17 @@ fn only_the_answer_awaited_is_taken() {
     assert_eq!(state(&w), WorkState::Working);
     // The awaited one is.
     assert!(w.on_delegate(&read_answer(&slot, None, 0)));
+    // With the store out, a store answer for another key is not taken.
+    expect_store(&mut w, &slot, 0);
+    assert!(!w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Stored { generation: 1 }
+    )));
+    assert!(w.has_out());
+    // On a new connection the read is sent again.
+    w.connection_lost();
+    expect_read(&mut w, &slot);
+    assert!(w.on_delegate(&read_answer(&slot, None, 0)));
     // During the PUT: an UPDATE answer or a PUT answer for another contract is not taken.
     expect_store(&mut w, &slot, 0);
     w.on_delegate(&store_answer(

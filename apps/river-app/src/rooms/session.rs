@@ -643,11 +643,7 @@ fn follow_on(
             reload = None;
             last_read = Instant::now();
         }
-        // Not while a create or join works (see above); at once when one has just finished.
-        if reload.is_none()
-            && !rooms.outbox.work.busy()
-            && (rooms.outbox.work.take_reload() || last_read.elapsed() >= pace.refresh)
-        {
+        if reload.is_none() && reload_due(&mut rooms.outbox.work, last_read.elapsed(), pace) {
             let (loader, reads) = Loader::start();
             for read in reads {
                 if let Err(e) = socket.send(&delegate::request(&read)) {
@@ -786,6 +782,13 @@ fn follow_on(
             rooms.report(status, report);
         }
     }
+}
+
+/// Whether to read the stored rooms again now: when the refresh interval has passed, or at once
+/// when a create or join has just finished, but never while one works. A read started then
+/// would put its requests beside the task's, and an error names neither.
+fn reload_due(work: &mut super::work::Work, since_read: Duration, pace: &Pace) -> bool {
+    !work.busy() && (work.take_reload() || since_read >= pace.refresh)
 }
 
 /// The room contract and the node's reason, when an update failed.
