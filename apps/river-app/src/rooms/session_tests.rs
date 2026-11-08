@@ -2076,26 +2076,44 @@ fn update_failures_that_name_no_update_go_to_the_one_room_that_owes() {
 
     let one = owing(&[&a]);
     assert_eq!(
-        one.failed_update_unnamed(&empty_ring, &none)
+        one.failed_update_unnamed(&empty_ring, &none, false)
             .map(|(id, _)| id),
         Some(a.id())
     );
     assert_eq!(
-        one.failed_update_unnamed(&missing(a.id()), &none)
+        one.failed_update_unnamed(&missing(a.id()), &none, false)
             .map(|(id, _)| id),
         Some(a.id())
     );
     // A subscribe waiting for its answer could be the one that failed.
     let mut asking = Subscriptions::default();
     asking.pending.insert(b.id(), Instant::now());
-    assert_eq!(one.failed_update_unnamed(&empty_ring, &asking), None);
+    assert_eq!(one.failed_update_unnamed(&empty_ring, &asking, false), None);
     // A missing contract for a room that owes nothing is a subscribe's.
-    assert_eq!(one.failed_update_unnamed(&missing(b.id()), &none), None);
+    assert_eq!(
+        one.failed_update_unnamed(&missing(b.id()), &none, false),
+        None
+    );
+    // A read of the stored rooms is under way: the failure may be one of its requests.
+    let shutdown: ClientError = ErrorKind::Shutdown.into();
+    assert_eq!(one.failed_update_unnamed(&shutdown, &none, true), None);
+    assert_eq!(
+        one.failed_update_unnamed(&shutdown, &none, false)
+            .map(|(id, _)| id),
+        Some(a.id())
+    );
+    // A subscribe for the owing room is waiting: its missing contract may be the subscribe's.
+    let mut asking_a = Subscriptions::default();
+    asking_a.pending.insert(a.id(), Instant::now());
+    assert_eq!(
+        one.failed_update_unnamed(&missing(a.id()), &asking_a, false),
+        None
+    );
     // Two rooms owe: which one failed can't be told.
     let two = owing(&[&a, &b]);
-    assert_eq!(two.failed_update_unnamed(&empty_ring, &none), None);
+    assert_eq!(two.failed_update_unnamed(&empty_ring, &none, false), None);
     assert_eq!(
-        two.failed_update_unnamed(&missing(b.id()), &none)
+        two.failed_update_unnamed(&missing(b.id()), &none, false)
             .map(|(id, _)| id),
         Some(b.id())
     );
@@ -2109,6 +2127,13 @@ fn a_rekeyed_room_owes_nothing_under_its_old_contract() {
     let rekeyed = TestRoom::new(1, "A", 2, &["a1"]);
     rooms.replace(loaded(vec![rekeyed.stored()]));
     assert!(!rooms.outbox.owes(&a.vk()));
+    // What was in flight goes again, unchanged, under the new contract.
+    let mut changed = false;
+    let again = rooms
+        .outbox
+        .next_update(&rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent again without the user acting");
+    assert_eq!(again.recent_messages.unwrap().len(), 1);
 
     // A room a complete read no longer lists owes nothing either.
     let b = TestRoom::new(2, "B", 1, &["b1"]);

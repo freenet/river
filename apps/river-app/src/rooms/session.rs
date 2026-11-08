@@ -690,7 +690,9 @@ fn follow_on(
             Some(Err(e)) => {
                 if let Some((id, cause)) = failed_update(&e) {
                     changed |= rooms.update_answered(&id, Err(cause));
-                } else if let Some((id, cause)) = rooms.failed_update_unnamed(&e, &subs) {
+                } else if let Some((id, cause)) =
+                    rooms.failed_update_unnamed(&e, &subs, reload.is_some())
+                {
                     // Not a reload failure either, so the reload goes on.
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some(id) = failed_contract(&e) {
@@ -1102,14 +1104,16 @@ impl Rooms {
     }
 
     /// The room an UPDATE failure names some other way than `ContractError::Update`: a
-    /// `MissingContract` for a room that owes an answer, or an error that names nothing
-    /// (`EmptyRing`, `PeerNotJoined`, `Shutdown`, an operation error or timeout, as the node
-    /// reports a failed start) when exactly one room owes an answer and no subscribe is
-    /// waiting for one.
+    /// `MissingContract` for a room that owes an answer and has no subscribe waiting for one,
+    /// or an error that names nothing (`EmptyRing`, `PeerNotJoined`, `Shutdown`, an operation
+    /// error or timeout, as the node reports a failed start) when exactly one room owes an
+    /// answer, no subscribe is waiting for one, and no read of the stored rooms is under way
+    /// (whose requests can fail the same way).
     fn failed_update_unnamed(
         &self,
         e: &ClientError,
         subs: &Subscriptions,
+        reloading: bool,
     ) -> Option<(ContractInstanceId, String)> {
         let owing: Vec<ContractInstanceId> = self
             .list
@@ -1120,13 +1124,15 @@ impl Rooms {
         match e.kind() {
             ErrorKind::RequestError(RequestError::ContractError(
                 ContractError::MissingContract { key },
-            )) if owing.contains(key) => Some((*key, "Freenet doesn't have this room.".into())),
+            )) if owing.contains(key) && !subs.pending.contains_key(key) => {
+                Some((*key, "Freenet doesn't have this room.".into()))
+            }
             ErrorKind::EmptyRing
             | ErrorKind::PeerNotJoined
             | ErrorKind::Shutdown
             | ErrorKind::OperationError { .. }
             | ErrorKind::FailedOperation
-                if owing.len() == 1 && subs.pending.is_empty() =>
+                if owing.len() == 1 && subs.pending.is_empty() && !reloading =>
             {
                 Some((owing[0], e.kind().to_string()))
             }

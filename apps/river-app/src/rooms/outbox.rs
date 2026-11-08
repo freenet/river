@@ -917,8 +917,14 @@ impl Outbox {
 
     /// The room's answers owed are for a contract it no longer uses (re-keyed): they will not
     /// come under its key.
+    /// What was in flight for it goes again, unchanged, under the new contract.
     pub fn forget_owed(&mut self, room: &VerifyingKey) {
         self.owed.remove(room);
+        for e in self.entries.iter_mut().filter(|e| e.room == *room) {
+            if matches!(e.status, Status::InFlight { .. }) {
+                e.status = Status::Queued;
+            }
+        }
     }
 
     /// The connection is gone: nothing is owed on the next one, and what was in flight goes
