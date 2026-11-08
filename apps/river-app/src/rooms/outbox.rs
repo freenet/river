@@ -124,7 +124,7 @@ pub enum Action {
     },
     /// Join the room a pasted invite code or link invites to. `room` is empty.
     Join {
-        code: String,
+        code: InviteCode,
         nickname: String,
     },
     /// Try a failed create or join again ([`super::work`]). `room` is empty.
@@ -135,6 +135,17 @@ pub enum Action {
     DismissWork {
         id: u64,
     },
+}
+
+/// A pasted invite code or link. It is a bearer credential (it carries the invitee's signing
+/// key), so its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InviteCode(pub String);
+
+impl std::fmt::Debug for InviteCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InviteCode(<hidden>)")
+    }
 }
 
 impl Action {

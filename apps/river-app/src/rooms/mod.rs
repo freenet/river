@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-pub use outbox::{Action, Command};
+pub use outbox::{Action, Command, InviteCode};
 pub use session::{Access, Issues, LinkStatus, RoomsUpdate};
 
 /// The node's client API on this computer.

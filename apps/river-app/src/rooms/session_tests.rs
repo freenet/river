@@ -1,4 +1,5 @@
 use super::*;
+use crate::rooms::outbox::InviteCode;
 use crate::rooms::outbox::{Action, Outbox};
 use crate::rooms::room::message_key;
 use crate::rooms::work::WorkState;
@@ -2561,7 +2562,7 @@ fn a_room_the_web_ui_stored_first_is_never_overwritten() {
     let other = TestRoom::new(1, "A", 1, &["a1"]);
     let (session, _dir) = following(&node, &[&other], "join-raced", quick());
     session.list(Action::Join {
-        code: link,
+        code: InviteCode(link),
         nickname: "Bea".into(),
     });
     session.wait_until("the join is refused", || {
@@ -2598,7 +2599,7 @@ fn joining_from_an_invitation_stores_the_room_sends_the_join_and_shows_it() {
     let (session, _dir) = following(&node, &[&other], "join", quick());
     // As pasted: the whole link.
     session.list(Action::Join {
-        code: format!("  {link}\n"),
+        code: InviteCode(format!("  {link}\n")),
         nickname: "Bea".into(),
     });
     session.wait_rooms("the joined room is in the list", |r, _, _| {
@@ -2783,7 +2784,7 @@ fn a_room_being_joined_sends_nothing_else_until_the_join_is_done() {
     };
     let (session, _dir) = following(&node, &[&a], "join-holds", pace);
     session.list(Action::Join {
-        code: link,
+        code: InviteCode(link),
         nickname: "Bea".into(),
     });
     session.wait_rooms("the stored room shows after a reconnect", |r, _, _| {

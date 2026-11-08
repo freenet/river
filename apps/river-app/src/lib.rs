@@ -1115,7 +1115,7 @@ mod tests {
             [rooms::Command {
                 room: String::new(),
                 action: rooms::Action::Join {
-                    code,
+                    code: rooms::InviteCode(code),
                     nickname: "Bea".into(),
                 },
             }]

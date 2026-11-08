@@ -1194,7 +1194,7 @@ impl Rooms {
                     self.list.iter().map(|r| r.stored.owner_vk).collect();
                 self.outbox
                     .work
-                    .join(&code, &nickname, &|vk| shown.contains(vk));
+                    .join(&code.0, &nickname, &|vk| shown.contains(vk));
                 true
             }
             Action::RetryWork { id } => self.outbox.work.retry(id),

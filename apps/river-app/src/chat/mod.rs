@@ -629,7 +629,13 @@ impl Chat {
             return;
         }
         self.close_dialog();
-        self.emit(String::new(), Action::Join { code, nickname });
+        self.emit(
+            String::new(),
+            Action::Join {
+                code: crate::rooms::InviteCode(code),
+                nickname,
+            },
+        );
     }
 
     /// Take where creates and joins stand. One that finished opens its room once the room is
@@ -899,6 +905,20 @@ mod state_tests {
         // Finished with the room already listed: opens at once.
         chat.show_work(done(2, target));
         assert_eq!(chat.room().unwrap().key, target);
+    }
+
+    /// An invite code is a credential: a command carrying one never prints it.
+    #[test]
+    fn a_join_command_does_not_print_its_invite_code() {
+        let command = Command {
+            room: String::new(),
+            action: Action::Join {
+                code: crate::rooms::InviteCode("SECRETCODE".into()),
+                nickname: "Bea".into(),
+            },
+        };
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("SECRETCODE"), "{shown}");
     }
 
     #[test]
