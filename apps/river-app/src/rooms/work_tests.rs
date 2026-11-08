@@ -168,7 +168,7 @@ fn a_conflict_reads_again_and_never_overwrites() {
         encode_new_room(&r).unwrap()
     };
     assert!(w.on_delegate(&read_answer(&slot, Some(other), 1)));
-    assert!(matches!(state(&w), WorkState::Failed { retry: true, .. }));
+    assert!(matches!(state(&w), WorkState::Failed { retry: false, .. }));
     assert!(w.next_request(false, Instant::now()).is_none());
 
     // The meta: a conflict re-reads, and the store keeps what the other writer added.
@@ -513,4 +513,187 @@ fn a_new_room_reads_back_as_itself() {
     assert_eq!(read.self_nickname, room.self_nickname);
     assert_eq!(read.invitation_secrets, room.invitation_secrets);
     assert_eq!(read.contract_key, room.contract_key);
+}
+
+/// A join of a public room, run up to the slot read it sends after reading the room: the work,
+/// the room's owner and slot key, and the invitee's identity.
+fn joining_to_slot(w: &mut Work) -> (VerifyingKey, Vec<u8>, SigningKey) {
+    let owner_sk = SigningKey::from_bytes(&[60; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let room = LiveRoom::new(stored(&plan.room));
+    let (inv, link) = invitation(&room, "http://x/").unwrap();
+    w.join(&link, "Bea", &|_| false);
+    let ClientRequest::ContractOp(ContractRequest::Get { .. }) = next(w) else {
+        panic!("a GET");
+    };
+    let owner = owner_sk.verifying_key();
+    let key = crate::rooms::create::contract_key(&owner);
+    let mut state_bytes = Vec::new();
+    ciborium::ser::into_writer(&plan.room.room_state, &mut state_bytes).unwrap();
+    assert!(w.on_contract(&ContractResponse::GetResponse {
+        key,
+        contract: None,
+        state: WrappedState::new(state_bytes),
+    }));
+    let slot = room_storage_key(&owner);
+    expect_read(w, &slot);
+    (owner, slot, inv.invitee_signing_key)
+}
+
+/// A browser tab accepted the same invitation and stored the room first: this join sends
+/// nothing (that tab has joined), and only opens the room.
+#[test]
+fn a_join_someone_else_already_stored_sends_no_second_join() {
+    let mut w = Work::default();
+    let (owner, slot, me) = joining_to_slot(&mut w);
+    // The tab's copy: the same identity, other bytes.
+    let mut theirs =
+        crate::rooms::create::new_room(SigningKey::from_bytes(&[61; 32]), "T", "T", false)
+            .unwrap()
+            .room;
+    theirs.owner_vk = owner;
+    theirs.self_vk = Some(me.verifying_key());
+    theirs.self_sk = Some(me);
+    w.on_delegate(&read_answer(
+        &slot,
+        Some(encode_new_room(&theirs).unwrap()),
+        3,
+    ));
+    expect_read(&mut w, ROOMS_META_KEY);
+}
+
+/// This join's own store landed but its answer was lost: the room holds exactly its bytes, so
+/// the join still goes out.
+#[test]
+fn a_join_whose_own_store_landed_still_sends_the_join() {
+    let mut w = Work::default();
+    let (_, slot, _) = joining_to_slot(&mut w);
+    w.on_delegate(&read_answer(&slot, None, 0));
+    let bytes = expect_store(&mut w, &slot, 0);
+    w.connection_lost();
+    expect_read(&mut w, &slot);
+    w.on_delegate(&read_answer(&slot, Some(bytes), 1));
+    assert!(matches!(
+        next(&mut w),
+        ClientRequest::ContractOp(ContractRequest::Update { .. })
+    ));
+}
+
+/// Try again on a join that failed before its UPDATE was taken reads the room again, so the
+/// join is built against the room as it is now, with the time it is sent.
+#[test]
+fn trying_a_join_again_reads_the_room_again() {
+    let mut w = Work::default();
+    let (_, slot, _) = joining_to_slot(&mut w);
+    w.on_delegate(&read_answer(&slot, None, 0));
+    expect_store(&mut w, &slot, 0);
+    w.on_delegate(&store_answer(
+        &slot,
+        CasStoreResult::Stored { generation: 1 },
+    ));
+    let ClientRequest::ContractOp(ContractRequest::Update { key, .. }) = next(&mut w) else {
+        panic!("an UPDATE");
+    };
+    let refused: ClientError =
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Update {
+            key,
+            cause: "busy".into(),
+        }))
+        .into();
+    assert!(w.on_error(&refused, false, &|_| false));
+    let id = w.views()[0].id;
+    assert!(w.retry(id));
+    assert!(matches!(
+        next(&mut w),
+        ClientRequest::ContractOp(ContractRequest::Get { .. })
+    ));
+}
+
+#[test]
+fn a_room_just_joined_is_not_joined_again() {
+    let mut w = Work::default();
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(f.private_state()));
+    let (_, link) = invitation(&room, "http://x/").unwrap();
+    w.join(&link, "Bea", &|_| false);
+    // Pretend it finished.
+    w.tasks[0].step = Step::Done;
+    w.join(&link, "Bea", &|_| false);
+    let views = w.views();
+    assert!(
+        matches!(&views[1].state, WorkState::Failed { why, .. } if why.contains("already joining"))
+    );
+    // A finished task's row can be put away.
+    assert!(w.dismiss(views[0].id));
+}
+
+#[test]
+fn a_store_the_delegate_refuses_is_said_and_can_be_tried_again() {
+    let mut w = Work::default();
+    let (_, slot) = creating(&mut w);
+    w.on_delegate(&read_answer(&slot, None, 0));
+    expect_store(&mut w, &slot, 0);
+    w.on_delegate(&store_answer(
+        &slot,
+        CasStoreResult::Failed("disk full".into()),
+    ));
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(retry && why.contains("disk full"), "{why}");
+}
+
+/// Up to the meta step of a create.
+fn creating_to_meta(w: &mut Work) -> VerifyingKey {
+    let (owner, slot) = creating(w);
+    w.on_delegate(&read_answer(&slot, None, 0));
+    expect_store(w, &slot, 0);
+    w.on_delegate(&store_answer(
+        &slot,
+        CasStoreResult::Stored { generation: 1 },
+    ));
+    let key = match next(w) {
+        ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) => contract.key(),
+        _ => panic!("a PUT"),
+    };
+    w.on_contract(&ContractResponse::PutResponse { key });
+    expect_read(w, ROOMS_META_KEY);
+    owner
+}
+
+/// A room list this app can't read is never overwritten, and trying again would read the same:
+/// it says so, with nothing to try again.
+#[test]
+fn an_unreadable_room_list_is_left_alone_and_said() {
+    let mut w = Work::default();
+    creating_to_meta(&mut w);
+    let mut list = Vec::new();
+    ciborium::ser::into_writer(&vec![1u8, 2], &mut list).unwrap();
+    w.on_delegate(&read_answer(ROOMS_META_KEY, Some(list), 2));
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(!retry && why.contains("room list"), "{why}");
+    assert!(w.next_request(false, Instant::now()).is_none());
+}
+
+#[test]
+fn a_room_list_that_keeps_changing_fails_after_the_web_uis_number_of_attempts() {
+    let mut w = Work::default();
+    creating_to_meta(&mut w);
+    for attempt in 0..CAS_ATTEMPTS {
+        if attempt > 0 {
+            expect_read(&mut w, ROOMS_META_KEY);
+        }
+        w.on_delegate(&read_answer(ROOMS_META_KEY, None, u64::from(attempt)));
+        expect_store(&mut w, ROOMS_META_KEY, u64::from(attempt));
+        w.on_delegate(&store_answer(
+            ROOMS_META_KEY,
+            CasStoreResult::Conflict {
+                current_generation: u64::from(attempt) + 1,
+                current_value: None,
+            },
+        ));
+    }
+    assert!(matches!(state(&w), WorkState::Failed { retry: true, .. }));
 }

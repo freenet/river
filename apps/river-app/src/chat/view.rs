@@ -340,8 +340,30 @@ fn work_row(w: &WorkView, p: &Palette, k: &Kit) -> El {
                 .w_full(),
         );
     match &w.state {
-        WorkState::Working | WorkState::Done { .. } => {
+        WorkState::Working => {
             r = r.child(label("Working on it…", st::SMALL, p.text_muted).key("work-status"));
+        }
+        // Stored; it shows here once the stored rooms are read again. Should that not happen
+        // (a read that keeps failing), the row can still be put away.
+        WorkState::Done { .. } => {
+            r = r
+                .child(
+                    label(
+                        "Saved. It will show in your rooms in a moment.",
+                        st::SMALL,
+                        p.text_muted,
+                    )
+                    .wrap()
+                    .w_full()
+                    .key("work-status"),
+                )
+                .child(
+                    Button::new("Dismiss")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(move |s: &mut RiverApp| s.chat.dismiss_work(id))
+                        .build(k)
+                        .key(format!("work-dismiss-{id}")),
+                );
         }
         WorkState::Failed { why, retry } => {
             r = r.child(

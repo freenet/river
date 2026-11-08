@@ -85,13 +85,24 @@ impl Default for Form {
     }
 }
 
-/// Where the invitation asked for in a room stands.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Where the invitation asked for in a room stands. Its `Debug` hides the link, which is a
+/// credential.
+#[derive(Clone, PartialEq, Eq)]
 pub enum InviteState {
     Making,
     /// Made, and its link copied.
     Copied(String),
     Failed(String),
+}
+
+impl std::fmt::Debug for InviteState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InviteState::Making => f.write_str("Making"),
+            InviteState::Copied(_) => f.write_str("Copied(<hidden>)"),
+            InviteState::Failed(why) => f.debug_tuple("Failed").field(why).finish(),
+        }
+    }
 }
 
 /// The connection to the node behind [`Source::Node`].

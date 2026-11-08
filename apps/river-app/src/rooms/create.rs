@@ -47,8 +47,8 @@ use freenet_stdlib::prelude::{
     WrappedContract, WrappedState,
 };
 use river_core::ecies::{
-    decrypt_secret_from_member_blob_raw, encrypt_secret_for_member, encrypt_with_symmetric_key,
-    generate_room_secret, seal_bytes,
+    encrypt_secret_for_member, encrypt_with_symmetric_key, generate_room_secret, seal_bytes,
+    try_decrypt_secret_from_member_blob_raw,
 };
 use river_core::invitation::Invitation;
 use river_core::room_state::configuration::{
@@ -154,6 +154,7 @@ pub fn new_room(
     nickname: &str,
     private: bool,
 ) -> Result<NewRoomPlan, String> {
+    let (name, nickname) = (name.trim(), nickname.trim());
     if let Some(reason) = create_refusal(name, nickname) {
         return Err(reason);
     }
@@ -288,7 +289,45 @@ pub fn invitation(room: &LiveRoom, web_app: &str) -> Result<(Invitation, String)
 /// What joining a room sends and stores. No `Debug`: it holds the invitee's key.
 pub struct JoinPlan {
     pub room: NewRoom,
-    pub delta: ChatRoomStateV1Delta,
+    /// What to send, or `None` when the room already has everything (the invitee is already a
+    /// member, as when an invitation is accepted twice).
+    pub delta: Option<ChatRoomStateV1Delta>,
+}
+
+/// Why a join can't go ahead, and whether trying the same join again later can help (a full
+/// room may have room later; a nickname over the room's limit never fits).
+#[derive(Debug, PartialEq, Eq)]
+pub struct JoinRefusal {
+    pub why: String,
+    pub retry: bool,
+}
+
+impl JoinRefusal {
+    fn final_(why: impl Into<String>) -> Self {
+        JoinRefusal {
+            why: why.into(),
+            retry: false,
+        }
+    }
+
+    fn for_now(why: impl Into<String>) -> Self {
+        JoinRefusal {
+            why: why.into(),
+            retry: true,
+        }
+    }
+}
+
+/// Why `invitation` can't be used at all: the key it gives the invitee is not the one its
+/// membership names, so joining with it would add someone else. The web UI leaves this to the
+/// room contract; here it is said before anything is stored.
+pub fn invitation_refusal(invitation: &Invitation) -> Option<String> {
+    (invitation.invitee_signing_key.verifying_key() != invitation.invitee.member.member_vk).then(
+        || {
+            "This invitation is damaged: the key it carries doesn't match the membership it grants."
+                .into()
+        },
+    )
 }
 
 /// Why `nickname` can't be used to join, before the room is read.
@@ -312,7 +351,7 @@ fn current_secret_from_state(state: &ChatRoomStateV1, sk: &SigningKey) -> Option
         .encrypted_secrets
         .iter()
         .find(|s| s.secret.member_id == me && s.secret.secret_version == version)?;
-    let secret = decrypt_secret_from_member_blob_raw(
+    let secret = try_decrypt_secret_from_member_blob_raw(
         &blob.secret.ciphertext,
         &blob.secret.nonce,
         &blob.secret.sender_ephemeral_public_key,
@@ -323,26 +362,32 @@ fn current_secret_from_state(state: &ChatRoomStateV1, sk: &SigningKey) -> Option
 }
 
 /// Join the room `state` (as read from the network under `contract_key`) with `invitation`,
-/// as `nickname`, at `now`.
+/// as `nickname`, at `now`. Only the room contract this build bundles is read and joined: a
+/// room the network keeps under another generation is not found here, where the web UI would
+/// look for it under older keys too.
 pub fn join(
     invitation: &Invitation,
     nickname: &str,
     state: &ChatRoomStateV1,
     contract_key: ContractKey,
     now: SystemTime,
-) -> Result<JoinPlan, String> {
-    if let Some(reason) = join_refusal(nickname) {
-        return Err(reason);
+) -> Result<JoinPlan, JoinRefusal> {
+    if let Some(reason) = join_refusal(nickname).or_else(|| invitation_refusal(invitation)) {
+        return Err(JoinRefusal::final_(reason));
     }
     let owner_vk = invitation.room;
     let params = ChatRoomParametersV1 { owner: owner_vk };
     let owner_id = params.owner_id();
     let config = &state.configuration.configuration;
     if config.owner_member_id != owner_id {
-        return Err("Freenet gave back a room that isn't the one this invitation is for.".into());
+        return Err(JoinRefusal::final_(
+            "Freenet gave back a room that isn't the one this invitation is for.",
+        ));
     }
     if let Some(reason) = nickname_refusal(nickname.len(), config) {
-        return Err(reason);
+        return Err(JoinRefusal::final_(format!(
+            "{reason} Join again with a shorter nickname."
+        )));
     }
     let sk = &invitation.invitee_signing_key;
     let me = MemberId::from(&sk.verifying_key());
@@ -353,7 +398,20 @@ pub fn join(
         .filter(|(v, _)| *v <= state.secrets.current_version)
         .copied()
         .collect();
-    let sealed = if config.privacy_mode == PrivacyMode::Private {
+    let present: std::collections::HashSet<MemberId> = state
+        .members
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
+    // Already in the room (an invitation accepted twice, or one re-sent to a member): nothing
+    // about the member is sent again, as the web UI's `build_state_for_put` adds nothing then.
+    // A second join event or a new version-0 nickname record would only repeat or replace what
+    // the room has.
+    let already = me == owner_id || present.contains(&me);
+    let sealed = if already {
+        None
+    } else if config.privacy_mode == PrivacyMode::Private {
         current_secret_from_state(state, sk)
             .or_else(|| {
                 let v = state.secrets.current_version;
@@ -378,17 +436,10 @@ pub fn join(
         .members
         .get_invite_chain(&invitation.invitee, &params)
         .unwrap_or_default();
-    let present: std::collections::HashSet<MemberId> = state
-        .members
-        .members
-        .iter()
-        .map(|m| m.member.id())
-        .collect();
-    let already = me == owner_id || present.contains(&me);
     let mut adding = Vec::new();
     if !already {
         if state.members.members.len() >= config.max_members {
-            return Err("This room is full.".into());
+            return Err(JoinRefusal::for_now("This room is full."));
         }
         adding.push(invitation.invitee.clone());
     }
@@ -408,28 +459,40 @@ pub fn join(
     );
     let join_id = join_event.id();
     let delta = ChatRoomStateV1Delta {
-        recent_messages: Some(vec![join_event]),
+        recent_messages: (!already).then(|| vec![join_event]),
         members: (!adding.is_empty()).then(|| MembersDelta::new(adding)),
         member_info: member_info.clone().map(|i| vec![i]),
         ..Default::default()
     };
+    let delta = (delta != ChatRoomStateV1Delta::default()).then_some(delta);
     let mut joined = state.clone();
-    joined
-        .apply_delta(&ChatRoomStateV1::default(), &params, &Some(delta.clone()))
-        .map_err(|e| format!("The room won't take you: {e}"))?;
-    let admitted = me == owner_id || joined.members.members.iter().any(|m| m.member.id() == me);
-    let kept = joined
-        .recent_messages
-        .messages
-        .iter()
-        .any(|m| m.id() == join_id);
-    if !admitted || !kept {
-        return Err(
-            "The room won't take you. You may have been banned, or the invitation may no longer \
-             be valid."
-                .into(),
-        );
+    if let Some(delta) = &delta {
+        joined
+            .apply_delta(&ChatRoomStateV1::default(), &params, &Some(delta.clone()))
+            .map_err(|e| JoinRefusal::for_now(format!("The room won't take you: {e}")))?;
     }
+    let admitted = me == owner_id || joined.members.members.iter().any(|m| m.member.id() == me);
+    let kept = already
+        || joined
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.id() == join_id);
+    if !admitted || !kept {
+        return Err(JoinRefusal::final_(
+            "The room won't take you. You may have been banned, or the invitation may no longer \
+             be valid.",
+        ));
+    }
+    // A member already in the room keeps the nickname record the room has for them.
+    let member_info = member_info.or_else(|| {
+        joined
+            .member_info
+            .member_info
+            .iter()
+            .find(|i| i.member_info.member_id == me)
+            .cloned()
+    });
     Ok(JoinPlan {
         room: NewRoom {
             owner_vk,

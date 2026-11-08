@@ -1167,6 +1167,33 @@ mod tests {
         assert!(rt.find("invite-status").is_some());
     }
 
+    /// A finished create or join whose room has not appeared yet says so, and can be put away.
+    #[test]
+    fn a_finished_create_can_be_dismissed_before_its_room_shows() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| {
+            s.chat.show_work(vec![rooms::work::WorkView {
+                id: 5,
+                what: "Creating “Book club”".into(),
+                state: rooms::work::WorkState::Done {
+                    room: "not-yet-shown".into(),
+                },
+            }])
+        });
+        settle(&mut rt);
+        assert!(rt.find("work-status").is_some());
+        press(&mut rt, "work-dismiss-5");
+        assert_eq!(
+            rt.state.chat.outgoing.last().map(|c| c.action.clone()),
+            Some(rooms::Action::DismissWork { id: 5 })
+        );
+        assert!(rt.find("work-status").is_none());
+        // And an invitation's link is never in a printed state.
+        let shown = format!("{:?}", chat::InviteState::Copied("SECRETCODE".into()));
+        assert!(!shown.contains("SECRETCODE"), "{shown}");
+    }
+
     #[test]
     fn a_failed_create_shows_why_with_try_again_and_dismiss() {
         let board = rune::clipboard::memory();

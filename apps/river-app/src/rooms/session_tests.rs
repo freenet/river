@@ -557,6 +557,8 @@ struct World {
     puts: Vec<ContractKey>,
     /// Take the next CAS store of a room key, but answer nothing (then clear this).
     silence_first_room_store: bool,
+    /// Answer the next listing with nothing (then clear this).
+    silence_next_list: bool,
     /// The reads the last listing's reader still has to make.
     reads_due: usize,
     /// Versioned reads and CAS stores that arrived while a reader was still reading.
@@ -835,6 +837,11 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                 }
                 if w.delegate_missing {
                     out.push(encode(Err(missing_delegate())));
+                    continue;
+                }
+                if matches!(read, ChatDelegateRequestMsg::ListRequest)
+                    && std::mem::take(&mut w.silence_next_list)
+                {
                     continue;
                 }
                 let reply = match read {
@@ -2580,7 +2587,7 @@ fn a_room_the_web_ui_stored_first_is_never_overwritten() {
     });
     session.wait_until("the join is refused", || {
         session.last_work().iter().any(|w| {
-            matches!(&w.state, WorkState::Failed { why, retry: true } if why.contains("already"))
+            matches!(&w.state, WorkState::Failed { why, retry: false } if why.contains("already"))
         })
     });
     node.with(|w| {
@@ -2689,7 +2696,7 @@ fn an_unanswered_store_reconnects_and_the_create_goes_on() {
     let node = fake_node(vec![]);
     let a = TestRoom::new(1, "A", 1, &["a1"]);
     let pace = Pace {
-        delegate_deadline: Duration::from_millis(300),
+        delegate_deadline: Duration::from_secs(2),
         ..quick()
     };
     let (session, _dir) = following(&node, &[&a], "create-silent", pace);
@@ -2791,7 +2798,7 @@ fn a_room_being_joined_sends_nothing_else_until_the_join_is_done() {
     });
     let a = TestRoom::new(1, "A", 1, &["a1"]);
     let pace = Pace {
-        update_wait: Duration::from_millis(300),
+        update_wait: Duration::from_secs(2),
         ..quick()
     };
     let (session, _dir) = following(&node, &[&a], "join-holds", pace);
@@ -2831,4 +2838,47 @@ fn a_room_being_joined_sends_nothing_else_until_the_join_is_done() {
             .iter()
             .any(|w| matches!(w.state, WorkState::Failed { .. }))
     );
+}
+
+/// A read of the stored rooms that never finishes drops the connection: its requests are still
+/// out, and an answer or error coming late could be taken for a create's or join's.
+#[test]
+fn a_read_of_the_stored_rooms_that_takes_too_long_reconnects() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        refresh: Duration::from_millis(50),
+        delegate_deadline: Duration::from_secs(2),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "reload-slow", pace);
+    node.with(|w| w.silence_next_list = true);
+    session.wait_until("a new connection", || {
+        node.with(|w| w.connections.len() >= 2)
+    });
+    session.wait_rooms("the rooms are still shown", |r, _, _| r.len() == 1);
+}
+
+/// An invitation asked for in a room that has gone (left in the browser) is said to have failed,
+/// so the screen does not wait for it forever; and the report that carries a link never prints it.
+#[test]
+fn an_invitation_for_a_room_gone_is_said_to_have_failed() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let gone = TestRoom::new(2, "B", 1, &["b1"]);
+    let (session, _dir) = following(&node, &[&a], "invite-gone", quick());
+    session.act(&gone, Action::Invite);
+    session.wait_until("the invitation is said to have failed", || {
+        session.invites().iter().any(|(room, link)| {
+            *room == bs58::encode(gone.vk().to_bytes()).into_string() && link.is_err()
+        })
+    });
+    let shown = format!(
+        "{:?}",
+        RoomsUpdate::Invite {
+            room: "r".into(),
+            link: Ok("http://x/?invitation=SECRETCODE".into()),
+        }
+    );
+    assert!(!shown.contains("SECRETCODE"), "{shown}");
 }

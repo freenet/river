@@ -184,8 +184,9 @@ pub struct Issues {
     pub unreadable: usize,
 }
 
-/// What the background work reports to the window.
-#[derive(Clone, Debug)]
+/// What the background work reports to the window. Its `Debug` hides an invitation's link,
+/// which is a credential.
+#[derive(Clone)]
 pub enum RoomsUpdate {
     Access(Access),
     /// The rooms, in the room list's order, with the room the web UI had open.
@@ -207,6 +208,36 @@ pub enum RoomsUpdate {
         room: String,
         link: Result<String, String>,
     },
+}
+
+impl std::fmt::Debug for RoomsUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoomsUpdate::Access(a) => f.debug_tuple("Access").field(a).finish(),
+            RoomsUpdate::Rooms {
+                rooms,
+                open,
+                status,
+                now,
+                issues,
+                work,
+            } => f
+                .debug_struct("Rooms")
+                .field("rooms", rooms)
+                .field("open", open)
+                .field("status", status)
+                .field("now", now)
+                .field("issues", issues)
+                .field("work", work)
+                .finish(),
+            RoomsUpdate::Status(s) => f.debug_tuple("Status").field(s).finish(),
+            RoomsUpdate::Invite { room, link } => f
+                .debug_struct("Invite")
+                .field("room", room)
+                .field("link", &link.as_ref().map(|_| "<hidden>"))
+                .finish(),
+        }
+    }
 }
 
 /// Run until stopped, or until a state that needs the user. `outbox` is what the user sent
@@ -636,12 +667,13 @@ fn follow_on(
             return e;
         }
         // Read the stored rooms again now and then, for rooms joined or left elsewhere.
+        // A read that took too long has requests still out, whose answers or errors could come
+        // late and be taken for a create's or join's: start again on a new connection.
         if let Some((_, started)) = &reload
             && started.elapsed() >= pace.delegate_deadline
         {
-            eprintln!("River: reading the stored rooms again took too long; will retry");
-            reload = None;
-            last_read = Instant::now();
+            rooms.report(status, report);
+            return SocketError::Failed("reading the stored rooms again took too long".into());
         }
         if reload.is_none() && reload_due(&mut rooms.outbox.work, last_read.elapsed(), pace) {
             let (loader, reads) = Loader::start();
@@ -1173,8 +1205,16 @@ impl Rooms {
                 // The read so far says nothing about this room (no store, nothing listed, or
                 // a slot that couldn't be read): it waits for a read that does.
                 None if !self.complete => self.outbox.waiting.push(command),
-                // Left, in the browser, before this arrived.
-                None => eprintln!("River: a command for a room no longer shown was dropped"),
+                // Left, in the browser, before this arrived. An invitation asked for there is
+                // said to have failed, so the screen does not wait for it.
+                None => {
+                    eprintln!("River: a command for a room no longer shown was dropped");
+                    if command.action == Action::Invite {
+                        self.invites
+                            .push((command.room, Err("This room is no longer here.".into())));
+                        changed = true;
+                    }
+                }
             }
         }
         changed

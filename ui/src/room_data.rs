@@ -10636,6 +10636,53 @@ mod stored_rooms_drift {
         );
     }
 
+    /// A room as the native app's `create::new_room` makes one: the owner's own key as the
+    /// identity, its public half beside it, and nothing an invitee would hold.
+    #[test]
+    fn a_room_the_native_app_creates_decodes_here_unchanged() {
+        let owner_sk = SigningKey::from_bytes(&[71u8; 32]);
+        let mut room = test_minimal_room_data(owner_sk.verifying_key());
+        room.room_state = test_generation_copy(&owner_sk, 1, 10, &[], 0);
+        room.self_sk = Some(owner_sk.clone());
+        room.self_vk = Some(owner_sk.verifying_key());
+        let native = encode_new_room(&as_new_room(&room)).unwrap();
+        let RoomSlot::Present(read) =
+            ciborium::de::from_reader::<RoomSlot, _>(&native[..]).expect("the web UI reads it")
+        else {
+            panic!("expected Present");
+        };
+        assert!(*read == room);
+        assert!(read.self_authorized_member.is_none() && read.self_nickname.is_none());
+        let mut ours = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(read), &mut ours).unwrap();
+        let mut expected = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room)), &mut expected).unwrap();
+        assert_eq!(ours, expected);
+    }
+
+    /// What the native app takes as the code in pasted text is what this web UI's join dialog
+    /// takes (`invitation_text_from_scan`).
+    #[test]
+    fn a_pasted_invitation_is_read_as_this_web_ui_reads_it() {
+        for pasted in [
+            "abc",
+            "  abc \n",
+            "http://127.0.0.1:7509/v1/contract/web/x/?invitation=abc",
+            "http://h/?a=1&invitation=a%42c#frag",
+            "http://h/?invitation=",
+            "http://h/?x=1",
+            "http://h/#?invitation=abc",
+            "?invitation=%zz",
+            "",
+        ] {
+            assert_eq!(
+                river_core::invitation::invitation_text_from_paste(pasted),
+                crate::invite_qr::invitation_text_from_scan(pasted),
+                "{pasted:?}"
+            );
+        }
+    }
+
     /// The native app's invite codes are this web UI's, both ways, byte for byte.
     #[test]
     fn invitations_are_the_same_bytes_both_ways() {
@@ -10664,6 +10711,14 @@ mod stored_rooms_drift {
         };
         let code = ours.to_encoded_string();
         assert_eq!(native.to_encoded_string().unwrap(), code);
+        // A public room's invitation, with no secrets, too.
+        let (mut ours_public, mut native_public) = (ours.clone(), native.clone());
+        ours_public.room_secrets.clear();
+        native_public.room_secrets.clear();
+        assert_eq!(
+            native_public.to_encoded_string().unwrap(),
+            ours_public.to_encoded_string()
+        );
         assert!(river_core::invitation::Invitation::from_encoded_string(&code).unwrap() == native);
         assert!(
             Invitation::from_encoded_string(&native.to_encoded_string().unwrap()).unwrap() == ours

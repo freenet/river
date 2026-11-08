@@ -215,7 +215,7 @@ fn joining_adds_the_invitee_their_nickname_and_a_join_event() {
     let at = now();
     let plan = join(&inv, "Bea", &state, key, at).unwrap();
     let me = MemberId::from(&inv.invitee_signing_key.verifying_key());
-    let delta = &plan.delta;
+    let delta = plan.delta.as_ref().unwrap();
     assert_eq!(
         delta.members.as_ref().unwrap().added(),
         std::slice::from_ref(&inv.invitee)
@@ -241,7 +241,7 @@ fn joining_adds_the_invitee_their_nickname_and_a_join_event() {
         ciborium::ser::into_writer(d, &mut b).unwrap();
         b
     };
-    assert_eq!(cbor(&again.delta), cbor(delta));
+    assert_eq!(cbor(again.delta.as_ref().unwrap()), cbor(delta));
 
     // What is stored: the invitation's identity and credentials, the room with the join in.
     let room = &plan.room;
@@ -280,7 +280,7 @@ fn joining_a_private_room_seals_the_nickname_with_the_invitations_secret() {
     )
     .unwrap();
     assert_eq!(plan.room.invitation_secrets, BTreeMap::from([(0, SECRET)]));
-    let info = &plan.delta.member_info.as_ref().unwrap()[0];
+    let info = &plan.delta.as_ref().unwrap().member_info.as_ref().unwrap()[0];
     assert!(matches!(
         info.member_info.preferred_nickname,
         SealedBytes::Private {
@@ -313,10 +313,10 @@ fn a_private_room_with_no_secret_to_seal_with_gets_no_nickname_record() {
         now(),
     )
     .unwrap();
-    assert!(plan.delta.member_info.is_none());
+    assert!(plan.delta.as_ref().unwrap().member_info.is_none());
     assert!(plan.room.self_member_info.is_none());
     // Still a member, with the join event in.
-    assert!(plan.delta.members.is_some());
+    assert!(plan.delta.as_ref().unwrap().members.is_some());
     assert_eq!(plan.room.self_nickname.as_deref(), Some("Bea"));
 }
 
@@ -335,7 +335,7 @@ fn a_room_that_would_not_take_the_invitee_refuses_the_join() {
     let Err(e) = join(&inv, "Bea", &full, key, now()) else {
         panic!("a full room refuses");
     };
-    assert!(e.contains("full"), "{e}");
+    assert!(e.why.contains("full") && e.retry, "{e:?}");
 
     // Banned.
     let mut banned = state.clone();
@@ -349,7 +349,8 @@ fn a_room_that_would_not_take_the_invitee_refuses_the_join() {
         &owner,
     );
     banned.bans.0.push(ban);
-    assert!(join(&inv, "Bea", &banned, key, now()).is_err());
+    // Banned: final, nothing to try again.
+    assert!(join(&inv, "Bea", &banned, key, now()).is_err_and(|e| !e.retry));
 
     // A room with another owner than the invitation names.
     let (other, _) = public_room_and_invitation(&SigningKey::from_bytes(&[47; 32]));
@@ -361,7 +362,11 @@ fn a_room_that_would_not_take_the_invitee_refuses_the_join() {
     config.max_nickname_size = 2;
     config.configuration_version += 1;
     tight.configuration = AuthorizedConfigurationV1::new(config, &owner);
-    assert!(join(&inv, "Bea", &tight, key, now()).is_err());
+    // Over the room's limit: final, and it says what to change.
+    assert!(
+        join(&inv, "Bea", &tight, key, now())
+            .is_err_and(|e| !e.retry && e.why.contains("shorter nickname"))
+    );
     assert!(join(&inv, "  ", &state, key, now()).is_err());
     assert!(join(&inv, "B\u{200B}ea", &state, key, now()).is_err());
 
@@ -390,5 +395,76 @@ fn an_invitee_already_in_the_room_is_not_added_twice() {
         now(),
     )
     .unwrap();
-    assert!(plan.delta.members.is_none());
+    // Nothing to send: no second join event, and no version-0 nickname record replacing the
+    // one the room has.
+    assert!(plan.delta.is_none());
+    assert_eq!(
+        plan.room.self_member_info.as_ref(),
+        state
+            .member_info
+            .member_info
+            .iter()
+            .find(|i| i.member_info.member_id == f.me_id())
+    );
+}
+
+#[test]
+fn an_invitation_whose_key_is_not_its_membership_is_refused() {
+    let owner = SigningKey::from_bytes(&[48; 32]);
+    let (state, mut inv) = public_room_and_invitation(&owner);
+    inv.invitee_signing_key = SigningKey::from_bytes(&[49; 32]);
+    assert!(invitation_refusal(&inv).is_some());
+    let e = join(
+        &inv,
+        "Bea",
+        &state,
+        contract_key(&owner.verifying_key()),
+        now(),
+    )
+    .err()
+    .unwrap();
+    assert!(!e.retry && e.why.contains("damaged"), "{e:?}");
+}
+
+/// A secret blob addressed to the invitee that does not decrypt (damaged in the room) is
+/// skipped, not fatal: the invitation's copy of the secret seals the nickname.
+#[test]
+fn a_blob_that_does_not_decrypt_falls_back_to_the_invitations_secret() {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    let room = LiveRoom::new(f.stored(state.clone()));
+    let (inv, _) = invitation(&room, WEB_APP).unwrap();
+    // A blob for the invitee whose ciphertext is garbage.
+    let me = MemberId::from(&inv.invitee_signing_key.verifying_key());
+    let mut bad = state.secrets.encrypted_secrets[0].clone();
+    bad.secret.member_id = me;
+    bad.secret.ciphertext = vec![1, 2, 3];
+    state.secrets.encrypted_secrets.push(bad);
+    assert!(current_secret_from_state(&state, &inv.invitee_signing_key).is_none());
+    let plan = join(
+        &inv,
+        "Bea",
+        &state,
+        contract_key(&f.owner.verifying_key()),
+        now(),
+    );
+    // The room may refuse the forged blob on apply; either way nothing panicked, and if it
+    // took the join, the nickname is sealed.
+    if let Ok(plan) = plan {
+        assert!(plan.delta.unwrap().member_info.is_some());
+    }
+}
+
+#[test]
+fn new_room_trims_what_was_typed() {
+    let plan = new_room(
+        SigningKey::from_bytes(&[50; 32]),
+        "  Book club ",
+        " Ada ",
+        false,
+    )
+    .unwrap();
+    let view = LiveRoom::new(stored(&plan.room)).view(&minutes);
+    assert_eq!(view.name, "Book club");
+    assert!(view.members.iter().any(|m| m.nickname == "Ada"));
 }

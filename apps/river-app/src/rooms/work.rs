@@ -120,8 +120,9 @@ enum Kind {
     Join {
         invitation: Box<Invitation>,
         nickname: String,
-        /// The join event's time, fixed so the join is the same bytes each time it is sent.
-        at: SystemTime,
+        /// Built when the room is read, so its join event carries that time. Kept across
+        /// connections, so a resend is the same bytes; built again on Try again, so a join
+        /// retried much later is not stamped with a time the room has trimmed.
         plan: Option<Box<JoinPlan>>,
     },
     /// Refused before it started; never works.
@@ -176,6 +177,10 @@ struct Task {
     failed: Option<(String, bool)>,
     /// Whether the stored rooms were asked to be read again for this task's finishing.
     reload_asked: bool,
+    /// Whether this task's own store put the room in the store. A join that finds the room
+    /// already stored under this identity by someone else (a browser tab that accepted the same
+    /// invitation) sends nothing: that tab has joined.
+    stored_by_us: bool,
 }
 
 impl Task {
@@ -190,6 +195,7 @@ impl Task {
             conflicts: 0,
             failed: None,
             reload_asked: false,
+            stored_by_us: false,
         }
     }
 
@@ -252,6 +258,12 @@ impl Task {
             (Kind::Create(_), Step::Slot) => Step::Put,
             (Kind::Create(_), Step::Put) => Step::Meta,
             (Kind::Join { .. }, Step::Get) => Step::Slot,
+            // Nothing to send (already a member), or another writer stored and joined.
+            (Kind::Join { plan, .. }, Step::Slot)
+                if !self.stored_by_us || plan.as_ref().is_none_or(|p| p.delta.is_none()) =>
+            {
+                Step::Meta
+            }
             (Kind::Join { .. }, Step::Slot) => Step::Update,
             (Kind::Join { .. }, Step::Update) => Step::Meta,
             (_, Step::Meta) => Step::Done,
@@ -264,23 +276,31 @@ impl Task {
     }
 
     /// What the write step stores, given the key's current value: bytes, nothing (the step is
-    /// done), or why it can't.
-    fn decide(&self, value: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
-        let owner = self.owner().ok_or("Something unexpected went wrong.")?;
+    /// done), or why it can't. A refusal here does not change by trying again, so it is final.
+    fn decide(&mut self, value: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
+        let unexpected = || "Something unexpected went wrong.".to_owned();
+        let owner = self.owner().ok_or_else(unexpected)?;
         if self.step == Step::Meta {
             return meta_with_current_room(value, &owner).map_err(|e| {
                 format!(
-                    "The room is saved, but River's room list in its storage can't be read here \
-                     ({e}), so River in your browser won't open the room first."
+                    "The room is saved and shows here, but River's room list in its storage \
+                     can't be read by this app ({e}), so River in your browser won't open the \
+                     room first. Nothing else is affected; you can dismiss this."
                 )
             });
         }
-        let room = self.room().ok_or("Something unexpected went wrong.")?;
+        let room = self.room().ok_or_else(unexpected)?;
         // Joining may overwrite a tombstone: accepting an invitation is an explicit rejoin.
         let over_tombstone = matches!(self.kind, Kind::Join { .. });
         match reconcile_new_room(value, room, over_tombstone) {
             NewRoomWrite::Store(bytes) => Ok(Some(bytes)),
-            NewRoomWrite::AlreadyStored => Ok(None),
+            NewRoomWrite::AlreadyStored => {
+                // This task's own earlier store, whose answer was lost, holds exactly its bytes.
+                if value.is_some() && encode_new_room(room).ok().as_deref() == value {
+                    self.stored_by_us = true;
+                }
+                Ok(None)
+            }
             NewRoomWrite::Refuse(why) => Err(why),
         }
     }
@@ -336,7 +356,9 @@ impl Work {
                 );
             }
         };
-        if let Some(why) = create::join_refusal(nickname) {
+        if let Some(why) =
+            create::join_refusal(nickname).or_else(|| create::invitation_refusal(&invitation))
+        {
             return self.refuse(WHAT, why);
         }
         if shown(&invitation.room) {
@@ -349,10 +371,11 @@ impl Work {
                     .into(),
             );
         }
+        // One working or just finished: a second join would send a second join event.
         if self
             .tasks
             .iter()
-            .any(|t| t.running() && t.owner() == Some(invitation.room))
+            .any(|t| t.owner() == Some(invitation.room) && (t.running() || t.step == Step::Done))
         {
             return self.refuse(WHAT, "You're already joining this room.".into());
         }
@@ -360,7 +383,6 @@ impl Work {
             Kind::Join {
                 invitation: Box::new(invitation),
                 nickname: nickname.trim().to_owned(),
-                at: SystemTime::now(),
                 plan: None,
             },
             Step::Get,
@@ -380,6 +402,14 @@ impl Work {
         t.conflicts = 0;
         t.out = None;
         t.phase = Phase::Read;
+        // A join not yet sent reads the room again, so what it sends is built against the room
+        // as it is now, with the time it is sent.
+        if let Kind::Join { plan, .. } = &mut t.kind
+            && matches!(t.step, Step::Get | Step::Slot | Step::Update)
+        {
+            *plan = None;
+            t.step = Step::Get;
+        }
         true
     }
 
@@ -478,8 +508,12 @@ impl Work {
                 ClientRequest::ContractOp(plan.put()),
             ),
             (Step::Update, Kind::Join { plan: Some(p), .. }) => {
+                let Some(delta) = &p.delta else {
+                    t.advance();
+                    return None;
+                };
                 let mut bytes = Vec::new();
-                if let Err(e) = ciborium::ser::into_writer(&p.delta, &mut bytes) {
+                if let Err(e) = ciborium::ser::into_writer(delta, &mut bytes) {
                     t.fail(format!("The join could not be encoded: {e}"), false);
                     return None;
                 }
@@ -502,10 +536,10 @@ impl Work {
         let Some(t) = self.active() else {
             return false;
         };
-        let Some((out, _)) = &t.out else {
+        let Some((out, _)) = t.out.clone() else {
             return false;
         };
-        match (out, answer) {
+        match (&out, answer) {
             (
                 Out::Read(key),
                 ChatDelegateResponseMsg::GetVersionedResponse {
@@ -523,13 +557,18 @@ impl Work {
                 }
                 // Nothing to store: the room is already there, or the meta already opens it.
                 Ok(None) => t.advance(),
-                Err(why) => t.fail(why, true),
+                Err(why) => t.fail(why, false),
             },
             (Out::Store(key), ChatDelegateResponseMsg::CasStoreResponse { key: k, result })
                 if k.as_bytes() == key.as_slice() =>
             {
                 match result {
-                    CasStoreResult::Stored { .. } => t.advance(),
+                    CasStoreResult::Stored { .. } => {
+                        if t.step == Step::Slot {
+                            t.stored_by_us = true;
+                        }
+                        t.advance()
+                    }
                     // Another writer stored first: read what it stored and work from that.
                     CasStoreResult::Conflict { .. } => {
                         t.out = None;
@@ -570,19 +609,18 @@ impl Work {
                         let Kind::Join {
                             invitation,
                             nickname,
-                            at,
                             plan,
                         } = &mut t.kind
                         else {
                             return false;
                         };
                         let key = create::contract_key(&invitation.room);
-                        match create::join(invitation, nickname, &state, key, *at) {
+                        match create::join(invitation, nickname, &state, key, SystemTime::now()) {
                             Ok(p) => {
                                 *plan = Some(Box::new(p));
                                 t.advance();
                             }
-                            Err(why) => t.fail(why, true),
+                            Err(r) => t.fail(r.why, r.retry),
                         }
                     }
                     Err(e) => t.fail(
