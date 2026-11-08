@@ -1,6 +1,6 @@
 import { test, expect, CDPSession, Locator, Page } from "@playwright/test";
 import { coarsePointer, committedRow, nextFrames, openRoomWithComposer, revealFooter, settle, submitMessage } from "./example-room";
-import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import { deliver, deliverOffscreen, expectFollowed, hideChatBehindMembers, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import {
   expectAtReact,
   expectEveryEmojiUsable,
@@ -624,6 +624,15 @@ test.describe("Reaction picker placement", () => {
 
 const WHEEL_DELTA = 200;
 
+/// Whether `row`'s React has no part inside the history's visible box.
+function reactOutOfView(page: Page, row: Locator): Promise<boolean> {
+  return row.getByTestId("message-react-button").evaluate((react) => {
+    const a = react.getBoundingClientRect();
+    const h = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    return a.bottom <= h.top || a.top >= h.bottom || a.right <= h.left || a.left >= h.right;
+  });
+}
+
 /// What a press at (x, y) lands in: the picker, the history, or neither.
 function hitAt(page: Page, x: number, y: number): Promise<string> {
   return page.evaluate(
@@ -759,6 +768,83 @@ test.describe("While the reaction picker is open", () => {
     await deliver(page, "followed while open");
     await expectFollowed(page, "followed while open", "an arrival follows under the open picker");
     await expectOpenFor(page, row);
+  });
+
+  test("once arrivals carry its React out of the history's view, the next wheel closes it and scrolls", async ({ page }) => {
+    test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
+    await openRoomWithComposer(page);
+    await deliver(page, "carried anchor");
+    const row = committedRow(page, "carried anchor");
+    await openFromKeyboard(page, row);
+    for (let i = 0; i < 30 && !(await reactOutOfView(page, row)); i++) {
+      await deliver(page, `carried filler ${i}: ${"c".repeat(200)}`);
+    }
+    expect(await reactOutOfView(page, row), "premise: arrivals carried React out of the history's view").toBe(true);
+    expect(await isOpen(page), "premise: arrivals alone do not close it").toBe(true);
+
+    // Low in the history: an engine that keeps the picker in the viewport
+    // (rather than following React out) leaves it near the top.
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [view.x + 30, view.y + view.height - 40];
+    expect(await hitAt(page, x, y), "premise: the point hits the history").toBe("history");
+    const before = (await scrollMetrics(page)).top;
+    await wheelAt(page, x, y);
+    expect((await scrollMetrics(page)).top, "the wheel scrolled the history").toBeLessThan(before);
+    await expectClosed(page);
+  });
+
+  test("a React only partly inside the history's view still holds the wheel", async ({ page }) => {
+    test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
+    await openRoomWithComposer(page);
+    for (let i = 0; i < 6; i++) await deliver(page, `clipped filler ${i}: ${"p".repeat(200)}`);
+    const row = committedRow(page, "clipped filler 3");
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await settle(page);
+    await openFromKeyboard(page, row);
+    // Programmatic scrolling is not held: put React half below the bottom edge.
+    await row.getByTestId("message-react-button").evaluate((react) => {
+      const c = document.getElementById("chat-scroll-container")!;
+      const a = react.getBoundingClientRect();
+      c.scrollTop += a.top - (c.getBoundingClientRect().bottom - a.height / 2);
+    });
+    await settle(page);
+    const straddles = await row.getByTestId("message-react-button").evaluate((react) => {
+      const a = react.getBoundingClientRect();
+      const bottom = document.getElementById("chat-scroll-container")!.getBoundingClientRect().bottom;
+      return a.top < bottom && a.bottom > bottom;
+    });
+    expect(straddles, "premise: React straddles the history's bottom edge").toBe(true);
+    expect(await isOpen(page), "premise: still open").toBe(true);
+
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [view.x + 30, view.y + 30];
+    expect(await hitAt(page, x, y), "premise: the point hits the history").toBe("history");
+    const before = (await scrollMetrics(page)).top;
+    await wheelAt(page, x, y);
+    expect((await scrollMetrics(page)).top, "held: the history did not move").toBe(before);
+    expect(await isOpen(page), "still open").toBe(true);
+  });
+
+  test("once narrowing the window hides the conversation behind the members panel, a wheel is let through and closes it", async ({ page }) => {
+    test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openRoomWithComposer(page);
+    await deliver(page, "hidden anchor");
+    await hideChatBehindMembers(page);
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await expect(page.locator("#chat-scroll-container"), "premise: wide, the chat shows beside the members").toBeVisible();
+    const row = committedRow(page, "hidden anchor");
+    await openFromKeyboard(page, row);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator("#chat-scroll-container"), "premise: narrow again, the chat is hidden").toBeHidden();
+    expect(await isOpen(page), "premise: hiding the chat alone does not close it").toBe(true);
+    const rail = (await page.getByTestId("members-rail").boundingBox())!;
+    const [x, y] = [rail.x + rail.width / 2, rail.y + rail.height / 2];
+    expect(await wheelCancelled(page, x, y, true), "a zoom is let through").toBe(false);
+    expect(await isOpen(page), "a zoom does not close it").toBe(true);
+    expect(await wheelCancelled(page, x, y, false), "the wheel is not cancelled").toBe(false);
+    await expectClosed(page);
   });
 
   test("an automatic reload waits, and closing it does not release one an unsent message holds", { tag: "@chromium-only" }, async ({ page }) => {
@@ -1005,6 +1091,24 @@ test.describe("A finger on the history and the reaction picker", () => {
       await expectClosed(page);
       await parkTouch(page, row);
       expect(await dragMoves(page, fingers), "closed again: the drag scrolls").toBeLessThan(-20);
+    });
+  });
+
+  test("once arrivals carry its React out of the history's view, the next drag closes it and scrolls", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliver(page, "carried touch anchor");
+    await recordTouch(page);
+    const row = committedRow(page, "carried touch anchor");
+    await withFingers(page, async (fingers) => {
+      await openFromKeyboard(page, row);
+      for (let i = 0; i < 30 && !(await reactOutOfView(page, row)); i++) {
+        await deliver(page, `carried touch filler ${i}: ${"t".repeat(200)}`);
+      }
+      expect(await reactOutOfView(page, row), "premise: arrivals carried React out of the history's view").toBe(true);
+      expect(await isOpen(page), "premise: arrivals alone do not close it").toBe(true);
+      expect(await dragMoves(page, fingers), "the drag scrolled the history").toBeLessThan(-20);
+      await expectClosed(page);
+      expect(await pickerCaptures(page), "nothing left captured").toEqual([]);
     });
   });
 

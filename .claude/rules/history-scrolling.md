@@ -111,7 +111,9 @@ Current behavior:
   lifted) and keyboard zoom still reach the browser, and the layout change a
   zoom makes is not a scroll the hold prevents. Closing the picker, however
   it closes, releases the hold at once, along with any finger it captured
-  mid-drag.
+  mid-drag. A picker whose React is no longer inside the history's view
+  (arrivals followed past it, or the conversation was hidden) holds nothing:
+  the next wheel or one-finger drag closes it and scrolls as usual.
 
 Known limitations:
 
