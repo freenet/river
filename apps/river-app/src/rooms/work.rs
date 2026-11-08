@@ -514,16 +514,15 @@ impl Work {
                     generation,
                 },
             ) if k.as_bytes() == key.as_slice() => match t.decide(value.as_deref()) {
-                // Storing what is there already would only rewrite it (the web UI's
-                // `cas_write_key` skips that too).
-                Ok(Some(bytes)) if value.as_deref() != Some(bytes.as_slice()) => {
+                Ok(Some(bytes)) => {
                     t.out = None;
                     t.phase = Phase::Store {
                         value: bytes,
                         generation: *generation,
                     };
                 }
-                Ok(_) => t.advance(),
+                // Nothing to store: the room is already there, or the meta already opens it.
+                Ok(None) => t.advance(),
                 Err(why) => t.fail(why, true),
             },
             (Out::Store(key), ChatDelegateResponseMsg::CasStoreResponse { key: k, result })
