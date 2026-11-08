@@ -144,4 +144,50 @@ mod tests {
         assert!(answers(&theirs).is_empty());
         assert!(answers(&HostResponse::Ok).is_empty());
     }
+
+    /// The version of `dep` that `package` resolves to in a Cargo.lock.
+    fn resolved(lock: &str, package: &str, dep: &str) -> String {
+        let blocks: Vec<&str> = lock.split("[[package]]").collect();
+        let name_line = |b: &str| {
+            b.lines()
+                .find(|l| l.starts_with("name = "))
+                .map(str::to_owned)
+        };
+        let block = blocks
+            .iter()
+            .find(|b| name_line(b).as_deref() == Some(&format!("name = \"{package}\"")))
+            .unwrap_or_else(|| panic!("{package} is in the lockfile"));
+        let entry = block
+            .lines()
+            .map(|l| l.trim().trim_matches(|c| c == '"' || c == ','))
+            .find(|l| *l == dep || l.starts_with(&format!("{dep} ")))
+            .unwrap_or_else(|| panic!("{package} depends on {dep}"));
+        if let Some(version) = entry.strip_prefix(&format!("{dep} ")) {
+            return version.to_owned();
+        }
+        // Only one version is locked, so the entry does not name it.
+        let only: Vec<&&str> = blocks
+            .iter()
+            .filter(|b| name_line(b).as_deref() == Some(&format!("name = \"{dep}\"")))
+            .collect();
+        assert_eq!(only.len(), 1, "{dep} is locked once");
+        only[0]
+            .lines()
+            .find_map(|l| l.strip_prefix("version = "))
+            .expect("a version")
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    /// The client API's wire format is bincode of freenet-stdlib's types, so this app must use
+    /// the stdlib the web UI uses: the version river-core resolves to in the root lockfile.
+    /// The two workspaces lock separately, so a bump in one alone fails here.
+    #[test]
+    fn the_wire_format_is_the_web_uis() {
+        const ROOT: &str = include_str!("../../../../Cargo.lock");
+        const APPS: &str = include_str!("../../../Cargo.lock");
+        let root = resolved(ROOT, "river-core", "freenet-stdlib");
+        assert_eq!(resolved(APPS, "river-core", "freenet-stdlib"), root);
+        assert_eq!(resolved(APPS, "river-app", "freenet-stdlib"), root);
+    }
 }

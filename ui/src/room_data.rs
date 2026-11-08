@@ -10414,4 +10414,62 @@ mod stored_rooms_drift {
         assert_eq!(river_core::stored_rooms::ROOMS_META_KEY, ROOMS_META_KEY);
         assert_eq!(river_core::stored_rooms::ROOM_KEY_PREFIX, ROOM_KEY_PREFIX);
     }
+
+    /// A blob an OLD web UI wrote, before the `#[serde(default)]` fields existed: only the
+    /// required fields. Both readers must decode it, and agree.
+    #[test]
+    fn a_blob_without_the_defaulted_fields_decodes_in_both_readers() {
+        #[derive(Serialize)]
+        struct OldRoomData {
+            owner_vk: VerifyingKey,
+            room_state: ChatRoomStateV1,
+            self_sk: SigningKey,
+            contract_key: ContractKey,
+        }
+        #[derive(Serialize)]
+        enum OldRoomSlot {
+            Present(Box<OldRoomData>),
+        }
+        let owner_sk = SigningKey::from_bytes(&[41u8; 32]);
+        let base = test_minimal_room_data(owner_sk.verifying_key());
+        let old = OldRoomSlot::Present(Box::new(OldRoomData {
+            owner_vk: base.owner_vk,
+            room_state: test_generation_copy(&owner_sk, 1, 10, &["old"], 0),
+            self_sk: SigningKey::from_bytes(&[42u8; 32]),
+            contract_key: base.contract_key,
+        }));
+        let bytes = cbor(&old);
+        let RoomSlot::Present(written) = ciborium::de::from_reader::<RoomSlot, _>(&bytes[..])
+            .expect("the web UI reads its old blob")
+        else {
+            panic!("expected Present");
+        };
+        let StoredRoomSlot::Present(read) = decode_room_slot(&bytes).expect("decodes") else {
+            panic!("expected Present");
+        };
+        assert_eq!(read.room_state, written.room_state);
+        assert_eq!(read.contract_key, written.contract_key);
+        assert_eq!(read.self_verifying_key(), written.self_verifying_key());
+        assert_eq!(read.self_vk, None);
+        assert_eq!(read.last_read_message_id, None);
+        assert_eq!(read.self_nickname, None);
+        assert!(read.invitation_secrets.is_empty());
+    }
+
+    /// A blob from a future web UI that no longer stores the private key: the identity comes
+    /// from `self_vk`, in both readers.
+    #[test]
+    fn a_blob_with_only_the_public_identity_decodes_in_both_readers() {
+        let mut room = full_room();
+        room.self_sk = None;
+        let me = SigningKey::from_bytes(&[43u8; 32]).verifying_key();
+        room.self_vk = Some(me);
+        let bytes = cbor(&RoomSlot::Present(Box::new(room.clone())));
+        let StoredRoomSlot::Present(read) = decode_room_slot(&bytes).expect("decodes") else {
+            panic!("expected Present");
+        };
+        assert!(read.self_sk.is_none());
+        assert_eq!(read.self_verifying_key(), Some(me));
+        assert_eq!(read.self_verifying_key(), room.self_verifying_key());
+    }
 }

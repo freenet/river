@@ -6,6 +6,12 @@
 //! `river_core::stored_rooms`), shows them, then subscribes to each room contract and keeps
 //! them current ([`room`]).
 //!
+//! It talks to whatever answers on the node's loopback port. A local program that took that
+//! port before Freenet could pose as the node: it would receive the grant token, and could show
+//! made-up rooms. The web UI places the same trust in the port, and Freenet does not treat
+//! other programs of the same user as a boundary either (freenet-core `app_grants.rs`, "What
+//! this does NOT protect against").
+//!
 //! It only reads. It never PUTs (not even the web UI's seed PUT for a room the network
 //! doesn't have), never sends an UPDATE, and never writes delegate storage.
 
@@ -22,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub use session::{Access, LinkStatus, RoomsUpdate};
+pub use session::{Access, Issues, LinkStatus, RoomsUpdate};
 
 /// The node's client API on this computer.
 pub const NODE_AUTHORITY: &str = "127.0.0.1:7509";
@@ -79,7 +85,13 @@ impl Link {
         std::thread::spawn(move || {
             let report = |u: RoomsUpdate| (inner.report)(u);
             let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                session::run(&inner.authority, inner.config_dir.as_deref(), &report)
+                session::run(
+                    &inner.authority,
+                    inner.config_dir.as_deref(),
+                    &report,
+                    &session::Pace::default(),
+                    &|| false,
+                )
             }))
             .unwrap_or_else(|_| {
                 Access::Refused(

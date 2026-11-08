@@ -187,7 +187,11 @@ impl LiveRoom {
                     }
                     None if self.secrets.contains_key(secret_version) => content.to_string_lossy(),
                     None if self.secrets.is_empty() => {
-                        "Decrypting messages. This should only take a moment.".into()
+                        // The web UI says "Decrypting messages" here because its delegate
+                        // back-fills the secret shortly. This app only gets one if a later
+                        // update carries it, so it says what is missing.
+                        "[Encrypted message - this device doesn't have the room's secret yet]"
+                            .into()
                     }
                     None => format!("[Encrypted message - secret v{secret_version} unavailable]"),
                 }
@@ -388,7 +392,9 @@ impl LiveRoom {
             .canonical(id)
             .map(|i| &i.member_info.preferred_nickname);
         let name = match sealed {
-            Some(s) => self.unseal(s).unwrap_or_else(|| s.to_string_lossy()),
+            // A nickname that can't be decrypted yet shows as "Member <id>" below, not as
+            // the sealed value's "[Encrypted: ...]" placeholder.
+            Some(s) => self.unseal(s).unwrap_or_default(),
             None if Some(id) == me => self.stored.self_nickname.clone().unwrap_or_default(),
             None => String::new(),
         };
@@ -462,8 +468,28 @@ fn clean_multiline(s: &str) -> String {
 }
 
 /// A time as the chat's message time: minutes since 1970-01-01 in the local time zone.
+///
+/// A message's time is whatever its author put there, so it can be anywhere a `SystemTime`
+/// can be. Never panics: times before 1970 show as 1970, and times past what the chat's
+/// message time can hold (the year 10136) show as the last minute it can.
+/// (`chrono`'s `From<SystemTime>` panics outside its own range, so it is not used.)
 pub fn local_minutes(t: SystemTime) -> u32 {
-    let local: chrono::DateTime<chrono::Local> = t.into();
-    let secs = local.timestamp() + i64::from(local.offset().local_minus_utc());
-    secs.div_euclid(60).clamp(0, i64::from(u32::MAX)) as u32
+    use chrono::{Offset, TimeZone};
+    let secs: i64 = match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => return 0,
+    };
+    let max_secs = i64::from(u32::MAX) * 60;
+    let secs = secs.min(max_secs);
+    let offset = chrono::DateTime::from_timestamp(secs, 0)
+        .map(|utc| {
+            chrono::Local
+                .offset_from_utc_datetime(&utc.naive_utc())
+                .fix()
+                .local_minus_utc()
+        })
+        .unwrap_or(0);
+    (secs + i64::from(offset))
+        .div_euclid(60)
+        .clamp(0, i64::from(u32::MAX)) as u32
 }

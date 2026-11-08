@@ -18,7 +18,7 @@
 //! against a scripted responder.
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The web container contract id of the River web app whose identity River asks for.
 pub const RIVER_WEB_APP: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
@@ -33,8 +33,11 @@ const ROUTE_REQUEST: &str = "/v1/app-grants/request";
 /// answers immediately.
 const REPOLL_PAUSE: Duration = Duration::from_secs(1);
 
-/// How many times a request that the node could not take right now (`503`) is retried.
+/// How many times a request that the node could not take right now (`429`, `503`) is retried.
 const REQUEST_RETRIES: u32 = 5;
+
+/// How many polls in a row may fail to reach the node before River gives up on the request.
+const POLL_RETRIES: u32 = 5;
 
 /// A grant token. It is a credential: it opens River's delegate storage, including room
 /// signing keys. It is never printed, so `Debug` hides it and there is no `Display`.
@@ -59,10 +62,20 @@ impl std::fmt::Debug for GrantToken {
 }
 
 /// One HTTP answer: its status and body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpReply {
     pub status: u16,
     pub body: String,
+}
+
+/// The body can carry a grant token, so `Debug` shows only the status.
+impl std::fmt::Debug for HttpReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpReply")
+            .field("status", &self.status)
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .finish()
+    }
 }
 
 /// The two HTTP calls the grant flow makes. `Err` is a transport failure (no node answered);
@@ -89,15 +102,50 @@ pub enum GrantOutcome {
 }
 
 /// Ask for a grant and wait for the user's answer. `waiting` is called once, with the page the
-/// user approves on, when the node has accepted the request; it opens that page.
-pub fn request_grant(http: &dyn GrantHttp, waiting: &mut dyn FnMut(&str)) -> GrantOutcome {
-    request_grant_paced(http, waiting, REPOLL_PAUSE)
+/// user approves on, when the node has accepted the request; it opens that page. `authority`
+/// is the node's `host:port`: the page must be on it.
+pub fn request_grant(
+    http: &dyn GrantHttp,
+    authority: &str,
+    waiting: &mut dyn FnMut(&str),
+) -> GrantOutcome {
+    request_grant_with(http, authority, waiting, &GrantPacing::default())
+}
+
+/// [`request_grant`] with its own pacing.
+pub fn request_grant_with(
+    http: &dyn GrantHttp,
+    authority: &str,
+    waiting: &mut dyn FnMut(&str),
+    pacing: &GrantPacing,
+) -> GrantOutcome {
+    request_grant_paced(http, authority, waiting, pacing, &mut |d| thread::sleep(d))
+}
+
+/// How the grant flow paces itself. Tests shrink these.
+#[derive(Clone, Debug)]
+pub struct GrantPacing {
+    /// The pause before polling again (after an answer the node gave at once) or retrying.
+    pub pause: Duration,
+    /// How long past the request's own expiry River keeps polling.
+    pub margin: Duration,
+}
+
+impl Default for GrantPacing {
+    fn default() -> Self {
+        GrantPacing {
+            pause: REPOLL_PAUSE,
+            margin: Duration::from_secs(30),
+        }
+    }
 }
 
 fn request_grant_paced(
     http: &dyn GrantHttp,
+    authority: &str,
     waiting: &mut dyn FnMut(&str),
-    pause: Duration,
+    pacing: &GrantPacing,
+    sleep: &mut dyn FnMut(Duration),
 ) -> GrantOutcome {
     let body = serde_json::json!({ "app": RIVER_WEB_APP, "client_name": CLIENT_NAME }).to_string();
     let mut tries = 0;
@@ -110,25 +158,43 @@ fn request_grant_paced(
             200 => break reply,
             404 | 405 => return GrantOutcome::Unsupported,
             409 => return GrantOutcome::Refused(grant_limit_message(&reply.body)),
-            503 if tries < REQUEST_RETRIES => {
+            429 | 503 if tries < REQUEST_RETRIES => {
                 tries += 1;
-                thread::sleep(pause);
+                sleep(pacing.pause);
             }
             status => return GrantOutcome::Refused(refusal(status, &reply.body)),
         }
     };
-    let Some((request_id, approve_url)) = parse_created(&created.body) else {
+    let Some(created) = parse_created(&created.body, authority) else {
         return GrantOutcome::Refused("Freenet sent an answer River doesn't understand.".into());
     };
-    waiting(&approve_url);
-    let poll = format!("{ROUTE_REQUEST}/{request_id}");
+    // The request is answerable for `expires_in_secs`; past that (and a margin for a slow
+    // answer) the node has forgotten it, whatever it says.
+    let deadline = Instant::now() + created.expires_in + pacing.margin;
+    waiting(&created.approve_url);
+    let poll = format!("{ROUTE_REQUEST}/{}", created.request_id);
+    let mut failures = 0;
     loop {
+        if Instant::now() >= deadline {
+            return GrantOutcome::Expired;
+        }
         let reply = match http.get(&poll) {
-            Ok(r) => r,
-            Err(e) => return GrantOutcome::Unreachable(e),
+            Ok(r) => {
+                failures = 0;
+                r
+            }
+            // The node may be restarting. The request id still names the same request, so
+            // keep polling it rather than start over (which would open another page).
+            Err(e) => {
+                failures += 1;
+                if failures > POLL_RETRIES {
+                    return GrantOutcome::Unreachable(e);
+                }
+                sleep(pacing.pause);
+                continue;
+            }
         };
         match (reply.status, status_field(&reply.body).as_deref()) {
-            (202, _) => {}
             (200, Some("approved")) => {
                 return match token_field(&reply.body) {
                     Some(t) => GrantOutcome::Approved(GrantToken::new(t)),
@@ -138,9 +204,10 @@ fn request_grant_paced(
                 };
             }
             (200, Some("denied")) => return GrantOutcome::Denied,
-            // At the grant limit, or the grant could not be stored: the request is kept and
-            // the node waits before answering, so keep polling.
-            (409, _) | (503, _) => thread::sleep(pause),
+            // Still pending (the node normally holds this answer for up to 30 seconds), at the
+            // grant limit, the grant not stored yet, or too many polls at once across every
+            // client of the node: the request is kept, so poll again after a pause.
+            (202, _) | (409, _) | (429, _) | (503, _) => sleep(pacing.pause),
             (404, _) => return GrantOutcome::Expired,
             (status, _) => return GrantOutcome::Refused(refusal(status, &reply.body)),
         }
@@ -151,7 +218,13 @@ fn json(body: &str) -> Option<serde_json::Value> {
     serde_json::from_str(body).ok()
 }
 
-fn parse_created(body: &str) -> Option<(String, String)> {
+struct Created {
+    request_id: String,
+    approve_url: String,
+    expires_in: Duration,
+}
+
+fn parse_created(body: &str, authority: &str) -> Option<Created> {
     let v = json(body)?;
     let id = v.get("request_id")?.as_str()?;
     let url = v.get("approve_url")?.as_str()?;
@@ -163,11 +236,23 @@ fn parse_created(body: &str) -> Option<(String, String)> {
     {
         return None;
     }
-    // Only ever open the node's own page.
-    if !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://localhost:") {
+    // Only ever open the node's own page: the URL's authority must be exactly the one River
+    // is talking to (no userinfo, no other host or port).
+    let rest = url.strip_prefix("http://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if &rest[..end] != authority {
         return None;
     }
-    Some((id.to_owned(), url.to_owned()))
+    let expires_in = v
+        .get("expires_in_secs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(600)
+        .min(24 * 60 * 60);
+    Some(Created {
+        request_id: id.to_owned(),
+        approve_url: url.to_owned(),
+        expires_in: Duration::from_secs(expires_in),
+    })
 }
 
 fn status_field(body: &str) -> Option<String> {
@@ -220,7 +305,11 @@ impl NodeHttp {
         let response = match result {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
-            Err(ureq::Error::Transport(t)) => return Err(t.to_string()),
+            // Not `t.to_string()`: that starts with the URL, and the poll URL carries the
+            // request id, which can collect the token. The kind says enough.
+            Err(ureq::Error::Transport(t)) => {
+                return Err(format!("Freenet didn't answer ({})", t.kind()));
+            }
         };
         let status = response.status();
         // Grant answers are small; cap what is read.
@@ -311,17 +400,35 @@ mod tests {
         }
     }
 
+    const AUTHORITY: &str = "127.0.0.1:7509";
+
+    std::thread_local! {
+        /// How many pauses the last `run` on this thread made.
+        static PAUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn pauses() -> usize {
+        PAUSES.with(|p| p.get())
+    }
+
     const CREATED: &str = r#"{"request_id":"req42","approve_url":"http://127.0.0.1:7509/v1/app-grants/approve/ap1","expires_in_secs":600}"#;
     const PENDING: &str = r#"{"status":"pending"}"#;
 
     fn run(script: Vec<Result<(u16, &str), &str>>) -> (GrantOutcome, Vec<String>, Scripted) {
         let http = Scripted::new(script);
         let mut opened = Vec::new();
+        let mut pauses = 0;
         let outcome = request_grant_paced(
             &http,
+            AUTHORITY,
             &mut |url| opened.push(url.to_owned()),
-            Duration::ZERO,
+            &GrantPacing {
+                pause: Duration::ZERO,
+                margin: Duration::ZERO,
+            },
+            &mut |_| pauses += 1,
         );
+        PAUSES.with(|p| p.set(pauses));
         assert!(
             http.replies.lock().unwrap().is_empty(),
             "the flow stopped before using the whole script"
@@ -431,8 +538,6 @@ mod tests {
             outcome,
             GrantOutcome::Unreachable("connection refused".into())
         );
-        let (outcome, _, _) = run(vec![Ok((200, CREATED)), Err("reset")]);
-        assert_eq!(outcome, GrantOutcome::Unreachable("reset".into()));
     }
 
     #[test]
@@ -450,6 +555,13 @@ mod tests {
             r#"{"request_id":"r","approve_url":"https://evil.example/approve"}"#,
             r#"{"request_id":"../x","approve_url":"http://127.0.0.1:7509/a"}"#,
             r#"{"approve_url":"http://127.0.0.1:7509/a"}"#,
+            // Userinfo makes the host evil.example.
+            r#"{"request_id":"r","approve_url":"http://127.0.0.1:7509@evil.example/a"}"#,
+            r#"{"request_id":"r","approve_url":"http://127.0.0.1:1@evil.example/"}"#,
+            // Another port on loopback is another program.
+            r#"{"request_id":"r","approve_url":"http://127.0.0.1:7510/a"}"#,
+            r#"{"request_id":"r","approve_url":"http://localhost:7509/a"}"#,
+            r#"{"request_id":"r","approve_url":"http://127.0.0.1:75091/a"}"#,
             "not json",
         ] {
             let (outcome, opened, _) = run(vec![Ok((200, created))]);
@@ -536,5 +648,77 @@ mod tests {
                 assert!(!line.starts_with("sec-fetch-"), "{line}");
             }
         }
+    }
+
+    #[test]
+    fn every_answer_that_means_poll_again_pauses_first() {
+        let (outcome, _, _) = run(vec![
+            Ok((200, CREATED)),
+            Ok((202, PENDING)),
+            Ok((409, r#"{"status":"grant_limit"}"#)),
+            Ok((429, r#"{"error":"too many polls"}"#)),
+            Ok((503, r#"{"error":"x"}"#)),
+            Ok((200, r#"{"status":"denied"}"#)),
+        ]);
+        assert_eq!(outcome, GrantOutcome::Denied);
+        assert_eq!(pauses(), 4);
+    }
+
+    #[test]
+    fn a_poll_that_cannot_reach_the_node_retries_the_same_request() {
+        let (outcome, opened, http) = run(vec![
+            Ok((200, CREATED)),
+            Err("Freenet didn't answer (Network Error)"),
+            Err("Freenet didn't answer (Network Error)"),
+            Ok((200, r#"{"status":"approved","token":"t"}"#)),
+        ]);
+        assert_eq!(outcome, GrantOutcome::Approved(GrantToken::new("t".into())));
+        // One page, one request, polled three times.
+        assert_eq!(opened.len(), 1);
+        let calls = http.calls();
+        assert_eq!(calls.iter().filter(|c| c.0 == "POST").count(), 1);
+        assert!(
+            calls[1..]
+                .iter()
+                .all(|c| c.1 == "/v1/app-grants/request/req42")
+        );
+        assert_eq!(pauses(), 2);
+
+        let mut script = vec![Ok((200, CREATED))];
+        script.extend(std::iter::repeat_n(Err("gone"), POLL_RETRIES as usize + 1));
+        let (outcome, _, _) = run(script);
+        assert_eq!(outcome, GrantOutcome::Unreachable("gone".into()));
+    }
+
+    #[test]
+    fn polling_stops_when_the_request_has_expired() {
+        let created =
+            r#"{"request_id":"req42","approve_url":"http://127.0.0.1:7509/a","expires_in_secs":0}"#;
+        let (outcome, opened, _) = run(vec![Ok((200, created))]);
+        assert_eq!(outcome, GrantOutcome::Expired);
+        assert_eq!(opened.len(), 1);
+    }
+
+    #[test]
+    fn a_reply_never_shows_its_body_in_debug_output() {
+        let r = HttpReply {
+            status: 200,
+            body: r#"{"token":"very-secret"}"#.into(),
+        };
+        assert!(!format!("{r:?}").contains("very-secret"));
+    }
+
+    /// A transport error names no URL: the poll URL carries the request id.
+    #[test]
+    fn transport_errors_do_not_name_the_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let http = NodeHttp::new(&format!("http://127.0.0.1:{port}"));
+        let err = http
+            .get("/v1/app-grants/request/secret-request-id")
+            .unwrap_err();
+        assert!(!err.contains("secret-request-id"), "{err}");
+        assert!(!err.contains("127.0.0.1"), "{err}");
     }
 }

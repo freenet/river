@@ -47,7 +47,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         })
         .child(rooms(chat, logo, narrow, &p));
     let Some(room) = chat.room() else {
-        return screen.child(no_rooms(chat.source, &p));
+        return screen.child(no_rooms(chat, &p));
     };
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     if chat.members_shown(narrow) {
@@ -169,7 +169,7 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette) -> El {
             34.0,
             p,
         )))
-        .child(source_status(chat.source, p));
+        .child(source_status(chat, p));
     let column = col()
         .key("rooms")
         .w(width)
@@ -195,8 +195,8 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette) -> El {
 
 /// Where the rooms come from, at the foot of the room list, and for rooms from the node the
 /// connection's state, as the web UI's connection pill shows it.
-fn source_status(source: Source, p: &Palette) -> El {
-    let (text, color) = match source {
+fn source_status(chat: &Chat, p: &Palette) -> El {
+    let (text, color) = match chat.source {
         Source::Example => ("Example rooms, not connected to Freenet", p.text_muted),
         Source::Node(LinkStatus::Loading) => ("Catching up with Freenet…", p.text_muted),
         Source::Node(LinkStatus::Live) => ("Connected to Freenet", p.text_muted),
@@ -205,10 +205,28 @@ fn source_status(source: Source, p: &Palette) -> El {
             p.text_secondary,
         ),
     };
-    row()
+    let mut status = col()
         .key("source-status")
         .px(4.0)
-        .child(label(text, st::SMALL, color).wrap().w_full())
+        .gap(4.0)
+        .child(label(text, st::SMALL, color).wrap().w_full());
+    let stale = &chat.issues.not_updated;
+    if !stale.is_empty() {
+        let names = stale.join(", ");
+        status = status.child(
+            label(
+                format!(
+                    "Couldn't apply the latest from Freenet to: {names}. Showing an older copy."
+                ),
+                st::SMALL,
+                p.text_secondary,
+            )
+            .key("not-updated")
+            .wrap()
+            .w_full(),
+        );
+    }
+    status
 }
 
 /// About how many characters of 12 point text fit in a room row's second line.
@@ -285,9 +303,18 @@ fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
     }
 }
 
-fn no_rooms(source: Source, p: &Palette) -> El {
-    let hint = match source {
+fn no_rooms(chat: &Chat, p: &Palette) -> El {
+    let hint = match chat.source {
         Source::Example => "Create a room, or enter an invite code to join one.",
+        // The node has no chat delegate under the key this build carries: River in the browser
+        // never ran on this node, or it runs a newer delegate than this build knows (rooms
+        // migrate forward with the web UI, so an older app no longer finds them).
+        Source::Node(_) if chat.issues.store_missing => {
+            "River's storage isn't on this computer's Freenet under the version this app knows. \
+             If you have never opened River in your browser on this computer, do that first. If \
+             you have, this app is probably older than River on the web: update it to see your \
+             rooms here."
+        }
         // This app can't create or join rooms yet; the web UI can.
         Source::Node(_) => {
             "Rooms you create or join in River in your browser, on this computer, show up here."
@@ -300,7 +327,12 @@ fn no_rooms(source: Source, p: &Palette) -> El {
         .center()
         .gap(8.0)
         .child(label("No rooms yet", st::TITLE, p.text))
-        .child(label(hint, st::BODY, p.text_secondary))
+        .child(
+            label(hint, st::BODY, p.text_secondary)
+                .key("no-rooms-hint")
+                .wrap()
+                .max_w(460.0),
+        )
 }
 
 // Members -------------------------------------------------------------------------------------

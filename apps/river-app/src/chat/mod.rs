@@ -117,6 +117,8 @@ pub struct Chat {
     /// Whether rooms from the node have been shown yet, so the room the web UI had open opens
     /// only the first time.
     node_rooms_shown: bool,
+    /// What the rooms from the node are missing, for the room list and the empty screen.
+    pub issues: crate::rooms::Issues,
 }
 
 impl Chat {
@@ -136,6 +138,7 @@ impl Chat {
             now,
             read: HashMap::new(),
             node_rooms_shown: false,
+            issues: Default::default(),
         };
         chat.set_rooms(rooms);
         chat

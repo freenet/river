@@ -254,7 +254,17 @@ fn an_invitation_secret_is_used_when_no_blob_is_sealed_to_this_member() {
     let mut stored = f.stored(state.clone());
     let room = LiveRoom::new(stored.clone()).view(&minutes);
     assert_eq!(room.name, "Private room");
-    assert!(room.messages[1].text.starts_with("Decrypting messages"));
+    assert!(
+        room.messages[1]
+            .text
+            .contains("doesn't have the room's secret")
+    );
+    // A nickname that cannot be decrypted is not shown as ciphertext.
+    assert!(
+        room.members
+            .iter()
+            .all(|m| m.nickname.starts_with("Member "))
+    );
 
     stored.invitation_secrets.insert(0, SECRET);
     let room = LiveRoom::new(stored).view(&minutes);
@@ -333,4 +343,255 @@ fn a_delta_adds_messages_and_rebuilds_actions() {
     assert_eq!(room.messages.len(), 3);
     assert_eq!(room.messages[2].text, "Later");
     assert_eq!(room.messages[0].text, "Hello everyone");
+}
+
+/// Add secret `version` to the room, sealed by the owner to `member`.
+fn add_secret(
+    f: &Fixture,
+    state: &mut ChatRoomStateV1,
+    version: u32,
+    secret: &[u8; 32],
+    member: &SigningKey,
+) {
+    if !state
+        .secrets
+        .versions
+        .iter()
+        .any(|v| v.record.version == version)
+    {
+        let record = SecretVersionRecordV1 {
+            version,
+            cipher_spec: RoomCipherSpec::Aes256Gcm,
+            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(version) + 1),
+        };
+        state.secrets.versions.push(AuthorizedSecretVersionRecord {
+            owner_signature: sign_struct(&record, &f.owner),
+            record,
+        });
+        state.secrets.current_version = state.secrets.current_version.max(version);
+    }
+    let (ciphertext, nonce, ephemeral) = encrypt_secret_for_member(secret, &member.verifying_key());
+    let blob = EncryptedSecretForMemberV1 {
+        member_id: MemberId::from(&member.verifying_key()),
+        secret_version: version,
+        ciphertext,
+        nonce,
+        sender_ephemeral_public_key: ephemeral.to_bytes(),
+        provider: f.owner_id(),
+    };
+    state
+        .secrets
+        .encrypted_secrets
+        .push(AuthorizedEncryptedSecretForMember {
+            owner_signature: sign_struct(&blob, &f.owner),
+            secret: blob,
+        });
+}
+
+fn text_at(
+    f: &Fixture,
+    secs: u64,
+    version: u32,
+    secret: &[u8; 32],
+    text: &str,
+) -> AuthorizedMessageV1 {
+    let (ct, nonce) = encrypt_with_symmetric_key(secret, &TextContentV1::new(text.into()).encode());
+    f.message(
+        &f.owner,
+        secs,
+        RoomMessageBody::private_text(ct, nonce, version),
+    )
+}
+
+/// A delta carrying private actions: the edit and the reaction only show if the actions are
+/// rebuilt with the decrypted payloads after the delta lands (`MessagesV1::apply_delta` only
+/// rebuilds public actions).
+#[test]
+fn a_delta_with_private_actions_shows_their_effect() {
+    let f = Fixture::new();
+    let mut live = LiveRoom::new(f.stored(f.private_state()));
+    let reply_id = live.stored.room_state.recent_messages.messages[1].id();
+    let (react_ct, react_nonce) = encrypt_with_symmetric_key(
+        &SECRET,
+        &ActionContentV1::reaction(reply_id.clone(), "🎉".into()).encode(),
+    );
+    let (edit_ct, edit_nonce) = encrypt_with_symmetric_key(
+        &SECRET,
+        &ActionContentV1::edit(reply_id, "Hi Olive, edited".into()).encode(),
+    );
+    let delta = river_core::room_state::ChatRoomStateV1Delta {
+        recent_messages: Some(vec![
+            f.message(
+                &f.owner,
+                500,
+                RoomMessageBody::private_action(react_ct, react_nonce, 0),
+            ),
+            f.message(
+                &f.me,
+                510,
+                RoomMessageBody::private_action(edit_ct, edit_nonce, 0),
+            ),
+        ]),
+        ..Default::default()
+    };
+    live.apply_delta(delta).expect("the delta applies");
+    let room = live.view(&minutes);
+    assert_eq!(room.messages.len(), 2, "actions are not messages");
+    let reply = &room.messages[1];
+    assert_eq!(reply.text, "Hi Olive, edited");
+    assert!(reply.edited);
+    assert_eq!(reply.reactions.len(), 1);
+    assert_eq!(reply.reactions[0].emoji, "🎉");
+    assert_eq!(reply.reactions[0].by, [room.members[0].id]);
+}
+
+/// A whole state from the network merges in, and its private messages decrypt.
+#[test]
+fn a_merged_state_brings_in_new_private_messages() {
+    let f = Fixture::new();
+    let state = f.private_state();
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let mut incoming = state;
+    incoming
+        .recent_messages
+        .messages
+        .push(text_at(&f, 700, 0, &SECRET, "From the network"));
+    live.merge_state(&incoming).expect("merges");
+    let room = live.view(&minutes);
+    assert_eq!(room.messages.last().unwrap().text, "From the network");
+    assert_eq!(
+        room.messages[0].text, "Hello everyone",
+        "actions still apply"
+    );
+}
+
+#[test]
+fn a_public_room_reads_without_secrets() {
+    let f = Fixture::new();
+    let mut state = ChatRoomStateV1 {
+        configuration: AuthorizedConfigurationV1::new(
+            Configuration {
+                owner_member_id: f.owner_id(),
+                display: RoomDisplayMetadata::public("Town".into(), Some("Everyone".into())),
+                ..Configuration::default()
+            },
+            &f.owner,
+        ),
+        ..Default::default()
+    };
+    state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.owner_id(),
+                version: 0,
+                preferred_nickname: SealedBytes::public(b"Olive".to_vec()),
+                deputies: Vec::new(),
+            },
+            &f.owner,
+        ));
+    state.recent_messages.messages =
+        vec![f.message(&f.owner, 60, RoomMessageBody::public("Hello town".into()))];
+    let room = LiveRoom::new(f.stored(state)).view(&minutes);
+    assert!(!room.private);
+    assert_eq!(
+        (room.name.as_str(), room.description.as_str()),
+        ("Town", "Everyone")
+    );
+    assert_eq!(room.messages[0].text, "Hello town");
+    assert_eq!(room.nickname(room.messages[0].author), "Olive");
+}
+
+#[test]
+fn a_blob_sealed_to_another_member_does_not_decrypt() {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    state.secrets.encrypted_secrets.clear();
+    let stranger = SigningKey::from_bytes(&[9; 32]);
+    add_secret(&f, &mut state, 0, &SECRET, &stranger);
+    let room = LiveRoom::new(f.stored(state)).view(&minutes);
+    assert_eq!(room.name, "Private room");
+    assert!(
+        room.messages[1]
+            .text
+            .contains("doesn't have the room's secret")
+    );
+}
+
+/// The owner-signed blob wins over an invitation's copy of the same version, as in the web UI.
+#[test]
+fn the_owner_signed_secret_wins_over_a_wrong_invitation_secret() {
+    let f = Fixture::new();
+    let mut stored = f.stored(f.private_state());
+    stored.invitation_secrets.insert(0, [13; 32]);
+    let room = LiveRoom::new(stored).view(&minutes);
+    assert_eq!(room.name, "Secret garden");
+    assert_eq!(room.messages[1].text, "Hi Olive");
+}
+
+#[test]
+fn messages_under_several_secret_versions_each_decrypt_and_a_missing_one_says_so() {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    let second = [21u8; 32];
+    add_secret(&f, &mut state, 1, &second, &f.me);
+    // Version 2 exists in the room, but nothing seals it to this member.
+    add_secret(
+        &f,
+        &mut state,
+        2,
+        &[22u8; 32],
+        &SigningKey::from_bytes(&[9; 32]),
+    );
+    state
+        .recent_messages
+        .messages
+        .push(text_at(&f, 800, 1, &second, "Under v1"));
+    state
+        .recent_messages
+        .messages
+        .push(text_at(&f, 900, 2, &[22u8; 32], "Under v2"));
+    let room = LiveRoom::new(f.stored(state)).view(&minutes);
+    let texts: Vec<&str> = room.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts[1], "Hi Olive");
+    assert_eq!(texts[2], "Under v1");
+    assert_eq!(texts[3], "[Encrypted message - secret v2 unavailable]");
+}
+
+/// A message's time is its author's choice; no time panics.
+#[test]
+fn any_message_time_shows_without_panicking() {
+    use super::room::local_minutes;
+    assert_eq!(
+        local_minutes(SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
+        0
+    );
+    let far = SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 50);
+    // Clamped to the last representable minute, give or take the local time zone.
+    assert!(local_minutes(far) >= u32::MAX - 24 * 60);
+    let now = local_minutes(SystemTime::now());
+    assert!(now > 29_000_000 && now < 40_000_000, "{now}");
+
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    // A time before 1970 cannot be serialized, so it never arrives; one far ahead can.
+    for (i, t) in [far].into_iter().enumerate() {
+        let (ct, nonce) =
+            encrypt_with_symmetric_key(&SECRET, &TextContentV1::new(format!("t{i}")).encode());
+        state
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: f.owner_id(),
+                    author: f.owner_id(),
+                    time: t,
+                    content: RoomMessageBody::private_text(ct, nonce, 0),
+                },
+                &f.owner,
+            ));
+    }
+    let room = LiveRoom::new(f.stored(state)).view(&local_minutes);
+    assert_eq!(room.messages.len(), 3);
 }

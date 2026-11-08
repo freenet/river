@@ -35,19 +35,38 @@ impl TokenStore {
         let dir = self.path.parent().ok_or("bad token path")?;
         create_private_dir(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
         let err = |e: std::io::Error| format!("couldn't save the Freenet grant: {e}");
-        let tmp = dir.join(format!(".{FILE_NAME}.tmp"));
-        let _ = fs::remove_file(&tmp);
+        // A name of its own, so two saves at once (two app windows) can't write one file.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let tmp = dir.join(format!(".{FILE_NAME}.{}.{nanos}.tmp", std::process::id()));
         let mut file = private_file(&tmp).map_err(err)?;
-        file.write_all(token.expose().as_bytes()).map_err(err)?;
-        file.sync_all().map_err(err)?;
+        let written = file
+            .write_all(token.expose().as_bytes())
+            .and_then(|()| file.sync_all());
         drop(file);
-        fs::rename(&tmp, &self.path).map_err(err)
+        if let Err(e) = written.and_then(|()| fs::rename(&tmp, &self.path)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err(e));
+        }
+        sync_dir(dir);
+        Ok(())
     }
 
     /// Forget the token (the node said it names nothing).
     pub fn discard(&self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Make the rename durable. Best effort, and only meaningful on Unix.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 #[cfg(unix)]

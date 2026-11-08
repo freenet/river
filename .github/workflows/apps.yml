@@ -18,6 +18,8 @@ on:
       - 'common/**'
       # river-core inherits its dependency versions from the root manifest.
       - 'Cargo.toml'
+      # A test checks the apps use the freenet-stdlib river-core resolves to here.
+      - 'Cargo.lock'
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - '.github/workflows/apps.yml'
@@ -28,6 +30,8 @@ on:
       - 'common/**'
       # river-core inherits its dependency versions from the root manifest.
       - 'Cargo.toml'
+      # A test checks the apps use the freenet-stdlib river-core resolves to here.
+      - 'Cargo.lock'
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - '.github/workflows/apps.yml'

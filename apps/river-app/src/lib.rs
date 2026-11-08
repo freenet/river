@@ -125,9 +125,12 @@ impl RiverApp {
                 open,
                 status,
                 now,
-            } => self
-                .chat
-                .show_node_rooms(rooms, open.as_deref(), status, now),
+                issues,
+            } => {
+                self.chat.issues = issues;
+                self.chat
+                    .show_node_rooms(rooms, open.as_deref(), status, now);
+            }
             RoomsUpdate::Status(status) => {
                 if let chat::Source::Node(_) = self.chat.source {
                     self.chat.source = chat::Source::Node(status);
@@ -266,6 +269,22 @@ pub const SCENES: &[Scene] = &[
     ("rooms-unreachable", |s| {
         connect(s);
         s.access = Access::Unreachable("Connection refused".into());
+    }),
+    ("rooms-permission-removed", |s| {
+        connect(s);
+        s.access = Access::PermissionRemoved;
+    }),
+    // The node has no chat delegate under the key this build carries.
+    ("chat-no-store", |s| {
+        connect(s);
+        s.chat = Chat::new(
+            chat::Source::Node(chat::LinkStatus::Live),
+            Vec::new(),
+            0,
+            0,
+            0,
+        );
+        s.chat.issues.store_missing = true;
     }),
 ];
 
@@ -425,6 +444,15 @@ fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
                 "Freenet's page in your browser was answered with Deny. To see your rooms here, \
                  ask again and choose Allow."
             },
+            None,
+            vec![ask_again_button(k)],
+        ),
+        Access::PermissionRemoved => panel(
+            t,
+            "River's permission was removed",
+            "River no longer has Freenet's permission to open your rooms: it was revoked on \
+             Freenet's Apps and permissions page, or Freenet lost it. Ask again to see your \
+             rooms here.",
             None,
             vec![ask_again_button(k)],
         ),
@@ -787,6 +815,7 @@ mod tests {
                     Access::Unsupported => "rooms-unsupported",
                     Access::Refused(_) => "rooms-refused",
                     Access::Unreachable(_) => "rooms-unreachable",
+                    Access::PermissionRemoved => "rooms-permission-removed",
                 },
             }
         }
@@ -806,7 +835,7 @@ mod tests {
             .collect();
         covered.sort();
         covered.dedup();
-        assert_eq!(covered.len(), 17, "{covered:?}");
+        assert_eq!(covered.len(), 18, "{covered:?}");
     }
 
     /// The logo is a gradient SVG shared with the web UI; this fails if an edit there breaks
@@ -878,6 +907,7 @@ mod tests {
             ),
             (Access::NotApproved { expired: false }, &["ask-again"][..]),
             (Access::NotApproved { expired: true }, &["ask-again"][..]),
+            (Access::PermissionRemoved, &["ask-again"][..]),
             (Access::Unsupported, &["rooms-retry", "manual"][..]),
             (Access::Refused("no".into()), &["rooms-retry"][..]),
             (Access::Unreachable("down".into()), &[][..]),
@@ -929,6 +959,7 @@ mod tests {
                     open: Some(first),
                     status: chat::LinkStatus::Loading,
                     now: 29_000_000,
+                    issues: Default::default(),
                 },
                 tx,
             );
