@@ -1083,8 +1083,8 @@ mod runtime {
     /// Deliberately broad. Every modal in this app renders a full-screen
     /// `fixed inset-0` overlay only while it is open, so any visible overlay
     /// means a dialog, picker or menu is up (with whatever is typed in it).
-    /// The reaction picker, a native popover with no overlay, is checked on
-    /// its own.
+    /// The reaction picker, a native popover with no overlay, and the mobile
+    /// message surfaces, modal dialogs, are checked on their own.
     /// Beyond that: unsent text in the room composer, a message being edited,
     /// any focused text field with something in it, and an invitation being
     /// accepted.
@@ -1117,6 +1117,14 @@ mod runtime {
         // overlay for the check below to see. Only while it is open; the
         // element stays mounted closed.
         if crate::components::conversation::reaction_picker_is_open() {
+            return true;
+        }
+        // A mobile actions sheet or reaction popup (below 48rem): open while
+        // its modal dialog is, an empty reaction field with the keyboard up
+        // included. Asked directly rather than left to the overlay check
+        // below, which looks for a class it does not carry. Closed, the
+        // dialogs stay mounted and hold nothing.
+        if crate::components::conversation::mobile_surface_is_open() {
             return true;
         }
         if let Ok(overlays) = document.query_selector_all(".fixed.inset-0") {
@@ -3026,6 +3034,10 @@ mod tests {
         assert!(
             busy.contains("reaction_picker_is_open()"),
             "an open reaction picker (a popover, no overlay) must hold it too"
+        );
+        assert!(
+            busy.contains("mobile_surface_is_open()"),
+            "an open mobile actions sheet or reaction popup must hold it too"
         );
         let flush_at = code.find("async fn reload_after_flush(").expect("flush");
         let flush = &code[flush_at..];

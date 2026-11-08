@@ -366,6 +366,290 @@
     box-shadow: 0 0 0 2px var(--color-accent);
 }
 
+/* Below Tailwind's `md` (48rem; the same query as `mobile_surface.rs`, the
+ * exact complement of `(min-width: 48rem)`, so no fractional width falls
+ * between): a message's trailing Reply, Edit and Delete are gone, hits and
+ * tab stops included, and a tap on the row opens them in the actions sheet.
+ * Its one reaction + stays, visible and tappable at rest on any pointer (a
+ * narrow mouse window too), after its chips. The footer keeps its line for
+ * the + alone. DM rows have no footer and are untouched. */
+@media not all and (min-width: 48rem) {
+    .msg-action-cluster {
+        display: none;
+    }
+
+    .msg-reaction-row > .msg-action {
+        opacity: 1;
+        pointer-events: auto;
+    }
+}
+
+/* The row's keyboard way into its actions sheet: below 48rem only, visually
+ * hidden until it has keyboard focus, then a small pill at the row's top
+ * right. At 48rem and wider it is not there at all. */
+.mobile-actions-entry {
+    display: none;
+}
+
+@media not all and (min-width: 48rem) {
+    .mobile-actions-entry {
+        display: block;
+        position: absolute;
+        top: 0;
+        right: 0;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        border: 0;
+    }
+
+    .mobile-actions-entry:focus-visible {
+        width: auto;
+        height: auto;
+        min-height: 32px;
+        padding: 4px 12px;
+        clip-path: none;
+        border-radius: 9999px;
+        border: 1px solid var(--color-border);
+        background: var(--color-panel);
+        color: var(--color-text);
+        font-size: 13px;
+        font-weight: 600;
+        outline: 2px solid var(--color-link);
+        outline-offset: 1px;
+        z-index: 1;
+    }
+}
+
+/* The two mobile surfaces (`mobile_message_actions.rs`,
+ * `mobile_reaction_input.rs`): a native modal <dialog> each, in the top layer
+ * over the header, history, composer and Latest. The dialog itself spans the
+ * viewport, transparent, so a tap outside the panel lands on the backdrop
+ * inside it, which dismisses; `::backdrop` dims. Its panel sits at the bottom
+ * with modest side spacing, rounded top corners and safe-area padding, lifted
+ * above the software keyboard and capped to the visible height while open
+ * (the two custom properties, set from `visualViewport`; `dvh` is only the
+ * fallback, since the keyboard does not shrink it on every browser). It
+ * scrolls itself when it does not fit; scrolling it never scrolls the page. */
+.mobile-sheet {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--color-text);
+    overflow: hidden;
+}
+
+.mobile-sheet:not([open]) {
+    display: none;
+}
+
+.mobile-sheet::backdrop {
+    background: rgb(0 0 0 / 0.5);
+}
+
+.mobile-sheet-backdrop {
+    position: absolute;
+    inset: 0;
+}
+
+.mobile-sheet-panel {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: var(--mobile-sheet-keyboard, 0px);
+    max-width: 32rem;
+    margin-inline: auto;
+    max-height: calc(100vh - 16px);
+    max-height: calc(var(--mobile-sheet-viewport, 100dvh) - 16px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 6px 12px max(12px, env(safe-area-inset-bottom));
+    border: 1px solid var(--color-border);
+    border-bottom: 0;
+    border-radius: 16px 16px 0 0;
+    background: var(--color-panel);
+    box-shadow: 0 -8px 24px rgb(0 0 0 / 0.18);
+}
+
+.mobile-sheet-handle {
+    width: 36px;
+    height: 4px;
+    margin: 2px auto 6px;
+    border-radius: 9999px;
+    background: var(--color-border-hover, var(--color-border));
+}
+
+.mobile-sheet-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.mobile-sheet-title {
+    font-size: 15px;
+    font-weight: 700;
+}
+
+.mobile-sheet-close {
+    width: 44px;
+    height: 44px;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 9999px;
+    color: var(--color-text-muted);
+}
+
+.mobile-sheet-close:hover,
+.mobile-sheet-close:focus-visible {
+    color: var(--color-text);
+    background: var(--color-surface);
+}
+
+.mobile-sheet-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.mobile-sheet-action {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-height: 48px;
+    padding: 0 12px;
+    border-radius: 10px;
+    font-size: 16px;
+    text-align: left;
+    color: var(--color-text);
+}
+
+.mobile-sheet-action > svg {
+    color: var(--color-text-muted);
+}
+
+.mobile-sheet-action:hover,
+.mobile-sheet-action:focus-visible {
+    background: var(--color-surface);
+}
+
+.mobile-sheet-action--danger,
+.mobile-sheet-action--danger > svg {
+    color: var(--color-danger-text);
+}
+
+.mobile-sheet :focus-visible {
+    outline: 2px solid var(--color-link);
+    outline-offset: 1px;
+}
+
+.mobile-reaction-label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+}
+
+/* 16px, so iOS does not zoom the page when it takes focus. */
+.mobile-reaction-input {
+    width: 100%;
+    min-height: 44px;
+    padding: 8px 12px;
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-size: 16px;
+}
+
+.mobile-reaction-input[aria-invalid="true"] {
+    border-color: var(--color-danger);
+}
+
+.mobile-reaction-hint {
+    margin-top: 4px;
+    font-size: 13px;
+    color: var(--color-text-muted);
+}
+
+.mobile-reaction-error {
+    margin-top: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-danger-text);
+}
+
+.mobile-reaction-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.mobile-sheet-primary,
+.mobile-sheet-secondary {
+    min-height: 44px;
+    padding: 0 16px;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+/* The dialogs' primary: raised neutral with a hairline, never a solid
+ * accent fill. */
+.mobile-sheet-primary {
+    border: 1px solid var(--color-border-hover, var(--color-border));
+    background: var(--color-panel);
+    color: var(--color-text);
+}
+
+.mobile-sheet-secondary {
+    color: var(--color-link);
+}
+
+.mobile-sheet-primary:hover,
+.mobile-sheet-secondary:hover {
+    background: var(--color-surface);
+}
+
+.mobile-reaction-palette {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+    gap: 4px;
+    margin-top: 10px;
+}
+
+.mobile-reaction-choice {
+    min-height: 44px;
+    border-radius: 10px;
+    font-size: 22px;
+    line-height: 1;
+}
+
+.mobile-reaction-choice:hover {
+    background: var(--color-surface);
+}
+
+.mobile-reaction-choice--current {
+    background-color: color-mix(in srgb, var(--color-accent) 20%, transparent);
+    box-shadow: inset 0 0 0 2px var(--color-accent);
+}
+
 /* Join notices: one quiet line, the icon in the avatar gutter. */
 .msg-event {
     display: grid;

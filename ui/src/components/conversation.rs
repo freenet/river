@@ -45,8 +45,14 @@ pub(crate) use self::outbox_commit::clear_room_now as clear_outbox_for_room_now;
 pub(crate) use self::outbox_commit::{
     has_signing as outbox_has_signing, has_unsent as outbox_has_unsent,
 };
+mod mobile_message_actions;
+mod mobile_reaction_input;
+mod mobile_surface;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 mod pending_effects;
 mod pending_sends;
+mod reaction_input;
 mod reaction_picker;
 mod reply_highlight;
 #[cfg(target_arch = "wasm32")]
@@ -65,6 +71,9 @@ use self::markdown::{
     clean_reply_preview, description_to_html, member_names_fingerprint, prune_message_html_cache,
     render_message_html_cached, running_behind_freenet_gateway,
 };
+use self::mobile_message_actions::{MobileAction, MobileActionsEntry, MobileMessageActionsSheet};
+use self::mobile_reaction_input::MobileReactionPopup;
+use self::mobile_surface::{MobileOpening, MobileSurface, MobileSurfaceGuard};
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
@@ -2394,6 +2403,43 @@ pub fn Conversation() -> Element {
             }
         }
     });
+    // The mobile actions sheet's actions (`mobile_message_actions.rs`), run
+    // after the sheet has closed. Checked here against the messages as they
+    // are now, not as the sheet opened on them: the row must still hold that
+    // message, and Edit and Delete must still be on your own. Each then goes
+    // the way the footer's control does.
+    let on_mobile_action = use_callback(
+        move |(action, row, message): (MobileAction, String, MessageId)| {
+            let groups = message_groups.peek();
+            let Some((items, _, member_names, _, _, _)) = groups.as_deref() else {
+                return;
+            };
+            let Some((group, msg)) = items.iter().find_map(|item| match item {
+                DisplayItem::Messages(group) => group
+                    .messages
+                    .iter()
+                    .find(|m| m.id == row && m.message_id == message)
+                    .map(|m| (group, m)),
+                DisplayItem::Event(_) => None,
+            }) else {
+                return;
+            };
+            match action {
+                MobileAction::Reply => on_group_reply.call(ReplyContext {
+                    message_id: msg.message_id.clone(),
+                    author_name: group.author_name.clone(),
+                    content_preview: reply_preview(&msg.content_text, member_names),
+                }),
+                MobileAction::Edit if group.is_self => {
+                    edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
+                }
+                MobileAction::Delete if group.is_self => {
+                    on_group_request_delete.call(msg.message_id.clone());
+                }
+                MobileAction::Edit | MobileAction::Delete => {}
+            }
+        },
+    );
 
     rsx! {
         div { class: "flex-1 flex flex-col min-w-0 bg-panel",
@@ -3163,6 +3209,15 @@ pub fn Conversation() -> Element {
 
             // The one reaction picker, opened by a message's footer React.
             ReactionPicker { surfaces: reaction_surfaces, on_react: on_group_react }
+            // Below 48rem: the actions sheet a row tap opens, the reaction
+            // popup its + opens, and what closes either at 48rem, outside
+            // the chat or across a re-key (`mobile_surface.rs`).
+            MobileMessageActionsSheet { surfaces: reaction_surfaces, on_action: on_mobile_action }
+            MobileReactionPopup { surfaces: reaction_surfaces, on_react: on_group_react }
+            MobileSurfaceGuard {
+                surfaces: reaction_surfaces,
+                contract_key: current_room_data.as_ref().map(|room| room.contract_key),
+            }
 
             // Message input or status
             {
@@ -3955,9 +4010,11 @@ fn MessageGroupComponent(
                     let Some((key, message_id)) = previous else {
                         return;
                     };
-                    // Closed because the picker opened (React from the
-                    // keyboard): focus stays where the reader put it.
-                    if reaction_picker_is_open() {
+                    // Closed because the picker or a mobile surface opened
+                    // (React from the keyboard, a tap below 48rem): focus
+                    // stays where the reader put it, never pulled out of the
+                    // surface (or its field, which would close the keyboard).
+                    if reaction_picker_is_open() || mobile_surface_is_open() {
                         return;
                     }
                     if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
@@ -4072,6 +4129,12 @@ fn MessageGroupComponent(
                         let is_first = idx == 0;
                         let reply_strip_val = msg.reply_strip.clone();
                         let row_time = row_time_labels(&msg);
+                        // Below 48rem a tap on the row opens its actions
+                        // sheet (`mobile_message_actions.rs`); a row being
+                        // edited has the form instead.
+                        let row_editing = editing_message.read().as_ref() == Some(&msg.id);
+                        let (tap_row, tap_message) = (msg.id.clone(), msg.message_id.clone());
+                        let press_row = msg.id.clone();
 
                         rsx! {
                             // One row per message (`.msg-row` in main.css): the
@@ -4085,14 +4148,40 @@ fn MessageGroupComponent(
                                 "data-testid": "message-row",
                                 "data-message-self": "{is_self}",
                                 class: "msg-row group",
+                                onpointerdown: move |e: PointerEvent| {
+                                    mobile_message_actions::note_row_press(&press_row, &e)
+                                },
+                                onpointerup: move |e: PointerEvent| {
+                                    mobile_message_actions::note_row_release(&e, false)
+                                },
+                                onpointercancel: move |e: PointerEvent| {
+                                    mobile_message_actions::note_row_release(&e, true)
+                                },
+                                onclick: move |e: MouseEvent| {
+                                    if !row_editing
+                                        && mobile_message_actions::row_tap_opens_actions(&e, &tap_row)
+                                    {
+                                        let opening = MobileOpening::new(
+                                            MobileSurface::Actions,
+                                            tap_row.clone(),
+                                            tap_message.clone(),
+                                            is_self,
+                                            None,
+                                        );
+                                        mobile_message_actions::open_actions(reactions, opening);
+                                    }
+                                },
                                 div {
                                     class: "msg-gutter",
                                     if is_first {
                                         // Decorative for assistive tech: the name
                                         // button beside it is the accessible
                                         // control, so this is no tab stop either.
+                                        // Its click opens the author's info, not
+                                        // the row's actions.
                                         div {
                                             "data-testid": "message-author-avatar",
+                                            "data-row-actions": "exclude",
                                             "aria-hidden": "true",
                                             class: "{avatar_class}",
                                             style: avatar_style.clone(),
@@ -4474,6 +4563,8 @@ fn MessageGroupComponent(
                                         // A row being edited has the form's own buttons.
                                         let show_actions = editing_message.read().as_ref() != Some(&msg.id);
                                         let row_for_invoker = msg.id.clone();
+                                        let row_for_entry = msg.id.clone();
+                                        let msg_id_for_entry = msg.message_id.clone();
                                         let msg_id_str_for_edit = msg.id.clone();
                                         let msg_id_for_delete = msg.message_id.clone();
                                         let msg_id_for_reply = msg.message_id.clone();
@@ -4505,8 +4596,12 @@ fn MessageGroupComponent(
                                             div {
                                                 "data-testid": "message-reaction-row",
                                                 // The chips, then React: the message's one way
-                                                // into the picker, which opens at it.
+                                                // into the picker, which opens at it. Taps here
+                                                // (a chip, its reactor list and that list's
+                                                // backdrop, React) never open the row's
+                                                // actions.
                                                 class: "msg-reaction-row",
+                                                "data-row-actions": "exclude",
                                                 // Existing reactions (clickable to toggle if user has reacted)
                                                 {
                                                     let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
@@ -4761,6 +4856,17 @@ fn MessageGroupComponent(
                                                         message: msg_id_for_invoker,
                                                         current: user_reaction,
                                                     }
+                                                }
+                                            }
+                                            // Below 48rem the cluster is hidden: a tap on the
+                                            // row opens its actions, and this hidden button
+                                            // is the keyboard's way in.
+                                            if show_actions {
+                                                MobileActionsEntry {
+                                                    surfaces: reactions,
+                                                    row: row_for_entry,
+                                                    message: msg_id_for_entry,
+                                                    own: is_self,
                                                 }
                                             }
                                             // Reply, Edit and Delete: one unit, which wraps
