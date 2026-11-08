@@ -12,11 +12,15 @@
 //! other programs of the same user as a boundary either (freenet-core `app_grants.rs`, "What
 //! this does NOT protect against").
 //!
-//! It only reads. It never PUTs (not even the web UI's seed PUT for a room the network
-//! doesn't have), never sends an UPDATE, and never writes delegate storage.
+//! It sends what the user writes in a room they are a member of: messages, replies, edits and
+//! deletions of their own messages, and reactions, each as an UPDATE of the room contract
+//! ([`outbox`]). It never PUTs (not even the web UI's seed PUT for a room the network doesn't
+//! have), never creates, joins or invites, and never writes delegate storage: the web UI owns
+//! that, and two writers to it are what would lose data.
 
 pub mod delegate;
 pub mod grant;
+pub mod outbox;
 pub mod room;
 #[cfg(test)]
 mod room_tests;
@@ -25,9 +29,11 @@ pub mod socket;
 pub mod token;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
+pub use outbox::{Action, Command};
 pub use session::{Access, Issues, LinkStatus, RoomsUpdate};
 
 /// The node's client API on this computer.
@@ -45,6 +51,12 @@ struct Inner {
     config_dir: Option<PathBuf>,
     authority: String,
     running: AtomicBool,
+    /// What the user did, for the background work. The receiving end is held by the one
+    /// session running at a time.
+    commands: Mutex<Sender<Command>>,
+    inbox: Mutex<Receiver<Command>>,
+    /// What the user sent that the node has not taken, kept while no session runs.
+    outbox: Mutex<outbox::Outbox>,
 }
 
 impl Link {
@@ -64,13 +76,25 @@ impl Link {
         config_dir: Option<PathBuf>,
         report: impl Fn(RoomsUpdate) + Send + Sync + 'static,
     ) -> Self {
+        let (tx, rx) = channel();
         Link {
             inner: Arc::new(Inner {
                 report: Box::new(report),
                 config_dir,
                 authority: authority.to_owned(),
                 running: AtomicBool::new(false),
+                commands: Mutex::new(tx),
+                inbox: Mutex::new(rx),
+                outbox: Mutex::new(outbox::Outbox::default()),
             }),
+        }
+    }
+
+    /// Hand something the user did to the background work. It shows in the next update.
+    pub fn send(&self, command: Command) {
+        if let Ok(tx) = self.inner.commands.lock() {
+            // The receiver lives as long as the link, so this cannot fail.
+            let _ = tx.send(command);
         }
     }
 
@@ -85,12 +109,24 @@ impl Link {
         std::thread::spawn(move || {
             let report = |u: RoomsUpdate| (inner.report)(u);
             let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Only one session runs at a time (`running`), so this is never contended; a
+                // poisoned lock only means an earlier session panicked, which is reported.
+                let inbox = inner
+                    .inbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut outbox = inner
+                    .outbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 session::run(
                     &inner.authority,
                     inner.config_dir.as_deref(),
                     &report,
                     &session::Pace::default(),
                     &|| false,
+                    &inbox,
+                    &mut outbox,
                 )
             }))
             .unwrap_or_else(|_| {

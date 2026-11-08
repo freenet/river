@@ -3,6 +3,7 @@
 use rune::{Env, Key, KeyEvent, Runtime};
 
 use super::example::{EMPTY_ROOM, PRIVATE_ROOM};
+use crate::rooms::{Action, Command};
 use crate::{NARROW_SCENE_SIZE, RiverApp, SCENES, Setup, WINDOW_SIZE, scene_size, view};
 
 fn connected() -> RiverApp {
@@ -30,6 +31,17 @@ fn press(rt: &mut Runtime<RiverApp>, key: &str) {
     rt.pointer_up(x, y);
     rt.frame(0.1);
     rt.frame(0.2);
+}
+
+/// Press a control that shows only while the pointer is over its message: hover first, as a
+/// person does.
+fn hover_press(rt: &mut Runtime<RiverApp>, key: &str) {
+    let (x, y) = rt.find(key).unwrap_or_else(|| panic!("no element {key}"));
+    rt.pointer_move(x, y);
+    for i in 1..30 {
+        rt.frame(f64::from(i) * 0.05);
+    }
+    press(rt, key);
 }
 
 fn key(rt: &mut Runtime<RiverApp>, key: Key) {
@@ -334,7 +346,11 @@ fn the_town_square_history_renders_its_parts() {
     // The release notes message's address is a link (`find` also finds link boxes).
     assert!(rt.find("https://freenet.org/news").is_some());
     assert!(rt.find("reply").is_some());
-    assert!(rt.find("reaction-🎉").is_some());
+    assert!(rt.elements().iter().any(|e| {
+        e.key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("reaction-") && k.ends_with("-🎉"))
+    }));
     assert!(rt.find("tag-owner").is_some());
 }
 
@@ -414,24 +430,302 @@ fn node_chat() -> RiverApp {
     s
 }
 
-#[test]
-fn rooms_from_the_node_are_read_only() {
+fn node_rooms(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
     let mut s = node_chat();
-    s.chat.show_node_rooms(
-        super::example::data().rooms,
-        None,
-        super::LinkStatus::Live,
-        29_000_000,
-    );
-    let mut rt = render(s, WINDOW_SIZE);
+    let mut rooms = super::example::data().rooms;
+    edit(&mut rooms);
+    s.chat
+        .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_000);
+    render(s, WINDOW_SIZE)
+}
+
+fn sent(rt: &mut Runtime<RiverApp>) -> Vec<Action> {
+    std::mem::take(&mut rt.state.chat.outgoing)
+        .into_iter()
+        .map(|c| c.action)
+        .collect()
+}
+
+/// A message in the open room by its author: (key, is it mine).
+fn message_of(rt: &Runtime<RiverApp>, mine: bool) -> String {
+    let room = rt.state.chat.room().unwrap();
+    room.messages
+        .iter()
+        .rev()
+        .find(|m| (m.author == room.me) == mine)
+        .unwrap()
+        .key
+        .clone()
+}
+
+#[test]
+fn a_message_typed_in_a_node_room_goes_to_the_node_and_is_not_added_here() {
+    let mut rt = node_rooms(|_| {});
+    let room = rt.state.chat.room().unwrap().key.clone();
     let before = rt.state.chat.room().unwrap().messages.len();
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("hello node".into()));
+    key(&mut rt, Key::Enter);
+    let commands = std::mem::take(&mut rt.state.chat.outgoing);
+    assert_eq!(
+        commands,
+        [Command {
+            room,
+            action: Action::Send {
+                text: "hello node".into(),
+                reply_to: None
+            }
+        }]
+    );
+    // The node's next update shows it; nothing is made up here meanwhile.
+    assert_eq!(rt.state.chat.room().unwrap().messages.len(), before);
+    assert_eq!(rt.state.chat.composer.text, "");
+}
+
+#[test]
+fn a_room_the_user_cannot_send_in_says_why_and_takes_nothing() {
+    let reason = "You have been banned from sending messages in this room.";
+    let mut rt = node_rooms(|rooms| {
+        for r in rooms {
+            r.send_block = Some(reason.into());
+        }
+    });
+    assert!(shows(&rt, reason));
     rt.state.chat.composer.replace_text("hello");
     assert!(!rt.state.chat.send());
-    let (x, y) = rt.find("send").expect("the send button is drawn");
-    rt.pointer_down(x, y);
-    rt.pointer_up(x, y);
-    rt.frame(1.0 / 60.0);
-    assert_eq!(rt.state.chat.room().unwrap().messages.len(), before);
+    press(&mut rt, "send");
+    let target = message_of(&rt, false);
+    // No action bar either, and the actions do nothing if reached another way.
+    assert!(rt.find(&format!("reply-{target}")).is_none());
+    rt.state.chat.start_reply(&target);
+    rt.state.chat.react(&target, "👍");
+    assert!(rt.state.chat.outgoing.is_empty());
+}
+
+#[test]
+fn reply_edit_delete_and_react_become_commands() {
+    let mut rt = node_rooms(|_| {});
+    let theirs = message_of(&rt, false);
+    let mine = message_of(&rt, true);
+    // Only your own messages offer Edit and Delete.
+    assert!(rt.find(&format!("edit-{theirs}")).is_none());
+    assert!(rt.find(&format!("delete-{theirs}")).is_none());
+
+    hover_press(&mut rt, &format!("reply-{theirs}"));
+    assert!(rt.find("replying").is_some());
+    key(&mut rt, Key::Text("agreed".into()));
+    key(&mut rt, Key::Enter);
+    assert_eq!(
+        sent(&mut rt),
+        [Action::Send {
+            text: "agreed".into(),
+            reply_to: Some(theirs.clone())
+        }]
+    );
+    assert!(rt.find("replying").is_none());
+
+    // Editing takes the composer and gives the draft back afterwards.
+    rt.state.chat.composer.replace_text("my draft");
+    let old = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .message_by_key(&mine)
+        .unwrap()
+        .text
+        .clone();
+    hover_press(&mut rt, &format!("edit-{mine}"));
+    assert_eq!(rt.state.chat.composer.text, old);
+    rt.state.chat.composer.replace_text("fixed text");
+    key(&mut rt, Key::Enter);
+    assert_eq!(
+        sent(&mut rt),
+        [Action::Edit {
+            target: mine.clone(),
+            text: "fixed text".into()
+        }]
+    );
+    assert_eq!(rt.state.chat.composer.text, "my draft");
+
+    hover_press(&mut rt, &format!("delete-{mine}"));
+    assert!(sent(&mut rt).is_empty(), "deleting asks first");
+    press(&mut rt, "confirm-delete");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::Delete {
+            target: mine.clone()
+        }]
+    );
+
+    hover_press(&mut rt, &format!("react-{theirs}"));
+    press(&mut rt, &format!("pick-{theirs}-0"));
+    assert_eq!(
+        sent(&mut rt),
+        [Action::React {
+            target: theirs.clone(),
+            emoji: "👍".into()
+        }]
+    );
+    assert!(rt.state.chat.picker.is_none());
+}
+
+#[test]
+fn pressing_a_reaction_toggles_it() {
+    let mut rt = node_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        let last = room.messages.len() - 1;
+        room.messages[last].reactions = vec![super::Reaction {
+            emoji: "🎉".into(),
+            by: vec![me],
+        }];
+    });
+    let target = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .last_message()
+        .unwrap()
+        .key
+        .clone();
+    press(&mut rt, &format!("reaction-{target}-🎉"));
+    assert_eq!(
+        sent(&mut rt),
+        [Action::React {
+            target,
+            emoji: "🎉".into()
+        }]
+    );
+}
+
+#[test]
+fn a_message_on_its_way_and_one_that_failed_say_so() {
+    let mut rt = node_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let n = room.messages.len();
+        room.messages[n - 1].author = room.me;
+        room.messages[n - 1].pending = Some(super::model::Pending {
+            entry: 7,
+            failed: Some("Freenet refused it: too big".into()),
+            retry: true,
+        });
+        room.messages[n - 2].author = room.me;
+        room.messages[n - 2].pending = Some(super::model::Pending {
+            entry: 6,
+            failed: None,
+            retry: false,
+        });
+        room.notices = vec![super::model::Notice {
+            entry: 9,
+            text: "Your reaction couldn't be sent. Freenet refused it: no".into(),
+            retry: true,
+        }];
+    });
+    assert!(shows(&rt, "Sending…"));
+    assert!(shows(&rt, "Not sent. Freenet refused it: too big"));
+    assert!(shows(&rt, "Your reaction couldn't be sent."));
+    // A message on its way can't be acted on yet.
+    let pending = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .key
+        .clone();
+    assert!(rt.find(&format!("actions-{pending}")).is_none());
+    press(&mut rt, "retry-7");
+    press(&mut rt, "discard-7");
+    press(&mut rt, "retry-9");
+    press(&mut rt, "dismiss-9");
+    assert_eq!(
+        sent(&mut rt),
+        [
+            Action::Retry { entry: 7 },
+            Action::Discard { entry: 7 },
+            Action::Retry { entry: 9 },
+            Action::Discard { entry: 9 },
+        ]
+    );
+}
+
+#[test]
+fn an_edit_starts_from_the_text_as_written_so_mentions_survive() {
+    let token = "@[Ada](rv:0011223344556677)";
+    let mut rt = node_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        let m = room
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.author == me)
+            .unwrap();
+        m.text = "hi @Ada".into();
+        m.source = format!("hi {token}");
+    });
+    let mine = message_of(&rt, true);
+    rt.state.chat.start_edit(&mine);
+    assert_eq!(rt.state.chat.composer.text, format!("hi {token}"));
+}
+
+#[test]
+fn switching_rooms_ends_a_reply_or_edit() {
+    let mut rt = node_rooms(|_| {});
+    let mine = message_of(&rt, true);
+    rt.state.chat.composer.replace_text("draft A");
+    rt.state.chat.start_edit(&mine);
+    press(&mut rt, &format!("room-{PRIVATE_ROOM}"));
+    assert!(matches!(rt.state.chat.mode, super::Mode::Write));
+    press(
+        &mut rt,
+        &format!("room-{}", super::example::data().rooms[0].key),
+    );
+    assert_eq!(rt.state.chat.composer.text, "draft A");
+}
+
+#[test]
+fn example_rooms_reply_edit_delete_and_react_in_memory() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let theirs = message_of(&rt, false);
+    let mine = message_of(&rt, true);
+    rt.state.chat.start_reply(&theirs);
+    rt.state.chat.composer.replace_text("a reply");
+    assert!(rt.state.chat.send());
+    let room = rt.state.chat.room().unwrap();
+    let reply = room.last_message().unwrap();
+    assert_eq!(reply.text, "a reply");
+    assert_eq!(
+        reply.reply_to.as_ref().map(|r| r.message),
+        room.message_by_key(&theirs).map(|m| m.id)
+    );
+    rt.state.chat.start_edit(&mine);
+    rt.state.chat.composer.replace_text("edited");
+    assert!(rt.state.chat.send());
+    let m = rt.state.chat.room().unwrap().message_by_key(&mine).unwrap();
+    assert!(m.edited && m.text == "edited");
+    rt.state.chat.react(&theirs, "👍");
+    assert_eq!(
+        rt.state.chat.room().unwrap().own_reaction(&theirs),
+        Some("👍")
+    );
+    rt.state.chat.react(&theirs, "👍");
+    assert_eq!(rt.state.chat.room().unwrap().own_reaction(&theirs), None);
+    rt.state.chat.ask_delete(&mine);
+    rt.state.chat.confirm_delete();
+    assert!(
+        rt.state
+            .chat
+            .room()
+            .unwrap()
+            .message_by_key(&mine)
+            .is_none()
+    );
+    assert!(rt.state.chat.outgoing.is_empty());
 }
 
 #[test]
@@ -482,23 +776,29 @@ fn a_room_read_here_counts_unread_from_where_it_was_read() {
     for (n, time) in [(1, last.time), (2, last.time + 1)] {
         room.messages.push(super::Message {
             id: last.id + n,
+            key: format!("k{n}"),
             author: someone,
             time,
             text: "new".into(),
+            source: "new".into(),
             reply_to: None,
             reactions: vec![],
             edited: false,
+            pending: None,
         });
     }
     // And one of this user's own, which is never unread.
     room.messages.push(super::Message {
         id: last.id + 3,
+        key: "k3".into(),
         author: room.me,
         time: last.time + 2,
         text: "mine".into(),
+        source: "mine".into(),
         reply_to: None,
         reactions: vec![],
         edited: false,
+        pending: None,
     });
     chat.show_node_rooms(rooms, None, super::LinkStatus::Live, 0);
     assert_eq!(unread(&chat), 2);

@@ -83,15 +83,19 @@ impl RiverApp {
     /// through `link` once one answers.
     pub fn attached(ctl: Controller, link: rooms::Link) -> Self {
         ctl.check();
+        let mut chat = Chat::new(
+            chat::Source::Node(chat::LinkStatus::Loading),
+            Vec::new(),
+            0,
+            0,
+            0,
+        );
+        // What the user does in a room goes to the background work, which sends it.
+        let sink = link.clone();
+        chat.set_sink(Box::new(move |command| sink.send(command)));
         RiverApp {
             setup: Setup::Checking,
-            chat: Chat::new(
-                chat::Source::Node(chat::LinkStatus::Loading),
-                Vec::new(),
-                0,
-                0,
-                0,
-            ),
+            chat,
             access: Access::Connecting,
             ctl: Some(ctl),
             link: Some(link),

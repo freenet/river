@@ -38,17 +38,46 @@ pub struct ReplyTo {
     pub preview: String,
 }
 
+/// A message of yours that the node has not taken yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    /// Its entry in the outbox, for Retry and Discard.
+    pub entry: u64,
+    /// Why it was not sent; `None` while it is still being sent.
+    pub failed: Option<String>,
+    /// Whether Retry can send it again.
+    pub retry: bool,
+}
+
+/// Something you did that could not be sent and has no message row to say so on (an edit, a
+/// deletion, a reaction).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub entry: u64,
+    pub text: String,
+    /// Whether Retry can send it again (not when what it acted on is gone).
+    pub retry: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub id: MessageId,
+    /// Stable across updates, unlike `id`: what an action on this message names.
+    pub key: String,
     pub author: MemberId,
     /// Minutes since the start of day 0 of message time. The chat knows which calendar date
     /// day 0 is (`Chat::day_zero`), which the day headings use.
     pub time: u32,
     pub text: String,
+    /// The text as written, which an edit starts from: mention tokens (`@[name](rv:id)`) as
+    /// they are stored, where `text` shows names. Empty when this computer can't read the
+    /// message, which then can't be edited.
+    pub source: String,
     pub reply_to: Option<ReplyTo>,
     pub reactions: Vec<Reaction>,
     pub edited: bool,
+    /// `Some` for a message of yours still on its way, or one that failed.
+    pub pending: Option<Pending>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +93,10 @@ pub struct Room {
     pub me: MemberId,
     /// Messages that arrived since this device last read the room.
     pub unread: usize,
+    /// Why you can't send here, if you can't: the composer says it instead of taking text.
+    pub send_block: Option<String>,
+    /// Edits, deletions and reactions of yours that could not be sent.
+    pub notices: Vec<Notice>,
 }
 
 impl Room {
@@ -94,14 +127,99 @@ impl Room {
         let time = self.last_message().map_or(time, |m| time.max(m.time));
         self.messages.push(Message {
             id,
+            key: id.to_string(),
             author: self.me,
             time,
             text: text.to_owned(),
+            source: text.to_owned(),
             reply_to: None,
             reactions: Vec::new(),
             edited: false,
+            pending: None,
         });
         id
+    }
+
+    pub fn message_by_key(&self, key: &str) -> Option<&Message> {
+        self.messages.iter().find(|m| m.key == key)
+    }
+
+    /// A reply from this device to the message keyed `target`, in memory (example rooms).
+    pub fn reply(&mut self, text: &str, time: u32, target: &str) -> Option<MessageId> {
+        let t = self.message_by_key(target)?;
+        let reply = ReplyTo {
+            message: t.id,
+            author: t.author,
+            preview: preview(&t.text, 100),
+        };
+        let id = self.send(text, time);
+        if let Some(m) = self.messages.iter_mut().find(|m| m.id == id) {
+            m.reply_to = Some(reply);
+        }
+        Some(id)
+    }
+
+    /// Change the text of your message keyed `target`, in memory (example rooms).
+    pub fn edit(&mut self, target: &str, text: &str) -> bool {
+        let me = self.me;
+        match self
+            .messages
+            .iter_mut()
+            .find(|m| m.key == target && m.author == me)
+        {
+            Some(m) => {
+                m.text = text.to_owned();
+                m.source = text.to_owned();
+                m.edited = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove your message keyed `target`, in memory (example rooms).
+    pub fn delete(&mut self, target: &str) -> bool {
+        let me = self.me;
+        let before = self.messages.len();
+        self.messages
+            .retain(|m| !(m.key == target && m.author == me));
+        self.messages.len() != before
+    }
+
+    /// Your reaction on the message keyed `target`, if any.
+    pub fn own_reaction(&self, target: &str) -> Option<&str> {
+        self.message_by_key(target)?
+            .reactions
+            .iter()
+            .find(|r| r.by.contains(&self.me))
+            .map(|r| r.emoji.as_str())
+    }
+
+    /// Toggle your reaction on the message keyed `target`, in memory (example rooms), as River
+    /// does: one reaction per member per message, so a different emoji replaces yours.
+    pub fn react(&mut self, target: &str, emoji: &str) -> bool {
+        let me = self.me;
+        let Some(m) = self.messages.iter_mut().find(|m| m.key == target) else {
+            return false;
+        };
+        let same = m
+            .reactions
+            .iter()
+            .any(|r| r.emoji == emoji && r.by.contains(&me));
+        for r in &mut m.reactions {
+            r.by.retain(|b| *b != me);
+        }
+        if !same {
+            match m.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                Some(r) => r.by.push(me),
+                None => m.reactions.push(Reaction {
+                    emoji: emoji.to_owned(),
+                    by: vec![me],
+                }),
+            }
+        }
+        m.reactions.retain(|r| !r.by.is_empty());
+        true
     }
 
     /// How many messages in the room someone else wrote: the most `unread` can honestly be.
@@ -284,12 +402,15 @@ mod tests {
     fn msg(id: u32, author: u32, time: u32) -> Message {
         Message {
             id,
+            key: id.to_string(),
             author,
             time,
             text: String::new(),
+            source: String::new(),
             reply_to: None,
             reactions: vec![],
             edited: false,
+            pending: None,
         }
     }
 
@@ -394,6 +515,8 @@ mod tests {
             messages: vec![msg(7, 2, 900)],
             me: 1,
             unread: 0,
+            send_block: None,
+            notices: Vec::new(),
         };
         let id = room.send("hi", 100);
         assert_eq!(id, 8);

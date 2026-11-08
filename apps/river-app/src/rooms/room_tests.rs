@@ -27,40 +27,45 @@ use river_core::util::sign_struct;
 use super::room::LiveRoom;
 use crate::chat::model::Role;
 
-const SECRET: [u8; 32] = [42; 32];
+pub(super) const SECRET: [u8; 32] = [42; 32];
 
-struct Fixture {
-    owner: SigningKey,
-    me: SigningKey,
+pub(super) struct Fixture {
+    pub(super) owner: SigningKey,
+    pub(super) me: SigningKey,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Fixture {
             owner: SigningKey::from_bytes(&[1; 32]),
             me: SigningKey::from_bytes(&[2; 32]),
         }
     }
 
-    fn owner_id(&self) -> MemberId {
+    pub(super) fn owner_id(&self) -> MemberId {
         MemberId::from(&self.owner.verifying_key())
     }
 
-    fn me_id(&self) -> MemberId {
+    pub(super) fn me_id(&self) -> MemberId {
         MemberId::from(&self.me.verifying_key())
     }
 
-    fn seal(&self, text: &str) -> SealedBytes {
+    pub(super) fn seal(&self, text: &str) -> SealedBytes {
         let (ciphertext, nonce) = encrypt_with_symmetric_key(&SECRET, text.as_bytes());
         SealedBytes::private(ciphertext, nonce, 0, text.len() as u32)
     }
 
-    fn private_body(&self, content_type: u32, version: u32, plain: &[u8]) -> RoomMessageBody {
+    pub(super) fn private_body(
+        &self,
+        content_type: u32,
+        version: u32,
+        plain: &[u8],
+    ) -> RoomMessageBody {
         let (ciphertext, nonce) = encrypt_with_symmetric_key(&SECRET, plain);
         RoomMessageBody::private(content_type, version, ciphertext, nonce, 0)
     }
 
-    fn message(
+    pub(super) fn message(
         &self,
         author: &SigningKey,
         secs: u64,
@@ -77,7 +82,7 @@ impl Fixture {
         )
     }
 
-    fn nickname(&self, who: &SigningKey, name: &str) -> AuthorizedMemberInfo {
+    pub(super) fn nickname(&self, who: &SigningKey, name: &str) -> AuthorizedMemberInfo {
         AuthorizedMemberInfo::new_with_member_key(
             MemberInfo {
                 member_id: MemberId::from(&who.verifying_key()),
@@ -90,7 +95,7 @@ impl Fixture {
     }
 
     /// A private room on secret v0, with the secret sealed to `me` by the owner.
-    fn private_state(&self) -> ChatRoomStateV1 {
+    pub(super) fn private_state(&self) -> ChatRoomStateV1 {
         let mut state = ChatRoomStateV1::default();
         let mut config = Configuration {
             owner_member_id: self.owner_id(),
@@ -192,7 +197,7 @@ impl Fixture {
         state
     }
 
-    fn stored(&self, state: ChatRoomStateV1) -> StoredRoom {
+    pub(super) fn stored(&self, state: ChatRoomStateV1) -> StoredRoom {
         StoredRoom {
             owner_vk: self.owner.verifying_key(),
             room_state: state,
@@ -205,6 +210,9 @@ impl Fixture {
             last_read_message_id: None,
             self_nickname: Some("Mia".into()),
             invitation_secrets: BTreeMap::new(),
+            self_authorized_member: None,
+            invite_chain: Vec::new(),
+            self_member_info: None,
         }
     }
 }
@@ -346,7 +354,7 @@ fn a_delta_adds_messages_and_rebuilds_actions() {
 }
 
 /// Add secret `version` to the room, sealed by the owner to `member`.
-fn add_secret(
+pub(super) fn add_secret(
     f: &Fixture,
     state: &mut ChatRoomStateV1,
     version: u32,

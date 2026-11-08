@@ -13,7 +13,8 @@ rune-kit.workspace = true
 
 # Reading the user's rooms from the local node (src/rooms/). River's own types, with the
 # client-only features the room-contract and chat-delegate WASM builds never enable.
-river-core = { path = "../../common", features = ["ecies", "mentions", "stored-rooms"] }
+# `ecies-randomized` seals what is sent to a private room (it needs a random nonce).
+river-core = { path = "../../common", features = ["ecies-randomized", "mentions", "stored-rooms"] }
 # The node's native client protocol is bincode of these types. Pinned to the version the root
 # workspace (and so the web UI) uses, so this app speaks exactly what the web UI speaks.
 # `the_wire_format_is_the_web_uis` (src/rooms/delegate.rs) fails when the lockfiles disagree.

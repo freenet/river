@@ -1,4 +1,6 @@
 use super::*;
+use crate::rooms::outbox::{Action, Outbox};
+use crate::rooms::room::message_key;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
@@ -62,6 +64,32 @@ struct TestRoom {
 }
 
 impl TestRoom {
+    /// The private room of `room_tests::Fixture` ("Secret garden", secret v0), with its owner
+    /// (seed 1) holding the secret too, so the owner can send in it.
+    fn private(generation: u8) -> TestRoom {
+        let f = crate::rooms::room_tests::Fixture::new();
+        let mut state = f.private_state();
+        crate::rooms::room_tests::add_secret(
+            &f,
+            &mut state,
+            0,
+            &crate::rooms::room_tests::SECRET,
+            &f.owner,
+        );
+        let params = ChatRoomParametersV1 {
+            owner: f.owner.verifying_key(),
+        };
+        let key = ContractKey::from_params_and_code(
+            Parameters::from(cbor(&params)),
+            ContractCode::from(vec![generation]),
+        );
+        TestRoom {
+            owner: f.owner,
+            state,
+            key,
+        }
+    }
+
     fn new(seed: u8, name: &str, generation: u8, texts: &[&str]) -> TestRoom {
         let owner = SigningKey::from_bytes(&[seed; 32]);
         let owner_id = MemberId::from(&owner.verifying_key());
@@ -510,6 +538,22 @@ struct World {
     /// How many grant requests to answer "node not ready" before taking one.
     grant_not_ready: usize,
     on_connect: Option<OnConnect>,
+    /// Every UPDATE received: the contract and its delta.
+    updates: Vec<(ContractKey, ChatRoomStateV1Delta)>,
+    /// How UPDATEs are answered.
+    update_play: UpdatePlay,
+}
+
+/// How the fake node answers an UPDATE.
+#[derive(Clone, Debug, Default)]
+enum UpdatePlay {
+    /// `UpdateResponse`, as the node does when the contract took it.
+    #[default]
+    Accept,
+    /// The node's update error with this cause.
+    Refuse(&'static str),
+    /// No answer at all.
+    Ignore,
 }
 
 impl World {
@@ -789,7 +833,31 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                 None => {}
             }
         }
-        other => panic!("the app must only read, but sent {other:?}"),
+        // The one write the app makes: a room contract UPDATE carrying a delta.
+        ClientRequest::ContractOp(ContractRequest::Update {
+            key,
+            data: UpdateData::Delta(delta),
+        }) => {
+            let delta: ChatRoomStateV1Delta = ciborium::de::from_reader(delta.as_ref()).unwrap();
+            w.updates.push((key, delta));
+            match w.update_play.clone() {
+                UpdatePlay::Accept => out.push(encode(Ok(HostResponse::ContractResponse(
+                    ContractResponse::UpdateResponse {
+                        key,
+                        summary: freenet_stdlib::prelude::StateSummary::from(vec![]),
+                    },
+                )))),
+                UpdatePlay::Refuse(cause) => out.push(encode(Err(ErrorKind::RequestError(
+                    RequestError::ContractError(ContractError::Update {
+                        key,
+                        cause: cause.into(),
+                    }),
+                )
+                .into()))),
+                UpdatePlay::Ignore => {}
+            }
+        }
+        other => panic!("the app must only read and UPDATE with a delta, but sent {other:?}"),
     }
     out
 }
@@ -808,6 +876,8 @@ fn quick() -> Pace {
         resubscribe_first: Duration::from_secs(60),
         resubscribe_max: Duration::from_secs(60),
         refresh: Duration::from_secs(3600),
+        update_wait: Duration::from_secs(60),
+        owed_limit: Duration::from_secs(180),
         delegate_deadline: Duration::from_secs(5),
         grant: GrantPacing {
             pause: Duration::ZERO,
@@ -829,12 +899,27 @@ struct Running {
     updates: Arc<Mutex<Vec<RoomsUpdate>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<Access>>,
+    commands: std::sync::mpsc::Sender<Command>,
 }
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
 impl Running {
     fn start(node: &FakeNode, dir: &Path, pace: Pace) -> Running {
+        Running::start_with(node, dir, pace, Arc::default(), std::sync::mpsc::channel())
+    }
+
+    /// Start with an outbox and a command channel that may outlive this run, as the link's do.
+    fn start_with(
+        node: &FakeNode,
+        dir: &Path,
+        pace: Pace,
+        outbox: Arc<Mutex<Outbox>>,
+        (commands, inbox): (
+            std::sync::mpsc::Sender<Command>,
+            std::sync::mpsc::Receiver<Command>,
+        ),
+    ) -> Running {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
@@ -848,6 +933,8 @@ impl Running {
                     &|u| updates.lock().unwrap().push(u),
                     &pace,
                     &|| stop.load(Ordering::Relaxed),
+                    &inbox,
+                    &mut outbox.lock().unwrap(),
                 )
             })
         };
@@ -855,7 +942,18 @@ impl Running {
             updates,
             stop,
             handle: Some(handle),
+            commands,
         }
+    }
+
+    /// Do something in the room `room`, as the chat screen would.
+    fn act(&self, room: &TestRoom, action: Action) {
+        self.commands
+            .send(Command {
+                room: bs58::encode(room.vk().to_bytes()).into_string(),
+                action,
+            })
+            .unwrap();
     }
 
     fn updates(&self) -> Vec<RoomsUpdate> {
@@ -1427,4 +1525,711 @@ fn a_stored_copy_that_cannot_be_merged_is_named() {
     ));
     assert!(rooms.replace(loaded(vec![bad])).is_empty());
     assert_eq!(rooms.issues().not_updated, ["A"]);
+}
+
+// Sending ---------------------------------------------------------------------------------------
+
+fn say(text: &str) -> Action {
+    Action::Send {
+        text: text.into(),
+        reply_to: None,
+    }
+}
+
+/// The message texted `text` in the newest room list: its delivery, or `None` if not shown.
+fn delivery_of(session: &Running, text: &str) -> Option<Option<crate::chat::model::Pending>> {
+    let (rooms, _, _) = session.last_rooms()?;
+    rooms[0]
+        .messages
+        .iter()
+        .find(|m| m.text == text)
+        .map(|m| m.pending.clone())
+}
+
+fn update_notification(room: &TestRoom, messages: Vec<AuthorizedMessageV1>) -> Message {
+    let delta = ChatRoomStateV1Delta {
+        recent_messages: Some(messages),
+        ..Default::default()
+    };
+    let note: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateNotification {
+            key: room.key,
+            update: UpdateData::Delta(cbor(&delta).into()),
+        },
+    ));
+    Message::Binary(bincode::serialize(&note).unwrap().into())
+}
+
+#[test]
+fn a_sent_message_shows_at_once_and_is_marked_sent_when_the_node_takes_it() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    // Held until the message has been seen on its way.
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a], "send-ok", quick());
+    session.act(&a, say("hello from the app"));
+    session.wait_until("shown on its way", || {
+        matches!(delivery_of(&session, "hello from the app"), Some(Some(p)) if p.failed.is_none())
+    });
+    let (key, delta) = node.with(|w| w.updates[0].clone());
+    // The room's contract, a delta carrying one message signed by the room's key.
+    assert_eq!(key, a.key);
+    let messages = delta.recent_messages.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].validate(&a.vk()).is_ok());
+    assert!(delta.members.is_none() && delta.member_info.is_none());
+
+    // The node answers: sent.
+    let answer: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateResponse {
+            key: a.key,
+            summary: freenet_stdlib::prelude::StateSummary::from(vec![]),
+        },
+    ));
+    node.with(|w| {
+        w.push
+            .push(Message::Binary(bincode::serialize(&answer).unwrap().into()))
+    });
+    session.wait_until("marked sent", || {
+        delivery_of(&session, "hello from the app") == Some(None)
+    });
+    assert_eq!(node.with(|w| w.updates.len()), 1);
+}
+
+#[test]
+fn a_refused_update_is_shown_with_the_reason_and_retry_sends_it_again() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Refuse("the contract said no"));
+    let (session, _dir) = following(&node, &[&a], "send-refused", quick());
+    session.act(&a, say("refused one"));
+    session.wait_until("shown as not sent", || {
+        matches!(
+            delivery_of(&session, "refused one"),
+            Some(Some(p)) if p.failed.as_deref().is_some_and(|f| f.contains("the contract said no"))
+        )
+    });
+    let Some(Some(pending)) = delivery_of(&session, "refused one") else {
+        unreachable!()
+    };
+    node.with(|w| w.update_play = UpdatePlay::Accept);
+    session.act(
+        &a,
+        Action::Retry {
+            entry: pending.entry,
+        },
+    );
+    session.wait_until("sent on retry", || {
+        delivery_of(&session, "refused one") == Some(None)
+    });
+    assert_eq!(node.with(|w| w.updates.len()), 2);
+}
+
+#[test]
+fn an_unanswered_update_fails_and_counts_as_sent_once_the_network_brings_it() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let pace = Pace {
+        update_wait: Duration::from_millis(200),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-unanswered", pace);
+    session.act(&a, say("lost answer"));
+    session.wait_until(
+        "failed for want of an answer",
+        || matches!(delivery_of(&session, "lost answer"), Some(Some(p)) if p.failed.is_some()),
+    );
+    // The node did take it, and the network brings it back.
+    let (_, delta) = node.with(|w| w.updates[0].clone());
+    let note = update_notification(&a, delta.recent_messages.unwrap());
+    node.with(|w| w.push.push(note));
+    session.wait_until("settled as sent", || {
+        delivery_of(&session, "lost answer") == Some(None)
+    });
+}
+
+#[test]
+fn what_was_out_when_the_connection_dropped_goes_again_unchanged() {
+    let node = fake_node(vec![]);
+    // A private room, so sealing it again would change it.
+    let a = TestRoom::private(1);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a], "send-reconnect", quick());
+    session.act(&a, say("across a drop"));
+    session.wait_until("sent once", || node.with(|w| w.updates.len() == 1));
+    // The room's secret rotates (shown by a message under the new one) before the drop.
+    let f = crate::rooms::room_tests::Fixture::new();
+    let v1 = [7u8; 32];
+    let mut rotated = a.state.clone();
+    crate::rooms::room_tests::add_secret(&f, &mut rotated, 1, &v1, &a.owner);
+    let (ct, nonce) = river_core::ecies::encrypt_with_symmetric_key(
+        &v1,
+        &river_core::room_state::content::TextContentV1::new("under v1".into()).encode(),
+    );
+    rotated.recent_messages.messages.push(message_with(
+        &a.owner,
+        RoomMessageBody::private_text(ct, nonce, 1),
+    ));
+    let note: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateNotification {
+            key: a.key,
+            update: UpdateData::State(cbor(&rotated).into()),
+        },
+    ));
+    node.with(|w| {
+        w.push
+            .push(Message::Binary(bincode::serialize(&note).unwrap().into()))
+    });
+    session.wait_rooms("the rotation arrived", |r, _, _| {
+        texts(&r[0]).contains(&"under v1".to_owned())
+    });
+    node.with(|w| {
+        w.update_play = UpdatePlay::Accept;
+        w.drop_live = true;
+    });
+    session.wait_until("sent again on the new connection", || {
+        node.with(|w| w.updates.len() >= 2)
+    });
+    let (first, second) = node.with(|w| (w.updates[0].1.clone(), w.updates[1].1.clone()));
+    assert_eq!(first.recent_messages, second.recent_messages);
+    let sealed: Vec<Option<u32>> = second
+        .recent_messages
+        .unwrap()
+        .iter()
+        .map(|m| m.message.content.secret_version())
+        .collect();
+    assert_eq!(
+        sealed,
+        [Some(0)],
+        "sent again as it was, not sealed again under v1"
+    );
+    session.wait_until("marked sent", || {
+        delivery_of(&session, "across a drop") == Some(None)
+    });
+}
+
+fn message_with(author: &SigningKey, content: RoomMessageBody) -> AuthorizedMessageV1 {
+    AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: MemberId::from(&author.verifying_key()),
+            author: MemberId::from(&author.verifying_key()),
+            time: SystemTime::now(),
+            content,
+        },
+        author,
+    )
+}
+
+#[test]
+fn a_first_read_that_finds_no_rooms_keeps_what_an_earlier_run_left_unsent() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    for first_read in [Loaded::missing(), loaded(vec![])] {
+        let mut outbox = Outbox::default();
+        assert!(outbox.command(&LiveRoom::new(a.stored()), say("left unsent")));
+        let mut rooms = Rooms {
+            outbox,
+            ..Rooms::default()
+        };
+        rooms.replace(first_read);
+        assert!(!rooms.outbox.is_empty());
+        // A read that finds the room keeps it too; one that finds rooms without it drops it.
+        rooms.replace(loaded(vec![a.stored()]));
+        assert!(!rooms.outbox.is_empty());
+        let b = TestRoom::new(2, "B", 1, &["b1"]);
+        rooms.replace(loaded(vec![b.stored()]));
+        assert!(rooms.outbox.is_empty());
+    }
+}
+
+#[test]
+fn a_run_that_panics_gives_the_outbox_back() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut outbox = Outbox::default();
+    assert!(outbox.command(&LiveRoom::new(a.stored()), say("kept")));
+    outbox.waiting.push(Command {
+        room: "x".into(),
+        action: say("waiting"),
+    });
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(
+            "127.0.0.1:1",
+            None,
+            &|_| panic!("a bug while reporting"),
+            &quick(),
+            // Asked to stop at once: if the panic were not where it is, the run would return.
+            &|| true,
+            &rx,
+            &mut outbox,
+        )
+    }));
+    assert!(ended.is_err());
+    assert!(!outbox.is_empty());
+    assert_eq!(outbox.waiting.len(), 1);
+}
+
+#[test]
+fn a_command_waiting_for_the_rooms_survives_a_stop() {
+    let node = fake_node(vec![Play::Drop; 1000]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.add_room(&a));
+    let dir = temp_dir("send-waiting-stop");
+    save_token(&dir, "kept-token");
+    let outbox: Arc<Mutex<Outbox>> = Arc::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Command {
+        room: bs58::encode(a.vk().to_bytes()).into_string(),
+        action: say("written before any rooms"),
+    })
+    .unwrap();
+    let first = Running::start_with(&node, &dir, quick(), outbox.clone(), (tx, rx));
+    // Every connection drops, so the rooms are never read; the command is taken while waiting.
+    first.wait_until("taken into the outbox", || {
+        node.with(|w| w.connections.len() >= 3)
+    });
+    drop(first);
+    assert_eq!(outbox.lock().unwrap().waiting.len(), 1);
+    node.with(|w| w.plays.clear());
+    let second = Running::start_with(&node, &dir, quick(), outbox, std::sync::mpsc::channel());
+    second.wait_until("sent once the next run reads the rooms", || {
+        delivery_of(&second, "written before any rooms") == Some(None)
+    });
+}
+
+#[test]
+fn a_command_while_disconnected_shows_at_once_and_goes_out_on_reconnecting() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        backoff_first: Duration::from_secs(1),
+        backoff_max: Duration::from_secs(1),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-offline", pace);
+    // Every new connection is dropped until the message has been seen.
+    node.with(|w| {
+        w.plays.extend(std::iter::repeat_n(Play::Drop, 1000));
+        w.drop_live = true;
+    });
+    session.wait_until("reconnecting", || {
+        session
+            .updates()
+            .iter()
+            .any(|u| matches!(u, RoomsUpdate::Status(LinkStatus::Reconnecting)))
+    });
+    session.act(&a, say("written offline"));
+    session.wait_until("shown while disconnected", || {
+        matches!(delivery_of(&session, "written offline"), Some(Some(_)))
+    });
+    assert!(node.with(|w| w.updates.is_empty()));
+    node.with(|w| w.plays.clear());
+    session.wait_until("sent and taken after reconnecting", || {
+        delivery_of(&session, "written offline") == Some(None)
+    });
+}
+
+fn accepted(room: &TestRoom) -> Message {
+    let answer: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateResponse {
+            key: room.key,
+            summary: freenet_stdlib::prelude::StateSummary::from(vec![]),
+        },
+    ));
+    Message::Binary(bincode::serialize(&answer).unwrap().into())
+}
+
+#[test]
+fn a_late_answer_settles_the_late_update_and_only_then_does_the_next_go() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let pace = Pace {
+        update_wait: Duration::from_millis(100),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-late", pace);
+    session.act(&a, say("first"));
+    session.wait_until(
+        "first shown unconfirmed",
+        || matches!(delivery_of(&session, "first"), Some(Some(p)) if p.failed.is_some()),
+    );
+    session.act(&a, say("second"));
+    session.wait_until(
+        "second shown on its way",
+        || matches!(delivery_of(&session, "second"), Some(Some(p)) if p.failed.is_none()),
+    );
+    // Second waits for first's answer; it has not gone out.
+    assert_eq!(node.with(|w| w.updates.len()), 1);
+    node.with(|w| w.push.push(accepted(&a)));
+    session.wait_until("first sent by its own late answer", || {
+        delivery_of(&session, "first") == Some(None)
+    });
+    session.wait_until("then second goes out", || {
+        node.with(|w| w.updates.len() == 2)
+    });
+    assert!(
+        matches!(delivery_of(&session, "second"), Some(Some(_))),
+        "not yet answered"
+    );
+    node.with(|w| w.push.push(accepted(&a)));
+    session.wait_until("second sent by its own answer", || {
+        delivery_of(&session, "second") == Some(None)
+    });
+}
+
+#[test]
+fn two_rooms_each_have_an_update_out_at_once() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a, &b], "send-two-rooms", quick());
+    session.act(&a, say("in A"));
+    session.act(&b, say("in B"));
+    session.wait_until("both out", || node.with(|w| w.updates.len() == 2));
+    let keys: HashSet<ContractKey> = node.with(|w| w.updates.iter().map(|(k, _)| *k).collect());
+    assert_eq!(keys, HashSet::from([a.key, b.key]));
+    // B's answer settles B, not A.
+    node.with(|w| w.push.push(accepted(&b)));
+    session.wait_until("B settled", || {
+        session.last_rooms().is_some_and(|(rooms, _, _)| {
+            let find = |name: &str, text: &str| {
+                rooms
+                    .iter()
+                    .find(|r| r.name == name)
+                    .and_then(|r| r.messages.iter().find(|m| m.text == text))
+                    .map(|m| m.pending.is_none())
+            };
+            find("B", "in B") == Some(true) && find("A", "in A") == Some(false)
+        })
+    });
+}
+
+#[test]
+fn a_command_sent_before_the_rooms_are_read_waits_for_them() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.add_room(&a));
+    let dir = temp_dir("send-early");
+    save_token(&dir, "kept-token");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Command {
+        room: bs58::encode(a.vk().to_bytes()).into_string(),
+        action: say("before anything"),
+    })
+    .unwrap();
+    let session = Running::start_with(&node, &dir, quick(), Arc::default(), (tx, rx));
+    session.wait_until("sent once the rooms are read", || {
+        delivery_of(&session, "before anything") == Some(None)
+    });
+}
+
+#[test]
+fn edit_react_and_delete_reach_the_node_and_the_screen() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "send-actions", quick());
+    let target = message_key(&a.state.recent_messages.messages[0].id());
+    session.act(
+        &a,
+        Action::Edit {
+            target: target.clone(),
+            text: "a1 fixed".into(),
+        },
+    );
+    session.act(
+        &a,
+        Action::React {
+            target: target.clone(),
+            emoji: "🎉".into(),
+        },
+    );
+    session.wait_until("edited and reacted", || {
+        session.last_rooms().is_some_and(|(rooms, _, _)| {
+            rooms[0].messages.first().is_some_and(|m| {
+                m.text == "a1 fixed" && m.edited && m.reactions.iter().any(|r| r.emoji == "🎉")
+            })
+        })
+    });
+    session.act(&a, Action::Delete { target });
+    session.wait_until("deleted, all three sent and answered", || {
+        node.with(|w| w.updates.len() == 3)
+            && session.last_rooms().is_some_and(|(rooms, _, _)| {
+                rooms[0].messages.is_empty() && rooms[0].notices.is_empty()
+            })
+    });
+    let kinds: Vec<u32> = node.with(|w| {
+        w.updates
+            .iter()
+            .flat_map(|(_, d)| d.recent_messages.clone().unwrap())
+            .map(|m| match &m.message.content {
+                RoomMessageBody::Public { data, .. } => {
+                    river_core::room_state::content::ActionContentV1::decode(data)
+                        .unwrap()
+                        .action_type
+                }
+                RoomMessageBody::Private { .. } => panic!("a public room"),
+            })
+            .collect()
+    });
+    use river_core::room_state::content::{
+        ACTION_TYPE_DELETE, ACTION_TYPE_EDIT, ACTION_TYPE_REACTION,
+    };
+    assert_eq!(
+        kinds,
+        [ACTION_TYPE_EDIT, ACTION_TYPE_REACTION, ACTION_TYPE_DELETE]
+    );
+}
+
+#[test]
+fn what_was_unsent_when_a_session_stopped_goes_out_in_the_next() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| {
+        w.add_room(&a);
+        w.update_play = UpdatePlay::Ignore;
+    });
+    let dir = temp_dir("send-restart");
+    save_token(&dir, "kept-token");
+    let outbox: Arc<Mutex<Outbox>> = Arc::default();
+    let first = Running::start_with(
+        &node,
+        &dir,
+        quick(),
+        outbox.clone(),
+        std::sync::mpsc::channel(),
+    );
+    first.wait_rooms("live", |r, _, s| r.len() == 1 && s == LinkStatus::Live);
+    first.act(&a, say("survives a stop"));
+    first.wait_until("sent once", || node.with(|w| w.updates.len() == 1));
+    // Stopped (as on a state that needs the user), with no answer yet.
+    drop(first);
+    node.with(|w| w.update_play = UpdatePlay::Accept);
+    let second = Running::start_with(&node, &dir, quick(), outbox, std::sync::mpsc::channel());
+    second.wait_until("shown and sent in the next session", || {
+        delivery_of(&second, "survives a stop") == Some(None)
+    });
+    let (one, two) = node.with(|w| (w.updates[0].1.clone(), w.updates[1].1.clone()));
+    assert_eq!(
+        one.recent_messages, two.recent_messages,
+        "the same message again"
+    );
+}
+
+// Round 3 --------------------------------------------------------------------------------------
+
+#[test]
+fn commands_waiting_through_a_read_that_finds_no_rooms_wait_for_one_that_does() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Command {
+        room: bs58::encode(a.vk().to_bytes()).into_string(),
+        action: say("carried over"),
+    })
+    .unwrap();
+    let mut rooms = Rooms::default();
+    rooms.replace(Loaded::missing());
+    assert!(!rooms.take_commands(&rx));
+    assert_eq!(rooms.outbox.waiting.len(), 1);
+    let mut unreadable = loaded(vec![]);
+    unreadable.listed = 1;
+    unreadable.unreadable = 1;
+    rooms.replace(unreadable);
+    assert!(!rooms.take_commands(&rx));
+    assert_eq!(rooms.outbox.waiting.len(), 1);
+    rooms.replace(loaded(vec![a.stored()]));
+    assert!(rooms.take_commands(&rx));
+    assert!(rooms.outbox.waiting.is_empty());
+    assert!(!rooms.outbox.is_empty());
+}
+
+/// Rooms `list`, each with one update out.
+fn owing(list: &[&TestRoom]) -> Rooms {
+    let mut rooms = Rooms::default();
+    rooms.replace(loaded(list.iter().map(|r| r.stored()).collect()));
+    for room in &rooms.list {
+        assert!(rooms.outbox.command(room, say("out")));
+        let mut changed = false;
+        assert!(
+            rooms
+                .outbox
+                .next_update(room, Instant::now(), &mut changed)
+                .is_some()
+        );
+    }
+    rooms
+}
+
+#[test]
+fn update_failures_that_name_no_update_go_to_the_one_room_that_owes() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let empty_ring: ClientError = ErrorKind::EmptyRing.into();
+    let missing = |id| -> ClientError {
+        ErrorKind::RequestError(RequestError::ContractError(
+            ContractError::MissingContract { key: id },
+        ))
+        .into()
+    };
+    let none = Subscriptions::default();
+
+    let one = owing(&[&a]);
+    assert_eq!(
+        one.failed_update_unnamed(&empty_ring, &none, false)
+            .map(|(id, _)| id),
+        Some(a.id())
+    );
+    assert_eq!(
+        one.failed_update_unnamed(&missing(a.id()), &none, false)
+            .map(|(id, _)| id),
+        Some(a.id())
+    );
+    // A subscribe waiting for its answer could be the one that failed.
+    let mut asking = Subscriptions::default();
+    asking.pending.insert(b.id(), Instant::now());
+    assert_eq!(one.failed_update_unnamed(&empty_ring, &asking, false), None);
+    // A missing contract for a room that owes nothing is a subscribe's.
+    assert_eq!(
+        one.failed_update_unnamed(&missing(b.id()), &none, false),
+        None
+    );
+    // A read of the stored rooms is under way: the failure may be one of its requests.
+    let shutdown: ClientError = ErrorKind::Shutdown.into();
+    assert_eq!(one.failed_update_unnamed(&shutdown, &none, true), None);
+    assert_eq!(
+        one.failed_update_unnamed(&shutdown, &none, false)
+            .map(|(id, _)| id),
+        Some(a.id())
+    );
+    // A subscribe for the owing room is waiting: its missing contract may be the subscribe's.
+    let mut asking_a = Subscriptions::default();
+    asking_a.pending.insert(a.id(), Instant::now());
+    assert_eq!(
+        one.failed_update_unnamed(&missing(a.id()), &asking_a, false),
+        None
+    );
+    // Two rooms owe: which one failed can't be told.
+    let two = owing(&[&a, &b]);
+    assert_eq!(two.failed_update_unnamed(&empty_ring, &none, false), None);
+    assert_eq!(
+        two.failed_update_unnamed(&missing(b.id()), &none, false)
+            .map(|(id, _)| id),
+        Some(b.id())
+    );
+}
+
+#[test]
+fn a_rekeyed_room_owes_nothing_under_its_old_contract() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut rooms = owing(&[&a]);
+    assert!(rooms.outbox.owes(&a.vk()));
+    let rekeyed = TestRoom::new(1, "A", 2, &["a1"]);
+    rooms.replace(loaded(vec![rekeyed.stored()]));
+    assert!(!rooms.outbox.owes(&a.vk()));
+    // What was in flight goes again, unchanged, under the new contract.
+    let mut changed = false;
+    let again = rooms
+        .outbox
+        .next_update(&rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent again without the user acting");
+    assert_eq!(again.recent_messages.unwrap().len(), 1);
+
+    // A room a complete read no longer lists owes nothing either.
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let mut rooms = owing(&[&a, &b]);
+    rooms.replace(loaded(vec![a.stored()]));
+    assert!(rooms.outbox.owes(&a.vk()));
+    assert!(!rooms.outbox.owes(&b.vk()));
+}
+
+#[test]
+fn an_update_failure_naming_nothing_reaches_the_screen() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a], "send-keyless", quick());
+    session.act(&a, say("into an empty ring"));
+    session.wait_until("sent", || node.with(|w| w.updates.len() == 1));
+    let error: Result<HostResponse, ClientError> = Err(ErrorKind::EmptyRing.into());
+    node.with(|w| {
+        w.push
+            .push(Message::Binary(bincode::serialize(&error).unwrap().into()))
+    });
+    session.wait_until("shown as refused", || {
+        matches!(
+            delivery_of(&session, "into an empty ring"),
+            Some(Some(p)) if p.failed.as_deref().is_some_and(|f| f.contains("no ring connections"))
+        )
+    });
+}
+
+#[test]
+fn retry_of_an_unanswered_update_reconnects_once_and_sends_it_again_unchanged() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    // No forced reconnect in this test's lifetime: only the Retry can reconnect.
+    let pace = Pace {
+        update_wait: Duration::from_millis(100),
+        owed_limit: Duration::from_secs(3600),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-retry-late", pace);
+    session.act(&a, say("say it again"));
+    session.wait_until(
+        "unconfirmed",
+        || matches!(delivery_of(&session, "say it again"), Some(Some(p)) if p.failed.is_some()),
+    );
+    assert_eq!(node.with(|w| w.connections.len()), 1);
+    node.with(|w| w.update_play = UpdatePlay::Accept);
+    let Some(Some(pending)) = delivery_of(&session, "say it again") else {
+        unreachable!()
+    };
+    session.act(
+        &a,
+        Action::Retry {
+            entry: pending.entry,
+        },
+    );
+    session.wait_until("sent on a new connection, and taken", || {
+        delivery_of(&session, "say it again") == Some(None)
+    });
+    let (connections, updates) = node.with(|w| (w.connections.len(), w.updates.clone()));
+    assert_eq!(connections, 2, "one reconnect");
+    assert_eq!(updates.len(), 2, "one resend");
+    assert_eq!(updates[0].1.recent_messages, updates[1].1.recent_messages);
+}
+
+#[test]
+fn an_answer_owed_too_long_reconnects_and_resends_then_gives_up() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let pace = Pace {
+        update_wait: Duration::from_millis(50),
+        owed_limit: Duration::from_millis(150),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-owed-long", pace);
+    session.act(&a, say("unheard"));
+    session.wait_until("given up on, after the bounded resends", || {
+        matches!(
+            delivery_of(&session, "unheard"),
+            Some(Some(p)) if p.failed.as_deref() == Some(super::super::outbox::NEVER_ANSWERED)
+        )
+    });
+    let updates = node.with(|w| w.updates.clone());
+    assert_eq!(
+        updates.len() as u32,
+        super::super::outbox::MAX_FORCED_RECONNECTS
+    );
+    assert!(
+        updates
+            .windows(2)
+            .all(|w| w[0].1.recent_messages == w[1].1.recent_messages)
+    );
+    assert!(
+        node.with(|w| w.connections.len()) as u32 >= super::super::outbox::MAX_FORCED_RECONNECTS
+    );
 }

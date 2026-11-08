@@ -4,11 +4,11 @@ use rune::tok::TextStyle;
 use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::{Kit, TextInput};
 
-use super::Chat;
 use super::icons;
-use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Role, Room};
+use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label, not_yet};
+use super::{Chat, Mode};
 use crate::RiverApp;
 
 const AVATAR: f32 = 36.0;
@@ -138,7 +138,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette) -> El {
             );
             items = items.child(day_divider(d, label, p));
         }
-        items = items.child(group_el(room, &group, p));
+        items = items.child(group_el(chat, room, &group, p));
     }
     // Keyed by room, so each room's viewport is its own: a room opens at its newest message
     // instead of at the offset the previous room was scrolled to.
@@ -194,7 +194,7 @@ fn tag(s: &str, p: &Palette) -> El {
 /// One author's run of messages. Each message is its own row, as in the web UI: the first
 /// carries the avatar and the name line, and the others show their time in the gutter while
 /// the pointer is over them.
-fn group_el(room: &Room, group: &Group, p: &Palette) -> El {
+fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette) -> El {
     let first = &group.messages[0];
     let author = room.member(group.author);
     let mine = group.author == room.me;
@@ -240,7 +240,7 @@ fn group_el(room: &Room, group: &Group, p: &Palette) -> El {
                     .min_w(0.0)
                     .gap(4.0)
                     .child(name_row.take().unwrap_or_else(row))
-                    .child(message_el(room, m, p)),
+                    .child(message_el(chat, room, m, p)),
             )
         } else {
             (
@@ -248,28 +248,217 @@ fn group_el(room: &Room, group: &Group, p: &Palette) -> El {
                     label(model::clock(m.time), st::GUTTER_TIME, p.text_muted)
                         .group_opacity(0.0, 1.0),
                 ),
-                col().grow(1.0).min_w(0.0).child(message_el(room, m, p)),
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(message_el(chat, room, m, p)),
             )
         };
-        rows = rows.child(
-            row()
-                .key(format!("row-{}", m.id))
-                .w_full()
-                .pt(if i == 0 { 6.0 } else { 3.0 })
-                .pb(3.0)
-                .pr(24.0)
-                .radius(8.0)
-                .items_start()
-                .hover_group()
-                .hover(if mine { p.own_row_hover } else { p.row_hover })
-                .child(gutter)
-                .child(content),
-        );
+        let mut line = row()
+            .key(format!("row-{}", m.id))
+            .w_full()
+            .pt(if i == 0 { 6.0 } else { 3.0 })
+            .pb(3.0)
+            .pr(24.0)
+            .radius(8.0)
+            .items_start()
+            .hover_group()
+            .hover(if mine { p.own_row_hover } else { p.row_hover })
+            .child(gutter)
+            .child(content);
+        if let Some(bar) = actions(chat, room, m, p) {
+            line = line.child(bar);
+        }
+        rows = rows.child(line);
     }
     rows
 }
 
-fn message_el(room: &Room, m: &Message, p: &Palette) -> El {
+/// A small icon button on a message's action bar.
+fn action_button(
+    key: String,
+    name: &'static str,
+    glyph: &'static rune::Icon,
+    p: &Palette,
+    press: impl Fn(&mut RiverApp) + 'static,
+) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(name)
+        .help(name)
+        .size(28.0, 28.0)
+        .radius(6.0)
+        .center()
+        .hover(p.surface_hover)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(press)
+        .child(icon(glyph, 15.0).color(p.text_secondary))
+}
+
+/// React, Reply, and for your own messages Edit and Delete, shown while the pointer is over
+/// the message, as the web UI's action cluster. `None` where the user can't act, and on a
+/// message still on its way.
+fn actions(chat: &Chat, room: &Room, m: &Message, p: &Palette) -> Option<El> {
+    if room.send_block.is_some() || m.pending.is_some() {
+        return None;
+    }
+    let k = &m.key;
+    let mut bar = row()
+        .key(format!("actions-{k}"))
+        .gap(2.0)
+        .padding(2.0)
+        .radius(8.0)
+        .fill(p.surface)
+        .border(1.0, p.line)
+        .pin(None, Some(-12.0), Some(16.0), None);
+    // Always shown while its picker is open, so the picker stays tied to what opened it.
+    if chat.picker.as_deref() != Some(k.as_str()) {
+        bar = bar.group_opacity(0.0, 1.0);
+    }
+    let key = k.clone();
+    bar = bar.child(action_button(
+        format!("react-{k}"),
+        "React",
+        &icons::SMILE,
+        p,
+        move |s| s.chat.toggle_picker(&key),
+    ));
+    let key = k.clone();
+    bar = bar.child(action_button(
+        format!("reply-{k}"),
+        "Reply",
+        &icons::REPLY,
+        p,
+        move |s| s.chat.start_reply(&key),
+    ));
+    if m.author == room.me && !m.source.is_empty() {
+        let key = k.clone();
+        bar = bar.child(action_button(
+            format!("edit-{k}"),
+            "Edit",
+            &icons::EDIT,
+            p,
+            move |s| s.chat.start_edit(&key),
+        ));
+    }
+    if m.author == room.me {
+        let key = k.clone();
+        bar = bar.child(action_button(
+            format!("delete-{k}"),
+            "Delete",
+            &icons::TRASH,
+            p,
+            move |s| s.chat.ask_delete(&key),
+        ));
+    }
+    Some(bar)
+}
+
+/// The web UI's frequent reactions (`FREQUENT_EMOJIS` in
+/// `ui/src/components/conversation/emoji_picker.rs`).
+const QUICK_REACTIONS: &[&str] = &[
+    "👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "😡", "🎉", "🤔", "👋", "✅", "💯", "🙏", "😍", "👏",
+];
+
+fn picker(room: &Room, m: &Message, p: &Palette) -> El {
+    let mine = room.own_reaction(&m.key);
+    let mut strip = row()
+        .key(format!("picker-{}", m.key))
+        .max_w(BODY_MAX_W)
+        .gap(2.0)
+        .padding(4.0)
+        .radius(10.0)
+        .fill(p.surface)
+        .border(1.0, p.line_strong)
+        .flex_wrap();
+    for (i, emoji) in QUICK_REACTIONS.iter().enumerate() {
+        let (key, e) = (m.key.clone(), (*emoji).to_owned());
+        let current = mine == Some(*emoji);
+        strip = strip.child(
+            row()
+                .key(format!("pick-{}-{i}", m.key))
+                .role("button")
+                .label(format!("React with {emoji}"))
+                .size(32.0, 32.0)
+                .radius(6.0)
+                .center()
+                .fill(if current {
+                    p.accent_soft
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut RiverApp| s.chat.react(&key, &e))
+                .child(label((*emoji).to_owned(), st::EMOJI, p.text)),
+        );
+    }
+    strip
+}
+
+/// Under a message of yours that the node has not taken: "Sending…", or why it was not sent
+/// with Retry and Discard.
+fn delivery(pending: &Pending, p: &Palette) -> El {
+    let Some(reason) = &pending.failed else {
+        return row()
+            .key("sending")
+            .child(label("Sending…", st::SMALL, p.text_muted));
+    };
+    let entry = pending.entry;
+    let mut choices = row().gap(12.0);
+    if pending.retry {
+        choices = choices.child(text_button(
+            format!("retry-{entry}"),
+            "Retry",
+            p.accent,
+            move |s| s.chat.retry(entry),
+        ));
+    }
+    choices = choices.child(text_button(
+        format!("discard-{entry}"),
+        "Discard",
+        p.text_secondary,
+        move |s| s.chat.discard(entry),
+    ));
+    col()
+        .key("not-sent")
+        .max_w(BODY_MAX_W)
+        .gap(4.0)
+        .child(
+            // A reason that can't be retried says for itself what became of it.
+            label(
+                if pending.retry {
+                    format!("Not sent. {reason}")
+                } else {
+                    reason.clone()
+                },
+                st::SMALL,
+                p.danger,
+            )
+            .wrap()
+            .w_full(),
+        )
+        .child(choices)
+}
+
+/// A pressable word, for small inline choices.
+fn text_button(
+    key: String,
+    name: &'static str,
+    color: Color,
+    press: impl Fn(&mut RiverApp) + 'static,
+) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(name)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(press)
+        .child(label(name, st::SMALL_STRONG, color))
+}
+
+fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette) -> El {
     let mut c = col().key(format!("msg-{}", m.id)).w_full().gap(5.0);
     if let Some(reply) = &m.reply_to {
         let author = room.nickname(reply.author).to_owned();
@@ -299,14 +488,30 @@ fn message_el(room: &Room, m: &Message, p: &Palette) -> El {
         );
     }
     c = c.child(message_body(m, p));
+    if let Some(pending) = &m.pending {
+        c = c.child(delivery(pending, p));
+    }
+    // Pressing a reaction toggles yours: the same emoji removes it, another replaces it.
+    let can_react = room.send_block.is_none() && m.pending.is_none();
     if !m.reactions.is_empty() {
-        // Shown, not pressable: adding a reaction is not built yet.
         let mut pills = row().key("reactions").gap(5.0).pt(2.0).flex_wrap();
         for r in &m.reactions {
             let mine = r.by.contains(&room.me);
+            let mut pill = row();
+            if can_react {
+                let (key, e) = (m.key.clone(), r.emoji.clone());
+                pill = pill
+                    .role("button")
+                    .label(if mine {
+                        format!("Remove your {} reaction", r.emoji)
+                    } else {
+                        format!("React with {}", r.emoji)
+                    })
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(move |s: &mut RiverApp| s.chat.react(&key, &e));
+            }
             pills = pills.child(
-                row()
-                    .key(format!("reaction-{}", r.emoji))
+                pill.key(format!("reaction-{}-{}", m.key, r.emoji))
                     .h(26.0)
                     .px(8.0)
                     .gap(5.0)
@@ -323,6 +528,9 @@ fn message_el(room: &Room, m: &Message, p: &Palette) -> El {
             );
         }
         c = c.child(pills);
+    }
+    if can_react && chat.picker.as_deref() == Some(m.key.as_str()) {
+        c = c.child(picker(room, m, p));
     }
     c
 }
@@ -364,13 +572,11 @@ fn message_body(m: &Message, p: &Palette) -> El {
 }
 
 fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
-    let can_send = chat.source.can_send();
+    let can_send = room.send_block.is_none();
     let has_text = can_send && !chat.composer.text.trim().is_empty();
-    let placeholder = if can_send {
-        format!("Message {}", room.name)
-    } else {
-        // Rooms read from the node are read-only in this version of the app.
-        "Sending from this app is coming soon. Use River in your browser to reply.".to_owned()
+    let placeholder = match &room.send_block {
+        None => format!("Message {}", room.name),
+        Some(reason) => reason.clone(),
     };
     let field = TextInput::new(&chat.composer)
         .plain()
@@ -403,7 +609,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         })
         .child(icon(&icons::SEND, 20.0).color(if has_text { p.accent } else { p.text_muted }));
     if !can_send {
-        send = not_yet(send);
+        send = send.disabled(true).opacity(0.45);
     }
     let emoji = not_yet(
         row()
@@ -415,7 +621,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
             .center()
             .child(icon(&icons::SMILE, 19.0).color(p.text_muted)),
     );
-    col()
+    let mut column = col()
         .key("composer")
         .w_full()
         .max_w(COLUMN_MAX_W)
@@ -423,27 +629,126 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .px(20.0)
         .pt(4.0)
         .pb(18.0)
-        .child(
-            row()
-                .key("composer-box")
+        .gap(6.0);
+    for n in &room.notices {
+        column = column.child(notice(n, p));
+    }
+    if let Some(reason) = &room.send_block {
+        // Said in full, not only as the placeholder, which a long reason would not fit.
+        column = column.child(
+            label(reason.clone(), st::SMALL, p.text_secondary)
+                .key("send-block")
+                .wrap()
                 .w_full()
-                .h(50.0)
-                .px(6.0)
-                .gap(4.0)
-                .center_y()
-                .radius(12.0)
-                .fill(p.surface)
-                .border(
-                    1.0,
-                    if chat.composer.focused {
-                        p.text_muted
-                    } else {
-                        p.line
-                    },
-                )
-                .shadow(8.0, 24.0, p.shadow)
-                .child(emoji)
-                .child(field)
-                .child(send),
-        )
+                .px(4.0),
+        );
+    } else if let Some(bar) = mode_bar(chat, room, p) {
+        column = column.child(bar);
+    }
+    column.child(
+        row()
+            .key("composer-box")
+            .w_full()
+            .h(50.0)
+            .px(6.0)
+            .gap(4.0)
+            .center_y()
+            .radius(12.0)
+            .fill(p.surface)
+            .border(
+                1.0,
+                if chat.composer.focused {
+                    p.text_muted
+                } else {
+                    p.line
+                },
+            )
+            .shadow(8.0, 24.0, p.shadow)
+            .child(emoji)
+            .child(field)
+            .child(send),
+    )
+}
+
+/// A failed edit, deletion or reaction, with Retry (when it can be sent again) and Dismiss.
+fn notice(n: &Notice, p: &Palette) -> El {
+    let entry = n.entry;
+    let mut choices = row().gap(12.0);
+    if n.retry {
+        choices = choices.child(text_button(
+            format!("retry-{entry}"),
+            "Retry",
+            p.accent,
+            move |s| s.chat.retry(entry),
+        ));
+    }
+    choices = choices.child(text_button(
+        format!("dismiss-{entry}"),
+        "Dismiss",
+        p.text_secondary,
+        move |s| s.chat.discard(entry),
+    ));
+    col()
+        .key(format!("notice-{entry}"))
+        .w_full()
+        .gap(4.0)
+        .px(12.0)
+        .py(8.0)
+        .radius(8.0)
+        .border(1.0, p.line_strong)
+        .child(label(n.text.clone(), st::SMALL, p.danger).wrap().w_full())
+        .child(choices)
+}
+
+/// Above the composer: what it is replying to, that it is editing, or the delete question.
+fn mode_bar(chat: &Chat, room: &Room, p: &Palette) -> Option<El> {
+    let bar = |key: &str, text: String| {
+        row()
+            .key(key.to_owned())
+            .w_full()
+            .gap(12.0)
+            .px(12.0)
+            .py(6.0)
+            .radius(8.0)
+            .center_y()
+            .fill(p.surface)
+            .child(
+                label(text, st::SMALL, p.text_secondary)
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            )
+    };
+    let cancel = || {
+        text_button("cancel".to_owned(), "Cancel", p.text_secondary, |s| {
+            s.chat.cancel()
+        })
+    };
+    match &chat.mode {
+        Mode::Write => None,
+        Mode::Reply(key) => {
+            let target = room.message_by_key(key);
+            let who = target.map_or("a message", |m| room.nickname(m.author));
+            let what = target
+                .map(|m| model::preview(&m.text, 80))
+                .unwrap_or_default();
+            Some(bar("replying", format!("Replying to {who}: {what}")).child(cancel()))
+        }
+        Mode::Edit { .. } => {
+            Some(bar("editing", "Editing your message. Send saves it.".to_owned()).child(cancel()))
+        }
+        Mode::Delete(_) => Some(
+            bar(
+                "deleting",
+                "Delete this message for everyone in the room?".to_owned(),
+            )
+            .child(text_button(
+                "confirm-delete".to_owned(),
+                "Delete",
+                p.danger,
+                |s| s.chat.confirm_delete(),
+            ))
+            .child(cancel()),
+        ),
+    }
 }
