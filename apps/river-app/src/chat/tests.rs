@@ -609,11 +609,13 @@ fn a_message_on_its_way_and_one_that_failed_say_so() {
         room.messages[n - 1].pending = Some(super::model::Pending {
             entry: 7,
             failed: Some("Freenet refused it: too big".into()),
+            retry: true,
         });
         room.messages[n - 2].author = room.me;
         room.messages[n - 2].pending = Some(super::model::Pending {
             entry: 6,
             failed: None,
+            retry: false,
         });
         room.notices = vec![super::model::Notice {
             entry: 9,

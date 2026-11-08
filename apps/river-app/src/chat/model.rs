@@ -45,6 +45,8 @@ pub struct Pending {
     pub entry: u64,
     /// Why it was not sent; `None` while it is still being sent.
     pub failed: Option<String>,
+    /// Whether Retry can send it again.
+    pub retry: bool,
 }
 
 /// Something you did that could not be sent and has no message row to say so on (an edit, a
@@ -68,7 +70,8 @@ pub struct Message {
     pub time: u32,
     pub text: String,
     /// The text as written, which an edit starts from: mention tokens (`@[name](rv:id)`) as
-    /// they are stored, where `text` shows names.
+    /// they are stored, where `text` shows names. Empty when this computer can't read the
+    /// message, which then can't be edited.
     pub source: String,
     pub reply_to: Option<ReplyTo>,
     pub reactions: Vec<Reaction>,

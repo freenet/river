@@ -25,20 +25,28 @@
 //!   one replaces it, counting reactions still on their way (`handle_toggle_reaction`).
 //! - **Admission.** A delta the room would take without adding the message (a cap, a ban) is a
 //!   failure, not a success (`apply_entry_to`'s "the room did not admit the message").
-//! - **A rotated secret.** A message sealed under a secret the room has moved on from is sealed
-//!   again under the current one before it goes out, keeping its time (`take_committable`).
+//! - **A rotated secret.** A message waiting to go out for the first time, sealed under a
+//!   secret the room has since moved on from, is sealed again under the current one, keeping
+//!   its time (`take_committable`), and never under an older one (`sealed_at_or_below`).
+//!   Here that holds only until it first goes out: from then on it is sent again unchanged,
+//!   since the node may already hold it and a resealed copy would show twice. The trade is
+//!   that a message resent after a rotation can reach a member the rotation excluded, which
+//!   the room itself allows (it admits any version it has a record of).
 //!   A message written as an identity the room no longer uses is never sent under the new one.
 //!
 //! Where this differs: the web UI marks a room to sync and never hears whether the node took
 //! the update. Here one update per room is out at a time, and its answer decides: an
 //! `UpdateResponse` means sent (if the room then holds the messages), an update error means
 //! failed, and no answer within [`super::session::Pace::update_wait`] is shown as not
-//! confirmed. An answer names only the contract, not the request, so an unconfirmed update
-//! keeps its room's turn until it is answered, the network brings its messages in, it is
-//! discarded, or the connection drops; otherwise its late answer would be taken for the next
-//! update's. Once sent, messages are only ever sent again unchanged (a retry of an unanswered
-//! update, a resend after a reconnect), so the node never gets two copies under two ids; only
-//! a refused one is built again. A send not taken stays on screen marked "Not sent" with
+//! confirmed. An answer names only the contract, not the request, so it is matched to the
+//! oldest update of that room still owed one, and nothing more goes out for a room while it
+//! owes an answer, whatever became of the entry meanwhile (settled by the network, discarded):
+//! otherwise an owed answer would be taken for the next update's. A new connection owes
+//! nothing, so Retry of an unanswered update reconnects, and so does an answer owed for three
+//! times `update_wait`. Once sent, messages are only ever sent again unchanged (a retry of an
+//! unanswered update, a resend after a reconnect), so the node never gets two copies under two
+//! ids; only a refused one is built again. One the node took but the room here does not show
+//! stays unconfirmed, with why, and is never sent again from here. A send not taken stays on screen marked "Not sent" with
 //! Retry and Discard; an edit, deletion or reaction not taken is said above the composer.
 //! Whatever the network later brings in with these messages' ids counts as sent, whatever the
 //! answer was. Nothing here writes the chat delegate's storage, so the web UI's
@@ -50,7 +58,7 @@
 //! nickname record, as the web UI itself does for a private room whose secret is missing, and
 //! the web UI's own repair publishes one later.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
@@ -389,9 +397,40 @@ fn applied(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> Result<LiveRoom
     next.apply_delta(delta(room, messages))
         .map_err(|e| format!("The room refused it: {e}"))?;
     if !held(&next, messages) {
-        return Err("The room didn't take it. You may have been removed or banned.".into());
+        return Err(why_not_kept(&next, messages));
     }
     Ok(next)
+}
+
+/// Why `room`, with `messages` applied, does not hold them.
+fn why_not_kept(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> String {
+    let state = &room.stored.room_state;
+    let versions: HashSet<u32> = state
+        .secrets
+        .versions
+        .iter()
+        .map(|v| v.record.version)
+        .collect();
+    if room.is_private()
+        && messages
+            .iter()
+            .filter_map(|m| m.message.content.secret_version())
+            .any(|v| !versions.contains(&v))
+    {
+        return "The room's copy on this computer doesn't have the key it was sealed with yet."
+            .into();
+    }
+    let keeps = state.configuration.configuration.max_recent_messages;
+    let held = &state.recent_messages.messages;
+    if held.len() >= keeps
+        && messages.iter().any(|m| {
+            held.first()
+                .is_none_or(|o| m.message.time <= o.message.time)
+        })
+    {
+        return "The room keeps only its newest messages, and this was not among them.".into();
+    }
+    "The room didn't take it. You may have been removed or banned.".into()
 }
 
 fn held(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> bool {
@@ -419,6 +458,10 @@ enum Status {
         at: Instant,
         late: bool,
     },
+    /// The node answered that it took it, but the room here does not hold it (why is the
+    /// text). It is not built or sent again; the network bringing it in settles it, or the
+    /// user discards it.
+    Unconfirmed(String),
     Failed(String),
 }
 
@@ -447,6 +490,24 @@ impl Entry {
         matches!(self.intent, Some(Intent::Text { .. }))
     }
 
+    /// Sealed under a secret version newer than `current`: building it again now would seal
+    /// it backwards (the web UI's `sealed_at_or_below` refuses that).
+    fn sealed_above(&self, current: Option<u32>) -> bool {
+        self.messages
+            .iter()
+            .filter_map(|m| m.message.content.secret_version())
+            .any(|v| current.is_none_or(|c| v > c))
+    }
+
+    /// Whether Retry can do anything for it.
+    fn retryable(&self) -> bool {
+        self.intent.is_some()
+            && matches!(
+                self.status,
+                Status::Failed(_) | Status::InFlight { late: true, .. }
+            )
+    }
+
     /// Sealed under a secret version older than `current` (the web UI only seals forward).
     fn sealed_before(&self, current: Option<u32>) -> bool {
         let Some(current) = current else {
@@ -461,7 +522,7 @@ impl Entry {
     /// Why it is shown as not sent, if it is.
     fn trouble(&self) -> Option<&str> {
         match &self.status {
-            Status::Failed(reason) => Some(reason),
+            Status::Failed(reason) | Status::Unconfirmed(reason) => Some(reason),
             Status::InFlight { late: true, .. } => Some(LATE),
             _ => None,
         }
@@ -479,6 +540,15 @@ pub(super) struct Outbox {
     /// Commands that arrived before the rooms were read.
     pub waiting: Vec<Command>,
     clock: Clock,
+    /// By room, the entries sent on this connection whose answer has not come, oldest first,
+    /// with when each was sent. An answer names only the contract, so it is the oldest one's.
+    /// Nothing more goes out for a room while it owes an answer, whatever became of the entry
+    /// (settled by the network, discarded, retried): otherwise the answer owed would be taken
+    /// for the next update's. A new connection owes nothing.
+    owed: HashMap<VerifyingKey, VecDeque<(u64, Instant)>>,
+    /// The user asked to send again something still owed an answer: that needs a new
+    /// connection, since a second copy on this one would owe a second answer to the same one.
+    reconnect: bool,
 }
 
 impl Default for Outbox {
@@ -488,6 +558,8 @@ impl Default for Outbox {
             next: 0,
             waiting: Vec::new(),
             clock: Box::new(SystemTime::now),
+            owed: HashMap::new(),
+            reconnect: false,
         }
     }
 }
@@ -516,7 +588,8 @@ impl Outbox {
             room: room.stored.owner_vk,
             intent,
             label,
-            author: None,
+            // Written as the room's identity now, whether or not it can be built yet.
+            author: room.stored.self_verifying_key(),
             time: (self.clock)(),
             messages: Vec::new(),
             status: Status::Queued,
@@ -646,6 +719,7 @@ impl Outbox {
     }
 
     fn retry(&mut self, id: u64, room: &LiveRoom) -> bool {
+        let current = room.current_secret().map(|(_, v)| v);
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -653,28 +727,37 @@ impl Outbox {
         else {
             return false;
         };
-        if entry.intent.is_none() {
+        if !entry.retryable() {
             return false;
         }
         match &entry.status {
-            // Unanswered: the same messages again, which the node may already hold. It goes
-            // first in its room, keeping the place it holds.
-            Status::InFlight { late: true, .. } => entry.status = Status::Queued,
+            // Unanswered: the same messages again, which the node may already hold, and only
+            // on a new connection. On this one its answer is still owed, and a second copy
+            // would owe a second answer that would be taken for the next update's.
+            Status::InFlight { late: true, .. } => self.reconnect = true,
+            // Sealed under a key newer than the room's copy here has (after a restart, before
+            // the network caught up): building it again now would seal it backwards.
+            Status::Failed(_) if entry.sealed_above(current) => {
+                entry.status = Status::Failed(
+                    "The room's newer key hasn't reached this computer yet, so it can't be \
+                     sealed again. Try again once the room has caught up."
+                        .into(),
+                );
+            }
             // Refused, or never sendable: a new send, stamped now, as the web UI's
             // `Outbox::retry`. Still as the identity it was written as (`rebuild` checks).
-            Status::Failed(_) => {
+            _ => {
                 entry.time = (self.clock)();
                 entry.status = Status::Queued;
                 entry.sent = false;
                 rebuild(entry, room);
             }
-            _ => return false,
         }
         true
     }
 
-    /// The update to send next for `room`, if none of its updates holds its turn. The entry it
-    /// carries is then in flight. `changed` is set when an entry failed here.
+    /// The update to send next for `room`, if the room owes no answer on this connection. The
+    /// entry it carries is then in flight. `changed` is set when an entry failed here.
     pub fn next_update(
         &mut self,
         room: &LiveRoom,
@@ -682,11 +765,7 @@ impl Outbox {
         changed: &mut bool,
     ) -> Option<ChatRoomStateV1Delta> {
         let vk = room.stored.owner_vk;
-        if self
-            .entries
-            .iter()
-            .any(|e| e.room == vk && matches!(e.status, Status::InFlight { .. }))
-        {
+        if self.owed.get(&vk).is_some_and(|o| !o.is_empty()) {
             return None;
         }
         let current = room.current_secret().map(|(_, v)| v);
@@ -720,39 +799,52 @@ impl Outbox {
                 late: false,
             };
             entry.sent = true;
+            self.owed.entry(vk).or_default().push_back((entry.id, now));
             return Some(delta(room, &entry.messages));
         }
         None
     }
 
-    /// The node answered the update holding `room`'s turn. Taken: its messages join the room
-    /// at once, and the entry is done if the room kept them; if it did not (the node answers a
-    /// delta that changed nothing the same way), it fails. Refused: it fails with the node's
-    /// reason. True when that changed anything.
+    /// The node answered an update for `room`: the oldest one it still owes an answer. If that
+    /// entry is gone (settled by the network, or discarded) the answer is only consumed. Taken:
+    /// its messages join the room at once, and the entry is done if the room kept them;
+    /// otherwise it stays unconfirmed with why. Refused: it fails with the node's reason. True
+    /// when that changed what shows.
     pub fn answered(&mut self, room: &mut LiveRoom, result: Result<(), String>) -> bool {
-        let Some(i) = self.entries.iter().position(|e| {
-            e.room == room.stored.owner_vk && matches!(e.status, Status::InFlight { .. })
-        }) else {
+        let Some((id, _)) = self
+            .owed
+            .get_mut(&room.stored.owner_vk)
+            .and_then(VecDeque::pop_front)
+        else {
+            return false;
+        };
+        let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.id == id && matches!(e.status, Status::InFlight { .. }))
+        else {
             return false;
         };
         match result {
             Ok(()) => {
                 let messages = self.entries[i].messages.clone();
-                let kept = match room.apply_delta(delta(room, &messages)) {
-                    Ok(()) => held(room, &messages),
+                match room.apply_delta(delta(room, &messages)) {
+                    Ok(()) if held(room, &messages) => {
+                        self.entries.remove(i);
+                    }
+                    // Taken by the node, so never built or sent again from here.
+                    Ok(()) => {
+                        self.entries[i].status = Status::Unconfirmed(format!(
+                            "Freenet took it, but the room here doesn't show it. {}",
+                            why_not_kept(room, &messages)
+                        ));
+                    }
                     Err(e) => {
                         eprintln!("River: a message Freenet took was not applied here: {e}");
-                        false
+                        self.entries[i].status = Status::Unconfirmed(format!(
+                            "Freenet took it, but the room here couldn't apply it: {e}"
+                        ));
                     }
-                };
-                if kept {
-                    self.entries.remove(i);
-                } else {
-                    self.entries[i].status = Status::Failed(
-                        "Freenet answered, but the room didn't keep it. You may have been \
-                         removed or banned."
-                            .into(),
-                    );
                 }
             }
             Err(reason) => {
@@ -762,8 +854,8 @@ impl Outbox {
         true
     }
 
-    /// Updates unanswered for `wait` by `now` are shown as not confirmed (they keep their
-    /// room's turn). True when any newly were.
+    /// Updates unanswered for `wait` by `now` are shown as not confirmed (their room still
+    /// owes the answer). True when any newly were.
     pub fn expire(&mut self, wait: Duration, now: Instant) -> bool {
         let mut any = false;
         for e in &mut self.entries {
@@ -778,9 +870,23 @@ impl Outbox {
         any
     }
 
-    /// The connection is gone: what was in flight goes again on the next one, as the same
-    /// signed messages, so one the node did take is not added twice.
+    /// Whether this connection should be dropped: the user asked to send again something
+    /// still owed an answer, or an answer has been owed for `bound`, which would otherwise
+    /// hold its room for good.
+    pub fn wants_reconnect(&self, bound: Duration, now: Instant) -> bool {
+        self.reconnect
+            || self
+                .owed
+                .values()
+                .filter_map(VecDeque::front)
+                .any(|(_, at)| now.saturating_duration_since(*at) >= bound)
+    }
+
+    /// The connection is gone: nothing is owed on the next one, and what was in flight goes
+    /// again on it, as the same signed messages, so one the node did take is not added twice.
     pub fn requeue(&mut self) {
+        self.owed.clear();
+        self.reconnect = false;
         for e in &mut self.entries {
             if matches!(e.status, Status::InFlight { .. }) {
                 e.status = Status::Queued;
@@ -834,14 +940,19 @@ impl Outbox {
                         Pending {
                             entry: e.id,
                             failed: trouble.clone(),
+                            retry: e.retryable(),
                         },
                     );
                 }
             } else if let Some(reason) = trouble {
                 notices.push(Notice {
                     entry: e.id,
-                    text: format!("{} couldn't be sent. {reason}", e.label),
-                    retry: e.intent.is_some(),
+                    text: match e.status {
+                        // Taken by the node, so not "couldn't be sent".
+                        Status::Unconfirmed(_) => format!("{}: {reason}", e.label),
+                        _ => format!("{} couldn't be sent. {reason}", e.label),
+                    },
+                    retry: e.retryable(),
                 });
             }
         }

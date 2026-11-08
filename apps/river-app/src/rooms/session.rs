@@ -29,9 +29,13 @@
 //!   marked as on its way, then sent as an UPDATE, one per room at a time ([`super::outbox`]
 //!   has the details and what it mirrors in the web UI). The node's answer decides: taken,
 //!   refused (shown as not sent, with the node's reason), or unanswered for
-//!   [`Pace::update_wait`] (the same). What was out when the connection dropped goes again on
-//!   the next one. Commands that arrive while disconnected are shown and wait; commands that
-//!   arrive before the rooms were first read wait for them.
+//!   [`Pace::update_wait`] (shown as not confirmed). An answer names only the room, so a room
+//!   that owes one sends nothing more on this connection; a retry of an unanswered update, or
+//!   an answer owed for three times `update_wait`, reconnects, since a new connection owes
+//!   nothing. What was out when the connection dropped goes again on the next one, unchanged.
+//!   Commands that arrive while disconnected are shown and wait; commands that arrive before
+//!   the rooms were first read wait for them. What is unsent outlives the run (a stop, or a
+//!   panic), and a first read that finds no rooms does not drop it.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -205,16 +209,36 @@ pub(super) fn run(
     commands: &Receiver<Command>,
     outbox: &mut Outbox,
 ) -> Access {
-    let mut rooms = Rooms {
-        outbox: std::mem::take(outbox),
-        ..Rooms::default()
+    let mut kept = KeepOutbox {
+        rooms: Rooms {
+            outbox: std::mem::take(outbox),
+            ..Rooms::default()
+        },
+        outbox,
     };
-    let end = run_with(
-        authority, config_dir, report, pace, stop, commands, &mut rooms,
-    );
-    rooms.outbox.requeue();
-    *outbox = std::mem::take(&mut rooms.outbox);
-    end
+    run_with(
+        authority,
+        config_dir,
+        report,
+        pace,
+        stop,
+        commands,
+        &mut kept.rooms,
+    )
+}
+
+/// Gives the outbox back to the link when a run ends, however it ends: a panic too (the link
+/// catches it), so what the user sent is not lost with the run.
+struct KeepOutbox<'a> {
+    rooms: Rooms,
+    outbox: &'a mut Outbox,
+}
+
+impl Drop for KeepOutbox<'_> {
+    fn drop(&mut self) {
+        self.rooms.outbox.requeue();
+        *self.outbox = std::mem::take(&mut self.rooms.outbox);
+    }
 }
 
 fn run_with(
@@ -558,6 +582,18 @@ fn follow_on(
         // What the user did, then the updates it makes.
         let mut changed = rooms.take_commands(commands);
         changed |= rooms.outbox.expire(pace.update_wait, Instant::now());
+        // A room that owes an answer sends nothing more on this connection; a new one owes
+        // nothing. So a retry of an unanswered update, or an answer owed for too long, is a
+        // reconnect.
+        if rooms
+            .outbox
+            .wants_reconnect(pace.update_wait.saturating_mul(3), Instant::now())
+        {
+            if changed {
+                rooms.report(status, report);
+            }
+            return SocketError::Failed("reconnecting to send again".into());
+        }
         match rooms.send_updates(socket) {
             Ok(failed) => changed |= failed,
             Err(e) => return e,
@@ -1021,7 +1057,11 @@ impl Rooms {
         self.store_missing = loaded.store_missing;
         self.unreadable = loaded.unreadable;
         self.loaded = true;
-        self.outbox.keep_rooms(&shown);
+        // Only a read that found rooms says which are gone. A first read of a run that finds
+        // no store, or nothing, must not drop what an earlier run left unsent.
+        if !loaded.store_missing && loaded.listed > 0 {
+            self.outbox.keep_rooms(&shown);
+        }
         for room in &self.list {
             self.outbox.reconcile(room);
         }

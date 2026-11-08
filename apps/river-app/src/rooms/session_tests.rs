@@ -64,6 +64,32 @@ struct TestRoom {
 }
 
 impl TestRoom {
+    /// The private room of `room_tests::Fixture` ("Secret garden", secret v0), with its owner
+    /// (seed 1) holding the secret too, so the owner can send in it.
+    fn private(generation: u8) -> TestRoom {
+        let f = crate::rooms::room_tests::Fixture::new();
+        let mut state = f.private_state();
+        crate::rooms::room_tests::add_secret(
+            &f,
+            &mut state,
+            0,
+            &crate::rooms::room_tests::SECRET,
+            &f.owner,
+        );
+        let params = ChatRoomParametersV1 {
+            owner: f.owner.verifying_key(),
+        };
+        let key = ContractKey::from_params_and_code(
+            Parameters::from(cbor(&params)),
+            ContractCode::from(vec![generation]),
+        );
+        TestRoom {
+            owner: f.owner,
+            state,
+            key,
+        }
+    }
+
     fn new(seed: u8, name: &str, generation: u8, texts: &[&str]) -> TestRoom {
         let owner = SigningKey::from_bytes(&[seed; 32]);
         let owner_id = MemberId::from(&owner.verifying_key());
@@ -1625,11 +1651,38 @@ fn an_unanswered_update_fails_and_counts_as_sent_once_the_network_brings_it() {
 #[test]
 fn what_was_out_when_the_connection_dropped_goes_again_unchanged() {
     let node = fake_node(vec![]);
-    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    // A private room, so sealing it again would change it.
+    let a = TestRoom::private(1);
     node.with(|w| w.update_play = UpdatePlay::Ignore);
     let (session, _dir) = following(&node, &[&a], "send-reconnect", quick());
     session.act(&a, say("across a drop"));
     session.wait_until("sent once", || node.with(|w| w.updates.len() == 1));
+    // The room's secret rotates (shown by a message under the new one) before the drop.
+    let f = crate::rooms::room_tests::Fixture::new();
+    let v1 = [7u8; 32];
+    let mut rotated = a.state.clone();
+    crate::rooms::room_tests::add_secret(&f, &mut rotated, 1, &v1, &a.owner);
+    let (ct, nonce) = river_core::ecies::encrypt_with_symmetric_key(
+        &v1,
+        &river_core::room_state::content::TextContentV1::new("under v1".into()).encode(),
+    );
+    rotated.recent_messages.messages.push(message_with(
+        &a.owner,
+        RoomMessageBody::private_text(ct, nonce, 1),
+    ));
+    let note: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateNotification {
+            key: a.key,
+            update: UpdateData::State(cbor(&rotated).into()),
+        },
+    ));
+    node.with(|w| {
+        w.push
+            .push(Message::Binary(bincode::serialize(&note).unwrap().into()))
+    });
+    session.wait_rooms("the rotation arrived", |r, _, _| {
+        texts(&r[0]).contains(&"under v1".to_owned())
+    });
     node.with(|w| {
         w.update_play = UpdatePlay::Accept;
         w.drop_live = true;
@@ -1639,8 +1692,106 @@ fn what_was_out_when_the_connection_dropped_goes_again_unchanged() {
     });
     let (first, second) = node.with(|w| (w.updates[0].1.clone(), w.updates[1].1.clone()));
     assert_eq!(first.recent_messages, second.recent_messages);
+    let sealed: Vec<Option<u32>> = second
+        .recent_messages
+        .unwrap()
+        .iter()
+        .map(|m| m.message.content.secret_version())
+        .collect();
+    assert_eq!(
+        sealed,
+        [Some(0)],
+        "sent again as it was, not sealed again under v1"
+    );
     session.wait_until("marked sent", || {
         delivery_of(&session, "across a drop") == Some(None)
+    });
+}
+
+fn message_with(author: &SigningKey, content: RoomMessageBody) -> AuthorizedMessageV1 {
+    AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: MemberId::from(&author.verifying_key()),
+            author: MemberId::from(&author.verifying_key()),
+            time: SystemTime::now(),
+            content,
+        },
+        author,
+    )
+}
+
+#[test]
+fn a_first_read_that_finds_no_rooms_keeps_what_an_earlier_run_left_unsent() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    for first_read in [Loaded::missing(), loaded(vec![])] {
+        let mut outbox = Outbox::default();
+        assert!(outbox.command(&LiveRoom::new(a.stored()), say("left unsent")));
+        let mut rooms = Rooms {
+            outbox,
+            ..Rooms::default()
+        };
+        rooms.replace(first_read);
+        assert!(!rooms.outbox.is_empty());
+        // A read that finds the room keeps it too; one that finds rooms without it drops it.
+        rooms.replace(loaded(vec![a.stored()]));
+        assert!(!rooms.outbox.is_empty());
+        let b = TestRoom::new(2, "B", 1, &["b1"]);
+        rooms.replace(loaded(vec![b.stored()]));
+        assert!(rooms.outbox.is_empty());
+    }
+}
+
+#[test]
+fn a_run_that_panics_gives_the_outbox_back() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut outbox = Outbox::default();
+    assert!(outbox.command(&LiveRoom::new(a.stored()), say("kept")));
+    outbox.waiting.push(Command {
+        room: "x".into(),
+        action: say("waiting"),
+    });
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(
+            "127.0.0.1:1",
+            None,
+            &|_| panic!("a bug while reporting"),
+            &quick(),
+            &|| false,
+            &rx,
+            &mut outbox,
+        )
+    }));
+    assert!(ended.is_err());
+    assert!(!outbox.is_empty());
+    assert_eq!(outbox.waiting.len(), 1);
+}
+
+#[test]
+fn a_command_waiting_for_the_rooms_survives_a_stop() {
+    let node = fake_node(vec![Play::Drop; 1000]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.add_room(&a));
+    let dir = temp_dir("send-waiting-stop");
+    save_token(&dir, "kept-token");
+    let outbox: Arc<Mutex<Outbox>> = Arc::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Command {
+        room: bs58::encode(a.vk().to_bytes()).into_string(),
+        action: say("written before any rooms"),
+    })
+    .unwrap();
+    let first = Running::start_with(&node, &dir, quick(), outbox.clone(), (tx, rx));
+    // Every connection drops, so the rooms are never read; the command is taken while waiting.
+    first.wait_until("taken into the outbox", || {
+        node.with(|w| w.connections.len() >= 3)
+    });
+    drop(first);
+    assert_eq!(outbox.lock().unwrap().waiting.len(), 1);
+    node.with(|w| w.plays.clear());
+    let second = Running::start_with(&node, &dir, quick(), outbox, std::sync::mpsc::channel());
+    second.wait_until("sent once the next run reads the rooms", || {
+        delivery_of(&second, "written before any rooms") == Some(None)
     });
 }
 
@@ -1800,10 +1951,11 @@ fn edit_react_and_delete_reach_the_node_and_the_screen() {
         })
     });
     session.act(&a, Action::Delete { target });
-    session.wait_until("deleted", || {
-        session
-            .last_rooms()
-            .is_some_and(|(rooms, _, _)| rooms[0].messages.is_empty())
+    session.wait_until("deleted, all three sent and answered", || {
+        node.with(|w| w.updates.len() == 3)
+            && session.last_rooms().is_some_and(|(rooms, _, _)| {
+                rooms[0].messages.is_empty() && rooms[0].notices.is_empty()
+            })
     });
     let kinds: Vec<u32> = node.with(|w| {
         w.updates

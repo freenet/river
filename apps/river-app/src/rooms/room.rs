@@ -82,6 +82,14 @@ impl LiveRoom {
 
     /// A message's text as the conversation shows it: edited, decrypted, mentions as names.
     pub fn shown_text(&self, m: &AuthorizedMessageV1) -> String {
+        let raw = self
+            .written_text(m)
+            .unwrap_or_else(|| self.body_text(&m.message.content));
+        self.render(&raw)
+    }
+
+    /// Text as written, with mentions as names.
+    fn render(&self, raw: &str) -> String {
         let state = &self.stored.room_state;
         let owner = RiverMemberId::from(&self.stored.owner_vk);
         let me = self
@@ -94,20 +102,23 @@ impl LiveRoom {
                 .find(|id| r.matches(*id))
                 .map(|id| self.nickname(id, me))
         };
-        let raw = self.source_text(m);
-        river_core::mention::render_plaintext_transformed(&raw, resolve_mention, |name| {
-            clean(&name)
-        })
+        river_core::mention::render_plaintext_transformed(raw, resolve_mention, |name| clean(&name))
     }
 
     /// A message's text as written: edited and decrypted, with mention tokens kept, so an edit
-    /// of it keeps its mentions.
-    pub fn source_text(&self, m: &AuthorizedMessageV1) -> String {
-        self.stored
-            .room_state
-            .recent_messages
-            .effective_text(m)
-            .unwrap_or_else(|| self.body_text(&m.message.content))
+    /// of it keeps its mentions. `None` for a private body this computer cannot decrypt, whose
+    /// placeholder must never be offered for editing.
+    pub fn written_text(&self, m: &AuthorizedMessageV1) -> Option<String> {
+        if let Some(edited) = self.stored.room_state.recent_messages.effective_text(m) {
+            return Some(edited);
+        }
+        match &m.message.content {
+            RoomMessageBody::Private { .. } => {
+                let (content_type, plain) = self.private_plaintext(&m.message.content)?;
+                Some(plain_text(content_type, &plain))
+            }
+            content @ RoomMessageBody::Public { .. } => Some(self.body_text(content)),
+        }
     }
 
     /// A member's name as the conversation shows it.
@@ -233,19 +244,7 @@ impl LiveRoom {
             },
             RoomMessageBody::Private { secret_version, .. } => {
                 match self.private_plaintext(content) {
-                    Some((content_type, plain)) => {
-                        if content_type == CONTENT_TYPE_TEXT
-                            && let Ok(t) = TextContentV1::decode(&plain)
-                        {
-                            return t.text;
-                        }
-                        if content_type == CONTENT_TYPE_REPLY
-                            && let Ok(r) = ReplyContentV1::decode(&plain)
-                        {
-                            return r.text;
-                        }
-                        String::from_utf8_lossy(&plain).into_owned()
-                    }
+                    Some((content_type, plain)) => plain_text(content_type, &plain),
                     None if self.secrets.contains_key(secret_version) => content.to_string_lossy(),
                     None if self.secrets.is_empty() => {
                         // The web UI says "Decrypting messages" here because its delegate
@@ -341,7 +340,16 @@ impl LiveRoom {
             .enumerate()
             .map(|(i, m)| (m.id(), i as model::MessageId + 1))
             .collect();
-        let texts: Vec<String> = shown.iter().map(|m| self.shown_text(m)).collect();
+        // Each body decrypted once: as written (for editing), then as shown.
+        let written: Vec<Option<String>> = shown.iter().map(|m| self.written_text(m)).collect();
+        let texts: Vec<String> = shown
+            .iter()
+            .zip(&written)
+            .map(|(m, w)| match w {
+                Some(w) => self.render(w),
+                None => self.render(&self.body_text(&m.message.content)),
+            })
+            .collect();
 
         let mut messages = Vec::with_capacity(shown.len());
         for (i, m) in shown.iter().enumerate() {
@@ -374,7 +382,7 @@ impl LiveRoom {
                 author: ids.of(m.message.author),
                 time: minutes(m.message.time),
                 text: texts[i].clone(),
-                source: self.source_text(m),
+                source: written[i].clone().unwrap_or_default(),
                 reply_to,
                 reactions,
                 edited: state.recent_messages.is_edited(&m.id()),
@@ -454,6 +462,21 @@ impl LiveRoom {
             name
         }
     }
+}
+
+/// A decrypted body's text, as the web UI's `try_decrypt_message_content` reads it.
+fn plain_text(content_type: u32, plain: &[u8]) -> String {
+    if content_type == CONTENT_TYPE_TEXT
+        && let Ok(t) = TextContentV1::decode(plain)
+    {
+        return t.text;
+    }
+    if content_type == CONTENT_TYPE_REPLY
+        && let Ok(r) = ReplyContentV1::decode(plain)
+    {
+        return r.text;
+    }
+    String::from_utf8_lossy(plain).into_owned()
 }
 
 /// The stable key of a River message on screen: its id (a hash of its signature) in decimal.

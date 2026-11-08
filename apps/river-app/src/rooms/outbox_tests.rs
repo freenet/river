@@ -538,7 +538,9 @@ fn a_message_the_room_would_not_keep_is_refused_here() {
     assert!(next(&mut outbox, &room, Instant::now()).is_none());
     let view = outbox.view(&room, &minutes);
     assert!(
-        view.notices[0].text.contains("didn't take it"),
+        view.notices[0]
+            .text
+            .contains("keeps only its newest messages"),
         "{:?}",
         view.notices
     );
@@ -749,7 +751,7 @@ fn what_is_sent_shows_at_once_marked_until_the_node_takes_it() {
 }
 
 #[test]
-fn an_answer_the_room_did_not_keep_is_a_failure() {
+fn an_answer_the_room_does_not_show_stays_unconfirmed_and_is_never_sent_again() {
     let f = Fixture::new();
     let mut room = public_room(&f);
     let mut outbox = outbox();
@@ -761,10 +763,43 @@ fn an_answer_the_room_did_not_keep_is_a_failure() {
     assert!(outbox.answered(&mut room, Ok(())));
     let view = outbox.view(&room, &minutes);
     assert!(
-        view.notices[0].text.contains("didn't keep it"),
+        view.notices[0]
+            .text
+            .starts_with("Your message: Freenet took it, but the room here doesn't show it.")
+            && view.notices[0].text.contains("removed or banned"),
         "{:?}",
         view.notices
     );
+    assert!(!view.notices[0].retry);
+    // Taken by the node: Retry does nothing, and it never goes out again from here.
+    let entry = view.notices[0].entry;
+    assert!(!outbox.command(&room, Action::Retry { entry }));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert!(outbox.command(&room, Action::Discard { entry }));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn an_answer_for_a_message_sealed_with_a_key_the_room_here_lacks_says_so() {
+    let f = Fixture::new();
+    let older = private_room(&f);
+    let mut state = older.stored.room_state.clone();
+    add_secret(&f, &mut state, 1, &[7; 32], &f.me);
+    let mut newer = older.clone();
+    newer.merge_state(&state).unwrap();
+    let mut outbox = outbox();
+    sent(&mut outbox, &newer, say("under v1"));
+    // The answer lands while the room here is a copy from before the rotation.
+    let mut here = older.clone();
+    assert!(outbox.answered(&mut here, Ok(())));
+    let pending = pending_of(&outbox, &newer, "under v1").unwrap().unwrap();
+    assert!(
+        pending
+            .failed
+            .unwrap()
+            .contains("doesn't have the key it was sealed with"),
+    );
+    assert!(!pending.retry);
 }
 
 #[test]
@@ -859,28 +894,24 @@ fn a_late_update_retried_or_resent_after_a_drop_goes_again_unchanged() {
     let f = Fixture::new();
     let mut room = private_room(&f);
     let mut outbox = outbox();
-    let t0 = Instant::now();
     let wait = Duration::from_secs(60);
     let first = sent(&mut outbox, &room, say("again and again"));
-    let t0 = t0.max(Instant::now());
+    let t0 = Instant::now();
     assert!(outbox.expire(wait, t0 + wait));
     let entry = pending_of(&outbox, &room, "again and again")
         .unwrap()
         .unwrap()
         .entry;
+    // Retry of an unanswered update: not on this connection, which still owes its answer.
+    assert!(!outbox.wants_reconnect(wait * 3, t0 + wait));
     assert!(outbox.command(&room, Action::Retry { entry }));
-    let retried = next(&mut outbox, &room, t0 + wait)
-        .unwrap()
-        .recent_messages
-        .unwrap();
-    assert_eq!(
-        retried, first,
-        "the same signed message, so the node can't hold two"
-    );
+    assert!(next(&mut outbox, &room, t0 + wait).is_none());
+    assert!(outbox.wants_reconnect(wait * 3, t0 + wait));
 
-    // The connection drops and the room's secret rotates meanwhile: still the same message,
-    // since the node may already hold it.
+    // On the new connection (with the room's secret rotated meanwhile): the same signed
+    // message, since the node may already hold it.
     outbox.requeue();
+    assert!(!outbox.wants_reconnect(wait * 3, t0 + wait));
     let mut state = room.stored.room_state.clone();
     add_secret(&f, &mut state, 1, &[7; 32], &f.me);
     room.merge_state(&state).unwrap();
@@ -1072,13 +1103,190 @@ fn a_waiting_message_is_never_sealed_back_under_an_older_secret() {
     let mut newer = older.clone();
     newer.merge_state(&state).unwrap();
     let mut outbox = outbox();
-    sent(&mut outbox, &newer, say("first"));
-    assert!(outbox.command(&newer, say("under v1")));
-    assert!(outbox.answered(&mut newer.clone(), Ok(())));
-    // Seen against a copy of the room from before the rotation, it is not sealed back to v0.
-    if let Some(delta) = next(&mut outbox, &older, Instant::now()) {
-        for m in delta.recent_messages.unwrap() {
-            assert_eq!(m.message.content.secret_version(), Some(1));
-        }
+    let first = sent(&mut outbox, &newer, say("under v1"));
+    assert!(outbox.answered(&mut newer.clone(), Err("busy".into())));
+    // Retried against a copy of the room from before the rotation (after a restart): it is not
+    // sealed back to v0, and says why.
+    let entry = pending_of(&outbox, &newer, "under v1")
+        .unwrap()
+        .unwrap()
+        .entry;
+    assert!(outbox.command(&older, Action::Retry { entry }));
+    assert!(next(&mut outbox, &older, Instant::now()).is_none());
+    let pending = pending_of(&outbox, &newer, "under v1").unwrap().unwrap();
+    assert!(pending.failed.unwrap().contains("newer key hasn't reached"));
+    assert_eq!(outbox.entries[0].messages, first, "not resealed");
+    // Once the room here catches up, Retry sends it.
+    assert!(outbox.command(&newer, Action::Retry { entry }));
+    let again = next(&mut outbox, &newer, Instant::now()).unwrap();
+    for m in again.recent_messages.unwrap() {
+        assert_eq!(m.message.content.secret_version(), Some(1));
     }
+}
+
+// An answer owed is never credited to the next update ----------------------------------------
+
+/// Send "A", and queue "B" behind it.
+fn a_then_b(outbox: &mut Outbox, room: &LiveRoom) -> Vec<AuthorizedMessageV1> {
+    let a = sent(outbox, room, say("A"));
+    assert!(outbox.command(room, say("B")));
+    a
+}
+
+/// B has not gone out, has no answer, and is not in the room.
+fn b_untouched(outbox: &Outbox, room: &LiveRoom) {
+    assert_eq!(pending_of(outbox, room, "B").unwrap().unwrap().failed, None);
+    assert!(
+        room.stored
+            .room_state
+            .recent_messages
+            .messages
+            .iter()
+            .all(|m| room.shown_text(m) != "B")
+    );
+}
+
+#[test]
+fn an_owed_answer_after_the_network_settled_its_update_is_not_the_next_ones() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    let a = a_then_b(&mut outbox, &room);
+    // The network brings A in before A's answer.
+    room.apply_delta(ChatRoomStateV1Delta {
+        recent_messages: Some(a),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(outbox.reconcile(&room));
+    assert!(
+        next(&mut outbox, &room, Instant::now()).is_none(),
+        "A's answer is owed"
+    );
+    // A's answer: consumed, not credited to B.
+    assert!(!outbox.answered(&mut room, Err("late".into())));
+    b_untouched(&outbox, &room);
+    assert!(
+        next(&mut outbox, &room, Instant::now()).is_some(),
+        "now B goes"
+    );
+}
+
+#[test]
+fn an_owed_answer_after_its_update_was_discarded_is_not_the_next_ones() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    a_then_b(&mut outbox, &room);
+    outbox.expire(Duration::ZERO, Instant::now() + Duration::from_secs(1));
+    let entry = pending_of(&outbox, &room, "A").unwrap().unwrap().entry;
+    assert!(outbox.command(&room, Action::Discard { entry }));
+    assert!(
+        next(&mut outbox, &room, Instant::now()).is_none(),
+        "A's answer is owed"
+    );
+    assert!(!outbox.answered(&mut room, Ok(())));
+    b_untouched(&outbox, &room);
+    assert!(
+        next(&mut outbox, &room, Instant::now()).is_some(),
+        "now B goes"
+    );
+}
+
+#[test]
+fn an_owed_answer_after_its_update_was_retried_is_its_own() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    a_then_b(&mut outbox, &room);
+    outbox.expire(Duration::ZERO, Instant::now() + Duration::from_secs(1));
+    let entry = pending_of(&outbox, &room, "A").unwrap().unwrap().entry;
+    assert!(outbox.command(&room, Action::Retry { entry }));
+    // Nothing goes out on this connection: not A again, not B.
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert_eq!(
+        pending_of(&outbox, &room, "A"),
+        Some(None),
+        "A's answer settles A"
+    );
+    b_untouched(&outbox, &room);
+}
+
+#[test]
+fn an_answer_owed_too_long_asks_for_a_new_connection() {
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let mut outbox = outbox();
+    let t0 = Instant::now();
+    assert!(outbox.command(&room, say("A")));
+    next(&mut outbox, &room, t0).unwrap();
+    let bound = Duration::from_secs(180);
+    assert!(!outbox.wants_reconnect(bound, t0 + bound / 2));
+    assert!(outbox.wants_reconnect(bound, t0 + bound));
+    outbox.requeue();
+    assert!(!outbox.wants_reconnect(bound, t0 + bound));
+    assert!(
+        next(&mut outbox, &room, t0 + bound).is_some(),
+        "A goes again"
+    );
+}
+
+#[test]
+fn a_message_never_built_is_not_built_later_as_another_identity() {
+    let f = Fixture::new();
+    let other = SigningKey::from_bytes(&[9; 32]);
+    // A private room where `me` has no secret, so nothing can be built as `me`, and `other`,
+    // a member holding the secret, is the identity this computer uses later.
+    let mut state = f.private_state();
+    state.secrets.encrypted_secrets.clear();
+    state
+        .members
+        .members
+        .push(admitted_by(&f, &f.owner, &other));
+    add_secret(&f, &mut state, 0, &SECRET, &other);
+    let unbuildable = LiveRoom::new(f.stored(state));
+    assert_eq!(participation(&unbuildable), Err(Blocked::NoSecret));
+    let mut stored = unbuildable.stored.clone();
+    stored.self_sk = Some(other.clone());
+    let after = LiveRoom::new(stored);
+    assert_eq!(participation(&after), Ok(()));
+    let mut outbox = outbox();
+    assert!(outbox.command(&unbuildable, say("as me")));
+    let entry = outbox.view(&unbuildable, &minutes).notices[0].entry;
+    assert!(outbox.command(&after, Action::Retry { entry }));
+    assert!(next(&mut outbox, &after, Instant::now()).is_none());
+    let view = outbox.view(&after, &minutes);
+    assert!(
+        view.notices
+            .iter()
+            .any(|n| n.text.contains(IDENTITY_CHANGED))
+            || view
+                .messages
+                .iter()
+                .any(|m| m.pending.as_ref().and_then(|p| p.failed.as_deref())
+                    == Some(IDENTITY_CHANGED)),
+        "{:?}",
+        view.notices
+    );
+}
+
+#[test]
+fn a_message_this_computer_cannot_read_offers_nothing_to_edit() {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    let (ct, nonce) = river_core::ecies::encrypt_with_symmetric_key(
+        &[3; 32],
+        &TextContentV1::new("unreadable".into()).encode(),
+    );
+    state.recent_messages.messages.push(f.message(
+        &f.me,
+        BASE,
+        RoomMessageBody::private_text(ct, nonce, 0),
+    ));
+    let room = LiveRoom::new(f.stored(state));
+    let view = Outbox::default().view(&room, &minutes);
+    let m = view.messages.last().unwrap();
+    assert!(m.text.starts_with("[Encrypted"), "{}", m.text);
+    assert_eq!(m.source, "");
 }

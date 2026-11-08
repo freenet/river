@@ -332,7 +332,7 @@ fn actions(chat: &Chat, room: &Room, m: &Message, p: &Palette) -> Option<El> {
         p,
         move |s| s.chat.start_reply(&key),
     ));
-    if m.author == room.me {
+    if m.author == room.me && !m.source.is_empty() {
         let key = k.clone();
         bar = bar.child(action_button(
             format!("edit-{k}"),
@@ -341,6 +341,8 @@ fn actions(chat: &Chat, room: &Room, m: &Message, p: &Palette) -> Option<El> {
             p,
             move |s| s.chat.start_edit(&key),
         ));
+    }
+    if m.author == room.me {
         let key = k.clone();
         bar = bar.child(action_button(
             format!("delete-{k}"),
@@ -404,31 +406,40 @@ fn delivery(pending: &Pending, p: &Palette) -> El {
             .child(label("Sending…", st::SMALL, p.text_muted));
     };
     let entry = pending.entry;
+    let mut choices = row().gap(12.0);
+    if pending.retry {
+        choices = choices.child(text_button(
+            format!("retry-{entry}"),
+            "Retry",
+            p.accent,
+            move |s| s.chat.retry(entry),
+        ));
+    }
+    choices = choices.child(text_button(
+        format!("discard-{entry}"),
+        "Discard",
+        p.text_secondary,
+        move |s| s.chat.discard(entry),
+    ));
     col()
         .key("not-sent")
         .max_w(BODY_MAX_W)
         .gap(4.0)
         .child(
-            label(format!("Not sent. {reason}"), st::SMALL, p.danger)
-                .wrap()
-                .w_full(),
+            // A reason that can't be retried says for itself what became of it.
+            label(
+                if pending.retry {
+                    format!("Not sent. {reason}")
+                } else {
+                    reason.clone()
+                },
+                st::SMALL,
+                p.danger,
+            )
+            .wrap()
+            .w_full(),
         )
-        .child(
-            row()
-                .gap(12.0)
-                .child(text_button(
-                    format!("retry-{entry}"),
-                    "Retry",
-                    p.accent,
-                    move |s| s.chat.retry(entry),
-                ))
-                .child(text_button(
-                    format!("discard-{entry}"),
-                    "Discard",
-                    p.text_secondary,
-                    move |s| s.chat.discard(entry),
-                )),
-        )
+        .child(choices)
 }
 
 /// A pressable word, for small inline choices.
