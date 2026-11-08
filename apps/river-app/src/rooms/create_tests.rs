@@ -464,7 +464,16 @@ fn new_room_trims_what_was_typed() {
         false,
     )
     .unwrap();
-    let view = LiveRoom::new(stored(&plan.room)).view(&minutes);
-    assert_eq!(view.name, "Book club");
-    assert!(view.members.iter().any(|m| m.nickname == "Ada"));
+    // What the room stores, not how a view shows it (a view trims what it shows anyway).
+    let state = &plan.room.room_state;
+    assert_eq!(
+        state.configuration.configuration.display.name,
+        SealedBytes::public(b"Book club".to_vec())
+    );
+    assert_eq!(
+        state.member_info.member_info[0]
+            .member_info
+            .preferred_nickname,
+        SealedBytes::public(b"Ada".to_vec())
+    );
 }
