@@ -1,4 +1,6 @@
-use crate::components::icons::{line_icon, REACT_ICON_PATH, REPLY_ICON_PATH, SEND_ICON_PATH};
+use crate::components::icons::{
+    line_icon, REACT_ICON_PATH, REPLY_TARGET_ICON_PATH, SEND_ICON_PATH,
+};
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -247,7 +249,7 @@ pub fn MessageInput(
                         let preview = ctx.content_preview.clone();
                         rsx! {
                             div { class: "flex items-center gap-2 mb-1.5 px-1 text-[13px] text-text-quote",
-                                span { "aria-hidden": "true", class: "flex-shrink-0 inline-flex", {line_icon(REPLY_ICON_PATH, 14)} }
+                                span { "aria-hidden": "true", class: "flex-shrink-0 inline-flex", {line_icon(REPLY_TARGET_ICON_PATH, 14)} }
                                 span { class: "flex-1 truncate",
                                     span { class: "font-bold text-text-secondary", "Replying to {author} " }
                                     "{preview}"

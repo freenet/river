@@ -27,6 +27,11 @@ pub(crate) const SHIELD_ICON_PATH: &str = "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10
 pub(crate) const JOIN_ICON_PATH: &str =
     "M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3";
 pub(crate) const REPLY_ICON_PATH: &str = "M9 14 4 9l5-5M20 20v-7a4 4 0 0 0-4-4H4";
+/// Points up and to the left, at the message a reply quotes, which sits above
+/// it: the reply strip and the composer's "Replying to" bar. The Reply button
+/// keeps [`REPLY_ICON_PATH`], the usual reply symbol; flipping that one would
+/// make it the Enter key's symbol.
+pub(crate) const REPLY_TARGET_ICON_PATH: &str = "M14 9 9 4 4 9M20 20h-7a4 4 0 0 1-4-4V4";
 pub(crate) const REACT_ICON_PATH: &str =
     "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01";
 pub(crate) const EDIT_ICON_PATH: &str = "M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z";
