@@ -1,9 +1,9 @@
 //! Browser hooks (`window.__riverTest`) the Playwright specs use to deliver
-//! INBOUND messages, remove messages, drive the no-room screen's load states,
-//! complete an own DM while another thread is open, put reactions on the
-//! newest message, count message group renders, make the room banner's
-//! sync-status read fail once, and hold or fail the signing of own messages
-//! (the chat delegate's round trip).
+//! INBOUND messages (also with chosen sender and arrival times), remove
+//! messages, drive the no-room screen's load states, complete an own DM while
+//! another thread is open, put reactions on the newest message, count message
+//! group renders, make the room banner's sync-status read fail once, and hold
+//! or fail the signing of own messages (the chat delegate's round trip).
 //!
 //! The composer is not a substitute: an own send is an explicit request to go
 //! to the newest message, so a message sent through the UI
@@ -258,6 +258,55 @@ pub fn install_test_hooks() {
                             .await;
                     Ok(JsValue::from_str(&format!("{outcome:?}")))
                 })
+            },
+        )
+        .into_js_value(),
+    );
+
+    // A same-author run appended in ONE mutation, from fixed timed identity
+    // `author` (0 or 1). Each entry is `{ text, sentSecs, receivedSecs }`,
+    // relative to now: the sender's clock, and when this client first saw the
+    // message (written to `RECEIVE_TIMES`, as an arrival records it). Returns
+    // each message's `[sentMs, receivedMs]`, so a spec knows exactly which
+    // time, clamp and delay every row should show.
+    set_hook(
+        "deliverTimedMessages",
+        Closure::<dyn FnMut(u32, js_sys::Array) -> js_sys::Array>::new(
+            move |author: u32, entries: js_sys::Array| {
+                let now_ms = js_sys::Date::now().floor() as i64;
+                let field = |entry: &JsValue, name: &str| {
+                    js_sys::Reflect::get(entry, &JsValue::from_str(name)).unwrap_or_else(|_| {
+                        wasm_bindgen::throw_str(&format!("deliverTimedMessages: no {name}"))
+                    })
+                };
+                let secs_ms = |value: JsValue, name: &str| {
+                    let secs = value.as_f64().unwrap_or_else(|| {
+                        wasm_bindgen::throw_str(&format!(
+                            "deliverTimedMessages: {name} not a number"
+                        ))
+                    });
+                    now_ms + (secs * 1000.0) as i64
+                };
+                let timed: Vec<TimedMessage> = entries
+                    .iter()
+                    .map(|entry| TimedMessage {
+                        text: field(&entry, "text").as_string().unwrap_or_else(|| {
+                            wasm_bindgen::throw_str("deliverTimedMessages: text not a string")
+                        }),
+                        sent_ms: secs_ms(field(&entry, "sentSecs"), "sentSecs"),
+                        received_ms: secs_ms(field(&entry, "receivedSecs"), "receivedSecs"),
+                    })
+                    .collect();
+                let result = js_sys::Array::new();
+                for message in &timed {
+                    let pair = js_sys::Array::new();
+                    pair.push(&JsValue::from_f64(message.sent_ms as f64));
+                    pair.push(&JsValue::from_f64(message.received_ms as f64));
+                    result.push(&pair);
+                }
+                let (sk, nickname) = timed_author(author);
+                crate::util::defer(move || deliver_timed(&sk, nickname, timed));
+                result
             },
         )
         .into_js_value(),
@@ -755,6 +804,21 @@ pub fn install_test_hooks() {
             .into_js_value(),
     );
 
+    // The automatic generation reload's busy check, the production predicate.
+    // Resolved from inside `defer`: it reads global signals, which need the
+    // Dioxus runtime a raw JS call does not have.
+    set_hook(
+        "userIsBusy",
+        Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
+            js_sys::Promise::new(&mut |resolve, _reject| {
+                crate::util::defer(move || {
+                    let busy = crate::components::app::freenet_api::generation_watch::user_is_busy_for_test();
+                    let _ = resolve.call1(&JsValue::NULL, &JsValue::from_bool(busy));
+                });
+            })
+        })
+        .into_js_value(),
+    );
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
@@ -914,26 +978,94 @@ fn push_test_body(
     delivery: Delivery,
 ) {
     let (sk, nickname) = test_author(delivery);
-    let author = MemberId::from(&sk.verifying_key());
     admit_with_nickname(room, room_key, &sk, nickname);
-
-    let time = crate::util::get_current_system_time();
-    let message = AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: MemberId::from(room_key),
-            author,
-            content,
-            time,
-        },
+    let message = signed_message(
+        room_key,
         &sk,
+        content,
+        crate::util::get_current_system_time(),
     );
 
     let messages = &mut room.room_state.recent_messages.messages;
     let at = match delivery {
         Delivery::Append => messages.len(),
-        Delivery::BeforeLast => messages.len().saturating_sub(1),
+        // Before the last RENDERED message: the example rooms end with
+        // reaction action messages, which render no row.
+        Delivery::BeforeLast => messages
+            .iter()
+            .rposition(|m| !m.message.content.is_action())
+            .unwrap_or(0),
     };
     messages.insert(at, message);
+}
+
+/// `content` from `sk`, stamped `time`, signed for `room_key`'s room.
+fn signed_message(
+    room_key: &VerifyingKey,
+    sk: &SigningKey,
+    content: RoomMessageBody,
+    time: std::time::SystemTime,
+) -> AuthorizedMessageV1 {
+    AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: MemberId::from(room_key),
+            author: MemberId::from(&sk.verifying_key()),
+            content,
+            time,
+        },
+        sk,
+    )
+}
+
+/// One message `deliverTimedMessages` delivers: its text, the sender's
+/// clock and when this client first saw it, in ms since the epoch.
+struct TimedMessage {
+    text: String,
+    sent_ms: i64,
+    received_ms: i64,
+}
+
+/// `deliverTimedMessages`' two fixed identities; throws for any other index.
+fn timed_author(index: u32) -> (SigningKey, &'static str) {
+    match index {
+        0 => (SigningKey::from_bytes(&[0x3C; 32]), "Timed Sender A"),
+        1 => (SigningKey::from_bytes(&[0x4C; 32]), "Timed Sender B"),
+        _ => wasm_bindgen::throw_str(&format!("deliverTimedMessages: no author {index}")),
+    }
+}
+
+/// Append `messages` from `sk` to the current room, with their arrival times,
+/// in one `RECEIVE_TIMES` write and one `ROOMS` mutation. Call it only from
+/// inside a `defer` closure.
+fn deliver_timed(sk: &SigningKey, nickname: &str, messages: Vec<TimedMessage>) {
+    let Some(room_key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    let signed: Vec<(AuthorizedMessageV1, i64)> = messages
+        .into_iter()
+        .map(|message| {
+            let time = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(message.sent_ms.max(0) as u64);
+            let content = RoomMessageBody::public(message.text);
+            (
+                signed_message(&room_key, sk, content, time),
+                message.received_ms,
+            )
+        })
+        .collect();
+    crate::components::app::receive_times::RECEIVE_TIMES.with_mut(|times| {
+        for (message, received_ms) in &signed {
+            times.insert(message.id().0 .0, *received_ms as f64);
+        }
+    });
+    with_current_room_mut(|room, room_key| {
+        admit_with_nickname(room, room_key, sk, nickname);
+        room.room_state
+            .recent_messages
+            .messages
+            .extend(signed.into_iter().map(|(message, _)| message));
+        prune_to_cap(room);
+    });
 }
 
 /// What a real arrival does once the room is at `max_recent_messages`: drain
@@ -988,7 +1120,9 @@ fn add_reactions_to_newest(emojis: Vec<String>) {
             .room_state
             .recent_messages
             .messages
-            .last()
+            .iter()
+            .rev()
+            .find(|m| !m.message.content.is_action())
             .map(|m| m.id())
         else {
             web_sys::console::error_1(&"__riverTest.addReactionsToNewest: no messages".into());

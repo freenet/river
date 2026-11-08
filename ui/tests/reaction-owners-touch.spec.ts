@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { coarsePointer, openInlinePicker, selectRoom, settle, touchOnly, waitForApp } from "./example-room";
+import { coarsePointer, openInlinePicker, selectRoom, settle, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -104,15 +104,12 @@ async function removeOwnReaction(page: Page, chip: Locator) {
     await expect(chip).toHaveCount(0);
     // The chip that opened the list is gone, so focus stays on the reaction
     // line rather than going nowhere: another chip while one remains, else
-    // the message's React action (the kebab on touch, the hover bar's React
-    // otherwise).
+    // the message's footer React.
     const message = page.locator(`[id="${messageId}"]`);
     const nearest =
       (await message.getByTestId("reaction-chip").count()) > 0
         ? message.getByTestId("reaction-chip").first()
-        : (await touchOnly(page))
-          ? message.getByTestId("message-kebab")
-          : message.getByTestId("message-hover-actions").getByRole("button", { name: "React" });
+        : message.getByTestId("message-react-button");
     await expect(nearest).toBeFocused();
   } else {
     await expect(owners).toHaveCount(0);
@@ -219,8 +216,7 @@ test.describe("Reaction owner list (#714)", () => {
       // and does not leave a second popover open.
       await page.mouse.click(8, 8);
       await expect(owners).toHaveCount(0);
-      await expect(page.getByTestId("emoji-picker")).toHaveCount(0);
-      await expect(page.getByTestId("message-action-menu")).toHaveCount(0);
+      await expect(page.getByTestId("emoji-picker")).toBeHidden();
 
       await pressChip(own);
       await expect(owners).toBeVisible();
@@ -294,6 +290,37 @@ test.describe("Reaction removed from the owner list", () => {
     await expect(own).toHaveCount(0);
     await expect(chips).toHaveCount(1);
     await expect(chips.first()).toBeFocused();
+  });
+});
+
+// Removing the message's last reaction from the list leaves no chip to go back
+// to: focus goes to the message's footer React, which is always there, and
+// without moving the history (only an arrival moves the view).
+test.describe("Last reaction removed from the owner list", () => {
+  test("focus goes to the footer React and the history stays put", async ({ page }) => {
+    test.skip(!(await coarsePointer(page)), "the list opens only on a coarse pointer");
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+    const chip = await addOwnReaction(page);
+    const messageId = await chip.evaluate((el) => el.closest('[id^="msg-"]')!.id);
+    const message = page.locator(`[id="${messageId}"]`);
+    await expect(message.getByTestId("reaction-chip"), "premise: the message's only chip").toHaveCount(1);
+
+    await pressChip(chip);
+    const owners = page.getByTestId("reaction-owners");
+    await expect(owners).toBeVisible();
+    // Park the message out of view, so a focus that scrolled would show.
+    await scrollChipOutOfView(page, chip);
+    const parked = await historyScrollTop(page);
+    // A click with no scroll of its own (Playwright's would scroll to it).
+    await owners.getByTestId("reaction-remove").evaluate((el) => (el as HTMLElement).click());
+    await expect(chip).toHaveCount(0);
+    await expect(owners).toHaveCount(0);
+    await expect(message.getByTestId("message-react-button")).toBeFocused();
+    await settle(page);
+    expect(await historyScrollTop(page), "the history did not move").toBeCloseTo(parked, 0);
   });
 });
 
@@ -422,3 +449,93 @@ async function expectOnScreen(page: Page, target: Locator) {
     expect(box.y + box.height).toBeLessThanOrEqual(vp.height + 1);
   }
 }
+
+// The reactor list and the reaction picker are separate surfaces, and at most
+// one of them is open: opening either closes the other, from the keyboard or
+// by touch, on the message the reader chose, without stealing focus back or
+// moving the history.
+test.describe("Reactor list and picker hand off", () => {
+  async function surfaces(page: Page) {
+    return page.evaluate(() => ({
+      picker: Array.from(document.querySelectorAll('[data-testid="message-react-button"][aria-expanded="true"]')).map(
+        (b) => b.closest('[id^="msg-"]')!.id,
+      ),
+      pickerOpen: !!document.querySelector('[data-testid="emoji-picker"]')?.matches(":popover-open"),
+      owners: Array.from(document.querySelectorAll('[data-testid="reaction-owners"]')).map(
+        (l) => l.closest('[id^="msg-"]')!.id,
+      ),
+    }));
+  }
+
+  /// A message of the reader's with one own reaction, parked short of the end.
+  async function reactedMessage(page: Page): Promise<{ message: Locator; id: string; chip: Locator }> {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await callRiverTest(page, "appendMessages", 6);
+    await expect(page.getByText("batched arrival 05")).toHaveCount(1, { timeout: 5_000 });
+    await waitSettledAtBottom(page);
+    const target = page.locator('[id^="msg-"]').filter({ hasText: "batched arrival 03" });
+    const id = (await target.getAttribute("id"))!;
+    const message = page.locator(`[id="${id}"]`);
+    await message.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await settle(page);
+    await openInlinePicker(page, message);
+    await page.getByTestId("emoji-picker").getByRole("button").first().click();
+    const chip = message.getByTestId("reaction-chip");
+    await expect(chip).toHaveCount(1);
+    await settle(page);
+    return { message, id, chip };
+  }
+
+  test("from the keyboard", async ({ page }) => {
+    const { message, id, chip } = await reactedMessage(page);
+    const react = message.getByTestId("message-react-button");
+    await chip.focus();
+    const parked = await historyScrollTop(page);
+
+    await chip.press("Enter");
+    await expect(page.getByTestId("reaction-owners")).toBeFocused();
+    expect(await surfaces(page)).toEqual({ picker: [], pickerOpen: false, owners: [id] });
+
+    // List to picker: the list closes, and its focus return does not take
+    // focus back from React.
+    await react.focus();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => surfaces(page)).toEqual({ picker: [id], pickerOpen: true, owners: [] });
+    await settle(page);
+    await expect(react, "focus stays on React").toBeFocused();
+
+    // Picker to list.
+    await chip.focus();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => surfaces(page)).toEqual({ picker: [], pickerOpen: false, owners: [id] });
+    await expect(page.getByTestId("reaction-owners")).toBeFocused();
+    await settle(page);
+    expect(await historyScrollTop(page), "the history did not move").toBeCloseTo(parked, 0);
+  });
+
+  test("by touch", async ({ page }) => {
+    test.skip(!mobileProject(), "a finger opens the list only on a touch project");
+    const { message, id, chip } = await reactedMessage(page);
+    const react = message.getByTestId("message-react-button");
+    const parked = await historyScrollTop(page);
+
+    // Picker to list: the tap on the chip closes the picker and opens the
+    // list on that same tap.
+    await react.tap();
+    await expect.poll(() => surfaces(page)).toEqual({ picker: [id], pickerOpen: true, owners: [] });
+    await chip.tap();
+    await expect.poll(() => surfaces(page)).toEqual({ picker: [], pickerOpen: false, owners: [id] });
+
+    // List to picker: the list's backdrop takes the first tap, which only
+    // closes it, as it always has; the next opens the picker.
+    const box = (await react.boundingBox())!;
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+    await expect.poll(() => surfaces(page)).toEqual({ picker: [], pickerOpen: false, owners: [] });
+    await react.tap();
+    await expect.poll(() => surfaces(page)).toEqual({ picker: [id], pickerOpen: true, owners: [] });
+    await settle(page);
+    expect(await historyScrollTop(page), "the history did not move").toBeCloseTo(parked, 0);
+  });
+});
