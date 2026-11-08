@@ -62,6 +62,11 @@ ecies = ["dep:aes-gcm", "dep:curve25519-dalek", "dep:sha2", "dep:x25519-dalek"]
 # (and transitively `getrandom`). Only safe to enable in builds with a
 # working CSPRNG — i.e. the UI, which runs in a browser, or native tests.
 ecies-randomized = ["ecies", "dep:rand"]
+# Error-returning variants of the ECIES decrypt for clients reading room state
+# they did not write (`try_decrypt_secret_from_member_blob_raw`). Client only:
+# the chat delegate keeps its own functions and does not enable this, so its
+# WASM and key are unchanged. Adds no dependencies.
+ecies-client = ["ecies"]
 # Legacy room-contract migration registry + helpers (freenet/river#292).
 # Enabled ONLY by the client crates (river-ui, riverctl). Deliberately OFF for
 # the room-contract and chat-delegate WASM builds so the `migration` module is

@@ -641,3 +641,18 @@ fn a_rejected_merge_changes_nothing() {
     assert!(live.merge_state(&incoming).is_err());
     assert_eq!(live.stored.room_state, before);
 }
+
+/// A secret blob addressed to this member that does not decrypt is skipped, not fatal: the
+/// room still opens, with the invitation's copy of that version's secret.
+#[test]
+fn a_secret_blob_that_does_not_decrypt_is_skipped() {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    for blob in &mut state.secrets.encrypted_secrets {
+        blob.secret.ciphertext = vec![9; 7];
+    }
+    let mut stored = f.stored(state);
+    stored.invitation_secrets = BTreeMap::from([(0, SECRET)]);
+    let room = LiveRoom::new(stored).view(&minutes);
+    assert_eq!(room.name, "Secret garden");
+}

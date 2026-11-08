@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::ecies::{
-    decrypt_secret_from_member_blob_raw, decrypt_with_symmetric_key, unseal_bytes_with_secrets,
+    decrypt_with_symmetric_key, try_decrypt_secret_from_member_blob_raw, unseal_bytes_with_secrets,
 };
 use river_core::room_state::content::{
     CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, ReplyContentV1, TextContentV1,
@@ -196,7 +196,7 @@ impl LiveRoom {
                 if s.member_id != me {
                     continue;
                 }
-                if let Ok(secret) = decrypt_secret_from_member_blob_raw(
+                if let Ok(secret) = try_decrypt_secret_from_member_blob_raw(
                     &s.ciphertext,
                     &s.nonce,
                     &s.sender_ephemeral_public_key,
