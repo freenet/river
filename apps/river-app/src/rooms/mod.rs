@@ -18,6 +18,7 @@
 //! have), never creates, joins or invites, and never writes delegate storage: the web UI owns
 //! that, and two writers to it are what would lose data.
 
+pub mod create;
 pub mod delegate;
 pub mod grant;
 pub mod outbox;
@@ -27,6 +28,7 @@ mod room_tests;
 mod session;
 pub mod socket;
 pub mod token;
+pub mod work;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

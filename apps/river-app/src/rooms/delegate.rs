@@ -1,6 +1,9 @@
 //! Talking to River's chat delegate, the store that holds the user's rooms.
 //!
-//! Only reads: `ListRequest` and `GetRequest`. This app never stores, deletes or signs.
+//! Reads (`ListRequest`, `GetRequest`), and the web UI's generation compare-and-swap
+//! (`GetVersionedRequest`, `CasStoreRequest`), which is the only way this app writes. It never
+//! stores without a generation, deletes, or asks the delegate to sign; what it stores, and
+//! when, is [`super::work`]'s business.
 
 use std::sync::OnceLock;
 
@@ -28,8 +31,7 @@ pub fn chat_delegate_key() -> &'static DelegateKey {
     })
 }
 
-/// The read requests this app sends. Anything else is unrepresentable here, so this app
-/// cannot write delegate storage.
+/// The plain read requests this app sends.
 #[derive(Clone, Debug)]
 pub enum Read {
     List,
@@ -43,8 +45,43 @@ pub fn request(read: &Read) -> ClientRequest<'static> {
             key: ChatDelegateKey::new(key.clone()),
         },
     };
+    message(&msg)
+}
+
+/// The compare-and-swap requests, the web UI's `cas_write_delegate_key`
+/// (`ui/src/components/app/chat_delegate.rs`): read a key with its generation, then store only
+/// if the key is still at the generation read. Nothing else that writes is representable here.
+#[derive(Clone, Debug)]
+pub enum Versioned {
+    Read(Vec<u8>),
+    Store {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        generation: u64,
+    },
+}
+
+pub fn versioned(v: &Versioned) -> ClientRequest<'static> {
+    let msg = match v {
+        Versioned::Read(key) => ChatDelegateRequestMsg::GetVersionedRequest {
+            key: ChatDelegateKey::new(key.clone()),
+        },
+        Versioned::Store {
+            key,
+            value,
+            generation,
+        } => ChatDelegateRequestMsg::CasStoreRequest {
+            key: ChatDelegateKey::new(key.clone()),
+            value: value.clone(),
+            expected_generation: *generation,
+        },
+    };
+    message(&msg)
+}
+
+fn message(msg: &ChatDelegateRequestMsg) -> ClientRequest<'static> {
     let mut payload = Vec::new();
-    ciborium::ser::into_writer(&msg, &mut payload).expect("CBOR into a Vec cannot fail");
+    ciborium::ser::into_writer(msg, &mut payload).expect("CBOR into a Vec cannot fail");
     ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
         key: chat_delegate_key().clone(),
         params: Parameters::from(Vec::<u8>::new()),

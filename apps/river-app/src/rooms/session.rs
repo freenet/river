@@ -63,10 +63,11 @@ use river_core::stored_rooms::{
 
 use super::delegate::{self, Read};
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
-use super::outbox::{Command, Outbox};
+use super::outbox::{Action, Command, Outbox};
 use super::room::{LiveRoom, local_minutes};
 use super::socket::{NodeSocket, SocketError, TokenVerdict, token_verdict};
 use super::token::TokenStore;
+use super::work::WorkView;
 pub use crate::chat::LinkStatus;
 use crate::chat::Room;
 
@@ -195,9 +196,17 @@ pub enum RoomsUpdate {
         /// The current time in message time (local minutes since 1970-01-01).
         now: u32,
         issues: Issues,
+        /// Rooms being created or joined, and those that failed.
+        work: Vec<WorkView>,
     },
     /// The connection's state changed while rooms are shown.
     Status(LinkStatus),
+    /// The invitation the user asked for in the room keyed `room`: its link, or why there is
+    /// none.
+    Invite {
+        room: String,
+        link: Result<String, String>,
+    },
 }
 
 /// Run until stopped, or until a state that needs the user. `outbox` is what the user sent
@@ -216,6 +225,10 @@ pub(super) fn run(
     let mut kept = KeepOutbox {
         rooms: Rooms {
             outbox: std::mem::take(outbox),
+            web_app: format!(
+                "http://{authority}/v1/contract/web/{}/",
+                super::grant::RIVER_WEB_APP
+            ),
             ..Rooms::default()
         },
         outbox,
@@ -598,9 +611,30 @@ fn follow_on(
             }
             return SocketError::Failed("reconnecting to send again".into());
         }
+        // A create or join whose request went unanswered: its answer must not arrive late and
+        // be taken for the next request's, so the task goes on on a new connection.
+        if rooms
+            .outbox
+            .work
+            .expire(pace.delegate_deadline, pace.update_wait, Instant::now())
+        {
+            rooms.report(status, report);
+            return SocketError::Failed("reconnecting to finish creating or joining a room".into());
+        }
         match rooms.send_updates(socket) {
             Ok(failed) => changed |= failed,
             Err(e) => return e,
+        }
+        // The create or join under way sends its next request, unless the stored rooms are
+        // being read: their answers and its are told apart by kind, but an error names neither.
+        if let Some(request) = rooms
+            .outbox
+            .work
+            .next_request(reload.is_some(), Instant::now())
+        {
+            if let Err(e) = socket.send(&request) {
+                return e;
+            }
         }
         // Read the stored rooms again now and then, for rooms joined or left elsewhere.
         if let Some((_, started)) = &reload
@@ -610,7 +644,11 @@ fn follow_on(
             reload = None;
             last_read = Instant::now();
         }
-        if reload.is_none() && last_read.elapsed() >= pace.refresh {
+        // Not while a create or join works (see above); at once when one has just finished.
+        if reload.is_none()
+            && !rooms.outbox.work.busy()
+            && (rooms.outbox.work.take_reload() || last_read.elapsed() >= pace.refresh)
+        {
             let (loader, reads) = Loader::start();
             for read in reads {
                 if let Err(e) = socket.send(&delegate::request(&read)) {
@@ -625,6 +663,13 @@ fn follow_on(
             Err(SocketError::Timeout) => None,
             Err(e) => return e,
         };
+        // A create's or join's own answer is its alone (`work` takes only what it awaits).
+        if let Some(Ok(HostResponse::ContractResponse(r))) = &response
+            && rooms.outbox.work.on_contract(r)
+        {
+            rooms.report(status, report);
+            continue;
+        }
         match response {
             None => {}
             Some(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
@@ -660,8 +705,12 @@ fn follow_on(
                 changed |= rooms.following(&instance_id, false);
             }
             Some(Ok(other)) => {
-                if let Some((loader, _)) = &mut reload {
-                    for answer in delegate::answers(&other) {
+                for answer in delegate::answers(&other) {
+                    if rooms.outbox.work.on_delegate(&answer) {
+                        changed = true;
+                        continue;
+                    }
+                    if let Some((loader, _)) = &mut reload {
                         match loader.on_answer(answer) {
                             Step::Send(reads) => {
                                 for read in reads {
@@ -688,17 +737,36 @@ fn follow_on(
                 }
             }
             Some(Err(e)) => {
-                if let Some((id, cause)) = failed_update(&e) {
-                    changed |= rooms.update_answered(&id, Err(cause));
-                } else if let Some((id, cause)) =
-                    rooms.failed_update_unnamed(&e, &subs, reload.is_some())
+                // An error that names nothing is a create's or join's only if nothing else
+                // could have caused it.
+                let alone = subs.pending.is_empty()
+                    && reload.is_none()
+                    && !rooms
+                        .list
+                        .iter()
+                        .any(|r| rooms.outbox.owes(&r.stored.owner_vk));
+                if rooms
+                    .outbox
+                    .work
+                    .on_error(&e, alone, &|id| subs.pending.contains_key(id))
                 {
+                    changed = true;
+                } else if let Some((id, cause)) = failed_update(&e) {
+                    changed |= rooms.update_answered(&id, Err(cause));
+                } else if let Some((id, cause)) = rooms.failed_update_unnamed(
+                    &e,
+                    &subs,
+                    reload.is_some() || rooms.outbox.work.has_out(),
+                ) {
                     // Not a reload failure either, so the reload goes on.
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some(id) = failed_contract(&e) {
-                    // A subscribe GET that failed: the room stays on its copy, asked again.
-                    subs.failed(id, pace);
-                    changed |= rooms.following(&id, false);
+                    // A subscribe GET that failed: the room stays on its copy, asked again. A
+                    // room not shown (one a create or join gave up on) is not asked for.
+                    if rooms.by_contract(&id).is_some() {
+                        subs.failed(id, pace);
+                        changed |= rooms.following(&id, false);
+                    }
                 } else if reload.is_some() {
                     match delegate_error(&e) {
                         // The store went away: keep the list shown (see the module docs).
@@ -995,8 +1063,13 @@ struct Rooms {
     /// Whether the last read listed every room: a store, rooms listed, all readable. Only such
     /// a read says a room is gone.
     complete: bool,
-    /// What the user sent that the node has not taken yet.
+    /// What the user sent that the node has not taken yet, and the rooms being created or
+    /// joined.
     outbox: Outbox,
+    /// River's web app on the node, which invite links open.
+    web_app: String,
+    /// Invitations made since the last report, by room key.
+    invites: Vec<(String, Result<String, String>)>,
 }
 
 impl Rooms {
@@ -1091,7 +1164,16 @@ impl Rooms {
         }
         let mut changed = false;
         for command in std::mem::take(&mut self.outbox.waiting) {
+            if command.action.is_list_level() {
+                changed |= self.list_command(command.action);
+                continue;
+            }
             match self.list.iter().find(|r| r.key() == command.room) {
+                Some(room) if command.action == Action::Invite => {
+                    let link = super::create::invitation(room, &self.web_app).map(|(_, l)| l);
+                    self.invites.push((room.key(), link));
+                    changed = true;
+                }
                 Some(room) => changed |= self.outbox.command(room, command.action),
                 // The read so far says nothing about this room (no store, nothing listed, or
                 // a slot that couldn't be read): it waits for a read that does.
@@ -1101,6 +1183,32 @@ impl Rooms {
             }
         }
         changed
+    }
+
+    /// Create, join, or try again or drop one that failed ([`super::work`]). True when it
+    /// changed what shows.
+    fn list_command(&mut self, action: Action) -> bool {
+        match action {
+            Action::CreateRoom {
+                name,
+                nickname,
+                private,
+            } => {
+                self.outbox.work.create(&name, &nickname, private);
+                true
+            }
+            Action::Join { code, nickname } => {
+                let shown: HashSet<VerifyingKey> =
+                    self.list.iter().map(|r| r.stored.owner_vk).collect();
+                self.outbox
+                    .work
+                    .join(&code, &nickname, &|vk| shown.contains(vk));
+                true
+            }
+            Action::RetryWork { id } => self.outbox.work.retry(id),
+            Action::DismissWork { id } => self.outbox.work.dismiss(id),
+            _ => false,
+        }
     }
 
     /// The room an UPDATE failure names some other way than `ContractError::Update`: a
@@ -1156,6 +1264,10 @@ impl Rooms {
         let mut changed = false;
         for i in 0..self.list.len() {
             let room = &self.list[i];
+            // A room being joined gets nothing else until the join is answered.
+            if self.outbox.work.holds(&room.stored.owner_vk) {
+                continue;
+            }
             let Some(delta) = self.outbox.next_update(room, Instant::now(), &mut changed) else {
                 continue;
             };
@@ -1281,14 +1393,22 @@ impl Rooms {
         }
     }
 
-    fn report(&self, status: LinkStatus, report: &dyn Fn(RoomsUpdate)) {
+    fn report(&mut self, status: LinkStatus, report: &dyn Fn(RoomsUpdate)) {
         report(RoomsUpdate::Rooms {
             rooms: self.views(),
             open: self.open.clone(),
             status,
             now: local_minutes(SystemTime::now()),
             issues: self.issues(),
+            work: self.outbox.work.views(),
         });
+        for (room, link) in std::mem::take(&mut self.invites) {
+            report(RoomsUpdate::Invite { room, link });
+        }
+        // A finished task is shown once its room is in the list (so the screen can open it),
+        // then it is done with.
+        let shown: HashSet<VerifyingKey> = self.list.iter().map(|r| r.stored.owner_vk).collect();
+        self.outbox.work.forget_done(&|vk| shown.contains(vk));
     }
 
     /// The connection is gone: keep showing the rooms if there are any, and say so.

@@ -130,6 +130,14 @@ impl LiveRoom {
         self.nickname(id, me)
     }
 
+    /// Every secret this member holds for the room, by version, ascending: what an invitation
+    /// to a private room carries (the web UI's `collect_invitation_secrets`).
+    pub fn secrets_by_version(&self) -> Vec<(u32, [u8; 32])> {
+        let mut all: Vec<(u32, [u8; 32])> = self.secrets.iter().map(|(v, s)| (*v, *s)).collect();
+        all.sort_by_key(|(v, _)| *v);
+        all
+    }
+
     pub fn is_private(&self) -> bool {
         self.stored
             .room_state
@@ -516,7 +524,7 @@ impl Ids {
 /// Characters that draw nothing or reorder text, which a name could use to look like someone
 /// else's. A short list next to the web UI's `sanitize_display_name`
 /// (`ui/src/util/display_name.rs`), which also folds confusable characters.
-fn is_hidden(c: char) -> bool {
+pub(super) fn is_hidden(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'

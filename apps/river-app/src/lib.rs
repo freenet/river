@@ -130,15 +130,25 @@ impl RiverApp {
                 status,
                 now,
                 issues,
+                work,
             } => {
                 self.chat.issues = issues;
                 self.chat
                     .show_node_rooms(rooms, open.as_deref(), status, now);
+                self.chat.show_work(work);
             }
             RoomsUpdate::Status(status) => {
                 if let chat::Source::Node(_) = self.chat.source {
                     self.chat.source = chat::Source::Node(status);
                 }
+            }
+            // The link is copied as the web UI's invite dialog copies it: to the clipboard as
+            // it is. It is a bearer credential, which the members panel says.
+            RoomsUpdate::Invite { room, link } => {
+                if let Ok(l) = &link {
+                    tx.copy(l.clone());
+                }
+                self.chat.invitation_made(room, link);
             }
         }
     }
@@ -966,6 +976,7 @@ mod tests {
                     status: chat::LinkStatus::Loading,
                     now: 29_000_000,
                     issues: Default::default(),
+                    work: Vec::new(),
                 },
                 tx,
             );

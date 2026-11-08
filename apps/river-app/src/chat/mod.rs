@@ -5,7 +5,9 @@
 //! sending, replying, editing, deleting and reacting work in memory, or the user's real rooms
 //! read from the node ([`Source::Node`], see `crate::rooms`), where each of those becomes a
 //! [`Command`] for the background work, which sends it and shows it on its way. Selecting a
-//! room and showing or hiding the members panel work either way.
+//! room and showing or hiding the members panel work either way. Creating a room, joining one
+//! from an invite code and inviting someone are only for rooms from the node: each is a
+//! [`Command`] too, and what became of it comes back as [`WorkView`]s and an invitation's link.
 
 mod conversation;
 pub mod example;
@@ -16,10 +18,11 @@ pub(crate) mod style;
 mod tests;
 mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rune::TextEdit;
 
+use crate::rooms::work::{WorkState, WorkView};
 use crate::rooms::{Action, Command};
 
 pub use model::{Member, Message, Reaction, ReplyTo, Role, Room};
@@ -50,6 +53,46 @@ pub enum Mode {
 
 /// Where commands for the node go.
 pub type Sink = Box<dyn Fn(Command)>;
+
+/// A dialog over the chat screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogKind {
+    Create,
+    Join,
+}
+
+/// What the create and join dialogs hold.
+pub struct Form {
+    pub open: Option<DialogKind>,
+    pub name: TextEdit,
+    pub nickname: TextEdit,
+    pub code: TextEdit,
+    pub private: bool,
+    /// Why what was entered can't be used, said in the dialog.
+    pub error: Option<String>,
+}
+
+impl Default for Form {
+    fn default() -> Self {
+        Form {
+            open: None,
+            name: TextEdit::new(""),
+            nickname: TextEdit::new(""),
+            code: TextEdit::new(""),
+            private: false,
+            error: None,
+        }
+    }
+}
+
+/// Where the invitation asked for in a room stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InviteState {
+    Making,
+    /// Made, and its link copied.
+    Copied(String),
+    Failed(String),
+}
 
 /// The connection to the node behind [`Source::Node`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +182,16 @@ pub struct Chat {
     /// Commands for the node, when there is no sink (tests); with one they go straight to it.
     pub outgoing: Vec<Command>,
     sink: Option<Sink>,
+    /// The create or join dialog.
+    pub form: Form,
+    /// Rooms being created or joined, and those that failed.
+    pub work: Vec<WorkView>,
+    /// Finished creates and joins already handled, so each opens its room once.
+    opened: HashSet<u64>,
+    /// A room just created or joined, to open as soon as it is in the list.
+    open_when_shown: Option<String>,
+    /// The invitation asked for, by the room it was asked for in.
+    pub invite: Option<(String, InviteState)>,
 }
 
 impl Chat {
@@ -163,6 +216,11 @@ impl Chat {
             picker: None,
             outgoing: Vec::new(),
             sink: None,
+            form: Form::default(),
+            work: Vec::new(),
+            opened: HashSet::new(),
+            open_when_shown: None,
+            invite: None,
         };
         chat.set_rooms(rooms);
         chat
@@ -247,6 +305,13 @@ impl Chat {
             if let Some(open) = open {
                 self.select(open);
             }
+        }
+        // A room just created or joined opens once it is here.
+        if let Some(key) = self.open_when_shown.clone()
+            && self.rooms.iter().any(|r| r.key == key)
+        {
+            self.open_when_shown = None;
+            self.select(&key);
         }
         // The open room is being read.
         if let Some(room) = self.room()
@@ -501,6 +566,127 @@ impl Chat {
         if let Some(key) = self.room().map(|r| r.key.clone()) {
             self.emit(key, Action::Discard { entry });
         }
+    }
+
+    /// Whether rooms can be created, joined and invited to: only rooms from the node.
+    pub fn can_change_rooms(&self) -> bool {
+        matches!(self.source, Source::Node(_))
+    }
+
+    /// Open the create or join dialog, empty.
+    pub fn open_dialog(&mut self, kind: DialogKind) {
+        if !self.can_change_rooms() {
+            return;
+        }
+        self.form = Form {
+            open: Some(kind),
+            ..Form::default()
+        };
+        match kind {
+            DialogKind::Create => self.form.name.focused = true,
+            DialogKind::Join => self.form.code.focused = true,
+        }
+    }
+
+    pub fn close_dialog(&mut self) {
+        self.form = Form::default();
+    }
+
+    /// Create the room the dialog describes. What can't be used is said in the dialog, which
+    /// stays open; otherwise it closes and the room's progress shows in the room list.
+    pub fn submit_create(&mut self) {
+        let name = self.form.name.text.trim().to_owned();
+        let nickname = self.form.nickname.text.trim().to_owned();
+        if let Some(why) = crate::rooms::create::create_refusal(&name, &nickname) {
+            self.form.error = Some(why);
+            return;
+        }
+        let private = self.form.private;
+        self.close_dialog();
+        self.emit(
+            String::new(),
+            Action::CreateRoom {
+                name,
+                nickname,
+                private,
+            },
+        );
+    }
+
+    /// Join the room the pasted invite code or link invites to.
+    pub fn submit_join(&mut self) {
+        let code = river_core::invitation::invitation_text_from_paste(&self.form.code.text);
+        let nickname = self.form.nickname.text.trim().to_owned();
+        let refusal = if code.is_empty() {
+            Some("Paste an invite code.".to_owned())
+        } else if let Err(e) = river_core::invitation::Invitation::from_encoded_string(&code) {
+            Some(format!("That doesn't look like a valid invite code: {e}"))
+        } else {
+            crate::rooms::create::join_refusal(&nickname)
+        };
+        if let Some(why) = refusal {
+            self.form.error = Some(why);
+            return;
+        }
+        self.close_dialog();
+        self.emit(String::new(), Action::Join { code, nickname });
+    }
+
+    /// Take where creates and joins stand. One that finished opens its room once the room is
+    /// in the list.
+    pub fn show_work(&mut self, work: Vec<WorkView>) {
+        for w in &work {
+            if let WorkState::Done { room } = &w.state
+                && self.opened.insert(w.id)
+            {
+                if self.rooms.iter().any(|r| &r.key == room) {
+                    self.select(room);
+                } else {
+                    self.open_when_shown = Some(room.clone());
+                }
+            }
+        }
+        self.work = work;
+    }
+
+    pub fn retry_work(&mut self, id: u64) {
+        self.emit(String::new(), Action::RetryWork { id });
+    }
+
+    pub fn dismiss_work(&mut self, id: u64) {
+        self.work.retain(|w| w.id != id);
+        self.emit(String::new(), Action::DismissWork { id });
+    }
+
+    /// Make an invitation to the open room; its link is copied when it comes back.
+    pub fn invite(&mut self) {
+        if !self.can_change_rooms() {
+            return;
+        }
+        let Some(key) = self.room().map(|r| r.key.clone()) else {
+            return;
+        };
+        self.invite = Some((key.clone(), InviteState::Making));
+        self.emit(key, Action::Invite);
+    }
+
+    /// The invitation for the room keyed `room` came back. True when its link is to be copied.
+    pub fn invitation_made(&mut self, room: String, link: Result<String, String>) -> bool {
+        let copied = link.is_ok();
+        self.invite = Some((
+            room,
+            match link {
+                Ok(l) => InviteState::Copied(l),
+                Err(why) => InviteState::Failed(why),
+            },
+        ));
+        copied
+    }
+
+    /// The invitation for the open room, if one was asked for there.
+    pub fn open_invite(&self) -> Option<&InviteState> {
+        let (room, state) = self.invite.as_ref()?;
+        (self.room().map(|r| &r.key) == Some(room)).then_some(state)
     }
 
     /// Show or hide the members panel, in the layout the window is in now.
