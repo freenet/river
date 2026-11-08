@@ -752,20 +752,13 @@ fn follow_on(
                     changed = true;
                 } else if let Some((id, cause)) = failed_update(&e) {
                     changed |= rooms.update_answered(&id, Err(cause));
-                } else if let Some((id, cause)) = rooms.failed_update_unnamed(
-                    &e,
-                    &subs,
-                    reload.is_some() || rooms.outbox.work.has_out(),
-                ) {
+                } else if let Some((id, cause)) =
+                    rooms.failed_update_unnamed(&e, &subs, reload.is_some())
+                {
                     // Not a reload failure either, so the reload goes on.
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some(id) = failed_contract(&e) {
-                    // A subscribe GET that failed: the room stays on its copy, asked again. A
-                    // room not shown (one a create or join gave up on) is not asked for.
-                    if rooms.by_contract(&id).is_some() {
-                        subs.failed(id, pace);
-                        changed |= rooms.following(&id, false);
-                    }
+                    changed |= rooms.subscribe_failed(&mut subs, id, pace);
                 } else if reload.is_some() {
                     match delegate_error(&e) {
                         // The store went away: keep the list shown (see the module docs).
@@ -1214,8 +1207,8 @@ impl Rooms {
     /// `MissingContract` for a room that owes an answer and has no subscribe waiting for one,
     /// or an error that names nothing (`EmptyRing`, `PeerNotJoined`, `Shutdown`, an operation
     /// error or timeout, as the node reports a failed start) when exactly one room owes an
-    /// answer, no subscribe is waiting for one, and no read of the stored rooms is under way
-    /// (whose requests can fail the same way).
+    /// answer, no subscribe is waiting for one, and no read of the stored rooms nor request of
+    /// a create or join is under way (whose requests can fail the same way).
     fn failed_update_unnamed(
         &self,
         e: &ClientError,
@@ -1239,7 +1232,10 @@ impl Rooms {
             | ErrorKind::Shutdown
             | ErrorKind::OperationError { .. }
             | ErrorKind::FailedOperation
-                if owing.len() == 1 && subs.pending.is_empty() && !reloading =>
+                if owing.len() == 1
+                    && subs.pending.is_empty()
+                    && !reloading
+                    && !self.outbox.work.has_out() =>
             {
                 Some((owing[0], e.kind().to_string()))
             }
@@ -1307,6 +1303,22 @@ impl Rooms {
 
     fn by_contract(&mut self, id: &ContractInstanceId) -> Option<&mut LiveRoom> {
         self.list.iter_mut().find(|r| r.contract_id() == *id)
+    }
+
+    /// A subscribe GET that failed: the room stays on its copy and is asked again. A room not
+    /// shown (the room of a join that gave up while its GET was out) is not asked for: that
+    /// would subscribe to a room the user is not in. True when it changed what shows.
+    fn subscribe_failed(
+        &mut self,
+        subs: &mut Subscriptions,
+        id: ContractInstanceId,
+        pace: &Pace,
+    ) -> bool {
+        if self.by_contract(&id).is_none() {
+            return false;
+        }
+        subs.failed(id, pace);
+        self.following(&id, false)
     }
 
     /// Record whether a room is subscribed; true when that changed what shows.

@@ -2206,6 +2206,16 @@ fn update_failures_that_name_no_update_go_to_the_one_room_that_owes() {
         one.failed_update_unnamed(&missing(a.id()), &asking_a, false),
         None
     );
+    // A create or join has a request out: it may be the one that failed.
+    let mut busy = owing(&[&a]);
+    busy.outbox.work.create("Room", "Ada", false);
+    assert!(
+        busy.outbox
+            .work
+            .next_request(false, Instant::now())
+            .is_some()
+    );
+    assert_eq!(busy.failed_update_unnamed(&shutdown, &none, false), None);
     // Two rooms owe: which one failed can't be told.
     let two = owing(&[&a, &b]);
     assert_eq!(two.failed_update_unnamed(&empty_ring, &none, false), None);
@@ -2214,6 +2224,18 @@ fn update_failures_that_name_no_update_go_to_the_one_room_that_owes() {
             .map(|(id, _)| id),
         Some(b.id())
     );
+}
+
+#[test]
+fn a_failed_subscribe_is_asked_again_only_for_a_room_shown() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut rooms = owing(&[&a]);
+    let mut subs = Subscriptions::default();
+    let gone = ContractInstanceId::new([9; 32]);
+    assert!(!rooms.subscribe_failed(&mut subs, gone, &quick()));
+    assert!(subs.retry.is_empty(), "a room not shown is not asked for");
+    assert!(rooms.subscribe_failed(&mut subs, a.id(), &quick()));
+    assert!(subs.retry.contains_key(&a.id()));
 }
 
 #[test]
@@ -2737,4 +2759,63 @@ fn creating_while_the_stored_rooms_are_read_often_never_overlaps_a_read() {
         assert_eq!(w.overlaps, 0);
         assert_eq!(w.puts.len(), 2);
     });
+}
+
+/// A join whose UPDATE goes unanswered reconnects, and the next connection shows the room it
+/// stored. While the join is still owed an answer, a message written in that room waits: an
+/// answer names only the room, so the join's and the message's could not be told apart.
+#[test]
+fn a_room_being_joined_sends_nothing_else_until_the_join_is_done() {
+    let node = fake_node(vec![]);
+    let garden = TestRoom::new(3, "Garden", 1, &["t1"]);
+    let inviter = LiveRoom::new(garden.stored());
+    let (_, link) = super::super::create::invitation(&inviter, "http://x/").unwrap();
+    let real = super::super::create::contract_key(&garden.vk());
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&garden.state))));
+        w.update_play = UpdatePlay::Ignore;
+    });
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        update_wait: Duration::from_millis(300),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "join-holds", pace);
+    session.list(Action::Join {
+        code: link,
+        nickname: "Bea".into(),
+    });
+    session.wait_rooms("the stored room shows after a reconnect", |r, _, _| {
+        r.iter().any(|r| r.name == "Garden")
+    });
+    session.act(&garden, say("hi"));
+    let is_join = |d: &ChatRoomStateV1Delta| {
+        d.recent_messages.as_ref().is_some_and(|m| {
+            m.iter()
+                .all(|m| m.message.content == RoomMessageBody::join_event())
+        })
+    };
+    session.wait_until("the message goes out once the join gives up", || {
+        node.with(|w| w.updates.iter().any(|(k, d)| *k == real && !is_join(d)))
+    });
+    let kinds: Vec<bool> = node.with(|w| {
+        w.updates
+            .iter()
+            .filter(|(k, _)| *k == real)
+            .map(|(_, d)| is_join(d))
+            .collect()
+    });
+    let first_other = kinds.iter().position(|join| !join).unwrap();
+    assert!(first_other >= 2, "the join was sent again first: {kinds:?}");
+    assert!(
+        kinds[first_other..].iter().all(|join| !join),
+        "no join after the message: {kinds:?}"
+    );
+    assert!(
+        session
+            .last_work()
+            .iter()
+            .any(|w| matches!(w.state, WorkState::Failed { .. }))
+    );
 }
