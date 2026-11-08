@@ -485,7 +485,31 @@ test.describe("Reactor list and picker hand off", () => {
     const chip = message.getByTestId("reaction-chip");
     await expect(chip).toHaveCount(1);
     await settle(page);
+    // Park it again, now that the reaction is in. This first real toggle
+    // rebuilds the room and drops every fixture chip, and the history keeps
+    // the reading row in place across that, not this message, so where the
+    // message ends up depends on the random fixture data: in about 1 run in
+    // 200 its React button ended 5px below the view. Playwright's tap() and
+    // focus() then scroll it into view themselves, and "the history did not
+    // move" failed on a scroll the app never made.
+    await message.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await settle(page);
+    await expectInHistoryView(page, message.getByTestId("message-react-button"));
+    await expectInHistoryView(page, chip);
     return { message, id, chip };
+  }
+
+  /// `target` lies wholly inside the history's view, so nothing acting on it
+  /// has to scroll it there first.
+  async function expectInHistoryView(page: Page, target: Locator) {
+    const [box, view] = await Promise.all([
+      target.boundingBox(),
+      page.locator("#chat-scroll-container").boundingBox(),
+    ]);
+    expect(box).not.toBeNull();
+    expect(view).not.toBeNull();
+    expect(box!.y, "below the history's top edge").toBeGreaterThanOrEqual(view!.y);
+    expect(box!.y + box!.height, "above the history's bottom edge").toBeLessThanOrEqual(view!.y + view!.height);
   }
 
   test("from the keyboard", async ({ page }) => {
