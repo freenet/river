@@ -177,6 +177,9 @@ struct Task {
     failed: Option<(String, bool)>,
     /// Whether the stored rooms were asked to be read again for this task's finishing.
     reload_asked: bool,
+    /// Whether the node answered the last request with a refusal of it (the UPDATE was not
+    /// taken, or the room is not there), rather than leaving its outcome unknown.
+    refused: bool,
 }
 
 impl Task {
@@ -191,6 +194,7 @@ impl Task {
             conflicts: 0,
             failed: None,
             reload_asked: false,
+            refused: false,
         }
     }
 
@@ -409,12 +413,15 @@ impl Work {
         t.conflicts = 0;
         t.out = None;
         t.phase = Phase::Read;
-        // A join that failed before its UPDATE reads the room again, so what it sends is built
-        // against the room as it is now, with the time it is sent. One that failed at its UPDATE
-        // sends the same join again: the node may hold it, and the same message id cannot show
-        // twice.
+        // A join reads the room again, so what it sends is built against the room as it is now,
+        // with the time it is sent, when it failed before its UPDATE, or when the node refused
+        // the UPDATE (the room may have filled up or banned the invitee since; whether to send
+        // at all is decided from the room, so reading it again can't join twice). When the
+        // UPDATE's outcome is unknown (no answer, or an error that says nothing about it), the
+        // same join goes again: the node may hold it, and the same message id can't show twice.
+        let refused = std::mem::take(&mut t.refused);
         if let Kind::Join { plan, .. } = &mut t.kind
-            && matches!(t.step, Step::Get | Step::Slot)
+            && (matches!(t.step, Step::Get | Step::Slot) || (t.step == Step::Update && refused))
         {
             *plan = None;
             t.step = Step::Get;
@@ -666,6 +673,16 @@ impl Work {
             return false;
         };
         let short = |cause: &str| -> String { cause.chars().take(200).collect() };
+        // An answer about this very request: the node refused it.
+        let refused = matches!(
+            (out, e.kind()),
+            (
+                Out::Contract(_),
+                ErrorKind::RequestError(RequestError::ContractError(
+                    ContractError::Update { .. } | ContractError::MissingContract { .. }
+                ))
+            )
+        );
         let why = match (out, e.kind()) {
             (Out::Contract(id), ErrorKind::RequestError(RequestError::ContractError(c))) => match c
             {
@@ -714,6 +731,7 @@ impl Work {
             _ => return false,
         };
         t.fail(why, true);
+        t.refused = refused;
         true
     }
 

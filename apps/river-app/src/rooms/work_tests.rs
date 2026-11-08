@@ -610,10 +610,10 @@ fn a_join_whose_own_store_landed_still_sends_the_join() {
     ));
 }
 
-/// Try again on a join that failed before its UPDATE was taken reads the room again, so the
-/// join is built against the room as it is now, with the time it is sent.
+/// The node refused the join's UPDATE (the room may have filled up since): Try again reads the
+/// room again and builds the join against it now, rather than sending what was refused.
 #[test]
-fn trying_a_join_again_after_its_update_sends_the_same_join() {
+fn trying_a_join_again_after_its_update_was_refused_reads_the_room_again() {
     let mut w = Work::default();
     let (_, slot, _) = joining_to_slot(&mut w);
     w.on_delegate(&read_answer(&slot, None, 0));
@@ -622,9 +622,7 @@ fn trying_a_join_again_after_its_update_sends_the_same_join() {
         &slot,
         CasStoreResult::Stored { generation: 1 },
     ));
-    let sent = next(&mut w);
-    let first = join_time(&sent);
-    let ClientRequest::ContractOp(ContractRequest::Update { key, .. }) = sent else {
+    let ClientRequest::ContractOp(ContractRequest::Update { key, .. }) = next(&mut w) else {
         panic!("an UPDATE");
     };
     let refused: ClientError =
@@ -636,9 +634,36 @@ fn trying_a_join_again_after_its_update_sends_the_same_join() {
     assert!(w.on_error(&refused, false, &|_| false));
     let id = w.views()[0].id;
     assert!(w.retry(id));
-    // The same join (same message id), not a second join event.
-    let again = next(&mut w);
-    assert_eq!(join_time(&again), first);
+    assert!(matches!(
+        next(&mut w),
+        ClientRequest::ContractOp(ContractRequest::Get { .. })
+    ));
+}
+
+/// The join's UPDATE went unanswered until the task gave up, so whether the node took it is
+/// unknown: Try again sends the same join (same message id), not a second join event.
+#[test]
+fn trying_a_join_again_after_no_answer_sends_the_same_join() {
+    let mut w = Work::default();
+    let (_, slot, _) = joining_to_slot(&mut w);
+    w.on_delegate(&read_answer(&slot, None, 0));
+    expect_store(&mut w, &slot, 0);
+    w.on_delegate(&store_answer(
+        &slot,
+        CasStoreResult::Stored { generation: 1 },
+    ));
+    let first = join_time(&next(&mut w));
+    let d = Duration::from_secs(1);
+    let start = Instant::now();
+    for n in 1..=MAX_RECONNECTS + 1 {
+        assert!(w.expire(d, d, start + d * 3 * n));
+        if n <= MAX_RECONNECTS {
+            assert_eq!(join_time(&next(&mut w)), first, "resent unchanged");
+        }
+    }
+    assert!(matches!(state(&w), WorkState::Failed { retry: true, .. }));
+    assert!(w.retry(w.views()[0].id));
+    assert_eq!(join_time(&next(&mut w)), first);
 }
 
 /// The slot store landed but its answer was lost, and the join failed there; the user tries
