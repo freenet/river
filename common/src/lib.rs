@@ -20,6 +20,11 @@ pub mod migration;
 #[cfg(any(feature = "own-purges", test))]
 pub mod own_purges;
 pub mod room_state;
+/// Read-side types for the rooms the web UI stores in the chat delegate. Gated
+/// on the `stored-rooms` feature (client crates only), so the WASM builds keep
+/// byte-identical WASM.
+#[cfg(any(feature = "stored-rooms", test))]
+pub mod stored_rooms;
 pub mod util;
 pub mod web_container;
 
