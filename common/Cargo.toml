@@ -88,6 +88,10 @@ own-purges = []
 # WASM builds do not enable it, so their bytes and keys stay byte-identical. It
 # adds no dependencies.
 stored-rooms = []
+# An invitation to a room as the web UI encodes it (`invitation`), for clients
+# other than the web UI (the native app). Client only, like `stored-rooms`: the
+# WASM builds do not enable it. It adds no dependencies.
+invitation = []
 
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the

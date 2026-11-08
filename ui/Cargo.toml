@@ -131,10 +131,10 @@ freenet-migrate-build = "0.2"
 toml = "0.8"
 
 [dev-dependencies]
-# The read-side types the native app decodes the stored rooms with, for the
-# drift test in room_data.rs (`stored_rooms_drift`). Test-only, so the UI build
-# itself does not compile them.
-river-core = { workspace = true, features = ["stored-rooms"] }
+# The types the native app reads and adds stored rooms with, and encodes
+# invitations with, for the drift tests in room_data.rs (`stored_rooms_drift`).
+# Test-only, so the UI build itself does not compile them.
+river-core = { workspace = true, features = ["stored-rooms", "invitation"] }
 # GrayImage only. Default image features pull AV1 and are unused by the QR test.
 image = { version = "0.25.10", default-features = false }
 # `img` is the feature that implements rqrr's buffer trait for `image::GrayImage`.
