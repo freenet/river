@@ -1,4 +1,4 @@
-import { expect, Locator, Page } from "@playwright/test";
+import { expect, Locator, Page, test } from "@playwright/test";
 
 export async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
@@ -153,8 +153,7 @@ export async function openOwnMessageEdit(page: Page, message?: Locator): Promise
   const ownRow = message ?? page.locator('[id^="msg-"][data-message-self="true"]').first();
   await expect(ownRow).toBeVisible();
   if (!message) await ownRow.scrollIntoViewIfNeeded();
-  await revealFooter(page, ownRow);
-  await ownRow.getByTestId("message-edit-button").click();
+  await clickFooter(page, ownRow, "message-edit-button");
   const editArea = page.locator('textarea[id^="edit-msg-"]');
   await expect(editArea).toBeVisible({ timeout: 5_000 });
   return editArea;
@@ -232,23 +231,151 @@ export async function revealFooter(page: Page, row: Locator) {
 }
 
 /// Click one of `row`'s footer controls by its test id, revealing it first.
+/// Below 48rem Reply, Edit and Delete are not in the footer: a tap on the
+/// row opens them in the actions sheet, and this goes that way.
 export async function clickFooter(page: Page, row: Locator, testid: string) {
+  const sheetAction = SHEET_ACTIONS[testid];
+  if (sheetAction && (await narrowLayout(page))) {
+    await openMessageActions(page, row);
+    await press(page, page.getByTestId(sheetAction));
+    await expect(page.getByTestId("mobile-message-actions-sheet")).toBeHidden();
+    return;
+  }
   await revealFooter(page, row);
   await row.getByTestId(testid).click();
 }
 
-/// Open `row`'s inline reaction picker through its footer React, the only
-/// way in.
+/// Open `row`'s reaction choices through its footer React, the only way in:
+/// the anchored picker at 48rem and wider; below it, the reaction popup with
+/// its palette shown.
 export async function openInlinePicker(page: Page, row: Locator) {
+  if (await narrowLayout(page)) {
+    await press(page, row.getByTestId("message-react-button"));
+    await expect(page.getByTestId("mobile-reaction-popup")).toBeVisible();
+    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
+    await expect(page.getByTestId("mobile-reaction-palette")).toBeVisible();
+    return;
+  }
   await clickFooter(page, row, "message-react-button");
+}
+
+/// The emoji buttons of whichever reaction choices `openInlinePicker` opened.
+export async function reactionChoices(page: Page): Promise<Locator> {
+  return (await narrowLayout(page))
+    ? page.getByTestId("mobile-reaction-palette").getByRole("button")
+    : page.getByTestId("emoji-picker").getByRole("button");
 }
 
 /// React to `row` with the picker's first emoji. Expects the row to end with
 /// exactly one reaction chip, so pass a row that has none.
 export async function reactTo(page: Page, row: Locator): Promise<Locator> {
   await openInlinePicker(page, row);
-  await page.getByTestId("emoji-picker").getByRole("button").first().click();
+  await press(page, (await reactionChoices(page)).first());
   const chip = row.getByTestId("reaction-chip");
   await expect(chip).toHaveCount(1);
   return chip;
+}
+
+/// Below Tailwind's `md` (48rem), the query `main.css` and the app use: a
+/// row's Reply, Edit and Delete are in its actions sheet, its + opens the
+/// reaction popup.
+export function narrowLayout(page: Page): Promise<boolean> {
+  return page.evaluate(() => window.matchMedia("not all and (min-width: 48rem)").matches);
+}
+
+/// A phone project's test of the desktop footer or the anchored reaction
+/// picker runs at a touch tablet's width: below 48rem a row's actions and
+/// reactions are the mobile sheet and popup instead. Keeps the height, and
+/// the device's touch input, so the wide coarse-pointer case stays covered.
+export async function asTouchTablet(page: Page) {
+  const vp = page.viewportSize();
+  if (vp && vp.width < 768) await page.setViewportSize({ width: 834, height: vp.height });
+}
+
+/// Whether this test's context has touch input, so `tap()` works: the
+/// project's device, whatever width a test sets.
+export async function hasTouch(_page: Page): Promise<boolean> {
+  return test.info().project.use.hasTouch === true;
+}
+
+/// Press `target` as the reader would: a tap where touch is available, else
+/// a click.
+export async function press(page: Page, target: Locator, options?: { position?: { x: number; y: number } }) {
+  if (await hasTouch(page)) await target.tap(options);
+  else await target.click(options);
+}
+
+/// Footer test ids and the sheet action that replaces each below 48rem.
+const SHEET_ACTIONS: Record<string, string> = {
+  "message-reply-button": "mobile-message-action-reply",
+  "message-edit-button": "mobile-message-action-edit",
+  "message-delete-button": "mobile-message-action-delete",
+};
+
+/// A point on `row` where a tap lands on the row itself: inside it, on
+/// nothing with a behaviour of its own (links, buttons, chips, the avatar).
+export async function plainPointOf(row: Locator): Promise<{ x: number; y: number }> {
+  await row.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    const view = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    if (r.top < view.top || r.bottom > view.bottom) el.scrollIntoView({ block: "center" });
+  });
+  const find = () => row.evaluate((el) => {
+    const interactive =
+      'a, button, input, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"]), [data-row-actions="exclude"], [data-member-id]';
+    const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
+    const body = el.querySelector('[data-testid="message-body"]')?.getBoundingClientRect() ?? content;
+    const candidates: [number, number][] = [];
+    // The body's lines, then the empty end of the content column, then its edges.
+    for (const fy of [0.5, 0.25, 0.75, 0.1, 0.9]) {
+      for (const fx of [0.98, 0.9, 0.75, 0.5, 0.25, 0.05]) {
+        candidates.push([body.left + body.width * fx, body.top + body.height * fy]);
+      }
+    }
+    for (const fy of [0.05, 0.5, 0.95]) candidates.push([content.right - 3, content.top + content.height * fy]);
+    for (const [x, y] of candidates) {
+      const at = document.elementFromPoint(x, y);
+      if (!at || !el.contains(at)) continue;
+      const control = at.closest(interactive);
+      if (control && el.contains(control)) continue;
+      return { x, y };
+    }
+    return null;
+  });
+  // Still: a row that just committed, or a history still following, can
+  // move between measuring the point and pressing it.
+  await expect
+    .poll(
+      () =>
+        row.evaluate(
+          (el) =>
+            new Promise<boolean>((resolve) => {
+              const a = el.getBoundingClientRect().top;
+              requestAnimationFrame(() => requestAnimationFrame(() => resolve(el.getBoundingClientRect().top === a)));
+            }),
+        ),
+      { message: "the row holds still", timeout: 5_000 },
+    )
+    .toBe(true);
+  // Polled: a dialog closing a moment ago may still cover it.
+  let point: { x: number; y: number } | null = null;
+  await expect.poll(async () => (point = await find()) !== null, { message: "a plain point on the row to tap", timeout: 5_000 }).toBe(true);
+  return point!;
+}
+
+/// Tap (or click) `row` on a plain point, as a reader opening its actions.
+export async function tapRow(page: Page, row: Locator) {
+  const { x, y } = await plainPointOf(row);
+  if (await hasTouch(page)) await page.touchscreen.tap(x, y);
+  else await page.mouse.click(x, y);
+}
+
+/// Below 48rem: open `row`'s actions sheet with a tap on the row, and check
+/// it is for that row.
+export async function openMessageActions(page: Page, row: Locator) {
+  await tapRow(page, row);
+  const sheet = page.getByTestId("mobile-message-actions-sheet");
+  await expect(sheet).toBeVisible();
+  const id = (await row.getAttribute("id"))!.replace(/^msg-/, "");
+  await expect(sheet).toHaveAttribute("data-target-row", id);
 }

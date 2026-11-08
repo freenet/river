@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { clickFooter, coarsePointer, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
+import { asTouchTablet, clickFooter, coarsePointer, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
 import { deliver, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { expectAtReact, expectEveryEmojiUsable, measurePicker } from "./reaction-picker-geometry";
 import { callRiverTest } from "./river-test";
@@ -433,7 +433,10 @@ test.describe("Avatars", () => {
 });
 
 // Placement at React is reaction-picker.spec.ts's (reaction-picker-geometry.ts).
+// The anchored picker exists from 48rem; a phone runs these at a touch
+// tablet's width.
 test.describe("The picker opens at React", () => {
+  test.beforeEach(async ({ page }) => asTouchTablet(page));
   // Opened upward, it stays upward and at React when a reaction moves React.
   test("opened upward, stays at React when a reaction arrives", async ({ page }) => {
     await openRoomWithComposer(page);
@@ -575,23 +578,24 @@ const NO_STRAY_SCROLL = { historyLeft: 0, root: [0, 0], page: [0, 0] };
 // A popover that overflows sideways, on a short phone view, is revealed by
 // the history's scrollTop alone: `scrollIntoView` also scrolled the
 // history's scrollLeft and overflow-hidden ancestors, which nothing scrolls
-// back. The overflow is forced (the picker and the form fit at every real
-// width), so the old behaviour would show.
+// back. The overflow is forced (the form fits at every real width), so the
+// old behaviour would show. Below 48rem reactions are the modal popup, which
+// moves no scroller at all, palette out included.
 test.describe("Revealing a popover on a short phone view", () => {
   test.use({ viewport: { width: 320, height: 480 } });
 
-  test("the picker and the edit form scroll nothing sideways or outside the history", async ({ page }) => {
+  test("the reaction popup and the edit form scroll nothing sideways or outside the history", async ({ page }) => {
     await openRoomWithComposer(page);
     await page.addStyleTag({
-      content: '[data-testid="emoji-picker"] { min-width: 520px; min-height: 700px; } [id^="edit-form-"] { min-width: 600px; }',
+      content: '[id^="edit-form-"] { min-width: 600px; }',
     });
     const row = page.getByTestId("message-row").last();
     await openInlinePicker(page, row);
-    await expect(page.getByTestId("emoji-picker")).toBeVisible();
+    await expect(page.getByTestId("mobile-reaction-popup")).toBeVisible();
     await nextFrames(page);
-    expect(await strayScroll(page), "picker").toEqual(NO_STRAY_SCROLL);
+    expect(await strayScroll(page), "reaction popup").toEqual(NO_STRAY_SCROLL);
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId("emoji-picker")).toBeHidden();
+    await expect(page.getByTestId("mobile-reaction-popup")).toBeHidden();
 
     await openOwnMessageEdit(page);
     await nextFrames(page);
@@ -603,6 +607,7 @@ test.describe("Revealing a popover on a short phone view", () => {
 // position, so its place must come from the control. The newest message, at
 // the bottom of the view, has no room for the picker below its React.
 test("the picker opened from the keyboard at the bottom of the view opens upward", async ({ page }) => {
+  await asTouchTablet(page);
   await openRoomWithComposer(page);
   await deliver(page, "keyboard picker");
   const row = page.getByTestId("message-row").filter({ hasText: "keyboard picker" });
@@ -777,6 +782,8 @@ test.describe("Message row hover band", () => {
 // React on a message taller than the view: the picker opens at React, inside
 // the viewport, and takes the next click. Opening it never moves the history.
 test.describe("React on a tall message", () => {
+  // The anchored picker's case; a phone runs it at a touch tablet's width.
+  test.beforeEach(async ({ page }) => asTouchTablet(page));
   test("the picker opens in view and takes the next click", async ({ page }) => {
     await openRoomWithComposer(page);
     // Tall but well under the room's message-size limit (an over-size
@@ -850,7 +857,9 @@ test.describe("React on a tall message", () => {
 test.describe("Latest over row controls", () => {
   test("a row control aligned with Latest never takes its click", async ({ page }) => {
     const touch = await coarsePointer(page);
-    await page.setViewportSize(touch ? { width: 390, height: 800 } : { width: 1024, height: 800 });
+    // Touch: a tablet's width, where the cluster shows at rest (below 48rem
+    // it is in the actions sheet instead).
+    await page.setViewportSize(touch ? { width: 834, height: 800 } : { width: 1024, height: 800 });
     await openRoomWithComposer(page);
     const control = '[data-testid="message-action-cluster"]';
     await readerLeavesTheEnd(page);

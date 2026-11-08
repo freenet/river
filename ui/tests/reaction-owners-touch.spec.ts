@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { coarsePointer, openInlinePicker, selectRoom, settle, waitForApp } from "./example-room";
+import { asTouchTablet, coarsePointer, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -67,7 +67,7 @@ async function addOwnReaction(page: Page): Promise<Locator> {
   const pinned = page.locator(`[id="${id}"]`);
   await pinned.scrollIntoViewIfNeeded();
   await openInlinePicker(page, pinned);
-  await page.getByTestId("emoji-picker").getByRole("button").first().click();
+  await press(page, (await reactionChoices(page)).first());
   const chip = pinned.locator('[data-testid="reaction-chip"][title*="click to remove"]');
   await expect(chip).toHaveCount(1);
   return chip;
@@ -278,7 +278,7 @@ test.describe("Reaction removed from the owner list", () => {
     const chips = message.getByTestId("reaction-chip");
     await message.scrollIntoViewIfNeeded();
     await openInlinePicker(page, message);
-    await page.getByTestId("emoji-picker").getByRole("button").filter({ hasNotText: "🦀" }).first().click();
+    await press(page, (await reactionChoices(page)).filter({ hasNotText: "🦀" }).first());
     const own = message.locator('[data-testid="reaction-chip"][title*="click to remove"]');
     await expect(own).toHaveCount(1);
     await expect(chips).toHaveCount(2);
@@ -455,6 +455,9 @@ async function expectOnScreen(page: Page, target: Locator) {
 // by touch, on the message the reader chose, without stealing focus back or
 // moving the history.
 test.describe("Reactor list and picker hand off", () => {
+  // The anchored picker's hand-off: a phone runs it at a touch tablet's
+  // width (mobile-reaction-input.spec.ts has the popup's).
+  test.beforeEach(async ({ page }) => asTouchTablet(page));
   async function surfaces(page: Page) {
     return page.evaluate(() => ({
       picker: Array.from(document.querySelectorAll('[data-testid="message-react-button"][aria-expanded="true"]')).map(

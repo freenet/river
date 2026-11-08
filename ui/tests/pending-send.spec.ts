@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { committedRow, FOOTER_CONTROLS, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, settle, submitMessage } from "./example-room";
+import { committedRow, FOOTER_CONTROLS, narrowLayout, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, press, reactionChoices, reactTo, settle, submitMessage } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // An own message is signed by the chat delegate, which can take seconds. It
@@ -46,6 +46,8 @@ test("a sent message shows at once, pending, and commits once when signed", asyn
   await expect(signed).toBeInViewport();
   await expect(signed.getByTestId("message-footer"), "once signed, its own footer").toHaveCount(1);
   for (const id of FOOTER_CONTROLS) await expect(signed.getByTestId(id), id).toHaveCount(1);
+  // Below 48rem its actions are a tap away, in the sheet.
+  if (await narrowLayout(page)) await expect(signed.getByTestId("mobile-message-actions-entry")).toHaveCount(1);
 });
 
 test("messages commit in the order they were sent, whatever order they are signed in", { tag: "@chromium-only" }, async ({
@@ -125,10 +127,10 @@ test("an own reaction, a switch to another emoji, and an edit show while their s
 
   // The reaction, still being signed, switches to another emoji from the footer.
   await openInlinePicker(page, row);
-  const second = page.getByTestId("emoji-picker").getByRole("button").nth(1);
+  const second = (await reactionChoices(page)).nth(1);
   const secondEmoji = (await second.textContent())!.trim();
   expect(secondEmoji, "premise: another emoji").not.toBe(first.replace(/\d+$/, ""));
-  await second.click();
+  await press(page, second);
   await expect(chip).toHaveCount(1);
   await expect(chip, "the switch shows before it is signed").toContainText(secondEmoji);
 
@@ -154,6 +156,7 @@ test("a second click on a reaction still being signed undoes it", { tag: "@chrom
   await callRiverTest(page, "holdMessageSigning");
   const chip = await reactTo(page, row);
   // A fine pointer removes its own reaction on click.
+  await page.mouse.move(0, 0);
   await chip.click();
   await expect(row.getByTestId("reaction-chip"), "the pending reaction is undone").toHaveCount(0);
 
