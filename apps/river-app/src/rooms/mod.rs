@@ -48,11 +48,21 @@ impl Link {
         config_dir: Option<PathBuf>,
         report: impl Fn(RoomsUpdate) + Send + Sync + 'static,
     ) -> Self {
+        Link::with_authority(NODE_AUTHORITY, config_dir, report)
+    }
+
+    /// A link to a node whose client API is at `authority` (`127.0.0.1:<port>`), such as a
+    /// test node on another port. The node honours a grant only over loopback.
+    pub fn with_authority(
+        authority: &str,
+        config_dir: Option<PathBuf>,
+        report: impl Fn(RoomsUpdate) + Send + Sync + 'static,
+    ) -> Self {
         Link {
             inner: Arc::new(Inner {
                 report: Box::new(report),
                 config_dir,
-                authority: NODE_AUTHORITY.to_owned(),
+                authority: authority.to_owned(),
                 running: AtomicBool::new(false),
             }),
         }

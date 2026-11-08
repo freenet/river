@@ -155,8 +155,15 @@ impl NodeSocket {
 
     /// Decode one message, or hold it if it is a chunk of a response still arriving.
     fn take(&mut self, bytes: &[u8]) -> Result<Option<HostResult>, SocketError> {
-        let decoded: HostResult = bincode::deserialize(bytes)
-            .map_err(|e| SocketError::Failed(format!("couldn't read Freenet's answer: {e}")))?;
+        // A node newer than this stdlib can send a response variant it doesn't know. Skip that
+        // one message rather than drop the connection and every subscription with it.
+        let decoded: HostResult = match bincode::deserialize(bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("River: skipping a message from Freenet it can't read: {e}");
+                return Ok(None);
+            }
+        };
         let (stream_id, index, total, data) = match decoded {
             // The chunks that follow carry the response itself.
             Ok(HostResponse::StreamHeader { .. }) => return Ok(None),
@@ -344,6 +351,19 @@ mod tests {
             token_verdict(&SocketError::Failed("x".into())),
             TokenVerdict::Retry
         );
+    }
+
+    #[test]
+    fn an_unreadable_message_is_skipped() {
+        let ok: HostResult = Ok(HostResponse::Ok);
+        let (authority, server) = serve(vec![
+            Message::Binary(vec![0xff, 0xff, 0xff, 0xff, 0xff].into()),
+            Message::Binary(bincode::serialize(&ok).unwrap().into()),
+        ]);
+        let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t".into())).unwrap();
+        assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
+        drop(socket);
+        server.join().unwrap();
     }
 
     #[test]

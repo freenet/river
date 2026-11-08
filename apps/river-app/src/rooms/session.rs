@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::{
-    ClientError, ClientRequest, ContractRequest, ContractResponse, DelegateError, ErrorKind,
-    HostResponse, RequestError,
+    ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, DelegateError,
+    ErrorKind, HostResponse, RequestError,
 };
 use freenet_stdlib::prelude::{ContractInstanceId, UpdateData};
 use river_core::chat_delegate::{ChatDelegateResponseMsg, LIST_REFUSED_MARKER};
@@ -33,6 +33,13 @@ const DELEGATE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// How long a subscribed connection may be silent before River checks it is still there.
 const IDLE_CHECK: Duration = Duration::from_secs(60);
+
+/// How often the subscribed connection wakes to check the two limits here.
+const TICK: Duration = Duration::from_secs(5);
+
+/// How long the room list says it is catching up before it stops waiting for rooms that
+/// have not answered their subscribe.
+const CATCH_UP_LIMIT: Duration = Duration::from_secs(45);
 
 const BACKOFF_FIRST: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -201,63 +208,88 @@ fn follow(
             return e;
         }
     }
-    if let Err(e) = socket.set_read_timeout(IDLE_CHECK) {
+    if let Err(e) = socket.set_read_timeout(TICK) {
         return e;
     }
     let mut pending: std::collections::HashSet<ContractInstanceId> =
         rooms.contract_ids().into_iter().collect();
-    if pending.is_empty() {
-        rooms.report(LinkStatus::Live, report);
-    }
+    let subscribed_at = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut status = LinkStatus::Loading;
     loop {
         let response = match socket.recv() {
-            Ok(r) => r,
-            Err(SocketError::Timeout) => {
-                if let Err(e) = socket.ping() {
-                    return e;
-                }
-                continue;
+            Ok(r) => {
+                last_activity = Instant::now();
+                Some(r)
             }
+            Err(SocketError::Timeout) => None,
             Err(e) => return e,
         };
-        let changed = match response {
-            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+        let mut changed = false;
+        match response {
+            None => {
+                // Quiet for a while: check the connection is still there.
+                if last_activity.elapsed() >= IDLE_CHECK {
+                    if let Err(e) = socket.ping() {
+                        return e;
+                    }
+                    last_activity = Instant::now();
+                }
+            }
+            Some(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
                 state,
                 ..
-            })) => {
-                let was_pending = pending.remove(key.id());
-                let merged = rooms.merge_state(key.id(), state.as_ref());
-                if was_pending && pending.is_empty() {
-                    rooms.report(LinkStatus::Live, report);
-                    false
-                } else {
-                    merged
-                }
+            }))) => {
+                pending.remove(key.id());
+                changed = rooms.merge_state(key.id(), state.as_ref());
             }
-            Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            Some(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
                 key,
                 update,
-            })) => rooms.apply_update(key.id(), &update),
+            }))) => changed = rooms.apply_update(key.id(), &update),
             // The network has no copy. The web UI would seed one with a PUT; this app only
             // reads, so it keeps showing the stored copy.
-            Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id })) => {
-                if pending.remove(&instance_id) && pending.is_empty() {
-                    rooms.report(LinkStatus::Live, report);
-                }
-                false
+            Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                instance_id,
+            }))) => {
+                pending.remove(&instance_id);
             }
             // A subscribe GET that failed leaves that room on its stored copy.
-            Ok(_) | Err(_) => false,
-        };
+            Some(Err(e)) => {
+                if let Some(id) = failed_contract(&e) {
+                    pending.remove(&id);
+                }
+            }
+            Some(Ok(_)) => {}
+        }
+        // "Catching up" ends when every room has answered, or after a while regardless: a
+        // room nobody on the network holds may never answer, and its subscription stays
+        // requested either way.
+        if status == LinkStatus::Loading
+            && (pending.is_empty() || subscribed_at.elapsed() >= CATCH_UP_LIMIT)
+        {
+            pending.clear();
+            status = LinkStatus::Live;
+            changed = true;
+        }
         if changed {
-            let status = if pending.is_empty() {
-                LinkStatus::Live
-            } else {
-                LinkStatus::Loading
-            };
             rooms.report(status, report);
         }
+    }
+}
+
+/// The room contract a failed request names, if any.
+fn failed_contract(e: &ClientError) -> Option<ContractInstanceId> {
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::ContractError(c)) => match c {
+            ContractError::Get { key, .. } | ContractError::Subscribe { key, .. } => {
+                Some(*key.id())
+            }
+            ContractError::MissingContract { key } => Some(*key),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -561,6 +593,28 @@ mod tests {
                 has_meta: false
             }
         );
+    }
+
+    #[test]
+    fn failed_gets_name_their_room() {
+        let id = ContractInstanceId::new([7; 32]);
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            id,
+            freenet_stdlib::prelude::CodeHash::new([1; 32]),
+        );
+        let get: ClientError =
+            ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
+                key,
+                cause: "no peers".into(),
+            }))
+            .into();
+        assert_eq!(failed_contract(&get), Some(id));
+        let missing: ClientError = ErrorKind::RequestError(RequestError::ContractError(
+            ContractError::MissingContract { key: id },
+        ))
+        .into();
+        assert_eq!(failed_contract(&missing), Some(id));
+        assert_eq!(failed_contract(&ErrorKind::NodeUnavailable.into()), None);
     }
 
     #[test]

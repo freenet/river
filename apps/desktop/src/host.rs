@@ -110,7 +110,10 @@ impl NodeHost for DesktopHost {
     }
 
     fn config_dir(&self) -> Option<std::path::PathBuf> {
-        directories::ProjectDirs::from("", "Freenet", "River").map(|d| d.config_dir().to_owned())
+        // The local (not roaming) config directory: on Windows a roaming profile would copy
+        // the node's grant token to other machines, where it means nothing.
+        directories::ProjectDirs::from("", "Freenet", "River")
+            .map(|d| d.config_local_dir().to_owned())
     }
 
     fn can_install(&self) -> bool {
