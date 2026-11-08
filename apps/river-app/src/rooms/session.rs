@@ -31,7 +31,7 @@
 //!   refused (shown as not sent, with the node's reason), or unanswered for
 //!   [`Pace::update_wait`] (shown as not confirmed). An answer names only the room, so a room
 //!   that owes one sends nothing more on this connection; a retry of an unanswered update, or
-//!   an answer owed for three times `update_wait`, reconnects, since a new connection owes
+//!   an answer owed for [`Pace::owed_limit`], reconnects, since a new connection owes
 //!   nothing. What was out when the connection dropped goes again on the next one, unchanged.
 //!   Commands that arrive while disconnected are shown and wait; commands that arrive before
 //!   the rooms were first read wait for them. What is unsent outlives the run (a stop, or a
@@ -99,6 +99,9 @@ pub(super) struct Pace {
     pub refresh: Duration,
     /// How long the node may take to answer an update before the message counts as not sent.
     pub update_wait: Duration,
+    /// How long an answer may be owed before the connection is dropped for it (three times
+    /// `update_wait` by default).
+    pub owed_limit: Duration,
     /// How long the chat delegate gets to answer a read. The web UI allows 10 seconds per
     /// request (first-time WASM compilation can be slow); a whole read gets a little more.
     pub delegate_deadline: Duration,
@@ -121,6 +124,7 @@ impl Default for Pace {
             resubscribe_max: Duration::from_secs(300),
             refresh: Duration::from_secs(60),
             update_wait: Duration::from_secs(60),
+            owed_limit: Duration::from_secs(180),
             delegate_deadline: Duration::from_secs(20),
             grant: GrantPacing::default(),
         }
@@ -587,7 +591,7 @@ fn follow_on(
         // reconnect.
         if rooms
             .outbox
-            .wants_reconnect(pace.update_wait.saturating_mul(3), Instant::now())
+            .wants_reconnect(pace.owed_limit, Instant::now())
         {
             if changed {
                 rooms.report(status, report);
@@ -685,6 +689,9 @@ fn follow_on(
             }
             Some(Err(e)) => {
                 if let Some((id, cause)) = failed_update(&e) {
+                    changed |= rooms.update_answered(&id, Err(cause));
+                } else if let Some((id, cause)) = rooms.failed_update_unnamed(&e, &subs) {
+                    // Not a reload failure either, so the reload goes on.
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some(id) = failed_contract(&e) {
                     // A subscribe GET that failed: the room stays on its copy, asked again.
@@ -983,6 +990,9 @@ struct Rooms {
     not_updated: HashSet<VerifyingKey>,
     /// Rooms not subscribed to yet.
     not_following: HashSet<VerifyingKey>,
+    /// Whether the last read listed every room: a store, rooms listed, all readable. Only such
+    /// a read says a room is gone.
+    complete: bool,
     /// What the user sent that the node has not taken yet.
     outbox: Outbox,
 }
@@ -1030,6 +1040,8 @@ impl Rooms {
                         }
                     } else {
                         new_ids.push(fresh.contract_id());
+                        // Re-keyed: answers owed under the old contract won't come under this.
+                        self.outbox.forget_owed(&vk);
                     }
                     fresh
                 }
@@ -1057,9 +1069,10 @@ impl Rooms {
         self.store_missing = loaded.store_missing;
         self.unreadable = loaded.unreadable;
         self.loaded = true;
-        // Only a read that found rooms says which are gone. A first read of a run that finds
-        // no store, or nothing, must not drop what an earlier run left unsent.
-        if !loaded.store_missing && loaded.listed > 0 {
+        // Only a complete read says which rooms are gone. A first read of a run that finds no
+        // store or nothing, or a room it couldn't read, must not drop what was left unsent.
+        self.complete = !loaded.store_missing && loaded.listed > 0 && loaded.unreadable == 0;
+        if self.complete {
             self.outbox.keep_rooms(&shown);
         }
         for room in &self.list {
@@ -1078,11 +1091,47 @@ impl Rooms {
         for command in std::mem::take(&mut self.outbox.waiting) {
             match self.list.iter().find(|r| r.key() == command.room) {
                 Some(room) => changed |= self.outbox.command(room, command.action),
+                // The read so far says nothing about this room (no store, nothing listed, or
+                // a slot that couldn't be read): it waits for a read that does.
+                None if !self.complete => self.outbox.waiting.push(command),
                 // Left, in the browser, before this arrived.
                 None => eprintln!("River: a command for a room no longer shown was dropped"),
             }
         }
         changed
+    }
+
+    /// The room an UPDATE failure names some other way than `ContractError::Update`: a
+    /// `MissingContract` for a room that owes an answer, or an error that names nothing
+    /// (`EmptyRing`, `PeerNotJoined`, `Shutdown`, an operation error or timeout, as the node
+    /// reports a failed start) when exactly one room owes an answer and no subscribe is
+    /// waiting for one.
+    fn failed_update_unnamed(
+        &self,
+        e: &ClientError,
+        subs: &Subscriptions,
+    ) -> Option<(ContractInstanceId, String)> {
+        let owing: Vec<ContractInstanceId> = self
+            .list
+            .iter()
+            .filter(|r| self.outbox.owes(&r.stored.owner_vk))
+            .map(LiveRoom::contract_id)
+            .collect();
+        match e.kind() {
+            ErrorKind::RequestError(RequestError::ContractError(
+                ContractError::MissingContract { key },
+            )) if owing.contains(key) => Some((*key, "Freenet doesn't have this room.".into())),
+            ErrorKind::EmptyRing
+            | ErrorKind::PeerNotJoined
+            | ErrorKind::Shutdown
+            | ErrorKind::OperationError { .. }
+            | ErrorKind::FailedOperation
+                if owing.len() == 1 && subs.pending.is_empty() =>
+            {
+                Some((owing[0], e.kind().to_string()))
+            }
+            _ => None,
+        }
     }
 
     /// While disconnected: take what the user did and show it. It is sent on reconnecting.
@@ -1124,7 +1173,7 @@ impl Rooms {
         Ok(changed)
     }
 
-    /// The node answered the update holding the turn of the room under contract `id`
+    /// The node answered the oldest update the room under contract `id` owes an answer
     /// ([`Outbox::answered`]). True when that changed what shows.
     fn update_answered(&mut self, id: &ContractInstanceId, result: Result<(), String>) -> bool {
         let Some(room) = self.list.iter_mut().find(|r| r.contract_id() == *id) else {

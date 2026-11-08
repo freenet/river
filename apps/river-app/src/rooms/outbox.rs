@@ -42,13 +42,14 @@
 //! oldest update of that room still owed one, and nothing more goes out for a room while it
 //! owes an answer, whatever became of the entry meanwhile (settled by the network, discarded):
 //! otherwise an owed answer would be taken for the next update's. A new connection owes
-//! nothing, so Retry of an unanswered update reconnects, and so does an answer owed for three
-//! times `update_wait`. Once sent, messages are only ever sent again unchanged (a retry of an
-//! unanswered update, a resend after a reconnect), so the node never gets two copies under two
-//! ids; only a refused one is built again. One the node took but the room here does not show
-//! stays unconfirmed, with why, and is never sent again from here. A send not taken stays on screen marked "Not sent" with
-//! Retry and Discard; an edit, deletion or reaction not taken is said above the composer.
-//! Whatever the network later brings in with these messages' ids counts as sent, whatever the
+//! nothing, so Retry of an unanswered update reconnects, and so does an answer owed for
+//! [`super::session::Pace::owed_limit`]; an update that has cost [`MAX_FORCED_RECONNECTS`]
+//! connections that way is left unconfirmed. Once sent, messages are only ever sent again
+//! unchanged (a retry of an unanswered update, a resend after a reconnect), so the node never
+//! gets two copies under two ids; only a refused one is built again. One the node took but the
+//! room here does not show stays unconfirmed, with why, and is never sent again from here. A
+//! send not taken stays on screen marked "Not sent" with Retry and Discard; an edit, deletion
+//! or reaction not taken is said above the composer. Whatever the network later brings in with these messages' ids counts as sent, whatever the
 //! answer was. Nothing here writes the chat delegate's storage, so the web UI's
 //! after-send bookkeeping (its read position, its stored copy of the room) is not done: the
 //! web UI picks the message up from the network.
@@ -417,8 +418,7 @@ fn why_not_kept(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> String {
             .filter_map(|m| m.message.content.secret_version())
             .any(|v| !versions.contains(&v))
     {
-        return "The room's copy on this computer doesn't have the key it was sealed with yet."
-            .into();
+        return KEY_NOT_HERE.into();
     }
     let keeps = state.configuration.configuration.max_recent_messages;
     let held = &state.recent_messages.messages;
@@ -428,10 +428,21 @@ fn why_not_kept(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> String {
                 .is_none_or(|o| m.message.time <= o.message.time)
         })
     {
-        return "The room keeps only its newest messages, and this was not among them.".into();
+        return CAPPED.into();
     }
-    "The room didn't take it. You may have been removed or banned.".into()
+    REMOVED.into()
 }
+
+pub(super) const KEY_NOT_HERE: &str =
+    "The room's copy on this computer doesn't have the key it was sealed with yet.";
+pub(super) const CAPPED: &str = "The room keeps only its newest messages, and this was not among \
+     them. If this computer's clock is behind, its messages look older than they are.";
+pub(super) const REMOVED: &str = "The room didn't take it. You may have been removed or banned.";
+/// How many times an update the node never answers is sent again on a new connection before
+/// it is left unconfirmed: each time costs every room a reconnect.
+pub(super) const MAX_FORCED_RECONNECTS: u32 = 3;
+pub(super) const NEVER_ANSWERED: &str = "Freenet never answered it, after several tries. It \
+     may still have arrived; if it does, this goes away.";
 
 fn held(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> bool {
     let ids: HashSet<MessageId> = room
@@ -483,6 +494,8 @@ struct Entry {
     /// again as they are, never rebuilt: the node may have taken them, and a rebuilt message
     /// has a new id, so it would show twice.
     sent: bool,
+    /// How many connections were dropped because this was owed an answer for too long.
+    forced: u32,
 }
 
 impl Entry {
@@ -594,6 +607,7 @@ impl Outbox {
             messages: Vec::new(),
             status: Status::Queued,
             sent: false,
+            forced: 0,
         };
         rebuild(&mut entry, room);
         self.entries.push(entry);
@@ -780,6 +794,11 @@ impl Outbox {
                 continue;
             }
             if !entry.sent {
+                if let Err(blocked) = participation(room) {
+                    entry.status = Status::Failed(blocked.reason().into());
+                    *changed = true;
+                    continue;
+                }
                 if entry.sealed_before(current) {
                     // Sealed again under the room's current secret, keeping its time.
                     rebuild(entry, room);
@@ -872,14 +891,34 @@ impl Outbox {
 
     /// Whether this connection should be dropped: the user asked to send again something
     /// still owed an answer, or an answer has been owed for `bound`, which would otherwise
-    /// hold its room for good.
-    pub fn wants_reconnect(&self, bound: Duration, now: Instant) -> bool {
-        self.reconnect
-            || self
-                .owed
-                .values()
-                .filter_map(VecDeque::front)
-                .any(|(_, at)| now.saturating_duration_since(*at) >= bound)
+    /// hold its room for good. An entry that has cost [`MAX_FORCED_RECONNECTS`] connections
+    /// this way is left unconfirmed, and not sent again.
+    pub fn wants_reconnect(&mut self, bound: Duration, now: Instant) -> bool {
+        let overdue: Vec<u64> = self
+            .owed
+            .values()
+            .filter_map(VecDeque::front)
+            .filter(|(_, at)| now.saturating_duration_since(*at) >= bound)
+            .map(|(id, _)| *id)
+            .collect();
+        for e in self.entries.iter_mut().filter(|e| overdue.contains(&e.id)) {
+            e.forced += 1;
+            if e.forced >= MAX_FORCED_RECONNECTS {
+                e.status = Status::Unconfirmed(NEVER_ANSWERED.into());
+            }
+        }
+        self.reconnect || !overdue.is_empty()
+    }
+
+    /// Whether `room` owes an answer on this connection.
+    pub fn owes(&self, room: &VerifyingKey) -> bool {
+        self.owed.get(room).is_some_and(|o| !o.is_empty())
+    }
+
+    /// The room's answers owed are for a contract it no longer uses (re-keyed): they will not
+    /// come under its key.
+    pub fn forget_owed(&mut self, room: &VerifyingKey) {
+        self.owed.remove(room);
     }
 
     /// The connection is gone: nothing is owed on the next one, and what was in flight goes
@@ -907,6 +946,7 @@ impl Outbox {
     /// Forget the rooms no longer shown: what was waiting there goes with them.
     pub fn keep_rooms(&mut self, shown: &HashSet<VerifyingKey>) {
         self.entries.retain(|e| shown.contains(&e.room));
+        self.owed.retain(|room, _| shown.contains(room));
     }
 
     /// `room` with what is on its way applied, which entries show as rows (by message key),

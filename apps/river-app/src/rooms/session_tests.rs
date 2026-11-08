@@ -877,6 +877,7 @@ fn quick() -> Pace {
         resubscribe_max: Duration::from_secs(60),
         refresh: Duration::from_secs(3600),
         update_wait: Duration::from_secs(60),
+        owed_limit: Duration::from_secs(180),
         delegate_deadline: Duration::from_secs(5),
         grant: GrantPacing {
             pause: Duration::ZERO,
@@ -1757,7 +1758,8 @@ fn a_run_that_panics_gives_the_outbox_back() {
             None,
             &|_| panic!("a bug while reporting"),
             &quick(),
-            &|| false,
+            // Asked to stop at once: if the panic were not where it is, the run would return.
+            &|| true,
             &rx,
             &mut outbox,
         )
@@ -2012,5 +2014,197 @@ fn what_was_unsent_when_a_session_stopped_goes_out_in_the_next() {
     assert_eq!(
         one.recent_messages, two.recent_messages,
         "the same message again"
+    );
+}
+
+// Round 3 --------------------------------------------------------------------------------------
+
+#[test]
+fn commands_waiting_through_a_read_that_finds_no_rooms_wait_for_one_that_does() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Command {
+        room: bs58::encode(a.vk().to_bytes()).into_string(),
+        action: say("carried over"),
+    })
+    .unwrap();
+    let mut rooms = Rooms::default();
+    rooms.replace(Loaded::missing());
+    assert!(!rooms.take_commands(&rx));
+    assert_eq!(rooms.outbox.waiting.len(), 1);
+    let mut unreadable = loaded(vec![]);
+    unreadable.listed = 1;
+    unreadable.unreadable = 1;
+    rooms.replace(unreadable);
+    assert!(!rooms.take_commands(&rx));
+    assert_eq!(rooms.outbox.waiting.len(), 1);
+    rooms.replace(loaded(vec![a.stored()]));
+    assert!(rooms.take_commands(&rx));
+    assert!(rooms.outbox.waiting.is_empty());
+    assert!(!rooms.outbox.is_empty());
+}
+
+/// Rooms `list`, each with one update out.
+fn owing(list: &[&TestRoom]) -> Rooms {
+    let mut rooms = Rooms::default();
+    rooms.replace(loaded(list.iter().map(|r| r.stored()).collect()));
+    for room in &rooms.list {
+        assert!(rooms.outbox.command(room, say("out")));
+        let mut changed = false;
+        assert!(
+            rooms
+                .outbox
+                .next_update(room, Instant::now(), &mut changed)
+                .is_some()
+        );
+    }
+    rooms
+}
+
+#[test]
+fn update_failures_that_name_no_update_go_to_the_one_room_that_owes() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let empty_ring: ClientError = ErrorKind::EmptyRing.into();
+    let missing = |id| -> ClientError {
+        ErrorKind::RequestError(RequestError::ContractError(
+            ContractError::MissingContract { key: id },
+        ))
+        .into()
+    };
+    let none = Subscriptions::default();
+
+    let one = owing(&[&a]);
+    assert_eq!(
+        one.failed_update_unnamed(&empty_ring, &none)
+            .map(|(id, _)| id),
+        Some(a.id())
+    );
+    assert_eq!(
+        one.failed_update_unnamed(&missing(a.id()), &none)
+            .map(|(id, _)| id),
+        Some(a.id())
+    );
+    // A subscribe waiting for its answer could be the one that failed.
+    let mut asking = Subscriptions::default();
+    asking.pending.insert(b.id(), Instant::now());
+    assert_eq!(one.failed_update_unnamed(&empty_ring, &asking), None);
+    // A missing contract for a room that owes nothing is a subscribe's.
+    assert_eq!(one.failed_update_unnamed(&missing(b.id()), &none), None);
+    // Two rooms owe: which one failed can't be told.
+    let two = owing(&[&a, &b]);
+    assert_eq!(two.failed_update_unnamed(&empty_ring, &none), None);
+    assert_eq!(
+        two.failed_update_unnamed(&missing(b.id()), &none)
+            .map(|(id, _)| id),
+        Some(b.id())
+    );
+}
+
+#[test]
+fn a_rekeyed_room_owes_nothing_under_its_old_contract() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut rooms = owing(&[&a]);
+    assert!(rooms.outbox.owes(&a.vk()));
+    let rekeyed = TestRoom::new(1, "A", 2, &["a1"]);
+    rooms.replace(loaded(vec![rekeyed.stored()]));
+    assert!(!rooms.outbox.owes(&a.vk()));
+
+    // A room a complete read no longer lists owes nothing either.
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let mut rooms = owing(&[&a, &b]);
+    rooms.replace(loaded(vec![a.stored()]));
+    assert!(rooms.outbox.owes(&a.vk()));
+    assert!(!rooms.outbox.owes(&b.vk()));
+}
+
+#[test]
+fn an_update_failure_naming_nothing_reaches_the_screen() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a], "send-keyless", quick());
+    session.act(&a, say("into an empty ring"));
+    session.wait_until("sent", || node.with(|w| w.updates.len() == 1));
+    let error: Result<HostResponse, ClientError> = Err(ErrorKind::EmptyRing.into());
+    node.with(|w| {
+        w.push
+            .push(Message::Binary(bincode::serialize(&error).unwrap().into()))
+    });
+    session.wait_until("shown as refused", || {
+        matches!(
+            delivery_of(&session, "into an empty ring"),
+            Some(Some(p)) if p.failed.as_deref().is_some_and(|f| f.contains("no ring connections"))
+        )
+    });
+}
+
+#[test]
+fn retry_of_an_unanswered_update_reconnects_once_and_sends_it_again_unchanged() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    // No forced reconnect in this test's lifetime: only the Retry can reconnect.
+    let pace = Pace {
+        update_wait: Duration::from_millis(100),
+        owed_limit: Duration::from_secs(3600),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-retry-late", pace);
+    session.act(&a, say("say it again"));
+    session.wait_until(
+        "unconfirmed",
+        || matches!(delivery_of(&session, "say it again"), Some(Some(p)) if p.failed.is_some()),
+    );
+    assert_eq!(node.with(|w| w.connections.len()), 1);
+    node.with(|w| w.update_play = UpdatePlay::Accept);
+    let Some(Some(pending)) = delivery_of(&session, "say it again") else {
+        unreachable!()
+    };
+    session.act(
+        &a,
+        Action::Retry {
+            entry: pending.entry,
+        },
+    );
+    session.wait_until("sent on a new connection, and taken", || {
+        delivery_of(&session, "say it again") == Some(None)
+    });
+    let (connections, updates) = node.with(|w| (w.connections.len(), w.updates.clone()));
+    assert_eq!(connections, 2, "one reconnect");
+    assert_eq!(updates.len(), 2, "one resend");
+    assert_eq!(updates[0].1.recent_messages, updates[1].1.recent_messages);
+}
+
+#[test]
+fn an_answer_owed_too_long_reconnects_and_resends_then_gives_up() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let pace = Pace {
+        update_wait: Duration::from_millis(50),
+        owed_limit: Duration::from_millis(150),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-owed-long", pace);
+    session.act(&a, say("unheard"));
+    session.wait_until("given up on, after the bounded resends", || {
+        matches!(
+            delivery_of(&session, "unheard"),
+            Some(Some(p)) if p.failed.as_deref() == Some(super::super::outbox::NEVER_ANSWERED)
+        )
+    });
+    let updates = node.with(|w| w.updates.clone());
+    assert_eq!(
+        updates.len() as u32,
+        super::super::outbox::MAX_FORCED_RECONNECTS
+    );
+    assert!(
+        updates
+            .windows(2)
+            .all(|w| w[0].1.recent_messages == w[1].1.recent_messages)
+    );
+    assert!(
+        node.with(|w| w.connections.len()) as u32 >= super::super::outbox::MAX_FORCED_RECONNECTS
     );
 }

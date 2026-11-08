@@ -1201,9 +1201,11 @@ fn an_owed_answer_after_its_update_was_retried_is_its_own() {
     a_then_b(&mut outbox, &room);
     outbox.expire(Duration::ZERO, Instant::now() + Duration::from_secs(1));
     let entry = pending_of(&outbox, &room, "A").unwrap().unwrap().entry;
+    assert!(!outbox.wants_reconnect(Duration::from_secs(600), Instant::now()));
     assert!(outbox.command(&room, Action::Retry { entry }));
-    // Nothing goes out on this connection: not A again, not B.
+    // Nothing goes out on this connection: not A again, not B. A new one is asked for.
     assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert!(outbox.wants_reconnect(Duration::from_secs(600), Instant::now()));
     assert!(outbox.answered(&mut room, Ok(())));
     assert_eq!(
         pending_of(&outbox, &room, "A"),
@@ -1289,4 +1291,111 @@ fn a_message_this_computer_cannot_read_offers_nothing_to_edit() {
     let m = view.messages.last().unwrap();
     assert!(m.text.starts_with("[Encrypted"), "{}", m.text);
     assert_eq!(m.source, "");
+}
+
+// Round 3 --------------------------------------------------------------------------------------
+
+#[test]
+fn a_waiting_message_in_a_room_that_moved_past_the_key_held_here_is_not_sent_under_the_old_one() {
+    let f = Fixture::new();
+    let mut room = private_room(&f);
+    let mut outbox = outbox();
+    a_then_b(&mut outbox, &room);
+    // The owner rotates to v1 and seals it to themselves only: this member has no v1.
+    let mut state = room.stored.room_state.clone();
+    add_secret(&f, &mut state, 1, &[7; 32], &f.owner);
+    room.merge_state(&state).unwrap();
+    assert_eq!(room.current_secret(), None);
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert_eq!(
+        pending_of(&outbox, &room, "B")
+            .unwrap()
+            .unwrap()
+            .failed
+            .as_deref(),
+        Some(Blocked::NoSecret.reason())
+    );
+}
+
+#[test]
+fn the_cap_and_missing_key_reasons_are_said_in_full() {
+    let f = Fixture::new();
+    let capped = LiveRoom::new(f.stored(with_config(&f, public_state(&f), |c| {
+        c.max_recent_messages = 0
+    })));
+    let mut outbox = outbox();
+    assert!(outbox.command(&capped, say("into nothing")));
+    assert_eq!(
+        outbox.view(&capped, &minutes).notices[0].text,
+        format!("Your message couldn't be sent. {CAPPED}")
+    );
+
+    let older = private_room(&f);
+    let mut state = older.stored.room_state.clone();
+    add_secret(&f, &mut state, 1, &[7; 32], &f.me);
+    let mut newer = older.clone();
+    newer.merge_state(&state).unwrap();
+    let mut outbox = self::outbox();
+    sent(&mut outbox, &newer, say("under v1"));
+    assert!(outbox.answered(&mut older.clone(), Ok(())));
+    assert_eq!(
+        pending_of(&outbox, &newer, "under v1")
+            .unwrap()
+            .unwrap()
+            .failed,
+        Some(format!(
+            "Freenet took it, but the room here doesn't show it. {KEY_NOT_HERE}"
+        ))
+    );
+}
+
+#[test]
+fn an_unconfirmed_message_is_settled_when_the_network_brings_it_in() {
+    let f = Fixture::new();
+    let older = private_room(&f);
+    let mut state = older.stored.room_state.clone();
+    add_secret(&f, &mut state, 1, &[7; 32], &f.me);
+    let mut newer = older.clone();
+    newer.merge_state(&state).unwrap();
+    let mut outbox = outbox();
+    let messages = sent(&mut outbox, &newer, say("under v1"));
+    assert!(outbox.answered(&mut older.clone(), Ok(())));
+    assert!(!outbox.is_empty());
+    newer
+        .apply_delta(ChatRoomStateV1Delta {
+            recent_messages: Some(messages),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(outbox.reconcile(&newer));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn an_update_never_answered_costs_a_bounded_number_of_reconnects() {
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let mut outbox = outbox();
+    let bound = Duration::from_secs(180);
+    let mut t = Instant::now();
+    assert!(outbox.command(&room, say("into the void")));
+    let mut sends = 0;
+    // Bounded here too, so a missing bound fails instead of looping.
+    for _ in 0..10 {
+        if next(&mut outbox, &room, t).is_none() {
+            break;
+        }
+        sends += 1;
+        t += bound;
+        assert!(outbox.wants_reconnect(bound, t));
+        outbox.requeue();
+    }
+    assert_eq!(sends, MAX_FORCED_RECONNECTS);
+    let pending = pending_of(&outbox, &room, "into the void")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.failed.as_deref(), Some(NEVER_ANSWERED));
+    assert!(!pending.retry, "Discard only");
+    assert!(!outbox.wants_reconnect(bound, t + bound));
 }
