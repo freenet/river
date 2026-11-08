@@ -4,11 +4,11 @@ use rune::tok::TextStyle;
 use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::{Kit, TextInput};
 
-use super::{Chat, Mode};
 use super::icons;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label, not_yet};
+use super::{Chat, Mode};
 use crate::RiverApp;
 
 const AVATAR: f32 = 36.0;
@@ -248,7 +248,10 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette) -> El {
                     label(model::clock(m.time), st::GUTTER_TIME, p.text_muted)
                         .group_opacity(0.0, 1.0),
                 ),
-                col().grow(1.0).min_w(0.0).child(message_el(chat, room, m, p)),
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(message_el(chat, room, m, p)),
             )
         };
         let mut line = row()
@@ -378,7 +381,11 @@ fn picker(room: &Room, m: &Message, p: &Palette) -> El {
                 .size(32.0, 32.0)
                 .radius(6.0)
                 .center()
-                .fill(if current { p.accent_soft } else { Color::TRANSPARENT })
+                .fill(if current {
+                    p.accent_soft
+                } else {
+                    Color::TRANSPARENT
+                })
                 .hover(p.surface_hover)
                 .cursor(rune::Cursor::Pointer)
                 .on_press(move |s: &mut RiverApp| s.chat.react(&key, &e))
@@ -628,28 +635,28 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         column = column.child(bar);
     }
     column.child(
-            row()
-                .key("composer-box")
-                .w_full()
-                .h(50.0)
-                .px(6.0)
-                .gap(4.0)
-                .center_y()
-                .radius(12.0)
-                .fill(p.surface)
-                .border(
-                    1.0,
-                    if chat.composer.focused {
-                        p.text_muted
-                    } else {
-                        p.line
-                    },
-                )
-                .shadow(8.0, 24.0, p.shadow)
-                .child(emoji)
-                .child(field)
-                .child(send),
-        )
+        row()
+            .key("composer-box")
+            .w_full()
+            .h(50.0)
+            .px(6.0)
+            .gap(4.0)
+            .center_y()
+            .radius(12.0)
+            .fill(p.surface)
+            .border(
+                1.0,
+                if chat.composer.focused {
+                    p.text_muted
+                } else {
+                    p.line
+                },
+            )
+            .shadow(8.0, 24.0, p.shadow)
+            .child(emoji)
+            .child(field)
+            .child(send),
+    )
 }
 
 /// A failed edit, deletion or reaction, with Retry (when it can be sent again) and Dismiss.
@@ -702,12 +709,9 @@ fn mode_bar(chat: &Chat, room: &Room, p: &Palette) -> Option<El> {
             )
     };
     let cancel = || {
-        text_button(
-            "cancel".to_owned(),
-            "Cancel",
-            p.text_secondary,
-            |s| s.chat.cancel(),
-        )
+        text_button("cancel".to_owned(), "Cancel", p.text_secondary, |s| {
+            s.chat.cancel()
+        })
     };
     match &chat.mode {
         Mode::Write => None,
@@ -719,9 +723,9 @@ fn mode_bar(chat: &Chat, room: &Room, p: &Palette) -> Option<El> {
                 .unwrap_or_default();
             Some(bar("replying", format!("Replying to {who}: {what}")).child(cancel()))
         }
-        Mode::Edit { .. } => Some(
-            bar("editing", "Editing your message. Send saves it.".to_owned()).child(cancel()),
-        ),
+        Mode::Edit { .. } => {
+            Some(bar("editing", "Editing your message. Send saves it.".to_owned()).child(cancel()))
+        }
         Mode::Delete(_) => Some(
             bar(
                 "deleting",

@@ -56,9 +56,7 @@ use river_core::room_state::content::{
 };
 use river_core::room_state::member::{AuthorizedMember, MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
-use river_core::room_state::message::{
-    AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody,
-};
+use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
 use river_core::room_state::privacy::SealedBytes;
 
 use super::room::{LiveRoom, message_key};
@@ -166,7 +164,8 @@ fn self_banned(room: &LiveRoom, vk: &VerifyingKey) -> bool {
         if let Some(admitted) = &room.stored.self_authorized_member {
             members.members.push(admitted.clone());
         }
-        let mut present: HashSet<MemberId> = members.members.iter().map(|m| m.member.id()).collect();
+        let mut present: HashSet<MemberId> =
+            members.members.iter().map(|m| m.member.id()).collect();
         for ancestor in &room.stored.invite_chain {
             if present.insert(ancestor.member.id()) {
                 members.members.push(ancestor.clone());
@@ -185,22 +184,30 @@ fn self_banned(room: &LiveRoom, vk: &VerifyingKey) -> bool {
 
 /// The web UI's `build_rejoin_delta`: what re-adds a member the room pruned for inactivity.
 /// Nothing for the owner, a current member, or a member with no stored admission.
-fn rejoin(
-    room: &LiveRoom,
-) -> (Option<MembersDelta>, Option<Vec<AuthorizedMemberInfo>>) {
+fn rejoin(room: &LiveRoom) -> (Option<MembersDelta>, Option<Vec<AuthorizedMemberInfo>>) {
     let Some(sk) = &room.stored.self_sk else {
         return (None, None);
     };
     let vk = sk.verifying_key();
     let state = &room.stored.room_state;
-    if vk == room.stored.owner_vk || state.members.members.iter().any(|m| m.member.member_vk == vk)
+    if vk == room.stored.owner_vk
+        || state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == vk)
     {
         return (None, None);
     }
     let Some(admitted) = &room.stored.self_authorized_member else {
         return (None, None);
     };
-    let present: HashSet<MemberId> = state.members.members.iter().map(|m| m.member.id()).collect();
+    let present: HashSet<MemberId> = state
+        .members
+        .members
+        .iter()
+        .map(|m| m.member.id())
+        .collect();
     let mut add: Vec<AuthorizedMember> = vec![admitted.clone()];
     for ancestor in &room.stored.invite_chain {
         if !present.contains(&ancestor.member.id()) {
@@ -211,7 +218,10 @@ fn rejoin(
     // must not be republished there.
     let reusable = room.stored.self_member_info.as_ref().filter(|info| {
         !room.is_private()
-            || matches!(info.member_info.preferred_nickname, SealedBytes::Private { .. })
+            || matches!(
+                info.member_info.preferred_nickname,
+                SealedBytes::Private { .. }
+            )
     });
     let info = match reusable {
         Some(info) => Some(info.clone()),
@@ -483,12 +493,11 @@ impl Outbox {
     }
 
     /// What an action builds, against the room as shown (with what is still on its way).
-    fn intent(
-        &self,
-        room: &LiveRoom,
-        action: Action,
-    ) -> Result<Intent, (&'static str, String)> {
-        let me = room.stored.self_verifying_key().map(|vk| MemberId::from(&vk));
+    fn intent(&self, room: &LiveRoom, action: Action) -> Result<Intent, (&'static str, String)> {
+        let me = room
+            .stored
+            .self_verifying_key()
+            .map(|vk| MemberId::from(&vk));
         let own = |target: &str, label: &'static str| {
             let m = room
                 .message_by_key(target)
@@ -507,14 +516,18 @@ impl Outbox {
             return Err((label, "It is empty.".to_owned()));
         }
         match action {
-            Action::Send { text, reply_to: None } => Ok(Intent::Text { text, reply: None }),
+            Action::Send {
+                text,
+                reply_to: None,
+            } => Ok(Intent::Text { text, reply: None }),
             Action::Send {
                 text,
                 reply_to: Some(target),
             } => {
-                let m = room
-                    .message_by_key(&target)
-                    .ok_or(("Your reply", "The message you replied to is gone.".to_owned()))?;
+                let m = room.message_by_key(&target).ok_or((
+                    "Your reply",
+                    "The message you replied to is gone.".to_owned(),
+                ))?;
                 Ok(Intent::Text {
                     text,
                     reply: Some(ReplyTarget {
@@ -608,8 +621,7 @@ impl Outbox {
             }
             if entry.author.is_some() && entry.author != me {
                 entry.status = Status::Failed(
-                    "This room's identity changed after it was written, so it was not sent."
-                        .into(),
+                    "This room's identity changed after it was written, so it was not sent.".into(),
                 );
                 *changed = true;
                 continue;
@@ -635,7 +647,11 @@ impl Outbox {
 
     /// The node answered `room`'s update in flight. Taken: the entry, for the caller to apply
     /// to the room. Refused: the entry fails with the node's reason.
-    pub fn answered(&mut self, room: &VerifyingKey, result: Result<(), String>) -> Option<Vec<AuthorizedMessageV1>> {
+    pub fn answered(
+        &mut self,
+        room: &VerifyingKey,
+        result: Result<(), String>,
+    ) -> Option<Vec<AuthorizedMessageV1>> {
         let i = self
             .entries
             .iter()
@@ -698,7 +714,11 @@ impl Outbox {
         let mut shown = room.clone();
         let mut rows = HashMap::new();
         let mut notices = Vec::new();
-        for e in self.entries.iter().filter(|e| e.room == room.stored.owner_vk) {
+        for e in self
+            .entries
+            .iter()
+            .filter(|e| e.room == room.stored.owner_vk)
+        {
             let failed = match &e.status {
                 Status::Failed(reason) => Some(reason.clone()),
                 _ => None,
@@ -764,8 +784,7 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom) {
         Ok((author, messages)) => {
             if entry.author.is_some_and(|a| a != author) {
                 entry.status = Status::Failed(
-                    "This room's identity changed after it was written, so it was not sent."
-                        .into(),
+                    "This room's identity changed after it was written, so it was not sent.".into(),
                 );
                 return;
             }

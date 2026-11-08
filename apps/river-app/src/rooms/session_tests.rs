@@ -1484,3 +1484,179 @@ fn a_stored_copy_that_cannot_be_merged_is_named() {
     assert!(rooms.replace(loaded(vec![bad])).is_empty());
     assert_eq!(rooms.issues().not_updated, ["A"]);
 }
+
+// Sending ---------------------------------------------------------------------------------------
+
+fn say(text: &str) -> Action {
+    Action::Send {
+        text: text.into(),
+        reply_to: None,
+    }
+}
+
+/// The message texted `text` in the newest room list: its delivery, or `None` if not shown.
+fn delivery_of(session: &Running, text: &str) -> Option<Option<crate::chat::model::Pending>> {
+    let (rooms, _, _) = session.last_rooms()?;
+    rooms[0]
+        .messages
+        .iter()
+        .find(|m| m.text == text)
+        .map(|m| m.pending.clone())
+}
+
+fn update_notification(room: &TestRoom, messages: Vec<AuthorizedMessageV1>) -> Message {
+    let delta = ChatRoomStateV1Delta {
+        recent_messages: Some(messages),
+        ..Default::default()
+    };
+    let note: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateNotification {
+            key: room.key,
+            update: UpdateData::Delta(cbor(&delta).into()),
+        },
+    ));
+    Message::Binary(bincode::serialize(&note).unwrap().into())
+}
+
+#[test]
+fn a_sent_message_shows_at_once_and_is_marked_sent_when_the_node_takes_it() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    // Held until the message has been seen on its way.
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a], "send-ok", quick());
+    session.act(&a, say("hello from the app"));
+    session.wait_until("shown on its way", || {
+        matches!(delivery_of(&session, "hello from the app"), Some(Some(p)) if p.failed.is_none())
+    });
+    let (key, delta) = node.with(|w| w.updates[0].clone());
+    // The room's contract, a delta carrying one message signed by the room's key.
+    assert_eq!(key, a.key);
+    let messages = delta.recent_messages.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].validate(&a.vk()).is_ok());
+    assert!(delta.members.is_none() && delta.member_info.is_none());
+
+    // The node answers: sent.
+    let answer: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+        ContractResponse::UpdateResponse {
+            key: a.key,
+            summary: freenet_stdlib::prelude::StateSummary::from(vec![]),
+        },
+    ));
+    node.with(|w| {
+        w.push
+            .push(Message::Binary(bincode::serialize(&answer).unwrap().into()))
+    });
+    session.wait_until("marked sent", || {
+        delivery_of(&session, "hello from the app") == Some(None)
+    });
+    assert_eq!(node.with(|w| w.updates.len()), 1);
+}
+
+#[test]
+fn a_refused_update_is_shown_with_the_reason_and_retry_sends_it_again() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Refuse("the contract said no"));
+    let (session, _dir) = following(&node, &[&a], "send-refused", quick());
+    session.act(&a, say("refused one"));
+    session.wait_until("shown as not sent", || {
+        matches!(
+            delivery_of(&session, "refused one"),
+            Some(Some(p)) if p.failed.as_deref().is_some_and(|f| f.contains("the contract said no"))
+        )
+    });
+    let Some(Some(pending)) = delivery_of(&session, "refused one") else {
+        unreachable!()
+    };
+    node.with(|w| w.update_play = UpdatePlay::Accept);
+    session.act(
+        &a,
+        Action::Retry {
+            entry: pending.entry,
+        },
+    );
+    session.wait_until("sent on retry", || {
+        delivery_of(&session, "refused one") == Some(None)
+    });
+    assert_eq!(node.with(|w| w.updates.len()), 2);
+}
+
+#[test]
+fn an_unanswered_update_fails_and_counts_as_sent_once_the_network_brings_it() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let pace = Pace {
+        update_wait: Duration::from_millis(200),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-unanswered", pace);
+    session.act(&a, say("lost answer"));
+    session.wait_until(
+        "failed for want of an answer",
+        || matches!(delivery_of(&session, "lost answer"), Some(Some(p)) if p.failed.is_some()),
+    );
+    // The node did take it, and the network brings it back.
+    let (_, delta) = node.with(|w| w.updates[0].clone());
+    let note = update_notification(&a, delta.recent_messages.unwrap());
+    node.with(|w| w.push.push(note));
+    session.wait_until("settled as sent", || {
+        delivery_of(&session, "lost answer") == Some(None)
+    });
+}
+
+#[test]
+fn what_was_out_when_the_connection_dropped_goes_again_unchanged() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    node.with(|w| w.update_play = UpdatePlay::Ignore);
+    let (session, _dir) = following(&node, &[&a], "send-reconnect", quick());
+    session.act(&a, say("across a drop"));
+    session.wait_until("sent once", || node.with(|w| w.updates.len() == 1));
+    node.with(|w| {
+        w.update_play = UpdatePlay::Accept;
+        w.drop_live = true;
+    });
+    session.wait_until("sent again on the new connection", || {
+        node.with(|w| w.updates.len() >= 2)
+    });
+    let (first, second) = node.with(|w| (w.updates[0].1.clone(), w.updates[1].1.clone()));
+    assert_eq!(first.recent_messages, second.recent_messages);
+    session.wait_until("marked sent", || {
+        delivery_of(&session, "across a drop") == Some(None)
+    });
+}
+
+#[test]
+fn a_command_while_disconnected_shows_at_once_and_goes_out_on_reconnecting() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        backoff_first: Duration::from_secs(1),
+        backoff_max: Duration::from_secs(1),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "send-offline", pace);
+    // Every new connection is dropped until the message has been seen.
+    node.with(|w| {
+        w.plays.extend(std::iter::repeat_n(Play::Drop, 1000));
+        w.drop_live = true;
+    });
+    session.wait_until("reconnecting", || {
+        session
+            .updates()
+            .iter()
+            .any(|u| matches!(u, RoomsUpdate::Status(LinkStatus::Reconnecting)))
+    });
+    session.act(&a, say("written offline"));
+    session.wait_until("shown while disconnected", || {
+        matches!(delivery_of(&session, "written offline"), Some(Some(_)))
+    });
+    assert!(node.with(|w| w.updates.is_empty()));
+    node.with(|w| w.plays.clear());
+    session.wait_until("sent and taken after reconnecting", || {
+        delivery_of(&session, "written offline") == Some(None)
+    });
+}

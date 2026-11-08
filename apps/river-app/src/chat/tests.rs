@@ -346,10 +346,11 @@ fn the_town_square_history_renders_its_parts() {
     // The release notes message's address is a link (`find` also finds link boxes).
     assert!(rt.find("https://freenet.org/news").is_some());
     assert!(rt.find("reply").is_some());
-    assert!(rt.elements().iter().any(|e| e
-        .key
-        .as_deref()
-        .is_some_and(|k| k.starts_with("reaction-") && k.ends_with("-🎉"))));
+    assert!(rt.elements().iter().any(|e| {
+        e.key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("reaction-") && k.ends_with("-🎉"))
+    }));
     assert!(rt.find("tag-owner").is_some());
 }
 
@@ -525,7 +526,15 @@ fn reply_edit_delete_and_react_become_commands() {
 
     // Editing takes the composer and gives the draft back afterwards.
     rt.state.chat.composer.replace_text("my draft");
-    let old = rt.state.chat.room().unwrap().message_by_key(&mine).unwrap().text.clone();
+    let old = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .message_by_key(&mine)
+        .unwrap()
+        .text
+        .clone();
     hover_press(&mut rt, &format!("edit-{mine}"));
     assert_eq!(rt.state.chat.composer.text, old);
     rt.state.chat.composer.replace_text("fixed text");
@@ -542,7 +551,12 @@ fn reply_edit_delete_and_react_become_commands() {
     hover_press(&mut rt, &format!("delete-{mine}"));
     assert!(sent(&mut rt).is_empty(), "deleting asks first");
     press(&mut rt, "confirm-delete");
-    assert_eq!(sent(&mut rt), [Action::Delete { target: mine.clone() }]);
+    assert_eq!(
+        sent(&mut rt),
+        [Action::Delete {
+            target: mine.clone()
+        }]
+    );
 
     hover_press(&mut rt, &format!("react-{theirs}"));
     press(&mut rt, &format!("pick-{theirs}-0"));
@@ -567,7 +581,15 @@ fn pressing_a_reaction_toggles_it() {
             by: vec![me],
         }];
     });
-    let target = rt.state.chat.room().unwrap().last_message().unwrap().key.clone();
+    let target = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .last_message()
+        .unwrap()
+        .key
+        .clone();
     press(&mut rt, &format!("reaction-{target}-🎉"));
     assert_eq!(
         sent(&mut rt),
@@ -603,7 +625,16 @@ fn a_message_on_its_way_and_one_that_failed_say_so() {
     assert!(shows(&rt, "Not sent. Freenet refused it: too big"));
     assert!(shows(&rt, "Your reaction couldn't be sent."));
     // A message on its way can't be acted on yet.
-    let pending = rt.state.chat.room().unwrap().messages.last().unwrap().key.clone();
+    let pending = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .key
+        .clone();
     assert!(rt.find(&format!("actions-{pending}")).is_none());
     press(&mut rt, "retry-7");
     press(&mut rt, "discard-7");
@@ -628,7 +659,10 @@ fn switching_rooms_ends_a_reply_or_edit() {
     rt.state.chat.start_edit(&mine);
     press(&mut rt, &format!("room-{PRIVATE_ROOM}"));
     assert!(matches!(rt.state.chat.mode, super::Mode::Write));
-    press(&mut rt, &format!("room-{}", super::example::data().rooms[0].key));
+    press(
+        &mut rt,
+        &format!("room-{}", super::example::data().rooms[0].key),
+    );
     assert_eq!(rt.state.chat.composer.text, "draft A");
 }
 
@@ -661,7 +695,14 @@ fn example_rooms_reply_edit_delete_and_react_in_memory() {
     assert_eq!(rt.state.chat.room().unwrap().own_reaction(&theirs), None);
     rt.state.chat.ask_delete(&mine);
     rt.state.chat.confirm_delete();
-    assert!(rt.state.chat.room().unwrap().message_by_key(&mine).is_none());
+    assert!(
+        rt.state
+            .chat
+            .room()
+            .unwrap()
+            .message_by_key(&mine)
+            .is_none()
+    );
     assert!(rt.state.chat.outgoing.is_empty());
 }
 

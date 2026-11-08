@@ -313,7 +313,9 @@ pub(super) fn run(
                 read_first_retry = false;
                 early_read = pace.early_read;
                 rooms.lost(&err.to_string(), report);
-                pause(&mut backoff, pace, stop, &mut || rooms.idle(commands, report));
+                pause(&mut backoff, pace, stop, &mut || {
+                    rooms.idle(commands, report)
+                });
             }
         }
     }
@@ -1041,8 +1043,10 @@ impl Rooms {
             let mut bytes = Vec::new();
             if let Err(e) = ciborium::ser::into_writer(&delta, &mut bytes) {
                 // Not expected for River's own types; the entry fails visibly.
-                self.outbox
-                    .answered(&room.stored.owner_vk, Err(format!("it could not be encoded: {e}")));
+                self.outbox.answered(
+                    &room.stored.owner_vk,
+                    Err(format!("it could not be encoded: {e}")),
+                );
                 changed = true;
                 continue;
             }

@@ -43,7 +43,7 @@ pub enum Mode {
     Reply(String),
     /// The composer holds the text of your message keyed so; sending saves it. `draft` is what
     /// the composer held before, given back afterwards.
-    Edit { key: String, draft: TextEdit },
+    Edit { key: String, draft: Box<TextEdit> },
     /// Asking whether to delete your message keyed so.
     Delete(String),
 }
@@ -332,7 +332,7 @@ impl Chat {
                     }
                     Source::Node(_) => self.emit(key, Action::Edit { target, text }),
                 }
-                self.composer = draft;
+                self.composer = *draft;
                 self.composer.focused = true;
                 return true;
             }
@@ -412,7 +412,7 @@ impl Chat {
         let draft = std::mem::replace(&mut self.composer, editing);
         self.mode = Mode::Edit {
             key: target.to_owned(),
-            draft,
+            draft: Box::new(draft),
         };
     }
 
@@ -447,7 +447,7 @@ impl Chat {
     /// Stop replying, editing or deleting; an edit gives the composer its draft back.
     pub fn cancel(&mut self) {
         if let Mode::Edit { draft, .. } = std::mem::take(&mut self.mode) {
-            self.composer = draft;
+            self.composer = *draft;
         }
         self.picker = None;
     }

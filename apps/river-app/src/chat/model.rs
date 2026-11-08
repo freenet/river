@@ -173,7 +173,8 @@ impl Room {
     pub fn delete(&mut self, target: &str) -> bool {
         let me = self.me;
         let before = self.messages.len();
-        self.messages.retain(|m| !(m.key == target && m.author == me));
+        self.messages
+            .retain(|m| !(m.key == target && m.author == me));
         self.messages.len() != before
     }
 
