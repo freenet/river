@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::util::ecies::{
-    decrypt_secret_from_member_blob_raw, encrypt_secret_for_member, seal_bytes,
+    encrypt_secret_for_member, seal_bytes, try_decrypt_secret_from_member_blob_raw,
 };
 use crate::util::get_current_system_time;
 use crate::{constants::ROOM_CONTRACT_WASM, util::to_cbor_vec};
@@ -509,7 +509,7 @@ pub(crate) fn current_secret_from_state(
         .encrypted_secrets
         .iter()
         .find(|s| s.secret.member_id == member_id && s.secret.secret_version == version)?;
-    let secret = river_core::ecies::try_decrypt_secret_from_member_blob_raw(
+    let secret = try_decrypt_secret_from_member_blob_raw(
         &blob.secret.ciphertext,
         &blob.secret.nonce,
         &blob.secret.sender_ephemeral_public_key,
@@ -969,7 +969,7 @@ impl RoomData {
                 .collect();
 
             for (version, ciphertext, nonce, ephemeral_key_bytes) in pending {
-                match river_core::ecies::try_decrypt_secret_from_member_blob_raw(
+                match try_decrypt_secret_from_member_blob_raw(
                     &ciphertext,
                     &nonce,
                     &ephemeral_key_bytes,
@@ -7765,7 +7765,7 @@ mod tests {
             .iter()
             .find(|s| s.secret.member_id == member_id && s.secret.secret_version == 0)
             .expect("member's v0 back-fill blob must be present");
-        let recovered = decrypt_secret_from_member_blob_raw(
+        let recovered = river_core::ecies::decrypt_secret_from_member_blob_raw(
             &member_v0_blob.secret.ciphertext,
             &member_v0_blob.secret.nonce,
             &member_v0_blob.secret.sender_ephemeral_public_key,
