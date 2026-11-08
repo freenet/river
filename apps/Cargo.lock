@@ -3375,6 +3375,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet-scaffold",
  "freenet-stdlib",
+ "rand 0.8.8",
  "river-core",
  "rune",
  "rune-kit",

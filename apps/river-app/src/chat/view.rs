@@ -4,14 +4,15 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, Pixels, ScrollSpec, col, el, icon, row, spacer, text};
-use rune_kit::Kit;
+use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, TextInput};
 
 use super::conversation::{avatar, conversation};
 use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
-use super::{Chat, LinkStatus, Source};
+use super::{Chat, DialogKind, InviteState, LinkStatus, Source};
 use crate::RiverApp;
+use crate::rooms::work::{WorkState, WorkView};
 
 /// Below this window width the members panel gives way to the conversation, as the web UI
 /// shows it beside the conversation only from 1024 pixels.
@@ -45,13 +46,15 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
                 s.chat.members_overlay = false;
             }
         })
-        .child(rooms(chat, logo, narrow, &p));
+        .child(rooms(chat, logo, narrow, &p, &k));
+    let mut layer = Vec::new();
+    dialogs(chat, &k, &mut layer);
     let Some(room) = chat.room() else {
-        return screen.child(no_rooms(chat, &p));
+        return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     if chat.members_shown(narrow) {
-        let panel = members(room, narrow, &p);
+        let panel = members(chat, room, narrow, &p, &k);
         if narrow {
             // Dim everything under the panel, the room list too: while it is open the panel
             // is modal, and a press anywhere outside it only closes it.
@@ -72,7 +75,129 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
             panel
         });
     }
-    screen
+    rune_kit::root(screen, layer)
+}
+
+type Get = fn(&mut RiverApp) -> &mut rune::TextEdit;
+
+/// The create and join dialogs, asking what the web UI's `CreateRoomModal` and
+/// `JoinWithCodeModal` ask: a name, a nickname and whether the room is private; or an invite
+/// code (or link) and a nickname.
+fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
+    let Some(kind) = chat.form.open else {
+        return;
+    };
+    let (key, title, description, submit_label, submit): (_, _, _, _, fn(&mut RiverApp)) =
+        match kind {
+            DialogKind::Create => (
+                "create-room",
+                "Create a room",
+                "You own the room you create. People join it with an invitation from a member.",
+                "Create room",
+                |s| s.chat.submit_create(),
+            ),
+            DialogKind::Join => (
+                "join-room",
+                "Join a room",
+                "Paste the invite code or link someone sent you.",
+                "Join room",
+                |s| s.chat.submit_join(),
+            ),
+        };
+    let field = |key: &str, label: &str, placeholder: &str, edit: &rune::TextEdit, get: Get| {
+        TextInput::new(edit)
+            .label(label.to_owned())
+            .placeholder(placeholder.to_owned())
+            .width(None)
+            .on_edit(get)
+            .on_submit(move |s: &mut RiverApp, _| submit(s))
+            .build(k)
+            .key(key.to_owned())
+            .w_full()
+    };
+    let mut body = col().key("form").w_full().px(16.0).pb(16.0).gap(12.0);
+    match kind {
+        DialogKind::Create => {
+            body = body
+                .child(field(
+                    "room-name",
+                    "Room name",
+                    "Room name",
+                    &chat.form.name,
+                    |s| &mut s.chat.form.name,
+                ))
+                .child(field(
+                    "room-nickname",
+                    "Your nickname",
+                    "Your nickname in this room",
+                    &chat.form.nickname,
+                    |s| &mut s.chat.form.nickname,
+                ))
+                .child(
+                    Checkbox::new(chat.form.private)
+                        .label("Private room")
+                        .description("Messages and names are encrypted for members only.")
+                        .on_toggle(|s: &mut RiverApp| s.chat.form.private = !s.chat.form.private)
+                        .build(k)
+                        .key("room-private"),
+                );
+        }
+        DialogKind::Join => {
+            body = body
+                .child(field(
+                    "invite-code",
+                    "Invite code",
+                    "Invite code or link",
+                    &chat.form.code,
+                    |s| &mut s.chat.form.code,
+                ))
+                .child(field(
+                    "join-nickname",
+                    "Your nickname",
+                    "Your nickname in this room",
+                    &chat.form.nickname,
+                    |s| &mut s.chat.form.nickname,
+                ));
+        }
+    }
+    if let Some(error) = &chat.form.error {
+        body = body.child(
+            text(error.clone())
+                .font(k.ty.ui)
+                .color(st::palette().danger)
+                .wrap()
+                .w_full()
+                .key("form-error"),
+        );
+    }
+    body = body.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .justify_end()
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.close_dialog())
+                    .build(k)
+                    .key("form-cancel"),
+            )
+            .child(
+                Button::new(submit_label)
+                    .variant(ButtonVariant::Contrast)
+                    .on_press(move |s: &mut RiverApp| submit(s))
+                    .build(k)
+                    .key("form-submit"),
+            ),
+    );
+    Dialog::new(key, title)
+        .description(description)
+        .width(440.0)
+        .fit()
+        .open(true)
+        .on_close(|s: &mut RiverApp| s.chat.close_dialog())
+        .child(body)
+        .build(k, layer);
 }
 
 pub(super) fn vline(p: &Palette) -> El {
@@ -123,7 +248,7 @@ fn outlined(key: &str, name: &str, glyph: &'static rune::Icon, h: f32, p: &Palet
 
 // The room list -------------------------------------------------------------------------------
 
-fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette) -> El {
+fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit) -> El {
     let mark = match logo {
         Some(px) => el().key("logo").size(30.0, 30.0).pixels(px),
         None => el().key("logo").size(30.0, 30.0),
@@ -144,32 +269,40 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette) -> El {
         .center_y()
         .child(label("Rooms", st::SECTION, p.text_muted))
         .child(spacer())
-        .child(not_yet(icon_button(
-            "create-room",
-            "Create room",
-            &icons::PLUS,
-            p,
-        )));
+        .child(if chat.can_change_rooms() {
+            icon_button("create-room", "Create room", &icons::PLUS, p)
+                .help("Create room")
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(|s: &mut RiverApp| s.chat.open_dialog(DialogKind::Create))
+        } else {
+            not_yet(icon_button("create-room", "Create room", &icons::PLUS, p))
+        });
     let width = if narrow { ROOMS_NARROW_W } else { ROOMS_W };
     let mut list = col().key("room-list").gap(2.0).px(10.0).pb(10.0);
     for room in chat.rooms() {
         let selected = chat.room().is_some_and(|r| r.key == room.key);
         list = list.child(room_row(room, selected, width, p));
     }
-    let footer = col()
+    let enter = outlined("enter-invite", "Enter invite code", &icons::INVITE, 34.0, p);
+    let mut footer = col()
         .key("rooms-footer")
         .px(12.0)
         .pt(12.0)
         .pb(14.0)
         .gap(12.0)
-        .child(not_yet(outlined(
-            "enter-invite",
-            "Enter invite code",
-            &icons::INVITE,
-            34.0,
-            p,
-        )))
-        .child(source_status(chat, p));
+        .child(if chat.can_change_rooms() {
+            enter
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(|s: &mut RiverApp| s.chat.open_dialog(DialogKind::Join))
+        } else {
+            not_yet(enter)
+        });
+    for w in &chat.work {
+        footer = footer.child(work_row(w, p, k));
+    }
+    let footer = footer.child(source_status(chat, p));
     let column = col()
         .key("rooms")
         .w(width)
@@ -191,6 +324,78 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette) -> El {
         .h_full()
         .child(column)
         .child(vline(p))
+}
+
+/// A room being created or joined: working, or failed with why, Try again and Dismiss.
+fn work_row(w: &WorkView, p: &Palette, k: &Kit) -> El {
+    let id = w.id;
+    let mut r = col()
+        .key(format!("work-{id}"))
+        .w_full()
+        .px(4.0)
+        .gap(4.0)
+        .child(
+            label(w.what.clone(), st::SMALL, p.text_secondary)
+                .wrap()
+                .w_full(),
+        );
+    match &w.state {
+        WorkState::Working => {
+            r = r.child(label("Working on it…", st::SMALL, p.text_muted).key("work-status"));
+        }
+        // Stored; it shows here once the stored rooms are read again. Should that not happen
+        // (a read that keeps failing), the row can still be put away.
+        WorkState::Done { .. } => {
+            r = r
+                .child(
+                    label(
+                        "Saved. It will show in your rooms in a moment.",
+                        st::SMALL,
+                        p.text_muted,
+                    )
+                    .wrap()
+                    .w_full()
+                    .key("work-status"),
+                )
+                .child(
+                    Button::new("Dismiss")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(move |s: &mut RiverApp| s.chat.dismiss_work(id))
+                        .build(k)
+                        .key(format!("work-dismiss-{id}")),
+                );
+        }
+        WorkState::Failed { why, retry } => {
+            r = r.child(
+                text(why.clone())
+                    .font(st::SMALL)
+                    .color(st::palette().danger)
+                    .wrap()
+                    .w_full()
+                    .key("work-why"),
+            );
+            let mut choices = row().gap(8.0);
+            if *retry {
+                choices = choices.child(
+                    Button::new("Try again")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(move |s: &mut RiverApp| s.chat.retry_work(id))
+                        .build(k)
+                        .key(format!("work-retry-{id}")),
+                );
+            }
+            r = r.child(
+                choices.child(
+                    Button::new("Dismiss")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(move |s: &mut RiverApp| s.chat.dismiss_work(id))
+                        .build(k)
+                        .key(format!("work-dismiss-{id}")),
+                ),
+            );
+        }
+    }
+    r
 }
 
 /// Where the rooms come from, at the foot of the room list, and for rooms from the node the
@@ -339,9 +544,9 @@ pub(super) fn no_rooms_hint(chat: &Chat) -> &'static str {
              you have, this app is probably older than River on the web: update it to see your \
              rooms here."
         }
-        // This app can't create or join rooms yet; the web UI can.
         Source::Node(_) => {
-            "Rooms you create or join in River in your browser, on this computer, show up here."
+            "Create a room, or enter an invite code to join one. Rooms you create or join in \
+             River in your browser, on this computer, show up here too."
         }
     }
 }
@@ -365,7 +570,7 @@ fn no_rooms(chat: &Chat, p: &Palette) -> El {
 
 // Members -------------------------------------------------------------------------------------
 
-fn members(room: &Room, overlay: bool, p: &Palette) -> El {
+fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El {
     // A stand-in for the web UI's order, which is you first and then the invite tree from the
     // owner down. These view models carry no invite tree yet, so after you come the owner and
     // then everyone else by name.
@@ -407,16 +612,64 @@ fn members(room: &Room, overlay: bool, p: &Palette) -> El {
             .on_press(|s: &mut RiverApp| s.chat.toggle_members(true)),
         );
     }
-    let footer = col()
-        .key("members-footer")
-        .padding(12.0)
-        .child(not_yet(outlined(
-            "invite",
-            "Invite someone",
-            &icons::INVITE,
-            38.0,
-            p,
-        )));
+    let invite = outlined("invite", "Invite someone", &icons::INVITE, 38.0, p);
+    let mut footer = col().key("members-footer").padding(12.0).gap(8.0);
+    footer = footer.child(if chat.can_change_rooms() {
+        invite
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.invite())
+    } else {
+        not_yet(invite)
+    });
+    match chat.open_invite() {
+        None => {}
+        Some(InviteState::Making) => {
+            footer = footer.child(
+                label("Making an invitation…", st::SMALL, p.text_muted).key("invite-status"),
+            );
+        }
+        Some(InviteState::Copied(link)) => {
+            let link = link.clone();
+            footer = footer
+                .child(
+                    label(
+                        "Invite link copied. Send it only to the person you're inviting: anyone \
+                         who has it can join as them.",
+                        st::SMALL,
+                        p.text_secondary,
+                    )
+                    .wrap()
+                    .w_full()
+                    .key("invite-status"),
+                )
+                .child(
+                    label(link.clone(), st::SMALL, p.text_muted)
+                        .truncate()
+                        .w_full()
+                        .key("invite-link"),
+                )
+                .child(
+                    Button::new("Copy again")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press_tx(move |_: &mut RiverApp, tx: &mut rune::Tx| {
+                            tx.copy(link.clone())
+                        })
+                        .build(k)
+                        .key("invite-copy"),
+                );
+        }
+        Some(InviteState::Failed(why)) => {
+            footer = footer.child(
+                text(why.clone())
+                    .font(st::SMALL)
+                    .color(st::palette().danger)
+                    .wrap()
+                    .w_full()
+                    .key("invite-status"),
+            );
+        }
+    }
     row().key("members-panel").h_full().child(vline(p)).child(
         col()
             .key("members")

@@ -5,7 +5,9 @@
 //! sending, replying, editing, deleting and reacting work in memory, or the user's real rooms
 //! read from the node ([`Source::Node`], see `crate::rooms`), where each of those becomes a
 //! [`Command`] for the background work, which sends it and shows it on its way. Selecting a
-//! room and showing or hiding the members panel work either way.
+//! room and showing or hiding the members panel work either way. Creating a room, joining one
+//! from an invite code and inviting someone are only for rooms from the node: each is a
+//! [`Command`] too, and what became of it comes back as [`WorkView`]s and an invitation's link.
 
 mod conversation;
 pub mod example;
@@ -16,10 +18,11 @@ pub(crate) mod style;
 mod tests;
 mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rune::TextEdit;
 
+use crate::rooms::work::{WorkState, WorkView};
 use crate::rooms::{Action, Command};
 
 pub use model::{Member, Message, Reaction, ReplyTo, Role, Room};
@@ -50,6 +53,57 @@ pub enum Mode {
 
 /// Where commands for the node go.
 pub type Sink = Box<dyn Fn(Command)>;
+
+/// A dialog over the chat screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogKind {
+    Create,
+    Join,
+}
+
+/// What the create and join dialogs hold.
+pub struct Form {
+    pub open: Option<DialogKind>,
+    pub name: TextEdit,
+    pub nickname: TextEdit,
+    pub code: TextEdit,
+    pub private: bool,
+    /// Why what was entered can't be used, said in the dialog.
+    pub error: Option<String>,
+}
+
+impl Default for Form {
+    fn default() -> Self {
+        Form {
+            open: None,
+            name: TextEdit::new(""),
+            nickname: TextEdit::new(""),
+            code: TextEdit::new(""),
+            private: false,
+            error: None,
+        }
+    }
+}
+
+/// Where the invitation asked for in a room stands. Its `Debug` hides the link, which is a
+/// credential.
+#[derive(Clone, PartialEq, Eq)]
+pub enum InviteState {
+    Making,
+    /// Made, and its link copied.
+    Copied(String),
+    Failed(String),
+}
+
+impl std::fmt::Debug for InviteState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InviteState::Making => f.write_str("Making"),
+            InviteState::Copied(_) => f.write_str("Copied(<hidden>)"),
+            InviteState::Failed(why) => f.debug_tuple("Failed").field(why).finish(),
+        }
+    }
+}
 
 /// The connection to the node behind [`Source::Node`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +193,16 @@ pub struct Chat {
     /// Commands for the node, when there is no sink (tests); with one they go straight to it.
     pub outgoing: Vec<Command>,
     sink: Option<Sink>,
+    /// The create or join dialog.
+    pub form: Form,
+    /// Rooms being created or joined, and those that failed.
+    pub work: Vec<WorkView>,
+    /// Finished creates and joins already handled, so each opens its room once.
+    opened: HashSet<u64>,
+    /// A room just created or joined, to open as soon as it is in the list.
+    open_when_shown: Option<String>,
+    /// The invitation asked for, by the room it was asked for in.
+    pub invite: Option<(String, InviteState)>,
 }
 
 impl Chat {
@@ -163,6 +227,11 @@ impl Chat {
             picker: None,
             outgoing: Vec::new(),
             sink: None,
+            form: Form::default(),
+            work: Vec::new(),
+            opened: HashSet::new(),
+            open_when_shown: None,
+            invite: None,
         };
         chat.set_rooms(rooms);
         chat
@@ -247,6 +316,13 @@ impl Chat {
             if let Some(open) = open {
                 self.select(open);
             }
+        }
+        // A room just created or joined opens once it is here.
+        if let Some(key) = self.open_when_shown.clone()
+            && self.rooms.iter().any(|r| r.key == key)
+        {
+            self.open_when_shown = None;
+            self.select(&key);
         }
         // The open room is being read.
         if let Some(room) = self.room()
@@ -503,6 +579,133 @@ impl Chat {
         }
     }
 
+    /// Whether rooms can be created, joined and invited to: only rooms from the node.
+    pub fn can_change_rooms(&self) -> bool {
+        matches!(self.source, Source::Node(_))
+    }
+
+    /// Open the create or join dialog, empty.
+    pub fn open_dialog(&mut self, kind: DialogKind) {
+        if !self.can_change_rooms() {
+            return;
+        }
+        self.form = Form {
+            open: Some(kind),
+            ..Form::default()
+        };
+        match kind {
+            DialogKind::Create => self.form.name.focused = true,
+            DialogKind::Join => self.form.code.focused = true,
+        }
+    }
+
+    pub fn close_dialog(&mut self) {
+        self.form = Form::default();
+    }
+
+    /// Create the room the dialog describes. What can't be used is said in the dialog, which
+    /// stays open; otherwise it closes and the room's progress shows in the room list.
+    pub fn submit_create(&mut self) {
+        let name = self.form.name.text.trim().to_owned();
+        let nickname = self.form.nickname.text.trim().to_owned();
+        if let Some(why) = crate::rooms::create::create_refusal(&name, &nickname) {
+            self.form.error = Some(why);
+            return;
+        }
+        let private = self.form.private;
+        self.close_dialog();
+        self.emit(
+            String::new(),
+            Action::CreateRoom {
+                name,
+                nickname,
+                private,
+            },
+        );
+    }
+
+    /// Join the room the pasted invite code or link invites to.
+    pub fn submit_join(&mut self) {
+        let code = river_core::invitation::invitation_text_from_paste(&self.form.code.text);
+        let nickname = self.form.nickname.text.trim().to_owned();
+        let refusal = if code.is_empty() {
+            Some("Paste an invite code.".to_owned())
+        } else if let Err(e) = river_core::invitation::Invitation::from_encoded_string(&code) {
+            Some(format!("That doesn't look like a valid invite code: {e}"))
+        } else {
+            crate::rooms::create::join_refusal(&nickname)
+        };
+        if let Some(why) = refusal {
+            self.form.error = Some(why);
+            return;
+        }
+        self.close_dialog();
+        self.emit(
+            String::new(),
+            Action::Join {
+                code: crate::rooms::InviteCode(code),
+                nickname,
+            },
+        );
+    }
+
+    /// Take where creates and joins stand. One that finished opens its room once the room is
+    /// in the list.
+    pub fn show_work(&mut self, work: Vec<WorkView>) {
+        for w in &work {
+            if let WorkState::Done { room } = &w.state
+                && self.opened.insert(w.id)
+            {
+                if self.rooms.iter().any(|r| &r.key == room) {
+                    self.select(room);
+                } else {
+                    self.open_when_shown = Some(room.clone());
+                }
+            }
+        }
+        self.work = work;
+    }
+
+    pub fn retry_work(&mut self, id: u64) {
+        self.emit(String::new(), Action::RetryWork { id });
+    }
+
+    pub fn dismiss_work(&mut self, id: u64) {
+        self.work.retain(|w| w.id != id);
+        self.emit(String::new(), Action::DismissWork { id });
+    }
+
+    /// Make an invitation to the open room; its link is copied when it comes back.
+    pub fn invite(&mut self) {
+        if !self.can_change_rooms() {
+            return;
+        }
+        let Some(key) = self.room().map(|r| r.key.clone()) else {
+            return;
+        };
+        self.invite = Some((key.clone(), InviteState::Making));
+        self.emit(key, Action::Invite);
+    }
+
+    /// The invitation for the room keyed `room` came back. True when its link is to be copied.
+    pub fn invitation_made(&mut self, room: String, link: Result<String, String>) -> bool {
+        let copied = link.is_ok();
+        self.invite = Some((
+            room,
+            match link {
+                Ok(l) => InviteState::Copied(l),
+                Err(why) => InviteState::Failed(why),
+            },
+        ));
+        copied
+    }
+
+    /// The invitation for the open room, if one was asked for there.
+    pub fn open_invite(&self) -> Option<&InviteState> {
+        let (room, state) = self.invite.as_ref()?;
+        (self.room().map(|r| &r.key) == Some(room)).then_some(state)
+    }
+
     /// Show or hide the members panel, in the layout the window is in now.
     pub fn toggle_members(&mut self, narrow: bool) {
         let open = if narrow {
@@ -679,5 +882,84 @@ mod state_tests {
         chat.composer.replace_text("   \n ");
         assert!(!chat.send());
         assert_eq!(chat.room().unwrap().messages.len(), before);
+    }
+
+    fn done(id: u64, room: &str) -> Vec<WorkView> {
+        vec![WorkView {
+            id,
+            what: String::new(),
+            state: WorkState::Done { room: room.into() },
+        }]
+    }
+
+    #[test]
+    fn a_room_just_created_or_joined_opens_once_it_is_in_the_list_and_only_once() {
+        let target = example::PRIVATE_ROOM;
+        let without: Vec<Room> = example::data()
+            .rooms
+            .into_iter()
+            .filter(|r| r.key != target)
+            .collect();
+        let mut chat = Chat::new(Source::Node(LinkStatus::Live), Vec::new(), 0, 0, 0);
+        chat.show_node_rooms(without.clone(), None, LinkStatus::Live, 0);
+        let first = chat.room().unwrap().key.clone();
+        // Finished before the list has it: opens when it arrives.
+        chat.show_work(done(1, target));
+        assert_eq!(chat.room().unwrap().key, first);
+        chat.show_node_rooms(example::data().rooms, None, LinkStatus::Live, 0);
+        assert_eq!(chat.room().unwrap().key, target);
+        // The same report again does not take the user back to it.
+        chat.select(&first);
+        chat.show_work(done(1, target));
+        chat.show_node_rooms(example::data().rooms, None, LinkStatus::Live, 0);
+        assert_eq!(chat.room().unwrap().key, first);
+        // Finished with the room already listed: opens at once.
+        chat.show_work(done(2, target));
+        assert_eq!(chat.room().unwrap().key, target);
+    }
+
+    /// An invite code is a credential: a command carrying one never prints it.
+    #[test]
+    fn a_join_command_does_not_print_its_invite_code() {
+        let command = Command {
+            room: String::new(),
+            action: Action::Join {
+                code: crate::rooms::InviteCode("SECRETCODE".into()),
+                nickname: "Bea".into(),
+            },
+        };
+        let shown = format!("{command:?}");
+        assert!(!shown.contains("SECRETCODE"), "{shown}");
+    }
+
+    #[test]
+    fn example_rooms_cannot_be_created_joined_or_invited_to() {
+        let mut chat = Chat::example();
+        chat.open_dialog(DialogKind::Create);
+        assert!(chat.form.open.is_none());
+        chat.invite();
+        assert!(chat.outgoing.is_empty() && chat.invite.is_none());
+    }
+
+    #[test]
+    fn an_invitation_shows_only_in_the_room_it_was_made_for() {
+        let mut chat = Chat::new(
+            Source::Node(LinkStatus::Live),
+            example::data().rooms,
+            0,
+            0,
+            0,
+        );
+        let open = chat.room().unwrap().key.clone();
+        chat.invite();
+        assert_eq!(chat.open_invite(), Some(&InviteState::Making));
+        assert!(chat.invitation_made(open.clone(), Ok("link".into())));
+        assert_eq!(
+            chat.open_invite(),
+            Some(&InviteState::Copied("link".into()))
+        );
+        chat.select(example::PRIVATE_ROOM);
+        assert_eq!(chat.open_invite(), None);
+        assert!(!chat.invitation_made(open, Err("no".into())));
     }
 }

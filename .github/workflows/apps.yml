@@ -4,9 +4,10 @@ name: Native apps
 # lockfile and toolchain pin, so build.yml never compiles them. This workflow
 # does: format, clippy, unit tests, and a headless render of every screen
 # (setup, rooms and chat). river-app depends on river-core (common/) and
-# compiles in two files from ui/ (the logo and the chat delegate WASM, whose
-# hash is the delegate key it reads rooms from), so those are in both path
-# lists too.
+# compiles in three files from ui/ (the logo, the chat delegate WASM, whose
+# hash is the delegate key it reads rooms from, and the room contract WASM,
+# whose hash is part of the contract key of every room it creates or joins), so
+# those are in both path lists too.
 #
 # GitHub-hosted ubuntu-latest, which is free on this public repo (see the
 # runs-on comment in build.yml for why larger runners are not used).
@@ -22,6 +23,7 @@ on:
       - 'Cargo.lock'
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
+      - 'ui/public/contracts/room_contract.wasm'
       - '.github/workflows/apps.yml'
   push:
     branches: [main]
@@ -34,6 +36,7 @@ on:
       - 'Cargo.lock'
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
+      - 'ui/public/contracts/room_contract.wasm'
       - '.github/workflows/apps.yml'
   workflow_dispatch:
 

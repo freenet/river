@@ -10500,4 +10500,232 @@ mod stored_rooms_drift {
         assert_eq!(read.self_verifying_key(), Some(me));
         assert_eq!(read.self_verifying_key(), room.self_verifying_key());
     }
+
+    // The native app's writes ------------------------------------------------------------------
+    //
+    // The native app adds rooms to the store with `river_core::stored_rooms::NewRoom` and
+    // points `rooms_meta` at them with `meta_with_current_room`. A slot this web UI could not
+    // decode would make the room vanish, and a meta edit that dropped a field would lose
+    // another tab's settings, so these encode with the native writer and decode with this one.
+
+    use river_core::stored_rooms::{
+        encode_new_room, meta_with_current_room, reconcile_new_room, NewRoom, NewRoomWrite,
+    };
+
+    /// `room` as the native writer stores it: every field `NewRoom` names. `room` must hold
+    /// the defaults in the fields it leaves out.
+    fn as_new_room(room: &RoomData) -> NewRoom {
+        NewRoom {
+            owner_vk: room.owner_vk,
+            room_state: room.room_state.clone(),
+            self_sk: room.self_sk.clone(),
+            self_vk: room.self_vk,
+            contract_key: room.contract_key,
+            last_read_message_id: room.last_read_message_id.clone(),
+            self_authorized_member: room.self_authorized_member.clone(),
+            invite_chain: room.invite_chain.clone(),
+            self_member_info: room.self_member_info.clone(),
+            self_nickname: room.self_nickname.clone(),
+            invitation_secrets: room.invitation_secrets.clone(),
+        }
+    }
+
+    /// A slot the native writer stores decodes here into exactly the room it describes, and
+    /// encodes again as the same bytes this web UI writes for that room: what the web UI
+    /// saves back after loading it is what it would have written itself.
+    #[test]
+    fn a_room_the_native_app_adds_decodes_here_unchanged() {
+        let mut room = full_room();
+        room.previous_contract_key = None;
+        let native = encode_new_room(&as_new_room(&room)).unwrap();
+        let RoomSlot::Present(read) =
+            ciborium::de::from_reader::<RoomSlot, _>(&native[..]).expect("the web UI reads it")
+        else {
+            panic!("expected Present");
+        };
+        assert!(
+            *read == room,
+            "the web UI reads the room the native app wrote"
+        );
+        let mut ours = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(read), &mut ours).unwrap();
+        let mut expected = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room.clone())), &mut expected)
+            .unwrap();
+        assert_eq!(ours, expected);
+
+        // A tab holding the same room saves over it with its usual merge, keeping it.
+        let merged = crate::components::app::chat_delegate::reconcile_room_present(
+            Some(&native),
+            &room.owner_vk,
+            &room,
+            false,
+        )
+        .expect("the web UI's save merges it")
+        .expect("and stores");
+        let RoomSlot::Present(after) =
+            ciborium::de::from_reader::<RoomSlot, _>(&merged[..]).unwrap()
+        else {
+            panic!("expected Present");
+        };
+        assert_eq!(after.self_verifying_key(), room.self_verifying_key());
+        assert_eq!(after.room_state, room.room_state);
+    }
+
+    /// What the native writer does with each slot this web UI writes: stores over a tombstone
+    /// only for a rejoin, and never replaces a present room.
+    #[test]
+    fn the_native_writer_only_adds_to_what_the_web_ui_stored() {
+        let room = full_room();
+        let new = as_new_room(&room);
+        let tomb = cbor(&RoomSlot::Tombstone);
+        assert!(matches!(
+            reconcile_new_room(Some(&tomb), &new, true),
+            NewRoomWrite::Store(_)
+        ));
+        assert!(matches!(
+            reconcile_new_room(Some(&tomb), &new, false),
+            NewRoomWrite::Refuse(_)
+        ));
+        // The web UI's own copy of this room, under this identity: left alone.
+        let present = cbor(&RoomSlot::Present(Box::new(room.clone())));
+        assert_eq!(
+            reconcile_new_room(Some(&present), &new, true),
+            NewRoomWrite::AlreadyStored
+        );
+        // Under another identity: refused.
+        let mut other = room.clone();
+        other.self_sk = Some(SigningKey::from_bytes(&[77u8; 32]));
+        other.self_vk = None;
+        let other = cbor(&RoomSlot::Present(Box::new(other)));
+        assert!(matches!(
+            reconcile_new_room(Some(&other), &new, true),
+            NewRoomWrite::Refuse(_)
+        ));
+    }
+
+    /// Setting the open room keeps every other field of this web UI's `RoomsMeta`.
+    #[test]
+    fn the_native_meta_edit_keeps_every_other_field() {
+        let a = SigningKey::from_bytes(&[51u8; 32]).verifying_key();
+        let b = SigningKey::from_bytes(&[52u8; 32]).verifying_key();
+        let c = SigningKey::from_bytes(&[53u8; 32]).verifying_key();
+        let meta = RoomsMeta {
+            current_room_key: Some(a),
+            notification_modes: HashMap::from([(a, NotificationMode::Muted)]),
+            room_order: vec![b, a],
+            identity_sources: vec![(a, [9u8; 32])],
+        };
+        let out = meta_with_current_room(Some(&cbor(&meta)), &c)
+            .unwrap()
+            .expect("a change");
+        let read: RoomsMeta = ciborium::de::from_reader(&out[..]).expect("the web UI reads it");
+        let mut expected = meta.clone();
+        expected.current_room_key = Some(c);
+        assert!(read == expected);
+        // Into an empty store: a meta this web UI reads with only the open room set.
+        let fresh: RoomsMeta =
+            ciborium::de::from_reader(&meta_with_current_room(None, &c).unwrap().unwrap()[..])
+                .unwrap();
+        assert!(
+            fresh
+                == RoomsMeta {
+                    current_room_key: Some(c),
+                    ..Default::default()
+                }
+        );
+    }
+
+    /// A room as the native app's `create::new_room` makes one: the owner's own key as the
+    /// identity, its public half beside it, and nothing an invitee would hold.
+    #[test]
+    fn a_room_the_native_app_creates_decodes_here_unchanged() {
+        let owner_sk = SigningKey::from_bytes(&[71u8; 32]);
+        let mut room = test_minimal_room_data(owner_sk.verifying_key());
+        room.room_state = test_generation_copy(&owner_sk, 1, 10, &[], 0);
+        room.self_sk = Some(owner_sk.clone());
+        room.self_vk = Some(owner_sk.verifying_key());
+        let native = encode_new_room(&as_new_room(&room)).unwrap();
+        let RoomSlot::Present(read) =
+            ciborium::de::from_reader::<RoomSlot, _>(&native[..]).expect("the web UI reads it")
+        else {
+            panic!("expected Present");
+        };
+        assert!(*read == room);
+        assert!(read.self_authorized_member.is_none() && read.self_nickname.is_none());
+        let mut ours = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(read), &mut ours).unwrap();
+        let mut expected = Vec::new();
+        ciborium::ser::into_writer(&RoomSlot::Present(Box::new(room)), &mut expected).unwrap();
+        assert_eq!(ours, expected);
+    }
+
+    /// What the native app takes as the code in pasted text is what this web UI's join dialog
+    /// takes (`invitation_text_from_scan`).
+    #[test]
+    fn a_pasted_invitation_is_read_as_this_web_ui_reads_it() {
+        for pasted in [
+            "abc",
+            "  abc \n",
+            "http://127.0.0.1:7509/v1/contract/web/x/?invitation=abc",
+            "http://h/?a=1&invitation=a%42c#frag",
+            "http://h/?invitation=",
+            "http://h/?x=1",
+            "http://h/#?invitation=abc",
+            "?invitation=%zz",
+            "http://h/?invitation=abc%",
+            "http://h/?invitation=abc%4",
+            "http://h/?invitation=%C3%A9t%C3%A9",
+            "http://h/?invitation=%E2%82",
+            "",
+        ] {
+            assert_eq!(
+                river_core::invitation::invitation_text_from_paste(pasted),
+                crate::invite_qr::invitation_text_from_scan(pasted),
+                "{pasted:?}"
+            );
+        }
+    }
+
+    /// The native app's invite codes are this web UI's, both ways, byte for byte.
+    #[test]
+    fn invitations_are_the_same_bytes_both_ways() {
+        use crate::components::members::Invitation;
+        let owner = SigningKey::from_bytes(&[61u8; 32]);
+        let invitee = SigningKey::from_bytes(&[62u8; 32]);
+        let invitee_member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner.verifying_key().into(),
+                invited_by: owner.verifying_key().into(),
+                member_vk: invitee.verifying_key(),
+            },
+            &owner,
+        );
+        let ours = Invitation {
+            room: owner.verifying_key(),
+            invitee_signing_key: invitee.clone(),
+            invitee: invitee_member.clone(),
+            room_secrets: vec![(0, [1u8; 32]), (2, [3u8; 32])],
+        };
+        let native = river_core::invitation::Invitation {
+            room: owner.verifying_key(),
+            invitee_signing_key: invitee,
+            invitee: invitee_member,
+            room_secrets: vec![(0, [1u8; 32]), (2, [3u8; 32])],
+        };
+        let code = ours.to_encoded_string();
+        assert_eq!(native.to_encoded_string().unwrap(), code);
+        // A public room's invitation, with no secrets, too.
+        let (mut ours_public, mut native_public) = (ours.clone(), native.clone());
+        ours_public.room_secrets.clear();
+        native_public.room_secrets.clear();
+        assert_eq!(
+            native_public.to_encoded_string().unwrap(),
+            ours_public.to_encoded_string()
+        );
+        assert!(river_core::invitation::Invitation::from_encoded_string(&code).unwrap() == native);
+        assert!(
+            Invitation::from_encoded_string(&native.to_encoded_string().unwrap()).unwrap() == ours
+        );
+    }
 }
