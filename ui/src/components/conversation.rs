@@ -4414,7 +4414,7 @@ fn MessageGroupComponent(
                                                                     class: "reply-strip-unavailable min-w-0 w-full max-w-[76ch] text-[13px] leading-[18px] mb-[3px] italic text-text-quote",
                                                                     // The arrow is decorative; the sentence
                                                                     // after it is what a screen reader needs.
-                                                                    span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5 not-italic", {line_icon(REPLY_ICON_PATH, 13)} }
+                                                                    span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5 not-italic", {line_icon(REPLY_TARGET_ICON_PATH, 13)} }
                                                                     "Original message unavailable"
                                                                 }
                                                             },
@@ -4435,7 +4435,7 @@ fn MessageGroupComponent(
                                                                         // writes no signal, so needs no `defer`.
                                                                         onclick: move |_| reply_highlight::jump_to_reply_target(&target_row),
                                                                         span { class: "reply-strip-text",
-                                                                            span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5", {line_icon(REPLY_ICON_PATH, 13)} }
+                                                                            span { "aria-hidden": "true", class: "inline-block align-[-2px] mr-1.5", {line_icon(REPLY_TARGET_ICON_PATH, 13)} }
                                                                             span { class: "font-bold text-text-secondary mr-1", "{author}" }
                                                                             " "
                                                                             span { "{preview}" }
