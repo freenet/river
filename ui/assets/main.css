@@ -424,7 +424,7 @@
 }
 
 /* The two mobile surfaces (`mobile_message_actions.rs`,
- * `mobile_reaction_input.rs`): a native modal <dialog> each, in the top layer
+ * `mobile_reaction_popup.rs`): a native modal <dialog> each, in the top layer
  * over the header, history, composer and Latest. The dialog itself spans the
  * viewport, transparent, so a tap outside the panel lands on the backdrop
  * inside it, which dismisses; `::backdrop` dims. Its panel sits at the bottom
@@ -556,88 +556,30 @@
     outline-offset: 1px;
 }
 
-.mobile-reaction-label {
-    display: block;
-    margin-bottom: 4px;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--color-text-secondary);
-}
-
-/* 16px, so iOS does not zoom the page when it takes focus. */
-.mobile-reaction-input {
-    width: 100%;
-    min-height: 44px;
-    padding: 8px 12px;
-    border: 1px solid var(--color-border);
-    border-radius: 10px;
-    background: var(--color-bg);
-    color: var(--color-text);
-    font-size: 16px;
-}
-
-.mobile-reaction-input[aria-invalid="true"] {
-    border-color: var(--color-danger);
-}
-
-.mobile-reaction-hint {
-    margin-top: 4px;
-    font-size: 13px;
-    color: var(--color-text-muted);
-}
-
-.mobile-reaction-error {
-    margin-top: 4px;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--color-danger-text);
-}
-
-.mobile-reaction-buttons {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 10px;
-}
-
-.mobile-sheet-primary,
-.mobile-sheet-secondary {
-    min-height: 44px;
-    padding: 0 16px;
-    border-radius: 10px;
-    font-size: 15px;
-    font-weight: 600;
-}
-
-/* The dialogs' primary: raised neutral with a hairline, never a solid
- * accent fill. */
-.mobile-sheet-primary {
-    border: 1px solid var(--color-border-hover, var(--color-border));
-    background: var(--color-panel);
-    color: var(--color-text);
-}
-
-.mobile-sheet-secondary {
-    color: var(--color-link);
-}
-
-.mobile-sheet-primary:hover,
-.mobile-sheet-secondary:hover {
-    background: var(--color-surface);
-}
-
+/* The popup's 16 choices: one row that scrolls sideways. The padding keeps
+ * the focus ring inside the row's clip, and the scroll padding matches it so
+ * a choice snaps beside the padding, not over it (WebKit snaps the first one
+ * 3px in otherwise). */
 .mobile-reaction-palette {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+    display: flex;
     gap: 4px;
-    margin-top: 10px;
+    padding: 3px;
+    scroll-padding-inline: 3px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
 }
 
 .mobile-reaction-choice {
-    min-height: 44px;
+    flex: none;
+    width: 44px;
+    height: 44px;
     border-radius: 10px;
     font-size: 22px;
     line-height: 1;
+    scroll-snap-align: start;
 }
 
 .mobile-reaction-choice:hover {

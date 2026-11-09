@@ -46,13 +46,12 @@ pub(crate) use self::outbox_commit::{
     has_signing as outbox_has_signing, has_unsent as outbox_has_unsent,
 };
 mod mobile_message_actions;
-mod mobile_reaction_input;
+mod mobile_reaction_popup;
 mod mobile_surface;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 mod pending_effects;
 mod pending_sends;
-mod reaction_input;
 mod reaction_picker;
 mod reply_highlight;
 #[cfg(target_arch = "wasm32")]
@@ -72,7 +71,7 @@ use self::markdown::{
     render_message_html_cached, running_behind_freenet_gateway,
 };
 use self::mobile_message_actions::{MobileAction, MobileActionsEntry, MobileMessageActionsSheet};
-use self::mobile_reaction_input::MobileReactionPopup;
+use self::mobile_reaction_popup::MobileReactionPopup;
 use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};

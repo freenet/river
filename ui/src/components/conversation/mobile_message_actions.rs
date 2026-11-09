@@ -1,7 +1,7 @@
 //! The mobile actions sheet: below 48rem, a tap on a signed message opens
 //! Reply, and Edit and Delete on your own, for that exact message, and nothing
 //! else (no reactions: its + opens the reaction popup,
-//! `mobile_reaction_input.rs`). `mobile_surface.rs` has what the two mobile
+//! `mobile_reaction_popup.rs`). `mobile_surface.rs` has what the two mobile
 //! surfaces share.
 //!
 //! Row taps ([`row_tap`], [`row_clicked`]). One ordinary tap on a message's
@@ -35,15 +35,18 @@
 //! when it runs, from the room as it is then (`Conversation`'s
 //! `on_mobile_action`).
 
-#[cfg(target_arch = "wasm32")]
-use super::mobile_surface::dom;
 use super::mobile_surface::{
-    narrow_now, opening_is_live, MobileDialogFrame, MobileOpening, MobileSurface, SHEET_ID,
+    narrow_now, opening_is_live, use_show_on_open, MobileDialogFrame, MobileOpening, MobileSurface,
+    SHEET_ID,
 };
 use super::reaction_picker::ReactionSurfaces;
+
 use crate::components::icons::{line_icon, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH};
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
+
+/// The sheet's first action, which takes focus when it opens.
+const REPLY_SELECTOR: &str = "[data-testid=\"mobile-message-action-reply\"]";
 
 /// One of the sheet's actions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,7 +355,6 @@ pub(super) fn MobileActionsEntry(
     // only from deferred callbacks.
     let expanded = surfaces
         .mobile
-        .opening
         .read()
         .as_ref()
         .is_some_and(|o| o.is_for(MobileSurface::Actions, &row));
@@ -419,36 +421,13 @@ pub(super) fn MobileMessageActionsSheet(
     // only from deferred callbacks, so no write is live during a render.
     let opening = surfaces
         .mobile
-        .opening
         .read()
         .clone()
         .filter(|o| o.surface == MobileSurface::Actions);
     let own = opening.as_ref().is_some_and(|o| o.own);
     let target_row = opening.as_ref().map(|o| o.row.clone()).unwrap_or_default();
-    // Shown once its contents are this opening's: after the render that put
-    // them in. Its first action takes focus; a button, so no keyboard. Once
-    // per opening: an effect run after Escape closed it, before the state
-    // follows, must not show it again.
-    let shown_token = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
-    use_effect(move || {
-        let token = surfaces
-            .mobile
-            .opening
-            .read()
-            .as_ref()
-            .filter(|o| o.surface == MobileSurface::Actions)
-            .map(|o| o.token);
-        let Some(token) = token else {
-            return;
-        };
-        let first_run = shown_token.replace(token) != token;
-        #[cfg(target_arch = "wasm32")]
-        if first_run && !dom::dialog_open(SHEET_ID) && dom::show_dialog(SHEET_ID) {
-            dom::focus_in(SHEET_ID, "[data-testid=\"mobile-message-action-reply\"]");
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = first_run;
-    });
+    // Shown once its contents are this opening's; its first action takes focus.
+    use_show_on_open(surfaces, MobileSurface::Actions, &[REPLY_SELECTOR]);
     let act = move |action: MobileAction| {
         move |_| {
             if let Some(token) = surfaces.mobile_token(MobileSurface::Actions) {

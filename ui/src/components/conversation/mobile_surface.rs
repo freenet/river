@@ -4,12 +4,12 @@
 //! Below Tailwind's `md` (48rem) a message row's trailing Reply, Edit and
 //! Delete are hidden. A tap on the row opens its **actions sheet**
 //! (`mobile_message_actions.rs`); a tap on its reaction + opens a separate
-//! **reaction popup** with a text field for the device keyboard's emoji
-//! (`mobile_reaction_input.rs`). At 48rem and wider neither exists: the footer
+//! **reaction popup**: one row of emoji that scrolls sideways
+//! (`mobile_reaction_popup.rs`). At 48rem and wider neither exists: the footer
 //! and the anchored reaction picker (`reaction_picker.rs`) are as before.
 //!
-//! Ownership. One [`MobileOpening`] at a time lives in [`MobileState`], which is
-//! part of the conversation's [`ReactionSurfaces`], so opening either mobile
+//! Ownership. One [`MobileOpening`] at a time lives in the `mobile` signal of
+//! the conversation's [`ReactionSurfaces`], so opening either mobile
 //! surface closes the desktop picker and the open reactor list, and opening the
 //! picker or a list closes a mobile surface: at most one is open. Groups pass
 //! the handle on without reading it (#830); the per-row entries, the hosts and
@@ -19,10 +19,14 @@
 //! An opening is one press: it carries a fresh token, the room and which
 //! showing of it ([`super::reaction_picker::note_room_shown`]), the room's
 //! contract key at the time (a re-key is another generation, which the showing
-//! counter does not see), and the row. Work queued for it (a submit, an action,
-//! focus) runs only while that same token is still the open one and the
+//! counter does not see), and the row. Work queued for it (a reaction, an
+//! action, focus) runs only while that same token is still the open one and the
 //! opening is still live ([`opening_is_live`]): a dismissal and reopening of the
-//! same message is a new token, so an older queued submit does nothing.
+//! same message is a new token, so an older queued reaction does nothing.
+//!
+//! Neither surface has a field, so neither brings up the software keyboard.
+//! Each is committed deferred and shown after the render that fills it
+//! ([`use_show_on_open`]), focus on one of its buttons.
 //!
 //! Both surfaces are a native modal `<dialog>` (`showModal`): it is in the top
 //! layer above the header, history, composer and Latest; the rest of the page
@@ -35,7 +39,6 @@
 //! underneath (history-scrolling.md); opening or closing one never moves the
 //! history.
 
-use super::reaction_input::ReactionInputError;
 use super::reaction_picker::{shown_room, ReactionSurfaces};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use crate::components::icons::{line_icon, CLOSE_ICON_PATH};
@@ -54,15 +57,13 @@ const NARROW_QUERY: &str = "not all and (min-width: 48rem)";
 pub(super) const SHEET_ID: &str = "mobile-message-actions-sheet";
 /// The reaction popup's dialog.
 pub(super) const POPUP_ID: &str = "mobile-reaction-popup";
-/// The reaction popup's field.
-pub(super) const POPUP_INPUT_ID: &str = "mobile-reaction-input";
 
 /// Which mobile surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MobileSurface {
     /// The row's Reply, Edit and Delete.
     Actions,
-    /// The reaction field and palette.
+    /// The row of reactions.
     Reaction,
 }
 
@@ -116,7 +117,7 @@ pub(super) struct MobileOpening {
     /// Shown from this; checked again against the room when an action runs.
     pub(super) own: bool,
     /// The reader's own reaction on it, as its footer last rendered it
-    /// (pending ones included). Only labels the popup's submit: the
+    /// (pending ones included). Only marks the popup's current choice: the
     /// pending-aware toggle decides from the room itself.
     pub(super) current: Option<String>,
 }
@@ -164,27 +165,6 @@ impl MobileOpening {
     }
 }
 
-/// The open mobile surface and the popup's scratch state: the field's text,
-/// what it last said about it, and whether the palette is out. All of it is
-/// cleared whenever a surface closes, so a new opening starts empty.
-#[derive(Clone, Copy, PartialEq)]
-pub(super) struct MobileState {
-    pub(super) opening: Signal<Option<MobileOpening>>,
-    pub(super) text: Signal<String>,
-    pub(super) error: Signal<Option<ReactionInputError>>,
-    pub(super) palette: Signal<bool>,
-}
-
-/// `Conversation`'s mobile state, made once (inside `use_reaction_surfaces`).
-pub(super) fn use_mobile_state() -> MobileState {
-    MobileState {
-        opening: use_signal(|| None),
-        text: use_signal(String::new),
-        error: use_signal(|| None),
-        palette: use_signal(|| false),
-    }
-}
-
 /// The open room's contract key, read now.
 fn live_contract_key() -> Option<ContractKey> {
     let owner = CURRENT_ROOM.try_peek().ok()?.owner_key?;
@@ -226,15 +206,13 @@ impl ReactionSurfaces {
     /// The open mobile opening, read fallibly (the conversation may have
     /// unmounted).
     fn mobile_opening(self) -> Option<MobileOpening> {
-        self.mobile.opening.try_peek().ok().and_then(|o| o.clone())
+        self.mobile.try_peek().ok().and_then(|o| o.clone())
     }
 
     /// Open `opening`'s surface, closing the desktop picker, a reactor list
     /// and the other mobile surface first. Nothing is opened for an opening
-    /// already gone; a popup the press showed for it is put away again.
-    /// Whether it is open. From a deferred callback only.
+    /// already gone. Whether it is open. From a deferred callback only.
     pub(super) fn open_mobile(self, opening: MobileOpening) -> bool {
-        let state = self.mobile;
         let current = self.mobile_opening();
         if !narrow_now() || !opening_is_live(&opening) {
             // Only a dialog no opening holds: a press superseded by a later
@@ -254,8 +232,7 @@ impl ReactionSurfaces {
                 dom::close_dialog(old.surface.dialog_id());
             }
         }
-        reset_scratch(state);
-        let mut slot = state.opening;
+        let mut slot = self.mobile;
         slot.set(Some(opening));
         dom::hold_background(true);
         dom::track_viewport(true);
@@ -263,7 +240,7 @@ impl ReactionSurfaces {
     }
 
     /// Close the open mobile surface and let go of what it held: the dialog,
-    /// the input hold and the viewport tracking, then its state and scratch.
+    /// the input hold and the viewport tracking, then its state.
     /// An ordinary dismissal (`restore`) returns focus, without scrolling, to
     /// the row's control it opened from if that is still live; a handoff
     /// (Reply, Edit, Delete) leaves focus to where it goes. Nothing is open
@@ -271,7 +248,6 @@ impl ReactionSurfaces {
     /// callback only; the state is read and written fallibly, since the
     /// conversation may have unmounted.
     pub(super) fn close_mobile(self, restore: bool) {
-        let state = self.mobile;
         let open = self.mobile_opening();
         dom::close_dialog(SHEET_ID);
         dom::close_dialog(POPUP_ID);
@@ -283,11 +259,9 @@ impl ReactionSurfaces {
         if restore && opening_is_live(&open) {
             dom::focus_control(&open.row, open.surface);
         }
-        let mut slot = state.opening;
-        if let Ok(mut slot) = slot.try_write() {
-            *slot = None;
-        }
-        reset_scratch(state);
+        let mut slot = self.mobile;
+        // A statement, so the write guard drops before `slot` does.
+        let _ = slot.try_write().map(|mut slot| *slot = None);
     }
 
     /// Dismiss `surface` (Close, the backdrop), from its handler: it closes,
@@ -363,23 +337,6 @@ impl ReactionSurfaces {
     }
 }
 
-/// Clear the popup's scratch, writing only what is not already clear (a
-/// write notifies even when it changes nothing).
-fn reset_scratch(state: MobileState) {
-    clear(state.text);
-    clear(state.error);
-    clear(state.palette);
-}
-
-/// Set `signal` back to its default, fallibly, if it is not already.
-fn clear<T: Default + PartialEq + 'static>(mut signal: Signal<T>) {
-    if signal.try_peek().is_ok_and(|value| *value != T::default()) {
-        if let Ok(mut value) = signal.try_write() {
-            *value = T::default();
-        }
-    }
-}
-
 /// Whether the window is below 48rem now. The authority for a press, which
 /// must not wait for [`NARROW`] to catch up with a resize.
 pub(super) fn narrow_now() -> bool {
@@ -439,7 +396,7 @@ pub(super) fn MobileSurfaceGuard(
     };
     // Infallible, deliberately: `Conversation`'s own `use_signal`, written
     // only from deferred callbacks, so no write is live during a render.
-    let open = surfaces.mobile.opening.read().clone();
+    let open = surfaces.mobile.read().clone();
     if let Some(open) = open {
         if !narrow || !in_chat || open.contract != contract_key {
             crate::util::defer(move || {
@@ -461,6 +418,36 @@ pub(super) fn MobileSurfaceGuard(
         dom::track_viewport(false);
     });
     rsx! {}
+}
+
+/// Show `surface`'s dialog once per opening, after the render that filled it,
+/// and focus the first of `focus` that matches: a button, so never the
+/// keyboard. Once per token: an effect run after Escape closed it, before the
+/// state follows, must not show it again.
+pub(super) fn use_show_on_open(
+    surfaces: ReactionSurfaces,
+    surface: MobileSurface,
+    focus: &'static [&'static str],
+) {
+    let shown_token = use_hook(|| std::rc::Rc::new(Cell::new(0u64)));
+    use_effect(move || {
+        // Infallible, deliberately: `Conversation`'s own `use_signal`, written
+        // only from deferred callbacks.
+        let token = surfaces
+            .mobile
+            .read()
+            .as_ref()
+            .filter(|o| o.surface == surface)
+            .map(|o| o.token);
+        let Some(token) = token else {
+            return;
+        };
+        let first_run = shown_token.replace(token) != token;
+        let id = surface.dialog_id();
+        if first_run && !dom::dialog_open(id) && dom::show_dialog(id) {
+            dom::focus_in(id, focus);
+        }
+    });
 }
 
 /// The modal dialog both mobile surfaces are drawn in: the dialog (its own
@@ -545,7 +532,7 @@ pub(crate) fn any_open() -> bool {
 pub(super) mod dom {
     use super::super::focus_without_scrolling;
     use super::MobileSurface;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
 
@@ -587,7 +574,7 @@ pub(super) mod dom {
     /// Show the dialog `id` as a modal. A browser without `showModal` (or
     /// one that throws) gets it shown in place instead, still usable.
     /// Whether it is open.
-    pub(crate) fn show_dialog(id: &str) -> bool {
+    pub(super) fn show_dialog(id: &str) -> bool {
         let Some(dialog) = element(id) else {
             return false;
         };
@@ -604,17 +591,6 @@ pub(super) mod dom {
         dialog.has_attribute("open")
     }
 
-    thread_local! {
-        /// How many times a dialog was closed from here, not by the reader.
-        static CLOSES: Cell<u64> = const { Cell::new(0) };
-    }
-
-    /// How many dialogs this code has closed so far: a dialog found closed
-    /// with the count unchanged was closed by the reader (Escape).
-    pub(crate) fn closes_from_here() -> u64 {
-        CLOSES.with(Cell::get)
-    }
-
     pub(super) fn close_dialog(id: &str) {
         let Some(dialog) = element(id) else {
             return;
@@ -622,7 +598,6 @@ pub(super) mod dom {
         if !dialog.has_attribute("open") {
             return;
         }
-        CLOSES.with(|c| c.set(c.get().wrapping_add(1)));
         let closed = js_sys::Reflect::get(&dialog, &"close".into())
             .ok()
             .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
@@ -632,17 +607,42 @@ pub(super) mod dom {
         }
     }
 
-    /// Focus the element with `id`, without scrolling.
-    pub(crate) fn focus_id(id: &str) -> bool {
-        element(id).is_some_and(|el| focus_without_scrolling(&el))
-    }
-
-    /// Focus the first element in dialog `id` matching `selector`.
-    pub(crate) fn focus_in(id: &str, selector: &str) {
-        let target = element(id).and_then(|d| d.query_selector(selector).ok().flatten());
+    /// Focus, without scrolling, the first element in dialog `id` matching
+    /// the first of `selectors` that matches anything. One inside a row that
+    /// scrolls sideways is centred in it first.
+    pub(super) fn focus_in(id: &str, selectors: &[&str]) {
+        let Some(dialog) = element(id) else {
+            return;
+        };
+        let target = selectors.iter().find_map(|selector| {
+            dialog
+                .query_selector(selector)
+                .ok()
+                .flatten()?
+                .dyn_into::<web_sys::HtmlElement>()
+                .ok()
+        });
         if let Some(target) = target {
+            centre_in_row(&target);
             focus_without_scrolling(&target);
         }
+    }
+
+    /// Scroll `el`'s parent sideways so `el` sits in its middle (the browser
+    /// clamps it at either end). Nothing for a parent that does not scroll.
+    fn centre_in_row(el: &web_sys::HtmlElement) {
+        let Some(row) = el.parent_element() else {
+            return;
+        };
+        if row.scroll_width() <= row.client_width() {
+            return;
+        }
+        let (choice, view) = (
+            el.get_bounding_client_rect(),
+            row.get_bounding_client_rect(),
+        );
+        let by = (choice.left() + choice.width() / 2.0) - (view.left() + view.width() / 2.0);
+        row.set_scroll_left(row.scroll_left() + by.round() as i32);
     }
 
     /// Keep Tab inside dialog `id`'s panel: from its last control Tab goes
@@ -882,9 +882,10 @@ pub(super) mod dom {
     }
     pub(super) fn focus_control(_row: &str, _surface: MobileSurface) {}
     pub(super) fn close_dialog(_id: &str) {}
-    pub(crate) fn closes_from_here() -> u64 {
-        0
+    pub(super) fn show_dialog(_id: &str) -> bool {
+        false
     }
+    pub(super) fn focus_in(_id: &str, _selectors: &[&str]) {}
     pub(super) fn hold_background(_on: bool) {}
     pub(super) fn track_viewport(_on: bool) {}
 }

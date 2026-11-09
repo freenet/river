@@ -1,4 +1,4 @@
-import { expect, Locator, Page, test } from "@playwright/test";
+import { CDPSession, expect, Locator, Page, test } from "@playwright/test";
 
 export async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
@@ -246,12 +246,11 @@ export async function clickFooter(page: Page, row: Locator, testid: string) {
 }
 
 /// Open `row`'s reaction choices through its footer React, the only way in:
-/// the anchored picker at 48rem and wider; below it, the reaction popup with
-/// its palette shown.
+/// the anchored picker at 48rem and wider; below it, the reaction popup and
+/// its row of choices.
 export async function openInlinePicker(page: Page, row: Locator) {
   if (await narrowLayout(page)) {
     await openReactionPopup(page, row);
-    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
     await expect(page.getByTestId("mobile-reaction-palette")).toBeVisible();
     return;
   }
@@ -461,5 +460,84 @@ export async function expectTouchHeldUntilClosed(
     const after = await historyPoint(page);
     expect(await page.evaluate(({ x, y }) => !!document.elementFromPoint(x, y)?.closest("#chat-scroll-container"), after), "premise: the history is under the point").toBe(true);
     expect(await touchmovePrevented(page, after.x, after.y), `closed by ${how}: let go`).toBe(false);
+  }
+}
+
+/// How far a test finger drags by default.
+export const DRAG_PX = 80;
+
+type Finger = { x: number; y: number };
+
+/// Fingers on the screen, through Chromium's input protocol: the browser
+/// hit-tests them, fires pointer and touch events, captures and scrolls as it
+/// does for a real finger. Spelled out as touchStart, touchMove a frame apart,
+/// touchEnd: `Input.synthesizeScrollGesture` with a touch source fires no
+/// touchmove and scrolls nothing in Linux headless Chromium (CI), picker open
+/// or not.
+export class Fingers {
+  private down = new Map<number, Finger>();
+  constructor(readonly cdp: CDPSession) {}
+
+  private send(type: "touchStart" | "touchMove" | "touchEnd" | "touchCancel") {
+    const touchPoints = type === "touchEnd" || type === "touchCancel" ? [] : [...this.down].map(([id, p]) => ({ id, x: p.x, y: p.y }));
+    return this.cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
+  }
+
+  get anyDown(): boolean {
+    return this.down.size > 0;
+  }
+
+  /// Put fingers down, together.
+  async press(...fingers: [number, number, number][]) {
+    for (const [id, x, y] of fingers) this.down.set(id, { x, y });
+    await this.send("touchStart");
+  }
+
+  /// Move each finger by its own distance, vertical alone or `[dx, dy]`, in
+  /// steps a frame apart.
+  async move(moves: Record<number, number | [number, number]>, steps = 10) {
+    const from = new Map([...this.down].map(([id, p]) => [id, { ...p }]));
+    for (let i = 1; i <= steps; i++) {
+      for (const [id, by] of Object.entries(moves)) {
+        const [dx, dy] = typeof by === "number" ? [0, by] : by;
+        const [f, at] = [from.get(Number(id))!, this.down.get(Number(id))!];
+        at.x = f.x + (dx * i) / steps;
+        at.y = f.y + (dy * i) / steps;
+      }
+      await this.send("touchMove");
+      await new Promise((r) => setTimeout(r, 16));
+    }
+  }
+
+  /// Every finger lifts.
+  async lift() {
+    this.down.clear();
+    await this.send("touchEnd");
+  }
+
+  /// The browser cancels every finger.
+  async cancel() {
+    this.down.clear();
+    await this.send("touchCancel");
+  }
+
+  /// One finger, down at (x, y), dragged `dy` and lifted.
+  async drag(x: number, y: number, dy = DRAG_PX) {
+    await this.press([1, x, y]);
+    await this.move({ 1: dy });
+    await this.lift();
+  }
+}
+
+/// Run `body` with fingers on `page`, every one lifted and the session
+/// detached afterwards, whatever happens.
+export async function withFingers(page: Page, body: (fingers: Fingers) => Promise<void>) {
+  const cdp = await page.context().newCDPSession(page);
+  const fingers = new Fingers(cdp);
+  try {
+    await body(fingers);
+  } finally {
+    if (fingers.anyDown) await fingers.cancel().catch(() => {});
+    await cdp.detach();
   }
 }

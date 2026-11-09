@@ -1,5 +1,5 @@
-import { test, expect, CDPSession, Locator, Page } from "@playwright/test";
-import { asTouchTablet, coarsePointer, committedRow, nextFrames, openRoomWithComposer, revealFooter, rowKey, settle, submitMessage, wheelCancelled } from "./example-room";
+import { test, expect, Locator, Page } from "@playwright/test";
+import { asTouchTablet, coarsePointer, committedRow, DRAG_PX, Fingers, nextFrames, openRoomWithComposer, revealFooter, rowKey, settle, submitMessage, wheelCancelled, withFingers } from "./example-room";
 import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import {
   expectAtReact,
@@ -22,7 +22,7 @@ import { callRiverTest } from "./river-test";
 // all of it.
 //
 // The picker exists from 48rem: below that a React opens the mobile reaction
-// popup instead (mobile-reaction-input.spec.ts). So a phone project runs
+// popup instead (mobile-reaction-popup.spec.ts). So a phone project runs
 // these at a touch tablet's width, keeping its touch input: the wide
 // coarse-pointer case.
 test.beforeEach(async ({ page }) => {
@@ -966,78 +966,6 @@ test.describe("While the reaction picker is open", () => {
     expect(await callRiverTest(page, "takeToastActionRuns"), "the action ran once, after the picker closed").toBe(1);
   });
 });
-
-const DRAG_PX = 80;
-
-type Finger = { x: number; y: number };
-
-/// Fingers on the screen, through Chromium's input protocol: the browser
-/// hit-tests them, fires pointer and touch events, captures and scrolls as it
-/// does for a real finger. Spelled out as touchStart, touchMove a frame apart,
-/// touchEnd: `Input.synthesizeScrollGesture` with a touch source fires no
-/// touchmove and scrolls nothing in Linux headless Chromium (CI), picker open
-/// or not.
-class Fingers {
-  private down = new Map<number, Finger>();
-  constructor(readonly cdp: CDPSession) {}
-
-  private send(type: "touchStart" | "touchMove" | "touchEnd" | "touchCancel") {
-    const touchPoints = type === "touchEnd" || type === "touchCancel" ? [] : [...this.down].map(([id, p]) => ({ id, x: p.x, y: p.y }));
-    return this.cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
-  }
-
-  get anyDown(): boolean {
-    return this.down.size > 0;
-  }
-
-  /// Put fingers down, together.
-  async press(...fingers: [number, number, number][]) {
-    for (const [id, x, y] of fingers) this.down.set(id, { x, y });
-    await this.send("touchStart");
-  }
-
-  /// Move each finger by its own vertical distance, in steps a frame apart.
-  async move(dys: Record<number, number>, steps = 10) {
-    const from = new Map([...this.down].map(([id, p]) => [id, { ...p }]));
-    for (let i = 1; i <= steps; i++) {
-      for (const [id, dy] of Object.entries(dys)) this.down.get(Number(id))!.y = from.get(Number(id))!.y + (dy * i) / steps;
-      await this.send("touchMove");
-      await new Promise((r) => setTimeout(r, 16));
-    }
-  }
-
-  /// Every finger lifts.
-  async lift() {
-    this.down.clear();
-    await this.send("touchEnd");
-  }
-
-  /// The browser cancels every finger.
-  async cancel() {
-    this.down.clear();
-    await this.send("touchCancel");
-  }
-
-  /// One finger, down at (x, y), dragged `dy` and lifted.
-  async drag(x: number, y: number, dy = DRAG_PX) {
-    await this.press([1, x, y]);
-    await this.move({ 1: dy });
-    await this.lift();
-  }
-}
-
-/// Run `body` with fingers on `page`, every one lifted and the session
-/// detached afterwards, whatever happens.
-async function withFingers(page: Page, body: (fingers: Fingers) => Promise<void>) {
-  const cdp = await page.context().newCDPSession(page);
-  const fingers = new Fingers(cdp);
-  try {
-    await body(fingers);
-  } finally {
-    if (fingers.anyDown) await fingers.cancel().catch(() => {});
-    await cdp.detach();
-  }
-}
 
 /// Record the touch pointers pressed and every touchmove as the page last
 /// sees it (window, bubbling): how many fingers it had and whether it was

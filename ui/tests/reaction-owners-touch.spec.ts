@@ -456,7 +456,7 @@ async function expectOnScreen(page: Page, target: Locator) {
 // moving the history.
 test.describe("Reactor list and picker hand off", () => {
   // The anchored picker's hand-off: a phone runs it at a touch tablet's
-  // width (mobile-reaction-input.spec.ts has the popup's).
+  // width (mobile-reaction-popup.spec.ts has the popup's).
   test.beforeEach(async ({ page }) => asTouchTablet(page));
   async function surfaces(page: Page) {
     return page.evaluate(() => ({

@@ -37,15 +37,14 @@
 //! opening runs, or an opening a later press superseded, does nothing.
 //!
 //! Below 48rem the same React opens the mobile reaction popup instead
-//! (`mobile_reaction_input.rs`), decided at the press, before any of the
+//! (`mobile_reaction_popup.rs`), decided at the press, before any of the
 //! above: a browser without native popovers still reacts there. The mobile
 //! surfaces share these [`ReactionSurfaces`], so at most one of the picker, a
 //! reactor list and a mobile surface is open (`mobile_surface.rs`).
 
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::mobile_surface::{
-    narrow_for_render, narrow_now, use_mobile_state, MobileOpening, MobileState, MobileSurface,
-    POPUP_ID,
+    narrow_for_render, narrow_now, MobileOpening, MobileSurface, POPUP_ID,
 };
 use super::{now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW};
@@ -119,7 +118,7 @@ impl ReactionTarget {
 pub(super) struct ReactionSurfaces {
     target: Signal<Option<ReactionTarget>>,
     open_owner_list: Signal<Option<Signal<Option<ReactionOwnersPopover>>>>,
-    pub(super) mobile: MobileState,
+    pub(super) mobile: Signal<Option<MobileOpening>>,
 }
 
 /// `Conversation`'s reaction surfaces, made once.
@@ -127,7 +126,7 @@ pub(super) fn use_reaction_surfaces() -> ReactionSurfaces {
     ReactionSurfaces {
         target: use_signal(|| None),
         open_owner_list: use_signal(|| None),
-        mobile: use_mobile_state(),
+        mobile: use_signal(|| None),
     }
 }
 
@@ -284,7 +283,7 @@ pub(super) fn ReactionInvoker(
         Some(target) if target.row == row => (true, target.current != current),
         _ => (false, false),
     };
-    let (mobile_expanded, mobile_stale) = match surfaces.mobile.opening.read().as_ref() {
+    let (mobile_expanded, mobile_stale) = match surfaces.mobile.read().as_ref() {
         Some(open) if open.is_for(MobileSurface::Reaction, &row) => (true, open.current != current),
         _ => (false, false),
     };
@@ -308,10 +307,10 @@ pub(super) fn ReactionInvoker(
             }
         });
     }
-    // The same for the mobile popup's submit label.
+    // The same for the mobile popup's current choice.
     if mobile_stale {
         let (row, current) = (row.clone(), current.clone());
-        let mut opening = surfaces.mobile.opening;
+        let mut opening = surfaces.mobile;
         crate::util::defer(move || {
             let stale = opening
                 .peek()
@@ -414,7 +413,7 @@ pub(super) fn ReactionInvoker(
                         false,
                         current.clone(),
                     );
-                    super::mobile_reaction_input::open_from_press(surfaces, opening);
+                    super::mobile_reaction_popup::open(surfaces, opening);
                     return;
                 }
                 // A pointer press on React while its picker is open closes

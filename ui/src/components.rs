@@ -102,7 +102,6 @@ mod volatile_value_binding_audit {
     const EXPECTED_EDITABLE: &[&str] = &[
         r#"components/conversation.rs <textarea> "{edit_text}""#,
         r#"components/conversation/message_input.rs <textarea> "{message_text}""#,
-        r#"components/conversation/mobile_reaction_input.rs <input> "{typed}""#,
         r#"components/direct_messages/dm_thread_modal.rs <textarea> "{draft.read()}""#,
         r#"components/direct_messages/invite_via_dm_picker_modal.rs <textarea> "{personal_message_value}""#,
         r#"components/members.rs <input> "{member_query}""#,

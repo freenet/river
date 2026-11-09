@@ -26,7 +26,7 @@ import { callRiverTest, rekeyThenClick } from "./river-test";
 // Below Tailwind's `md` (48rem) a signed message's trailing Reply, Edit and
 // Delete are hidden; a tap on the row opens them, and only them, in a modal
 // actions sheet (mobile_message_actions.rs), and its one reaction + stays
-// visible and opens a separate reaction popup (mobile-reaction-input.spec.ts).
+// visible and opens a separate reaction popup (mobile-reaction-popup.spec.ts).
 // Width alone decides: a narrow mouse window is mobile, a wide touch screen
 // keeps the desktop footer. These run on every project at the widths they
 // set, so the desktop projects are narrow mouse windows here.
@@ -546,7 +546,7 @@ test.describe("Below 48rem", () => {
     await expect(sheet(page), "coming back reopens nothing").toBeHidden();
 
     await openMessageActions(page, own);
-    await rekeyThenClick(page, "mobile-message-action-reply");
+    await rekeyThenClick(page, '[data-testid="mobile-message-action-reply"]');
     await settle(page);
     await expect(sheet(page)).toBeHidden();
     await expect(page.getByTestId("message-composer"), "the Reply queued across the re-key did nothing").not.toContainText("Replying to");
@@ -764,6 +764,6 @@ test.describe("Inside the gateway's sandboxed frame", () => {
     await expect(s).toBeHidden();
     await row.getByTestId("message-react-button").click();
     await expect(frame.getByTestId(POPUP)).toBeVisible();
-    await expect(frame.getByTestId("mobile-reaction-input")).toBeFocused();
+    await expect(frame.getByTestId("mobile-reaction-palette").getByRole("button").first()).toBeFocused();
   });
 });

@@ -1120,9 +1120,8 @@ mod runtime {
             return true;
         }
         // A mobile actions sheet or reaction popup (below 48rem): open while
-        // its modal dialog is, an empty reaction field with the keyboard up
-        // included. Asked directly rather than left to the overlay check
-        // below, which looks for a class it does not carry. Closed, the
+        // its modal dialog is. Asked directly rather than left to the overlay
+        // check below, which looks for a class it does not carry. Closed, the
         // dialogs stay mounted and hold nothing.
         if crate::components::conversation::mobile_surface_is_open() {
             return true;

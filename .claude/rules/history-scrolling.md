@@ -119,8 +119,8 @@ Current behavior:
   mobile reaction popup, each a native modal `<dialog>`
   (`conversation/mobile_surface.rs`). While one is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
-  picker holds them, and the panel itself still scrolls and its field still
-  takes selections; a zoom (Ctrl+wheel, a pinch) is not held, nothing is
+  picker holds them, and the panel itself still scrolls (the reaction popup's
+  row of emoji sideways); a zoom (Ctrl+wheel, a pinch) is not held, nothing is
   captured, and every close path removes the listeners. Unlike the picker,
   a modal keeps holding while its message is still rendered, even after
   arrivals carried that row out of the history's view: only the message
