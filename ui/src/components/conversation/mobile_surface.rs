@@ -90,6 +90,13 @@ impl MobileSurface {
         }
     }
 
+    /// Whether its panel shows the title and a Close button. The reaction
+    /// popup does not: a tap outside it (or Escape) dismisses it, and the
+    /// title is only its accessible name.
+    fn has_header(self) -> bool {
+        self == Self::Actions
+    }
+
     /// The row's control this surface opens from, and returns focus to.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn control_selector(self) -> &'static str {
@@ -452,9 +459,9 @@ pub(super) fn use_show_on_open(
 
 /// The modal dialog both mobile surfaces are drawn in: the dialog (its own
 /// `close` event brings the state in line, and Tab stays inside), the
-/// backdrop and Close (both dismiss), and the panel with its handle and
-/// header. Each surface renders only its body, as `children`, after the
-/// header.
+/// backdrop (dismisses), and the panel with its handle and, for the actions
+/// sheet, a header with its title and Close (also dismisses). Each surface
+/// renders only its body, as `children`, after that.
 #[component]
 pub(super) fn MobileDialogFrame(
     surfaces: ReactionSurfaces,
@@ -464,6 +471,7 @@ pub(super) fn MobileDialogFrame(
     children: Element,
 ) -> Element {
     let (id, prefix, title) = (surface.dialog_id(), surface.prefix(), surface.title());
+    let header = surface.has_header();
     // The dialog closing by itself (Escape): the state follows. The listener
     // lives as long as the frame.
     #[cfg(target_arch = "wasm32")]
@@ -477,7 +485,8 @@ pub(super) fn MobileDialogFrame(
             id: "{id}",
             "data-testid": "{id}",
             class: "mobile-sheet",
-            "aria-labelledby": "{prefix}-title",
+            "aria-labelledby": if header { "{prefix}-title" },
+            "aria-label": if !header { "{title}" },
             "data-target-row": "{target_row}",
             onmounted: move |_| {
                 #[cfg(target_arch = "wasm32")]
@@ -503,16 +512,18 @@ pub(super) fn MobileDialogFrame(
             }
             div { class: "mobile-sheet-panel",
                 div { class: "mobile-sheet-handle", "aria-hidden": "true" }
-                div { class: "mobile-sheet-header",
-                    h2 { id: "{prefix}-title", class: "mobile-sheet-title", "{title}" }
-                    button {
-                        r#type: "button",
-                        "data-testid": "{prefix}-close",
-                        class: "mobile-sheet-close",
-                        "aria-label": "Close",
-                        title: "Close",
-                        onclick: move |_| surfaces.dismiss_mobile(surface),
-                        {line_icon(CLOSE_ICON_PATH, 18)}
+                if header {
+                    div { class: "mobile-sheet-header",
+                        h2 { id: "{prefix}-title", class: "mobile-sheet-title", "{title}" }
+                        button {
+                            r#type: "button",
+                            "data-testid": "{prefix}-close",
+                            class: "mobile-sheet-close",
+                            "aria-label": "Close",
+                            title: "Close",
+                            onclick: move |_| surfaces.dismiss_mobile(surface),
+                            {line_icon(CLOSE_ICON_PATH, 18)}
+                        }
                     }
                 }
                 {children}

@@ -4,7 +4,8 @@
 //! It holds the 16 [`FREQUENT_EMOJIS`] the desktop picker offers, in one row
 //! that scrolls sideways (the panel is outside the background hold, so a swipe
 //! on it scrolls it). A tap on one reacts, or on the reader's current reaction
-//! removes it, and closes the popup. It has no field, so it never brings up
+//! removes it, and closes the popup. It has no title or Close button: a tap
+//! outside it, or Escape, dismisses it. It has no field, so it never brings up
 //! the software keyboard: like the actions sheet it is committed deferred and
 //! shown after the render that fills it, the current reaction (else the first
 //! choice) centred in the row and focused.

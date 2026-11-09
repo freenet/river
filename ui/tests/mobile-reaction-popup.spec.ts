@@ -2,6 +2,7 @@ import { test, expect, Locator, Page } from "@playwright/test";
 import {
   committedRow,
   expectTouchHeldUntilClosed,
+  historyPoint,
   keyboardFocus,
   openReactionPopup,
   openRoomWithComposer,
@@ -18,7 +19,7 @@ import { callRiverTest, rekeyThenClick } from "./river-test";
 // (mobile_reaction_popup.rs): the 16 choices the desktop picker has, in one
 // row that scrolls sideways. A tap on one reacts and closes it. It has no
 // field, so it never asks for the software keyboard, and it never opens the
-// row's actions.
+// row's actions. It has no title or Close: a tap outside it dismisses it.
 
 const POPUP = "mobile-reaction-popup";
 const FREQUENT = ["👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "😡", "🎉", "🤔", "👋", "✅", "💯", "🙏", "😍", "👏"];
@@ -76,7 +77,9 @@ test.describe("The mobile reaction popup", () => {
     await expect(react).toHaveAttribute("aria-expanded", "false");
     await openReactionPopup(page, row);
     await expect(react).toHaveAttribute("aria-expanded", "true");
-    await expect(popup(page).getByRole("heading", { name: "React to message" })).toBeVisible();
+    await expect(popup(page), "named, though it shows no title").toHaveAccessibleName("React to message");
+    await expect(popup(page).getByRole("heading"), "no title").toHaveCount(0);
+    await expect(page.getByTestId("mobile-reaction-close"), "no Close: a tap outside dismisses it").toHaveCount(0);
     await expect(page.getByTestId("mobile-message-actions-sheet"), "never the actions").toBeHidden();
     await expect(popup(page).locator("input, textarea, [contenteditable]"), "no field to raise a keyboard").toHaveCount(0);
     await expect(palette(page)).toHaveAttribute("role", "group");
@@ -94,11 +97,14 @@ test.describe("The mobile reaction popup", () => {
     expect(g.overflowX).toBe("auto");
     expect(g.scrolls, "wider than the panel: it scrolls sideways").toBe(true);
     expect(g.left, "it opens at the start").toBe(0);
-    await press(page, page.getByTestId("mobile-reaction-close"));
+    // A tap outside, over the history, lands on the backdrop and dismisses it.
+    const outside = await historyPoint(page);
+    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), outside)).toBe("mobile-reaction-backdrop");
+    await pressAt(page, outside);
     await expect(popup(page)).toBeHidden();
     await expect(react, "focus back on the +").toBeFocused();
     expect(await composer.evaluate((el: HTMLTextAreaElement) => [el.value, el.selectionStart, el.selectionEnd])).toEqual(["my unsent draft", 3, 9]);
-    await expect(chips(row), "Close reacts with nothing").toHaveCount(0);
+    await expect(chips(row), "dismissing reacts with nothing").toHaveCount(0);
   });
 
   test("a tap reacts and closes it; the same emoji removes, another switches", async ({ page }) => {
@@ -160,11 +166,12 @@ test.describe("The mobile reaction popup", () => {
     const row = await openRoomWithTarget(page);
     await openReactionPopup(page, row);
     const key = await rowKey(row);
-    // In one task: Close, + again on the same message, then the old choice.
+    // In one task: a tap outside, + again on the same message, then the old
+    // choice.
     await page.evaluate(
       ({ key, sel }) => {
         const choice = document.querySelector<HTMLElement>(sel)!;
-        const close = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-close"]')!;
+        const close = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-backdrop"]')!;
         const plus = document.querySelector<HTMLElement>(`[id="msg-${key}"] [data-testid="message-react-button"]`)!;
         close.click();
         plus.click();
