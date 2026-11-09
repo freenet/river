@@ -289,7 +289,7 @@
  * message ends with "(edited)" on a short line of its own, which the controls
  * share. A code block scrolls rather than wrapping, so the controls get a line
  * below it, clear of its scrollbar; any other ending (a rule, a table, an
- * empty body) gets an empty 22px line. The footer takes no hits itself, so at
+ * empty body, a nested list) gets an empty 22px line. The footer takes no hits itself, so at
  * rest nothing under it is blocked; its controls take them once shown.
  *
  * A first reaction adds the footer line, so a reaction on a row above the
@@ -329,23 +329,40 @@
         min-height: 22px;
     }
 
+    /* The text's last line: a last paragraph or heading, the last item of a
+     * last list (or that item's last paragraph, in a loose list), or a last
+     * quote's last paragraph or heading. */
     .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
-    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child::after,
-    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child > :last-child::after {
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child > p:last-child::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after {
         content: "";
         display: inline-block;
         width: var(--msg-actions-clear);
         height: 1px;
     }
 
-    /* The controls' 28px less the 2px they reach into the row's padding. */
-    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > pre:last-child {
+    /* A tight list's last item holds its text itself. Its own rule, as are
+     * the `:has()` rules below: a browser without `:has()` drops only these. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child:not(:has(> :is(p, ul, ol, pre, blockquote, table, hr)))::after {
+        content: "";
+        display: inline-block;
+        width: var(--msg-actions-clear);
+        height: 1px;
+    }
+
+    /* A code block, at the end or ending a last quote: room below it for the
+     * controls (their 28px less the 2px they reach into the row's padding),
+     * clear of its scrollbar. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > pre:last-child,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child > pre:last-child {
         margin-bottom: 26px;
     }
 
-    /* Any other ending. Its own rule: a browser without `:has()` drops only
-     * this one. */
-    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child:not(:has(> :is(p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, pre):last-child))::after {
+    /* Any other ending (a rule, a table, an empty body; a last item or quote
+     * ending in a nested list, quote or table) gets an empty line. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child:not(:has(> :is(p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, pre):last-child))::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child:has(> :is(ul, ol, pre, blockquote, table, hr):last-child)::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child:not(:has(> :is(p, h1, h2, h3, h4, h5, h6, pre):last-child))::after {
         content: "";
         display: block;
         height: 22px;

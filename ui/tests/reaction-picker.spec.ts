@@ -50,16 +50,17 @@ async function scrollWithRow(page: Page, row: Locator) {
 
 /// Nothing scrolled, except the end hold taking `row`'s growth. On a desktop
 /// with a mouse a first reaction gives a row with none its footer line
-/// (main.css, "Controls at the end of the last line"); a reader at the end is
-/// held there, which moves the scroll by exactly that growth and leaves the
-/// distance from the end alone. Any other scroll fails.
+/// (main.css, "Controls at the end of the last line"). A reader at the end is
+/// held there: the scroll moves by exactly that growth, and the distance from
+/// the end does not change. Anyone else is not moved at all.
 function expectNothingScrolled(before: Awaited<ReturnType<typeof scrollWithRow>>, after: Awaited<ReturnType<typeof scrollWithRow>>) {
   const moved = after.top - before.top;
-  if (Math.abs(moved) < 0.5) return;
-  const grown = after.rowHeight - before.rowHeight;
-  expect(moved, `nothing scrolled but the end hold (row grew ${grown}px)`).toBeCloseTo(grown, 0);
-  expect(before.toEnd, "the end hold: the reader was at the end").toBeLessThanOrEqual(4);
-  expect(after.toEnd, "the end hold: the reader is still at the end").toBeCloseTo(before.toEnd, 0);
+  if (before.toEnd <= 4) {
+    expect(after.toEnd, "a reader at the end is still there").toBeCloseTo(before.toEnd, 0);
+    expect(moved, "only by the row's growth").toBeCloseTo(after.rowHeight - before.rowHeight, 0);
+  } else {
+    expect(moved, "nothing scrolled").toBeCloseTo(0, 0);
+  }
 }
 
 async function expectOpenFor(page: Page, row: Locator) {

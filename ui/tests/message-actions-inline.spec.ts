@@ -47,18 +47,23 @@ function rowLayout(row: Locator) {
       }
       return out;
     };
-    // How the message ends, and which element carries the inline spacer.
+    // How the message ends, and the inline spacer, wherever the CSS put it.
     const prose = body.querySelector(":scope > .prose");
     const last = prose?.lastElementChild ?? null;
     let ending = "other";
-    let spacerHost: Element | null = null;
     if (body.lastElementChild !== prose) ending = "edited";
     else if (!last) ending = "empty";
-    else if (/^(P|H[1-6])$/.test(last.tagName)) [ending, spacerHost] = ["paragraph", last];
-    else if (/^(UL|OL)$/.test(last.tagName)) [ending, spacerHost] = ["list", last.querySelector(":scope > li:last-child")];
-    else if (last.tagName === "BLOCKQUOTE") [ending, spacerHost] = ["quote", last.lastElementChild];
+    else if (/^(P|H[1-6])$/.test(last.tagName)) ending = "paragraph";
+    else if (/^(UL|OL)$/.test(last.tagName)) ending = "list";
+    else if (last.tagName === "BLOCKQUOTE") ending = "quote";
     else if (last.tagName === "PRE") ending = "code";
-    const after = spacerHost ? getComputedStyle(spacerHost, "::after") : null;
+    const spacers = [prose, ...Array.from(prose?.querySelectorAll("*") ?? [])]
+      .filter((e): e is Element => !!e)
+      .map((e) => getComputedStyle(e, "::after"))
+      .filter((s) => s.content !== "none" && s.content !== "normal" && s.display === "inline-block");
+    const after = spacers.at(-1) ?? null;
+    const pres = Array.from(prose?.querySelectorAll("pre") ?? []);
+    const lastPre = pres.at(-1) ?? null;
     const controls = Array.from(footer.querySelectorAll("button")).map((b) => ({
       id: b.getAttribute("data-testid") ?? "?",
       box: box(b.getBoundingClientRect()),
@@ -77,9 +82,11 @@ function rowLayout(row: Locator) {
       row: box(el.getBoundingClientRect()),
       content: box(content.getBoundingClientRect()),
       body: box(body.getBoundingClientRect()),
-      pre: last?.tagName === "PRE" ? box(last.getBoundingClientRect()) : null,
+      // The last code block, if the message ends in one (at the top level or
+      // in a last quote).
+      pre: lastPre && lastPre.getBoundingClientRect().bottom >= body.getBoundingClientRect().bottom - 30 ? box(lastPre.getBoundingClientRect()) : null,
       ending,
-      spacer: after && after.content !== "none" ? parseFloat(after.width) : null,
+      spacer: after ? parseFloat(after.width) : null,
       text: (body.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 40),
     };
   });
@@ -110,7 +117,11 @@ async function openRoomWithEndings(page: Page) {
   for (const text of [
     "Ends in a heading:\n\n## A heading long enough to run most of the way across the column, to the controls",
     "Ends in a list:\n\n- first item\n- a last item long enough to run to the column's edge, where the controls sit on hover",
+    "Ends in a loose list:\n\n- first item\n\n- a last item long enough to run to the column's edge, where the controls sit on hover",
+    "Ends in a nested list:\n\n- first item\n  - a nested last item long enough to run to the column's edge, where the controls sit",
     "Ends in a quote:\n\n> a quoted last line long enough to run to the column's edge, where the controls sit on hover",
+    "Ends in quoted code:\n\n> quoted\n>\n> ```\n> let quoted_code_runs_past_the_column = and_scrolls_sideways(rather_than_wrapping, under_controls);\n> ```",
+    "Ends in a quoted list:\n\n> - a quoted last item long enough to run to the column's edge, where the controls sit on hover",
     "Ends in a rule:\n\n---",
     "Ends in code:\n\n```\nlet the_last_line_of_code_runs_past_the_column = and_scrolls_sideways(rather_than_wrapping, under_the_controls_or_not);\n```",
     `Ends in a long link: https://example.com/${"long".repeat(60)}`,
@@ -144,7 +155,7 @@ test.describe("Controls at the end of the last line on a desktop with a mouse", 
     test.skip(!(await inlineFooter(page)), "touch pointers keep the footer line");
   });
 
-  test("a row with no reactions keeps no footer line, wastes no line, and its controls cover no text", async ({ page }) => {
+  test("a row with no reactions keeps no footer line, wastes no line, and its controls cover no text", async ({ page, browserName }) => {
     test.setTimeout(180_000);
     await openRoomWithEndings(page);
     const short = await rowLayout(committedRow(page, "Short."));
@@ -175,20 +186,22 @@ test.describe("Controls at the end of the last line on a desktop with a mouse", 
     for (const id of ids) {
       const row = page.locator(`[id="${id}"]`);
       await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-      // Off every row but still in the page: under load Firefox can take a
-      // pointer parked at the window's corner as gone, and then match no
-      // `:hover` at all, even after it moves onto a row.
+      // Off every row, inside the page.
       await page.mouse.move(40, 450);
       // Near the top, older history may page in and move the rows.
       await settle(page);
-      // A row the history cannot scroll away from its very top is left out:
-      // there, under parallel load, Firefox intermittently matches no `:hover`
-      // at all (not even on <html>) with the pointer on the row. Every kind of
-      // ending is among the rows below it.
-      const pinnedAtTop = await row.evaluate((el) => {
-        const c = document.getElementById("chat-scroll-container")!;
-        return c.scrollTop === 0 && el.getBoundingClientRect().top - c.getBoundingClientRect().top < 100;
-      });
+      // On Firefox, a row the history cannot scroll away from its very top is
+      // left out: there, under parallel load, Firefox intermittently matches
+      // no `:hover` at all (not even on <html>) with the pointer on the row,
+      // though the row is what `elementFromPoint` finds and nothing in the
+      // history re-renders. Chromium and WebKit check it. Every kind of ending
+      // is among the rows below it.
+      const pinnedAtTop =
+        browserName === "firefox" &&
+        (await row.evaluate((el) => {
+          const c = document.getElementById("chat-scroll-container")!;
+          return c.scrollTop === 0 && el.getBoundingClientRect().top - c.getBoundingClientRect().top < 100;
+        }));
       if (pinnedAtTop) continue;
       const rest = await rowLayout(row);
       const what = `"${rest.text}" (${rest.ending})`;
@@ -197,7 +210,7 @@ test.describe("Controls at the end of the last line on a desktop with a mouse", 
       expect.soft(rest.footerTakesHit, `${what}: at rest the footer takes no hits`).toBe(false);
       // Under 12px (a footer line was 28px); a code block keeps 26px below it
       // for the controls, clear of its scrollbar.
-      expect.soft(rest.row.bottom - rest.body.bottom, `${what}: nothing reserved below the message`).toBeLessThan(rest.ending === "code" ? 12 + 26 : 12);
+      expect.soft(rest.row.bottom - rest.body.bottom, `${what}: nothing reserved below the message`).toBeLessThan(rest.pre ? 12 + 26 : 12);
       if (rest.ending === "paragraph") {
         paragraphs++;
         if (rest.lastTextBottom !== null && rest.body.bottom - rest.lastTextBottom > 15) wrapped++;
@@ -215,7 +228,7 @@ test.describe("Controls at the end of the last line on a desktop with a mouse", 
         if (shown.pre) expect.soft(c.box.top, `${what}: ${c.id} below the code block and its scrollbar`).toBeGreaterThanOrEqual(shown.pre.bottom - 0.5);
       }
     }
-    for (const kind of ["paragraph", "list", "quote", "code", "edited", "other"]) {
+    for (const kind of ["paragraph", "list", "quote", "code", "edited", "empty", "other"]) {
       expect(endings.get(kind) ?? 0, `premise: a message ending in ${kind} was checked (${JSON.stringify([...endings])})`).toBeGreaterThan(0);
     }
     expect(wrapped, "premise: some last lines would have run under the controls, and wrapped").toBeGreaterThan(0);
