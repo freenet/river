@@ -7718,8 +7718,8 @@ mod tests {
         );
         assert!(
             squashed(conversation).contains(
-                "reaction_owner_marks( *reactor_id, &name, &impersonation, owner_id, \
-                 &deputy_badges, )"
+                "reaction_owner_marks( *reactor_id, &name, impersonation, owner_id, \
+                 deputy_badges, )"
             ),
             "the reactor list call site no longer passes `*reactor_id`. Passing \
              the viewer id would flag the real owner"

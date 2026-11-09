@@ -97,8 +97,8 @@ Current behavior:
 - The history follows under every dialog and popover, a DM thread over the
   room included, and is read under all of them except that DM thread: member
   info, room settings, invite and ban dialogs, a reactor list, the
-  reaction picker, and below 48rem the mobile actions sheet and reaction
-  popup (`conversation/mobile_surface.rs`). The reader is at the end anyway when the dialog
+  reaction picker, and below 48rem the mobile message sheet
+  (`conversation/mobile_surface.rs`). The reader is at the end anyway when the dialog
   closes, but those arrivals count as read without having been on screen
   unobstructed.
 - While the reaction picker is open the reader's own wheel and one-finger
@@ -115,21 +115,21 @@ Current behavior:
   mid-drag. A picker whose React is no longer inside the history's view
   (arrivals followed past it, or the conversation was hidden) holds nothing:
   the next wheel or one-finger drag closes it and scrolls as usual.
-- Below 48rem a row tap opens the mobile actions sheet and the + opens the
-  mobile reaction popup, each a native modal `<dialog>`
-  (`conversation/mobile_surface.rs`). While one is open the reader's wheel
+- Below 48rem a row tap, the +, a reaction chip or the row's keyboard entry
+  opens the one mobile message sheet, a native modal `<dialog>`
+  (`conversation/mobile_surface.rs`). While it is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
-  picker holds them, and the panel itself still scrolls (the reaction popup's
-  row of emoji sideways); a zoom (Ctrl+wheel, a pinch) is not held, nothing
-  outside the dialog is captured, and every close path removes the
-  listeners. Either can be dragged down from anywhere on the screen to
-  dismiss it (`conversation/mobile_sheet_drag.rs`): its backdrop and panel
+  picker holds them, and parts of the panel still scroll (the emoji row
+  sideways, a long reactor list vertically); a zoom (Ctrl+wheel, a pinch) is
+  not held, nothing outside the dialog is captured, and every close path
+  removes the listeners. It can be dragged down from anywhere on the screen
+  to dismiss it (`conversation/mobile_sheet_drag.rs`): its backdrop and panel
   take no pan (`touch-action: none`), so the drag never scrolls the
   history, and a second finger cancels it. Unlike the picker,
   a modal keeps holding while its message is still rendered, even after
   arrivals carried that row out of the history's view: only the message
   leaving the history closes it. Arrivals, following, the end hold and reads
-  go on underneath as under the other dialogs, and opening or closing either
+  go on underneath as under the other dialogs, and opening or closing it
   never scrolls the history (focus returns to the row's control with
   `preventScroll`).
 

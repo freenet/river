@@ -18,33 +18,33 @@ import {
   tapRow,
   touchmovePrevented,
   wheelCancelled,
+  panelAtRest,
 } from "./example-room";
 import { DM_PEER, openThread } from "./dm-thread";
 import { deliver, scrollMetrics } from "./history-geometry";
 import { callRiverTest, rekeyThenClick } from "./river-test";
 
 // Below Tailwind's `md` (48rem) a signed message's trailing Reply, Edit and
-// Delete are hidden; a tap on the row opens them, and only them, in a modal
-// actions sheet (mobile_message_actions.rs), and its one reaction + stays
-// visible and opens a separate reaction popup (mobile-reaction-popup.spec.ts).
+// Delete are hidden; a tap on the row opens the modal message sheet
+// (mobile_message_sheet.rs): the emoji row, who reacted, then those actions.
+// Its one reaction + stays visible and opens the same sheet, and so does a
+// reaction chip (mobile-reaction-popup.spec.ts has the reaction half).
 // Width alone decides: a narrow mouse window is mobile, a wide touch screen
 // keeps the desktop footer. These run on every project at the widths they
 // set, so the desktop projects are narrow mouse windows here.
 
-const SHEET = "mobile-message-actions-sheet";
-const POPUP = "mobile-reaction-popup";
+const SHEET = "mobile-message-sheet";
 
 function sheet(page: Page): Locator {
   return page.getByTestId(SHEET);
 }
 
-/// Whether nothing opened: neither mobile surface, and no tap reached them.
+/// Whether nothing opened: no sheet, and no tap reached one.
 async function expectNoSurface(page: Page) {
   await settle(page);
   // Past the double-click window a mouse click waits out before opening.
   await page.waitForTimeout(400);
   await expect(sheet(page)).toBeHidden();
-  await expect(page.getByTestId(POPUP)).toBeHidden();
 }
 
 /// The footer's state below 48rem: the cluster's display, the + per row and
@@ -131,7 +131,7 @@ test.describe("Below 48rem", () => {
     for (const counts of perRow) expect(counts).toEqual([1, 1]);
   });
 
-  test("a tap on a row opens the desktop footer's actions for that exact message, and nothing else", async ({ page }) => {
+  test("a tap on a row opens the sheet for that exact message: the emoji row, then the desktop footer's actions", async ({ page }) => {
     const { received, own, continuation } = await openRoomWithRows(page);
     // Self owns this room: owning it grants no Edit or Delete on another
     // author's message, here or in the footer.
@@ -143,21 +143,22 @@ test.describe("Below 48rem", () => {
     for (const [row, expected] of rows) {
       await openMessageActions(page, row);
       const s = sheet(page);
-      await expect(s, "named, though it shows no title").toHaveAccessibleName("Message actions");
+      await expect(s, "named, though it shows no title").toHaveAccessibleName("Message options");
       await expect(s.getByRole("heading"), "no title").toHaveCount(0);
       await expect(page.getByTestId("mobile-message-actions-close"), "no Close: a tap outside dismisses it").toHaveCount(0);
       const actions = await s.locator(".mobile-sheet-actions button").evaluateAll((bs) =>
         bs.map((b) => b.getAttribute("data-testid")!.replace("mobile-message-action-", "")),
       );
       expect(actions).toEqual(expected);
-      // Actions only: no reaction, shortcut or field in it.
+      // The emoji row above the actions, and no field.
+      await expect(s.getByTestId("mobile-reaction-palette").getByRole("button")).toHaveCount(16);
       await expect(s.locator("input, textarea")).toHaveCount(0);
-      await expect(s.getByText(/React|palette|👍/)).toHaveCount(0);
-      await expect(page.getByTestId(POPUP)).toBeHidden();
-      await expect(row.getByTestId("message-react-button")).toHaveAttribute("aria-expanded", "false");
+      const [paletteBox, actionsBox] = [await s.getByTestId("mobile-reaction-palette").boundingBox(), await s.locator(".mobile-sheet-actions").boundingBox()];
+      expect(paletteBox!.y, "emoji first, actions below").toBeLessThan(actionsBox!.y);
+      await expect(row.getByTestId("message-react-button")).toHaveAttribute("aria-expanded", "true");
       await expect(row.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "true");
-      // Not the keyboard: a button has focus.
-      await expect(s.getByTestId("mobile-message-action-reply")).toBeFocused();
+      // Not the keyboard: an emoji (a button) has focus.
+      await expect(s.locator(".mobile-reaction-palette button:focus")).toHaveCount(1);
       // A tap outside returns focus to the row's entry, without scrolling.
       const before = (await scrollMetrics(page)).top;
       await pressAt(page, await historyPoint(page));
@@ -175,7 +176,7 @@ test.describe("Below 48rem", () => {
     }
   });
 
-  test("controls inside a row keep their own behaviour and open no actions", async ({ page, context }) => {
+  test("controls inside a row keep their own behaviour; its chip and + open the same sheet", async ({ page, context }) => {
     await openRoomWithComposer(page);
     // A link and a mention in raw message HTML, a reply strip, an author
     // name and avatar, a chip and the +.
@@ -211,18 +212,16 @@ test.describe("Below 48rem", () => {
     await expect(chipRow).toHaveCount(1);
     await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
     await press(page, chipRow.getByTestId("reaction-chip"));
-    await settle(page);
-    await expect(sheet(page), "a chip is the chip's").toBeHidden();
-    // Its reactor list (a tap) closes from its backdrop, which opens nothing.
-    if (await page.getByTestId("reaction-owners").isVisible()) {
-      await page.keyboard.press("Escape");
-      await expect(page.getByTestId("reaction-owners")).toBeHidden();
-    }
-    await press(page, chipRow.getByTestId("message-react-button"));
-    await expect(page.getByTestId(POPUP)).toBeVisible();
-    await expect(sheet(page)).toBeHidden();
+    await expect(sheet(page), "a chip opens the row's sheet").toBeVisible();
+    await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(chipRow));
+    await expect(page.getByTestId("reaction-owners"), "not the desktop reactor list").toHaveCount(0);
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId(POPUP)).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
+    await press(page, chipRow.getByTestId("message-react-button"));
+    await expect(sheet(page), "the + opens the same sheet").toBeVisible();
+    await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(chipRow));
+    await page.keyboard.press("Escape");
+    await expect(sheet(page)).toBeHidden();
 
     // The plain part of the same row does open its actions.
     await openMessageActions(page, chipRow);
@@ -279,7 +278,7 @@ test.describe("Below 48rem", () => {
     const backTab = browserName === "webkit" ? "Alt+Shift+Tab" : "Shift+Tab";
     const { own } = await openRoomWithRows(page);
     const entry = own.getByTestId("mobile-message-actions-entry");
-    await expect(entry).toHaveAccessibleName("Message actions");
+    await expect(entry).toHaveAccessibleName("Message options");
     await expect(entry).toHaveAttribute("aria-haspopup", "dialog");
     await expect(entry).toHaveAttribute("aria-controls", SHEET);
     await keyboardFocus(page, entry);
@@ -288,13 +287,13 @@ test.describe("Below 48rem", () => {
     await page.keyboard.press("Enter");
     await expect(sheet(page)).toBeVisible();
     await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(own));
-    const reply = page.getByTestId("mobile-message-action-reply");
+    const first = sheet(page).getByTestId("mobile-reaction-palette").getByRole("button").first();
     const del = page.getByTestId("mobile-message-action-delete");
-    await expect(reply).toBeFocused();
-    // Tab order: Reply, Edit, Delete; wrapping both ways.
+    await expect(first, "the first emoji takes focus").toBeFocused();
+    // Tab order: the 16 emoji, then Reply, Edit, Delete; wrapping both ways.
     await del.focus();
     await page.keyboard.press(tab);
-    await expect(reply, "Tab from the last control wraps to the first").toBeFocused();
+    await expect(first, "Tab from the last control wraps to the first").toBeFocused();
     await page.keyboard.press(backTab);
     await expect(del, "Shift+Tab from the first wraps to the last").toBeFocused();
     expect(await page.locator("dialog[open]").count()).toBe(1);
@@ -316,7 +315,7 @@ test.describe("Below 48rem", () => {
     const hb = (await hamburger.boundingBox())!;
     const point = { x: hb.x + hb.width / 2, y: hb.y + hb.height / 2 };
     const hit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid") ?? null, point);
-    expect(hit, "premise: the backdrop covers the header").toBe("mobile-message-actions-backdrop");
+    expect(hit, "premise: the backdrop covers the header").toBe("mobile-message-sheet-backdrop");
     await pressAt(page, point);
     await expect(sheet(page)).toBeHidden();
     await settle(page);
@@ -457,7 +456,7 @@ test.describe("Below 48rem", () => {
     const receivedKey = await rowKey(received);
     await page.evaluate((receivedKey) => {
       const reply = document.querySelector<HTMLElement>('[data-testid="mobile-message-action-reply"]')!;
-      const backdrop = document.querySelector<HTMLElement>('[data-testid="mobile-message-actions-backdrop"]')!;
+      const backdrop = document.querySelector<HTMLElement>('[data-testid="mobile-message-sheet-backdrop"]')!;
       const entry = document.querySelector<HTMLElement>(`[id="msg-${receivedKey}"] [data-testid="mobile-message-actions-entry"]`)!;
       backdrop.click();
       entry.click();
@@ -621,7 +620,10 @@ function panelGeometry(page: Page, id: string) {
     const r = panel.getBoundingClientRect();
     const buttons = Array.from(panel.querySelectorAll("button")).map((b) => {
       const br = b.getBoundingClientRect();
-      return { id: b.getAttribute("data-testid") ?? b.textContent, w: br.width, h: br.height, left: br.left, right: br.right };
+      // An emoji past the row's edge is reached by scrolling the row.
+      const inRow = b.closest(".mobile-reaction-palette");
+      const right = inRow ? Math.min(br.right, inRow.getBoundingClientRect().right) : br.right;
+      return { id: b.getAttribute("data-testid") ?? b.textContent, w: br.width, h: br.height, left: br.left, right };
     });
     return {
       vw: document.documentElement.clientWidth,
@@ -646,6 +648,7 @@ test.describe("The actions sheet at 320px", () => {
     for (const scheme of ["light", "dark"] as const) {
       await page.emulateMedia({ colorScheme: scheme });
       await openMessageActions(page, own);
+      await panelAtRest(page, SHEET);
       const g = await panelGeometry(page, SHEET);
       expect(g.overflowX, "no page overflow").toBe(false);
       expect(g.left).toBeGreaterThanOrEqual(0);
@@ -691,7 +694,7 @@ test.describe("At 48rem and wider", () => {
     await expect(react).toHaveAttribute("aria-controls", "reaction-picker");
     await press(page, react);
     await expect(page.getByTestId("emoji-picker")).toBeVisible();
-    await expect(page.getByTestId(POPUP)).toBeHidden();
+    await expect(page.getByTestId(SHEET)).toBeHidden();
   });
 });
 
@@ -760,10 +763,10 @@ test.describe("Inside the gateway's sandboxed frame", () => {
     await expect(s).toHaveAttribute("data-target-row", await rowKey(row));
     const panel = await s.locator(".mobile-sheet-panel").boundingBox();
     expect(panel!.y + panel!.height, "bottom-aligned in the frame").toBeGreaterThan(740);
-    await frame.getByTestId("mobile-message-actions-backdrop").click({ position: { x: 40, y: 120 } });
+    await frame.getByTestId("mobile-message-sheet-backdrop").click({ position: { x: 40, y: 120 } });
     await expect(s).toBeHidden();
     await row.getByTestId("message-react-button").click();
-    await expect(frame.getByTestId(POPUP)).toBeVisible();
+    await expect(frame.getByTestId(SHEET)).toBeVisible();
     await expect(frame.getByTestId("mobile-reaction-palette").getByRole("button").first()).toBeFocused();
   });
 });

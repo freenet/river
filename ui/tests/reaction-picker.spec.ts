@@ -886,7 +886,7 @@ test.describe("While the reaction picker is open", () => {
 
     await page.setViewportSize({ width: 390, height: 844 });
     await expectClosed(page);
-    await expect(row.getByTestId("message-react-button"), "now the popup's").toHaveAttribute("aria-controls", "mobile-reaction-popup");
+    await expect(row.getByTestId("message-react-button"), "now the popup's").toHaveAttribute("aria-controls", "mobile-message-sheet");
     const view = (await page.locator("#chat-scroll-container").boundingBox())!;
     const [x, y] = [view.x + 30, view.y + 30];
     expect(await wheelCancelled(page, x, y, false), "the wheel is not held").toBe(false);

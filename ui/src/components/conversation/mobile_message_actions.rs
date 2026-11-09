@@ -1,8 +1,8 @@
-//! The mobile actions sheet: below 48rem, a tap on a signed message opens
-//! Reply, and Edit and Delete on your own, for that exact message, and nothing
-//! else (no reactions: its + opens the reaction popup,
-//! `mobile_reaction_popup.rs`). `mobile_surface.rs` has what the two mobile
-//! surfaces share.
+//! How a row opens the mobile message sheet (`mobile_message_sheet.rs`):
+//! below 48rem, a tap on a signed message, or its keyboard entry, opens the
+//! sheet for that exact message. Its + and its chips open the same sheet
+//! (`reaction_picker.rs`, `conversation.rs`). `mobile_surface.rs` has the
+//! sheet's state and lifecycle.
 //!
 //! Row taps ([`row_tap`], [`row_clicked`]). One ordinary tap on a message's
 //! non-interactive content or background opens it. Anything with a behaviour
@@ -25,36 +25,16 @@
 //! Keyboard. Each row has one visually hidden native button
 //! ([`MobileActionsEntry`]), shown on keyboard focus, which opens the same
 //! sheet. The row's own semantics are untouched: no `role="button"` around its
-//! Markdown.
-//!
-//! The sheet focuses its first action, never a field, so it never brings up
-//! the software keyboard. Reply, Edit and Delete close it first and then hand
-//! over to the existing flows (the composer's reply, the inline editor via
-//! `edit_trigger`, the delete confirmation), which take focus; an ordinary
-//! dismissal returns focus to the row's entry. What an action does is decided
-//! when it runs, from the room as it is then (`Conversation`'s
-//! `on_mobile_action`).
+//! Markdown. The entry is also the row's hook into an open sheet: it keeps
+//! the sheet's reactions in step with the row, and its unmounting is how the
+//! sheet learns its message left.
 
-use super::mobile_surface::{
-    narrow_now, opening_is_live, use_show_on_open, MobileDialogFrame, MobileOpening, MobileSurface,
-    SHEET_ID,
-};
+use super::mobile_message_sheet::SheetReaction;
+use super::mobile_surface::{narrow_now, MobileOpening, Origin, SHEET_ID};
 use super::reaction_picker::ReactionSurfaces;
-
-use crate::components::icons::{line_icon, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH};
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
-
-/// The sheet's first action, which takes focus when it opens.
-const REPLY_SELECTOR: &str = "[data-testid=\"mobile-message-action-reply\"]";
-
-/// One of the sheet's actions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MobileAction {
-    Reply,
-    Edit,
-    Delete,
-}
+use std::rc::Rc;
 
 /// The message's own controls and the marked exclusions: a click inside any
 /// of these is that control's, never the row's.
@@ -160,7 +140,7 @@ pub(super) fn note_row_release(e: &PointerEvent, cancelled: bool) {
     }
 }
 
-/// What a click on a row does to its actions sheet.
+/// What a click on a row does to its sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowTap {
     Nothing,
@@ -173,16 +153,48 @@ enum RowTap {
     OpenAfterWindow,
 }
 
-/// A click on `row` (message `message`, the reader's own if `own`), from its
-/// handler: opens its actions sheet now, after the double-click window, or
-/// not at all ([`row_tap`]). Every row click, whatever it does, cancels a
-/// click still waiting. A row being edited opens nothing.
+/// The message a row opens the sheet for, as the row renders it.
+#[derive(Clone)]
+pub(super) struct RowTarget {
+    pub(super) row: String,
+    pub(super) message: MessageId,
+    /// The message is the reader's own.
+    pub(super) own: bool,
+    /// The reader's own reaction on it.
+    pub(super) current: Option<String>,
+    pub(super) reactions: Rc<Vec<SheetReaction>>,
+}
+
+impl RowTarget {
+    fn opening(self, origin: Origin) -> MobileOpening {
+        MobileOpening::new(
+            origin,
+            self.row,
+            self.message,
+            self.own,
+            self.current,
+            self.reactions,
+        )
+    }
+}
+
+/// Open the sheet for `target`, from `origin`'s handler. The opening is
+/// committed deferred.
+pub(super) fn open_sheet(surfaces: ReactionSurfaces, target: RowTarget, origin: Origin) {
+    let opening = target.opening(origin);
+    crate::util::defer(move || {
+        surfaces.open_mobile(opening);
+    });
+}
+
+/// A click on `target`'s row, from its handler: opens its sheet now, after
+/// the double-click window, or not at all ([`row_tap`]). Every row click,
+/// whatever it does, cancels a click still waiting. A row being edited opens
+/// nothing.
 pub(super) fn row_clicked(
     surfaces: ReactionSurfaces,
     e: &MouseEvent,
-    row: String,
-    message: MessageId,
-    own: bool,
+    target: RowTarget,
     editing: bool,
 ) {
     let click = ROW_CLICKS.with(|c| {
@@ -190,21 +202,21 @@ pub(super) fn row_clicked(
         c.set(next);
         next
     });
-    let tap = row_tap(e, &row);
+    let tap = row_tap(e, &target.row);
     if editing || tap == RowTap::Nothing {
         return;
     }
-    let opening = MobileOpening::new(MobileSurface::Actions, row.clone(), message, own, None);
     if tap == RowTap::Open {
-        open_actions(surfaces, opening);
+        open_sheet(surfaces, target, Origin::Entry);
         return;
     }
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(crate::util::millis(ROW_DOUBLE_CLICK_WAIT_MS)).await;
-        let still =
-            ROW_CLICKS.with(|c| c.get()) == click && narrow_now() && !row_has_selection(&row);
+        let still = ROW_CLICKS.with(|c| c.get()) == click
+            && narrow_now()
+            && !row_has_selection(&target.row);
         if still {
-            open_actions(surfaces, opening);
+            open_sheet(surfaces, target, Origin::Entry);
         }
     });
 }
@@ -234,7 +246,7 @@ fn row_has_selection(row: &str) -> bool {
     }
 }
 
-/// Whether this click on `row` is a tap that opens its actions: below 48rem,
+/// Whether this click on `row` is a tap that opens its sheet: below 48rem,
 /// a plain primary single click, on nothing interactive, completing no
 /// selection, from a press on this row that neither moved nor was spoiled. A
 /// click with no press of its own (assistive technology) counts. Consumes
@@ -331,17 +343,11 @@ fn press_makes_tap(press: Option<&RowPress>, row: &str, x: f64, y: f64, now: f64
     }
 }
 
-/// Open the actions sheet for `opening`, from a row tap or the entry. From
-/// the event handler; the opening is committed deferred.
-fn open_actions(surfaces: ReactionSurfaces, opening: MobileOpening) {
-    crate::util::defer(move || {
-        surfaces.open_mobile(opening);
-    });
-}
-
-/// A row's keyboard way into its actions sheet: a native button, visually
-/// hidden until it has keyboard focus, below 48rem only (`main.css`). Rendered
-/// in every signed row not being edited.
+/// A row's keyboard way into its sheet: a native button, visually hidden
+/// until it has keyboard focus, below 48rem only (`main.css`). Rendered in
+/// every signed row not being edited. While the sheet is open for its row it
+/// keeps the sheet's current reaction and reactor list in step with the row
+/// (a reaction landing from another device, or one still being signed).
 #[component]
 pub(super) fn MobileActionsEntry(
     surfaces: ReactionSurfaces,
@@ -350,26 +356,48 @@ pub(super) fn MobileActionsEntry(
     message: MessageId,
     /// The message is the reader's own.
     own: bool,
+    /// The reader's own reaction on it, if any.
+    current: Option<String>,
+    /// Its reactions, as its chips show them.
+    reactions: Rc<Vec<SheetReaction>>,
 ) -> Element {
     // Infallible, deliberately: `Conversation`'s own `use_signal`, written
     // only from deferred callbacks.
-    let expanded = surfaces
-        .mobile
-        .read()
-        .as_ref()
-        .is_some_and(|o| o.is_for(MobileSurface::Actions, &row));
+    let (expanded, stale) = match surfaces.mobile.read().as_ref() {
+        Some(open) if open.is_for(&row) => {
+            (true, open.current != current || open.reactions != reactions)
+        }
+        _ => (false, false),
+    };
+    if stale {
+        let (row, current, reactions) = (row.clone(), current.clone(), reactions.clone());
+        let mut opening = surfaces.mobile;
+        crate::util::defer(move || {
+            let stale = opening.peek().as_ref().is_some_and(|o| {
+                o.is_for(&row) && (o.current != current || o.reactions != reactions)
+            });
+            if stale {
+                opening.with_mut(|o| {
+                    if let Some(o) = o.as_mut() {
+                        o.current = current;
+                        o.reactions = reactions;
+                    }
+                });
+            }
+        });
+    }
     // Its row leaving the history closes a sheet open for it; the row only
-    // remounting keeps it, and focus returns to the new entry.
+    // remounting keeps it, and focus returns to the new control.
     {
         let row = row.clone();
-        use_drop(move || surfaces.mobile_control_unmounting(MobileSurface::Actions, &row));
+        use_drop(move || surfaces.mobile_control_unmounting(&row));
     }
     rsx! {
         button {
             r#type: "button",
             "data-testid": "mobile-message-actions-entry",
             class: "mobile-actions-entry",
-            "aria-label": "Message actions",
+            "aria-label": "Message options",
             "aria-haspopup": "dialog",
             "aria-controls": SHEET_ID,
             "aria-expanded": "{expanded}",
@@ -377,94 +405,16 @@ pub(super) fn MobileActionsEntry(
                 if !narrow_now() {
                     return;
                 }
-                let opening = MobileOpening::new(
-                    MobileSurface::Actions,
-                    row.clone(),
-                    message.clone(),
+                let target = RowTarget {
+                    row: row.clone(),
+                    message: message.clone(),
                     own,
-                    None,
-                );
-                open_actions(surfaces, opening);
+                    current: current.clone(),
+                    reactions: reactions.clone(),
+                };
+                open_sheet(surfaces, target, Origin::Entry);
             },
-            "Actions"
-        }
-    }
-}
-
-/// An action for opening `token`, run deferred: the sheet closes first, then,
-/// if that opening was still the open one and still live, the action is
-/// handed to `Conversation`, which checks it against the room as it is now.
-fn dispatch(
-    surfaces: ReactionSurfaces,
-    token: u64,
-    action: MobileAction,
-    on_action: Callback<(MobileAction, String, MessageId)>,
-) {
-    let Some(opening) = surfaces.mobile_opening_for(MobileSurface::Actions, token) else {
-        return;
-    };
-    let live = opening_is_live(&opening);
-    surfaces.close_mobile(false);
-    if live {
-        on_action.call((action, opening.row, opening.message));
-    }
-}
-
-/// The conversation's one mobile actions sheet. Rendered once by
-/// `Conversation`, closed until a row tap or entry opens it below 48rem.
-#[component]
-pub(super) fn MobileMessageActionsSheet(
-    surfaces: ReactionSurfaces,
-    on_action: Callback<(MobileAction, String, MessageId)>,
-) -> Element {
-    // Infallible, deliberately: `Conversation`'s own `use_signal`, written
-    // only from deferred callbacks, so no write is live during a render.
-    let opening = surfaces
-        .mobile
-        .read()
-        .clone()
-        .filter(|o| o.surface == MobileSurface::Actions);
-    let own = opening.as_ref().is_some_and(|o| o.own);
-    let target_row = opening.as_ref().map(|o| o.row.clone()).unwrap_or_default();
-    // Shown once its contents are this opening's; its first action takes focus.
-    use_show_on_open(surfaces, MobileSurface::Actions, &[REPLY_SELECTOR]);
-    let act = move |action: MobileAction| {
-        move |_| {
-            if let Some(token) = surfaces.mobile_token(MobileSurface::Actions) {
-                crate::util::defer(move || dispatch(surfaces, token, action, on_action));
-            }
-        }
-    };
-    rsx! {
-        MobileDialogFrame { surfaces, surface: MobileSurface::Actions, target_row,
-            div { class: "mobile-sheet-actions",
-                button {
-                    r#type: "button",
-                    "data-testid": "mobile-message-action-reply",
-                    class: "mobile-sheet-action",
-                    onclick: act(MobileAction::Reply),
-                    {line_icon(REPLY_ICON_PATH, 20)}
-                    span { "Reply" }
-                }
-                if own {
-                    button {
-                        r#type: "button",
-                        "data-testid": "mobile-message-action-edit",
-                        class: "mobile-sheet-action",
-                        onclick: act(MobileAction::Edit),
-                        {line_icon(EDIT_ICON_PATH, 20)}
-                        span { "Edit" }
-                    }
-                    button {
-                        r#type: "button",
-                        "data-testid": "mobile-message-action-delete",
-                        class: "mobile-sheet-action mobile-sheet-action--danger",
-                        onclick: act(MobileAction::Delete),
-                        {line_icon(DELETE_ICON_PATH, 20)}
-                        span { "Delete" }
-                    }
-                }
-            }
+            "Options"
         }
     }
 }

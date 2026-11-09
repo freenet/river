@@ -1,50 +1,56 @@
-//! What the two mobile message surfaces share: the width they appear at, what
-//! one is open for, and the modal dialog both are drawn in.
+//! The mobile message sheet's state, frame and lifecycle: the width it
+//! appears at, what it is open for, and the modal dialog it is drawn in.
 //!
 //! Below Tailwind's `md` (48rem) a message row's trailing Reply, Edit and
-//! Delete are hidden. A tap on the row opens its **actions sheet**
-//! (`mobile_message_actions.rs`); a tap on its reaction + opens a separate
-//! **reaction popup**: one row of emoji that scrolls sideways
-//! (`mobile_reaction_popup.rs`). At 48rem and wider neither exists: the footer
-//! and the anchored reaction picker (`reaction_picker.rs`) are as before.
+//! Delete are hidden. A tap on the row, on its reaction +, or on one of its
+//! reaction chips, or its keyboard entry, opens the one **message sheet**
+//! (`mobile_message_sheet.rs`): the 16 emoji in a row that scrolls sideways,
+//! who reacted, then Reply, and Edit and Delete on your own. Row taps and the
+//! entry are `mobile_message_actions.rs`. At 48rem and wider it does not
+//! exist: the footer, the anchored reaction picker (`reaction_picker.rs`) and
+//! the chips' reactor lists are as before.
 //!
 //! Ownership. One [`MobileOpening`] at a time lives in the `mobile` signal of
-//! the conversation's [`ReactionSurfaces`], so opening either mobile
-//! surface closes the desktop picker and the open reactor list, and opening the
-//! picker or a list closes a mobile surface: at most one is open. Groups pass
-//! the handle on without reading it (#830); the per-row entries, the hosts and
+//! the conversation's [`ReactionSurfaces`], so opening the sheet closes the
+//! desktop picker and the open reactor list, and opening the picker or a list
+//! closes the sheet: at most one is open. Groups pass the handle on without
+//! reading it (#830); the per-row entries, the sheet and
 //! [`MobileSurfaceGuard`] render from it. Every write is deferred
 //! (dioxus-signal-safety.md).
 //!
 //! An opening is one press: it carries a fresh token, the room and which
 //! showing of it ([`super::reaction_picker::note_room_shown`]), the room's
 //! contract key at the time (a re-key is another generation, which the showing
-//! counter does not see), and the row. Work queued for it (a reaction, an
-//! action, focus) runs only while that same token is still the open one and the
-//! opening is still live ([`opening_is_live`]): a dismissal and reopening of the
-//! same message is a new token, so an older queued reaction does nothing.
+//! counter does not see), the row, the control it opened from ([`Origin`]),
+//! and what the row showed of the message's reactions. Work queued for it (a
+//! reaction, an action, focus) runs only while that same token is still the
+//! open one and the opening is still live ([`opening_is_live`]): a dismissal
+//! and reopening of the same message is a new token, so an older queued
+//! reaction does nothing.
 //!
-//! Neither surface has a field, so neither brings up the software keyboard.
-//! Each is committed deferred and shown after the render that fills it
-//! ([`use_show_on_open`]), focus on one of its buttons.
+//! The sheet has no field, so it never brings up the software keyboard. It is
+//! committed deferred and shown after the render that fills it
+//! ([`use_show_on_open`]), focus on the reader's current reaction or else the
+//! first emoji.
 //!
-//! Both surfaces are a native modal `<dialog>` (`showModal`): it is in the top
+//! The sheet is a native modal `<dialog>` (`showModal`): it is in the top
 //! layer above the header, history, composer and Latest; the rest of the page
 //! is inert, so a tap on the backdrop reaches nothing underneath and Tab stays
 //! inside (also wrapped here, [`dom::contain_tab`]). Escape closes it natively;
-//! the dialog's own `close` event brings the state back in line. While one is
+//! the dialog's own `close` event brings the state back in line. While it is
 //! open the reader's wheel and one-finger touch scrolling outside its panel are
 //! held off ([`dom::hold_background`]), a zoom (Ctrl+wheel, a pinch) is not,
 //! and nothing outside the dialog is captured. Arrivals, following, the end
 //! hold and reads go on underneath (history-scrolling.md); opening or closing
-//! one never moves the history.
+//! it never moves the history.
 //!
-//! Dismissal. Neither has a title or Close button: their title is the
-//! dialog's accessible name. A tap outside slides the panel away, and a
-//! downward drag starting anywhere on the screen drags it and dismisses it
-//! once far or fast enough (`mobile_sheet_drag.rs`). Escape and a choice
-//! (an emoji, an action) close it at once.
+//! Dismissal. It has no title or Close button: its title is the dialog's
+//! accessible name. A tap outside slides the panel away, and a downward drag
+//! starting anywhere on the screen drags it and dismisses it once far or fast
+//! enough (`mobile_sheet_drag.rs`). Escape and a choice (an emoji, an action)
+//! close it at once.
 
+use super::mobile_message_sheet::SheetReaction;
 use super::reaction_picker::{shown_room, ReactionSurfaces};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use dioxus::prelude::*;
@@ -52,64 +58,51 @@ use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractKey;
 use river_core::room_state::message::MessageId;
 use std::cell::Cell;
+use std::rc::Rc;
 
 /// Below Tailwind's `md`: the exact complement of `(min-width: 48rem)`, so no
 /// fractional width between 767px and 768px belongs to neither. `main.css`
 /// uses the same query.
 const NARROW_QUERY: &str = "not all and (min-width: 48rem)";
 
-/// The actions sheet's dialog.
-pub(super) const SHEET_ID: &str = "mobile-message-actions-sheet";
-/// The reaction popup's dialog.
-pub(super) const POPUP_ID: &str = "mobile-reaction-popup";
+/// The sheet's dialog.
+pub(super) const SHEET_ID: &str = "mobile-message-sheet";
+/// Its dialog's accessible name.
+const SHEET_TITLE: &str = "Message options";
+/// The row's keyboard entry: rendered while the row has the sheet at all
+/// (signed, not being edited), so its presence is what keeps an opening live.
+const ENTRY_SELECTOR: &str = "[data-testid=\"mobile-message-actions-entry\"]";
+/// The row's reaction +.
+pub(super) const REACT_SELECTOR: &str = "[data-testid=\"message-react-button\"]";
 
-/// Which mobile surface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MobileSurface {
-    /// The row's Reply, Edit and Delete.
-    Actions,
-    /// The row of reactions.
-    Reaction,
+/// The control a sheet opened from, which focus returns to when it is
+/// dismissed. A row tap returns to the row's entry, as its keyboard way in.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Origin {
+    /// The row itself, or its keyboard entry.
+    Entry,
+    /// The row's reaction +.
+    React,
+    /// One of its reaction chips, by element id.
+    Chip(String),
 }
 
-impl MobileSurface {
-    fn dialog_id(self) -> &'static str {
-        match self {
-            Self::Actions => SHEET_ID,
-            Self::Reaction => POPUP_ID,
-        }
-    }
-
-    /// What its frame's test ids start with.
-    fn prefix(self) -> &'static str {
-        match self {
-            Self::Actions => "mobile-message-actions",
-            Self::Reaction => "mobile-reaction",
-        }
-    }
-
-    /// Its dialog's accessible name.
-    fn title(self) -> &'static str {
-        match self {
-            Self::Actions => "Message actions",
-            Self::Reaction => "React to message",
-        }
-    }
-
-    /// The row's control this surface opens from, and returns focus to.
+impl Origin {
+    /// The control in the row, as a selector.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    fn control_selector(self) -> &'static str {
+    fn control_selector(&self) -> String {
         match self {
-            Self::Actions => "[data-testid=\"mobile-message-actions-entry\"]",
-            Self::Reaction => "[data-testid=\"message-react-button\"]",
+            Self::Entry => ENTRY_SELECTOR.to_string(),
+            Self::React => REACT_SELECTOR.to_string(),
+            Self::Chip(id) => format!("[id=\"{id}\"]"),
         }
     }
 }
 
-/// What a mobile surface is open for: one press on one message.
+/// What the sheet is open for: one press on one message.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct MobileOpening {
-    pub(super) surface: MobileSurface,
+    pub(super) origin: Origin,
     /// This opening, among every mobile opening on the page.
     pub(super) token: u64,
     room: Option<VerifyingKey>,
@@ -123,9 +116,12 @@ pub(super) struct MobileOpening {
     /// Shown from this; checked again against the room when an action runs.
     pub(super) own: bool,
     /// The reader's own reaction on it, as its footer last rendered it
-    /// (pending ones included). Only marks the popup's current choice: the
+    /// (pending ones included). Only marks the sheet's current choice: the
     /// pending-aware toggle decides from the room itself.
     pub(super) current: Option<String>,
+    /// Its reactions and who made them, as its row last rendered them: what
+    /// the sheet lists. Kept in step by the row's entry.
+    pub(super) reactions: Rc<Vec<SheetReaction>>,
 }
 
 thread_local! {
@@ -145,15 +141,16 @@ impl MobileOpening {
     /// A new opening, now: a fresh token, and the room, showing and
     /// generation the history shows.
     pub(super) fn new(
-        surface: MobileSurface,
+        origin: Origin,
         row: String,
         message: MessageId,
         own: bool,
         current: Option<String>,
+        reactions: Rc<Vec<SheetReaction>>,
     ) -> Self {
         let (room, visit) = shown_room();
         Self {
-            surface,
+            origin,
             token: next_token(),
             room,
             visit,
@@ -162,12 +159,13 @@ impl MobileOpening {
             message,
             own,
             current,
+            reactions,
         }
     }
 
-    /// Whether this is `surface`'s opening for `row`.
-    pub(super) fn is_for(&self, surface: MobileSurface, row: &str) -> bool {
-        self.surface == surface && self.row == row
+    /// Whether this is an opening for `row`.
+    pub(super) fn is_for(&self, row: &str) -> bool {
+        self.row == row
     }
 }
 
@@ -189,7 +187,7 @@ pub(super) fn opening_is_live(opening: &MobileOpening) -> bool {
     let (shown, visit) = shown_room();
     let current_room = CURRENT_ROOM.try_peek().ok().and_then(|r| r.owner_key);
     opening_matches(opening, shown, visit, current_room, live_contract_key())
-        && dom::row_control_exists(&opening.row, opening.surface)
+        && dom::row_control(&opening.row, ENTRY_SELECTOR).is_some()
 }
 
 /// [`opening_is_live`]'s room and generation half, pure for native tests.
@@ -215,29 +213,15 @@ impl ReactionSurfaces {
         self.mobile.try_peek().ok().and_then(|o| o.clone())
     }
 
-    /// Open `opening`'s surface, closing the desktop picker, a reactor list
-    /// and the other mobile surface first. Nothing is opened for an opening
-    /// already gone. Whether it is open. From a deferred callback only.
+    /// Open the sheet for `opening`, closing the desktop picker and a
+    /// reactor list first. Nothing is opened for an opening already gone.
+    /// Whether it is open. From a deferred callback only.
     pub(super) fn open_mobile(self, opening: MobileOpening) -> bool {
-        let current = self.mobile_opening();
         if !narrow_now() || !opening_is_live(&opening) {
-            // Only a dialog no opening holds: a press superseded by a later
-            // one must not take the later one's dialog away.
-            if current
-                .as_ref()
-                .is_none_or(|o| o.surface != opening.surface)
-            {
-                dom::close_dialog(opening.surface.dialog_id());
-            }
             return false;
         }
         self.close();
         self.close_owner_list_now();
-        if let Some(old) = current {
-            if old.surface != opening.surface {
-                dom::close_dialog(old.surface.dialog_id());
-            }
-        }
         let mut slot = self.mobile;
         slot.set(Some(opening));
         dom::hold_background(true);
@@ -256,26 +240,25 @@ impl ReactionSurfaces {
     pub(super) fn close_mobile(self, restore: bool) {
         let open = self.mobile_opening();
         dom::close_dialog(SHEET_ID);
-        dom::close_dialog(POPUP_ID);
         dom::hold_background(false);
         dom::track_viewport(false);
         let Some(open) = open else {
             return;
         };
         if restore && opening_is_live(&open) {
-            dom::focus_control(&open.row, open.surface);
+            dom::focus_control(&open.row, &open.origin.control_selector());
         }
         let mut slot = self.mobile;
         // A statement, so the write guard drops before `slot` does.
         let _ = slot.try_write().map(|mut slot| *slot = None);
     }
 
-    /// Close `surface`'s opening `token`, focus back on its control, if it is
-    /// still the open one: the end of a slide away (`mobile_sheet_drag.rs`),
-    /// which may come twice. From a deferred callback only.
+    /// Close opening `token`, focus back on its control, if it is still the
+    /// open one: the end of a slide away (`mobile_sheet_drag.rs`), which may
+    /// come twice. From a deferred callback only.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub(super) fn dismiss_opening(self, surface: MobileSurface, token: u64) {
-        if self.mobile_opening_for(surface, token).is_some() {
+    pub(super) fn dismiss_opening(self, token: u64) {
+        if self.mobile_opening_for(token).is_some() {
             self.close_mobile(true);
         }
     }
@@ -288,32 +271,32 @@ impl ReactionSurfaces {
         }
     }
 
-    /// `surface`'s dialog closed by itself (Escape): bring the state in line
-    /// and return focus. Nothing if it is open again by now (a close and an
+    /// The dialog closed by itself (Escape): bring the state in line and
+    /// return focus. Nothing if it is open again by now (a close and an
     /// opening in one task). From a deferred callback only.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    fn mobile_dialog_closed(self, surface: MobileSurface) {
+    fn mobile_dialog_closed(self) {
         let open = self.mobile_opening();
-        if open.is_some_and(|o| o.surface == surface) && !dom::dialog_open(surface.dialog_id()) {
+        if open.is_some() && !dom::dialog_open(SHEET_ID) {
             self.close_mobile(true);
         }
     }
 
-    /// `row`'s control for `surface` is unmounting (from its `use_drop`). If
-    /// the opening open for it now is still live when the deferred check runs,
-    /// its row only remounted: it stays open, and focus returns to the new
-    /// control when it closes. Otherwise it closes, silently.
-    pub(super) fn mobile_control_unmounting(self, surface: MobileSurface, row: &str) {
+    /// `row`'s entry is unmounting (from its `use_drop`). If the opening
+    /// open for it now is still live when the deferred check runs, its row
+    /// only remounted: it stays open, and focus returns to the new control
+    /// when it closes. Otherwise it closes, silently.
+    pub(super) fn mobile_control_unmounting(self, row: &str) {
         let Some(token) = self
             .mobile_opening()
-            .filter(|o| o.is_for(surface, row))
+            .filter(|o| o.is_for(row))
             .map(|o| o.token)
         else {
             return;
         };
         crate::util::defer(move || {
             if self
-                .mobile_opening_for(surface, token)
+                .mobile_opening_for(token)
                 .is_some_and(|o| !opening_is_live(&o))
             {
                 self.close_mobile(false);
@@ -321,23 +304,15 @@ impl ReactionSurfaces {
         });
     }
 
-    /// The open opening for `surface`, if `token` is it. Read when queued work
-    /// runs.
-    pub(super) fn mobile_opening_for(
-        self,
-        surface: MobileSurface,
-        token: u64,
-    ) -> Option<MobileOpening> {
-        self.mobile_opening()
-            .filter(|o| o.surface == surface && o.token == token)
+    /// The open opening, if `token` is it. Read when queued work runs.
+    pub(super) fn mobile_opening_for(self, token: u64) -> Option<MobileOpening> {
+        self.mobile_opening().filter(|o| o.token == token)
     }
 
-    /// The token of the open `surface`, now. Taken by a press, which queues
-    /// work for that opening only.
-    pub(super) fn mobile_token(self, surface: MobileSurface) -> Option<u64> {
-        self.mobile_opening()
-            .filter(|o| o.surface == surface)
-            .map(|o| o.token)
+    /// The open opening's token, now. Taken by a press, which queues work
+    /// for that opening only.
+    pub(super) fn mobile_token(self) -> Option<u64> {
+        self.mobile_opening().map(|o| o.token)
     }
 }
 
@@ -404,7 +379,7 @@ pub(super) fn MobileSurfaceGuard(
     if let Some(open) = open {
         if !narrow || !in_chat || open.contract != contract_key {
             crate::util::defer(move || {
-                let still_open = surfaces.mobile_opening_for(open.surface, open.token);
+                let still_open = surfaces.mobile_opening_for(open.token);
                 let gone = !narrow_now()
                     || MOBILE_VIEW
                         .try_peek()
@@ -424,64 +399,48 @@ pub(super) fn MobileSurfaceGuard(
     rsx! {}
 }
 
-/// Show `surface`'s dialog once per opening, after the render that filled it,
-/// and focus the first of `focus` that matches: a button, so never the
-/// keyboard. Once per token: an effect run after Escape closed it, before the
-/// state follows, must not show it again.
-pub(super) fn use_show_on_open(
-    surfaces: ReactionSurfaces,
-    surface: MobileSurface,
-    focus: &'static [&'static str],
-) {
+/// Show the sheet once per opening, after the render that filled it, and
+/// focus the first of `focus` that matches: a button, so never the keyboard.
+/// A new opening starts at rest, even in a dialog still open: one still
+/// sliding away from an earlier opening comes back. Once per token: an effect
+/// run after Escape closed it, before the state follows, must not show it
+/// again.
+pub(super) fn use_show_on_open(surfaces: ReactionSurfaces, focus: &'static [&'static str]) {
     let shown_token = use_hook(|| std::rc::Rc::new(Cell::new(0u64)));
     use_effect(move || {
         // Infallible, deliberately: `Conversation`'s own `use_signal`, written
         // only from deferred callbacks.
-        let token = surfaces
-            .mobile
-            .read()
-            .as_ref()
-            .filter(|o| o.surface == surface)
-            .map(|o| o.token);
+        let token = surfaces.mobile.read().as_ref().map(|o| o.token);
         let Some(token) = token else {
             return;
         };
-        let first_run = shown_token.replace(token) != token;
-        let id = surface.dialog_id();
-        // A new opening starts at rest, even in a dialog still open: one
-        // still sliding away from an earlier opening comes back.
-        if first_run {
-            super::mobile_sheet_drag::reset(id);
+        if shown_token.replace(token) == token {
+            return;
         }
-        if first_run && !dom::dialog_open(id) && dom::show_dialog(id) {
-            dom::focus_in(id, focus);
+        super::mobile_sheet_drag::reset(SHEET_ID);
+        if !dom::dialog_open(SHEET_ID) && dom::show_dialog(SHEET_ID) {
+            dom::focus_in(SHEET_ID, focus);
         }
     });
 }
 
-/// The modal dialog both mobile surfaces are drawn in: the dialog (its own
+/// The modal dialog the sheet is drawn in: the dialog (its own
 /// `close` event brings the state in line, Tab stays inside, and a downward
 /// drag anywhere on it dismisses it), the backdrop (a tap slides it away),
-/// and the panel with its handle. Each surface renders only its body, as
-/// `children`, after the handle.
+/// and the panel with its handle. The sheet renders its body as `children`,
+/// after the handle.
 #[component]
 pub(super) fn MobileDialogFrame(
     surfaces: ReactionSurfaces,
-    surface: MobileSurface,
-    /// The open opening's row, if it is this surface's.
+    /// The open opening's row, if any.
     target_row: String,
     children: Element,
 ) -> Element {
-    let (id, prefix, title) = (surface.dialog_id(), surface.prefix(), surface.title());
+    let (id, prefix, title) = (SHEET_ID, SHEET_ID, SHEET_TITLE);
     // Infallible, deliberately: `Conversation`'s own `use_signal`, written
     // only from deferred callbacks. The drag reads it from the DOM, so a
     // slide away closes only the opening it began on.
-    let token = surfaces
-        .mobile
-        .read()
-        .as_ref()
-        .filter(|o| o.surface == surface)
-        .map_or(0, |o| o.token);
+    let token = surfaces.mobile.read().as_ref().map_or(0, |o| o.token);
     // The drag's listeners, for as long as the frame lives.
     #[cfg(target_arch = "wasm32")]
     let drag_listeners = use_hook(|| {
@@ -509,11 +468,11 @@ pub(super) fn MobileDialogFrame(
                 #[cfg(target_arch = "wasm32")]
                 {
                     let listener = dom::on_dialog_close(id, move || {
-                        crate::util::defer(move || surfaces.mobile_dialog_closed(surface));
+                        crate::util::defer(move || surfaces.mobile_dialog_closed());
                     });
                     *close_listener.borrow_mut() = listener;
                     *drag_listeners.borrow_mut() =
-                        super::mobile_sheet_drag::install(id, surface, surfaces);
+                        super::mobile_sheet_drag::install(id, surfaces);
                 }
             },
             onkeydown: move |e: KeyboardEvent| {
@@ -527,7 +486,7 @@ pub(super) fn MobileDialogFrame(
             div {
                 "data-testid": "{prefix}-backdrop",
                 class: "mobile-sheet-backdrop",
-                onclick: move |_| super::mobile_sheet_drag::animate_out(id, surface, surfaces),
+                onclick: move |_| super::mobile_sheet_drag::animate_out(id, surfaces),
             }
             div { class: "mobile-sheet-panel",
                 div { class: "mobile-sheet-handle", "aria-hidden": "true" }
@@ -537,17 +496,16 @@ pub(super) fn MobileDialogFrame(
     }
 }
 
-/// Whether a mobile surface's dialog is open, for the reload's busy check and
-/// the reactor list's focus handoff.
+/// Whether the sheet's dialog is open, for the reload's busy check and the
+/// reactor list's focus handoff.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn any_open() -> bool {
-    dom::dialog_open(SHEET_ID) || dom::dialog_open(POPUP_ID)
+    dom::dialog_open(SHEET_ID)
 }
 
 #[cfg(target_arch = "wasm32")]
 pub(super) mod dom {
     use super::super::focus_without_scrolling;
-    use super::MobileSurface;
     use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -567,22 +525,22 @@ pub(super) mod dom {
         element(id).is_some_and(|d| d.has_attribute("open"))
     }
 
-    /// The row's control for `surface`, as the document has it now.
-    pub(crate) fn row_control(row: &str, surface: MobileSurface) -> Option<web_sys::HtmlElement> {
+    /// The control in `row` matching `selector`, as the document has it now.
+    pub(crate) fn row_control(row: &str, selector: &str) -> Option<web_sys::HtmlElement> {
         document()?
             .get_element_by_id(&format!("msg-{row}"))?
-            .query_selector(surface.control_selector())
+            .query_selector(selector)
             .ok()??
             .dyn_into::<web_sys::HtmlElement>()
             .ok()
     }
 
-    pub(super) fn row_control_exists(row: &str, surface: MobileSurface) -> bool {
-        row_control(row, surface).is_some()
-    }
-
-    pub(super) fn focus_control(row: &str, surface: MobileSurface) {
-        if let Some(control) = row_control(row, surface) {
+    /// Focus, without scrolling, the control in `row` matching `selector`,
+    /// else the row's +, if either is still there.
+    pub(super) fn focus_control(row: &str, selector: &str) {
+        if let Some(control) =
+            row_control(row, selector).or_else(|| row_control(row, super::REACT_SELECTOR))
+        {
             focus_without_scrolling(&control);
         }
     }
@@ -889,14 +847,14 @@ pub(super) mod dom {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) mod dom {
-    use super::MobileSurface;
     pub(crate) fn dialog_open(_id: &str) -> bool {
         false
     }
-    pub(super) fn row_control_exists(_row: &str, _surface: MobileSurface) -> bool {
-        true
+    /// Natively every row control "exists", so openings stay live in tests.
+    pub(crate) fn row_control(_row: &str, _selector: &str) -> Option<()> {
+        Some(())
     }
-    pub(super) fn focus_control(_row: &str, _surface: MobileSurface) {}
+    pub(super) fn focus_control(_row: &str, _selector: &str) {}
     pub(super) fn close_dialog(_id: &str) {}
     pub(super) fn show_dialog(_id: &str) -> bool {
         false
@@ -926,7 +884,7 @@ mod tests {
         contract: Option<ContractKey>,
     ) -> MobileOpening {
         MobileOpening {
-            surface: MobileSurface::Reaction,
+            origin: Origin::React,
             token: 1,
             room,
             visit,
@@ -935,6 +893,7 @@ mod tests {
             message: MessageId(freenet_scaffold::util::FastHash(7)),
             own: false,
             current: None,
+            reactions: Rc::new(Vec::new()),
         }
     }
 

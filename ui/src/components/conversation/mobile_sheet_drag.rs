@@ -1,10 +1,9 @@
-//! Dragging a mobile surface (the actions sheet, the reaction popup) down to
-//! dismiss it.
+//! Dragging the mobile message sheet down to dismiss it.
 //!
 //! A pointer that goes down anywhere in the open dialog (the backdrop, the
 //! panel, an action, an emoji) and then moves further down than sideways drags the panel
 //! with it, by the distance moved, and fades the dim behind it. Released far
-//! enough or fast enough ([`release`]) the panel slides away and the surface
+//! enough or fast enough ([`release`]) the panel slides away and the sheet
 //! closes; otherwise it springs back. Upward it gives a little and springs
 //! back. A sideways move is left alone: on the emoji row the browser is
 //! already scrolling it (`touch-action: pan-x`, `main.css`). A second finger
@@ -105,7 +104,6 @@ pub(super) use self::dom::{animate_out, install, reset, Listeners};
 
 #[cfg(target_arch = "wasm32")]
 mod dom {
-    use super::super::mobile_surface::MobileSurface;
     use super::super::reaction_picker::ReactionSurfaces;
     use super::{intent, offset, release, velocity, Axis, Release, VELOCITY_WINDOW_MS};
     use std::cell::{Cell, RefCell};
@@ -205,24 +203,20 @@ mod dom {
             .filter(|token| *token != 0)
     }
 
-    fn close_later(surfaces: ReactionSurfaces, surface: MobileSurface, token: u64) {
-        crate::util::defer(move || surfaces.dismiss_opening(surface, token));
+    fn close_later(surfaces: ReactionSurfaces, token: u64) {
+        crate::util::defer(move || surfaces.dismiss_opening(token));
     }
 
     /// Slide the panel away, then close the opening it shows. Once: a second
     /// call while it leaves does nothing. With reduced motion, close now.
-    pub(in super::super) fn animate_out(
-        id: &str,
-        surface: MobileSurface,
-        surfaces: ReactionSurfaces,
-    ) {
+    pub(in super::super) fn animate_out(id: &str, surfaces: ReactionSurfaces) {
         let Some(dialog) = element(id) else {
             return;
         };
-        leave(&dialog, surface, surfaces);
+        leave(&dialog, surfaces);
     }
 
-    fn leave(dialog: &web_sys::HtmlElement, surface: MobileSurface, surfaces: ReactionSurfaces) {
+    fn leave(dialog: &web_sys::HtmlElement, surfaces: ReactionSurfaces) {
         let Some(token) = opening_token(dialog) else {
             return;
         };
@@ -230,7 +224,7 @@ mod dom {
             return;
         }
         let Some(panel) = panel(dialog).filter(|_| !reduced_motion()) else {
-            close_later(surfaces, surface, token);
+            close_later(surfaces, token);
             return;
         };
         let _ = dialog.class_list().remove_1(DRAGGING);
@@ -241,7 +235,7 @@ mod dom {
         let _ = dialog.style().set_property(SHADE, "0");
         // Closed when the slide ends, or after a bound if no transition
         // runs; whichever is second finds the opening gone and does nothing.
-        let done = Closure::once_into_js(move || close_later(surfaces, surface, token));
+        let done = Closure::once_into_js(move || close_later(surfaces, token));
         let options = web_sys::AddEventListenerOptions::new();
         options.set_once(true);
         let _ = panel.add_event_listener_with_callback_and_add_event_listener_options(
@@ -251,7 +245,7 @@ mod dom {
         );
         crate::util::safe_spawn_local(async move {
             crate::util::sleep(crate::util::millis(320)).await;
-            close_later(surfaces, surface, token);
+            close_later(surfaces, token);
         });
     }
 
@@ -358,12 +352,7 @@ mod dom {
         }
     }
 
-    fn on_up(
-        dialog: &web_sys::HtmlElement,
-        event: web_sys::Event,
-        surface: MobileSurface,
-        surfaces: ReactionSurfaces,
-    ) {
+    fn on_up(dialog: &web_sys::HtmlElement, event: web_sys::Event, surfaces: ReactionSurfaces) {
         let Some(e) = pointer(&event) else {
             return;
         };
@@ -378,7 +367,7 @@ mod dom {
         let speed = velocity(&samples, event.time_stamp());
         let height = panel(dialog).map_or(1.0, |p| f64::from(p.offset_height()));
         match release(gesture.offset, speed, height) {
-            Release::Dismiss => leave(dialog, surface, surfaces),
+            Release::Dismiss => leave(dialog, surfaces),
             Release::SpringBack => spring_back(dialog),
         }
     }
@@ -430,7 +419,6 @@ mod dom {
     /// Listen for drags on dialog `id`, for as long as the result lives.
     pub(in super::super) fn install(
         id: &'static str,
-        surface: MobileSurface,
         surfaces: ReactionSurfaces,
     ) -> Option<Listeners> {
         let dialog = element(id)?;
@@ -441,7 +429,7 @@ mod dom {
         };
         let up = {
             let dialog = dialog.clone();
-            Listener::new(move |event: web_sys::Event| on_up(&dialog, event, surface, surfaces))
+            Listener::new(move |event: web_sys::Event| on_up(&dialog, event, surfaces))
         };
         let click = Listener::new(move |event: web_sys::Event| on_click(id, event));
         let target: web_sys::EventTarget = dialog.clone().into();
@@ -467,12 +455,7 @@ mod dom {
 
 /// Native builds have no DOM, and so no dialog to dismiss.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn animate_out(
-    _id: &str,
-    _surface: super::mobile_surface::MobileSurface,
-    _surfaces: super::reaction_picker::ReactionSurfaces,
-) {
-}
+pub(super) fn animate_out(_id: &str, _surfaces: super::reaction_picker::ReactionSurfaces) {}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn reset(_id: &str) {}

@@ -24,7 +24,7 @@ import { callRiverTest } from "./river-test";
 // input needs Chromium's input protocol (CDP), so the finger tests run on
 // chromium and mobile-chrome; the mouse tests run on the desktop engines.
 
-const POPUP = "mobile-reaction-popup";
+const POPUP = "mobile-message-sheet";
 
 function popup(page: Page): Locator {
   return page.getByTestId(POPUP);
@@ -66,14 +66,14 @@ test.use({ viewport: { width: 390, height: 760 } });
 test("the row shows no scroll bar, does not snap, and takes only sideways pans", async ({ page }) => {
   await openPopup(page);
   const g = await page.evaluate(() => {
-    const row = document.querySelector("#mobile-reaction-popup .mobile-reaction-palette") as HTMLElement;
+    const row = document.querySelector("#mobile-message-sheet .mobile-reaction-palette") as HTMLElement;
     const css = (sel: string) => getComputedStyle(document.querySelector(sel)!);
     return {
       gutter: row.offsetHeight - row.clientHeight,
       snap: getComputedStyle(row).scrollSnapType,
       row: getComputedStyle(row).touchAction,
-      backdrop: css("#mobile-reaction-popup .mobile-sheet-backdrop").touchAction,
-      panel: css("#mobile-reaction-popup .mobile-sheet-panel").touchAction,
+      backdrop: css("#mobile-message-sheet .mobile-sheet-backdrop").touchAction,
+      panel: css("#mobile-message-sheet .mobile-sheet-panel").touchAction,
     };
   });
   expect(g.gutter, "no scroll bar takes room under the row").toBe(0);
@@ -282,7 +282,7 @@ test.describe("A finger on the reaction popup", () => {
 });
 
 test.describe("The actions sheet's gestures", () => {
-  const SHEET = "mobile-message-actions-sheet";
+  const SHEET = "mobile-message-sheet";
 
   /// A received message, its actions sheet open and at rest.
   async function openSheet(page: Page): Promise<Locator> {
@@ -298,7 +298,7 @@ test.describe("The actions sheet's gestures", () => {
   test("it has no title or Close, and a tap outside slides it away", async ({ page }) => {
     const row = await openSheet(page);
     const sheet = page.getByTestId(SHEET);
-    await expect(sheet).toHaveAccessibleName("Message actions");
+    await expect(sheet).toHaveAccessibleName("Message options");
     await expect(sheet.getByRole("heading")).toHaveCount(0);
     await expect(page.getByTestId("mobile-message-actions-close")).toHaveCount(0);
     await pressAt(page, await historyPoint(page));

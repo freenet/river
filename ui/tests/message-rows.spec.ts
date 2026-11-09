@@ -591,11 +591,11 @@ test.describe("Revealing a popover on a short phone view", () => {
     });
     const row = page.getByTestId("message-row").last();
     await openInlinePicker(page, row);
-    await expect(page.getByTestId("mobile-reaction-popup")).toBeVisible();
+    await expect(page.getByTestId("mobile-message-sheet")).toBeVisible();
     await nextFrames(page);
     expect(await strayScroll(page), "reaction popup").toEqual(NO_STRAY_SCROLL);
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId("mobile-reaction-popup")).toBeHidden();
+    await expect(page.getByTestId("mobile-message-sheet")).toBeHidden();
 
     await openOwnMessageEdit(page);
     await nextFrames(page);
@@ -743,8 +743,10 @@ test.describe("Message row hover band", () => {
     await expect.poll(opacity).toBe("1");
   });
 
+  // The narrowest width with a reactor list: below 48rem a chip opens the
+  // mobile message sheet instead (mobile-reaction-popup.spec.ts).
   test.describe("at a narrow width", () => {
-    test.use({ viewport: { width: 480, height: 800 } });
+    test.use({ viewport: { width: 768, height: 800 } });
 
     test("the band stays while the row's reactor list is open, and removing the reaction does not scroll", async ({ page }) => {
       const { received } = await openRoomWithPairs(page);
@@ -782,7 +784,7 @@ test.describe("Message row hover band", () => {
       expect(await resolveColor(page, await background(row)), "the band stays while the list is open").toEqual(band);
       const box = (await owners.boundingBox())!;
       expect(box.x).toBeGreaterThanOrEqual(-0.5);
-      expect(box.x + box.width).toBeLessThanOrEqual(480.5);
+      expect(box.x + box.width).toBeLessThanOrEqual(768.5);
 
       // Remove the reaction from the list: the chip and the band go with it,
       // and nothing scrolls.
@@ -946,7 +948,7 @@ test.describe("Latest over row controls at phone width", () => {
     expect(at, "Latest's centre is Latest's").toBe(true);
     await latest.click();
     await expect(latest).toBeHidden();
-    await expect(page.getByTestId("mobile-message-actions-sheet")).toBeHidden();
+    await expect(page.getByTestId("mobile-message-sheet")).toBeHidden();
   });
 });
 

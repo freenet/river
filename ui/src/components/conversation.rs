@@ -46,7 +46,7 @@ pub(crate) use self::outbox_commit::{
     has_signing as outbox_has_signing, has_unsent as outbox_has_unsent,
 };
 mod mobile_message_actions;
-mod mobile_reaction_popup;
+mod mobile_message_sheet;
 mod mobile_sheet_drag;
 mod mobile_surface;
 #[cfg(target_arch = "wasm32")]
@@ -71,9 +71,10 @@ use self::markdown::{
     clean_reply_preview, description_to_html, member_names_fingerprint, prune_message_html_cache,
     render_message_html_cached, running_behind_freenet_gateway,
 };
-use self::mobile_message_actions::{MobileAction, MobileActionsEntry, MobileMessageActionsSheet};
-use self::mobile_reaction_popup::MobileReactionPopup;
+use self::mobile_message_actions::{open_sheet, MobileActionsEntry, RowTarget};
+use self::mobile_message_sheet::{MobileAction, MobileMessageSheet, Reactor, SheetReaction};
 use self::mobile_surface::MobileSurfaceGuard;
+use self::mobile_surface::Origin;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
@@ -2403,7 +2404,7 @@ pub fn Conversation() -> Element {
             }
         }
     });
-    // The mobile actions sheet's actions (`mobile_message_actions.rs`), run
+    // The mobile message sheet's actions (`mobile_message_sheet.rs`), run
     // after the sheet has closed. Checked here against the messages as they
     // are now, not as the sheet opened on them: the row must still hold that
     // message, and Edit and Delete must still be on your own. Each then goes
@@ -3209,11 +3210,10 @@ pub fn Conversation() -> Element {
 
             // The one reaction picker, opened by a message's footer React.
             ReactionPicker { surfaces: reaction_surfaces, on_react: on_group_react }
-            // Below 48rem: the actions sheet a row tap opens, the reaction
-            // popup its + opens, and what closes either at 48rem, outside
-            // the chat or across a re-key (`mobile_surface.rs`).
-            MobileMessageActionsSheet { surfaces: reaction_surfaces, on_action: on_mobile_action }
-            MobileReactionPopup { surfaces: reaction_surfaces, on_react: on_group_react }
+            // Below 48rem: the message sheet a row tap, its +, a chip or its
+            // entry opens, and what closes it at 48rem, outside the chat or
+            // across a re-key (`mobile_surface.rs`).
+            MobileMessageSheet { surfaces: reaction_surfaces, on_react: on_group_react, on_action: on_mobile_action }
             MobileSurfaceGuard {
                 surfaces: reaction_surfaces,
                 contract_key: current_room_data.as_ref().map(|room| room.contract_key),
@@ -3889,6 +3889,58 @@ fn reaction_owner_marks(
     )
 }
 
+/// A message's reactions as its chips and the mobile sheet show them: by
+/// emoji, each with who made it ("You" for the reader, never checked for
+/// impersonation; everyone else with the same ⚠ / 🛡 as the author line).
+fn sheet_reactions(
+    reactions: &HashMap<String, Vec<MemberId>>,
+    self_member_id: Option<MemberId>,
+    member_names: &HashMap<MemberId, String>,
+    impersonation: &ImpersonationChecker,
+    owner_id: MemberId,
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
+) -> Vec<SheetReaction> {
+    let mut sorted: Vec<_> = reactions.iter().collect();
+    sorted.sort_by_key(|(emoji, _)| emoji.as_str());
+    sorted
+        .into_iter()
+        .map(|(emoji, reactors)| SheetReaction {
+            emoji: emoji.clone(),
+            mine: self_member_id.is_some_and(|me| reactors.contains(&me)),
+            reactors: reactors
+                .iter()
+                .map(|reactor_id| {
+                    let is_you = Some(*reactor_id) == self_member_id;
+                    let name = if is_you {
+                        "You".to_string()
+                    } else {
+                        member_names
+                            .get(reactor_id)
+                            .cloned()
+                            .unwrap_or_else(|| "Unknown".to_string())
+                    };
+                    let (warning, badge) = if is_you {
+                        (None, deputy_badges.get(reactor_id).cloned())
+                    } else {
+                        reaction_owner_marks(
+                            *reactor_id,
+                            &name,
+                            impersonation,
+                            owner_id,
+                            deputy_badges,
+                        )
+                    };
+                    Reactor {
+                        name,
+                        warning,
+                        badge,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// A reply's snapshot of the message it answers. Cleaned (mentions -> @name,
 /// markdown stripped) BEFORE truncating, so the stored preview is plain text
 /// and no consumer (UI, CLI, old client) ever sees a raw token, even one that
@@ -4133,12 +4185,37 @@ fn MessageGroupComponent(
                         let is_first = idx == 0;
                         let reply_strip_val = msg.reply_strip.clone();
                         let row_time = row_time_labels(&msg);
-                        // Below 48rem a tap on the row opens its actions
-                        // sheet (`mobile_message_actions.rs`); a row being
-                        // edited has the form instead.
+                        // Below 48rem a tap on the row opens its sheet
+                        // (`mobile_message_actions.rs`); a row being edited
+                        // has the form instead.
                         let row_editing = editing_message.read().as_ref() == Some(&msg.id);
-                        let (tap_row, tap_message) = (msg.id.clone(), msg.message_id.clone());
                         let press_row = msg.id.clone();
+                        // Its reactions and who made them, once per render:
+                        // the chips and the mobile sheet show the same list.
+                        let row_reactions = Rc::new(sheet_reactions(
+                            &msg.reactions,
+                            self_member_id,
+                            &member_names,
+                            &impersonation,
+                            owner_id,
+                            &deputy_badges,
+                        ));
+                        // The reader's own reaction on it. No known identity
+                        // means none is ours, so nothing is highlighted and
+                        // the picker offers a fresh reaction rather than a
+                        // toggle of someone else's.
+                        let user_reaction: Option<String> =
+                            row_reactions.iter().find(|r| r.mine).map(|r| r.emoji.clone());
+                        // What the row, its +, its chips and its entry open
+                        // the mobile sheet for.
+                        let sheet_target = RowTarget {
+                            row: msg.id.clone(),
+                            message: msg.message_id.clone(),
+                            own: is_self,
+                            current: user_reaction.clone(),
+                            reactions: row_reactions.clone(),
+                        };
+                        let tap_target = sheet_target.clone();
 
                         rsx! {
                             // One row per message (`.msg-row` in main.css): the
@@ -4165,9 +4242,7 @@ fn MessageGroupComponent(
                                     mobile_message_actions::row_clicked(
                                         reactions,
                                         &e,
-                                        tap_row.clone(),
-                                        tap_message.clone(),
-                                        is_self,
+                                        tap_target.clone(),
                                         row_editing,
                                     );
                                 },
@@ -4575,18 +4650,10 @@ fn MessageGroupComponent(
                                         let reply_preview_names = preview_names.clone();
                                         let reply_author_name = group.author_name.clone();
 
-                                        // Find user's current reaction on this message (if any)
-                                        // No known identity ⇒ no reaction is ours,
-                                        // so nothing is highlighted and the picker
-                                        // offers a fresh reaction rather than a
-                                        // toggle of someone else's.
-                                        let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
-                                            if self_member_id.is_some_and(|me| reactors.contains(&me)) {
-                                                Some(emoji.clone())
-                                            } else {
-                                                None
-                                            }
-                                        });
+                                        let user_reaction = user_reaction.clone();
+                                        let reactions_for_invoker = row_reactions.clone();
+                                        let reactions_for_entry = row_reactions.clone();
+                                        let current_for_entry = user_reaction.clone();
                                         let msg_id_for_invoker = msg.message_id.clone();
 
                                         rsx! {
@@ -4604,39 +4671,21 @@ fn MessageGroupComponent(
                                                 "data-row-actions": "exclude",
                                                 // Existing reactions (clickable to toggle if user has reacted)
                                                 {
-                                                    let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
-                                                    sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
-                                                    sorted_reactions.into_iter().map(|(emoji, reactors)| {
-                                                        let count = reactors.len();
-                                                        let is_user_reaction = self_member_id.is_some_and(|me| reactors.contains(&me));
+                                                    row_reactions.iter().map(|reaction| {
+                                                        let emoji = &reaction.emoji;
+                                                        let count = reaction.reactors.len();
+                                                        let is_user_reaction = reaction.mine;
                                                         let emoji_for_click = emoji.clone();
                                                         let msg_id_for_click = msg_id_react.clone();
-
-                                                        // "You" is not a nickname, so it is not checked
-                                                        // for impersonation. Everyone else gets the
-                                                        // same ⚠ / 🛡 as the author line.
-                                                        let shown_reactors: Vec<_> = reactors.iter().map(|reactor_id| {
-                                                            let is_you = Some(*reactor_id) == self_member_id;
-                                                            let name = if is_you {
-                                                                "You".to_string()
-                                                            } else {
-                                                                member_names.get(reactor_id)
-                                                                    .cloned()
-                                                                    .unwrap_or_else(|| "Unknown".to_string())
-                                                            };
-                                                            let (warning, badge) = if is_you {
-                                                                (None, deputy_badges.get(reactor_id).cloned())
-                                                            } else {
-                                                                reaction_owner_marks(
-                                                                    *reactor_id,
-                                                                    &name,
-                                                                    &impersonation,
-                                                                    owner_id,
-                                                                    &deputy_badges,
-                                                                )
-                                                            };
-                                                            (name, warning, badge)
-                                                        }).collect();
+                                                        let shown_reactors: Vec<_> = reaction
+                                                            .reactors
+                                                            .iter()
+                                                            .map(|r| (r.name.clone(), r.warning.clone(), r.badge.clone()))
+                                                            .collect();
+                                                        // Below 48rem a chip opens the row's sheet,
+                                                        // which lists who reacted.
+                                                        let chip_target = sheet_target.clone();
+                                                        let chip_target_for_key = sheet_target.clone();
                                                         let names_str = shown_reactors
                                                             .iter()
                                                             .map(|(name, _, _)| name.as_str())
@@ -4780,6 +4829,14 @@ fn MessageGroupComponent(
                                                                             &chip_pressed_with_click,
                                                                             &owners_key_for_click,
                                                                         );
+                                                                        if mobile_surface::narrow_now() {
+                                                                            open_sheet(
+                                                                                reactions,
+                                                                                chip_target.clone(),
+                                                                                Origin::Chip(reaction_chip_id(&owners_key_for_click)),
+                                                                            );
+                                                                            return;
+                                                                        }
                                                                         if gesture_opens_owner_list(pressed_with.as_deref()) {
                                                                             let popover = reaction_owners_popover_at(
                                                                                 owners_key_for_click.clone(),
@@ -4830,6 +4887,14 @@ fn MessageGroupComponent(
                                                                         }
                                                                         // Space would scroll the history.
                                                                         e.prevent_default();
+                                                                        if mobile_surface::narrow_now() {
+                                                                            open_sheet(
+                                                                                reactions,
+                                                                                chip_target_for_key.clone(),
+                                                                                Origin::Chip(chip_id_for_key.clone()),
+                                                                            );
+                                                                            return;
+                                                                        }
                                                                         let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
                                                                         let popover = reaction_owners_popover_at(
                                                                             owners_key_for_key.clone(),
@@ -4855,6 +4920,8 @@ fn MessageGroupComponent(
                                                         row: row_for_invoker,
                                                         message: msg_id_for_invoker,
                                                         current: user_reaction,
+                                                        own: is_self,
+                                                        reactions: reactions_for_invoker,
                                                     }
                                                 }
                                             }
@@ -4867,6 +4934,8 @@ fn MessageGroupComponent(
                                                     row: row_for_entry,
                                                     message: msg_id_for_entry,
                                                     own: is_self,
+                                                    current: current_for_entry,
+                                                    reactions: reactions_for_entry,
                                                 }
                                                 // Reply, Edit and Delete: one unit, which wraps
                                                 // onto its own line when it does not fit.

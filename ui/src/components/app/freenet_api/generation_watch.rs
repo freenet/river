@@ -1119,8 +1119,8 @@ mod runtime {
         if crate::components::conversation::reaction_picker_is_open() {
             return true;
         }
-        // A mobile actions sheet or reaction popup (below 48rem): open while
-        // its modal dialog is. Asked directly rather than left to the overlay
+        // The mobile message sheet (below 48rem): open while its modal dialog
+        // is. Asked directly rather than left to the overlay
         // check below, which looks for a class it does not carry. Closed, the
         // dialogs stay mounted and hold nothing.
         if crate::components::conversation::mobile_surface_is_open() {
@@ -3036,7 +3036,7 @@ mod tests {
         );
         assert!(
             busy.contains("mobile_surface_is_open()"),
-            "an open mobile actions sheet or reaction popup must hold it too"
+            "an open mobile message sheet must hold it too"
         );
         let flush_at = code.find("async fn reload_after_flush(").expect("flush");
         let flush = &code[flush_at..];

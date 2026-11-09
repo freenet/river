@@ -238,7 +238,7 @@ export async function clickFooter(page: Page, row: Locator, testid: string) {
   if (sheetAction && (await narrowLayout(page))) {
     await openMessageActions(page, row);
     await press(page, page.getByTestId(sheetAction));
-    await expect(page.getByTestId("mobile-message-actions-sheet")).toBeHidden();
+    await expect(page.getByTestId("mobile-message-sheet")).toBeHidden();
     return;
   }
   await revealFooter(page, row);
@@ -383,7 +383,7 @@ export async function tapRow(page: Page, row: Locator) {
 /// it is for that row.
 export async function openMessageActions(page: Page, row: Locator) {
   await tapRow(page, row);
-  const sheet = page.getByTestId("mobile-message-actions-sheet");
+  const sheet = page.getByTestId("mobile-message-sheet");
   await expect(sheet).toBeVisible();
   await expect(sheet).toHaveAttribute("data-target-row", await rowKey(row));
 }
@@ -392,7 +392,7 @@ export async function openMessageActions(page: Page, row: Locator) {
 /// that row.
 export async function openReactionPopup(page: Page, row: Locator) {
   await press(page, row.getByTestId("message-react-button"));
-  const popup = page.getByTestId("mobile-reaction-popup");
+  const popup = page.getByTestId("mobile-message-sheet");
   await expect(popup).toBeVisible();
   await expect(popup).toHaveAttribute("data-target-row", await rowKey(row));
 }

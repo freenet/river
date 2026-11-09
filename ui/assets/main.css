@@ -366,7 +366,7 @@
     box-shadow: 0 0 0 2px var(--color-accent);
 }
 
-/* The row's keyboard way into its actions sheet: below 48rem only, visually
+/* The row's keyboard way into its message sheet: below 48rem only, visually
  * hidden until it has keyboard focus, then a small pill at the row's top
  * right. At 48rem and wider it is not there at all. */
 .mobile-actions-entry {
@@ -376,7 +376,7 @@
 /* Below Tailwind's `md` (48rem; the same query as `mobile_surface.rs`, the
  * exact complement of `(min-width: 48rem)`, so no fractional width falls
  * between): a message's trailing Reply, Edit and Delete are gone, hits and
- * tab stops included, and a tap on the row opens them in the actions sheet.
+ * tab stops included, and a tap on the row opens them in the message sheet.
  * Its one reaction + stays, visible and tappable at rest on any pointer (a
  * narrow mouse window too), after its chips. The footer keeps its line for
  * the + alone. DM rows have no footer and are untouched. The keyboard entry
@@ -423,8 +423,8 @@
     }
 }
 
-/* The two mobile surfaces (`mobile_message_actions.rs`,
- * `mobile_reaction_popup.rs`): a native modal <dialog> each, in the top layer
+/* The mobile message sheet (`mobile_message_sheet.rs`): a native modal
+ * <dialog>, in the top layer
  * over the header, history, composer and Latest. The dialog itself spans the
  * viewport, transparent, so a tap outside the panel lands on the backdrop
  * inside it, which slides the panel away; `::backdrop` dims. Neither has a
@@ -435,7 +435,7 @@
  * fallback, since the keyboard does not shrink it on every browser). A
  * wheel scrolls it when it does not fit; scrolling it never scrolls the page.
  *
- * Both slide up when they open and can be dragged down from anywhere
+ * It slides up when it opens and can be dragged down from anywhere
  * (`mobile_sheet_drag.rs`): the backdrop and panel take no pan
  * (`touch-action: none`), so the pointer events reach the drag and nothing
  * scrolls, and a pinch still zooms. The drag sets the
@@ -530,10 +530,61 @@
     background: var(--color-border-hover, var(--color-border));
 }
 
+/* Who reacted, between the emoji row and the actions: each emoji with its
+ * people, names separated by commas. A long list scrolls itself, and a
+ * vertical pan there scrolls it instead of dragging the sheet (the rest of
+ * the panel takes no pan). */
+.mobile-sheet-reactors {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 7.5rem;
+    margin: 6px 0 0;
+    padding: 8px 4px 2px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    touch-action: pan-y;
+    border-top: 1px solid var(--color-border);
+    list-style: none;
+}
+
+.mobile-sheet-reaction {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 14px;
+    line-height: 20px;
+    color: var(--color-text-secondary);
+}
+
+.mobile-sheet-reaction-emoji {
+    flex: none;
+    font-size: 16px;
+}
+
+.mobile-sheet-reaction-names {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.mobile-sheet-reactor {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
+}
+
+.mobile-sheet-reactor + .mobile-sheet-reactor::before {
+    content: ", ";
+    white-space: pre;
+}
+
 .mobile-sheet-actions {
     display: flex;
     flex-direction: column;
     gap: 2px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--color-border);
 }
 
 .mobile-sheet-action {
@@ -568,7 +619,7 @@
     outline-offset: 1px;
 }
 
-/* The popup's 16 choices: one row that scrolls sideways, freely and with
+/* The sheet's 16 choices: one row that scrolls sideways, freely and with
  * momentum, no snapping and no scroll bar (a choice cut off at the edge shows
  * there are more). It takes only sideways pans: a vertical move on it is the
  * popup's drag (`mobile_sheet_drag.rs`). The padding keeps the focus ring

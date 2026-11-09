@@ -166,6 +166,11 @@ async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
   return chip;
 }
 
+// The reactor list exists at 48rem and wider: below it a chip opens the
+// mobile message sheet, which lists who reacted (mobile-reaction-popup.spec.ts).
+// So a phone project runs these at a touch tablet's width.
+test.beforeEach(async ({ page }) => asTouchTablet(page));
+
 test.describe("Reaction owner list (#714)", () => {
   test("a coarse pointer can read who reacted; a fine pointer still removes on click", async ({
     page,
@@ -455,9 +460,8 @@ async function expectOnScreen(page: Page, target: Locator) {
 // by touch, on the message the reader chose, without stealing focus back or
 // moving the history.
 test.describe("Reactor list and picker hand off", () => {
-  // The anchored picker's hand-off: a phone runs it at a touch tablet's
-  // width (mobile-reaction-popup.spec.ts has the popup's).
-  test.beforeEach(async ({ page }) => asTouchTablet(page));
+  // The anchored picker's hand-off, at a touch tablet's width (the file's
+  // beforeEach); mobile-reaction-popup.spec.ts has the mobile sheet's.
   async function surfaces(page: Page) {
     return page.evaluate(() => ({
       picker: Array.from(document.querySelectorAll('[data-testid="message-react-button"][aria-expanded="true"]')).map(

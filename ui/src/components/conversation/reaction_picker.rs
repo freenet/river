@@ -36,16 +36,16 @@
 //! reader is told to try again, once per press; a target gone by the time the
 //! opening runs, or an opening a later press superseded, does nothing.
 //!
-//! Below 48rem the same React opens the mobile reaction popup instead
-//! (`mobile_reaction_popup.rs`), decided at the press, before any of the
-//! above: a browser without native popovers still reacts there. The mobile
-//! surfaces share these [`ReactionSurfaces`], so at most one of the picker, a
-//! reactor list and a mobile surface is open (`mobile_surface.rs`).
+//! Below 48rem the same React opens the mobile message sheet instead
+//! (`mobile_message_sheet.rs`), decided at the press, before any of the
+//! above: a browser without native popovers still reacts there. The sheet
+//! shares these [`ReactionSurfaces`], so at most one of the picker, a
+//! reactor list and the sheet is open (`mobile_surface.rs`).
 
 use super::emoji_picker::FREQUENT_EMOJIS;
-use super::mobile_surface::{
-    narrow_for_render, narrow_now, MobileOpening, MobileSurface, POPUP_ID,
-};
+use super::mobile_message_actions::{open_sheet, RowTarget};
+use super::mobile_message_sheet::SheetReaction;
+use super::mobile_surface::{narrow_for_render, narrow_now, MobileOpening, Origin, SHEET_ID};
 use super::{now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW};
 use crate::components::icons::{line_icon, REACT_ICON_PATH};
@@ -263,7 +263,7 @@ fn target_matches_room(
 
 /// The footer React of one message: the only way into the picker, and where
 /// it opens. A message's footer shows it unless the message is being edited.
-/// Below 48rem it opens the mobile reaction popup instead, and stays visible
+/// Below 48rem it opens the mobile message sheet instead, and stays visible
 /// at rest there (`main.css`).
 #[component]
 pub(super) fn ReactionInvoker(
@@ -273,6 +273,10 @@ pub(super) fn ReactionInvoker(
     message: MessageId,
     /// The reader's own reaction on the message, if any.
     current: Option<String>,
+    /// The message is the reader's own (the sheet offers Edit and Delete).
+    own: bool,
+    /// Its reactions, as its chips show them (the sheet lists them).
+    reactions: Rc<Vec<SheetReaction>>,
 ) -> Element {
     // This invoker's own signal reads: no other footer renders when the
     // picker opens or closes. Infallible, deliberately: `target` and the
@@ -283,10 +287,11 @@ pub(super) fn ReactionInvoker(
         Some(target) if target.row == row => (true, target.current != current),
         _ => (false, false),
     };
-    let (mobile_expanded, mobile_stale) = match surfaces.mobile.read().as_ref() {
-        Some(open) if open.is_for(MobileSurface::Reaction, &row) => (true, open.current != current),
-        _ => (false, false),
-    };
+    let mobile_expanded = surfaces
+        .mobile
+        .read()
+        .as_ref()
+        .is_some_and(|open| open.is_for(&row));
     let narrow = narrow_for_render();
     // A reaction landing while the picker is open (the reader's own, from
     // another device or still being signed) moves the highlight with it.
@@ -307,35 +312,16 @@ pub(super) fn ReactionInvoker(
             }
         });
     }
-    // The same for the mobile popup's current choice.
-    if mobile_stale {
-        let (row, current) = (row.clone(), current.clone());
-        let mut opening = surfaces.mobile;
-        crate::util::defer(move || {
-            let stale = opening
-                .peek()
-                .as_ref()
-                .is_some_and(|o| o.is_for(MobileSurface::Reaction, &row) && o.current != current);
-            if stale {
-                opening.with_mut(|o| {
-                    if let Some(o) = o.as_mut() {
-                        o.current = current;
-                    }
-                });
-            }
-        });
-    }
     // The message leaving the history (deleted, even optimistically, or out
     // of the rendered range) takes its picker with it. A rollback renders a
     // new invoker with nothing open: the picker is not reopened, and a pick
     // queued meanwhile finds no target. Its row only remounting (its group
     // lost its first message, and with it its key) leaves a new React for the
-    // same message: the picker stays open and moves to it. A mobile popup
-    // open for it is kept or closed by the same test.
+    // same message: the picker stays open and moves to it. (The mobile
+    // sheet is kept or closed by the row's entry.)
     {
         let row = row.clone();
         use_drop(move || {
-            surfaces.mobile_control_unmounting(MobileSurface::Reaction, &row);
             // The opening this React was for, taken now, while its element is
             // still the one in the document: what runs later acts on that
             // opening only, never on one made since.
@@ -386,7 +372,7 @@ pub(super) fn ReactionInvoker(
     }
     let press_row = row.clone();
     let (haspopup, controls, expanded) = if narrow {
-        ("dialog", POPUP_ID, mobile_expanded)
+        ("dialog", SHEET_ID, mobile_expanded)
     } else {
         ("true", PICKER_ID, desktop_expanded)
     };
@@ -404,16 +390,16 @@ pub(super) fn ReactionInvoker(
             onclick: move |_| {
                 // Every press supersedes an opening still waiting to run.
                 let activation = next_activation();
-                // Below 48rem, decided now: the popup, never the picker.
+                // Below 48rem, decided now: the sheet, never the picker.
                 if narrow_now() {
-                    let opening = MobileOpening::new(
-                        MobileSurface::Reaction,
-                        row.clone(),
-                        message.clone(),
-                        false,
-                        current.clone(),
-                    );
-                    super::mobile_reaction_popup::open(surfaces, opening);
+                    let target = RowTarget {
+                        row: row.clone(),
+                        message: message.clone(),
+                        own,
+                        current: current.clone(),
+                        reactions: reactions.clone(),
+                    };
+                    open_sheet(surfaces, target, Origin::React);
                     return;
                 }
                 // A pointer press on React while its picker is open closes
@@ -670,7 +656,7 @@ mod dom {
     use super::super::mobile_surface::dom::{
         is_zoom, row_control, set_window_capture_listeners, touches,
     };
-    use super::super::mobile_surface::MobileSurface;
+    use super::super::mobile_surface::REACT_SELECTOR;
     use super::super::TAP_SLOP_PX;
     use super::{ReactionSurfaces, ANCHOR_NAME, PICKER_ID};
     use dioxus::prelude::ReadableExt;
@@ -701,7 +687,7 @@ mod dom {
     }
 
     pub(super) fn react_button(row: &str) -> Option<web_sys::HtmlElement> {
-        row_control(row, MobileSurface::Reaction)
+        row_control(row, REACT_SELECTOR)
     }
 
     pub(crate) fn is_open() -> bool {

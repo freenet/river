@@ -15,16 +15,18 @@ import {
 import { deliver } from "./history-geometry";
 import { callRiverTest, rekeyThenClick } from "./river-test";
 
-// Below 48rem a message's reaction + opens a separate reaction popup
-// (mobile_reaction_popup.rs): the 16 choices the desktop picker has, in one
-// row that scrolls sideways. A tap on one reacts and closes it. It has no
-// field, so it never asks for the software keyboard, and it never opens the
-// row's actions. It has no title or Close: a tap outside it dismisses it.
+// Below 48rem a message's reaction +, a reaction chip and a tap on the row
+// open one message sheet (mobile_message_sheet.rs); these are its reaction
+// half (mobile-message-actions.spec.ts has the row taps and the actions).
+// On top, the 16 choices the desktop picker has, in one row that scrolls
+// sideways: a tap on one reacts and closes it. Then who reacted. It has no
+// field, so it never asks for the software keyboard. It has no title or
+// Close: a tap outside it dismisses it.
 
-const POPUP = "mobile-reaction-popup";
+const POPUP = "mobile-message-sheet";
 const FREQUENT = ["👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "😡", "🎉", "🤔", "👋", "✅", "💯", "🙏", "😍", "👏"];
 /// The first choice, for a click queued inside one `page.evaluate`.
-const FIRST_CHOICE = "#mobile-reaction-popup .mobile-reaction-choice";
+const FIRST_CHOICE = "#mobile-message-sheet .mobile-reaction-choice";
 
 function popup(page: Page): Locator {
   return page.getByTestId(POPUP);
@@ -77,10 +79,11 @@ test.describe("The mobile reaction popup", () => {
     await expect(react).toHaveAttribute("aria-expanded", "false");
     await openReactionPopup(page, row);
     await expect(react).toHaveAttribute("aria-expanded", "true");
-    await expect(popup(page), "named, though it shows no title").toHaveAccessibleName("React to message");
+    await expect(popup(page), "named, though it shows no title").toHaveAccessibleName("Message options");
     await expect(popup(page).getByRole("heading"), "no title").toHaveCount(0);
     await expect(page.getByTestId("mobile-reaction-close"), "no Close: a tap outside dismisses it").toHaveCount(0);
-    await expect(page.getByTestId("mobile-message-actions-sheet"), "never the actions").toBeHidden();
+    await expect(popup(page).getByTestId("mobile-message-action-reply"), "the actions below the emoji").toBeVisible();
+    await expect(popup(page).getByTestId("mobile-sheet-reactors"), "no reactions, no list").toHaveCount(0);
     await expect(popup(page).locator("input, textarea, [contenteditable]"), "no field to raise a keyboard").toHaveCount(0);
     await expect(palette(page)).toHaveAttribute("role", "group");
     await expect(palette(page)).toHaveAccessibleName("Reactions");
@@ -99,7 +102,7 @@ test.describe("The mobile reaction popup", () => {
     expect(g.left, "it opens at the start").toBe(0);
     // A tap outside, over the history, lands on the backdrop and dismisses it.
     const outside = await historyPoint(page);
-    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), outside)).toBe("mobile-reaction-backdrop");
+    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), outside)).toBe("mobile-message-sheet-backdrop");
     await pressAt(page, outside);
     await expect(popup(page)).toBeHidden();
     await expect(react, "focus back on the +").toBeFocused();
@@ -171,7 +174,7 @@ test.describe("The mobile reaction popup", () => {
     await page.evaluate(
       ({ key, sel }) => {
         const choice = document.querySelector<HTMLElement>(sel)!;
-        const close = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-backdrop"]')!;
+        const close = document.querySelector<HTMLElement>('[data-testid="mobile-message-sheet-backdrop"]')!;
         const plus = document.querySelector<HTMLElement>(`[id="msg-${key}"] [data-testid="message-react-button"]`)!;
         close.click();
         plus.click();
@@ -194,29 +197,64 @@ test.describe("The mobile reaction popup", () => {
     // Over the header's rooms button.
     const hamburger = (await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).first().boundingBox())!;
     const point = { x: hamburger.x + hamburger.width / 2, y: hamburger.y + hamburger.height / 2 };
-    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), point)).toBe("mobile-reaction-backdrop");
+    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), point)).toBe("mobile-message-sheet-backdrop");
     await pressAt(page, point);
     await expect(popup(page)).toBeHidden();
     await expect(chips(row)).toHaveCount(0);
     await expect(page.locator("#chat-scroll-container"), "the rooms panel did not open").toBeVisible();
   });
 
-  test("closing a reactor list for the popup leaves focus on its first choice", async ({ page }) => {
+  test("a chip opens the sheet, which lists who reacted; dismissed, focus returns to the chip", async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "memberReactsToNewest", "🎉");
     const chip = chips(row);
     await expect(chip).toHaveCount(1);
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    // From the keyboard: the chip's list, then Tab to the + and Enter.
+    await press(page, chip);
+    await expect(popup(page)).toBeVisible();
+    await expect(popup(page)).toHaveAttribute("data-target-row", await rowKey(row));
+    await expect(page.getByTestId("reaction-owners"), "not the desktop reactor list").toHaveCount(0);
+    const list = popup(page).getByTestId("mobile-sheet-reactors");
+    await expect(list).toHaveAccessibleName("Who reacted");
+    await expect(list.getByTestId("mobile-sheet-reaction")).toHaveCount(1);
+    await expect(list.getByTestId("mobile-sheet-reaction")).toContainText("🎉");
+    const names = await list.getByTestId("mobile-sheet-reactor").allTextContents();
+    expect(names, "the member who reacted, not the reader").toHaveLength(1);
+    expect(names[0]).not.toBe("You");
+    const [paletteBox, listBox, actionsBox] = [
+      await palette(page).boundingBox(),
+      await list.boundingBox(),
+      await popup(page).locator(".mobile-sheet-actions").boundingBox(),
+    ];
+    expect(paletteBox!.y, "emoji, then who reacted").toBeLessThan(listBox!.y);
+    expect(listBox!.y, "then the actions").toBeLessThan(actionsBox!.y);
+    await expect(choices(page).first(), "an emoji takes focus").toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(popup(page)).toBeHidden();
+    await expect(chip, "focus back on the chip it opened from").toBeFocused();
+
+    // The reader joins in: the list then names them too, as "You".
+    await openReactionPopup(page, row);
+    await press(page, palette(page).getByRole("button", { name: "React with 🎉" }));
+    await expect(chip).toContainText("2");
+    await press(page, chip);
+    await expect(popup(page).getByTestId("mobile-sheet-reactor")).toHaveCount(2);
+    await expect(popup(page).getByTestId("mobile-sheet-reactor").filter({ hasText: /^You$/ })).toHaveCount(1);
+    await expect(palette(page).getByRole("button", { name: "Remove 🎉 reaction" }), "and it is their current one").toBeVisible();
+  });
+
+  test("Enter on a chip opens the sheet too", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await callRiverTest(page, "memberReactsToNewest", "🎉");
+    const chip = chips(row);
+    await expect(chip).toHaveCount(1);
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await keyboardFocus(page, chip);
     await page.keyboard.press("Enter");
-    await expect(page.getByTestId("reaction-owners")).toBeVisible();
-    await row.getByTestId("message-react-button").focus();
-    await page.keyboard.press("Enter");
     await expect(popup(page)).toBeVisible();
-    await expect(page.getByTestId("reaction-owners"), "the list closed").toHaveCount(0);
-    await settle(page);
-    await expect(choices(page).first(), "its focus return did not take the popup's focus").toBeFocused();
+    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(chip).toBeFocused();
   });
 
   test("its message leaving closes it; a remount keeps it", { tag: "@chromium-only" }, async ({ page }) => {
@@ -358,7 +396,7 @@ test.describe("The reaction popup on a short screen", () => {
     const row = await openRoomWithTarget(page);
     await openReactionPopup(page, row);
     const g = await page.evaluate(() => {
-      const panel = document.querySelector("#mobile-reaction-popup .mobile-sheet-panel") as HTMLElement;
+      const panel = document.querySelector("#mobile-message-sheet .mobile-sheet-panel") as HTMLElement;
       const r = panel.getBoundingClientRect();
       const palette = panel.querySelector(".mobile-reaction-palette") as HTMLElement;
       return {
