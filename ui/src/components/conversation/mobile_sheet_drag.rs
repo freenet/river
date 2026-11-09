@@ -4,8 +4,8 @@
 //! panel, an action, an emoji) and then moves further down than sideways drags the panel
 //! with it, by the distance moved, and fades the dim behind it. Released far
 //! enough or fast enough ([`release`]) the panel slides away and the sheet
-//! closes; otherwise it springs back. Upward it gives a little and springs
-//! back. A sideways move is left alone: on the emoji row the browser is
+//! closes; otherwise it springs back. Upward it does not move: it never sits
+//! higher than at rest, fully visible on the bottom edge. A sideways move is left alone: on the emoji row the browser is
 //! already scrolling it (`touch-action: pan-x`, `main.css`). A second finger
 //! (a pinch) cancels the drag, and the zoom goes ahead.
 //!
@@ -34,9 +34,6 @@ const MIN_FLICK_PX: f64 = 16.0;
 const VELOCITY_WINDOW_MS: f64 = 100.0;
 /// A finger held still this long before it lifts released with no speed.
 const STILL_MS: f64 = 80.0;
-/// Upward the panel follows a fifth of the move, at most this far.
-const UP_RESISTANCE: f64 = 0.2;
-const UP_MAX_PX: f64 = 24.0;
 
 /// Which way a pointer set off, once it is past the tap slop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,13 +54,11 @@ pub(super) fn intent(dx: f64, dy: f64) -> Option<Axis> {
     }
 }
 
-/// Where the panel sits for a pointer `dy` below where it went down.
+/// Where the panel sits for a pointer `dy` below where it went down: with
+/// the finger, downward only. It never sits higher than at rest, where it is
+/// fully visible on the bottom edge.
 pub(super) fn offset(dy: f64) -> f64 {
-    if dy >= 0.0 {
-        dy
-    } else {
-        (dy * UP_RESISTANCE).max(-UP_MAX_PX)
-    }
+    dy.max(0.0)
 }
 
 /// The speed (px/ms, down positive) of a release at `released_at`, from the
@@ -480,11 +475,11 @@ mod tests {
     }
 
     #[test]
-    fn down_follows_the_finger_and_up_resists() {
+    fn down_follows_the_finger_and_up_stays_put() {
         assert_eq!(offset(50.0), 50.0);
         assert_eq!(offset(0.0), 0.0);
-        assert_eq!(offset(-50.0), -10.0);
-        assert_eq!(offset(-500.0), -UP_MAX_PX);
+        assert_eq!(offset(-50.0), 0.0);
+        assert_eq!(offset(-500.0), 0.0);
     }
 
     #[test]

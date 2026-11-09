@@ -413,6 +413,15 @@ export function panelOffset(page: Page, id: string): Promise<number> {
   }, id);
 }
 
+/// How far the open panel of mobile dialog `id` sits above the bottom of
+/// the viewport, in px (0 at rest; the opening slide counts).
+export function panelBottomGap(page: Page, id: string): Promise<number> {
+  return page.evaluate((id) => {
+    const panel = document.querySelector(`#${id} .mobile-sheet-panel`)!;
+    return window.innerHeight - panel.getBoundingClientRect().bottom;
+  }, id);
+}
+
 /// Wait until the open panel of mobile dialog `id` has no slide or
 /// transition running.
 export async function panelAtRest(page: Page, id: string) {

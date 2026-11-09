@@ -6,6 +6,7 @@ import {
   openReactionPopup,
   openRoomWithComposer,
   panelAtRest,
+  panelBottomGap,
   panelOffset,
   pressAt,
   settle,
@@ -159,6 +160,17 @@ test.describe("A mouse on the reaction popup", () => {
     await expect(popup(page), "a sideways drag is no tap").toBeVisible();
     expect(await panelOffset(page, POPUP)).toBe(0);
   });
+
+  test("a mouse drag up does not lift it", async ({ page }) => {
+    await openPopup(page);
+    const [x, y] = await handlePoint(page);
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x, y - 120, { steps: 6 });
+    expect(await panelBottomGap(page, POPUP), "no gap under it").toBeLessThan(1);
+    await page.mouse.up();
+    await expect(popup(page)).toBeVisible();
+  });
 });
 
 test.describe("A finger on the reaction popup", () => {
@@ -230,15 +242,18 @@ test.describe("A finger on the reaction popup", () => {
     expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signs);
   });
 
-  test("dragging up resists and springs back", async ({ page }) => {
+  test("dragging up never lifts it above its rest position", async ({ page }) => {
     await openPopup(page);
     const [x, y] = await handlePoint(page);
+    expect(await panelBottomGap(page, POPUP), "premise: at rest on the bottom edge").toBeLessThan(1);
     await withFingers(page, async (fingers) => {
       await fingers.press([1, x, y]);
       await fingers.move({ 1: [0, -100] }, 10);
-      const held = await panelOffset(page, POPUP);
-      expect(held, "it gives a little").toBeLessThan(0);
-      expect(held, "and no more than 24px").toBeGreaterThanOrEqual(-24);
+      expect(await panelOffset(page, POPUP), "no upward offset").toBe(0);
+      expect(await panelBottomGap(page, POPUP), "no gap under it").toBeLessThan(1);
+      // Back down past the start: it follows from where the finger went down.
+      await fingers.move({ 1: [0, 130] }, 10);
+      expect(await panelOffset(page, POPUP)).toBeGreaterThan(20);
       await fingers.lift();
     });
     await panelAtRest(page, POPUP);
