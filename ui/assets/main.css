@@ -366,13 +366,21 @@
     box-shadow: 0 0 0 2px var(--color-accent);
 }
 
+/* The row's keyboard way into its actions sheet: below 48rem only, visually
+ * hidden until it has keyboard focus, then a small pill at the row's top
+ * right. At 48rem and wider it is not there at all. */
+.mobile-actions-entry {
+    display: none;
+}
+
 /* Below Tailwind's `md` (48rem; the same query as `mobile_surface.rs`, the
  * exact complement of `(min-width: 48rem)`, so no fractional width falls
  * between): a message's trailing Reply, Edit and Delete are gone, hits and
  * tab stops included, and a tap on the row opens them in the actions sheet.
  * Its one reaction + stays, visible and tappable at rest on any pointer (a
  * narrow mouse window too), after its chips. The footer keeps its line for
- * the + alone. DM rows have no footer and are untouched. */
+ * the + alone. DM rows have no footer and are untouched. The keyboard entry
+ * above is shown. */
 @media not all and (min-width: 48rem) {
     .msg-action-cluster {
         display: none;
@@ -382,16 +390,7 @@
         opacity: 1;
         pointer-events: auto;
     }
-}
 
-/* The row's keyboard way into its actions sheet: below 48rem only, visually
- * hidden until it has keyboard focus, then a small pill at the row's top
- * right. At 48rem and wider it is not there at all. */
-.mobile-actions-entry {
-    display: none;
-}
-
-@media not all and (min-width: 48rem) {
     .mobile-actions-entry {
         display: block;
         position: absolute;

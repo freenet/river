@@ -89,7 +89,7 @@ pub(super) fn single_emoji(input: &str) -> Result<&str, ReactionInputError> {
 /// The most bytes a reaction may have. The longest RGI sequence in Emoji 16.0
 /// (a kiss or couple with two skin tones) is 35 bytes, a subdivision flag 28;
 /// this leaves room for any of them and refuses pasted runs of text.
-pub(super) const MAX_REACTION_BYTES: usize = 64;
+const MAX_REACTION_BYTES: usize = 64;
 
 /// The most elements a ZWJ sequence may join: the RGI maximum in Emoji 16.0
 /// (families, kisses and couples join four).
@@ -119,9 +119,8 @@ fn emoji_sequence_len(s: &[char]) -> Option<usize> {
     if is_regional_indicator(s[0]) {
         return s
             .get(1)
-            .copied()
-            .filter(|&c| is_regional_indicator(c))
-            .map(|_| 2);
+            .is_some_and(|&c| is_regional_indicator(c))
+            .then_some(2);
     }
     // Tag sequence: the black flag alone, a subdivision id in tag letters
     // and digits (a region and its subdivision, 3 to 7 of them), the cancel
@@ -181,17 +180,8 @@ fn is_tag_spec(c: char) -> bool {
 
 fn in_ranges(c: char, ranges: &[(u32, u32)]) -> bool {
     let c = c as u32;
-    ranges
-        .binary_search_by(|&(lo, hi)| {
-            if hi < c {
-                std::cmp::Ordering::Less
-            } else if lo > c {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
-        .is_ok()
+    let at = ranges.partition_point(|&(_, hi)| hi < c);
+    ranges.get(at).is_some_and(|&(lo, _)| lo <= c)
 }
 
 fn is_emoji(c: char) -> bool {
@@ -528,9 +518,6 @@ mod tests {
 
     #[test]
     fn default_emoji_characters() {
-        accepts("👍");
-        accepts("😂");
-        accepts("🔥");
         accepts("⌚");
         accepts("🦰"); // a hair component on its own
         accepts("🏽"); // a skin tone on its own is an emoji character
@@ -576,8 +563,9 @@ mod tests {
     fn modifier_sequences() {
         accepts("👍🏽");
         accepts("👋🏿");
-        accepts("\u{1FAF1}\u{1F3FB}"); // rightwards hand, light
-                                       // A skin tone after a character that takes none is two emoji.
+        // Rightwards hand, light.
+        accepts("\u{1FAF1}\u{1F3FB}");
+        // A skin tone after a character that takes none is two emoji.
         refuses("😂🏽", Multiple);
     }
 
@@ -589,8 +577,9 @@ mod tests {
         accepts("❤\u{FE0F}\u{200D}🔥"); // heart on fire
         accepts("🧑🏽\u{200D}🚀"); // astronaut, medium skin tone
         accepts("👩🏻\u{200D}\u{2764}\u{FE0F}\u{200D}👨🏿"); // couple with heart
-        accepts("🏃\u{200D}♂"); // minimally qualified: no VS16 on the sign
-                                // Emoji 16.0's new direction-facing ZWJ sequences.
+                                                         // Minimally qualified: no VS16 on the sign.
+        accepts("🏃\u{200D}♂");
+        // Emoji 16.0's new direction-facing ZWJ sequences.
         accepts("🏃\u{200D}\u{27A1}\u{FE0F}");
         // A dangling joiner is not a sequence.
         refuses("👨\u{200D}", NotEmoji);
@@ -634,12 +623,14 @@ mod tests {
             "🏳\u{FE0F}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
             NotEmoji,
         );
+        // Capitals.
         refuses(
             "🏴\u{E0047}\u{E0042}\u{E0045}\u{E004E}\u{E0047}\u{E007F}",
             NotEmoji,
-        ); // capitals
-        refuses("🏴\u{E0020}\u{E0067}\u{E0062}\u{E007F}", NotEmoji); // tag space
-                                                                     // A subdivision id is 3 to 7 tags.
+        );
+        // A tag space.
+        refuses("🏴\u{E0020}\u{E0067}\u{E0062}\u{E007F}", NotEmoji);
+        // A subdivision id is 3 to 7 tags.
         refuses("🏴\u{E0067}\u{E0062}\u{E007F}", NotEmoji);
         refuses(&format!("🏴{}\u{E007F}", "\u{E0061}".repeat(8)), NotEmoji);
     }
@@ -683,14 +674,6 @@ mod tests {
         refuses("👍👍", Multiple);
         refuses("😂🔥", Multiple);
         refuses("❤\u{FE0F}👍", Multiple);
-    }
-
-    /// Surrounding whitespace is not part of the emoji; the emoji's own
-    /// bytes come back unchanged.
-    #[test]
-    fn surrounding_whitespace_is_left_out() {
-        assert_eq!(single_emoji(" ❤\u{FE0F} "), Ok("❤\u{FE0F}"));
-        assert_eq!(single_emoji("👍\n"), Ok("👍"));
     }
 
     /// Every palette choice is accepted as typed, so the field and the

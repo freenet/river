@@ -137,9 +137,7 @@ impl ReactionSurfaces {
     /// callback only.
     pub(super) fn owner_list_opened(mut self, list: Signal<Option<ReactionOwnersPopover>>) {
         self.close();
-        if self.mobile.opening.peek().is_some() {
-            self.close_mobile(false);
-        }
+        self.close_mobile(false);
         self.open_owner_list.set(Some(list));
     }
 
@@ -287,9 +285,7 @@ pub(super) fn ReactionInvoker(
         _ => (false, false),
     };
     let (mobile_expanded, mobile_stale) = match surfaces.mobile.opening.read().as_ref() {
-        Some(open) if open.surface == MobileSurface::Reaction && open.row == row => {
-            (true, open.current != current)
-        }
+        Some(open) if open.is_for(MobileSurface::Reaction, &row) => (true, open.current != current),
         _ => (false, false),
     };
     let narrow = narrow_for_render();
@@ -317,9 +313,10 @@ pub(super) fn ReactionInvoker(
         let (row, current) = (row.clone(), current.clone());
         let mut opening = surfaces.mobile.opening;
         crate::util::defer(move || {
-            let stale = opening.peek().as_ref().is_some_and(|o| {
-                o.surface == MobileSurface::Reaction && o.row == row && o.current != current
-            });
+            let stale = opening
+                .peek()
+                .as_ref()
+                .is_some_and(|o| o.is_for(MobileSurface::Reaction, &row) && o.current != current);
             if stale {
                 opening.with_mut(|o| {
                     if let Some(o) = o.as_mut() {
@@ -339,17 +336,7 @@ pub(super) fn ReactionInvoker(
     {
         let row = row.clone();
         use_drop(move || {
-            if let Ok(open) = surfaces.mobile.opening.try_peek() {
-                if let Some(open) = open
-                    .as_ref()
-                    .filter(|o| o.surface == MobileSurface::Reaction && o.row == row)
-                {
-                    let token = open.token;
-                    crate::util::defer(move || {
-                        surfaces.mobile_control_dropped(MobileSurface::Reaction, token)
-                    });
-                }
-            }
+            surfaces.mobile_control_unmounting(MobileSurface::Reaction, &row);
             // The opening this React was for, taken now, while its element is
             // still the one in the document: what runs later acts on that
             // opening only, never on one made since.
@@ -480,9 +467,7 @@ fn open_for(mut surfaces: ReactionSurfaces, target: ReactionTarget, activation: 
     if !is_latest_activation(activation) || !popover_supported() || !target_is_live(&target) {
         return;
     }
-    if surfaces.mobile.opening.peek().is_some() {
-        surfaces.close_mobile(false);
-    }
+    surfaces.close_mobile(false);
     surfaces.close_owner_list_now();
     if surfaces.target.peek().as_ref() != Some(&target) {
         surfaces.target.set(Some(target.clone()));
@@ -612,7 +597,7 @@ pub(super) fn ReactionPicker(
                                 key: "{emoji}",
                                 r#type: "button",
                                 class: if is_current { "reaction-picker-emoji reaction-picker-emoji--current" } else { "reaction-picker-emoji" },
-                                title: if is_current { format!("Remove {emoji} reaction") } else { format!("React with {emoji}") },
+                                title: choice_label(&emoji, is_current),
                                 onclick: {
                                     let emoji = emoji.clone();
                                     move |_| {
@@ -628,6 +613,16 @@ pub(super) fn ReactionPicker(
                 }
             }
         }
+    }
+}
+
+/// What a palette choice says it does, as its title and accessible name: the
+/// reader's current reaction is removed, any other emoji reacts.
+pub(super) fn choice_label(emoji: &str, is_current: bool) -> String {
+    if is_current {
+        format!("Remove {emoji} reaction")
+    } else {
+        format!("React with {emoji}")
     }
 }
 
@@ -673,6 +668,11 @@ fn new_state(e: &Event<ToggleData>) -> Option<String> {
 #[cfg(target_arch = "wasm32")]
 mod dom {
     use super::super::focus_without_scrolling;
+    use super::super::mobile_surface::dom::{
+        is_zoom, row_control, set_window_capture_listeners, touches,
+    };
+    use super::super::mobile_surface::MobileSurface;
+    use super::super::TAP_SLOP_PX;
     use super::{ReactionSurfaces, ANCHOR_NAME, PICKER_ID};
     use dioxus::prelude::ReadableExt;
     use std::cell::RefCell;
@@ -702,12 +702,7 @@ mod dom {
     }
 
     pub(super) fn react_button(row: &str) -> Option<web_sys::HtmlElement> {
-        document()?
-            .get_element_by_id(&format!("msg-{row}"))?
-            .query_selector("[data-testid=\"message-react-button\"]")
-            .ok()??
-            .dyn_into::<web_sys::HtmlElement>()
-            .ok()
+        row_control(row, MobileSurface::Reaction)
     }
 
     pub(crate) fn is_open() -> bool {
@@ -951,30 +946,14 @@ mod dom {
         if on && BLOCKING.with(|b| b.get()) {
             return;
         }
-        if let Some(window) = web_sys::window() {
-            BLOCKER.with(|blocker| {
-                let mut blocker = blocker.borrow_mut();
-                if !on && blocker.is_none() {
-                    return;
-                }
-                let callback = blocker.get_or_insert_with(|| Closure::new(on_held_input));
-                let function: &js_sys::Function = callback.as_ref().unchecked_ref();
-                for kind in HELD_KINDS {
-                    if on {
-                        let options = web_sys::AddEventListenerOptions::new();
-                        options.set_capture(true);
-                        options.set_passive(false);
-                        let _ = window
-                            .add_event_listener_with_callback_and_add_event_listener_options(
-                                kind, function, &options,
-                            );
-                    } else {
-                        let _ = window
-                            .remove_event_listener_with_callback_and_bool(kind, function, true);
-                    }
-                }
-            });
-        }
+        BLOCKER.with(|blocker| {
+            let mut blocker = blocker.borrow_mut();
+            if !on && blocker.is_none() {
+                return;
+            }
+            let callback = blocker.get_or_insert_with(|| Closure::new(on_held_input));
+            set_window_capture_listeners(&HELD_KINDS, callback.as_ref().unchecked_ref(), on);
+        });
         BLOCKING.with(|b| b.set(on));
         if !on {
             release_capture();
@@ -1000,9 +979,6 @@ mod dom {
         static CAPTURED: RefCell<Option<(web_sys::HtmlElement, i32)>> =
             const { RefCell::new(None) };
     }
-
-    /// How far a finger may wander and still be a tap, in CSS px.
-    const TAP_SLOP_PX: f64 = 10.0;
 
     fn on_held_input(event: web_sys::Event) {
         let kind = event.type_();
@@ -1173,23 +1149,6 @@ mod dom {
                 *c = None;
             }
         });
-    }
-
-    /// How many fingers a touch event says are down.
-    fn touches(event: &web_sys::Event) -> u32 {
-        js_sys::Reflect::get(event, &"touches".into())
-            .and_then(|list| js_sys::Reflect::get(&list, &"length".into()))
-            .ok()
-            .and_then(|n| n.as_f64())
-            .map_or(0, |n| n as u32)
-    }
-
-    /// A wheel with Ctrl down: the browser zooms on it (Ctrl+wheel, and a
-    /// touchpad pinch arrives as one), so it is never held.
-    fn is_zoom(wheel: &web_sys::Event) -> bool {
-        wheel
-            .dyn_ref::<web_sys::MouseEvent>()
-            .is_some_and(web_sys::MouseEvent::ctrl_key)
     }
 }
 

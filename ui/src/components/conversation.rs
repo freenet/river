@@ -3584,6 +3584,10 @@ type PressRecord = Rc<std::cell::RefCell<Option<(String, String, f64)>>>;
 /// for longer than this therefore opens the list rather than removing.
 const PRESS_FRESH_MS: f64 = 1500.0;
 
+/// How far a press may wander and still be a tap, in CSS px.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const TAP_SLOP_PX: f64 = 10.0;
+
 /// Monotonic milliseconds (`performance.now()`), so a wall-clock change
 /// cannot make a press look fresh or stale.
 fn now_ms() -> f64 {
@@ -4557,7 +4561,7 @@ fn MessageGroupComponent(
                                         let row_id_for_chips = msg.id.clone();
                                         let msg_id_react = msg.message_id.clone();
                                         // A row being edited has the form's own buttons.
-                                        let show_actions = editing_message.read().as_ref() != Some(&msg.id);
+                                        let show_actions = !row_editing;
                                         let row_for_invoker = msg.id.clone();
                                         let row_for_entry = msg.id.clone();
                                         let msg_id_for_entry = msg.message_id.clone();
@@ -4854,20 +4858,18 @@ fn MessageGroupComponent(
                                                     }
                                                 }
                                             }
-                                            // Below 48rem the cluster is hidden: a tap on the
-                                            // row opens its actions, and this hidden button
-                                            // is the keyboard's way in.
                                             if show_actions {
+                                                // Below 48rem the cluster is hidden: a tap on the
+                                                // row opens its actions, and this hidden button
+                                                // is the keyboard's way in.
                                                 MobileActionsEntry {
                                                     surfaces: reactions,
                                                     row: row_for_entry,
                                                     message: msg_id_for_entry,
                                                     own: is_self,
                                                 }
-                                            }
-                                            // Reply, Edit and Delete: one unit, which wraps
-                                            // onto its own line when it does not fit.
-                                            if show_actions {
+                                                // Reply, Edit and Delete: one unit, which wraps
+                                                // onto its own line when it does not fit.
                                                 div {
                                                     "data-testid": "message-action-cluster",
                                                     class: "msg-action-cluster",

@@ -37,11 +37,11 @@
 
 #[cfg(target_arch = "wasm32")]
 use super::mobile_surface::dom;
-use super::mobile_surface::{narrow_now, opening_is_live, MobileOpening, MobileSurface, SHEET_ID};
-use super::reaction_picker::ReactionSurfaces;
-use crate::components::icons::{
-    line_icon, CLOSE_ICON_PATH, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH,
+use super::mobile_surface::{
+    narrow_now, opening_is_live, MobileDialogFrame, MobileOpening, MobileSurface, SHEET_ID,
 };
+use super::reaction_picker::ReactionSurfaces;
+use crate::components::icons::{line_icon, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH};
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
 
@@ -60,10 +60,6 @@ const EXCLUDED: &str = "a, button, input, textarea, select, option, label, summa
      video, audio, iframe, object, embed, [role=\"button\"], [role=\"link\"], \
      [role=\"menuitem\"], [role=\"dialog\"], [contenteditable=\"\"], [contenteditable=\"true\"], \
      [tabindex]:not([tabindex=\"-1\"]), [data-row-actions=\"exclude\"], [data-member-id]";
-
-/// How far a press may wander and still be a tap, in CSS px.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-const TAP_SLOP_PX: f64 = 10.0;
 
 /// A press on a message row, kept for the click it may become. Not a signal:
 /// nothing renders from it.
@@ -89,7 +85,7 @@ struct RowPress {
 /// cancels it, and so does a selection made meanwhile. 500ms is the Windows
 /// default double-click time, as the room description's click uses. A finger
 /// opens at once: a double tap does not select a word.
-pub(super) const ROW_DOUBLE_CLICK_WAIT_MS: u64 = 500;
+const ROW_DOUBLE_CLICK_WAIT_MS: u64 = 500;
 
 thread_local! {
     static ROW_PRESS: std::cell::RefCell<Option<RowPress>> =
@@ -163,7 +159,7 @@ pub(super) fn note_row_release(e: &PointerEvent, cancelled: bool) {
 
 /// What a click on a row does to its actions sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RowTap {
+enum RowTap {
     Nothing,
     /// A finger's tap, or a click with no press of its own (assistive
     /// technology): open now.
@@ -327,14 +323,14 @@ fn press_makes_tap(press: Option<&RowPress>, row: &str, x: f64, y: f64, now: f64
             p.row == row
                 && !p.spoiled
                 && now - p.at <= super::PRESS_FRESH_MS
-                && (x - p.x).hypot(y - p.y) <= TAP_SLOP_PX
+                && (x - p.x).hypot(y - p.y) <= super::TAP_SLOP_PX
         }
     }
 }
 
 /// Open the actions sheet for `opening`, from a row tap or the entry. From
 /// the event handler; the opening is committed deferred.
-pub(super) fn open_actions(surfaces: ReactionSurfaces, opening: MobileOpening) {
+fn open_actions(surfaces: ReactionSurfaces, opening: MobileOpening) {
     crate::util::defer(move || {
         surfaces.open_mobile(opening);
     });
@@ -359,25 +355,12 @@ pub(super) fn MobileActionsEntry(
         .opening
         .read()
         .as_ref()
-        .is_some_and(|o| o.surface == MobileSurface::Actions && o.row == row);
+        .is_some_and(|o| o.is_for(MobileSurface::Actions, &row));
     // Its row leaving the history closes a sheet open for it; the row only
     // remounting keeps it, and focus returns to the new entry.
     {
         let row = row.clone();
-        use_drop(move || {
-            let Ok(open) = surfaces.mobile.opening.try_peek() else {
-                return;
-            };
-            if let Some(token) = open
-                .as_ref()
-                .filter(|o| o.surface == MobileSurface::Actions && o.row == row)
-                .map(|o| o.token)
-            {
-                crate::util::defer(move || {
-                    surfaces.mobile_control_dropped(MobileSurface::Actions, token)
-                });
-            }
-        });
+        use_drop(move || surfaces.mobile_control_unmounting(MobileSurface::Actions, &row));
     }
     rsx! {
         button {
@@ -419,7 +402,7 @@ fn dispatch(
         return;
     };
     let live = opening_is_live(&opening);
-    surfaces.close_mobile(!live);
+    surfaces.close_mobile(false);
     if live {
         on_action.call((action, opening.row, opening.message));
     }
@@ -466,15 +449,6 @@ pub(super) fn MobileMessageActionsSheet(
         #[cfg(not(target_arch = "wasm32"))]
         let _ = first_run;
     });
-    #[cfg(target_arch = "wasm32")]
-    let close_listener = use_hook(|| {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            None::<(
-                web_sys::HtmlElement,
-                wasm_bindgen::closure::Closure<dyn FnMut()>,
-            )>,
-        ))
-    });
     let act = move |action: MobileAction| {
         move |_| {
             if let Some(token) = surfaces.mobile_token(MobileSurface::Actions) {
@@ -482,89 +456,33 @@ pub(super) fn MobileMessageActionsSheet(
             }
         }
     };
-    let dismiss = move |_| {
-        let token = surfaces.mobile_token(MobileSurface::Actions);
-        crate::util::defer(move || {
-            if token.is_some_and(|t| {
-                surfaces
-                    .mobile_opening_for(MobileSurface::Actions, t)
-                    .is_some()
-            }) {
-                surfaces.close_mobile(true);
-            }
-        });
-    };
     rsx! {
-        dialog {
-            id: SHEET_ID,
-            "data-testid": "mobile-message-actions-sheet",
-            class: "mobile-sheet",
-            "aria-labelledby": "mobile-message-actions-title",
-            "data-target-row": "{target_row}",
-            onmounted: move |_| {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let listener = dom::on_dialog_close(SHEET_ID, move || {
-                        crate::util::defer(move || {
-                            surfaces.mobile_dialog_closed(MobileSurface::Actions)
-                        });
-                    });
-                    *close_listener.borrow_mut() = listener;
+        MobileDialogFrame { surfaces, surface: MobileSurface::Actions, target_row,
+            div { class: "mobile-sheet-actions",
+                button {
+                    r#type: "button",
+                    "data-testid": "mobile-message-action-reply",
+                    class: "mobile-sheet-action",
+                    onclick: act(MobileAction::Reply),
+                    {line_icon(REPLY_ICON_PATH, 20)}
+                    span { "Reply" }
                 }
-            },
-            onkeydown: move |e: KeyboardEvent| {
-                #[cfg(target_arch = "wasm32")]
-                if e.key() == Key::Tab && dom::contain_tab(SHEET_ID, e.modifiers().shift()) {
-                    e.prevent_default();
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = e;
-            },
-            div {
-                "data-testid": "mobile-message-actions-backdrop",
-                class: "mobile-sheet-backdrop",
-                onclick: dismiss,
-            }
-            div { class: "mobile-sheet-panel",
-                div { class: "mobile-sheet-handle", "aria-hidden": "true" }
-                div { class: "mobile-sheet-header",
-                    h2 { id: "mobile-message-actions-title", class: "mobile-sheet-title", "Message actions" }
+                if own {
                     button {
                         r#type: "button",
-                        "data-testid": "mobile-message-actions-close",
-                        class: "mobile-sheet-close",
-                        "aria-label": "Close",
-                        title: "Close",
-                        onclick: dismiss,
-                        {line_icon(CLOSE_ICON_PATH, 18)}
-                    }
-                }
-                div { class: "mobile-sheet-actions",
-                    button {
-                        r#type: "button",
-                        "data-testid": "mobile-message-action-reply",
+                        "data-testid": "mobile-message-action-edit",
                         class: "mobile-sheet-action",
-                        onclick: act(MobileAction::Reply),
-                        {line_icon(REPLY_ICON_PATH, 20)}
-                        span { "Reply" }
+                        onclick: act(MobileAction::Edit),
+                        {line_icon(EDIT_ICON_PATH, 20)}
+                        span { "Edit" }
                     }
-                    if own {
-                        button {
-                            r#type: "button",
-                            "data-testid": "mobile-message-action-edit",
-                            class: "mobile-sheet-action",
-                            onclick: act(MobileAction::Edit),
-                            {line_icon(EDIT_ICON_PATH, 20)}
-                            span { "Edit" }
-                        }
-                        button {
-                            r#type: "button",
-                            "data-testid": "mobile-message-action-delete",
-                            class: "mobile-sheet-action mobile-sheet-action--danger",
-                            onclick: act(MobileAction::Delete),
-                            {line_icon(DELETE_ICON_PATH, 20)}
-                            span { "Delete" }
-                        }
+                    button {
+                        r#type: "button",
+                        "data-testid": "mobile-message-action-delete",
+                        class: "mobile-sheet-action mobile-sheet-action--danger",
+                        onclick: act(MobileAction::Delete),
+                        {line_icon(DELETE_ICON_PATH, 20)}
+                        span { "Delete" }
                     }
                 }
             }

@@ -185,6 +185,69 @@ pub fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Whether the media query `query` matches now; `None` where there is no
+/// `matchMedia` (and off the web).
+pub fn media_matches(query: &str) -> Option<bool> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()?
+            .match_media(query)
+            .ok()
+            .flatten()
+            .map(|list| list.matches())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = query;
+        None
+    }
+}
+
+/// Keep `signal` equal to whether `query` matches, from a `matchMedia` change
+/// listener that lives as long as the page. The write is deferred, and made
+/// only on a change (dioxus-signal-safety.md). Installs once per query.
+pub fn watch_media(query: &'static str, signal: &'static dioxus::prelude::GlobalSignal<bool>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use dioxus::prelude::ReadableExt;
+        use wasm_bindgen::JsCast;
+        thread_local! {
+            static WATCHED: std::cell::RefCell<Vec<&'static str>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let installed = WATCHED.with(|watched| {
+            let mut watched = watched.borrow_mut();
+            let installed = watched.contains(&query);
+            if !installed {
+                watched.push(query);
+            }
+            installed
+        });
+        if installed {
+            return;
+        }
+        let Some(list) = web_sys::window().and_then(|w| w.match_media(query).ok().flatten()) else {
+            return;
+        };
+        let watched = list.clone();
+        let on_change = Closure::<dyn FnMut()>::new(move || {
+            let matches = watched.matches();
+            defer(move || {
+                if *signal.peek() != matches {
+                    *signal.write() = matches;
+                }
+            });
+        });
+        let _ = list.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+        // Lives as long as the page.
+        on_change.forget();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (query, signal);
+    }
+}
+
 /// Wasm-safe replacement for `std::time::SystemTime::now()`. On wasm32,
 /// `SystemTime::now()` panics at runtime ("time not implemented on this
 /// platform") because rustc's wasm stub is `unreachable!()`. This helper

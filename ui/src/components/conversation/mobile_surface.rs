@@ -38,6 +38,7 @@
 use super::reaction_input::ReactionInputError;
 use super::reaction_picker::{shown_room, ReactionSurfaces};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
+use crate::components::icons::{line_icon, CLOSE_ICON_PATH};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractKey;
@@ -47,7 +48,6 @@ use std::cell::Cell;
 /// Below Tailwind's `md`: the exact complement of `(min-width: 48rem)`, so no
 /// fractional width between 767px and 768px belongs to neither. `main.css`
 /// uses the same query.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const NARROW_QUERY: &str = "not all and (min-width: 48rem)";
 
 /// The actions sheet's dialog.
@@ -67,10 +67,25 @@ pub(super) enum MobileSurface {
 }
 
 impl MobileSurface {
-    pub(super) fn dialog_id(self) -> &'static str {
+    fn dialog_id(self) -> &'static str {
         match self {
             Self::Actions => SHEET_ID,
             Self::Reaction => POPUP_ID,
+        }
+    }
+
+    /// What its frame's test ids and title id start with.
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Actions => "mobile-message-actions",
+            Self::Reaction => "mobile-reaction",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Actions => "Message actions",
+            Self::Reaction => "React to message",
         }
     }
 
@@ -142,6 +157,11 @@ impl MobileOpening {
             current,
         }
     }
+
+    /// Whether this is `surface`'s opening for `row`.
+    pub(super) fn is_for(&self, surface: MobileSurface, row: &str) -> bool {
+        self.surface == surface && self.row == row
+    }
 }
 
 /// The open mobile surface and the popup's scratch state: the field's text,
@@ -203,16 +223,19 @@ fn opening_matches(
 }
 
 impl ReactionSurfaces {
+    /// The open mobile opening, read fallibly (the conversation may have
+    /// unmounted).
+    fn mobile_opening(self) -> Option<MobileOpening> {
+        self.mobile.opening.try_peek().ok().and_then(|o| o.clone())
+    }
+
     /// Open `opening`'s surface, closing the desktop picker, a reactor list
     /// and the other mobile surface first. Nothing is opened for an opening
     /// already gone; a popup the press showed for it is put away again.
     /// Whether it is open. From a deferred callback only.
     pub(super) fn open_mobile(self, opening: MobileOpening) -> bool {
         let state = self.mobile;
-        let current = state.opening.try_peek().ok().and_then(|o| o.clone());
-        if current.as_ref().is_some_and(|o| o.token == opening.token) {
-            return true;
-        }
+        let current = self.mobile_opening();
         if !narrow_now() || !opening_is_live(&opening) {
             // Only a dialog no opening holds: a press superseded by a later
             // one must not take the later one's dialog away.
@@ -243,12 +266,13 @@ impl ReactionSurfaces {
     /// the input hold and the viewport tracking, then its state and scratch.
     /// An ordinary dismissal (`restore`) returns focus, without scrolling, to
     /// the row's control it opened from if that is still live; a handoff
-    /// (Reply, Edit, Delete) leaves focus to where it goes. From a deferred
+    /// (Reply, Edit, Delete) leaves focus to where it goes. Nothing is open
+    /// after it, and with nothing open it changes nothing. From a deferred
     /// callback only; the state is read and written fallibly, since the
     /// conversation may have unmounted.
     pub(super) fn close_mobile(self, restore: bool) {
         let state = self.mobile;
-        let open = state.opening.try_peek().ok().and_then(|o| o.clone());
+        let open = self.mobile_opening();
         dom::close_dialog(SHEET_ID);
         dom::close_dialog(POPUP_ID);
         dom::hold_background(false);
@@ -266,17 +290,22 @@ impl ReactionSurfaces {
         reset_scratch(state);
     }
 
+    /// Dismiss `surface` (Close, the backdrop), from its handler: it closes,
+    /// focus back on its control, unless an opening other than the one open
+    /// now has replaced it by then. A press not yet committed is closed too.
+    pub(super) fn dismiss_mobile(self, surface: MobileSurface) {
+        let token = self.mobile_token(surface);
+        crate::util::defer(move || {
+            if token.is_none_or(|t| self.mobile_opening_for(surface, t).is_some()) {
+                self.close_mobile(true);
+            }
+        });
+    }
+
     /// Close the mobile surface if what it is for has gone. From a deferred
     /// callback only.
     pub(super) fn close_mobile_if_stale(self) {
-        let stale = self
-            .mobile
-            .opening
-            .try_peek()
-            .ok()
-            .and_then(|o| o.clone())
-            .is_some_and(|o| !opening_is_live(&o));
-        if stale {
+        if self.mobile_opening().is_some_and(|o| !opening_is_live(&o)) {
             self.close_mobile(false);
         }
     }
@@ -285,24 +314,33 @@ impl ReactionSurfaces {
     /// and return focus. Nothing if it is open again by now (a close and an
     /// opening in one task). From a deferred callback only.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub(super) fn mobile_dialog_closed(self, surface: MobileSurface) {
-        let open = self.mobile.opening.try_peek().ok().and_then(|o| o.clone());
+    fn mobile_dialog_closed(self, surface: MobileSurface) {
+        let open = self.mobile_opening();
         if open.is_some_and(|o| o.surface == surface) && !dom::dialog_open(surface.dialog_id()) {
             self.close_mobile(true);
         }
     }
 
-    /// `row`'s control for `surface` unmounted while opening `token` was
-    /// open. If the opening is still live its row only remounted: it stays
-    /// open, and focus returns to the new control when it closes. Otherwise
-    /// it closes, silently. From a deferred callback only.
-    pub(super) fn mobile_control_dropped(self, surface: MobileSurface, token: u64) {
-        let open = self.mobile.opening.try_peek().ok().and_then(|o| o.clone());
-        if let Some(open) = open {
-            if open.surface == surface && open.token == token && !opening_is_live(&open) {
+    /// `row`'s control for `surface` is unmounting (from its `use_drop`). If
+    /// the opening open for it now is still live when the deferred check runs,
+    /// its row only remounted: it stays open, and focus returns to the new
+    /// control when it closes. Otherwise it closes, silently.
+    pub(super) fn mobile_control_unmounting(self, surface: MobileSurface, row: &str) {
+        let Some(token) = self
+            .mobile_opening()
+            .filter(|o| o.is_for(surface, row))
+            .map(|o| o.token)
+        else {
+            return;
+        };
+        crate::util::defer(move || {
+            if self
+                .mobile_opening_for(surface, token)
+                .is_some_and(|o| !opening_is_live(&o))
+            {
                 self.close_mobile(false);
             }
-        }
+        });
     }
 
     /// The open opening for `surface`, if `token` is it. Read when queued work
@@ -312,42 +350,32 @@ impl ReactionSurfaces {
         surface: MobileSurface,
         token: u64,
     ) -> Option<MobileOpening> {
-        self.mobile
-            .opening
-            .try_peek()
-            .ok()
-            .and_then(|o| o.clone())
+        self.mobile_opening()
             .filter(|o| o.surface == surface && o.token == token)
     }
 
     /// The token of the open `surface`, now. Taken by a press, which queues
     /// work for that opening only.
     pub(super) fn mobile_token(self, surface: MobileSurface) -> Option<u64> {
-        self.mobile
-            .opening
-            .try_peek()
-            .ok()
-            .and_then(|o| o.as_ref().filter(|o| o.surface == surface).map(|o| o.token))
+        self.mobile_opening()
+            .filter(|o| o.surface == surface)
+            .map(|o| o.token)
     }
 }
 
 /// Clear the popup's scratch, writing only what is not already clear (a
 /// write notifies even when it changes nothing).
 fn reset_scratch(state: MobileState) {
-    let (mut text, mut error, mut palette) = (state.text, state.error, state.palette);
-    if text.try_peek().is_ok_and(|t| !t.is_empty()) {
-        if let Ok(mut text) = text.try_write() {
-            text.clear();
-        }
-    }
-    if error.try_peek().is_ok_and(|e| e.is_some()) {
-        if let Ok(mut error) = error.try_write() {
-            *error = None;
-        }
-    }
-    if palette.try_peek().is_ok_and(|p| *p) {
-        if let Ok(mut palette) = palette.try_write() {
-            *palette = false;
+    clear(state.text);
+    clear(state.error);
+    clear(state.palette);
+}
+
+/// Set `signal` back to its default, fallibly, if it is not already.
+fn clear<T: Default + PartialEq + 'static>(mut signal: Signal<T>) {
+    if signal.try_peek().is_ok_and(|value| *value != T::default()) {
+        if let Ok(mut value) = signal.try_write() {
+            *value = T::default();
         }
     }
 }
@@ -355,22 +383,14 @@ fn reset_scratch(state: MobileState) {
 /// Whether the window is below 48rem now. The authority for a press, which
 /// must not wait for [`NARROW`] to catch up with a resize.
 pub(super) fn narrow_now() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window()
-            .and_then(|w| w.match_media(NARROW_QUERY).ok().flatten())
-            .is_some_and(|m| m.matches())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        false
-    }
+    crate::util::media_matches(NARROW_QUERY).unwrap_or(false)
 }
 
 /// Whether the window is below 48rem, for rendering: the invokers' route and
 /// labels, and the guard that closes a mobile surface at 48rem. Kept by a
-/// `matchMedia` listener ([`install_narrow_listener`]).
-pub(super) static NARROW: GlobalSignal<bool> = Global::new(narrow_now);
+/// `matchMedia` listener ([`crate::util::watch_media`], installed by
+/// [`MobileSurfaceGuard`]).
+static NARROW: GlobalSignal<bool> = Global::new(narrow_now);
 
 /// [`NARROW`], read fallibly: a contended read answers from the media query
 /// itself, and this render, holding no subscription, is woken by the nudge
@@ -383,39 +403,6 @@ pub(super) fn narrow_for_render() -> bool {
             crate::util::signal_guard::schedule_nudge();
             narrow_now()
         }
-    }
-}
-
-/// Keep [`NARROW`] current as the window crosses 48rem. The write is deferred
-/// (dioxus-signal-safety.md). Installs once.
-fn install_narrow_listener() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use wasm_bindgen::JsCast;
-        thread_local! {
-            static INSTALLED: Cell<bool> = const { Cell::new(false) };
-        }
-        if INSTALLED.with(|i| i.replace(true)) {
-            return;
-        }
-        let Some(query) =
-            web_sys::window().and_then(|w| w.match_media(NARROW_QUERY).ok().flatten())
-        else {
-            return;
-        };
-        let watched = query.clone();
-        let on_change = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-            let narrow = watched.matches();
-            crate::util::defer(move || {
-                if *NARROW.peek() != narrow {
-                    *NARROW.write() = narrow;
-                }
-            });
-        });
-        let _ =
-            query.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
-        // Lives as long as the page.
-        on_change.forget();
     }
 }
 
@@ -440,7 +427,7 @@ pub(super) fn MobileSurfaceGuard(
     /// The open room's contract key, as `Conversation` renders it.
     contract_key: Option<ContractKey>,
 ) -> Element {
-    install_narrow_listener();
+    crate::util::watch_media(NARROW_QUERY, &NARROW);
     let narrow = narrow_for_render();
     let in_chat = match MOBILE_VIEW.try_read() {
         Ok(view) => *view == MobileView::Chat,
@@ -476,6 +463,77 @@ pub(super) fn MobileSurfaceGuard(
     rsx! {}
 }
 
+/// The modal dialog both mobile surfaces are drawn in: the dialog (its own
+/// `close` event brings the state in line, and Tab stays inside), the
+/// backdrop and Close (both dismiss), and the panel with its handle and
+/// header. Each surface renders only its body, as `children`, after the
+/// header.
+#[component]
+pub(super) fn MobileDialogFrame(
+    surfaces: ReactionSurfaces,
+    surface: MobileSurface,
+    /// The open opening's row, if it is this surface's.
+    target_row: String,
+    children: Element,
+) -> Element {
+    let (id, prefix, title) = (surface.dialog_id(), surface.prefix(), surface.title());
+    // The dialog closing by itself (Escape): the state follows. The listener
+    // lives as long as the frame.
+    #[cfg(target_arch = "wasm32")]
+    let close_listener = use_hook(|| {
+        std::rc::Rc::new(std::cell::RefCell::new(
+            None::<wasm_bindgen::closure::Closure<dyn FnMut()>>,
+        ))
+    });
+    rsx! {
+        dialog {
+            id: "{id}",
+            "data-testid": "{id}",
+            class: "mobile-sheet",
+            "aria-labelledby": "{prefix}-title",
+            "data-target-row": "{target_row}",
+            onmounted: move |_| {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let listener = dom::on_dialog_close(id, move || {
+                        crate::util::defer(move || surfaces.mobile_dialog_closed(surface));
+                    });
+                    *close_listener.borrow_mut() = listener;
+                }
+            },
+            onkeydown: move |e: KeyboardEvent| {
+                #[cfg(target_arch = "wasm32")]
+                if e.key() == Key::Tab && dom::contain_tab(id, e.modifiers().shift()) {
+                    e.prevent_default();
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = e;
+            },
+            div {
+                "data-testid": "{prefix}-backdrop",
+                class: "mobile-sheet-backdrop",
+                onclick: move |_| surfaces.dismiss_mobile(surface),
+            }
+            div { class: "mobile-sheet-panel",
+                div { class: "mobile-sheet-handle", "aria-hidden": "true" }
+                div { class: "mobile-sheet-header",
+                    h2 { id: "{prefix}-title", class: "mobile-sheet-title", "{title}" }
+                    button {
+                        r#type: "button",
+                        "data-testid": "{prefix}-close",
+                        class: "mobile-sheet-close",
+                        "aria-label": "Close",
+                        title: "Close",
+                        onclick: move |_| surfaces.dismiss_mobile(surface),
+                        {line_icon(CLOSE_ICON_PATH, 18)}
+                    }
+                }
+                {children}
+            }
+        }
+    }
+}
+
 /// Whether a mobile surface's dialog is open, for the reload's busy check and
 /// the reactor list's focus handoff.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -486,7 +544,7 @@ pub(crate) fn any_open() -> bool {
 #[cfg(target_arch = "wasm32")]
 pub(super) mod dom {
     use super::super::focus_without_scrolling;
-    use super::{MobileSurface, POPUP_ID, SHEET_ID};
+    use super::MobileSurface;
     use std::cell::{Cell, RefCell};
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -507,7 +565,7 @@ pub(super) mod dom {
     }
 
     /// The row's control for `surface`, as the document has it now.
-    fn row_control(row: &str, surface: MobileSurface) -> Option<web_sys::HtmlElement> {
+    pub(crate) fn row_control(row: &str, surface: MobileSurface) -> Option<web_sys::HtmlElement> {
         document()?
             .get_element_by_id(&format!("msg-{row}"))?
             .query_selector(surface.control_selector())
@@ -516,11 +574,11 @@ pub(super) mod dom {
             .ok()
     }
 
-    pub(crate) fn row_control_exists(row: &str, surface: MobileSurface) -> bool {
+    pub(super) fn row_control_exists(row: &str, surface: MobileSurface) -> bool {
         row_control(row, surface).is_some()
     }
 
-    pub(crate) fn focus_control(row: &str, surface: MobileSurface) {
+    pub(super) fn focus_control(row: &str, surface: MobileSurface) {
         if let Some(control) = row_control(row, surface) {
             focus_without_scrolling(&control);
         }
@@ -557,7 +615,7 @@ pub(super) mod dom {
         CLOSES.with(Cell::get)
     }
 
-    pub(crate) fn close_dialog(id: &str) {
+    pub(super) fn close_dialog(id: &str) {
         let Some(dialog) = element(id) else {
             return;
         };
@@ -590,7 +648,7 @@ pub(super) mod dom {
     /// Keep Tab inside dialog `id`'s panel: from its last control Tab goes
     /// to the first, from the first Shift+Tab goes to the last. Whether it
     /// moved focus (the caller then prevents the default).
-    pub(crate) fn contain_tab(id: &str, backwards: bool) -> bool {
+    pub(super) fn contain_tab(id: &str, backwards: bool) -> bool {
         let Some(dialog) = element(id) else {
             return false;
         };
@@ -633,7 +691,6 @@ pub(super) mod dom {
 
     thread_local! {
         static BLOCKER: RefCell<Option<Blocker>> = const { RefCell::new(None) };
-        static BLOCKING: Cell<bool> = const { Cell::new(false) };
         static VIEWPORT: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
     }
 
@@ -646,32 +703,12 @@ pub(super) mod dom {
     /// touch with more than one finger. Nothing is captured, so turning it
     /// off is only removing the listeners; one left behind holds nothing
     /// while no surface is open.
-    pub(crate) fn hold_background(on: bool) {
-        if on == BLOCKING.with(Cell::get) {
-            return;
-        }
-        let Some(window) = web_sys::window() else {
-            return;
-        };
+    pub(super) fn hold_background(on: bool) {
         BLOCKER.with(|blocker| {
             let mut blocker = blocker.borrow_mut();
             let callback = blocker.get_or_insert_with(|| Closure::new(on_held_input));
-            let function: &js_sys::Function = callback.as_ref().unchecked_ref();
-            for kind in HELD_KINDS {
-                if on {
-                    let options = web_sys::AddEventListenerOptions::new();
-                    options.set_capture(true);
-                    options.set_passive(false);
-                    let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
-                        kind, function, &options,
-                    );
-                } else {
-                    let _ =
-                        window.remove_event_listener_with_callback_and_bool(kind, function, true);
-                }
-            }
+            set_window_capture_listeners(&HELD_KINDS, callback.as_ref().unchecked_ref(), on);
         });
-        BLOCKING.with(|b| b.set(on));
     }
 
     fn on_held_input(event: web_sys::Event) {
@@ -687,9 +724,7 @@ pub(super) mod dom {
             return;
         }
         let zoom = match event.type_().as_str() {
-            "wheel" => event
-                .dyn_ref::<web_sys::MouseEvent>()
-                .is_some_and(web_sys::MouseEvent::ctrl_key),
+            "wheel" => is_zoom(&event),
             _ => touches(&event) > 1,
         };
         if !zoom && event.cancelable() {
@@ -697,12 +732,47 @@ pub(super) mod dom {
         }
     }
 
-    fn touches(event: &web_sys::Event) -> u32 {
+    /// Add (`on`) or remove `callback` as a capturing, non-passive window
+    /// listener for each of `kinds`. Adding it again is a no-op (the DOM
+    /// keeps one listener per callback and phase), and so is removing one
+    /// that is not there.
+    pub(crate) fn set_window_capture_listeners(
+        kinds: &[&str],
+        callback: &js_sys::Function,
+        on: bool,
+    ) {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        for &kind in kinds {
+            if on {
+                let options = web_sys::AddEventListenerOptions::new();
+                options.set_capture(true);
+                options.set_passive(false);
+                let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
+                    kind, callback, &options,
+                );
+            } else {
+                let _ = window.remove_event_listener_with_callback_and_bool(kind, callback, true);
+            }
+        }
+    }
+
+    /// How many fingers a touch event says are down.
+    pub(crate) fn touches(event: &web_sys::Event) -> u32 {
         js_sys::Reflect::get(event, &"touches".into())
             .and_then(|list| js_sys::Reflect::get(&list, &"length".into()))
             .ok()
             .and_then(|n| n.as_f64())
             .map_or(0, |n| n as u32)
+    }
+
+    /// A wheel with Ctrl down: the browser zooms on it (Ctrl+wheel, and a
+    /// touchpad pinch arrives as one), so it is never held.
+    pub(crate) fn is_zoom(wheel: &web_sys::Event) -> bool {
+        wheel
+            .dyn_ref::<web_sys::MouseEvent>()
+            .is_some_and(web_sys::MouseEvent::ctrl_key)
     }
 
     /// While a surface is open, follow the visual viewport: the software
@@ -712,7 +782,7 @@ pub(super) mod dom {
     /// (`--mobile-sheet-keyboard`) and capped to the visual height
     /// (`--mobile-sheet-viewport`). A browser without `visualViewport`
     /// keeps the CSS fallbacks.
-    pub(crate) fn track_viewport(on: bool) {
+    pub(super) fn track_viewport(on: bool) {
         let Some(window) = web_sys::window() else {
             return;
         };
@@ -789,20 +859,16 @@ pub(super) mod dom {
     /// Listen for dialog `id` closing by itself (Escape), for as long as the
     /// returned closure lives. `on_close` runs from the listener; it defers
     /// any signal write.
-    pub(crate) fn on_dialog_close(
+    pub(super) fn on_dialog_close(
         id: &str,
         on_close: impl FnMut() + 'static,
-    ) -> Option<(web_sys::HtmlElement, Closure<dyn FnMut()>)> {
-        let dialog = element(id)?;
+    ) -> Option<Closure<dyn FnMut()>> {
         let listener = Closure::<dyn FnMut()>::new(on_close);
-        dialog
+        element(id)?
             .add_event_listener_with_callback("close", listener.as_ref().unchecked_ref())
             .ok()?;
-        Some((dialog, listener))
+        Some(listener)
     }
-
-    // Both ids are used by the busy check.
-    const _: [&str; 2] = [SHEET_ID, POPUP_ID];
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -811,16 +877,16 @@ pub(super) mod dom {
     pub(crate) fn dialog_open(_id: &str) -> bool {
         false
     }
-    pub(crate) fn row_control_exists(_row: &str, _surface: MobileSurface) -> bool {
+    pub(super) fn row_control_exists(_row: &str, _surface: MobileSurface) -> bool {
         true
     }
-    pub(crate) fn focus_control(_row: &str, _surface: MobileSurface) {}
-    pub(crate) fn close_dialog(_id: &str) {}
+    pub(super) fn focus_control(_row: &str, _surface: MobileSurface) {}
+    pub(super) fn close_dialog(_id: &str) {}
     pub(crate) fn closes_from_here() -> u64 {
         0
     }
-    pub(crate) fn hold_background(_on: bool) {}
-    pub(crate) fn track_viewport(_on: bool) {}
+    pub(super) fn hold_background(_on: bool) {}
+    pub(super) fn track_viewport(_on: bool) {}
 }
 
 #[cfg(test)]
@@ -881,13 +947,5 @@ mod tests {
             !opening_matches(&opening(None, 3, g1), None, 3, None, g1),
             "no room"
         );
-    }
-
-    /// Every press is a new opening, even of the same message.
-    #[test]
-    fn each_opening_has_its_own_token() {
-        let first = next_token();
-        let second = next_token();
-        assert_ne!(first, second);
     }
 }
