@@ -2,6 +2,7 @@ import { test, expect, Locator, Page } from "@playwright/test";
 import {
   coarsePointer,
   committedRow,
+  inlineFooter,
   nextFrames,
   openInlinePicker,
   openOwnMessageEdit,
@@ -24,8 +25,9 @@ import { callRiverTest } from "./river-test";
 
 type Box = { left: number; right: number; top: number; bottom: number };
 
-/// Where `row`'s controls and text are. Text is every non-blank text node in
-/// the row's content outside the footer, one box per line it occupies.
+/// Where `row`'s controls and text are, and how its message ends. Text is
+/// every non-blank text node in the row's content outside the footer, one box
+/// per line it occupies.
 function rowLayout(row: Locator) {
   return row.evaluate((el) => {
     const box = (r: DOMRect) => ({ left: r.left, right: r.right, top: r.top, bottom: r.bottom });
@@ -45,63 +47,82 @@ function rowLayout(row: Locator) {
       }
       return out;
     };
-    const prose = body.querySelector(".prose");
+    // How the message ends, and which element carries the inline spacer.
+    const prose = body.querySelector(":scope > .prose");
+    const last = prose?.lastElementChild ?? null;
+    let ending = "other";
+    let spacerHost: Element | null = null;
+    if (body.lastElementChild !== prose) ending = "edited";
+    else if (!last) ending = "empty";
+    else if (/^(P|H[1-6])$/.test(last.tagName)) [ending, spacerHost] = ["paragraph", last];
+    else if (/^(UL|OL)$/.test(last.tagName)) [ending, spacerHost] = ["list", last.querySelector(":scope > li:last-child")];
+    else if (last.tagName === "BLOCKQUOTE") [ending, spacerHost] = ["quote", last.lastElementChild];
+    else if (last.tagName === "PRE") ending = "code";
+    const after = spacerHost ? getComputedStyle(spacerHost, "::after") : null;
+    const controls = Array.from(footer.querySelectorAll("button")).map((b) => ({
+      id: b.getAttribute("data-testid") ?? "?",
+      box: box(b.getBoundingClientRect()),
+    }));
+    const f = footer.getBoundingClientRect();
+    const hit = document.elementFromPoint(f.left + f.width / 2, f.top + f.height / 2);
+    const bodyText = textLines(body);
     return {
       footerPosition: getComputedStyle(footer).position,
-      controls: Array.from(footer.querySelectorAll("button")).map((b) => ({
-        id: b.getAttribute("data-testid") ?? "?",
-        box: box(b.getBoundingClientRect()),
-      })),
+      footer: box(f),
+      footerTakesHit: !!hit && footer.contains(hit),
+      controls,
+      controlsSpan: controls.length ? controls[controls.length - 1].box.right - controls[0].box.left : 0,
       lines: textLines(content),
-      bodyLines: textLines(body),
+      lastTextBottom: bodyText.length ? Math.max(...bodyText.map((l) => l.box.bottom)) : null,
       row: box(el.getBoundingClientRect()),
       content: box(content.getBoundingClientRect()),
       body: box(body.getBoundingClientRect()),
-      endsWithParagraph: prose?.lastElementChild?.tagName === "P" && body.lastElementChild === prose,
+      pre: last?.tagName === "PRE" ? box(last.getBoundingClientRect()) : null,
+      ending,
+      spacer: after && after.content !== "none" ? parseFloat(after.width) : null,
       text: (body.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 40),
     };
   });
 }
 
-function overlapsText(control: Box, line: Box) {
-  const middle = (line.top + line.bottom) / 2;
-  return line.right > control.left + 0.5 && line.left < control.right - 0.5 && middle > control.top && middle < control.bottom;
-}
-
-async function desktopMouse(page: Page) {
-  const wide = await page.evaluate(() => window.matchMedia("(min-width: 48rem)").matches);
-  return wide && !(await coarsePointer(page));
+/// A control covers a line when they overlap across, and by more than 4px
+/// down: a 28px control on a 22px line reaches 3px into the lines either side.
+function covers(control: Box, line: Box) {
+  const across = Math.min(control.right, line.right) - Math.max(control.left, line.left);
+  const down = Math.min(control.bottom, line.bottom) - Math.max(control.top, line.top);
+  return across > 0.5 && down > 4;
 }
 
 const WORDS = "one two six ten red tan big low far new old cup".split(" ");
 
 /// A room with every kind of reaction-less row: received messages whose last
 /// line grows a short word at a time across a whole line (so some would run
-/// under the controls without the spacer), your own long messages, and
-/// messages ending in a code block, a list, a quote, a reply and an edit.
+/// under the controls without the spacer), your own messages likewise, and
+/// messages ending in a heading, a list, a quote, a rule, code, a long URL,
+/// nothing, an edit and a reply.
 async function openRoomWithEndings(page: Page) {
   await openRoomWithComposer(page);
   const base = "A received message whose last line lands somewhere along the column, a short word at a time:";
   for (let i = 0; i < 32; i++) {
     await callRiverTest(page, "appendMessage", `${base} ${Array.from({ length: i }, (_, j) => WORDS[j % WORDS.length]).join(" ")} end${i}.`);
   }
-  await expect(committedRow(page, "end31.")).toHaveCount(1);
-  const own = "Your own message, with four controls to keep clear of:";
-  for (let i = 0; i < 12; i++) {
-    const row = await submitMessage(page, `${own} ${Array.from({ length: 3 * i }, (_, j) => WORDS[j % WORDS.length]).join(" ")} own${i}.`);
-    await expect(row).toHaveCount(1);
-  }
-  // Markdown renders differently from its source, so each is found by its
-  // first line.
-  for (const [marker, text] of [
-    ["Ends in code:", "Ends in code:\n\n```\nlet the_last_line_of_code = run_under_the_controls(if_it_could, wrap_or_scroll_sideways);\n```"],
-    ["Ends in a list:", "Ends in a list:\n\n- first item\n- a last item long enough to run to the column's edge, where the controls sit on hover"],
-    ["Ends in a quote:", "Ends in a quote:\n\n> a quoted last line long enough to run to the column's edge, where the controls sit on hover"],
+  await callRiverTest(page, "appendMessage", "Short.");
+  for (const text of [
+    "Ends in a heading:\n\n## A heading long enough to run most of the way across the column, to the controls",
+    "Ends in a list:\n\n- first item\n- a last item long enough to run to the column's edge, where the controls sit on hover",
+    "Ends in a quote:\n\n> a quoted last line long enough to run to the column's edge, where the controls sit on hover",
+    "Ends in a rule:\n\n---",
+    "Ends in code:\n\n```\nlet the_last_line_of_code_runs_past_the_column = and_scrolls_sideways(rather_than_wrapping, under_the_controls_or_not);\n```",
+    `Ends in a long link: https://example.com/${"long".repeat(60)}`,
+    "[an unused link reference]: https://example.com/",
+    "Last of the endings.",
   ]) {
-    const input = page.getByTestId("message-input");
-    await input.fill(text);
-    await input.press("Enter");
-    await expect(committedRow(page, marker)).toHaveCount(1);
+    await callRiverTest(page, "appendMessage", text);
+  }
+  await expect(committedRow(page, "Last of the endings.")).toHaveCount(1);
+  const own = "Your own message, with four controls to keep clear of:";
+  for (let i = 0; i < 6; i++) {
+    await expect(await submitMessage(page, `${own} ${Array.from({ length: 6 * i }, (_, j) => WORDS[j % WORDS.length]).join(" ")} own${i}.`)).toHaveCount(1);
   }
   const edited = await submitMessage(page, "To be edited, with a long last line that runs most of the way to the column's edge, wrapping.");
   await expect(edited).toHaveCount(1);
@@ -120,80 +141,132 @@ async function openRoomWithEndings(page: Page) {
 test.describe("Controls at the end of the last line on a desktop with a mouse", () => {
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
-    test.skip(!(await desktopMouse(page)), "touch pointers keep the footer line");
+    test.skip(!(await inlineFooter(page)), "touch pointers keep the footer line");
   });
 
-  test("a row with no reactions keeps no footer line, and its controls sit on its last line and cover no text", async ({ page }) => {
+  test("a row with no reactions keeps no footer line, wastes no line, and its controls cover no text", async ({ page }) => {
     test.setTimeout(180_000);
     await openRoomWithEndings(page);
-    const rows = page.getByTestId("conversation-history").getByTestId("message-row").and(page.locator('[data-has-reactions="false"]'));
-    const count = await rows.count();
+    const short = await rowLayout(committedRow(page, "Short."));
+    expect(short.body.bottom - short.body.top, "a one-line message stays one line").toBeLessThan(23);
+
+    // Page the whole history in first. Scrolling near the top otherwise pages
+    // older messages in above a row while it is hovered, moving it out from
+    // under the pointer mid-check.
+    let height = -1;
+    for (let tries = 0; tries < 20; tries++) {
+      const now = await page.locator("#chat-scroll-container").evaluate((c) => {
+        c.scrollTop = 0;
+        return c.scrollHeight;
+      });
+      if (now === height) break;
+      height = now;
+      await settle(page);
+    }
+    // By id, not position, so a row is the same row throughout its check.
+    const ids = await page
+      .getByTestId("conversation-history")
+      .getByTestId("message-row")
+      .and(page.locator('[data-has-reactions="false"]'))
+      .evaluateAll((els) => els.map((el) => el.id));
+    const endings = new Map<string, number>();
+    let paragraphs = 0;
     let wrapped = 0;
-    let checked = 0;
-    for (let i = 0; i < count; i++) {
-      const row = rows.nth(i);
+    for (const id of ids) {
+      const row = page.locator(`[id="${id}"]`);
       await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-      await page.mouse.move(0, 0);
-      await nextFrames(page);
+      // Off every row but still in the page: under load Firefox can take a
+      // pointer parked at the window's corner as gone, and then match no
+      // `:hover` at all, even after it moves onto a row.
+      await page.mouse.move(40, 450);
+      // Near the top, older history may page in and move the rows.
+      await settle(page);
+      // A row the history cannot scroll away from its very top is left out:
+      // there, under parallel load, Firefox intermittently matches no `:hover`
+      // at all (not even on <html>) with the pointer on the row. Every kind of
+      // ending is among the rows below it.
+      const pinnedAtTop = await row.evaluate((el) => {
+        const c = document.getElementById("chat-scroll-container")!;
+        return c.scrollTop === 0 && el.getBoundingClientRect().top - c.getBoundingClientRect().top < 100;
+      });
+      if (pinnedAtTop) continue;
       const rest = await rowLayout(row);
-      const what = `"${rest.text}"`;
-      expect(rest.footerPosition, `${what}: the footer takes no line`).toBe("absolute");
-      // Under 12px: a footer line would be 28px. (A list's last item keeps its
-      // own bottom margin, which collapses out of the body, as before.)
-      expect(rest.row.bottom - rest.body.bottom, `${what}: nothing reserved below the message`).toBeLessThan(12);
-      // A paragraph whose spacer wrapped ends with an empty line.
-      const lastText = Math.max(...rest.bodyLines.map((l) => l.box.bottom));
-      if (rest.endsWithParagraph && rest.body.bottom - lastText > 15) wrapped++;
+      const what = `"${rest.text}" (${rest.ending})`;
+      endings.set(rest.ending, (endings.get(rest.ending) ?? 0) + 1);
+      expect.soft(rest.footerPosition, `${what}: the footer takes no line`).toBe("absolute");
+      expect.soft(rest.footerTakesHit, `${what}: at rest the footer takes no hits`).toBe(false);
+      // Under 12px (a footer line was 28px); a code block keeps 26px below it
+      // for the controls, clear of its scrollbar.
+      expect.soft(rest.row.bottom - rest.body.bottom, `${what}: nothing reserved below the message`).toBeLessThan(rest.ending === "code" ? 12 + 26 : 12);
+      if (rest.ending === "paragraph") {
+        paragraphs++;
+        if (rest.lastTextBottom !== null && rest.body.bottom - rest.lastTextBottom > 15) wrapped++;
+      }
 
       await revealFooter(page, row);
-      await expect(row.getByTestId("message-reply-button")).toHaveCSS("opacity", "1");
+      await expect(row.getByTestId("message-reply-button"), `${what}: shown on hover`).toHaveCSS("opacity", "1");
       const shown = await rowLayout(row);
-      expect(shown.row, `${what}: showing the controls moves nothing`).toEqual(rest.row);
+      expect.soft(shown.row, `${what}: showing the controls moves nothing`).toEqual(rest.row);
+      if (shown.spacer !== null) expect.soft(shown.spacer, `${what}: the spacer is as wide as the controls`).toBeGreaterThanOrEqual(shown.controlsSpan);
       for (const c of shown.controls) {
-        for (const l of shown.lines) {
-          expect(overlapsText(c.box, l.box), `${what}: ${c.id} covers "${l.text}"`).toBe(false);
-        }
-        // A message ending in a list, quote or code block keeps that block's
-        // trailing margin, which puts the controls a little lower, in the
-        // empty line its spacer made.
-        const middle = (c.box.top + c.box.bottom) / 2;
-        const tolerance = rest.endsWithParagraph || rest.text.includes("(edited)") ? 4 : 10;
-        expect(Math.abs(middle - (shown.body.bottom - 11)), `${what}: ${c.id} on the last line`).toBeLessThan(tolerance);
-        expect(c.box.right, `${what}: ${c.id} inside the content column`).toBeLessThanOrEqual(shown.content.right + 0.5);
-        expect(c.box.bottom, `${what}: ${c.id} inside its row`).toBeLessThanOrEqual(shown.row.bottom + 0.5);
+        for (const l of shown.lines) expect.soft(covers(c.box, l.box), `${what}: ${c.id} covers "${l.text}"`).toBe(false);
+        expect.soft(Math.abs(c.box.bottom - shown.row.bottom), `${what}: ${c.id} at the row's foot`).toBeLessThan(1);
+        expect.soft(c.box.right, `${what}: ${c.id} inside the content column`).toBeLessThanOrEqual(shown.content.right + 0.5);
+        if (shown.pre) expect.soft(c.box.top, `${what}: ${c.id} below the code block and its scrollbar`).toBeGreaterThanOrEqual(shown.pre.bottom - 0.5);
       }
-      checked++;
     }
-    expect(checked, "premise: the rows were checked").toBeGreaterThan(40);
+    for (const kind of ["paragraph", "list", "quote", "code", "edited", "other"]) {
+      expect(endings.get(kind) ?? 0, `premise: a message ending in ${kind} was checked (${JSON.stringify([...endings])})`).toBeGreaterThan(0);
+    }
     expect(wrapped, "premise: some last lines would have run under the controls, and wrapped").toBeGreaterThan(0);
+    expect(wrapped, `only those: ${wrapped} of ${paragraphs} paragraphs wrapped`).toBeLessThan(paragraphs / 2);
   });
 
-  test("a row with reactions keeps its footer line, with the controls on it", async ({ page }) => {
+  test("a row with reactions keeps its footer line with the controls on it, and goes back when they go", async ({ page }) => {
     await openRoomWithComposer(page);
     const row = await submitMessage(page, "a message that gets a reaction");
     await expect(row).toHaveCount(1);
-    expect((await rowLayout(row)).footerPosition, "premise: no footer line before the reaction").toBe("absolute");
-    await reactTo(page, row);
+    await page.mouse.move(0, 0);
+    await settle(page);
+    const before = await rowLayout(row);
+    expect(before.footerPosition, "premise: no footer line before the reaction").toBe("absolute");
+    expect(before.spacer, "premise: a spacer before the reaction").not.toBeNull();
+
+    const chip = await reactTo(page, row);
     await expect(row).toHaveAttribute("data-has-reactions", "true");
     await page.mouse.move(0, 0);
     await settle(page);
+    await revealFooter(page, row);
     const after = await rowLayout(row);
     expect(after.footerPosition).toBe("static");
-    const footer = (await row.getByTestId("message-footer").boundingBox())!;
-    expect(footer.y, "the footer is under the message").toBeGreaterThanOrEqual(after.body.bottom - 0.5);
-    expect(footer.height).toBeGreaterThanOrEqual(26);
+    expect(after.spacer, "no spacer once the footer has its line").toBeNull();
+    expect(after.footer.top, "the footer is under the message").toBeGreaterThanOrEqual(after.body.bottom - 0.5);
+    expect(after.footer.bottom - after.footer.top).toBeGreaterThanOrEqual(26);
+    for (const c of after.controls) {
+      expect(c.box.top >= after.footer.top - 0.5 && c.box.bottom <= after.footer.bottom + 0.5, `${c.id} on the footer line`).toBe(true);
+    }
+
+    // Taking the reaction back returns the row to its first layout.
+    await chip.click();
+    await expect(row).toHaveAttribute("data-has-reactions", "false");
+    await page.mouse.move(0, 0);
+    await settle(page);
+    const back = await rowLayout(row);
+    expect(back.footerPosition).toBe("absolute");
+    expect(back.row.bottom - back.row.top).toBeCloseTo(before.row.bottom - before.row.top, 0);
   });
 
-  test("the first reaction moves React down to the footer line, and an open picker goes with it", async ({ page }) => {
+  test("the first reaction moves React down to the footer line, and a picker opened upward goes with it", async ({ page }) => {
     await openRoomWithComposer(page);
     const row = await submitMessage(page, "first reaction moves React");
     await expect(row).toHaveCount(1);
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await expect(row).toBeInViewport();
     await openInlinePicker(page, row);
     await expect(page.getByTestId("emoji-picker")).toBeVisible();
     // React's place in its row: the history may scroll as the row grows.
     const inRow = (m: Awaited<ReturnType<typeof measurePicker>>) => row.evaluate((el, top) => top - el.getBoundingClientRect().top, m.react.top);
     const before = await measurePicker(row);
+    expect(before.picker.bottom, "premise: it opened upward").toBeLessThanOrEqual(before.react.top + 0.5);
     expectAtReact(before);
     const beforeInRow = await inRow(before);
     await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
@@ -203,6 +276,7 @@ test.describe("Controls at the end of the last line on a desktop with a mouse", 
     expect((await inRow(after)) - beforeInRow, "premise: React moved down to the footer line").toBeGreaterThan(20);
     await expect(page.getByTestId("emoji-picker"), "still open").toBeVisible();
     expectAtReact(after);
+    expect(after.picker.bottom, "still upward").toBeLessThanOrEqual(after.react.top + 0.5);
     await page.keyboard.press("Escape");
   });
 });
@@ -217,8 +291,26 @@ test.describe("Controls keep the footer line on a narrow window", () => {
     await expect(row).toHaveAttribute("data-has-reactions", "false");
     const layout = await rowLayout(row);
     expect(layout.footerPosition).toBe("static");
-    const footer = (await row.getByTestId("message-footer").boundingBox())!;
-    expect(footer.height).toBeGreaterThanOrEqual(26);
-    expect(footer.y, "the footer is under the message").toBeGreaterThanOrEqual(layout.body.bottom - 0.5);
+    expect(layout.footer.bottom - layout.footer.top).toBeGreaterThanOrEqual(26);
+    expect(layout.footer.top, "the footer is under the message").toBeGreaterThanOrEqual(layout.body.bottom - 0.5);
+  });
+});
+
+test.describe("Controls keep the footer line with a touch pointer on a wide window", () => {
+  test.use({ viewport: { width: 1024, height: 768 }, hasTouch: true });
+
+  test("a touch laptop or tablet keeps the footer line, with the controls shown at rest", async ({ page }) => {
+    await openRoomWithComposer(page);
+    const wide = await page.evaluate(() => window.matchMedia("(min-width: 48rem)").matches);
+    test.skip(!wide || !(await coarsePointer(page)), "this engine does not report a touch pointer here");
+    const row = await submitMessage(page, "touch laptop footer");
+    await expect(row).toHaveCount(1);
+    await page.mouse.move(0, 0);
+    await settle(page);
+    const layout = await rowLayout(row);
+    expect(layout.footerPosition).toBe("static");
+    expect(layout.spacer).toBeNull();
+    expect(layout.footer.top, "the footer is under the message").toBeGreaterThanOrEqual(layout.body.bottom - 0.5);
+    await expect(row.getByTestId("message-reply-button")).toHaveCSS("opacity", "1");
   });
 });

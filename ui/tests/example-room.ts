@@ -224,6 +224,14 @@ export function coarsePointer(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
 }
 
+/// Whether a row with no reactions keeps no footer line: a desktop-width
+/// window with a mouse puts its controls at the end of its last line instead
+/// (main.css, "Controls at the end of the last line").
+export async function inlineFooter(page: Page): Promise<boolean> {
+  const wide = await page.evaluate(() => window.matchMedia("(min-width: 48rem)").matches);
+  return wide && !(await coarsePointer(page));
+}
+
 /// Show `row`'s footer controls (React, Reply, Edit, Delete): a fine pointer
 /// hovers the row, as a reader does; a touch or hybrid pointer already shows
 /// them.

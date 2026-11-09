@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { clickFooter, coarsePointer, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
+import { clickFooter, coarsePointer, inlineFooter, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
 import { deliver, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { expectAtReact, expectEveryEmojiUsable, measurePicker } from "./reaction-picker-geometry";
 import { callRiverTest } from "./river-test";
@@ -439,17 +439,21 @@ test.describe("The picker opens at React", () => {
     await openRoomWithComposer(page);
     await deliver(page, "upward reflow probe");
     const row = page.getByTestId("message-row").filter({ hasText: "upward reflow probe" });
-    // One reaction first, so React is on the footer line after its chip, where
-    // a second chip moves it sideways (with none, a desktop with a mouse puts
-    // React at the end of the last line: message-actions-inline.spec.ts).
-    await callRiverTest(page, "addReactionsToNewest", ["👍"]);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+    // Where a row with no reactions keeps no footer line, one reaction first,
+    // so React is on the footer line after its chip and the next chip moves it
+    // sideways. The first reaction moving React down to that line is
+    // message-actions-inline.spec.ts's.
+    const seeded = await inlineFooter(page);
+    if (seeded) {
+      await callRiverTest(page, "addReactionsToNewest", ["👍"]);
+      await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+    }
     await expect(row).toBeInViewport();
     await openInlinePicker(page, row);
     const before = await measurePicker(row);
     expect(before.picker.bottom, "premise: it opened upward").toBeLessThanOrEqual(before.react.top + 0.5);
     await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(2);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(seeded ? 2 : 1);
     await nextFrames(page);
     const after = await measurePicker(row);
     expect(after.react.left - before.react.left, "premise: the chip moved React").toBeGreaterThan(20);

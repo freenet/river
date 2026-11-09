@@ -175,9 +175,8 @@ test.describe("Footer controls on a fine pointer", () => {
     await page.mouse.move(0, 0);
     await settle(page);
     const rest = await rowBox(own);
-    // Its controls' room is kept at rest: a footer line, or on a desktop with a
-    // mouse the end of its last line (message-actions-inline.spec.ts).
-    expect(rest.footerHeight, "the footer keeps its controls' room with no reactions").toBeGreaterThanOrEqual(26);
+    // Where the controls' room is kept (a footer line, or on a desktop with a
+    // mouse the end of the last line) is message-actions-inline.spec.ts's.
     expect(await controlStates(own, ids), "at rest").toEqual(allStates(ids, HIDDEN));
 
     await own.getByTestId("message-body").hover();

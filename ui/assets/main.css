@@ -284,11 +284,17 @@
  * them wraps instead (one more line, and only then). No text runs under the
  * controls, and showing them still moves nothing.
  *
- * The spacer ends the message's last block when the text is the body's last
- * child. An edited message ends with "(edited)" on a short line of its own,
- * which the controls share. A code block does not wrap, so there the spacer
- * is a line of its own inside it; after a list or a quote it falls on a line
- * of its own anyway.
+ * The spacer ends the text's last line: in a last paragraph or heading, the
+ * last item of a last list, or the last paragraph of a last quote. An edited
+ * message ends with "(edited)" on a short line of its own, which the controls
+ * share. A code block scrolls rather than wrapping, so the controls get a line
+ * below it, clear of its scrollbar; any other ending (a rule, a table, an
+ * empty body) gets an empty 22px line. The footer takes no hits itself, so at
+ * rest nothing under it is blocked; its controls take them once shown.
+ *
+ * A first reaction adds the footer line, so a reaction on a row above the
+ * view moves a reader who is not at the end, as it did before #862
+ * (history-scrolling.md).
  *
  * A row with reactions keeps its footer line, since the chips are content.
  * Touch pointers and narrow windows keep the footer as above.
@@ -315,16 +321,32 @@
         min-height: 0;
         margin-top: 0;
         column-gap: 2px;
+        pointer-events: none;
     }
 
-    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :last-child::after {
+    /* A body that renders nothing still has a line for the controls. */
+    .msg-row[data-has-reactions="false"] .msg-body {
+        min-height: 22px;
+    }
+
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child > :last-child::after {
         content: "";
         display: inline-block;
         width: var(--msg-actions-clear);
         height: 1px;
     }
 
-    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > pre:last-child::after {
+    /* The controls' 28px less the 2px they reach into the row's padding. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > pre:last-child {
+        margin-bottom: 26px;
+    }
+
+    /* Any other ending. Its own rule: a browser without `:has()` drops only
+     * this one. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child:not(:has(> :is(p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, pre):last-child))::after {
+        content: "";
         display: block;
         height: 22px;
     }
