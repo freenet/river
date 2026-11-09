@@ -62,8 +62,18 @@ function rowLayout(row: Locator) {
       .map((e) => getComputedStyle(e, "::after"))
       .filter((s) => s.content !== "none" && s.content !== "normal" && s.display === "inline-block");
     const after = spacers.at(-1) ?? null;
-    const pres = Array.from(prose?.querySelectorAll("pre") ?? []);
-    const lastPre = pres.at(-1) ?? null;
+    // Where the CSS promises an inline spacer: a last paragraph or heading, a
+    // last list's last item holding its text (itself, or in a last
+    // paragraph), a last quote's last paragraph or heading.
+    const textual = (e: Element | null | undefined) => !!e && /^(P|H[1-6])$/.test(e.tagName);
+    const lastItem = last && /^(UL|OL)$/.test(last.tagName) ? last.querySelector(":scope > li:last-child") : null;
+    const expectsSpacer =
+      textual(last) ||
+      (!!lastItem && (textual(lastItem.lastElementChild) || !lastItem.querySelector(":scope > :is(p, ul, ol, pre, blockquote, table, hr)"))) ||
+      (last?.tagName === "BLOCKQUOTE" && textual(last.lastElementChild));
+    // The code block the message ends with, at the top level or in a last quote.
+    const lastPre =
+      last?.tagName === "PRE" ? last : last?.tagName === "BLOCKQUOTE" && last.lastElementChild?.tagName === "PRE" ? last.lastElementChild : null;
     const controls = Array.from(footer.querySelectorAll("button")).map((b) => ({
       id: b.getAttribute("data-testid") ?? "?",
       box: box(b.getBoundingClientRect()),
@@ -84,7 +94,9 @@ function rowLayout(row: Locator) {
       body: box(body.getBoundingClientRect()),
       // The last code block, if the message ends in one (at the top level or
       // in a last quote).
-      pre: lastPre && lastPre.getBoundingClientRect().bottom >= body.getBoundingClientRect().bottom - 30 ? box(lastPre.getBoundingClientRect()) : null,
+      pre: lastPre ? box(lastPre.getBoundingClientRect()) : null,
+      spacerCount: spacers.length,
+      expectsSpacer: body.lastElementChild === prose && expectsSpacer,
       ending,
       spacer: after ? parseFloat(after.width) : null,
       text: (body.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 40),
@@ -220,6 +232,8 @@ test.describe("Controls at the end of the last line on a desktop with a mouse", 
       await expect(row.getByTestId("message-reply-button"), `${what}: shown on hover`).toHaveCSS("opacity", "1");
       const shown = await rowLayout(row);
       expect.soft(shown.row, `${what}: showing the controls moves nothing`).toEqual(rest.row);
+      expect.soft(shown.spacerCount, `${what}: at most one spacer`).toBeLessThanOrEqual(1);
+      if (shown.expectsSpacer) expect.soft(shown.spacer, `${what}: a spacer ends the text`).not.toBeNull();
       if (shown.spacer !== null) expect.soft(shown.spacer, `${what}: the spacer is as wide as the controls`).toBeGreaterThanOrEqual(shown.controlsSpan);
       for (const c of shown.controls) {
         for (const l of shown.lines) expect.soft(covers(c.box, l.box), `${what}: ${c.id} covers "${l.text}"`).toBe(false);
