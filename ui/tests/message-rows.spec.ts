@@ -439,12 +439,17 @@ test.describe("The picker opens at React", () => {
     await openRoomWithComposer(page);
     await deliver(page, "upward reflow probe");
     const row = page.getByTestId("message-row").filter({ hasText: "upward reflow probe" });
+    // One reaction first, so React is on the footer line after its chip, where
+    // a second chip moves it sideways (with none, a desktop with a mouse puts
+    // React at the end of the last line: message-actions-inline.spec.ts).
+    await callRiverTest(page, "addReactionsToNewest", ["👍"]);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
     await expect(row).toBeInViewport();
     await openInlinePicker(page, row);
     const before = await measurePicker(row);
     expect(before.picker.bottom, "premise: it opened upward").toBeLessThanOrEqual(before.react.top + 0.5);
     await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(2);
     await nextFrames(page);
     const after = await measurePicker(row);
     expect(after.react.left - before.react.left, "premise: the chip moved React").toBeGreaterThan(20);

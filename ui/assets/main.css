@@ -139,7 +139,11 @@
  * The chips wrap, React after them; the cluster wraps as a unit onto its own
  * line when it does not fit beside them, kept 16px clear on a shared line.
  * Its right edge is the body's 76ch measure (`ch` at the body's 15px), so on
- * a wide row the actions stay by the text they act on. */
+ * a wide row the actions stay by the text they act on.
+ *
+ * On a desktop-width window with a mouse, a message with no reactions keeps
+ * no footer line: its controls sit at the end of its last line instead
+ * ("Controls at the end of the last line" below). */
 .msg-footer {
     display: flex;
     flex-wrap: wrap;
@@ -268,6 +272,61 @@
     .msg-row:has([aria-expanded="true"]) .msg-action {
         opacity: 1;
         pointer-events: auto;
+    }
+}
+
+/* Controls at the end of the last line. On a desktop-width window with a
+ * mouse, the controls show only on hover, so a footer line kept for them left
+ * every message double-spaced at rest. A message with no reactions therefore
+ * keeps no footer line: its footer sits at the bottom right of the row, on the
+ * message's last line, which chat messages rarely fill. An invisible spacer as
+ * wide as the controls ends the text, so a last line that would run under
+ * them wraps instead (one more line, and only then). No text runs under the
+ * controls, and showing them still moves nothing.
+ *
+ * The spacer ends the message's last block when the text is the body's last
+ * child. An edited message ends with "(edited)" on a short line of its own,
+ * which the controls share. A code block does not wrap, so there the spacer
+ * is a line of its own inside it; after a list or a quote it falls on a line
+ * of its own anyway.
+ *
+ * A row with reactions keeps its footer line, since the chips are content.
+ * Touch pointers and narrow windows keep the footer as above.
+ *
+ * `--msg-actions-w` is the controls' width: React and Reply, plus Edit and
+ * Delete on your own, 28px cells 2px apart. `[data-has-reactions]` comes from
+ * `MessageGroupComponent`. */
+@media (min-width: 48rem) and (hover: hover) and (not (any-pointer: coarse)) {
+    .msg-row {
+        --msg-actions-w: calc(2 * 28px + 2px);
+        --msg-actions-clear: calc(var(--msg-actions-w) + 8px);
+    }
+
+    .msg-row[data-message-self="true"] {
+        --msg-actions-w: calc(4 * 28px + 3 * 2px);
+    }
+
+    /* On the last 22px line, centred within 1px and inside the row's 2px
+     * bottom padding. */
+    .msg-row[data-has-reactions="false"] .msg-footer {
+        position: absolute;
+        bottom: -2px;
+        right: max(0px, calc(100% - 76ch));
+        min-height: 0;
+        margin-top: 0;
+        column-gap: 2px;
+    }
+
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :last-child::after {
+        content: "";
+        display: inline-block;
+        width: var(--msg-actions-clear);
+        height: 1px;
+    }
+
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > pre:last-child::after {
+        display: block;
+        height: 22px;
     }
 }
 
