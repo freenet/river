@@ -15,8 +15,10 @@ import { callRiverTest } from "./river-test";
 
 // Every signed message ends with a footer: on the left its reaction chips and
 // its one React, then a trailing cluster of Reply, and Edit and Delete on your
-// own messages. The footer's line is kept for every message, so showing its
-// controls never moves anything. A fine pointer shows them while the row is
+// own messages. The footer's room is kept for every message (a line of its
+// own, or on a desktop with a mouse and no reactions the end of its last line:
+// message-actions-inline.spec.ts), so showing its controls never moves
+// anything. A fine pointer shows them while the row is
 // hovered, holds keyboard focus or has its picker open, and shows a control
 // that has focus however it got it; a touch or hybrid pointer shows them at
 // rest. Reaction chips always show.
@@ -173,7 +175,8 @@ test.describe("Footer controls on a fine pointer", () => {
     await page.mouse.move(0, 0);
     await settle(page);
     const rest = await rowBox(own);
-    expect(rest.footerHeight, "the footer keeps its line with no reactions").toBeGreaterThanOrEqual(26);
+    // Where the controls' room is kept (a footer line, or on a desktop with a
+    // mouse the end of the last line) is message-actions-inline.spec.ts's.
     expect(await controlStates(own, ids), "at rest").toEqual(allStates(ids, HIDDEN));
 
     await own.getByTestId("message-body").hover();

@@ -139,7 +139,11 @@
  * The chips wrap, React after them; the cluster wraps as a unit onto its own
  * line when it does not fit beside them, kept 16px clear on a shared line.
  * Its right edge is the body's 76ch measure (`ch` at the body's 15px), so on
- * a wide row the actions stay by the text they act on. */
+ * a wide row the actions stay by the text they act on.
+ *
+ * On a desktop-width window with a mouse, a message with no reactions keeps
+ * no footer line: its controls sit at the end of its last line instead
+ * ("Controls at the end of the last line" below). */
 .msg-footer {
     display: flex;
     flex-wrap: wrap;
@@ -268,6 +272,100 @@
     .msg-row:has([aria-expanded="true"]) .msg-action {
         opacity: 1;
         pointer-events: auto;
+    }
+}
+
+/* Controls at the end of the last line. On a desktop-width window with a
+ * mouse, the controls show only on hover, so a footer line kept for them left
+ * every message double-spaced at rest. A message with no reactions therefore
+ * keeps no footer line: its footer sits at the bottom right of the row, on the
+ * message's last line, which chat messages rarely fill. An invisible spacer as
+ * wide as the controls ends the text, so a last line that would run under
+ * them wraps instead (one more line, and only then). No text runs under the
+ * controls, and showing them still moves nothing.
+ *
+ * The spacer ends the text's last line: in a last paragraph or heading, the
+ * last item of a last list, or the last paragraph of a last quote. An edited
+ * message ends with "(edited)" on a short line of its own, which the controls
+ * share. A code block scrolls rather than wrapping, so the controls get a line
+ * below it, clear of its scrollbar; any other ending (a rule, a table, an
+ * empty body, a nested list) gets an empty 22px line. The footer takes no hits itself, so at
+ * rest nothing under it is blocked; its controls take them once shown.
+ *
+ * A first reaction adds the footer line, so a reaction on a row above the
+ * view moves a reader who is not at the end, as it did before #862
+ * (history-scrolling.md).
+ *
+ * A row with reactions keeps its footer line, since the chips are content.
+ * Touch pointers and narrow windows keep the footer as above.
+ *
+ * `--msg-actions-w` is the controls' width: React and Reply, plus Edit and
+ * Delete on your own, 28px cells 2px apart. `[data-has-reactions]` comes from
+ * `MessageGroupComponent`. */
+@media (min-width: 48rem) and (hover: hover) and (not (any-pointer: coarse)) {
+    .msg-row {
+        --msg-actions-w: calc(2 * 28px + 2px);
+        --msg-actions-clear: calc(var(--msg-actions-w) + 8px);
+    }
+
+    .msg-row[data-message-self="true"] {
+        --msg-actions-w: calc(4 * 28px + 3 * 2px);
+    }
+
+    /* On the last 22px line, centred within 1px and inside the row's 2px
+     * bottom padding. */
+    .msg-row[data-has-reactions="false"] .msg-footer {
+        position: absolute;
+        bottom: -2px;
+        right: max(0px, calc(100% - 76ch));
+        min-height: 0;
+        margin-top: 0;
+        column-gap: 2px;
+        pointer-events: none;
+    }
+
+    /* A body that renders nothing still has a line for the controls. */
+    .msg-row[data-has-reactions="false"] .msg-body {
+        min-height: 22px;
+    }
+
+    /* The text's last line: a last paragraph or heading, the last item of a
+     * last list (or that item's last paragraph, in a loose list), or a last
+     * quote's last paragraph or heading. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child > p:last-child::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after {
+        content: "";
+        display: inline-block;
+        width: var(--msg-actions-clear);
+        height: 1px;
+    }
+
+    /* A tight list's last item holds its text itself. Its own rule, as are
+     * the `:has()` rules below: a browser without `:has()` drops only these. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child:not(:has(> :is(p, ul, ol, pre, blockquote, table, hr)))::after {
+        content: "";
+        display: inline-block;
+        width: var(--msg-actions-clear);
+        height: 1px;
+    }
+
+    /* A code block, at the end or ending a last quote: room below it for the
+     * controls (their 28px less the 2px they reach into the row's padding),
+     * clear of its scrollbar. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > pre:last-child,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child > pre:last-child {
+        margin-bottom: 26px;
+    }
+
+    /* Any other ending (a rule, a table, an empty body; a last item or quote
+     * ending in a nested list, quote or table) gets an empty line. */
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child:not(:has(> :is(p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, pre):last-child))::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > :is(ul, ol):last-child > li:last-child:has(> :is(ul, ol, pre, blockquote, table, hr):last-child)::after,
+    .msg-row[data-has-reactions="false"] .msg-body > .prose:last-child > blockquote:last-child:not(:has(> :is(p, h1, h2, h3, h4, h5, h6, pre):last-child))::after {
+        content: "";
+        display: block;
+        height: 22px;
     }
 }
 
