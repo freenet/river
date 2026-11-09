@@ -47,6 +47,7 @@ pub(crate) use self::outbox_commit::{
 };
 mod mobile_message_actions;
 mod mobile_reaction_popup;
+mod mobile_sheet_drag;
 mod mobile_surface;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;

@@ -432,7 +432,17 @@
  * above the software keyboard and capped to the visible height while open
  * (the two custom properties, set from `visualViewport`; `dvh` is only the
  * fallback, since the keyboard does not shrink it on every browser). It
- * scrolls itself when it does not fit; scrolling it never scrolls the page. */
+ * scrolls itself when it does not fit; scrolling it never scrolls the page.
+ *
+ * The reaction popup (`.mobile-sheet--drag`, `mobile_sheet_drag.rs`) slides
+ * up when it opens and can be dragged down from anywhere on it: its backdrop
+ * and panel take no pan (`touch-action: none`), so the pointer events reach
+ * the drag and nothing scrolls, and a pinch still zooms. The drag sets the
+ * panel's inline `transform` and `--sheet-shade` (the dim, 0 to 1); released
+ * short it settles back through the transition below, dismissed it slides
+ * away (`is-leaving`). `is-dragging` follows the finger with no transition.
+ * The opening slide uses `translate`, which composes with the drag's
+ * `transform`, so a drag during it does not jump. */
 .mobile-sheet {
     position: fixed;
     inset: 0;
@@ -478,6 +488,41 @@
     border-radius: 16px 16px 0 0;
     background: var(--color-panel);
     box-shadow: 0 -8px 24px rgb(0 0 0 / 0.18);
+}
+
+.mobile-sheet--drag .mobile-sheet-backdrop,
+.mobile-sheet--drag .mobile-sheet-panel {
+    touch-action: none;
+}
+
+.mobile-sheet--drag::backdrop {
+    background: rgb(0 0 0 / calc(0.5 * var(--sheet-shade, 1)));
+}
+
+@keyframes mobile-sheet-in {
+    from {
+        translate: 0 100%;
+    }
+}
+
+.mobile-sheet--drag[open] .mobile-sheet-panel {
+    animation: mobile-sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    transition: transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.mobile-sheet--drag.is-dragging .mobile-sheet-panel {
+    transition: none;
+}
+
+.mobile-sheet--drag.is-leaving .mobile-sheet-panel {
+    transition: transform 180ms ease-in;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .mobile-sheet--drag[open] .mobile-sheet-panel {
+        animation: none;
+        transition: none;
+    }
 }
 
 .mobile-sheet-handle {
@@ -556,20 +601,24 @@
     outline-offset: 1px;
 }
 
-/* The popup's 16 choices: one row that scrolls sideways. The padding keeps
- * the focus ring inside the row's clip, and the scroll padding matches it so
- * a choice snaps beside the padding, not over it (WebKit snaps the first one
- * 3px in otherwise). */
+/* The popup's 16 choices: one row that scrolls sideways, freely and with
+ * momentum, no snapping and no scroll bar (a choice cut off at the edge shows
+ * there are more). It takes only sideways pans: a vertical move on it is the
+ * popup's drag (`mobile_sheet_drag.rs`). The padding keeps the focus ring
+ * inside the row's clip. */
 .mobile-reaction-palette {
     display: flex;
     gap: 4px;
     padding: 3px;
-    scroll-padding-inline: 3px;
     overflow-x: auto;
     overflow-y: hidden;
     overscroll-behavior-x: contain;
-    scroll-snap-type: x proximity;
-    scrollbar-width: thin;
+    scrollbar-width: none;
+    touch-action: pan-x;
+}
+
+.mobile-reaction-palette::-webkit-scrollbar {
+    display: none;
 }
 
 .mobile-reaction-choice {
@@ -579,7 +628,6 @@
     border-radius: 10px;
     font-size: 22px;
     line-height: 1;
-    scroll-snap-align: start;
 }
 
 .mobile-reaction-choice:hover {

@@ -403,6 +403,25 @@ export async function historyPoint(page: Page): Promise<{ x: number; y: number }
   return { x: view.x + 40, y: view.y + 30 };
 }
 
+/// How far the open panel of mobile dialog `id` sits below its rest
+/// position now, in px (its computed `transform`; the opening slide's
+/// `translate` is not counted).
+export function panelOffset(page: Page, id: string): Promise<number> {
+  return page.evaluate((id) => {
+    const panel = document.querySelector(`#${id} .mobile-sheet-panel`)!;
+    return new DOMMatrix(getComputedStyle(panel).transform).m42;
+  }, id);
+}
+
+/// Wait until the open panel of mobile dialog `id` has no slide or
+/// transition running.
+export async function panelAtRest(page: Page, id: string) {
+  await page.waitForFunction(
+    (id) => document.querySelector(`#${id} .mobile-sheet-panel`)?.getAnimations().every((a) => a.playState !== "running") ?? false,
+    id,
+  );
+}
+
 /// A point inside the open panel of mobile dialog `id`, on no control.
 export async function panelPoint(page: Page, id: string): Promise<{ x: number; y: number }> {
   const box = (await page.locator(`#${id} .mobile-sheet-panel`).boundingBox())!;

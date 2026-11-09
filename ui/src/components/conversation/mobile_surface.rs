@@ -35,9 +35,15 @@
 //! the dialog's own `close` event brings the state back in line. While one is
 //! open the reader's wheel and one-finger touch scrolling outside its panel are
 //! held off ([`dom::hold_background`]), a zoom (Ctrl+wheel, a pinch) is not,
-//! and nothing is captured. Arrivals, following, the end hold and reads go on
-//! underneath (history-scrolling.md); opening or closing one never moves the
-//! history.
+//! and nothing outside the dialog is captured. Arrivals, following, the end
+//! hold and reads go on underneath (history-scrolling.md); opening or closing
+//! one never moves the history.
+//!
+//! Dismissal. Escape, Close (the actions sheet) and a tap on the backdrop
+//! dismiss. The reaction popup ([`MobileSurface::drags_to_dismiss`]) slides
+//! away instead of vanishing on a tap outside, and a downward drag starting
+//! anywhere on it drags its panel and dismisses it once far or fast enough
+//! (`mobile_sheet_drag.rs`).
 
 use super::reaction_picker::{shown_room, ReactionSurfaces};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
@@ -95,6 +101,13 @@ impl MobileSurface {
     /// title is only its accessible name.
     fn has_header(self) -> bool {
         self == Self::Actions
+    }
+
+    /// Whether a downward drag anywhere on it slides it away and closes it,
+    /// and a tap outside slides it away too (`mobile_sheet_drag.rs`). The
+    /// actions sheet does not: its actions sit where a drag would start.
+    pub(super) fn drags_to_dismiss(self) -> bool {
+        self == Self::Reaction
     }
 
     /// The row's control this surface opens from, and returns focus to.
@@ -283,6 +296,16 @@ impl ReactionSurfaces {
         });
     }
 
+    /// Close `surface`'s opening `token`, focus back on its control, if it is
+    /// still the open one: the end of a slide away (`mobile_sheet_drag.rs`),
+    /// which may come twice. From a deferred callback only.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(super) fn dismiss_opening(self, surface: MobileSurface, token: u64) {
+        if self.mobile_opening_for(surface, token).is_some() {
+            self.close_mobile(true);
+        }
+    }
+
     /// Close the mobile surface if what it is for has gone. From a deferred
     /// callback only.
     pub(super) fn close_mobile_if_stale(self) {
@@ -451,6 +474,9 @@ pub(super) fn use_show_on_open(
         };
         let first_run = shown_token.replace(token) != token;
         let id = surface.dialog_id();
+        if first_run && !dom::dialog_open(id) {
+            super::mobile_sheet_drag::reset(id);
+        }
         if first_run && !dom::dialog_open(id) && dom::show_dialog(id) {
             dom::focus_in(id, focus);
         }
@@ -471,7 +497,23 @@ pub(super) fn MobileDialogFrame(
     children: Element,
 ) -> Element {
     let (id, prefix, title) = (surface.dialog_id(), surface.prefix(), surface.title());
-    let header = surface.has_header();
+    let (header, drag) = (surface.has_header(), surface.drags_to_dismiss());
+    // Infallible, deliberately: `Conversation`'s own `use_signal`, written
+    // only from deferred callbacks. The drag reads it from the DOM, so a
+    // slide away closes only the opening it began on.
+    let token = surfaces
+        .mobile
+        .read()
+        .as_ref()
+        .filter(|o| o.surface == surface)
+        .map_or(0, |o| o.token);
+    // The drag's listeners, for as long as the frame lives.
+    #[cfg(target_arch = "wasm32")]
+    let drag_listeners = use_hook(|| {
+        std::rc::Rc::new(std::cell::RefCell::new(
+            None::<super::mobile_sheet_drag::Listeners>,
+        ))
+    });
     // The dialog closing by itself (Escape): the state follows. The listener
     // lives as long as the frame.
     #[cfg(target_arch = "wasm32")]
@@ -484,10 +526,11 @@ pub(super) fn MobileDialogFrame(
         dialog {
             id: "{id}",
             "data-testid": "{id}",
-            class: "mobile-sheet",
+            class: if drag { "mobile-sheet mobile-sheet--drag" } else { "mobile-sheet" },
             "aria-labelledby": if header { "{prefix}-title" },
             "aria-label": if !header { "{title}" },
             "data-target-row": "{target_row}",
+            "data-opening": "{token}",
             onmounted: move |_| {
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -495,6 +538,10 @@ pub(super) fn MobileDialogFrame(
                         crate::util::defer(move || surfaces.mobile_dialog_closed(surface));
                     });
                     *close_listener.borrow_mut() = listener;
+                    if drag {
+                        *drag_listeners.borrow_mut() =
+                            super::mobile_sheet_drag::install(id, surface, surfaces);
+                    }
                 }
             },
             onkeydown: move |e: KeyboardEvent| {
@@ -508,7 +555,13 @@ pub(super) fn MobileDialogFrame(
             div {
                 "data-testid": "{prefix}-backdrop",
                 class: "mobile-sheet-backdrop",
-                onclick: move |_| surfaces.dismiss_mobile(surface),
+                onclick: move |_| {
+                    if drag {
+                        super::mobile_sheet_drag::animate_out(id, surface, surfaces);
+                    } else {
+                        surfaces.dismiss_mobile(surface);
+                    }
+                },
             }
             div { class: "mobile-sheet-panel",
                 div { class: "mobile-sheet-handle", "aria-hidden": "true" }

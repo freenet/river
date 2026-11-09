@@ -120,8 +120,12 @@ Current behavior:
   (`conversation/mobile_surface.rs`). While one is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and the panel itself still scrolls (the reaction popup's
-  row of emoji sideways); a zoom (Ctrl+wheel, a pinch) is not held, nothing is
-  captured, and every close path removes the listeners. Unlike the picker,
+  row of emoji sideways); a zoom (Ctrl+wheel, a pinch) is not held, nothing
+  outside the dialog is captured, and every close path removes the
+  listeners. The reaction popup can also be dragged down from anywhere on
+  the screen to dismiss it (`conversation/mobile_sheet_drag.rs`): its
+  backdrop and panel take no pan (`touch-action: none`), so the drag never
+  scrolls the history, and a second finger cancels it. Unlike the picker,
   a modal keeps holding while its message is still rendered, even after
   arrivals carried that row out of the history's view: only the message
   leaving the history closes it. Arrivals, following, the end hold and reads
