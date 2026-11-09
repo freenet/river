@@ -166,7 +166,7 @@ pub(super) struct RowTarget {
 }
 
 impl RowTarget {
-    fn opening(self, origin: Origin) -> MobileOpening {
+    fn opening(self, origin: Origin, by_pointer: bool) -> MobileOpening {
         MobileOpening::new(
             origin,
             self.row,
@@ -174,14 +174,36 @@ impl RowTarget {
             self.own,
             self.current,
             self.reactions,
+            by_pointer,
         )
     }
 }
 
-/// Open the sheet for `target`, from `origin`'s handler. The opening is
-/// committed deferred.
-pub(super) fn open_sheet(surfaces: ReactionSurfaces, target: RowTarget, origin: Origin) {
-    let opening = target.opening(origin);
+/// Whether a click came from a pointer (a tap or a mouse click) rather than
+/// a key: a key's activation click has `detail` 0.
+pub(super) fn pointer_click(e: &MouseEvent) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        e.data()
+            .downcast::<web_sys::MouseEvent>()
+            .is_some_and(|m| m.detail() > 0)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// Open the sheet for `target`, from `origin`'s handler, by a pointer or not
+/// ([`pointer_click`]). The opening is committed deferred.
+pub(super) fn open_sheet(
+    surfaces: ReactionSurfaces,
+    target: RowTarget,
+    origin: Origin,
+    by_pointer: bool,
+) {
+    let opening = target.opening(origin, by_pointer);
     crate::util::defer(move || {
         surfaces.open_mobile(opening);
     });
@@ -206,8 +228,9 @@ pub(super) fn row_clicked(
     if editing || tap == RowTap::Nothing {
         return;
     }
+    let by_pointer = pointer_click(e);
     if tap == RowTap::Open {
-        open_sheet(surfaces, target, Origin::Entry);
+        open_sheet(surfaces, target, Origin::Entry, by_pointer);
         return;
     }
     crate::util::safe_spawn_local(async move {
@@ -216,7 +239,7 @@ pub(super) fn row_clicked(
             && narrow_now()
             && !row_has_selection(&target.row);
         if still {
-            open_sheet(surfaces, target, Origin::Entry);
+            open_sheet(surfaces, target, Origin::Entry, by_pointer);
         }
     });
 }
@@ -401,7 +424,7 @@ pub(super) fn MobileActionsEntry(
             "aria-haspopup": "dialog",
             "aria-controls": SHEET_ID,
             "aria-expanded": "{expanded}",
-            onclick: move |_| {
+            onclick: move |e: MouseEvent| {
                 if !narrow_now() {
                     return;
                 }
@@ -412,7 +435,7 @@ pub(super) fn MobileActionsEntry(
                     current: current.clone(),
                     reactions: reactions.clone(),
                 };
-                open_sheet(surfaces, target, Origin::Entry);
+                open_sheet(surfaces, target, Origin::Entry, pointer_click(&e));
             },
             "Options"
         }

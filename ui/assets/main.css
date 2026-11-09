@@ -604,9 +604,18 @@
     color: var(--color-text-muted);
 }
 
-.mobile-sheet-action:hover,
 .mobile-sheet-action:focus-visible {
     background: var(--color-surface);
+}
+
+/* Hover backgrounds only where something really hovers: a tap leaves an
+ * emulated pointer, and on some touch browsers a sticky :hover, under the
+ * finger, which is where the sheet's first emoji or action appears. */
+@media (hover: hover) {
+    .mobile-sheet-action:hover,
+    .mobile-reaction-choice:hover {
+        background: var(--color-surface);
+    }
 }
 
 .mobile-sheet-action--danger,
@@ -617,6 +626,13 @@
 .mobile-sheet :focus-visible {
     outline: 2px solid var(--color-link);
     outline-offset: 1px;
+}
+
+/* Opened by a tap or a click: the emoji focused on opening shows no ring,
+ * which would read as the reader's current reaction, until a key is pressed
+ * in the sheet (`mobile_surface.rs`, `mark_opened_by`). */
+.mobile-sheet[data-opened-by="pointer"] :focus-visible {
+    outline: none;
 }
 
 /* The sheet's 16 choices: one row that scrolls sideways, freely and with
@@ -646,10 +662,6 @@
     border-radius: 10px;
     font-size: 22px;
     line-height: 1;
-}
-
-.mobile-reaction-choice:hover {
-    background: var(--color-surface);
 }
 
 .mobile-reaction-choice--current {

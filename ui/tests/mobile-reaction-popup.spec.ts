@@ -243,6 +243,28 @@ test.describe("The mobile reaction popup", () => {
     await expect(palette(page).getByRole("button", { name: "Remove 🎉 reaction" }), "and it is their current one").toBeVisible();
   });
 
+  test("opened by a tap its focused emoji shows no ring until a key is pressed; opened by a key it shows at once", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    const outline = () => page.evaluate(() => getComputedStyle(document.activeElement!).outlineStyle);
+    await openReactionPopup(page, row);
+    await expect(choices(page).first()).toBeFocused();
+    await expect(popup(page)).toHaveAttribute("data-opened-by", "pointer");
+    expect(await outline(), "no ring that reads as the current reaction").toBe("none");
+    // Any key in it: the reader is on the keyboard now.
+    await page.keyboard.press("Shift");
+    await expect(popup(page)).toHaveAttribute("data-opened-by", "keyboard");
+    await page.keyboard.press("Escape");
+    await expect(popup(page)).toBeHidden();
+
+    // From the keyboard: the ring shows straight away.
+    await keyboardFocus(page, row.getByTestId("message-react-button"));
+    await page.keyboard.press("Enter");
+    await expect(popup(page)).toBeVisible();
+    await expect(choices(page).first()).toBeFocused();
+    await expect(popup(page)).toHaveAttribute("data-opened-by", "keyboard");
+    expect(await outline(), "the keyboard's focus ring").not.toBe("none");
+  });
+
   test("Enter on a chip opens the sheet too", async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "memberReactsToNewest", "🎉");

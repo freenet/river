@@ -122,6 +122,10 @@ pub(super) struct MobileOpening {
     /// Its reactions and who made them, as its row last rendered them: what
     /// the sheet lists. Kept in step by the row's entry.
     pub(super) reactions: Rc<Vec<SheetReaction>>,
+    /// A pointer opened it (a tap or a click, not a key): its focus shows no
+    /// ring until a key is pressed in it, so the focused emoji does not look
+    /// like the reader's current reaction.
+    pub(super) by_pointer: bool,
 }
 
 thread_local! {
@@ -147,6 +151,7 @@ impl MobileOpening {
         own: bool,
         current: Option<String>,
         reactions: Rc<Vec<SheetReaction>>,
+        by_pointer: bool,
     ) -> Self {
         let (room, visit) = shown_room();
         Self {
@@ -160,6 +165,7 @@ impl MobileOpening {
             own,
             current,
             reactions,
+            by_pointer,
         }
     }
 
@@ -410,14 +416,19 @@ pub(super) fn use_show_on_open(surfaces: ReactionSurfaces, focus: &'static [&'st
     use_effect(move || {
         // Infallible, deliberately: `Conversation`'s own `use_signal`, written
         // only from deferred callbacks.
-        let token = surfaces.mobile.read().as_ref().map(|o| o.token);
-        let Some(token) = token else {
+        let opened = surfaces
+            .mobile
+            .read()
+            .as_ref()
+            .map(|o| (o.token, o.by_pointer));
+        let Some((token, by_pointer)) = opened else {
             return;
         };
         if shown_token.replace(token) == token {
             return;
         }
         super::mobile_sheet_drag::reset(SHEET_ID);
+        dom::mark_opened_by(SHEET_ID, by_pointer);
         if !dom::dialog_open(SHEET_ID) && dom::show_dialog(SHEET_ID) {
             dom::focus_in(SHEET_ID, focus);
         }
@@ -476,6 +487,8 @@ pub(super) fn MobileDialogFrame(
                 }
             },
             onkeydown: move |e: KeyboardEvent| {
+                // A key in it: from now on its focus shows, however it opened.
+                dom::mark_opened_by(id, false);
                 #[cfg(target_arch = "wasm32")]
                 if e.key() == Key::Tab && dom::contain_tab(id, e.modifiers().shift()) {
                     e.prevent_default();
@@ -578,6 +591,16 @@ pub(super) mod dom {
             .is_some_and(|f| f.call0(&dialog).is_ok());
         if !closed || dialog.has_attribute("open") {
             let _ = dialog.remove_attribute("open");
+        }
+    }
+
+    /// Mark dialog `id` as opened by a pointer (its focus ring is hidden,
+    /// `main.css`) or by the keyboard. Kept on the element, not rendered:
+    /// the first key pressed in it flips it, with no state to write.
+    pub(super) fn mark_opened_by(id: &str, pointer: bool) {
+        if let Some(dialog) = element(id) {
+            let by = if pointer { "pointer" } else { "keyboard" };
+            let _ = dialog.set_attribute("data-opened-by", by);
         }
     }
 
@@ -860,6 +883,7 @@ pub(super) mod dom {
         false
     }
     pub(super) fn focus_in(_id: &str, _selectors: &[&str]) {}
+    pub(super) fn mark_opened_by(_id: &str, _pointer: bool) {}
     pub(super) fn hold_background(_on: bool) {}
     pub(super) fn track_viewport(_on: bool) {}
 }
@@ -894,6 +918,7 @@ mod tests {
             own: false,
             current: None,
             reactions: Rc::new(Vec::new()),
+            by_pointer: false,
         }
     }
 

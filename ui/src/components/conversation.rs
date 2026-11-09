@@ -4834,6 +4834,7 @@ fn MessageGroupComponent(
                                                                                 reactions,
                                                                                 chip_target.clone(),
                                                                                 Origin::Chip(reaction_chip_id(&owners_key_for_click)),
+                                                                                mobile_message_actions::pointer_click(&e),
                                                                             );
                                                                             return;
                                                                         }
@@ -4892,6 +4893,7 @@ fn MessageGroupComponent(
                                                                                 reactions,
                                                                                 chip_target_for_key.clone(),
                                                                                 Origin::Chip(chip_id_for_key.clone()),
+                                                                                false,
                                                                             );
                                                                             return;
                                                                         }

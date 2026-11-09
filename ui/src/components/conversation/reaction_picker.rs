@@ -43,7 +43,7 @@
 //! reactor list and the sheet is open (`mobile_surface.rs`).
 
 use super::emoji_picker::FREQUENT_EMOJIS;
-use super::mobile_message_actions::{open_sheet, RowTarget};
+use super::mobile_message_actions::{open_sheet, pointer_click, RowTarget};
 use super::mobile_message_sheet::SheetReaction;
 use super::mobile_surface::{narrow_for_render, narrow_now, MobileOpening, Origin, SHEET_ID};
 use super::{now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
@@ -387,7 +387,7 @@ pub(super) fn ReactionInvoker(
             "aria-controls": controls,
             "aria-expanded": "{expanded}",
             onpointerdown: move |_| record_press(&press_row, surfaces),
-            onclick: move |_| {
+            onclick: move |e: MouseEvent| {
                 // Every press supersedes an opening still waiting to run.
                 let activation = next_activation();
                 // Below 48rem, decided now: the sheet, never the picker.
@@ -399,7 +399,7 @@ pub(super) fn ReactionInvoker(
                         current: current.clone(),
                         reactions: reactions.clone(),
                     };
-                    open_sheet(surfaces, target, Origin::React);
+                    open_sheet(surfaces, target, Origin::React, pointer_click(&e));
                     return;
                 }
                 // A pointer press on React while its picker is open closes
