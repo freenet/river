@@ -250,8 +250,7 @@ export async function clickFooter(page: Page, row: Locator, testid: string) {
 /// its palette shown.
 export async function openInlinePicker(page: Page, row: Locator) {
   if (await narrowLayout(page)) {
-    await press(page, row.getByTestId("message-react-button"));
-    await expect(page.getByTestId("mobile-reaction-popup")).toBeVisible();
+    await openReactionPopup(page, row);
     await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
     await expect(page.getByTestId("mobile-reaction-palette")).toBeVisible();
     return;
@@ -303,6 +302,19 @@ export async function hasTouch(_page: Page): Promise<boolean> {
 export async function press(page: Page, target: Locator, options?: { position?: { x: number; y: number } }) {
   if (await hasTouch(page)) await target.tap(options);
   else await target.click(options);
+}
+
+/// Press the page at a point as the reader would: a tap where touch is
+/// available, else a click.
+export async function pressAt(page: Page, { x, y }: { x: number; y: number }) {
+  if (await hasTouch(page)) await page.touchscreen.tap(x, y);
+  else await page.mouse.click(x, y);
+}
+
+/// The message key a row's id carries (`msg-<key>`), as the mobile surfaces'
+/// `data-target-row` names it.
+export async function rowKey(row: Locator): Promise<string> {
+  return (await row.getAttribute("id"))!.replace(/^msg-/, "");
 }
 
 /// Footer test ids and the sheet action that replaces each below 48rem.
@@ -365,9 +377,7 @@ export async function plainPointOf(row: Locator): Promise<{ x: number; y: number
 
 /// Tap (or click) `row` on a plain point, as a reader opening its actions.
 export async function tapRow(page: Page, row: Locator) {
-  const { x, y } = await plainPointOf(row);
-  if (await hasTouch(page)) await page.touchscreen.tap(x, y);
-  else await page.mouse.click(x, y);
+  await pressAt(page, await plainPointOf(row));
 }
 
 /// Below 48rem: open `row`'s actions sheet with a tap on the row, and check
@@ -376,8 +386,28 @@ export async function openMessageActions(page: Page, row: Locator) {
   await tapRow(page, row);
   const sheet = page.getByTestId("mobile-message-actions-sheet");
   await expect(sheet).toBeVisible();
-  const id = (await row.getAttribute("id"))!.replace(/^msg-/, "");
-  await expect(sheet).toHaveAttribute("data-target-row", id);
+  await expect(sheet).toHaveAttribute("data-target-row", await rowKey(row));
+}
+
+/// Below 48rem: open `row`'s reaction popup with its +, and check it is for
+/// that row.
+export async function openReactionPopup(page: Page, row: Locator) {
+  await press(page, row.getByTestId("message-react-button"));
+  const popup = page.getByTestId("mobile-reaction-popup");
+  await expect(popup).toBeVisible();
+  await expect(popup).toHaveAttribute("data-target-row", await rowKey(row));
+}
+
+/// A point over the history's top, below the header.
+export async function historyPoint(page: Page): Promise<{ x: number; y: number }> {
+  const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+  return { x: view.x + 40, y: view.y + 30 };
+}
+
+/// A point inside the open panel of mobile dialog `id`, on no control.
+export async function panelPoint(page: Page, id: string): Promise<{ x: number; y: number }> {
+  const box = (await page.locator(`#${id} .mobile-sheet-panel`).boundingBox())!;
+  return { x: box.x + box.width / 2, y: box.y + 6 };
 }
 
 /// Whether a one- (or two-) finger `touchmove` at the point is cancelled,
@@ -393,4 +423,43 @@ export function touchmovePrevented(page: Page, x: number, y: number, fingers = 1
     },
     { x, y, fingers },
   );
+}
+
+/// Whether a synthetic, cancelable wheel dispatched where (x, y) lands was
+/// cancelled: the hold's handler contract, not the browser's scroll or zoom.
+export function wheelCancelled(page: Page, x: number, y: number, ctrlKey: boolean): Promise<boolean> {
+  return page.evaluate(
+    ([x, y, ctrlKey]) => {
+      const at = document.elementFromPoint(x, y)!;
+      const wheel = new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: y, ctrlKey, bubbles: true, cancelable: true });
+      return !at.dispatchEvent(wheel);
+    },
+    [x, y, ctrlKey] as const,
+  );
+}
+
+/// For each `[how, close]`: open mobile dialog `id` with `open`, check that a
+/// one-finger touch over the history is held while a pinch and a touch on
+/// its panel are not, close it with `close`, and check the hold let go.
+export async function expectTouchHeldUntilClosed(
+  page: Page,
+  id: string,
+  open: () => Promise<void>,
+  closes: [string, () => Promise<void>][],
+) {
+  const dialog = page.getByTestId(id);
+  for (const [how, close] of closes) {
+    await open();
+    const h = await historyPoint(page);
+    expect(await touchmovePrevented(page, h.x, h.y), `${how}: a finger over the history is held`).toBe(true);
+    expect(await touchmovePrevented(page, h.x, h.y, 2), `${how}: a pinch is not`).toBe(false);
+    const inside = await panelPoint(page, id);
+    expect(await touchmovePrevented(page, inside.x, inside.y), `${how}: the panel scrolls`).toBe(false);
+    await close();
+    await expect(dialog).toBeHidden();
+    await settle(page);
+    const after = await historyPoint(page);
+    expect(await page.evaluate(({ x, y }) => !!document.elementFromPoint(x, y)?.closest("#chat-scroll-container"), after), "premise: the history is under the point").toBe(true);
+    expect(await touchmovePrevented(page, after.x, after.y), `closed by ${how}: let go`).toBe(false);
+  }
 }

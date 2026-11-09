@@ -111,3 +111,12 @@ export async function callRiverTest<K extends keyof RiverTestHooks>(
     { name: name as string, args: args as unknown[] }
   ) as Promise<ReturnType<RiverTestHooks[K]>>;
 }
+
+/// Re-key the current room and click the control with test id `testid` in
+/// one task, the re-key first, so the click is queued across it.
+export async function rekeyThenClick(page: Page, testid: string) {
+  await page.evaluate((testid) => {
+    (window as unknown as { __riverTest: RiverTestHooks }).__riverTest.rekeyCurrentRoom();
+    document.querySelector<HTMLElement>(`[data-testid="${testid}"]`)!.click();
+  }, testid);
+}

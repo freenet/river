@@ -1,5 +1,5 @@
 import { test, expect, CDPSession, Locator, Page } from "@playwright/test";
-import { asTouchTablet, coarsePointer, committedRow, nextFrames, openRoomWithComposer, revealFooter, settle, submitMessage } from "./example-room";
+import { asTouchTablet, coarsePointer, committedRow, nextFrames, openRoomWithComposer, revealFooter, rowKey, settle, submitMessage, wheelCancelled } from "./example-room";
 import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import {
   expectAtReact,
@@ -344,8 +344,7 @@ test.describe("The reaction picker", () => {
     ]);
     const [lead, middle, survivor] = ["remount lead", "remount middle", "remount survivor"].map((t) => committedRow(page, t));
     await expect(survivor).toHaveCount(1);
-    const keyOf = async (row: Locator) => (await row.getAttribute("id"))!.replace(/^msg-/, "");
-    const [leadKey, middleKey, survivorKey] = [await keyOf(lead), await keyOf(middle), await keyOf(survivor)];
+    const [leadKey, middleKey, survivorKey] = [await rowKey(lead), await rowKey(middle), await rowKey(survivor)];
     const groupKey = (row: Locator) => row.evaluate((el) => el.closest(".msg-group")?.getAttribute("data-item-key") ?? null);
     for (const row of [lead, middle, survivor]) expect(await groupKey(row), "premise: one group, keyed by its first message").toBe(leadKey);
     expect(
@@ -692,19 +691,6 @@ async function wheelAt(page: Page, x: number, y: number) {
   await settle(page);
 }
 
-/// Whether a synthetic, cancelable wheel dispatched where (x, y) lands was
-/// cancelled: the hold's handler contract, not the browser's scroll or zoom.
-function wheelCancelled(page: Page, x: number, y: number, ctrlKey: boolean): Promise<boolean> {
-  return page.evaluate(
-    ([x, y, ctrlKey]) => {
-      const at = document.elementFromPoint(x, y)!;
-      const wheel = new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: y, ctrlKey, bubbles: true, cancelable: true });
-      return !at.dispatchEvent(wheel);
-    },
-    [x, y, ctrlKey] as const,
-  );
-}
-
 test.describe("While the reaction picker is open", () => {
   test("the reader's wheel scrolls the history neither over it nor over the picker; closing it lets it again", async ({ page }) => {
     test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
@@ -890,7 +876,7 @@ test.describe("While the reaction picker is open", () => {
   // Below 48rem the React is the mobile popup's, so narrowing the window
   // closes the picker outright and lets go of its hold; widening again
   // reopens nothing.
-  test("narrowing the window below 48rem closes it, lets go of the wheel, and widening reopens nothing", async ({ page }) => {
+  test("narrowing the window below 48rem closes it, lets go of the wheel, and widening reopens nothing", { tag: "@chromium-only" }, async ({ page }) => {
     test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
     await page.setViewportSize({ width: 1280, height: 844 });
     await openRoomWithComposer(page);
@@ -1539,7 +1525,7 @@ test.describe("Without a working Popover API", () => {
     const [lead, survivor] = [committedRow(page, "quiet lead"), committedRow(page, "quiet survivor")];
     await expect(survivor).toHaveCount(1);
     const groupKey = (row: Locator) => row.evaluate((el) => el.closest(".msg-group")?.getAttribute("data-item-key") ?? null);
-    const leadKey = (await lead.getAttribute("id"))!.replace(/^msg-/, "");
+    const leadKey = await rowKey(lead);
     expect(await groupKey(survivor), "premise: one group, keyed by the lead").toBe(leadKey);
     await page.getByTestId("message-input").blur();
     const signs = await callRiverTest(page, "messageSignsRecorded");

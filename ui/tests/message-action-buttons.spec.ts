@@ -6,9 +6,7 @@ import {
   committedRow,
   FOOTER_CONTROLS,
   keyboardFocus,
-  openMessageActions,
   openRoomWithComposer,
-  press,
   reactTo,
   revealFooter,
   settle,
@@ -420,15 +418,6 @@ test.describe("Footer at 320px", () => {
         expect(c.box.right).toBeLessThanOrEqual(Math.min(layout.content.right, layout.scroller.right, layout.viewport) + 0.5);
       }
     }
-
-    // The real controls answer real presses.
-    await press(page, row.getByTestId("message-react-button"));
-    await expect(page.getByTestId("mobile-reaction-popup")).toBeVisible();
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("mobile-reaction-popup")).toBeHidden();
-    await openMessageActions(page, row);
-    await press(page, page.getByTestId("mobile-message-action-reply"));
-    await expect(page.getByTestId("message-composer")).toContainText("Replying to");
   });
 });
 

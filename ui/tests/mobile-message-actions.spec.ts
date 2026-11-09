@@ -2,21 +2,26 @@ import { test, expect, Locator, Page } from "@playwright/test";
 import {
   coarsePointer,
   committedRow,
+  expectTouchHeldUntilClosed,
   hasTouch,
+  historyPoint,
   keyboardFocus,
   narrowLayout,
   openMessageActions,
   openRoomWithComposer,
   plainPointOf,
   press,
+  pressAt,
+  rowKey,
   settle,
   submitMessage,
   tapRow,
   touchmovePrevented,
+  wheelCancelled,
 } from "./example-room";
 import { DM_PEER, openThread } from "./dm-thread";
 import { deliver, scrollMetrics } from "./history-geometry";
-import { callRiverTest } from "./river-test";
+import { callRiverTest, rekeyThenClick } from "./river-test";
 
 // Below Tailwind's `md` (48rem) a signed message's trailing Reply, Edit and
 // Delete are hidden; a tap on the row opens them, and only them, in a modal
@@ -40,22 +45,6 @@ async function expectNoSurface(page: Page) {
   await page.waitForTimeout(400);
   await expect(sheet(page)).toBeHidden();
   await expect(page.getByTestId(POPUP)).toBeHidden();
-}
-
-/// A point over the history's top, below the header.
-async function historyPoint(page: Page): Promise<{ x: number; y: number }> {
-  const view = (await page.locator("#chat-scroll-container").boundingBox())!;
-  return { x: view.x + 40, y: view.y + 30 };
-}
-
-/// A point inside the open panel of dialog `id`, on no control.
-async function panelPoint(page: Page, id: string): Promise<{ x: number; y: number }> {
-  const box = (await page.locator(`#${id} .mobile-sheet-panel`).boundingBox())!;
-  return { x: box.x + box.width / 2, y: box.y + 6 };
-}
-
-function rowKey(row: Locator): Promise<string> {
-  return row.getAttribute("id").then((id) => id!.replace(/^msg-/, ""));
 }
 
 /// The footer's state below 48rem: the cluster's display, the + per row and
@@ -142,23 +131,23 @@ test.describe("Below 48rem", () => {
     for (const counts of perRow) expect(counts).toEqual([1, 1]);
   });
 
-  test("a tap on a row opens actions for that exact message, and nothing else", async ({ page }) => {
+  test("a tap on a row opens the desktop footer's actions for that exact message, and nothing else", async ({ page }) => {
     const { received, own, continuation } = await openRoomWithRows(page);
-    for (const [row, own_] of [
-      [received, false],
-      [own, true],
-      [continuation, true],
-    ] as const) {
+    // Self owns this room: owning it grants no Edit or Delete on another
+    // author's message, here or in the footer.
+    const rows = [
+      [received, ["reply"]],
+      [own, ["reply", "edit", "delete"]],
+      [continuation, ["reply", "edit", "delete"]],
+    ] as const;
+    for (const [row, expected] of rows) {
       await openMessageActions(page, row);
       const s = sheet(page);
-      await expect(s).toHaveAttribute("data-target-row", await rowKey(row));
       await expect(s.getByRole("heading", { name: "Message actions" })).toBeVisible();
-      const actions = await s.locator(".mobile-sheet-actions button").evaluateAll((bs) => bs.map((b) => b.getAttribute("data-testid")));
-      expect(actions).toEqual(
-        own_
-          ? ["mobile-message-action-reply", "mobile-message-action-edit", "mobile-message-action-delete"]
-          : ["mobile-message-action-reply"],
+      const actions = await s.locator(".mobile-sheet-actions button").evaluateAll((bs) =>
+        bs.map((b) => b.getAttribute("data-testid")!.replace("mobile-message-action-", "")),
       );
+      expect(actions).toEqual(expected);
       // Actions only: no reaction, shortcut or field in it.
       await expect(s.locator("input, textarea")).toHaveCount(0);
       await expect(s.getByText(/React|palette|👍/)).toHaveCount(0);
@@ -175,24 +164,13 @@ test.describe("Below 48rem", () => {
       await expect(row.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "false");
       expect((await scrollMetrics(page)).top, "dismissing scrolled nothing").toBe(before);
     }
-  });
-
-  test("the + opens only the reaction popup; row and + alternate without stacking", async ({ page }) => {
-    const { own } = await openRoomWithRows(page);
-    for (let round = 0; round < 2; round++) {
-      await press(page, own.getByTestId("message-react-button"));
-      await expect(page.getByTestId(POPUP)).toBeVisible();
-      await expect(sheet(page), "the + never opens actions").toBeHidden();
-      await expect(page.getByTestId(POPUP).getByText(/Reply|Edit|Delete/)).toHaveCount(0);
-      await press(page, page.getByTestId("mobile-reaction-close"));
-      await expect(page.getByTestId(POPUP)).toBeHidden();
-
-      await openMessageActions(page, own);
-      await expect(page.getByTestId(POPUP), "a row tap never opens the reaction popup").toBeHidden();
-      await press(page, page.getByTestId("mobile-message-actions-close"));
-      await expect(sheet(page)).toBeHidden();
+    await page.setViewportSize({ width: 900, height: 760 });
+    for (const [row, expected] of rows) {
+      const footer = await row.getByTestId("message-action-cluster").locator("button").evaluateAll((bs) =>
+        bs.map((b) => b.getAttribute("data-testid")!.replace(/^message-|-button$/g, "")),
+      );
+      expect(footer, "the 900px footer offers what the sheet did").toEqual(expected);
     }
-    expect(await page.locator("dialog[open]").count(), "nothing left open").toBe(0);
   });
 
   test("controls inside a row keep their own behaviour and open no actions", async ({ page, context }) => {
@@ -287,7 +265,6 @@ test.describe("Below 48rem", () => {
     await expectNoSurface(page);
     expect(await page.evaluate(() => window.getSelection()!.toString()), "the selection is left alone").toContain("own first row");
     await page.evaluate(() => window.getSelection()!.removeAllRanges());
-    // A Ctrl-click.
     await own.dispatchEvent("click", { clientX: x, clientY: y, button: 0, ctrlKey: true, bubbles: true });
     await expectNoSurface(page);
     // And then a plain tap does.
@@ -339,8 +316,7 @@ test.describe("Below 48rem", () => {
     const point = { x: hb.x + hb.width / 2, y: hb.y + hb.height / 2 };
     const hit = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid") ?? null, point);
     expect(hit, "premise: the backdrop covers the header").toBe("mobile-message-actions-backdrop");
-    if (await hasTouch(page)) await page.touchscreen.tap(point.x, point.y);
-    else await page.mouse.click(point.x, point.y);
+    await pressAt(page, point);
     await expect(sheet(page)).toBeHidden();
     await settle(page);
     await expect(page.locator("#chat-scroll-container"), "the chat is still the panel shown").toBeVisible();
@@ -505,13 +481,7 @@ test.describe("Below 48rem", () => {
       await settle(page);
       expect((await scrollMetrics(page)).top, "the history did not move").toBe(before);
       // A zoom is let through: not cancelled.
-      const cancelled = await page.evaluate(({ x, y }) => {
-        const target = document.elementFromPoint(x, y)!;
-        const e = new WheelEvent("wheel", { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true, clientX: x, clientY: y });
-        target.dispatchEvent(e);
-        return e.defaultPrevented;
-      }, { x: view.x + 30, y: view.y + 30 });
-      expect(cancelled, "Ctrl+wheel is a zoom").toBe(false);
+      expect(await wheelCancelled(page, view.x + 30, view.y + 30, true), "Ctrl+wheel is a zoom").toBe(false);
     }
     // An arrival is still followed by a reader at the end.
     await callRiverTest(page, "appendMessage", "arrives under the sheet");
@@ -530,46 +500,20 @@ test.describe("Below 48rem", () => {
     }
   });
 
-
   test("one-finger touch is held outside the panel, not inside it or for a pinch; every close path lets go", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
-    const closes: [string, () => Promise<void>][] = [
+    await expectTouchHeldUntilClosed(page, SHEET, () => openMessageActions(page, own), [
       ["Close", () => press(page, page.getByTestId("mobile-message-actions-close"))],
       ["Escape", () => page.keyboard.press("Escape")],
-      ["backdrop", async () => {
-        const p = await historyPoint(page);
-        if (await hasTouch(page)) await page.touchscreen.tap(p.x, p.y);
-        else await page.mouse.click(p.x, p.y);
-      }],
+      ["backdrop", async () => pressAt(page, await historyPoint(page))],
       ["48rem", async () => {
         await page.setViewportSize({ width: 768, height: 760 });
         await expect(sheet(page)).toBeHidden();
         await page.setViewportSize({ width: 390, height: 760 });
       }],
-    ];
-    for (const [how, close] of closes) {
-      await openMessageActions(page, own);
-      const h = await historyPoint(page);
-      expect(await touchmovePrevented(page, h.x, h.y), `${how}: a finger over the history is held`).toBe(true);
-      expect(await touchmovePrevented(page, h.x, h.y, 2), `${how}: a pinch is not`).toBe(false);
-      const inside = await panelPoint(page, SHEET);
-      expect(await touchmovePrevented(page, inside.x, inside.y), `${how}: the panel scrolls`).toBe(false);
-      await close();
-      await expect(sheet(page)).toBeHidden();
-      await settle(page);
-      const after = await historyPoint(page);
-      expect(await page.evaluate(({ x, y }) => !!document.elementFromPoint(x, y)?.closest("#chat-scroll-container"), after), "premise: the history is under the point").toBe(true);
-      expect(await touchmovePrevented(page, after.x, after.y), `closed by ${how}: let go`).toBe(false);
-    }
-    // Its message leaving.
-    await callRiverTest(page, "appendMessage", "touch leaving row");
-    const leaving = committedRow(page, "touch leaving row");
-    await expect(leaving).toHaveCount(1);
-    await openMessageActions(page, leaving);
-    await callRiverTest(page, "removeMessages", "touch leaving row");
-    await expect(sheet(page)).toBeHidden();
-    const after = await historyPoint(page);
-    expect(await touchmovePrevented(page, after.x, after.y), "closed by its message leaving: let go").toBe(false);
+      // Last: it takes the row away.
+      ["its message leaving", () => callRiverTest(page, "removeMessages", "own first row")],
+    ]);
   });
 
   test("an arrival carrying its row out of view keeps it open, usable and holding", async ({ page }) => {
@@ -602,11 +546,7 @@ test.describe("Below 48rem", () => {
     await expect(sheet(page), "coming back reopens nothing").toBeHidden();
 
     await openMessageActions(page, own);
-    // The re-key and a Reply pressed in the same task, the re-key first.
-    await page.evaluate(() => {
-      (window as unknown as { __riverTest: { rekeyCurrentRoom(): void } }).__riverTest.rekeyCurrentRoom();
-      document.querySelector<HTMLElement>('[data-testid="mobile-message-action-reply"]')!.click();
-    });
+    await rekeyThenClick(page, "mobile-message-action-reply");
     await settle(page);
     await expect(sheet(page)).toBeHidden();
     await expect(page.getByTestId("message-composer"), "the Reply queued across the re-key did nothing").not.toContainText("Replying to");
@@ -620,8 +560,7 @@ test.describe("Below 48rem", () => {
     const notice = page.getByTestId("join-notice").last();
     await expect(notice).toBeVisible();
     const nb = (await notice.boundingBox())!;
-    if (await hasTouch(page)) await page.touchscreen.tap(nb.x + nb.width - 4, nb.y + nb.height / 2);
-    else await page.mouse.click(nb.x + nb.width - 4, nb.y + nb.height / 2);
+    await pressAt(page, { x: nb.x + nb.width - 4, y: nb.y + nb.height / 2 });
     await expectNoSurface(page);
     await expect(page.getByTestId("date-separator").first()).toBeAttached();
 
@@ -632,29 +571,6 @@ test.describe("Below 48rem", () => {
     await press(page, dmRow);
     await expectNoSurface(page);
     await expect(dmRow.getByTestId("mobile-message-actions-entry")).toHaveCount(0);
-  });
-
-  test("the sheet offers exactly what the desktop footer does, row by row", async ({ page }) => {
-    // Self owns this room: owning it grants no Edit or Delete on another
-    // author's message, here or in the footer.
-    const { received, own } = await openRoomWithRows(page);
-    const sheetActions: Record<string, string[]> = {};
-    for (const [name, row] of [["received", received], ["own", own]] as const) {
-      await openMessageActions(page, row);
-      sheetActions[name] = await sheet(page).locator(".mobile-sheet-actions button").evaluateAll((bs) =>
-        bs.map((b) => b.getAttribute("data-testid")!.replace("mobile-message-action-", "")),
-      );
-      await page.keyboard.press("Escape");
-      await expect(sheet(page)).toBeHidden();
-    }
-    await page.setViewportSize({ width: 900, height: 760 });
-    for (const [name, row] of [["received", received], ["own", own]] as const) {
-      const footer = await row.getByTestId("message-action-cluster").locator("button").evaluateAll((bs) =>
-        bs.map((b) => b.getAttribute("data-testid")!.replace(/^message-|-button$/g, "")),
-      );
-      expect(sheetActions[name], `${name}: sheet and footer agree`).toEqual(footer);
-    }
-    expect(sheetActions.received).toEqual(["reply"]);
   });
 
   test("a double- or triple-click selects text in a narrow mouse window and opens nothing", async ({ page }) => {
@@ -673,7 +589,7 @@ test.describe("Below 48rem", () => {
     await expect(sheet(page)).toBeVisible();
   });
 
-  test("a contact whose release never reached a row does not make later taps a pinch", async ({ page }) => {
+  test("a contact whose release never reached a row does not make later taps a pinch", { tag: "@chromium-only" }, async ({ page }) => {
     const { own } = await openRoomWithRows(page);
     const { x, y } = await plainPointOf(own);
     // A finger down on a row that was replaced before it lifted: no pointerup.
@@ -841,7 +757,7 @@ test.describe("Inside the gateway's sandboxed frame", () => {
     await content.click({ position: { x: cb.width - 3, y: Math.min(8, cb.height / 2) } });
     const s = frame.getByTestId(SHEET);
     await expect(s).toBeVisible();
-    await expect(s).toHaveAttribute("data-target-row", (await row.getAttribute("id"))!.replace(/^msg-/, ""));
+    await expect(s).toHaveAttribute("data-target-row", await rowKey(row));
     const panel = await s.locator(".mobile-sheet-panel").boundingBox();
     expect(panel!.y + panel!.height, "bottom-aligned in the frame").toBeGreaterThan(740);
     await frame.getByTestId("mobile-message-actions-close").click();

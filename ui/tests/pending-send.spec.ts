@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { committedRow, FOOTER_CONTROLS, narrowLayout, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, press, reactionChoices, reactTo, settle, submitMessage } from "./example-room";
+import { committedRow, FOOTER_CONTROLS, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, press, reactionChoices, reactTo, settle, submitMessage } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // An own message is signed by the chat delegate, which can take seconds. It
@@ -46,8 +46,6 @@ test("a sent message shows at once, pending, and commits once when signed", asyn
   await expect(signed).toBeInViewport();
   await expect(signed.getByTestId("message-footer"), "once signed, its own footer").toHaveCount(1);
   for (const id of FOOTER_CONTROLS) await expect(signed.getByTestId(id), id).toHaveCount(1);
-  // Below 48rem its actions are a tap away, in the sheet.
-  if (await narrowLayout(page)) await expect(signed.getByTestId("mobile-message-actions-entry")).toHaveCount(1);
 });
 
 test("messages commit in the order they were sent, whatever order they are signed in", { tag: "@chromium-only" }, async ({

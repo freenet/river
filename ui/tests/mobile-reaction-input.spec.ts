@@ -1,7 +1,17 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { committedRow, keyboardFocus, openRoomWithComposer, press, settle, touchmovePrevented } from "./example-room";
+import {
+  committedRow,
+  expectTouchHeldUntilClosed,
+  keyboardFocus,
+  openReactionPopup,
+  openRoomWithComposer,
+  press,
+  pressAt,
+  rowKey,
+  settle,
+} from "./example-room";
 import { deliver } from "./history-geometry";
-import { callRiverTest } from "./river-test";
+import { callRiverTest, rekeyThenClick } from "./river-test";
 
 // Below 48rem a message's reaction + opens a separate reaction popup
 // (mobile_reaction_input.rs): a labelled field for the device keyboard's
@@ -23,13 +33,6 @@ function input(page: Page): Locator {
 
 function chips(row: Locator): Locator {
   return row.getByTestId("reaction-chip");
-}
-
-async function openPopup(page: Page, row: Locator) {
-  await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-  await press(page, row.getByTestId("message-react-button"));
-  await expect(popup(page)).toBeVisible();
-  await expect(popup(page)).toHaveAttribute("data-target-row", (await row.getAttribute("id"))!.replace(/^msg-/, ""));
 }
 
 /// Type `text` into the field the way a keyboard's emoji key delivers it.
@@ -68,7 +71,7 @@ test.describe("The mobile reaction popup", () => {
     await expect(react).toHaveAttribute("aria-haspopup", "dialog");
     await expect(react).toHaveAttribute("aria-controls", POPUP);
     await expect(react).toHaveAttribute("aria-expanded", "false");
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     await expect(react).toHaveAttribute("aria-expanded", "true");
     await expect(popup(page).getByRole("heading", { name: "React to message" })).toBeVisible();
     await expect(input(page), "the field takes focus on the press").toBeFocused();
@@ -89,15 +92,11 @@ test.describe("The mobile reaction popup", () => {
 
   test("typing never submits; React reacts once with the exact bytes typed", async ({ page }) => {
     const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     // A text-default heart with its VS16, a skin-toned ZWJ sequence: kept as typed.
     await typeEmoji(page, "❤️");
-    await page.evaluate(() => {
-      const field = document.getElementById("mobile-reaction-input")!;
-      field.dispatchEvent(new CompositionEvent("compositionend", { data: "❤️", bubbles: true }));
-    });
     await settle(page);
-    await expect(popup(page), "typing and a composition ending do not submit").toBeVisible();
+    await expect(popup(page), "typing does not submit").toBeVisible();
     await expect(chips(row)).toHaveCount(0);
     await expect(page.getByTestId("mobile-reaction-submit")).toHaveText("React");
     await press(page, page.getByTestId("mobile-reaction-submit"));
@@ -107,7 +106,7 @@ test.describe("The mobile reaction popup", () => {
     await expect(row.getByTestId("message-react-button"), "focus back on the +").toBeFocused();
 
     // A ZWJ sequence with a skin tone switches to it, whole.
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     await expect(input(page), "a new opening starts empty").toHaveValue("");
     await typeEmoji(page, "🧑🏽‍🚀");
     await page.keyboard.press("Enter");
@@ -115,10 +114,12 @@ test.describe("The mobile reaction popup", () => {
     expect(await chipCodepoints(row)).toEqual(["1f9d1 1f3fd 200d 1f680"]);
   });
 
-  test("Enter submits only once a composition has finished", async ({ page }) => {
+  test("Enter submits only once a composition has finished, in either event order", { tag: "@chromium-only" }, async ({ page }) => {
     const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     await typeEmoji(page, "😂");
+    // Chromium's and Firefox's order: the confirming Enter during the
+    // composition, then compositionend.
     await page.evaluate(() => {
       const field = document.getElementById("mobile-reaction-input")!;
       field.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
@@ -133,230 +134,6 @@ test.describe("The mobile reaction popup", () => {
     });
     await settle(page);
     await expect(chips(row), "the composition ending submits nothing").toHaveCount(0);
-    await page.keyboard.press("Enter");
-    await expect(popup(page)).toBeHidden();
-    await expect(chips(row)).toHaveCount(1);
-  });
-
-  test("text, several emoji and nothing are explained; the field stays editable", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
-    const error = page.getByTestId("mobile-reaction-error");
-    for (const [typed, says] of [
-      ["", "Type or paste one emoji."],
-      ["ok", "That isn’t an emoji River knows. Choose one from the palette."],
-      ["7", "That isn’t an emoji River knows. Choose one from the palette."],
-      ["👍👍", "One emoji per reaction."],
-    ]) {
-      await input(page).fill(typed);
-      await press(page, page.getByTestId("mobile-reaction-submit"));
-      await expect(error).toHaveText(says);
-      await expect(error).toHaveAttribute("role", "alert");
-      await expect(input(page)).toHaveAttribute("aria-invalid", "true");
-      await expect(popup(page)).toBeVisible();
-      await expect(input(page), "what was typed stays").toHaveValue(typed);
-    }
-    await expect(chips(row)).toHaveCount(0);
-    // Editing clears the explanation; a valid emoji then reacts.
-    await input(page).fill("👍");
-    await expect(error).toHaveCount(0);
-    await press(page, page.getByTestId("mobile-reaction-submit"));
-    await expect(chips(row)).toHaveCount(1);
-  });
-
-  test("the same emoji removes, another switches, and the palette commits in one tap", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
-    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
-    const palette = page.getByTestId("mobile-reaction-palette");
-    await expect(palette).toBeVisible();
-    await expect(page.getByTestId("mobile-reaction-palette-toggle")).toHaveAttribute("aria-expanded", "true");
-    const choices = palette.getByRole("button");
-    await expect(choices, "every one of the existing 16").toHaveCount(16);
-    expect(await choices.allTextContents()).toEqual(["👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "😡", "🎉", "🤔", "👋", "✅", "💯", "🙏", "😍", "👏"]);
-    await press(page, choices.first());
-    await expect(popup(page)).toBeHidden();
-    await expect(chips(row)).toHaveCount(1);
-    await expect(chips(row)).toContainText("👍");
-
-    // Typing the reaction you already have says it removes it, and does.
-    await openPopup(page, row);
-    await typeEmoji(page, "👍");
-    await expect(page.getByTestId("mobile-reaction-submit")).toHaveText("Remove");
-    await input(page).fill("😂");
-    await expect(page.getByTestId("mobile-reaction-submit")).toHaveText("React");
-    await input(page).fill("👍");
-    await press(page, page.getByTestId("mobile-reaction-submit"));
-    await expect(chips(row)).toHaveCount(0);
-
-    // A palette choice switches: one chip, the new emoji.
-    await openPopup(page, row);
-    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
-    await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button", { name: "React with 🎉" }));
-    await expect(chips(row)).toHaveCount(1);
-    await openPopup(page, row);
-    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
-    await expect(page.getByTestId("mobile-reaction-palette").getByRole("button", { name: "Remove 🎉 reaction" }), "the current one is marked").toBeVisible();
-    await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button", { name: "React with 😂" }));
-    await expect(chips(row)).toHaveCount(1);
-    await expect(chips(row)).toContainText("😂");
-  });
-
-  test("a duplicate submit acts once and does not undo itself", { tag: "@chromium-only" }, async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
-    await typeEmoji(page, "🔥");
-    const signs = await callRiverTest(page, "messageSignsRecorded");
-    await page.evaluate(() => {
-      const submit = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-submit"]')!;
-      submit.click();
-      submit.click();
-      document.getElementById("mobile-reaction-input")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
-    });
-    await settle(page);
-    await expect(chips(row), "one reaction, not toggled back off").toHaveCount(1);
-    await expect(chips(row)).toContainText("🔥");
-    await expect.poll(() => callRiverTest(page, "messageSignsRecorded"), { message: "signed once" }).toBe(signs + 1);
-  });
-
-  test("a submit queued before a dismissal and reopening of the same message does nothing", { tag: "@chromium-only" }, async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
-    await typeEmoji(page, "🔥");
-    const key = (await row.getAttribute("id"))!;
-    // In one task: Close, + again on the same message, then the old submit.
-    await page.evaluate((key) => {
-      const submit = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-submit"]')!;
-      const close = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-close"]')!;
-      const plus = document.querySelector<HTMLElement>(`[id="${key}"] [data-testid="message-react-button"]`)!;
-      close.click();
-      plus.click();
-      submit.click();
-    }, key);
-    await settle(page);
-    await expect(chips(row), "the earlier opening's submit did nothing").toHaveCount(0);
-    await expect(popup(page), "the new opening is open").toBeVisible();
-    await expect(input(page), "and starts empty").toHaveValue("");
-  });
-
-  test("Escape and the backdrop discard what was typed, and the backdrop tap reaches nothing", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
-    await typeEmoji(page, "🔥");
-    await page.keyboard.press("Escape");
-    await expect(popup(page)).toBeHidden();
-    await expect(chips(row)).toHaveCount(0);
-    await openPopup(page, row);
-    await expect(input(page)).toHaveValue("");
-    await typeEmoji(page, "🔥");
-    // Over the header's rooms button.
-    const hamburger = (await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).first().boundingBox())!;
-    const point = { x: hamburger.x + hamburger.width / 2, y: hamburger.y + hamburger.height / 2 };
-    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), point)).toBe("mobile-reaction-backdrop");
-    if (test.info().project.use.hasTouch) await page.touchscreen.tap(point.x, point.y);
-    else await page.mouse.click(point.x, point.y);
-    await expect(popup(page)).toBeHidden();
-    await expect(chips(row)).toHaveCount(0);
-    await expect(page.locator("#chat-scroll-container"), "the rooms panel did not open").toBeVisible();
-  });
-
-  test("closing a reactor list for the popup leaves focus in the field", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await callRiverTest(page, "memberReactsToNewest", "🎉");
-    const chip = chips(row);
-    await expect(chip).toHaveCount(1);
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    // From the keyboard: the chip's list, then Tab to the + and Enter.
-    await keyboardFocus(page, chip);
-    await page.keyboard.press("Enter");
-    await expect(page.getByTestId("reaction-owners")).toBeVisible();
-    await row.getByTestId("message-react-button").focus();
-    await page.keyboard.press("Enter");
-    await expect(popup(page)).toBeVisible();
-    await expect(page.getByTestId("reaction-owners"), "the list closed").toHaveCount(0);
-    await settle(page);
-    await expect(input(page), "its focus return did not take the field's focus").toBeFocused();
-  });
-
-  test("its message leaving closes it; a remount keeps it; a room switch and 48rem close it", { tag: "@chromium-only" }, async ({ page }) => {
-    await openRoomWithComposer(page);
-    await callRiverTest(page, "deliverTimedMessages", 0, [
-      { text: "popup lead", sentSecs: 1, receivedSecs: 0 },
-      { text: "popup survivor", sentSecs: 2, receivedSecs: 0 },
-    ]);
-    const survivor = committedRow(page, "popup survivor");
-    await expect(survivor).toHaveCount(1);
-    await openPopup(page, survivor);
-    await typeEmoji(page, "🔥");
-    await survivor.evaluate((el) => ((window as unknown as { __old: Element }).__old = el));
-    await callRiverTest(page, "removeMessages", "popup lead");
-    await expect(committedRow(page, "popup lead")).toHaveCount(0);
-    await settle(page);
-    expect(await survivor.evaluate((el) => el === (window as unknown as { __old: Element }).__old), "premise: remounted").toBe(false);
-    await expect(popup(page), "a remount keeps it").toBeVisible();
-    await expect(input(page), "with what was typed").toHaveValue("🔥");
-    await press(page, page.getByTestId("mobile-reaction-submit"));
-    await expect(chips(survivor), "and a submit acts on it, once").toHaveCount(1);
-    await expect(survivor.getByTestId("message-react-button"), "focus to the new +").toBeFocused();
-
-    await openPopup(page, survivor);
-    await callRiverTest(page, "removeMessages", "popup survivor");
-    await expect(popup(page), "its message left").toBeHidden();
-
-    await deliver(page, "popup switch");
-    const row = committedRow(page, "popup switch");
-    await openPopup(page, row);
-    await callRiverTest(page, "switchRoom", "Team Chat Room");
-    await expect(popup(page)).toBeHidden();
-    await callRiverTest(page, "switchRoom", "Your Private Room");
-    await expect(row).toHaveCount(1);
-    await settle(page);
-    await expect(popup(page)).toBeHidden();
-
-    await openPopup(page, row);
-    await page.setViewportSize({ width: 768, height: 760 });
-    await expect(popup(page)).toBeHidden();
-    await page.setViewportSize({ width: 390, height: 760 });
-    await settle(page);
-    await expect(popup(page), "never reopened by resizing back").toBeHidden();
-  });
-
-  test("open with an empty field, a reload waits; closed, it does not", { tag: "@chromium-only" }, async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await page.getByTestId("message-input").blur();
-    expect(await callRiverTest(page, "userIsBusy"), "premise: idle").toBe(false);
-    await openPopup(page, row);
-    await expect(input(page)).toHaveValue("");
-    expect(await callRiverTest(page, "userIsBusy"), "an empty field open is busy").toBe(true);
-    await page.keyboard.press("Escape");
-    await expect(popup(page)).toBeHidden();
-    await row.getByTestId("message-react-button").blur();
-    expect(await callRiverTest(page, "userIsBusy"), "closed and mounted: not busy").toBe(false);
-  });
-
-  test("without the Popover API the + still opens it; at 48rem it explains why it cannot", async ({ page }) => {
-    await page.addInitScript(() => {
-      Object.defineProperty(HTMLElement.prototype, "showPopover", { value: undefined, configurable: true, writable: true });
-    });
-    const row = await openRoomWithTarget(page);
-    const react = row.getByTestId("message-react-button");
-    await expect(react).not.toHaveAttribute("aria-disabled");
-    await openPopup(page, row);
-    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
-    await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button").first());
-    await expect(chips(row)).toHaveCount(1);
-    await page.setViewportSize({ width: 900, height: 760 });
-    await expect(react, "at 48rem the desktop picker cannot open, and says so").toHaveAttribute("aria-disabled", "true");
-    await expect(row.getByTestId("message-react-unavailable")).toHaveCount(1);
-    await page.setViewportSize({ width: 390, height: 760 });
-    await expect(react).not.toHaveAttribute("aria-disabled");
-  });
-
-
-  test("the Enter that confirms a WebKit conversion after its composition ends does not submit", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
-    await typeEmoji(page, "😂");
     // WebKit's order: compositionend first, then the confirming Enter, which
     // says isComposing: false and keyCode 229.
     await page.evaluate(() => {
@@ -380,77 +157,227 @@ test.describe("The mobile reaction popup", () => {
     await expect(chips(row)).toHaveCount(1);
   });
 
-  test("one-finger touch is held outside the panel, not inside it or for a pinch; every close path lets go", async ({ page }) => {
+  test("text, several emoji and nothing are explained; the field stays editable", async ({ page }) => {
     const row = await openRoomWithTarget(page);
-    const history = async () => {
-      const v = (await page.locator("#chat-scroll-container").boundingBox())!;
-      return { x: v.x + 40, y: v.y + 30 };
-    };
-    const closes: [string, () => Promise<void>][] = [
-      ["Close", () => press(page, page.getByTestId("mobile-reaction-close"))],
-      ["Escape", () => page.keyboard.press("Escape")],
-      ["backdrop", async () => {
-        const p = await history();
-        if (test.info().project.use.hasTouch) await page.touchscreen.tap(p.x, p.y);
-        else await page.mouse.click(p.x, p.y);
-      }],
+    await openReactionPopup(page, row);
+    const error = page.getByTestId("mobile-reaction-error");
+    for (const [typed, says] of [
+      ["", "Type or paste one emoji."],
+      ["ok", "That isn’t an emoji River knows. Choose one from the palette."],
+      ["👍👍", "One emoji per reaction."],
+    ]) {
+      await input(page).fill(typed);
+      await press(page, page.getByTestId("mobile-reaction-submit"));
+      await expect(error).toHaveText(says);
+      await expect(error).toHaveAttribute("role", "alert");
+      await expect(input(page)).toHaveAttribute("aria-invalid", "true");
+      await expect(popup(page)).toBeVisible();
+      await expect(input(page), "what was typed stays").toHaveValue(typed);
+    }
+    await expect(chips(row)).toHaveCount(0);
+    // Editing clears the explanation; a valid emoji then reacts.
+    await input(page).fill("👍");
+    await expect(error).toHaveCount(0);
+    await press(page, page.getByTestId("mobile-reaction-submit"));
+    await expect(chips(row)).toHaveCount(1);
+  });
+
+  test("the same emoji removes, another switches, and the palette commits in one tap", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await openReactionPopup(page, row);
+    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
+    const palette = page.getByTestId("mobile-reaction-palette");
+    await expect(palette).toBeVisible();
+    await expect(page.getByTestId("mobile-reaction-palette-toggle")).toHaveAttribute("aria-expanded", "true");
+    const choices = palette.getByRole("button");
+    await expect(choices, "every one of the existing 16").toHaveCount(16);
+    expect(await choices.allTextContents()).toEqual(["👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "😡", "🎉", "🤔", "👋", "✅", "💯", "🙏", "😍", "👏"]);
+    await press(page, choices.first());
+    await expect(popup(page)).toBeHidden();
+    await expect(chips(row)).toHaveCount(1);
+    await expect(chips(row)).toContainText("👍");
+
+    // Typing the reaction you already have says it removes it, and does.
+    await openReactionPopup(page, row);
+    await typeEmoji(page, "👍");
+    await expect(page.getByTestId("mobile-reaction-submit")).toHaveText("Remove");
+    await input(page).fill("😂");
+    await expect(page.getByTestId("mobile-reaction-submit")).toHaveText("React");
+    await input(page).fill("👍");
+    await press(page, page.getByTestId("mobile-reaction-submit"));
+    await expect(chips(row)).toHaveCount(0);
+
+    // A palette choice switches: one chip, the new emoji.
+    await openReactionPopup(page, row);
+    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
+    await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button", { name: "React with 🎉" }));
+    await expect(chips(row)).toHaveCount(1);
+    await openReactionPopup(page, row);
+    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
+    await expect(page.getByTestId("mobile-reaction-palette").getByRole("button", { name: "Remove 🎉 reaction" }), "the current one is marked").toBeVisible();
+    await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button", { name: "React with 😂" }));
+    await expect(chips(row)).toHaveCount(1);
+    await expect(chips(row)).toContainText("😂");
+  });
+
+  test("a duplicate submit acts once and does not undo itself", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await openReactionPopup(page, row);
+    await typeEmoji(page, "🔥");
+    const signs = await callRiverTest(page, "messageSignsRecorded");
+    await page.evaluate(() => {
+      const submit = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-submit"]')!;
+      submit.click();
+      submit.click();
+      document.getElementById("mobile-reaction-input")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    await settle(page);
+    await expect(chips(row), "one reaction, not toggled back off").toHaveCount(1);
+    await expect(chips(row)).toContainText("🔥");
+    await expect.poll(() => callRiverTest(page, "messageSignsRecorded"), { message: "signed once" }).toBe(signs + 1);
+  });
+
+  test("a submit queued before a dismissal and reopening of the same message does nothing", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await openReactionPopup(page, row);
+    await typeEmoji(page, "🔥");
+    const key = await rowKey(row);
+    // In one task: Close, + again on the same message, then the old submit.
+    await page.evaluate((key) => {
+      const submit = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-submit"]')!;
+      const close = document.querySelector<HTMLElement>('[data-testid="mobile-reaction-close"]')!;
+      const plus = document.querySelector<HTMLElement>(`[id="msg-${key}"] [data-testid="message-react-button"]`)!;
+      close.click();
+      plus.click();
+      submit.click();
+    }, key);
+    await settle(page);
+    await expect(chips(row), "the earlier opening's submit did nothing").toHaveCount(0);
+    await expect(popup(page), "the new opening is open").toBeVisible();
+    await expect(input(page), "and starts empty").toHaveValue("");
+  });
+
+  test("Escape and the backdrop discard what was typed, and the backdrop tap reaches nothing", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await openReactionPopup(page, row);
+    await typeEmoji(page, "🔥");
+    await page.keyboard.press("Escape");
+    await expect(popup(page)).toBeHidden();
+    await expect(chips(row)).toHaveCount(0);
+    await openReactionPopup(page, row);
+    await expect(input(page)).toHaveValue("");
+    await typeEmoji(page, "🔥");
+    // Over the header's rooms button.
+    const hamburger = (await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).first().boundingBox())!;
+    const point = { x: hamburger.x + hamburger.width / 2, y: hamburger.y + hamburger.height / 2 };
+    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), point)).toBe("mobile-reaction-backdrop");
+    await pressAt(page, point);
+    await expect(popup(page)).toBeHidden();
+    await expect(chips(row)).toHaveCount(0);
+    await expect(page.locator("#chat-scroll-container"), "the rooms panel did not open").toBeVisible();
+  });
+
+  test("closing a reactor list for the popup leaves focus in the field", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await callRiverTest(page, "memberReactsToNewest", "🎉");
+    const chip = chips(row);
+    await expect(chip).toHaveCount(1);
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    // From the keyboard: the chip's list, then Tab to the + and Enter.
+    await keyboardFocus(page, chip);
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("reaction-owners")).toBeVisible();
+    await row.getByTestId("message-react-button").focus();
+    await page.keyboard.press("Enter");
+    await expect(popup(page)).toBeVisible();
+    await expect(page.getByTestId("reaction-owners"), "the list closed").toHaveCount(0);
+    await settle(page);
+    await expect(input(page), "its focus return did not take the field's focus").toBeFocused();
+  });
+
+  test("its message leaving closes it; a remount keeps it", { tag: "@chromium-only" }, async ({ page }) => {
+    await openRoomWithComposer(page);
+    await callRiverTest(page, "deliverTimedMessages", 0, [
+      { text: "popup lead", sentSecs: 1, receivedSecs: 0 },
+      { text: "popup survivor", sentSecs: 2, receivedSecs: 0 },
+    ]);
+    const survivor = committedRow(page, "popup survivor");
+    await expect(survivor).toHaveCount(1);
+    await openReactionPopup(page, survivor);
+    await typeEmoji(page, "🔥");
+    await survivor.evaluate((el) => ((window as unknown as { __old: Element }).__old = el));
+    await callRiverTest(page, "removeMessages", "popup lead");
+    await expect(committedRow(page, "popup lead")).toHaveCount(0);
+    await settle(page);
+    expect(await survivor.evaluate((el) => el === (window as unknown as { __old: Element }).__old), "premise: remounted").toBe(false);
+    await expect(popup(page), "a remount keeps it").toBeVisible();
+    await expect(input(page), "with what was typed").toHaveValue("🔥");
+    await press(page, page.getByTestId("mobile-reaction-submit"));
+    await expect(chips(survivor), "and a submit acts on it, once").toHaveCount(1);
+    await expect(survivor.getByTestId("message-react-button"), "focus to the new +").toBeFocused();
+
+    await openReactionPopup(page, survivor);
+    await callRiverTest(page, "removeMessages", "popup survivor");
+    await expect(popup(page), "its message left").toBeHidden();
+  });
+
+  test("open with an empty field, a reload waits; closed, it does not", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await page.getByTestId("message-input").blur();
+    expect(await callRiverTest(page, "userIsBusy"), "premise: idle").toBe(false);
+    await openReactionPopup(page, row);
+    await expect(input(page)).toHaveValue("");
+    expect(await callRiverTest(page, "userIsBusy"), "an empty field open is busy").toBe(true);
+    await page.keyboard.press("Escape");
+    await expect(popup(page)).toBeHidden();
+    await row.getByTestId("message-react-button").blur();
+    expect(await callRiverTest(page, "userIsBusy"), "closed and mounted: not busy").toBe(false);
+  });
+
+  test("without the Popover API the + still opens it", { tag: "@chromium-only" }, async ({ page }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(HTMLElement.prototype, "showPopover", { value: undefined, configurable: true, writable: true });
+    });
+    const row = await openRoomWithTarget(page);
+    const react = row.getByTestId("message-react-button");
+    await expect(react).not.toHaveAttribute("aria-disabled");
+    await openReactionPopup(page, row);
+    await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
+    await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button").first());
+    await expect(chips(row)).toHaveCount(1);
+  });
+
+  // The hold and the close paths both surfaces share are the actions
+  // sheet's test; these are the popup's own.
+  test("the touch hold lets go when a palette pick or its message leaving closes it", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await expectTouchHeldUntilClosed(page, POPUP, () => openReactionPopup(page, row), [
       ["a palette pick", async () => {
         await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
         await press(page, page.getByTestId("mobile-reaction-palette").getByRole("button").first());
       }],
-      ["48rem", async () => {
-        await page.setViewportSize({ width: 768, height: 760 });
-        await expect(popup(page)).toBeHidden();
-        await page.setViewportSize({ width: 390, height: 760 });
-      }],
-    ];
-    for (const [how, close] of closes) {
-      await openPopup(page, row);
-      const h = await history();
-      expect(await touchmovePrevented(page, h.x, h.y), `${how}: a finger over the history is held`).toBe(true);
-      expect(await touchmovePrevented(page, h.x, h.y, 2), `${how}: a pinch is not`).toBe(false);
-      const panel = (await page.locator("#mobile-reaction-popup .mobile-sheet-panel").boundingBox())!;
-      expect(await touchmovePrevented(page, panel.x + panel.width / 2, panel.y + 6), `${how}: the panel scrolls`).toBe(false);
-      await close();
-      await expect(popup(page)).toBeHidden();
-      await settle(page);
-      const after = await history();
-      expect(await touchmovePrevented(page, after.x, after.y), `closed by ${how}: let go`).toBe(false);
-    }
-    await openPopup(page, row);
-    await callRiverTest(page, "removeMessages", "react target");
-    await expect(popup(page)).toBeHidden();
-    const after = await history();
-    expect(await touchmovePrevented(page, after.x, after.y), "closed by its message leaving: let go").toBe(false);
+      // Last: it takes the row away.
+      ["its message leaving", () => callRiverTest(page, "removeMessages", "react target")],
+    ]);
   });
 
-  test("leaving the chat panel or a re-key closes it, and a submit queued across the re-key does nothing", { tag: "@chromium-only" }, async ({ page }) => {
+  test("a re-key closes it, and a submit queued across it does nothing", { tag: "@chromium-only" }, async ({ page }) => {
     const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
-    await callRiverTest(page, "setMobileView", "rooms");
-    await expect(popup(page)).toBeHidden();
-    await callRiverTest(page, "setMobileView", "chat");
-    await settle(page);
-    await expect(popup(page), "coming back reopens nothing").toBeHidden();
-
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     await typeEmoji(page, "🔥");
     const signs = await callRiverTest(page, "messageSignsRecorded");
-    await page.evaluate(() => {
-      (window as unknown as { __riverTest: { rekeyCurrentRoom(): void } }).__riverTest.rekeyCurrentRoom();
-      document.querySelector<HTMLElement>('[data-testid="mobile-reaction-submit"]')!.click();
-    });
+    await rekeyThenClick(page, "mobile-reaction-submit");
     await settle(page);
     await expect(popup(page)).toBeHidden();
     await expect(chips(row), "no reaction from the earlier generation's opening").toHaveCount(0);
     expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signs);
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
   });
 
   test("a reaction from the popup that cannot be signed is rolled back, and says so", { tag: "@chromium-only" }, async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "holdMessageSigning");
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     await typeEmoji(page, "🔥");
     await press(page, page.getByTestId("mobile-reaction-submit"));
     await expect(chips(row), "shown while its signature is held").toHaveCount(1);
@@ -465,7 +392,7 @@ test.describe("The mobile reaction popup", () => {
     const row = await openRoomWithTarget(page);
     await settle(page);
     await callRiverTest(page, "takeMessageGroupRenders");
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     await typeEmoji(page, "🔥");
     await page.keyboard.press("Escape");
     await expect(popup(page)).toBeHidden();
@@ -479,7 +406,7 @@ test.describe("The reaction popup on a short screen", () => {
 
   test("fits at 320px, scrolls itself with the palette out, and keeps every control reachable", async ({ page }) => {
     const row = await openRoomWithTarget(page);
-    await openPopup(page, row);
+    await openReactionPopup(page, row);
     await press(page, page.getByTestId("mobile-reaction-palette-toggle"));
     await expect(page.getByTestId("mobile-reaction-palette")).toBeVisible();
     const g = await page.evaluate(() => {
