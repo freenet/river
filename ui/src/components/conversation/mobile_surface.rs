@@ -39,15 +39,14 @@
 //! hold and reads go on underneath (history-scrolling.md); opening or closing
 //! one never moves the history.
 //!
-//! Dismissal. Escape, Close (the actions sheet) and a tap on the backdrop
-//! dismiss. The reaction popup ([`MobileSurface::drags_to_dismiss`]) slides
-//! away instead of vanishing on a tap outside, and a downward drag starting
-//! anywhere on it drags its panel and dismisses it once far or fast enough
-//! (`mobile_sheet_drag.rs`).
+//! Dismissal. Neither has a title or Close button: their title is the
+//! dialog's accessible name. A tap outside slides the panel away, and a
+//! downward drag starting anywhere on the screen drags it and dismisses it
+//! once far or fast enough (`mobile_sheet_drag.rs`). Escape and a choice
+//! (an emoji, an action) close it at once.
 
 use super::reaction_picker::{shown_room, ReactionSurfaces};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
-use crate::components::icons::{line_icon, CLOSE_ICON_PATH};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractKey;
@@ -81,7 +80,7 @@ impl MobileSurface {
         }
     }
 
-    /// What its frame's test ids and title id start with.
+    /// What its frame's test ids start with.
     fn prefix(self) -> &'static str {
         match self {
             Self::Actions => "mobile-message-actions",
@@ -89,25 +88,12 @@ impl MobileSurface {
         }
     }
 
+    /// Its dialog's accessible name.
     fn title(self) -> &'static str {
         match self {
             Self::Actions => "Message actions",
             Self::Reaction => "React to message",
         }
-    }
-
-    /// Whether its panel shows the title and a Close button. The reaction
-    /// popup does not: a tap outside it (or Escape) dismisses it, and the
-    /// title is only its accessible name.
-    fn has_header(self) -> bool {
-        self == Self::Actions
-    }
-
-    /// Whether a downward drag anywhere on it slides it away and closes it,
-    /// and a tap outside slides it away too (`mobile_sheet_drag.rs`). The
-    /// actions sheet does not: its actions sit where a drag would start.
-    pub(super) fn drags_to_dismiss(self) -> bool {
-        self == Self::Reaction
     }
 
     /// The row's control this surface opens from, and returns focus to.
@@ -282,18 +268,6 @@ impl ReactionSurfaces {
         let mut slot = self.mobile;
         // A statement, so the write guard drops before `slot` does.
         let _ = slot.try_write().map(|mut slot| *slot = None);
-    }
-
-    /// Dismiss `surface` (Close, the backdrop), from its handler: it closes,
-    /// focus back on its control, unless an opening other than the one open
-    /// now has replaced it by then. A press not yet committed is closed too.
-    pub(super) fn dismiss_mobile(self, surface: MobileSurface) {
-        let token = self.mobile_token(surface);
-        crate::util::defer(move || {
-            if token.is_none_or(|t| self.mobile_opening_for(surface, t).is_some()) {
-                self.close_mobile(true);
-            }
-        });
     }
 
     /// Close `surface`'s opening `token`, focus back on its control, if it is
@@ -474,7 +448,9 @@ pub(super) fn use_show_on_open(
         };
         let first_run = shown_token.replace(token) != token;
         let id = surface.dialog_id();
-        if first_run && !dom::dialog_open(id) {
+        // A new opening starts at rest, even in a dialog still open: one
+        // still sliding away from an earlier opening comes back.
+        if first_run {
             super::mobile_sheet_drag::reset(id);
         }
         if first_run && !dom::dialog_open(id) && dom::show_dialog(id) {
@@ -484,10 +460,10 @@ pub(super) fn use_show_on_open(
 }
 
 /// The modal dialog both mobile surfaces are drawn in: the dialog (its own
-/// `close` event brings the state in line, and Tab stays inside), the
-/// backdrop (dismisses), and the panel with its handle and, for the actions
-/// sheet, a header with its title and Close (also dismisses). Each surface
-/// renders only its body, as `children`, after that.
+/// `close` event brings the state in line, Tab stays inside, and a downward
+/// drag anywhere on it dismisses it), the backdrop (a tap slides it away),
+/// and the panel with its handle. Each surface renders only its body, as
+/// `children`, after the handle.
 #[component]
 pub(super) fn MobileDialogFrame(
     surfaces: ReactionSurfaces,
@@ -497,7 +473,6 @@ pub(super) fn MobileDialogFrame(
     children: Element,
 ) -> Element {
     let (id, prefix, title) = (surface.dialog_id(), surface.prefix(), surface.title());
-    let (header, drag) = (surface.has_header(), surface.drags_to_dismiss());
     // Infallible, deliberately: `Conversation`'s own `use_signal`, written
     // only from deferred callbacks. The drag reads it from the DOM, so a
     // slide away closes only the opening it began on.
@@ -526,9 +501,8 @@ pub(super) fn MobileDialogFrame(
         dialog {
             id: "{id}",
             "data-testid": "{id}",
-            class: if drag { "mobile-sheet mobile-sheet--drag" } else { "mobile-sheet" },
-            "aria-labelledby": if header { "{prefix}-title" },
-            "aria-label": if !header { "{title}" },
+            class: "mobile-sheet",
+            "aria-label": "{title}",
             "data-target-row": "{target_row}",
             "data-opening": "{token}",
             onmounted: move |_| {
@@ -538,10 +512,8 @@ pub(super) fn MobileDialogFrame(
                         crate::util::defer(move || surfaces.mobile_dialog_closed(surface));
                     });
                     *close_listener.borrow_mut() = listener;
-                    if drag {
-                        *drag_listeners.borrow_mut() =
-                            super::mobile_sheet_drag::install(id, surface, surfaces);
-                    }
+                    *drag_listeners.borrow_mut() =
+                        super::mobile_sheet_drag::install(id, surface, surfaces);
                 }
             },
             onkeydown: move |e: KeyboardEvent| {
@@ -555,30 +527,10 @@ pub(super) fn MobileDialogFrame(
             div {
                 "data-testid": "{prefix}-backdrop",
                 class: "mobile-sheet-backdrop",
-                onclick: move |_| {
-                    if drag {
-                        super::mobile_sheet_drag::animate_out(id, surface, surfaces);
-                    } else {
-                        surfaces.dismiss_mobile(surface);
-                    }
-                },
+                onclick: move |_| super::mobile_sheet_drag::animate_out(id, surface, surfaces),
             }
             div { class: "mobile-sheet-panel",
                 div { class: "mobile-sheet-handle", "aria-hidden": "true" }
-                if header {
-                    div { class: "mobile-sheet-header",
-                        h2 { id: "{prefix}-title", class: "mobile-sheet-title", "{title}" }
-                        button {
-                            r#type: "button",
-                            "data-testid": "{prefix}-close",
-                            class: "mobile-sheet-close",
-                            "aria-label": "Close",
-                            title: "Close",
-                            onclick: move |_| surfaces.dismiss_mobile(surface),
-                            {line_icon(CLOSE_ICON_PATH, 18)}
-                        }
-                    }
-                }
                 {children}
             }
         }

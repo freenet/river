@@ -1,8 +1,8 @@
-//! Dragging a mobile surface down to dismiss it (the reaction popup:
-//! [`super::mobile_surface::MobileSurface::drags_to_dismiss`]).
+//! Dragging a mobile surface (the actions sheet, the reaction popup) down to
+//! dismiss it.
 //!
 //! A pointer that goes down anywhere in the open dialog (the backdrop, the
-//! panel, an emoji) and then moves further down than sideways drags the panel
+//! panel, an action, an emoji) and then moves further down than sideways drags the panel
 //! with it, by the distance moved, and fades the dim behind it. Released far
 //! enough or fast enough ([`release`]) the panel slides away and the surface
 //! closes; otherwise it springs back. Upward it gives a little and springs
@@ -11,7 +11,7 @@
 //! (a pinch) cancels the drag, and the zoom goes ahead.
 //!
 //! A tap outside slides the panel away the same way ([`animate_out`]); Escape
-//! and an emoji close it at once. With `prefers-reduced-motion: reduce`
+//! and a choice (an emoji, an action) close it at once. With `prefers-reduced-motion: reduce`
 //! nothing slides: a dismissal closes at once.
 //!
 //! The listeners touch only the DOM and the thread-locals here. The one state
@@ -465,14 +465,13 @@ mod dom {
     }
 }
 
-/// Native builds have no DOM: a dismissal closes at once.
+/// Native builds have no DOM, and so no dialog to dismiss.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn animate_out(
     _id: &str,
-    surface: super::mobile_surface::MobileSurface,
-    surfaces: super::reaction_picker::ReactionSurfaces,
+    _surface: super::mobile_surface::MobileSurface,
+    _surfaces: super::reaction_picker::ReactionSurfaces,
 ) {
-    surfaces.dismiss_mobile(surface);
 }
 
 #[cfg(not(target_arch = "wasm32"))]

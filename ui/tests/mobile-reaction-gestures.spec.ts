@@ -2,6 +2,7 @@ import { test, expect, Locator, Page } from "@playwright/test";
 import {
   committedRow,
   historyPoint,
+  openMessageActions,
   openReactionPopup,
   openRoomWithComposer,
   panelAtRest,
@@ -14,7 +15,9 @@ import {
 import { deliver } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
-// The mobile reaction popup's gestures (mobile_sheet_drag.rs): its emoji row
+// The mobile surfaces' gestures (mobile_sheet_drag.rs), mostly through the
+// reaction popup; the actions sheet shares them (its own block at the end).
+// The popup's emoji row
 // scrolls sideways with no scroll bar, a downward drag that starts anywhere
 // on the screen drags the panel and dismisses it once far or fast enough
 // (else it springs back), and a tap outside slides it away. Real touch
@@ -89,7 +92,7 @@ test("a tap outside slides it away and closes it; reopened, it is at rest", asyn
   await openReactionPopup(page, row);
   await panelAtRest(page, POPUP);
   expect(await panelOffset(page, POPUP)).toBe(0);
-  expect(await popup(page).evaluate((d) => [d.className, (d as HTMLElement).style.getPropertyValue("--sheet-shade")])).toEqual(["mobile-sheet mobile-sheet--drag", ""]);
+  expect(await popup(page).evaluate((d) => [d.className, (d as HTMLElement).style.getPropertyValue("--sheet-shade")])).toEqual(["mobile-sheet", ""]);
 });
 
 test("with reduced motion it opens and closes without sliding", { tag: "@chromium-only" }, async ({ page }) => {
@@ -275,5 +278,61 @@ test.describe("A finger on the reaction popup", () => {
     expect(await palette(page).evaluate((el) => el.scrollLeft), "the row scrolled").toBeGreaterThan(50);
     expect(await panelOffset(page, POPUP)).toBe(0);
     await expect(popup(page)).toBeVisible();
+  });
+});
+
+test.describe("The actions sheet's gestures", () => {
+  const SHEET = "mobile-message-actions-sheet";
+
+  /// A received message, its actions sheet open and at rest.
+  async function openSheet(page: Page): Promise<Locator> {
+    await openRoomWithComposer(page);
+    await deliver(page, "act target");
+    const row = committedRow(page, "act target");
+    await expect(row).toHaveCount(1);
+    await openMessageActions(page, row);
+    await panelAtRest(page, SHEET);
+    return row;
+  }
+
+  test("it has no title or Close, and a tap outside slides it away", async ({ page }) => {
+    const row = await openSheet(page);
+    const sheet = page.getByTestId(SHEET);
+    await expect(sheet).toHaveAccessibleName("Message actions");
+    await expect(sheet.getByRole("heading")).toHaveCount(0);
+    await expect(page.getByTestId("mobile-message-actions-close")).toHaveCount(0);
+    await pressAt(page, await historyPoint(page));
+    await expect(sheet).toBeHidden();
+    await expect(row.getByTestId("mobile-message-actions-entry"), "focus back on the entry").toBeFocused();
+  });
+
+  test.describe("with a finger", () => {
+    test.skip(({ browserName }) => browserName !== "chromium", "real touch input needs Chromium's input protocol");
+
+    test("a drag down from the handle closes it; a slow short one springs back", async ({ page }) => {
+      await openSheet(page);
+      const box = (await page.locator(`#${SHEET} .mobile-sheet-handle`).boundingBox())!;
+      const [x, y] = [Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2)];
+      await withFingers(page, async (fingers) => {
+        await fingers.press([1, x, y]);
+        await fingers.move({ 1: [0, 30] }, 20);
+        await fingers.lift();
+      });
+      await panelAtRest(page, SHEET);
+      expect(await panelOffset(page, SHEET), "sprung back").toBe(0);
+      await expect(page.getByTestId(SHEET)).toBeVisible();
+      await withFingers(page, (fingers) => fingers.drag(x, y, 150));
+      await expect(page.getByTestId(SHEET)).toBeHidden();
+    });
+
+    test("a drag down that starts on Reply closes it without replying", async ({ page }) => {
+      await openSheet(page);
+      const box = (await page.getByTestId("mobile-message-action-reply").boundingBox())!;
+      const [x, y] = [Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2)];
+      await withFingers(page, (fingers) => fingers.drag(x, y, 150));
+      await expect(page.getByTestId(SHEET)).toBeHidden();
+      await settle(page);
+      await expect(page.getByTestId("message-composer"), "no reply began").not.toContainText("Replying to");
+    });
   });
 });

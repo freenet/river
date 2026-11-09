@@ -143,7 +143,9 @@ test.describe("Below 48rem", () => {
     for (const [row, expected] of rows) {
       await openMessageActions(page, row);
       const s = sheet(page);
-      await expect(s.getByRole("heading", { name: "Message actions" })).toBeVisible();
+      await expect(s, "named, though it shows no title").toHaveAccessibleName("Message actions");
+      await expect(s.getByRole("heading"), "no title").toHaveCount(0);
+      await expect(page.getByTestId("mobile-message-actions-close"), "no Close: a tap outside dismisses it").toHaveCount(0);
       const actions = await s.locator(".mobile-sheet-actions button").evaluateAll((bs) =>
         bs.map((b) => b.getAttribute("data-testid")!.replace("mobile-message-action-", "")),
       );
@@ -156,9 +158,9 @@ test.describe("Below 48rem", () => {
       await expect(row.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "true");
       // Not the keyboard: a button has focus.
       await expect(s.getByTestId("mobile-message-action-reply")).toBeFocused();
-      // Close returns focus to the row's entry, without scrolling.
+      // A tap outside returns focus to the row's entry, without scrolling.
       const before = (await scrollMetrics(page)).top;
-      await press(page, s.getByTestId("mobile-message-actions-close"));
+      await pressAt(page, await historyPoint(page));
       await expect(s).toBeHidden();
       await expect(row.getByTestId("mobile-message-actions-entry")).toBeFocused();
       await expect(row.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "false");
@@ -288,12 +290,11 @@ test.describe("Below 48rem", () => {
     await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(own));
     const reply = page.getByTestId("mobile-message-action-reply");
     const del = page.getByTestId("mobile-message-action-delete");
-    const close = page.getByTestId("mobile-message-actions-close");
     await expect(reply).toBeFocused();
-    // Tab order: Close, Reply, Edit, Delete; wrapping both ways.
+    // Tab order: Reply, Edit, Delete; wrapping both ways.
     await del.focus();
     await page.keyboard.press(tab);
-    await expect(close, "Tab from the last control wraps to the first").toBeFocused();
+    await expect(reply, "Tab from the last control wraps to the first").toBeFocused();
     await page.keyboard.press(backTab);
     await expect(del, "Shift+Tab from the first wraps to the last").toBeFocused();
     expect(await page.locator("dialog[open]").count()).toBe(1);
@@ -456,9 +457,9 @@ test.describe("Below 48rem", () => {
     const receivedKey = await rowKey(received);
     await page.evaluate((receivedKey) => {
       const reply = document.querySelector<HTMLElement>('[data-testid="mobile-message-action-reply"]')!;
-      const close = document.querySelector<HTMLElement>('[data-testid="mobile-message-actions-close"]')!;
+      const backdrop = document.querySelector<HTMLElement>('[data-testid="mobile-message-actions-backdrop"]')!;
       const entry = document.querySelector<HTMLElement>(`[id="msg-${receivedKey}"] [data-testid="mobile-message-actions-entry"]`)!;
-      close.click();
+      backdrop.click();
       entry.click();
       reply.click();
     }, receivedKey);
@@ -503,7 +504,6 @@ test.describe("Below 48rem", () => {
   test("one-finger touch is held outside the panel, not inside it or for a pinch; every close path lets go", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
     await expectTouchHeldUntilClosed(page, SHEET, () => openMessageActions(page, own), [
-      ["Close", () => press(page, page.getByTestId("mobile-message-actions-close"))],
       ["Escape", () => page.keyboard.press("Escape")],
       ["backdrop", async () => pressAt(page, await historyPoint(page))],
       ["48rem", async () => {
@@ -760,7 +760,7 @@ test.describe("Inside the gateway's sandboxed frame", () => {
     await expect(s).toHaveAttribute("data-target-row", await rowKey(row));
     const panel = await s.locator(".mobile-sheet-panel").boundingBox();
     expect(panel!.y + panel!.height, "bottom-aligned in the frame").toBeGreaterThan(740);
-    await frame.getByTestId("mobile-message-actions-close").click();
+    await frame.getByTestId("mobile-message-actions-backdrop").click({ position: { x: 40, y: 120 } });
     await expect(s).toBeHidden();
     await row.getByTestId("message-react-button").click();
     await expect(frame.getByTestId(POPUP)).toBeVisible();
