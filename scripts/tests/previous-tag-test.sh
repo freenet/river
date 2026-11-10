@@ -27,10 +27,16 @@ for t in v0.1.51 riverctl-v0.2.9 riverctl-v0.2.10 riverctl-v0.2.25 \
 done
 
 expect() { # <prefix> <tag> <expected previous, or empty>
-    local got
+    local got rc
     got="$(cd "$repo" && "$script" "$1" "$2")"
+    rc=$?
     checks=$((checks + 1))
-    if [[ "$got" == "$3" ]]; then
+    # The exit status is checked too: an empty expectation must not pass because
+    # the script crashed and printed nothing.
+    if [[ $rc -ne 0 ]]; then
+        failures=$((failures + 1))
+        printf 'FAIL %s -> script exited %d\n' "$2" "$rc"
+    elif [[ "$got" == "$3" ]]; then
         printf 'ok   %s -> %s\n' "$2" "${3:-<none>}"
     else
         failures=$((failures + 1))
@@ -46,6 +52,7 @@ expect river-desktop-v river-desktop-v0.2.0-rc.1 river-desktop-v0.1.0
 expect river-desktop-v river-desktop-v0.2.0-rc.2 river-desktop-v0.2.0-rc.1
 expect river-desktop-v river-desktop-v0.2.0 river-desktop-v0.2.0-rc.2   # rc before release
 expect river-desktop-v river-desktop-v0.10.0 river-desktop-v0.2.0
+expect river-desktop-v river-desktop-v9.9.9 ""             # tag not in the list
 
 printf '\n%d checks, %d failed\n' "$checks" "$failures"
 [[ $failures -eq 0 ]]

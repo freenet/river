@@ -2,6 +2,7 @@
 # Refuse to release the desktop app from a commit that should not ship.
 #
 #   verify-release.sh <tag> <commit>
+#   verify-release.sh --version-only <commit>   prints version=<apps/Cargo.toml version>
 #
 # Checks, against the git history (origin/main must be fetched; MAIN_REF overrides it):
 #
@@ -34,7 +35,7 @@
 
 set -euo pipefail
 
-TAG="${1:?usage: verify-release.sh <tag> <commit>}"
+TAG="${1:?usage: verify-release.sh <tag> <commit> | --version-only <commit>}"
 COMMIT="${2:?commit required}"
 MAIN_REF="${MAIN_REF:-origin/main}"
 B3SUM="${B3SUM:-b3sum}"
@@ -47,20 +48,31 @@ fail() { echo "::error::$*" >&2; exit 1; }
 
 COMMIT="$(git rev-parse --verify "$COMMIT^{commit}")" || fail "Commit '$2' not found."
 
+# The [workspace.package] version in apps/Cargo.toml at $COMMIT. Plain awk rather than a
+# TOML library: this also runs in CI on runners whose python3 predates tomllib
+# (scripts/tests/verify-release-test.sh), and the workflow reads the version through
+# --version-only so there is one parser.
+cargo_version() {
+    git show "$COMMIT:apps/Cargo.toml" | awk '
+        /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[workspace\.package\][[:space:]]*$/); next }
+        in_pkg && /^[[:space:]]*version[[:space:]]*=/ {
+            sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
+        }'
+}
+cargo_version="$(cargo_version)" || fail "apps/Cargo.toml not readable at $COMMIT."
+[[ -n "$cargo_version" ]] || fail "No [workspace.package] version in apps/Cargo.toml at $COMMIT."
+
+if [[ "$TAG" == "--version-only" ]]; then
+    echo "version=$cargo_version"
+    exit 0
+fi
+
 # 1. Tag and version.
 [[ "$TAG" == river-desktop-v* ]] || fail "Tag '$TAG' is not of the form river-desktop-v<version>."
 tag_version="${TAG#river-desktop-v}"
 semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
 [[ "$tag_version" =~ $semver ]] || fail "Tag '$TAG' does not end in a semver version."
 
-# Plain awk rather than a TOML library: this also runs in CI on runners whose python3
-# predates tomllib (scripts/tests/verify-release-test.sh).
-cargo_version="$(git show "$COMMIT:apps/Cargo.toml" | awk '
-    /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[workspace\.package\][[:space:]]*$/); next }
-    in_pkg && /^[[:space:]]*version[[:space:]]*=/ {
-        sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
-    }')"
-[[ -n "$cargo_version" ]] || fail "No [workspace.package] version in apps/Cargo.toml at $COMMIT."
 echo "tag version:           $tag_version" >&2
 echo "apps/Cargo.toml:       $cargo_version" >&2
 [[ "$tag_version" == "$cargo_version" ]] \
@@ -107,6 +119,8 @@ record_hash() {
 }
 check_hash() {
     local path="$1" actual expected
+    # Checked first: piping a failed `git show` into the hasher would hash empty input.
+    git cat-file -e "$COMMIT:$path" 2>/dev/null || fail "$path does not exist at $COMMIT."
     actual="$(git show "$COMMIT:$path" | "$B3SUM" --no-names | tr -d '[:space:]')"
     [[ -n "$actual" ]] || fail "Could not hash $path."
     expected="$(record_hash "$path")" || fail "pointer-records.toml has no single record with a code_hash for $path."

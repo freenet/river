@@ -301,30 +301,41 @@ signed and notarized universal macOS `River.app` (zipped), a signed Windows
 x86_64 zip, and `SHA256SUMS.txt`. The workflow creates the release as a
 **draft**; a maintainer publishes it.
 
-Prerequisites before the first release (repository settings, admin only): a
-tag ruleset that restricts creating `river-desktop-v*` tags to admins, and a
-deployment policy on the `release` environment that allows only
-`river-desktop-v*` tags. A pushed tag runs the workflow file at the tagged
-commit, so without the ruleset anyone who can push a tag chooses which checks
-run. Both sign jobs use the one `release` environment, so a required-reviewer
-rule on it asks for approval twice per release.
+Setup before the first release (repository admin), in this order:
 
-1. Raise `MIN_INSTALL_VERSION` (above) to the current Freenet release. This is
-   a manual step: check the latest freenet-core release first.
-2. Merge a PR that bumps `[workspace.package] version` in `apps/Cargo.toml`.
-3. `git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>`
-4. Download the draft's assets, check them against `SHA256SUMS.txt`, and run
+1. Create the `release` environment.
+2. Give it a deployment policy that allows only `river-desktop-v*` tags.
+3. Add a tag ruleset that restricts creating `river-desktop-v*` tags to admins.
+4. Only then add the signing secrets (listed below) to the environment.
+
+The `if: github.event_name == 'push'` conditions on the sign and release jobs
+are not a security boundary: every branch and tag runs its own copy of the
+workflow file, so whoever can push one can remove them. The environment's
+deployment policy, which GitHub enforces outside the file, is what keeps the
+signing secrets to `river-desktop-v*` tags, and the ruleset decides who can
+create those. Both sign jobs use the one `release` environment, so a
+required-reviewer rule on it asks for approval twice per release.
+
+Each release:
+
+1. In one PR, raise `MIN_INSTALL_VERSION` (above) to the current Freenet
+   release (check the latest freenet-core release; nothing automates this) and
+   bump `[workspace.package] version` in `apps/Cargo.toml`. Merge it.
+2. `git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>`
+3. Download the draft's assets, check them against `SHA256SUMS.txt`, and run
    them on a real Mac and a real Windows PC (install Freenet, approve the
-   grant, see rooms, send a message). Then publish the draft. 0.x versions are
-   prereleases. Every desktop release, including from 1.0, is created with
-   `--latest=false`, because riverctl releases hold the repo's "Latest" badge;
-   leave "Set as the latest release" unticked when publishing.
+   grant, see rooms, send a message).
+4. Publish the draft with "Set as the latest release" unticked (from the
+   command line: `gh release edit <tag> --draft=false --latest=false`; through
+   the API: `make_latest=false`). The workflow cannot enforce this. Every
+   desktop release, including from 1.0, stays off "Latest" because riverctl
+   releases hold the repo's "Latest" badge. 0.x versions are prereleases.
 
-To rehearse without signing or releasing, run the workflow by hand
-(`workflow_dispatch`) on any branch: a DRY RUN that runs every `verify` check
-except "the commit is on main", builds, packages and writes the notes header.
-The signing jobs have no rehearsal path other than a real tag; the draft is
-what makes a first run safe.
+To rehearse, run the workflow by hand (`workflow_dispatch`) on any branch. This
+DRY RUN runs every `verify` check except "the commit is on main", builds,
+packages and writes the notes header. It does not exercise the secrets check,
+signing, or the draft-release logic: those have no rehearsal path other than a
+real tag, and the draft is what makes a first run safe.
 
 The workflow's `verify` job (`apps/desktop/packaging/verify-release.sh`,
 tested by `scripts/tests/verify-release-test.sh` in `build.yml`) refuses the

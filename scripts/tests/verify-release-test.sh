@@ -9,10 +9,10 @@
 # AND the gate's own message for that check, so deleting or weakening any one
 # check makes its case fail here instead of passing silently.
 #
-# Builds a throwaway git repository with the files the gate reads. Needs git
-# and python3 (3.11+, for tomllib); the BLAKE3 hasher is replaced by a SHA-256
-# stand-in through the gate's B3SUM override, since what is tested is the
-# comparison, not the hash function.
+# Builds a throwaway git repository with the files the gate reads. Needs git,
+# awk and sha256sum; the BLAKE3 hasher is replaced by a SHA-256 stand-in through
+# the gate's B3SUM override, since what is tested is the comparison, not the
+# hash function.
 #
 # Run: ./scripts/tests/verify-release-test.sh
 
@@ -194,6 +194,73 @@ echo 11 > "$repo/published-contract/contract-version.txt"
 c_norec="$(commit 'chore(publish): bump webapp contract version to 11 (#5)')"
 run river-desktop-v0.1.0 "$c_norec"
 expect_refusal "refuses when a WASM has no pointer record" "has no single record with a code_hash for ui/public/contracts/chat_delegate.wasm"
+
+# records_case <name> <expected message>: pointer-records.toml comes from stdin, the
+# WASM stays delegate-v2 / contract-v1, and the commit is made the latest publish so
+# only the pointer-record check can refuse it.
+version=11
+records_case() {
+    write_state 0.1.0 delegate-v2 contract-v1
+    cat > "$repo/pointer-records.toml"
+    commit "chore: $1" >/dev/null
+    version=$((version + 1))
+    echo "$version" > "$repo/published-contract/contract-version.txt"
+    local rev
+    rev="$(commit "chore(publish): bump webapp contract version to $version")"
+    run river-desktop-v0.1.0 "$rev"
+    expect_refusal "refuses: $1" "$2"
+}
+d2="$(hash_of delegate-v2)"
+c1="$(hash_of contract-v1)"
+D=ui/public/contracts/chat_delegate.wasm
+C=ui/public/contracts/room_contract.wasm
+
+records_case "two records for one WASM" "has no single record with a code_hash for $D" <<EOF
+[[record]]
+wasm_path = "$C"
+code_hash = "$c1"
+[[record]]
+wasm_path = "$D"
+code_hash = "$d2"
+[[record]]
+wasm_path = "$D"
+code_hash = "$d2"
+EOF
+
+records_case "a record without a code_hash" "has no single record with a code_hash for $D" <<EOF
+[[record]]
+wasm_path = "$C"
+code_hash = "$c1"
+[[record]]
+wasm_path = "$D"
+EOF
+
+records_case "the delegate hash differs from its record" "BLAKE3 of $D" <<EOF
+[[record]]
+wasm_path = "$C"
+code_hash = "$c1"
+[[record]]
+wasm_path = "$D"
+code_hash = "$(hash_of delegate-OTHER)"
+EOF
+
+# A WASM missing from the tree is reported as missing, not hashed as empty input.
+write_state 0.1.0 delegate-v2 contract-v1
+g rm -q "$D"
+commit 'chore: no delegate WASM' >/dev/null
+version=$((version + 1))
+echo "$version" > "$repo/published-contract/contract-version.txt"
+c_nowasm="$(commit "chore(publish): bump webapp contract version to $version")"
+run river-desktop-v0.1.0 "$c_nowasm"
+expect_refusal "refuses when a WASM file is missing" "$D does not exist at"
+
+# --version-only, which the workflow uses on pull requests and dry runs.
+run --version-only "$c_ok"
+if [[ $rc -eq 0 && "$out" == "version=0.1.0" ]]; then
+    ok "--version-only prints the apps/Cargo.toml version"
+else
+    fail "--version-only prints the apps/Cargo.toml version" "exit $rc" "$out" "$err"
+fi
 
 printf '\n%d checks, %d failed\n' "$checks" "$failures"
 [[ $failures -eq 0 ]]

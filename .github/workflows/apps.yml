@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -66,7 +66,8 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          changed="$(git diff --name-only "$BASE...$HEAD")"
+          # --no-renames: a renamed or deleted logo shows up under its old path.
+          changed="$(git diff --name-only --no-renames "$BASE...$HEAD")"
           if grep -qx 'ui/assets/river_logo.svg' <<<"$changed" \
              && ! grep -q '^apps/desktop/packaging/icons/' <<<"$changed"; then
             echo "::error::ui/assets/river_logo.svg changed but the desktop icons did not. Run apps/desktop/packaging/generate-icons.sh and commit apps/desktop/packaging/icons/."

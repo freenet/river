@@ -11,15 +11,18 @@ run-name: >-
 # web UI is published to Freenet with `cargo make publish-river`
 # (.claude/rules/river-publish.md).
 #
-# Release flow (AGENTS.md, "Releasing the desktop app"):
-#   1. Bump [workspace.package] version in apps/Cargo.toml (and MIN_INSTALL_VERSION)
-#      through a normal PR, merge to main.
+# Release flow (AGENTS.md, "Releasing the desktop app", is the full version):
+#   1. Raise MIN_INSTALL_VERSION (apps/desktop/src/release.rs) to the current
+#      Freenet release and bump [workspace.package] version in apps/Cargo.toml,
+#      through a normal PR; merge to main.
 #   2. git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>
 #   3. This workflow verifies the tag, builds and tests on all three platforms,
 #      signs (macOS: Developer ID + notarization; Windows: Azure Artifact
 #      Signing), and creates a DRAFT GitHub release with SHA256SUMS.txt.
 #   4. A maintainer smoke-tests the draft's downloads on a real Mac and a real
-#      Windows PC, then publishes the draft.
+#      Windows PC, then publishes the draft with "Set as the latest release"
+#      UNTICKED (or make_latest=false through the API or `gh release edit
+#      --draft=false --latest=false`). The workflow cannot enforce that.
 #
 # `verify` (apps/desktop/packaging/verify-release.sh, tested by
 # scripts/tests/verify-release-test.sh in build.yml) refuses the tag unless it
@@ -27,20 +30,24 @@ run-name: >-
 # byte-identical to the last published River web UI, and the WASM hashes match
 # pointer-records.toml.
 #
-# A pushed tag runs the workflow file AT THE TAGGED COMMIT, so anyone who can
-# push a river-desktop-v* tag chooses which version of these checks runs. Two
-# repository settings close that, and are prerequisites for the first release:
-#   - a tag ruleset that restricts creating river-desktop-v* tags to admins;
-#   - a deployment policy on the `release` environment that allows only
-#     river-desktop-v* tags. Both sign jobs use that environment, so a
-#     required-reviewer rule on it would ask for approval twice per release.
+# Security boundary. The `if: github.event_name == 'push'` conditions below are
+# NOT one: any branch or tag runs its OWN copy of this file, so whoever can push
+# one can delete them. What protects the signing identities is the `release`
+# environment's deployment policy, enforced by GitHub outside this file. Set up
+# in this ORDER, before the first release (repository admin):
+#   1. create the `release` environment;
+#   2. give it a deployment policy that allows only river-desktop-v* tags;
+#   3. add a tag ruleset that restricts creating river-desktop-v* tags to admins;
+#   4. only then add the signing secrets to the environment.
+# Both sign jobs use that one environment, so a required-reviewer rule on it
+# would ask for approval twice per release.
 #
-# Other triggers, neither of which can sign or release (the sign-* and
-# github-release jobs run only for tag pushes):
+# Other triggers. The sign-* and github-release jobs are skipped for both:
 #   - pull requests that touch the packaging run the build and package jobs
 #     with no secrets, so packaging is checked on every platform before a tag;
-#   - workflow_dispatch is a DRY RUN: verify without the on-main check, build,
-#     package, and write the release-notes header.
+#   - workflow_dispatch is a DRY RUN: every verify check except "the commit is
+#     on main", then build, package and the release-notes header. It does not
+#     exercise the secrets check, signing, or the draft-release logic.
 #
 # Signing secrets live in the `release` environment (same names as
 # freenet-core): APPLE_DEVELOPER_ID_P12_BASE64, APPLE_DEVELOPER_ID_P12_PASSWORD,
@@ -112,7 +119,8 @@ jobs:
             git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
             apps/desktop/packaging/verify-release.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           else
-            version="$(python3 -c 'import tomllib; print(tomllib.load(open("apps/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+            version="$(apps/desktop/packaging/verify-release.sh --version-only "$GITHUB_SHA")"
+            version="${version#version=}"
             if [ "$IS_DRY_RUN" = "true" ]; then
               echo "::notice::DRY RUN: every release check except 'the commit is on main'. Nothing is signed or released."
               git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
@@ -525,39 +533,46 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Generated notes cover changes since the previous desktop release,
-          # not since whichever riverctl tag happens to be newest.
+          # Generated notes cover changes since the previous desktop release.
+          # With no previous desktop tag there is nothing to diff against, and
+          # GitHub would pick the newest release of any family (a riverctl
+          # one), so the first release gets no generated notes.
           prev="$(scripts/previous-tag.sh river-desktop-v "$TAG")"
-          gen_args=(-f tag_name="$TAG")
-          if [ -n "$prev" ]; then
-            echo "Notes start at $prev"
-            gen_args+=(-f previous_tag_name="$prev")
-          fi
           notes="$RUNNER_TEMP/notes.md"
           cp "$RUNNER_TEMP/notes/header.md" "$notes"
-          gh api -X POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" "${gen_args[@]}" \
-            --jq .body >> "$notes"
+          if [ -n "$prev" ]; then
+            echo "Notes start at $prev"
+            gh api -X POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$TAG" -f previous_tag_name="$prev" --jq .body >> "$notes"
+          else
+            echo "First release." >> "$notes"
+          fi
           case "$VERSION" in
             0.*) prerelease=true ;;
             *) prerelease=false ;;
           esac
           title="River desktop v${VERSION}"
 
-          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>"$RUNNER_TEMP/view.err")"; then
-            if [ "$state" != "true" ]; then
+          # Does a release for this tag exist, and is it a draft? The release
+          # list includes drafts (for a token with write access); any API error
+          # fails the step here instead of being taken for "not found".
+          state="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                    --jq ".[] | select(.tag_name == \"$TAG\") | .draft")"
+          case "$state" in
+            "")
+              gh release create "$TAG" dist/* --draft --verify-tag --title "$title" \
+                --notes-file "$notes" --prerelease="$prerelease" --latest=false ;;
+            true)
+              # A re-run: bring the existing draft up to date. (gh finds drafts
+              # by tag: its release lookup queries drafts as well.)
+              echo "Draft $TAG exists; replacing its assets, notes and flags"
+              gh release upload "$TAG" dist/* --clobber
+              gh release edit "$TAG" --draft=true --title "$title" --notes-file "$notes" \
+                --prerelease="$prerelease" --latest=false ;;
+            false)
               echo "::error::Release $TAG is already published. Not replacing its assets or notes; delete it or release a new version."
-              exit 1
-            fi
-            # A re-run: bring the existing draft up to date.
-            echo "Draft $TAG exists; replacing its assets, notes and flags"
-            gh release upload "$TAG" dist/* --clobber
-            gh release edit "$TAG" --draft=true --title "$title" --notes-file "$notes" \
-              --prerelease="$prerelease" --latest=false
-          elif grep -q 'release not found' "$RUNNER_TEMP/view.err"; then
-            gh release create "$TAG" dist/* --draft --verify-tag --title "$title" \
-              --notes-file "$notes" --prerelease="$prerelease" --latest=false
-          else
-            cat "$RUNNER_TEMP/view.err" >&2
-            echo "::error::Could not tell whether release $TAG exists."
-            exit 1
-          fi
+              exit 1 ;;
+            *)
+              echo "::error::More than one release exists for $TAG: $state"
+              exit 1 ;;
+          esac
