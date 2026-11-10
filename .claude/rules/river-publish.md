@@ -170,8 +170,11 @@ The river repo publishes **two things on independent cadences** — do not confl
 |----------|---------------|-------------------|
 | **riverctl** (the CLI) | crates.io (`river-core` + `riverctl`) + GitHub release with prebuilt binaries | **tag-triggered CI** — see below |
 | **River UI** (Dioxus webapp) | Freenet (contract key `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`) | `cargo make publish-river` (the checklist above) |
+| **Desktop app** (`apps/`, binary `river`) | GitHub release (`river-desktop-v*`) | **tag-triggered CI**, `.github/workflows/release-desktop.yml`; see AGENTS.md "Releasing the desktop app" |
 
 They are NOT 1:1 — a CLI-only fix ships riverctl without touching the UI, and a UI-only change publishes to Freenet without a new riverctl. The one coupling is room-contract WASM: when it changes, BOTH must be republished (they embed the WASM and derive the contract key from it).
+
+**A River UI publish that changes `chat_delegate.wasm` or `room_contract.wasm` needs a new desktop app release.** The app compiles both files in (the delegate key it reads the user's rooms under, and part of every room's contract key) and has no migration code, so once the web UI moves users to new keys, existing app builds stop finding their rooms until a new build ships. Tag `river-desktop-v<version>` on a main commit at or after that publish's `chore(publish): bump webapp contract version` commit; the release workflow refuses a tag whose `ui/public/contracts/` differs from the last published UI.
 
 ## Releasing riverctl (crates.io + GitHub release) — tag-triggered
 

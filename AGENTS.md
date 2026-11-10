@@ -293,6 +293,41 @@ The installer ties a release's signed checksums to its tag by finding
 in `release.rs`). If freenet-core ever stops shipping that DMG, River refuses
 every release until that check changes.
 
+### Releasing the desktop app
+
+Releases are GitHub releases under `river-desktop-v<version>` tags, built and
+signed by `.github/workflows/release-desktop.yml`: a Linux x86_64 tarball, a
+signed and notarized universal macOS `River.app` (zipped), a signed Windows
+x86_64 zip, and `SHA256SUMS.txt`. 0.x versions are prereleases and do not take
+the repo's "Latest" badge (riverctl releases hold it).
+
+1. Merge a PR that bumps `[workspace.package] version` in `apps/Cargo.toml`
+   (and `MIN_INSTALL_VERSION`, above).
+2. `git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>`
+
+The workflow's `verify` job (`apps/desktop/packaging/verify-release.sh`)
+refuses the tag unless its version matches `apps/Cargo.toml`, the commit is on
+main, and `ui/public/contracts/` is byte-identical to the latest
+`chore(publish): bump webapp contract version` commit on main. That last rule
+exists because the app compiles in the chat delegate and room contract WASM and
+cannot migrate between keys, so it must carry exactly what the live web UI
+carries. If the WASM changed since the last UI publish, publish the UI first.
+The release notes record the published web UI version and the BLAKE3 hashes of
+both WASMs.
+
+Packaging lives in `apps/desktop/packaging/` (icons generated from
+`ui/assets/river_logo.svg` by `generate-icons.sh` and committed; the Windows
+icon and version resource are embedded by `apps/desktop/build.rs`). Pull
+requests that touch it run the build and package jobs on all three platforms,
+without secrets. Signing runs only for tags, in jobs that use the `release`
+environment, which holds `APPLE_DEVELOPER_ID_P12_BASE64`,
+`APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ASC_API_KEY_P8_BASE64`,
+`APPLE_ASC_API_KEY_ID`, `APPLE_ASC_API_KEY_ISSUER_ID`, `AZURE_CLIENT_ID`,
+`AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID`; the Entra federated credential
+is for `repo:freenet/river:environment:release`. `SHA256SUMS.txt` is not
+signed: `FREENET_RELEASE_SIGNING_KEY` is the Freenet updater's trust root and
+must not be used here.
+
 ## Share Links in Messages
 
 Freenet share links in message text (`https://freenet.org/open#<id>…`,
