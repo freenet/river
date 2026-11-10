@@ -554,7 +554,15 @@
     border: 0;
     background: transparent;
     color: var(--color-text);
+    /* `clip`, not `hidden`: a `hidden` box can still be scrolled, and
+     * `showModal()` focuses the first control while the opening slide holds
+     * the panel below the dialog, so the browser scrolled the dialog to
+     * reveal it. WebKit kept that scroll until the slide ended (the panel
+     * rose a panel's height above the bottom edge, then dropped back);
+     * Chromium clamped it every frame, which cancelled the slide. `hidden`
+     * stays for a browser without `clip`. */
     overflow: hidden;
+    overflow: clip;
 }
 
 .mobile-sheet:not([open]) {

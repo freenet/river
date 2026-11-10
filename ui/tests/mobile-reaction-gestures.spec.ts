@@ -173,6 +173,44 @@ test.describe("A mouse on the reaction popup", () => {
   });
 });
 
+test.describe("The reaction popup's opening slide", () => {
+  // `showModal()` focuses the first emoji while the slide still holds the
+  // panel below the dialog. A dialog that can scroll is scrolled to reveal
+  // it: WebKit kept that scroll for the whole slide, so the panel rose its
+  // own height above the bottom edge and dropped back when the slide ended;
+  // Chromium clamped it each frame, so the panel never slid at all.
+  test("never scrolls the dialog or lifts the panel off the bottom edge", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await deliver(page, "react target");
+    const row = committedRow(page, "react target");
+    await expect(row).toHaveCount(1);
+    await page.evaluate((id) => {
+      const frames: { scrollTop: number; gap: number }[] = [];
+      (window as unknown as { __sheetFrames: typeof frames }).__sheetFrames = frames;
+      const sample = () => {
+        const dialog = document.getElementById(id) as HTMLDialogElement | null;
+        const panel = dialog?.querySelector(".mobile-sheet-panel");
+        if (dialog?.open && panel) {
+          frames.push({ scrollTop: dialog.scrollTop, gap: window.innerHeight - panel.getBoundingClientRect().bottom });
+        }
+        requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    }, POPUP);
+    await openReactionPopup(page, row);
+    await panelAtRest(page, POPUP);
+    await settle(page);
+    const frames = await page.evaluate(() => (window as unknown as { __sheetFrames: { scrollTop: number; gap: number }[] }).__sheetFrames);
+    expect(frames.length, "premise: frames were sampled while it was open").toBeGreaterThan(0);
+    expect(Math.max(...frames.map((f) => f.scrollTop)), "the dialog never scrolls").toBe(0);
+    expect(Math.max(...frames.map((f) => f.gap)), "never above the bottom edge").toBeLessThan(1);
+    expect(
+      await popup(page).evaluate((el) => getComputedStyle(el).overflowY),
+      "the dialog is no scroll container",
+    ).toBe("clip");
+  });
+});
+
 test.describe("A finger on the reaction popup", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "real touch input needs Chromium's input protocol");
 
