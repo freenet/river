@@ -47,6 +47,10 @@ River $VERSION for Linux ($ARCH)
 Run ./river to start. River finds the Freenet node on this computer, or offers to
 install it.
 
+Before first use: this preview cannot set up River's storage on your Freenet node
+by itself. If you have never used River on this computer, open River in your web
+browser through Freenet once first, then start this app.
+
 To add River to your applications menu:
 
   mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons/hicolor/512x512/apps

@@ -298,28 +298,62 @@ every release until that check changes.
 Releases are GitHub releases under `river-desktop-v<version>` tags, built and
 signed by `.github/workflows/release-desktop.yml`: a Linux x86_64 tarball, a
 signed and notarized universal macOS `River.app` (zipped), a signed Windows
-x86_64 zip, and `SHA256SUMS.txt`. 0.x versions are prereleases and do not take
-the repo's "Latest" badge (riverctl releases hold it).
+x86_64 zip, and `SHA256SUMS.txt`. The workflow creates the release as a
+**draft**; a maintainer publishes it.
 
-1. Merge a PR that bumps `[workspace.package] version` in `apps/Cargo.toml`
-   (and `MIN_INSTALL_VERSION`, above).
-2. `git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>`
+Prerequisites before the first release (repository settings, admin only): a
+tag ruleset that restricts creating `river-desktop-v*` tags to admins, and a
+deployment policy on the `release` environment that allows only
+`river-desktop-v*` tags. A pushed tag runs the workflow file at the tagged
+commit, so without the ruleset anyone who can push a tag chooses which checks
+run. Both sign jobs use the one `release` environment, so a required-reviewer
+rule on it asks for approval twice per release.
 
-The workflow's `verify` job (`apps/desktop/packaging/verify-release.sh`)
-refuses the tag unless its version matches `apps/Cargo.toml`, the commit is on
-main, and `ui/public/contracts/` is byte-identical to the latest
-`chore(publish): bump webapp contract version` commit on main. That last rule
-exists because the app compiles in the chat delegate and room contract WASM and
-cannot migrate between keys, so it must carry exactly what the live web UI
-carries. If the WASM changed since the last UI publish, publish the UI first.
-The release notes record the published web UI version and the BLAKE3 hashes of
-both WASMs.
+1. Raise `MIN_INSTALL_VERSION` (above) to the current Freenet release. This is
+   a manual step: check the latest freenet-core release first.
+2. Merge a PR that bumps `[workspace.package] version` in `apps/Cargo.toml`.
+3. `git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>`
+4. Download the draft's assets, check them against `SHA256SUMS.txt`, and run
+   them on a real Mac and a real Windows PC (install Freenet, approve the
+   grant, see rooms, send a message). Then publish the draft. 0.x versions are
+   prereleases. Every desktop release, including from 1.0, is created with
+   `--latest=false`, because riverctl releases hold the repo's "Latest" badge;
+   leave "Set as the latest release" unticked when publishing.
 
-Packaging lives in `apps/desktop/packaging/` (icons generated from
-`ui/assets/river_logo.svg` by `generate-icons.sh` and committed; the Windows
-icon and version resource are embedded by `apps/desktop/build.rs`). Pull
-requests that touch it run the build and package jobs on all three platforms,
-without secrets. Signing runs only for tags, in jobs that use the `release`
+To rehearse without signing or releasing, run the workflow by hand
+(`workflow_dispatch`) on any branch: a DRY RUN that runs every `verify` check
+except "the commit is on main", builds, packages and writes the notes header.
+The signing jobs have no rehearsal path other than a real tag; the draft is
+what makes a first run safe.
+
+The workflow's `verify` job (`apps/desktop/packaging/verify-release.sh`,
+tested by `scripts/tests/verify-release-test.sh` in `build.yml`) refuses the
+tag unless its version matches `apps/Cargo.toml`, the commit is on main,
+`ui/public/contracts/` is byte-identical to the latest
+`chore(publish): bump webapp contract version` commit on main's first-parent
+history, and both WASMs' BLAKE3 hashes match `pointer-records.toml`. The WASM
+rule exists because the app compiles in the chat delegate and room contract
+WASM and cannot migrate between keys, so it must carry exactly what the live
+web UI carries. If the WASM changed since the last UI publish, publish the UI
+first. The release notes record the published web UI version and both
+hashes, and tell new users the known limitation: the app does not register
+the chat delegate, so someone who has never used River must open it in the
+browser once first.
+
+What CI does and does not check per platform: `river --version` is checked
+on Linux and on the arm64 slice of the macOS binary. The x86_64 macOS slice is
+compiled and linked but never executed in CI. On Windows `river.exe
+--version` prints nothing (release builds use the GUI subsystem, so there is
+no console), so the exe's `ProductVersion` resource is the version check
+there.
+
+Packaging lives in `apps/desktop/packaging/`. The icons in `icons/` are
+generated from `ui/assets/river_logo.svg` and committed: whoever changes the
+logo runs `generate-icons.sh` and commits the result, and `apps.yml` fails a
+PR that changes the logo without the icons. The Windows icon and version
+resource are embedded by `apps/desktop/build.rs`. Pull requests that touch the
+packaging run the build and package jobs on all three platforms, without
+secrets. Signing runs only for tags, in jobs that use the `release`
 environment, which holds `APPLE_DEVELOPER_ID_P12_BASE64`,
 `APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ASC_API_KEY_P8_BASE64`,
 `APPLE_ASC_API_KEY_ID`, `APPLE_ASC_API_KEY_ISSUER_ID`, `AZURE_CLIENT_ID`,

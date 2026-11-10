@@ -35,6 +35,10 @@ River $Version for Windows (x86_64)
 Run river.exe to start. River finds the Freenet node on this computer, or offers to
 install it.
 
+Before first use: this preview cannot set up River's storage on your Freenet node
+by itself. If you have never used River on this computer, open River in your web
+browser through Freenet once first, then start this app.
+
 Source: https://github.com/freenet/river
 "@ | Set-Content -Path (Join-Path $dir 'README.txt') -Encoding utf8
 
@@ -44,3 +48,10 @@ if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path $dir -DestinationPath $zip
 Remove-Item -Recurse -Force $stage
 Write-Host $zip
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+try {
+    $archive.Entries | ForEach-Object { Write-Host ("{0,12}  {1}" -f $_.Length, $_.FullName) }
+} finally {
+    $archive.Dispose()
+}

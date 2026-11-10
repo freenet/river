@@ -1,26 +1,46 @@
 name: Release desktop app
 
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('DRY RUN of the desktop release on {0} (no signing, no release)', github.ref_name)
+      || '' }}
+
 # Tag-triggered release of River's native desktop app (apps/, binary `river`).
 #
 # This is the desktop app ONLY. riverctl has release-riverctl.yml, and the River
 # web UI is published to Freenet with `cargo make publish-river`
 # (.claude/rules/river-publish.md).
 #
-# Release flow:
-#   1. Bump [workspace.package] version in apps/Cargo.toml through a normal PR,
-#      merge to main.
+# Release flow (AGENTS.md, "Releasing the desktop app"):
+#   1. Bump [workspace.package] version in apps/Cargo.toml (and MIN_INSTALL_VERSION)
+#      through a normal PR, merge to main.
 #   2. git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>
 #   3. This workflow verifies the tag, builds and tests on all three platforms,
 #      signs (macOS: Developer ID + notarization; Windows: Azure Artifact
-#      Signing), and creates a GitHub prerelease with SHA256SUMS.txt.
+#      Signing), and creates a DRAFT GitHub release with SHA256SUMS.txt.
+#   4. A maintainer smoke-tests the draft's downloads on a real Mac and a real
+#      Windows PC, then publishes the draft.
 #
-# `verify` refuses the tag unless it matches apps/Cargo.toml, the commit is on
-# main, and ui/public/contracts/ is byte-identical to the last published River
-# web UI (see apps/desktop/packaging/verify-release.sh for why and how).
+# `verify` (apps/desktop/packaging/verify-release.sh, tested by
+# scripts/tests/verify-release-test.sh in build.yml) refuses the tag unless it
+# matches apps/Cargo.toml, the commit is on main, ui/public/contracts/ is
+# byte-identical to the last published River web UI, and the WASM hashes match
+# pointer-records.toml.
 #
-# On pull requests that touch the packaging, the build and package jobs run
-# without secrets, so packaging is checked on every platform before any tag.
-# Signing and the release run only for tags.
+# A pushed tag runs the workflow file AT THE TAGGED COMMIT, so anyone who can
+# push a river-desktop-v* tag chooses which version of these checks runs. Two
+# repository settings close that, and are prerequisites for the first release:
+#   - a tag ruleset that restricts creating river-desktop-v* tags to admins;
+#   - a deployment policy on the `release` environment that allows only
+#     river-desktop-v* tags. Both sign jobs use that environment, so a
+#     required-reviewer rule on it would ask for approval twice per release.
+#
+# Other triggers, neither of which can sign or release (the sign-* and
+# github-release jobs run only for tag pushes):
+#   - pull requests that touch the packaging run the build and package jobs
+#     with no secrets, so packaging is checked on every platform before a tag;
+#   - workflow_dispatch is a DRY RUN: verify without the on-main check, build,
+#     package, and write the release-notes header.
 #
 # Signing secrets live in the `release` environment (same names as
 # freenet-core): APPLE_DEVELOPER_ID_P12_BASE64, APPLE_DEVELOPER_ID_P12_PASSWORD,
@@ -44,6 +64,7 @@ on:
       - 'apps/desktop/Cargo.toml'
       # The release profile lives here.
       - 'apps/Cargo.toml'
+  workflow_dispatch:
 
 # Least privilege: read-only by default. sign-windows adds id-token: write and
 # github-release adds contents: write, each for itself only.
@@ -59,6 +80,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/river-desktop-v') }}
+  IS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
   verify:
@@ -67,10 +89,21 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
       webapp_version: ${{ steps.check.outputs.webapp_version }}
+      delegate_hash: ${{ steps.check.outputs.delegate_hash }}
+      contract_hash: ${{ steps.check.outputs.contract_hash }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+      # BLAKE3 is the code hash Freenet keys contracts and delegates by. It is
+      # computed here, in a job whose token is read-only, rather than next to
+      # the release's write token: `cargo install` runs third-party build
+      # scripts.
+      - name: Install b3sum
+        if: github.event_name != 'pull_request'
+        working-directory: ${{ runner.temp }}
+        run: command -v b3sum || cargo install b3sum --locked --version 1.8.5
       - name: Verify tag, main ancestry and baked-in WASM
         id: check
         run: |
@@ -79,10 +112,15 @@ jobs:
             git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
             apps/desktop/packaging/verify-release.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           else
-            # Pull request: no tag to check; package the version in the tree.
             version="$(python3 -c 'import tomllib; print(tomllib.load(open("apps/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
-            echo "version=$version" >> "$GITHUB_OUTPUT"
-            echo "webapp_version=" >> "$GITHUB_OUTPUT"
+            if [ "$IS_DRY_RUN" = "true" ]; then
+              echo "::notice::DRY RUN: every release check except 'the commit is on main'. Nothing is signed or released."
+              git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+              DRY_RUN=1 apps/desktop/packaging/verify-release.sh "river-desktop-v$version" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            else
+              # Pull request: no tag to check; package the version in the tree.
+              echo "version=$version" >> "$GITHUB_OUTPUT"
+            fi
           fi
           cat "$GITHUB_OUTPUT"
 
@@ -99,6 +137,8 @@ jobs:
         working-directory: apps
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Install system libraries
         run: |
           sudo apt-get update
@@ -134,6 +174,8 @@ jobs:
         working-directory: apps
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Install toolchain and targets
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -180,6 +222,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Tests
@@ -199,6 +243,44 @@ jobs:
             dist/River-*-UNSIGNED.zip
           if-no-files-found: error
 
+  release-notes:
+    needs: verify
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      WEBAPP_VERSION: ${{ needs.verify.outputs.webapp_version }}
+      DELEGATE_HASH: ${{ needs.verify.outputs.delegate_hash }}
+      CONTRACT_HASH: ${{ needs.verify.outputs.contract_hash }}
+    steps:
+      - name: Write release notes header
+        run: |
+          set -euo pipefail
+          for v in WEBAPP_VERSION DELEGATE_HASH CONTRACT_HASH; do
+            [ -n "${!v}" ] || { echo "::error::verify did not output $v"; exit 1; }
+          done
+          mkdir -p notes
+          cat > notes/header.md <<EOF
+          Preview release of River for the desktop: Linux x86_64, macOS (Apple silicon and Intel; signed and notarized) and Windows x86_64 (signed). \`SHA256SUMS.txt\` lists the SHA-256 of each download.
+
+          **Before first use:** this preview cannot set up River's storage on your Freenet node by itself. If you have never used River on this computer, open River in your web browser through Freenet once first, then start the app. Otherwise the app finds no rooms.
+
+          Built from ${GITHUB_SHA}. It carries the same chat delegate and room contract as the River web app published as version **${WEBAPP_VERSION}**:
+
+          | WASM | BLAKE3 code hash |
+          |---|---|
+          | \`chat_delegate.wasm\` | \`${DELEGATE_HASH}\` |
+          | \`room_contract.wasm\` | \`${CONTRACT_HASH}\` |
+
+          EOF
+          cat notes/header.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          # Not release-*: github-release downloads that pattern as assets.
+          name: notes-header
+          path: notes/header.md
+          if-no-files-found: error
+
   sign-macos:
     needs: [verify, build-macos]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/river-desktop-v')
@@ -209,6 +291,8 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Check signing secrets are present
         env:
           APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
@@ -267,6 +351,10 @@ jobs:
           echo "ASC_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
       - name: Sign, notarize, staple and verify
         env:
+          # Pinned on purpose: the same Developer ID freenet-core signs with.
+          # sign-macos.sh requires the signature to name exactly this identity
+          # and team. If a renewed certificate changes the name or team, change
+          # both here together with the APPLE_DEVELOPER_ID_P12_* secrets.
           CODESIGN_IDENTITY: "Developer ID Application: Ian CLARKE (R55ZESJCXG)"
           EXPECTED_TEAM_ID: R55ZESJCXG
           ASC_API_KEY_ID: ${{ secrets.APPLE_ASC_API_KEY_ID }}
@@ -302,6 +390,8 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Check signing secrets are present
         shell: bash
         env:
@@ -366,6 +456,21 @@ jobs:
       - name: Package
         shell: pwsh
         run: apps/desktop/packaging/package-windows.ps1 -Exe signing/river.exe -Version $env:VERSION -OutDir release
+      # Check what users download: the exe inside the zip, not the one it was made from.
+      - name: Verify the signature inside the zip
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem release\River-*-windows-x86_64.zip | Select-Object -First 1
+          $out = Join-Path $env:RUNNER_TEMP 'zipcheck'
+          Expand-Archive -Path $zip.FullName -DestinationPath $out -Force
+          $f = Join-Path $out 'River\river.exe'
+          $sig = Get-AuthenticodeSignature $f
+          Write-Host "$f => $($sig.Status) / $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "Unsigned or invalid inside the zip: $f" }
+          if (-not $sig.TimeStamperCertificate) { throw "Missing timestamp inside the zip: $f" }
+          if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {
+            throw "Unexpected signer inside the zip: '$($sig.SignerCertificate.Subject)'"
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-windows
@@ -373,7 +478,7 @@ jobs:
           if-no-files-found: error
 
   github-release:
-    needs: [verify, build-linux, sign-macos, sign-windows]
+    needs: [verify, build-linux, release-notes, sign-macos, sign-windows]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/river-desktop-v')
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -381,18 +486,22 @@ jobs:
       contents: write   # create the release; this job only
     env:
       VERSION: ${{ needs.verify.outputs.version }}
-      WEBAPP_VERSION: ${{ needs.verify.outputs.webapp_version }}
       TAG: ${{ github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          # The tags, for scripts/previous-tag.sh.
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notes-header
+          path: ${{ runner.temp }}/notes
       - name: Check assets and write SHA256SUMS.txt
         run: |
           set -euo pipefail
@@ -407,48 +516,48 @@ jobs:
           fi
           sha256sum River-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      # BLAKE3 is the code hash Freenet keys contracts and delegates by.
-      - name: Install b3sum
-        working-directory: ${{ runner.temp }}
-        run: command -v b3sum || cargo install b3sum --locked --version 1.8.5
-      - name: Write release notes header
+      # A DRAFT: a maintainer publishes it after running the downloads on real
+      # hardware. --latest=false always, also from 1.0: riverctl releases hold
+      # the repo's "Latest" badge. 0.x versions are marked prerelease.
+      - name: Create or update the draft GitHub release
+        env:
+          # The write token is visible to this step only.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          delegate="$(b3sum --no-names ui/public/contracts/chat_delegate.wasm)"
-          contract="$(b3sum --no-names ui/public/contracts/room_contract.wasm)"
-          cat > "$RUNNER_TEMP/notes.md" <<EOF
-          Preview release of River for the desktop: Linux x86_64, macOS (Apple silicon and Intel; signed and notarized) and Windows x86_64 (signed). \`SHA256SUMS.txt\` lists the SHA-256 of each download.
-
-          Built from ${GITHUB_SHA}. It carries the same chat delegate and room contract as the River web app published as version **${WEBAPP_VERSION}**:
-
-          | WASM | BLAKE3 code hash |
-          |---|---|
-          | \`chat_delegate.wasm\` | \`${delegate}\` |
-          | \`room_contract.wasm\` | \`${contract}\` |
-
-          EOF
-          cat "$RUNNER_TEMP/notes.md"
-      - name: Create or update the GitHub release
-        run: |
-          set -euo pipefail
-          args=(--verify-tag --title "River desktop v${VERSION}"
-                --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
-                # riverctl releases currently own the repo's "Latest" badge.
-                --latest=false)
           # Generated notes cover changes since the previous desktop release,
           # not since whichever riverctl tag happens to be newest.
-          # The desktop tag just below this one in version order.
-          prev="$(git tag --list 'river-desktop-v*' | sort -V \
-                  | awk -v t="$TAG" '$0 == t { print p; exit } { p = $0 }')"
+          prev="$(scripts/previous-tag.sh river-desktop-v "$TAG")"
+          gen_args=(-f tag_name="$TAG")
           if [ -n "$prev" ]; then
             echo "Notes start at $prev"
-            args+=(--notes-start-tag "$prev")
+            gen_args+=(-f previous_tag_name="$prev")
           fi
+          notes="$RUNNER_TEMP/notes.md"
+          cp "$RUNNER_TEMP/notes/header.md" "$notes"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" "${gen_args[@]}" \
+            --jq .body >> "$notes"
           case "$VERSION" in
-            0.*) args+=(--prerelease) ;;
+            0.*) prerelease=true ;;
+            *) prerelease=false ;;
           esac
-          # Idempotent: a re-run after a transient failure replaces the assets.
-          if ! gh release create "$TAG" "${args[@]}" dist/*; then
-            echo "Release $TAG already exists; uploading assets with --clobber"
+          title="River desktop v${VERSION}"
+
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>"$RUNNER_TEMP/view.err")"; then
+            if [ "$state" != "true" ]; then
+              echo "::error::Release $TAG is already published. Not replacing its assets or notes; delete it or release a new version."
+              exit 1
+            fi
+            # A re-run: bring the existing draft up to date.
+            echo "Draft $TAG exists; replacing its assets, notes and flags"
             gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --draft=true --title "$title" --notes-file "$notes" \
+              --prerelease="$prerelease" --latest=false
+          elif grep -q 'release not found' "$RUNNER_TEMP/view.err"; then
+            gh release create "$TAG" dist/* --draft --verify-tag --title "$title" \
+              --notes-file "$notes" --prerelease="$prerelease" --latest=false
+          else
+            cat "$RUNNER_TEMP/view.err" >&2
+            echo "::error::Could not tell whether release $TAG exists."
+            exit 1
           fi

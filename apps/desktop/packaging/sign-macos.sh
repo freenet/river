@@ -12,6 +12,13 @@
 #
 # The signing identity must already be in a keychain codesign can search.
 #
+# The identity and team are pinned on purpose: check_signature below requires the
+# signature to name exactly this Developer ID Application certificate and team, the
+# same identity freenet-core signs Freenet.app with. When Apple renews the certificate
+# the name stays the same unless the account holder or team changes; if it does change,
+# update CODESIGN_IDENTITY and EXPECTED_TEAM_ID in the sign-macos job of
+# .github/workflows/release-desktop.yml together with the new .p12 secret.
+#
 # Hardened runtime, with NO entitlements. Each entitlement switches off one hardened
 # runtime protection, and River needs none of them: it runs no JIT and no WASM (unlike
 # the Freenet node, which needs allow-jit for wasmtime), loads no unsigned libraries

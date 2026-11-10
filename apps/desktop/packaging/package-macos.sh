@@ -28,6 +28,7 @@ echo ">> Universal binary"
 lipo -create -output "$APP/Contents/MacOS/river" "$ARM64_BIN" "$X86_BIN"
 chmod 0755 "$APP/Contents/MacOS/river"
 archs="$(lipo -archs "$APP/Contents/MacOS/river")"
+echo "architectures: $archs"
 for want in arm64 x86_64; do
     if [[ " $archs " != *" $want "* ]]; then
         echo "package-macos.sh: universal binary lacks $want (has: $archs)" >&2
@@ -35,6 +36,8 @@ for want in arm64 x86_64; do
     fi
 done
 
+# This runs the slice native to the build machine (arm64 on CI). The x86_64 slice is
+# compiled and linked but never executed in CI; only an Intel Mac runs it.
 reported="$("$APP/Contents/MacOS/river" --version)"
 if [[ "$reported" != "river $VERSION" ]]; then
     echo "package-macos.sh: binary reports '$reported', expected 'river $VERSION'" >&2

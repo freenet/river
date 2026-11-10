@@ -206,6 +206,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The tags, for scripts/previous-tag.sh.
+          fetch-depth: 0
+          persist-credentials: false
       - name: Download binary artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -214,11 +218,20 @@ jobs:
       - name: Create or update GitHub release
         run: |
           set -euo pipefail
+          # Generated notes start at the previous riverctl tag. Without this,
+          # GitHub picks the newest release of ANY tag family as "previous",
+          # which may be a river-desktop-v* release.
+          notes_args=(--generate-notes)
+          prev="$(scripts/previous-tag.sh riverctl-v "$TAG")"
+          if [ -n "$prev" ]; then
+            echo "Notes start at $prev"
+            notes_args+=(--notes-start-tag "$prev")
+          fi
           # Idempotent: if the release already exists (e.g. a re-run after a
           # transient failure), upload/replace the assets instead of aborting.
           if ! gh release create "$TAG" \
                 --title "riverctl v${VERSION}" \
-                --generate-notes \
+                "${notes_args[@]}" \
                 dist/*; then
             echo "Release $TAG already exists — uploading assets with --clobber"
             gh release upload "$TAG" dist/* --clobber
