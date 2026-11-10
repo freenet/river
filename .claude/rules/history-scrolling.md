@@ -243,6 +243,11 @@ Browser scroll anchoring is disabled on the room scroller, and a browser test
 asserts the computed `overflow-anchor: none`. Custom position corrections
 remain in place. Known limitation: late images and bulk removal above a parked
 reader are not corrected ([#507](https://github.com/freenet/river/issues/507)).
+Nor is a row's first reaction or its last reaction's removal: on a
+desktop-width window with a mouse, a row with no reactions keeps no footer
+line (`main.css`, "Controls at the end of the last line"), so either changes
+the row's height by that line, as every reaction line did before #862. A
+reader at the end is held there; one parked below that row is moved.
 
 ## DM threads
 

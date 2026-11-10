@@ -50,7 +50,7 @@
 //! room here does not show stays unconfirmed, with why, and is never sent again from here. A
 //! send not taken stays on screen marked "Not sent" with Retry and Discard; an edit, deletion
 //! or reaction not taken is said above the composer. Whatever the network later brings in with these messages' ids counts as sent, whatever the
-//! answer was. Nothing here writes the chat delegate's storage, so the web UI's
+//! answer was. Sending writes nothing to the chat delegate's storage, so the web UI's
 //! after-send bookkeeping (its read position, its stored copy of the room) is not done: the
 //! web UI picks the message up from the network.
 //!
@@ -114,6 +114,51 @@ pub enum Action {
     Discard {
         entry: u64,
     },
+    /// Make an invitation to the room, for its link to be copied ([`super::create`]).
+    Invite,
+    /// Create a room. The command's `room` is empty: this is not about a room shown.
+    CreateRoom {
+        name: String,
+        nickname: String,
+        private: bool,
+    },
+    /// Join the room a pasted invite code or link invites to. `room` is empty.
+    Join {
+        code: InviteCode,
+        nickname: String,
+    },
+    /// Try a failed create or join again ([`super::work`]). `room` is empty.
+    RetryWork {
+        id: u64,
+    },
+    /// Drop a failed create or join. `room` is empty.
+    DismissWork {
+        id: u64,
+    },
+}
+
+/// A pasted invite code or link. It is a bearer credential (it carries the invitee's signing
+/// key), so its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InviteCode(pub String);
+
+impl std::fmt::Debug for InviteCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InviteCode(<hidden>)")
+    }
+}
+
+impl Action {
+    /// Whether this is about the room list rather than one room.
+    pub fn is_list_level(&self) -> bool {
+        matches!(
+            self,
+            Action::CreateRoom { .. }
+                | Action::Join { .. }
+                | Action::RetryWork { .. }
+                | Action::DismissWork { .. }
+        )
+    }
 }
 
 /// Why the user can't send in a room. The order of the checks is the web UI's
@@ -552,6 +597,9 @@ pub(super) struct Outbox {
     next: u64,
     /// Commands that arrived before the rooms were read.
     pub waiting: Vec<Command>,
+    /// Rooms being created or joined. Kept here so they outlive a connection and a session
+    /// as what was sent does.
+    pub work: super::work::Work,
     clock: Clock,
     /// By room, the entries sent on this connection whose answer has not come, oldest first,
     /// with when each was sent. An answer names only the contract, so it is the oldest one's.
@@ -570,6 +618,7 @@ impl Default for Outbox {
             entries: Vec::new(),
             next: 0,
             waiting: Vec::new(),
+            work: Default::default(),
             clock: Box::new(SystemTime::now),
             owed: HashMap::new(),
             reconnect: false,
@@ -726,9 +775,15 @@ impl Outbox {
                 }
                 Ok(Intent::Actions { label, actions })
             }
-            Action::Retry { .. } | Action::Discard { .. } => {
-                Err(("Your message", "Nothing to do.".to_owned()))
-            }
+            // Retry and Discard are taken in `command`; the rest are not about a message, and
+            // the session takes them before they get here.
+            Action::Retry { .. }
+            | Action::Discard { .. }
+            | Action::Invite
+            | Action::CreateRoom { .. }
+            | Action::Join { .. }
+            | Action::RetryWork { .. }
+            | Action::DismissWork { .. } => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 
@@ -930,6 +985,7 @@ impl Outbox {
     /// The connection is gone: nothing is owed on the next one, and what was in flight goes
     /// again on it, as the same signed messages, so one the node did take is not added twice.
     pub fn requeue(&mut self) {
+        self.work.connection_lost();
         self.owed.clear();
         self.reconnect = false;
         for e in &mut self.entries {

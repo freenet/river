@@ -14,10 +14,15 @@
 //!
 //! It sends what the user writes in a room they are a member of: messages, replies, edits and
 //! deletions of their own messages, and reactions, each as an UPDATE of the room contract
-//! ([`outbox`]). It never PUTs (not even the web UI's seed PUT for a room the network doesn't
-//! have), never creates, joins or invites, and never writes delegate storage: the web UI owns
-//! that, and two writers to it are what would lose data.
+//! ([`outbox`]). It makes invitations, creates rooms and joins them from invitations
+//! ([`create`], [`work`]). Those are the only times it writes the chat delegate's storage, which
+//! the web UI writes too, at the same time: it writes only with the web UI's generation
+//! compare-and-swap, only adds a room where none is stored, and in `rooms_meta` only changes the
+//! open room ([`work`] has the details). Its only PUT is the seed PUT of a room it has just
+//! created, under that room's own contract; it never seeds a room the network lacks, which the
+//! web UI does.
 
+pub mod create;
 pub mod delegate;
 pub mod grant;
 pub mod outbox;
@@ -27,13 +32,14 @@ mod room_tests;
 mod session;
 pub mod socket;
 pub mod token;
+pub mod work;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-pub use outbox::{Action, Command};
+pub use outbox::{Action, Command, InviteCode};
 pub use session::{Access, Issues, LinkStatus, RoomsUpdate};
 
 /// The node's client API on this computer.

@@ -4228,6 +4228,10 @@ fn MessageGroupComponent(
                                 "data-anchor-key": "{msg.id}",
                                 "data-testid": "message-row",
                                 "data-message-self": "{is_self}",
+                                // For main.css: on a desktop with a mouse, a row with no
+                                // reactions puts its controls at the end of its last line
+                                // instead of on a footer line of their own.
+                                "data-has-reactions": "{!msg.reactions.is_empty()}",
                                 class: "msg-row group",
                                 onpointerdown: move |e: PointerEvent| {
                                     mobile_message_actions::note_row_press(&press_row, &e)
@@ -4613,7 +4617,7 @@ fn MessageGroupComponent(
                                                 // breaks a long URL only where it would overflow the column.
                                                 div {
                                                     "data-testid": "message-body",
-                                                    class: "text-[15px] leading-[22px] text-text max-w-[76ch]",
+                                                    class: "msg-body text-[15px] leading-[22px] text-text max-w-[76ch]",
                                                     div {
                                                         class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
                                                         dangerous_inner_html: "{msg.content_html}"
@@ -4628,7 +4632,11 @@ fn MessageGroupComponent(
                                     // The footer: the reaction chips and React, then Reply,
                                     // and Edit and Delete on your own (`.msg-footer` in
                                     // main.css). Its line is kept whether or not the
-                                    // controls show. Their handlers are this group's, and
+                                    // controls show, except on a desktop with a mouse when
+                                    // the message has no reactions: there the controls sit
+                                    // at the end of its last line instead (main.css,
+                                    // "Controls at the end of the last line"). Their handlers
+                                    // are this group's, and
                                     // Conversation's stable `use_callback`s (#830).
                                     {
                                         // `msg.id` is the row's DOM id suffix (`msg-{id}`);

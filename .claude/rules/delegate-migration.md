@@ -220,6 +220,15 @@ published, riverctl pins it with `=`, and `release-riverctl.yml` skips a
 river-core version crates.io already has, so a river-core source change that
 riverctl needs requires the bump, and with it the room-contract re-key.
 
+Measured again 2026-11-10 (freenet/river#879): river-core 0.4.0 -> 0.4.1 alone
+changed BOTH `room_contract.wasm` and `chat_delegate.wasm`. When riverctl needs
+only a small river-core helper, it can avoid the bump by carrying a local copy
+pinned to river-core by a test, as #879 did for the non-panicking member-secret
+decrypt (`cli/src/private_room.rs::try_decrypt_member_secret`). Each such copy
+names the river-core function that replaces it at the next river-core release
+that re-keys anyway (#880 for this one); check `cli/src` for them when making
+that release.
+
 Note the measurement must use the co-build: building `-p room-contract` alone
 resolves river-core with different features and gives a different hash even
 on an unmodified tree.

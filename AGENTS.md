@@ -228,20 +228,31 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
   stored in the chat delegate, and subscribes to each room contract. In a room
   the user can send in it sends messages, replies, edits and deletions of the
   user's own messages, and reactions, each as a room contract UPDATE built and
-  signed as the web UI does (`src/rooms/outbox.rs`). It never PUTs, never
-  creates, joins or invites, and never writes delegate storage. The chat screen
+  signed as the web UI does (`src/rooms/outbox.rs`). It creates rooms, makes
+  invitations and joins rooms from them (`src/rooms/create.rs`,
+  `src/rooms/work.rs`). These are its only writes to the chat delegate's
+  storage, which the web UI writes at the same time: each is the web UI's
+  generation compare-and-swap (`GetVersionedRequest`, then `CasStoreRequest`,
+  reading again on a conflict), it only ADDS a room where the key holds nothing
+  (or a tombstone, when joining), and in `rooms_meta` it changes only the open
+  room (`river_core::stored_rooms`). The bytes it stores are pinned to the web
+  UI's types by the `stored_rooms_drift` tests in `ui/src/room_data.rs`. Its
+  only PUT is the seed PUT of a room it has just created, under that room's own
+  contract; joining sends an UPDATE where the web UI PUTs. The chat screen
   (`src/chat/`) shows them; snapshots and tests use built-in example data
   (`chat::Source::Example`). Its colours and sizes follow the web UI in `ui/`.
   It depends on `river-core` (`common/`) by path, with the client-only
-  features `ecies-randomized`, `mentions` and `stored-rooms`, so a change under `common/`
-  (or to the root `Cargo.toml`, which river-core inherits versions from) runs
-  `apps.yml`. It compiles in two `ui/` files with `include_bytes!`: the logo
-  `ui/assets/river_logo.svg` and the chat delegate
+  features `ecies-randomized`, `ecies-client`, `mentions`, `stored-rooms`
+  and `invitation`, so a change under `common/` (or to the root `Cargo.toml`,
+  which river-core inherits versions from) runs `apps.yml`. It compiles in
+  three `ui/` files with
+  `include_bytes!`: the logo `ui/assets/river_logo.svg`, the chat delegate
   `ui/public/contracts/chat_delegate.wasm`, whose hash is the delegate key it
-  reads rooms from. An edit to either runs `apps.yml`; nothing else under `ui/`
-  is read by `apps/`. A test checks that its `freenet-stdlib` (the client
-  API's wire format) is the version river-core resolves to in the root
-  `Cargo.lock`.
+  reads rooms from, and the room contract `ui/public/contracts/room_contract.wasm`,
+  whose hash is part of every room's contract key. An edit to any of them runs
+  `apps.yml`; nothing else under `ui/` is read by `apps/`. A test checks
+  that its `freenet-stdlib` (the client API's wire format) is the version
+  river-core resolves to in the root `Cargo.lock`.
 - `apps/desktop`: the desktop shell (binary `river`), including the Freenet
   installer, which verifies the release's signed checksums.
 
@@ -331,8 +342,8 @@ Changes to `apps/Cargo.toml` and `apps/Cargo.lock` cannot alter the key:
 the WASM is built from the root workspace with the root `Cargo.lock`, and the
 apps' lockfile is never consulted there, even though `apps/river-app` depends
 on `river-core` by path (see the note in `apps/Cargo.toml`). Any client-only
-feature it enables (`stored-rooms`, ...) must stay off for the room-contract
-and chat-delegate builds.
+feature it enables (`stored-rooms`, `invitation`, `ecies-client`, ...) must
+stay off for the room-contract and chat-delegate builds.
 
 The full workflow — `cargo make add-migration` BEFORE rebuilding, the
 two single-source-of-truth TOMLs, CI validation, and the key files —

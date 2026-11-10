@@ -2,6 +2,11 @@ pub mod chat_delegate;
 pub mod crypto_values;
 #[cfg(feature = "ecies")]
 pub mod ecies;
+/// An invitation to a room as the web UI encodes it, for clients other than the
+/// web UI. Gated on the `invitation` feature (client crates only), so the WASM
+/// builds keep byte-identical WASM.
+#[cfg(any(feature = "invitation", test))]
+pub mod invitation;
 pub mod key_derivation;
 /// `@mention` codec (freenet/river @mentions feature). Gated on the `mentions`
 /// feature so the room-contract / chat-delegate WASM builds (which do not
@@ -20,9 +25,9 @@ pub mod migration;
 #[cfg(any(feature = "own-purges", test))]
 pub mod own_purges;
 pub mod room_state;
-/// Read-side types for the rooms the web UI stores in the chat delegate. Gated
-/// on the `stored-rooms` feature (client crates only), so the WASM builds keep
-/// byte-identical WASM.
+/// The rooms the web UI stores in the chat delegate: reading them, and adding a
+/// room to them. Gated on the `stored-rooms` feature (client crates only), so
+/// the WASM builds keep byte-identical WASM.
 #[cfg(any(feature = "stored-rooms", test))]
 pub mod stored_rooms;
 pub mod util;

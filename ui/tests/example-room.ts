@@ -223,6 +223,14 @@ export function coarsePointer(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("(hover: none), (any-pointer: coarse)").matches);
 }
 
+/// Whether a row with no reactions keeps no footer line: a desktop-width
+/// window with a mouse puts its controls at the end of its last line instead
+/// (main.css, "Controls at the end of the last line").
+export async function inlineFooter(page: Page): Promise<boolean> {
+  const wide = await page.evaluate(() => window.matchMedia("(min-width: 48rem)").matches);
+  return wide && !(await coarsePointer(page));
+}
+
 /// Show `row`'s footer controls (React, Reply, Edit, Delete): a fine pointer
 /// hovers the row, as a reader does; a touch or hybrid pointer already shows
 /// them.
@@ -336,6 +344,8 @@ export async function plainPointOf(row: Locator): Promise<{ x: number; y: number
       'a, button, input, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"]), [data-row-actions="exclude"], [data-member-id]';
     const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
     const body = el.querySelector('[data-testid="message-body"]')?.getBoundingClientRect() ?? content;
+    // Hover can reveal inline controls between measuring and pressing.
+    const controlBoxes = Array.from(el.querySelectorAll(interactive)).map((e) => e.getBoundingClientRect());
     const candidates: [number, number][] = [];
     // The body's lines, then the empty end of the content column, then its edges.
     for (const fy of [0.5, 0.25, 0.75, 0.1, 0.9]) {
@@ -345,6 +355,7 @@ export async function plainPointOf(row: Locator): Promise<{ x: number; y: number
     }
     for (const fy of [0.05, 0.5, 0.95]) candidates.push([content.right - 3, content.top + content.height * fy]);
     for (const [x, y] of candidates) {
+      if (controlBoxes.some((r) => x >= r.left && x < r.right && y >= r.top && y < r.bottom)) continue;
       const at = document.elementFromPoint(x, y);
       if (!at || !el.contains(at)) continue;
       const control = at.closest(interactive);

@@ -4907,8 +4907,9 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "assert_cmd",
  "atty",
@@ -4934,6 +4935,7 @@ dependencies = [
  "river-core",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4944,6 +4946,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "x25519-dalek",
 ]
 
 [[package]]

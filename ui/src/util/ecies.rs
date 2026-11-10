@@ -6,10 +6,13 @@
 //! UI imports keep working.
 #![allow(unused_imports)]
 
+// The panicking `decrypt` / `decrypt_secret_from_member_blob*` are deliberately
+// not re-exported: room secret blobs are peer data, so the UI decrypts them only
+// with the non-panicking `try_decrypt_secret_from_member_blob_raw`.
 pub use river_core::ecies::{
-    decrypt, decrypt_secret_from_member_blob, decrypt_secret_from_member_blob_raw,
     decrypt_with_symmetric_key, encrypt_secret_for_member, encrypt_with_symmetric_key,
-    generate_room_secret, seal_bytes, unseal_bytes, unseal_bytes_with_secrets,
+    generate_room_secret, seal_bytes, try_decrypt_secret_from_member_blob_raw, unseal_bytes,
+    unseal_bytes_with_secrets,
 };
 
 use river_core::room_state::privacy::SealedBytes;

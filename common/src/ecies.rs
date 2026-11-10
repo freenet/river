@@ -202,6 +202,39 @@ pub fn decrypt_secret_from_member_blob(
     Ok(secret)
 }
 
+/// [`decrypt_secret_from_member_blob_raw`] for clients, which returns an error
+/// where that function panics: when the ciphertext does not decrypt under the
+/// member's key (a damaged or foreign blob), and when the result is not 32
+/// bytes. Clients read these blobs from room state they did not write, so a
+/// blob that fails to decrypt must be skipped, never fatal.
+///
+/// Client-only (the `ecies-client` feature, and this crate's tests so CI runs
+/// them): the chat delegate keeps its own functions, unchanged, so its WASM and
+/// key stay byte-identical.
+#[cfg(any(feature = "ecies-client", test))]
+pub fn try_decrypt_secret_from_member_blob_raw(
+    ciphertext: &[u8],
+    nonce: &[u8; 12],
+    ephemeral_sender_key_bytes: &[u8; 32],
+    member_private_key: &SigningKey,
+) -> Result<[u8; 32], String> {
+    let ephemeral = X25519PublicKey::from(*ephemeral_sender_key_bytes);
+    let shared_secret =
+        ed25519_to_x25519_private_key(member_private_key).diffie_hellman(&ephemeral);
+    let symmetric_key = Sha256::digest(shared_secret.as_bytes());
+    let cipher = Aes256Gcm::new_from_slice(&symmetric_key)
+        .map_err(|e| format!("Failed to create cipher: {e}"))?;
+    let decrypted = cipher
+        .decrypt(&Nonce::from(*nonce), ciphertext)
+        .map_err(|e| format!("Decryption failed: {e}"))?;
+    <[u8; 32]>::try_from(decrypted.as_slice()).map_err(|_| {
+        format!(
+            "Decrypted secret has invalid length: {} (expected 32)",
+            decrypted.len()
+        )
+    })
+}
+
 // ============================================================================
 // Sealing — `unseal_*` is always available; `seal_bytes` requires randomness
 // ============================================================================
@@ -706,5 +739,55 @@ mod tests_randomized {
         let last = envelope.len() - 1;
         envelope[last] ^= 0x01;
         assert!(unseal_dm_from_sender(&recipient_sk, &envelope).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_client {
+    use super::*;
+
+    #[test]
+    fn a_blob_that_does_not_decrypt_is_an_error_not_a_panic() {
+        let member = SigningKey::from_bytes(&[3; 32]);
+        let secret = [5u8; 32];
+        let (ciphertext, nonce, ephemeral) =
+            encrypt_secret_for_member(&secret, &member.verifying_key());
+        let eph = ephemeral.to_bytes();
+        assert_eq!(
+            try_decrypt_secret_from_member_blob_raw(&ciphertext, &nonce, &eph, &member),
+            Ok(secret)
+        );
+        // Damaged, addressed to someone else, or not a secret's length: errors.
+        let mut damaged = ciphertext.clone();
+        damaged[0] ^= 1;
+        assert!(try_decrypt_secret_from_member_blob_raw(&damaged, &nonce, &eph, &member).is_err());
+        let other = SigningKey::from_bytes(&[4; 32]);
+        assert!(
+            try_decrypt_secret_from_member_blob_raw(&ciphertext, &nonce, &eph, &other).is_err()
+        );
+        assert!(try_decrypt_secret_from_member_blob_raw(&[], &nonce, &eph, &member).is_err());
+        // On a good blob it gives what the delegate's own function gives.
+        assert_eq!(
+            try_decrypt_secret_from_member_blob_raw(&ciphertext, &nonce, &eph, &member),
+            decrypt_secret_from_member_blob_raw(&ciphertext, &nonce, &eph, &member)
+        );
+    }
+
+    /// A blob that decrypts, but to something other than a 32-byte secret, is an error.
+    #[test]
+    fn a_blob_that_is_not_a_secret_is_an_error() {
+        let member = SigningKey::from_bytes(&[6; 32]);
+        let ephemeral = X25519EphemeralSecret::from([8u8; 32]);
+        let eph = X25519PublicKey::from(&ephemeral).to_bytes();
+        let shared =
+            ephemeral.diffie_hellman(&ed25519_to_x25519_public_key(&member.verifying_key()));
+        let key = Sha256::digest(shared.as_bytes());
+        let nonce = [0u8; 12];
+        let short = Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .encrypt(&Nonce::from(nonce), [1u8; 16].as_slice())
+            .unwrap();
+        let e = try_decrypt_secret_from_member_blob_raw(&short, &nonce, &eph, &member).unwrap_err();
+        assert!(e.contains("length"), "{e}");
     }
 }

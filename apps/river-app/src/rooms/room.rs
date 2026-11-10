@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::ecies::{
-    decrypt_secret_from_member_blob_raw, decrypt_with_symmetric_key, unseal_bytes_with_secrets,
+    decrypt_with_symmetric_key, try_decrypt_secret_from_member_blob_raw, unseal_bytes_with_secrets,
 };
 use river_core::room_state::content::{
     CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, ReplyContentV1, TextContentV1,
@@ -130,6 +130,14 @@ impl LiveRoom {
         self.nickname(id, me)
     }
 
+    /// Every secret this member holds for the room, by version, ascending: what an invitation
+    /// to a private room carries (the web UI's `collect_invitation_secrets`).
+    pub fn secrets_by_version(&self) -> Vec<(u32, [u8; 32])> {
+        let mut all: Vec<(u32, [u8; 32])> = self.secrets.iter().map(|(v, s)| (*v, *s)).collect();
+        all.sort_by_key(|(v, _)| *v);
+        all
+    }
+
     pub fn is_private(&self) -> bool {
         self.stored
             .room_state
@@ -188,7 +196,7 @@ impl LiveRoom {
                 if s.member_id != me {
                     continue;
                 }
-                if let Ok(secret) = decrypt_secret_from_member_blob_raw(
+                if let Ok(secret) = try_decrypt_secret_from_member_blob_raw(
                     &s.ciphertext,
                     &s.nonce,
                     &s.sender_ephemeral_public_key,
@@ -516,7 +524,7 @@ impl Ids {
 /// Characters that draw nothing or reorder text, which a name could use to look like someone
 /// else's. A short list next to the web UI's `sanitize_display_name`
 /// (`ui/src/util/display_name.rs`), which also folds confusable characters.
-fn is_hidden(c: char) -> bool {
+pub(super) fn is_hidden(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'

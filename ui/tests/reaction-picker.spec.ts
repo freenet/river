@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { asTouchTablet, coarsePointer, committedRow, DRAG_PX, Fingers, nextFrames, openRoomWithComposer, revealFooter, rowKey, settle, submitMessage, wheelCancelled, withFingers } from "./example-room";
+import { asTouchTablet, coarsePointer, committedRow, DRAG_PX, Fingers, inlineFooter, nextFrames, openRoomWithComposer, revealFooter, rowKey, settle, submitMessage, wheelCancelled, withFingers } from "./example-room";
 import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import {
   expectAtReact,
@@ -50,6 +50,26 @@ function expandedRows(page: Page): Promise<string[]> {
       (b) => b.closest('[id^="msg-"]')!.id,
     ),
   );
+}
+
+/// The history's scroll, with `row`'s height.
+async function scrollWithRow(page: Page, row: Locator) {
+  return { ...(await scrollMetrics(page)), rowHeight: await row.evaluate((el) => el.getBoundingClientRect().height) };
+}
+
+/// Nothing scrolled, except the end hold taking `row`'s growth. On a desktop
+/// with a mouse a first reaction gives a row with none its footer line
+/// (main.css, "Controls at the end of the last line"). A reader at the end is
+/// held there, snapped to the very end: the scroll moves by that growth plus
+/// whatever was left to the end. Anyone else is not moved at all.
+function expectNothingScrolled(before: Awaited<ReturnType<typeof scrollWithRow>>, after: Awaited<ReturnType<typeof scrollWithRow>>) {
+  const moved = after.top - before.top;
+  if (before.toEnd <= 4) {
+    expect(after.toEnd, "a reader at the end is still there").toBeLessThanOrEqual(0.5);
+    expect(moved, "only by the row's growth and what was left to the end").toBeCloseTo(after.rowHeight - before.rowHeight + before.toEnd, 0);
+  } else {
+    expect(moved, "nothing scrolled").toBeCloseTo(0, 0);
+  }
 }
 
 async function expectOpenFor(page: Page, row: Locator) {
@@ -146,7 +166,7 @@ test.describe("The reaction picker", () => {
 
     // Read after focusing React, which Playwright's focus scrolls to.
     await openFromKeyboard(page, row);
-    const parked = (await scrollMetrics(page)).top;
+    const parked = await scrollWithRow(page, row);
     const first = picker(page).getByRole("button").first();
     const emoji = (await first.textContent())!.trim();
     await first.focus();
@@ -156,7 +176,7 @@ test.describe("The reaction picker", () => {
     await expect(row.getByTestId("reaction-chip")).toContainText(emoji);
     await expect(row.getByTestId("message-react-button"), "focus goes back to React").toBeFocused();
     await settle(page);
-    expect((await scrollMetrics(page)).top, "nothing scrolled").toBeCloseTo(parked, 0);
+    expectNothingScrolled(parked, await scrollWithRow(page, row));
 
     // Reopened, the reader's reaction is the highlighted one.
     await openFromKeyboard(page, row);
@@ -412,7 +432,7 @@ test.describe("The reaction picker", () => {
       await expectOpenFor(page, survivor);
     }
 
-    const parked = (await scrollMetrics(page)).top;
+    const parked = await scrollWithRow(page, survivor);
     const picked = (await emoji.textContent())!.trim();
     await page.keyboard.press("Enter");
     await expectClosed(page);
@@ -421,7 +441,7 @@ test.describe("The reaction picker", () => {
     await settle(page);
     expect(await callRiverTest(page, "messageSignsRecorded"), "one pick, signed once").toBe(signs + 1);
     expect(await liveReactFocused(), "focus goes back to the new React").toBe(true);
-    expect((await scrollMetrics(page)).top, "nothing scrolled").toBeCloseTo(parked, 0);
+    expectNothingScrolled(parked, await scrollWithRow(page, survivor));
   });
 
   // After a mouse pick, focus goes back to React from script, which is not
@@ -435,7 +455,7 @@ test.describe("The reaction picker", () => {
     const row = committedRow(page, "mouse focus target");
     const react = row.getByTestId("message-react-button");
     await openWithPointer(page, row);
-    const parked = (await scrollMetrics(page)).top;
+    const parked = await scrollWithRow(page, row);
     await picker(page).getByRole("button").first().click();
     await expectClosed(page);
     await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
@@ -458,7 +478,7 @@ test.describe("The reaction picker", () => {
       }, testid);
     const returned = await state("message-react-button");
     test.info().annotations.push({ type: "focus after a mouse pick", description: returned.focused ? "on React" : "not on React" });
-    expect((await scrollMetrics(page)).top, "nothing scrolled").toBeCloseTo(parked, 0);
+    expectNothingScrolled(parked, await scrollWithRow(page, row));
     if (!returned.focused) {
       // WebKit focuses no button on a click, so no focus is returned; React
       // keeps the hover reveal.
@@ -481,13 +501,22 @@ test.describe("The reaction picker", () => {
   });
 
   // On a long message React is at its foot, after the body, and the picker
-  // hangs from it there.
+  // hangs from it there. Where a row with no reactions keeps no footer line
+  // (a desktop with a mouse), it gets one reaction first, so React is on that
+  // line; the first reaction moving React down to it is
+  // message-actions-inline.spec.ts's.
   test("a reaction arriving while it is open moves React, and the picker with it", async ({ page }) => {
     await openRoomWithComposer(page);
     await callRiverTest(page, "appendMessage", Array.from({ length: 6 }, (_, i) => `reflow line ${i}`).join("\n\n"));
     const row = committedRow(page, "reflow line 5");
     await expect(row).toHaveCount(1);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
+    const seeded = await inlineFooter(page);
+    if (seeded) {
+      await callRiverTest(page, "addReactionsToNewest", ["👍"]);
+      await expect(row.getByTestId("reaction-chip")).toHaveCount(1);
+    } else {
+      await expect(row.getByTestId("reaction-chip")).toHaveCount(0);
+    }
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await openFromKeyboard(page, row);
     const before = await measurePicker(row);
@@ -497,7 +526,7 @@ test.describe("The reaction picker", () => {
     expectEveryEmojiUsable(before);
     expectInvokerUncovered(before);
     await callRiverTest(page, "addReactionsToNewest", ["🎉", "👀", "🔥"]);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(3);
+    await expect(row.getByTestId("reaction-chip")).toHaveCount(seeded ? 4 : 3);
     await nextFrames(page);
     const after = await measurePicker(row);
     expect(after.react.left - before.react.left, "premise: the chips moved React").toBeGreaterThan(20);
@@ -587,16 +616,19 @@ test.describe("Reaction picker placement", () => {
 
     test("it opens from React's left edge toward the free side", async ({ page }) => {
       await openRoomWithComposer(page);
-      // The rooms rail out, and the column against the window's left edge.
+      // The rail and avatar gutter out, and the column against the window's left edge.
       await page.evaluate(() => {
         let rail: Element | null = document.querySelector('[data-testid="room-list"]');
         while (rail && rail.parentElement && !rail.parentElement.classList.contains("app-root")) rail = rail.parentElement;
         (rail as HTMLElement).style.setProperty("display", "none", "important");
       });
-      await page.addStyleTag({ content: ".conversation-column { margin-inline: 0 !important; }" });
+      await page.addStyleTag({ content: ".conversation-column { margin-inline: 0 !important; } .msg-row { --msg-gutter: 0px; } .msg-gutter { visibility: hidden; }" });
       await deliverOffscreen(page, "start edge desktop");
-      for (let i = 0; i < 3; i++) await deliverOffscreen(page, `start desktop filler ${i}: ${"s".repeat(200)}`);
+      // A reaction keeps React on the left-hand footer line on desktop too.
+      await callRiverTest(page, "addReactionsToNewest", ["👍"]);
       const start = committedRow(page, "start edge desktop");
+      await expect(start.getByTestId("reaction-chip")).toHaveCount(1);
+      for (let i = 0; i < 3; i++) await deliverOffscreen(page, `start desktop filler ${i}: ${"s".repeat(200)}`);
       await start.evaluate((el) => el.scrollIntoView({ block: "center" }));
       await openFromKeyboard(page, start);
       const m = await measurePicker(start);
