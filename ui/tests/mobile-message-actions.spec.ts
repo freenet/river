@@ -42,8 +42,6 @@ function sheet(page: Page): Locator {
 /// Whether nothing opened: no sheet, and no tap reached one.
 async function expectNoSurface(page: Page) {
   await settle(page);
-  // Past the double-click window a mouse click waits out before opening.
-  await page.waitForTimeout(400);
   await expect(sheet(page)).toBeHidden();
 }
 
@@ -572,20 +570,38 @@ test.describe("Below 48rem", () => {
     await expect(dmRow.getByTestId("mobile-message-actions-entry")).toHaveCount(0);
   });
 
-  test("a double- or triple-click selects text in a narrow mouse window and opens nothing", async ({ page }) => {
-    test.skip(await hasTouch(page), "a mouse's multi-click; a finger opens at once");
+  test("a press opens it at once, with a mouse too, and a row takes no double-tap zoom", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
-    const word = own.getByTestId("message-body").locator("p").first();
-    await word.dblclick({ position: { x: 6, y: 6 } });
-    await expectNoSurface(page);
-    expect((await page.evaluate(() => window.getSelection()!.toString())).trim(), "a word is selected").not.toBe("");
-    await word.click({ position: { x: 6, y: 6 }, clickCount: 3 });
-    await expectNoSurface(page);
-    expect(await page.evaluate(() => window.getSelection()!.toString()), "the line is selected").toContain("own first row");
-    await page.evaluate(() => window.getSelection()!.removeAllRanges());
-    // A single click opens it, once the double-click window has passed.
+    // iOS Safari holds a tap's click back while a double tap could zoom.
+    expect(await own.evaluate((el) => getComputedStyle(el).touchAction)).toBe("manipulation");
+    // From the click to the dialog showing, timed in the page: a mouse click
+    // once waited out a 500ms double-click window first.
+    await page.evaluate(() => {
+      const w = window as unknown as { __sheetOpenedAfter?: number };
+      let clicked = 0;
+      document.addEventListener("click", () => { clicked = performance.now(); }, { capture: true, once: true });
+      const observer = new MutationObserver(() => {
+        if (!document.querySelector("dialog#mobile-message-sheet[open]")) return;
+        w.__sheetOpenedAfter = performance.now() - clicked;
+        observer.disconnect();
+      });
+      observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["open"] });
+    });
     await tapRow(page, own);
     await expect(sheet(page)).toBeVisible();
+    const after = await page.evaluate(() => (window as unknown as { __sheetOpenedAfter?: number }).__sheetOpenedAfter);
+    expect(after, "shown straight after the click").toBeLessThan(300);
+  });
+
+  test("the second click of a double-click on a row is not a tap", async ({ page }) => {
+    test.skip(await hasTouch(page), "a mouse's multi-click");
+    const { own } = await openRoomWithRows(page);
+    const { x, y } = await plainPointOf(own);
+    // Alone, with no first click before it: it opens nothing.
+    await page.mouse.move(x, y);
+    await page.mouse.down({ clickCount: 2 });
+    await page.mouse.up({ clickCount: 2 });
+    await expectNoSurface(page);
   });
 
   test("a contact whose release never reached a row does not make later taps a pinch", { tag: "@chromium-only" }, async ({ page }) => {

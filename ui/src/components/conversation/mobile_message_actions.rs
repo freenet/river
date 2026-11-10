@@ -15,12 +15,12 @@
 //! not see. A drag or scroll (a press that moved, or one the browser
 //! cancelled), a second finger, a press too old to be this click, and a tap
 //! that completes a text selection open nothing; touch scrolling and text
-//! selection themselves are left alone. A finger's tap opens at once; a mouse
-//! or pen click waits out the double-click window
-//! ([`ROW_DOUBLE_CLICK_WAIT_MS`]) and opens only if no other row click came
-//! and nothing was selected meanwhile, so a narrow mouse window keeps double-
-//! and triple-click selection (the second click is never a tap, and the
-//! sheet never opens under it).
+//! selection themselves are left alone. A tap or click opens at once, whatever
+//! the pointer: a mouse click does not wait out the double-click window, so in
+//! a narrow mouse window the first click of a double-click opens the sheet
+//! (the second click is never a tap). Rows take no double-tap zoom below
+//! 48rem (`touch-action: manipulation`, `main.css`), so iOS Safari does not
+//! hold the click back waiting for a second tap.
 //!
 //! Keyboard. Each row has one visually hidden native button
 //! ([`MobileActionsEntry`]), shown on keyboard focus, which opens the same
@@ -57,27 +57,13 @@ struct RowPress {
     /// Another finger landed during it (a pinch), or the browser cancelled
     /// it (it became a scroll).
     spoiled: bool,
-    /// A finger: it opens at once. A mouse or pen waits out the double-click
-    /// window ([`ROW_DOUBLE_CLICK_WAIT_MS`]).
-    touch: bool,
 }
-
-/// How long a mouse or pen click on a row waits before opening its actions,
-/// so that the first click of a double- or triple-click (which selects a word
-/// or a line) never opens the sheet over the text: any later click on a row
-/// cancels it, and so does a selection made meanwhile. 500ms is the Windows
-/// default double-click time, as the room description's click uses. A finger
-/// opens at once: a double tap does not select a word.
-const ROW_DOUBLE_CLICK_WAIT_MS: u64 = 500;
 
 thread_local! {
     static ROW_PRESS: std::cell::RefCell<Option<RowPress>> =
         const { std::cell::RefCell::new(None) };
     /// The touch or pen contacts down on message rows, by pointer id.
     static CONTACTS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// How many clicks rows have had. A click waiting out the double-click
-    /// window opens only if no row click came after it.
-    static ROW_CLICKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A `pointerdown` on `row`. A second contact while one is down spoils the
@@ -118,7 +104,6 @@ pub(super) fn note_row_press(row: &str, e: &PointerEvent) {
             y: point.y,
             at: super::now_ms(),
             spoiled: false,
-            touch: pointer_type == "touch",
         });
     });
 }
@@ -138,19 +123,6 @@ pub(super) fn note_row_release(e: &PointerEvent, cancelled: bool) {
             }
         });
     }
-}
-
-/// What a click on a row does to its sheet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RowTap {
-    Nothing,
-    /// A finger's tap, or a click with no press of its own (assistive
-    /// technology): open now.
-    Open,
-    /// A mouse or pen click: open once the double-click window has passed
-    /// with no other row click and no selection.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    OpenAfterWindow,
 }
 
 /// The message a row opens the sheet for, as the row renders it.
@@ -209,39 +181,20 @@ pub(super) fn open_sheet(
     });
 }
 
-/// A click on `target`'s row, from its handler: opens its sheet now, after
-/// the double-click window, or not at all ([`row_tap`]). Every row click,
-/// whatever it does, cancels a click still waiting. A row being edited opens
-/// nothing.
+/// A click on `target`'s row, from its handler: opens its sheet at once, or
+/// not at all ([`row_tap`]). A row being edited opens nothing.
 pub(super) fn row_clicked(
     surfaces: ReactionSurfaces,
     e: &MouseEvent,
     target: RowTarget,
     editing: bool,
 ) {
-    let click = ROW_CLICKS.with(|c| {
-        let next = c.get().wrapping_add(1);
-        c.set(next);
-        next
-    });
+    // Always consumes the press, an editing row's too.
     let tap = row_tap(e, &target.row);
-    if editing || tap == RowTap::Nothing {
+    if editing || !tap {
         return;
     }
-    let by_pointer = pointer_click(e);
-    if tap == RowTap::Open {
-        open_sheet(surfaces, target, Origin::Entry, by_pointer);
-        return;
-    }
-    crate::util::safe_spawn_local(async move {
-        crate::util::sleep(crate::util::millis(ROW_DOUBLE_CLICK_WAIT_MS)).await;
-        let still = ROW_CLICKS.with(|c| c.get()) == click
-            && narrow_now()
-            && !row_has_selection(&target.row);
-        if still {
-            open_sheet(surfaces, target, Origin::Entry, by_pointer);
-        }
-    });
+    open_sheet(surfaces, target, Origin::Entry, pointer_click(e));
 }
 
 /// Whether a non-empty text selection touches `row`.
@@ -274,16 +227,16 @@ fn row_has_selection(row: &str) -> bool {
 /// selection, from a press on this row that neither moved nor was spoiled. A
 /// click with no press of its own (assistive technology) counts. Consumes
 /// the press.
-fn row_tap(e: &MouseEvent, row: &str) -> RowTap {
+fn row_tap(e: &MouseEvent, row: &str) -> bool {
     let press = ROW_PRESS.with(|p| p.borrow_mut().take());
     if !narrow_now() {
-        return RowTap::Nothing;
+        return false;
     }
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::JsCast;
         let Some(mouse) = e.data().downcast::<web_sys::MouseEvent>().cloned() else {
-            return RowTap::Nothing;
+            return false;
         };
         // The second click of a double-click (or third of a triple) is the
         // reader selecting a word or line: never a tap.
@@ -294,30 +247,30 @@ fn row_tap(e: &MouseEvent, row: &str) -> RowTap {
             || mouse.shift_key()
             || mouse.alt_key()
         {
-            return RowTap::Nothing;
+            return false;
         }
         let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-            return RowTap::Nothing;
+            return false;
         };
         let Some(row_el) = document.get_element_by_id(&format!("msg-{row}")) else {
-            return RowTap::Nothing;
+            return false;
         };
         // The target may be a text node's parent, deep in the raw HTML.
         let Some(target) = mouse
             .target()
             .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
         else {
-            return RowTap::Nothing;
+            return false;
         };
         let target = match target.dyn_ref::<web_sys::Element>() {
             Some(el) => el.clone(),
             None => match target.parent_element() {
                 Some(el) => el,
-                None => return RowTap::Nothing,
+                None => return false,
             },
         };
         if !row_el.contains(Some(&target)) {
-            return RowTap::Nothing;
+            return false;
         }
         let excluded = target
             .closest(EXCLUDED)
@@ -325,28 +278,23 @@ fn row_tap(e: &MouseEvent, row: &str) -> RowTap {
             .flatten()
             .is_some_and(|control| row_el.contains(Some(&control)));
         if excluded {
-            return RowTap::Nothing;
+            return false;
         }
         if row_has_selection(row) {
-            return RowTap::Nothing;
+            return false;
         }
-        let tap = press_makes_tap(
+        press_makes_tap(
             press.as_ref(),
             row,
             f64::from(mouse.client_x()),
             f64::from(mouse.client_y()),
             super::now_ms(),
-        );
-        match press {
-            _ if !tap => RowTap::Nothing,
-            Some(p) if !p.touch => RowTap::OpenAfterWindow,
-            _ => RowTap::Open,
-        }
+        )
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = (e, row, press);
-        RowTap::Nothing
+        false
     }
 }
 
@@ -454,7 +402,6 @@ mod tests {
             y,
             at,
             spoiled: false,
-            touch: true,
         }
     }
 

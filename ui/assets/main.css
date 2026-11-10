@@ -484,6 +484,14 @@
         display: none;
     }
 
+    /* A tap on a row opens its sheet, so a double tap is not a zoom there.
+     * While double-tap zoom is on, iOS Safari holds a tap's click back until
+     * it knows no second tap is coming, and the sheet opened that much late.
+     * Panning and pinch zoom are unchanged. */
+    .msg-row {
+        touch-action: manipulation;
+    }
+
     .msg-reaction-row > .msg-action {
         opacity: 1;
         pointer-events: auto;
