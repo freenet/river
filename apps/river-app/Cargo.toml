@@ -24,7 +24,7 @@ rand = "0.8"
 # `the_wire_format_is_the_web_uis` (src/rooms/delegate.rs) fails when the lockfiles disagree.
 freenet-stdlib = { version = "=0.12.1", features = ["contract"] }
 freenet-scaffold = "0.2.2"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 ciborium = "0.2"
 bincode = "1"
 bs58 = "0.5"
