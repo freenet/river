@@ -18,7 +18,9 @@ use river_app::{Controller, NodeHost, RiverApp};
 
 fn main() {
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
-        println!("river {}", env!("CARGO_PKG_VERSION"));
+        // Not println!, which panics when stdout is a closed pipe.
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "river {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     // A headless run (`--snap`, `--tree`, `--script`, ...) gets a window with nothing behind

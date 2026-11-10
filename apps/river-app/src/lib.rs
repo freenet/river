@@ -473,8 +473,11 @@ fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
         Access::Unsupported => panel(
             t,
             "Freenet needs an update",
-            "To open your rooms, River needs Freenet 0.2.156 or newer. Update it (run \
-             `freenet update`, or install the latest from freenet.org), then try again.",
+            &format!(
+                "To open your rooms, River needs Freenet {} or newer. Update it (run \
+                 `freenet update`, or install the latest from freenet.org), then try again.",
+                rooms::grant::GRANT_NODE_VERSION
+            ),
             None,
             vec![rooms_retry_button(k), manual_install_button(k)],
         ),

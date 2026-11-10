@@ -472,6 +472,12 @@ mod tests {
     }
 
     #[test]
+    fn the_installer_never_installs_a_freenet_without_app_grants() {
+        let grants = parse_version(river_app::rooms::grant::GRANT_NODE_VERSION).unwrap();
+        assert!(grants <= MIN_INSTALL_VERSION);
+    }
+
+    #[test]
     fn the_latest_redirect_must_name_a_new_enough_release() {
         // Derived from the floor, so raising it at a release doesn't break this test.
         let base = "https://github.com/freenet/freenet-core/releases/tag/";
