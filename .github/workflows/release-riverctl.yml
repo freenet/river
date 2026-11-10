@@ -206,20 +206,56 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The tags, for scripts/previous-tag.sh.
+          fetch-depth: 0
+          persist-credentials: false
       - name: Download binary artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
+      # This create/upload/publish logic has no automated test; it was exercised
+      # against a stub `gh` (as the desktop release step was, see AGENTS.md).
       - name: Create or update GitHub release
         run: |
           set -euo pipefail
-          # Idempotent: if the release already exists (e.g. a re-run after a
-          # transient failure), upload/replace the assets instead of aborting.
-          if ! gh release create "$TAG" \
-                --title "riverctl v${VERSION}" \
-                --generate-notes \
-                dist/*; then
-            echo "Release $TAG already exists — uploading assets with --clobber"
-            gh release upload "$TAG" dist/* --clobber
+          # Generated notes start at the previous riverctl tag. Without it,
+          # GitHub picks the newest release of ANY tag family as "previous",
+          # which may be a river-desktop-v* release; with no previous riverctl
+          # tag at all, there are no generated notes.
+          prev="$(scripts/previous-tag.sh riverctl-v "$TAG")"
+          if [ -n "$prev" ]; then
+            echo "Notes start at $prev"
+            notes_args=(--generate-notes --notes-start-tag "$prev")
+          else
+            notes_args=(--notes "First release.")
           fi
+          # Idempotent: on a re-run after a transient failure, replace the
+          # assets of the release that already exists. Existence is checked
+          # first, so any other failure of `gh release create` fails the job
+          # with its real error. The release list includes drafts.
+          # $TAG is interpolated into the jq program. That is safe only because
+          # `verify` refuses any tag whose version is not cli/Cargo.toml's.
+          state="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                    --jq ".[] | select(.tag_name == \"$TAG\") | .draft")"
+          case "$state" in
+            "")
+              gh release create "$TAG" \
+                --title "riverctl v${VERSION}" \
+                "${notes_args[@]}" \
+                dist/* ;;
+            false)
+              echo "Release $TAG already exists; uploading assets with --clobber"
+              gh release upload "$TAG" dist/* --clobber ;;
+            true)
+              # `gh release create` makes a draft, uploads, then publishes; a
+              # run that died in between left this draft. riverctl releases are
+              # published, so finish the job.
+              echo "Release $TAG is a leftover draft; uploading assets and publishing it"
+              gh release upload "$TAG" dist/* --clobber
+              gh release edit "$TAG" --draft=false ;;
+            *)
+              echo "::error::More than one release exists for $TAG: $state"
+              exit 1 ;;
+          esac

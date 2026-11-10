@@ -48,3 +48,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.blake3]
 opt-level = 3
+
+# Release builds are what the desktop release workflow ships
+# (.github/workflows/release-desktop.yml). Strip debug info only: symbol names stay, so a
+# panic backtrace from a user still names functions.
+[profile.release]
+strip = "debuginfo"
+lto = "thin"
