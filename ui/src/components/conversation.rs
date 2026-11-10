@@ -3617,6 +3617,84 @@ fn take_fresh_press(record: &PressRecord, key: &str) -> Option<String> {
         .map(|(_, pointer_type, _)| pointer_type)
 }
 
+/// How long a finger rests on a reaction chip before its reactor list opens.
+const CHIP_HOLD_MS: u64 = 500;
+
+/// What Enter or Space on a reaction chip does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChipKey {
+    /// Toggle the chip's emoji as the reader's reaction, as a press does.
+    React,
+    /// Open the chip's reactor list.
+    OwnerList,
+}
+
+/// Enter and Space react. With Shift, at 48rem and wider, they open the
+/// reactor list; below 48rem there is none (the sheet lists who reacted).
+fn chip_key(narrow: bool, shift: bool) -> ChipKey {
+    if shift && !narrow {
+        ChipKey::OwnerList
+    } else {
+        ChipKey::React
+    }
+}
+
+/// A finger or pen held on a reaction chip, at 48rem and wider, opens its
+/// reactor list (#714): a press reacts, and touch has no hover `title`.
+/// Not a signal: nothing renders from it.
+#[derive(Default)]
+struct ChipHold {
+    /// The press being timed: its chip, and a generation that a later press
+    /// outdates.
+    pending: Option<(String, u32)>,
+    generation: u32,
+    /// The chip whose hold opened the list. The click its lift sends is not
+    /// a press.
+    held: Option<String>,
+}
+
+impl ChipHold {
+    /// A pointer went down on `key`. The generation to time, if this press
+    /// can become a hold.
+    fn press(&mut self, key: &str, pointer_type: &str, narrow: bool) -> Option<u32> {
+        self.held = None;
+        self.pending = None;
+        self.generation = self.generation.wrapping_add(1);
+        if narrow || !matches!(pointer_type, "touch" | "pen") {
+            return None;
+        }
+        self.pending = Some((key.to_string(), self.generation));
+        Some(self.generation)
+    }
+
+    /// The press lifted, left the chip or was cancelled (a scroll) first.
+    fn cancel(&mut self) {
+        self.pending = None;
+    }
+
+    /// The timer for `generation` ran out. The chip whose list opens, if
+    /// that press is still down.
+    fn fire(&mut self, generation: u32) -> Option<String> {
+        match self.pending.take() {
+            Some((key, pending)) if pending == generation => {
+                self.held = Some(key.clone());
+                Some(key)
+            }
+            other => {
+                self.pending = other;
+                None
+            }
+        }
+    }
+
+    /// A click on `key`: whether it is the lift of the hold that opened
+    /// that chip's list.
+    fn take_release(&mut self, key: &str) -> bool {
+        self.pending = None;
+        self.held.take().is_some_and(|held| held == key)
+    }
+}
+
 /// What a pointer of this type does to a chip: `Some(true)` opens the list,
 /// `Some(false)` removes, `None` is unknown.
 fn pointer_type_opens_owner_list(pointer_type: &str) -> Option<bool> {
@@ -4029,6 +4107,8 @@ fn MessageGroupComponent(
     // click consumes it; see `gesture_opens_owner_list` for why the click's
     // own type is not used.
     let chip_pressed_with: PressRecord = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
+    // A finger resting on a reaction chip in this group; see `ChipHold`.
+    let chip_hold = use_hook(|| Rc::new(std::cell::RefCell::new(ChipHold::default())));
     {
         // (key, message id) of the list that was open on the last run.
         let owners_focus = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
@@ -4734,6 +4814,13 @@ fn MessageGroupComponent(
                                                         let row_id_for_owners_key = row_id_for_chips.clone();
                                                         let chip_id = reaction_chip_id(&owners_key);
                                                         let chip_id_for_key = chip_id.clone();
+                                                        let chip_id_for_hold = chip_id.clone();
+                                                        let row_id_for_hold = row_id_for_chips.clone();
+                                                        let chip_hold_down = chip_hold.clone();
+                                                        let chip_hold_up = chip_hold.clone();
+                                                        let chip_hold_leave = chip_hold.clone();
+                                                        let chip_hold_cancel = chip_hold.clone();
+                                                        let chip_hold_click = chip_hold.clone();
                                                         let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
 
                                                         rsx! {
@@ -4811,7 +4898,7 @@ fn MessageGroupComponent(
                                                                     // A pill; your own reaction is the link
                                                                     // colour on the soft accent, like a mention.
                                                                     class: format!(
-                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold {}",
+                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold select-none [-webkit-touch-callout:none] {}",
                                                                         if is_user_reaction {
                                                                             "cursor-pointer border-[color-mix(in_srgb,var(--color-link)_50%,transparent)] bg-accent-soft text-link"
                                                                         } else {
@@ -4820,16 +4907,54 @@ fn MessageGroupComponent(
                                                                     ),
                                                                     title: "{tooltip}",
                                                                     onpointerdown: move |e: PointerEvent| {
+                                                                        let pointer_type = e.data().pointer_type();
+                                                                        let started = chip_hold_down.borrow_mut().press(
+                                                                            &owners_key_for_press,
+                                                                            &pointer_type,
+                                                                            mobile_surface::narrow_now(),
+                                                                        );
                                                                         record_press(
                                                                             &chip_pressed_with_down,
                                                                             &owners_key_for_press,
-                                                                            e.data().pointer_type(),
+                                                                            pointer_type,
                                                                         );
+                                                                        let Some(generation) = started else {
+                                                                            return;
+                                                                        };
+                                                                        let hold = chip_hold_down.clone();
+                                                                        let chip_id = chip_id_for_hold.clone();
+                                                                        let row = row_id_for_hold.clone();
+                                                                        crate::util::safe_spawn_local(async move {
+                                                                            crate::util::sleep(crate::util::millis(CHIP_HOLD_MS)).await;
+                                                                            // The chip, or its whole group, may have
+                                                                            // gone under the finger.
+                                                                            let Some((x, y)) = element_centre(&chip_id) else {
+                                                                                return;
+                                                                            };
+                                                                            let Some(key) = hold.borrow_mut().fire(generation) else {
+                                                                                return;
+                                                                            };
+                                                                            let popover = reaction_owners_popover_at(key, row, x, y);
+                                                                            crate::util::defer(move || {
+                                                                                reactions.owner_list_opened(open_reaction_owners);
+                                                                                open_reaction_owners.set(Some(popover));
+                                                                            });
+                                                                        });
                                                                     },
+                                                                    onpointerup: move |_| chip_hold_up.borrow_mut().cancel(),
+                                                                    onpointerleave: move |_| chip_hold_leave.borrow_mut().cancel(),
                                                                     onpointercancel: move |_| {
                                                                         chip_pressed_with_cancel.borrow_mut().take();
+                                                                        // A scroll that starts on the chip ends here.
+                                                                        chip_hold_cancel.borrow_mut().cancel();
                                                                     },
                                                                     onclick: move |e: MouseEvent| {
+                                                                        // The lift of the hold that opened the list is
+                                                                        // not a press.
+                                                                        if chip_hold_click.borrow_mut().take_release(&owners_key_for_click) {
+                                                                            chip_pressed_with_click.borrow_mut().take();
+                                                                            return;
+                                                                        }
                                                                         let click_y = e.client_coordinates().y;
                                                                         let click_x = e.client_coordinates().x;
                                                                         // Only this chip's own recent press counts.
@@ -5018,6 +5143,68 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chip_key_reacts_except_shift_at_48rem_and_wider() {
+        assert_eq!(chip_key(false, false), ChipKey::React);
+        assert_eq!(chip_key(false, true), ChipKey::OwnerList);
+        assert_eq!(chip_key(true, false), ChipKey::React);
+        assert_eq!(chip_key(true, true), ChipKey::React);
+    }
+
+    #[test]
+    fn chip_hold_times_a_finger_or_pen_at_48rem_and_wider_only() {
+        let mut hold = ChipHold::default();
+        assert!(hold.press("a", "touch", false).is_some());
+        assert!(hold.press("a", "pen", false).is_some());
+        assert!(hold.press("a", "mouse", false).is_none());
+        assert!(hold.press("a", "touch", true).is_none());
+    }
+
+    #[test]
+    fn chip_hold_that_fires_swallows_its_own_release_once() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        assert_eq!(hold.fire(generation), Some("a".to_string()));
+        assert!(hold.take_release("a"));
+        assert!(!hold.take_release("a"), "only once");
+    }
+
+    #[test]
+    fn chip_hold_release_belongs_to_the_held_chip_only() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.fire(generation);
+        assert!(!hold.take_release("b"));
+    }
+
+    #[test]
+    fn chip_hold_ended_early_never_fires() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.cancel();
+        assert_eq!(hold.fire(generation), None);
+        assert!(!hold.take_release("a"), "its click is a press");
+    }
+
+    #[test]
+    fn chip_hold_timer_of_an_earlier_press_does_not_fire_a_later_one() {
+        let mut hold = ChipHold::default();
+        let first = hold.press("a", "touch", false).unwrap();
+        hold.cancel();
+        let second = hold.press("a", "touch", false).unwrap();
+        assert_eq!(hold.fire(first), None);
+        assert_eq!(hold.fire(second), Some("a".to_string()));
+    }
+
+    #[test]
+    fn chip_hold_a_new_press_forgets_an_unclaimed_release() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.fire(generation);
+        hold.press("a", "mouse", false);
+        assert!(!hold.take_release("a"));
+    }
 
     /// A popover is revealed on the first mount after it opens, never on a
     /// re-mount, and another popover's mount does not use up the request.

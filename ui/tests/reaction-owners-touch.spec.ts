@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { asTouchTablet, coarsePointer, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp } from "./example-room";
+import { asTouchTablet, coarsePointer, holdChip, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -264,6 +264,41 @@ test.describe("Reaction owner list (#714)", () => {
       const added = await addOwnReaction(page);
       await removeOwnReaction(page, added);
     }
+  });
+});
+
+test.describe("Reaction chip held (#714)", () => {
+  test("a held finger opens the list; lifting it neither closes the list nor reacts", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+
+    const owners = page.getByTestId("reaction-owners");
+    const ownSelector = '[data-testid="reaction-chip"][title*="click to remove"]';
+    const own = await chipByOwnReaction(page, true);
+    const ownCount = await page.locator(ownSelector).count();
+    const names = namesFromTitle((await own.getAttribute("title")) ?? "");
+
+    const lift = await holdChip(page, own);
+    // Before the lift: nothing but the hold can have opened it.
+    await expect(owners).toBeVisible();
+    await expect(owners.getByTestId("reaction-remove")).toBeVisible();
+    await expect(owners.getByTestId("reaction-owner")).toHaveCount(names.length);
+    await lift();
+    await settle(page);
+    await expect(owners, "the lift's click does not close it").toBeVisible();
+    await expect(page.locator(ownSelector), "nor remove the reaction").toHaveCount(ownCount);
+    await owners.press("Escape");
+    await expect(owners).toHaveCount(0);
+
+    // A resting finger selects nothing and raises no callout.
+    expect(
+      await own.evaluate((el) => {
+        const s = getComputedStyle(el) as CSSStyleDeclaration & { webkitUserSelect?: string };
+        return s.userSelect || s.webkitUserSelect;
+      }),
+    ).toBe("none");
   });
 });
 

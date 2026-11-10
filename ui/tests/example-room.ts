@@ -318,6 +318,40 @@ export async function pressAt(page: Page, { x, y }: { x: number; y: number }) {
   else await page.mouse.click(x, y);
 }
 
+/// A pointer down on `chip`, held past the app's hold time (CHIP_HOLD_MS,
+/// 500). Returns the lift, which also sends the click a browser sends when
+/// the pointer lifts. Dispatched events: outside Chromium's input protocol
+/// Playwright has no touch hold, and the app decides a hold on the
+/// `pointerdown`'s type and a timer alone.
+export async function holdChip(page: Page, chip: Locator, pointerType: "touch" | "pen" | "mouse" = "touch"): Promise<() => Promise<void>> {
+  const fire = (type: string) =>
+    chip.evaluate(
+      (el, [type, pointerType]) => {
+        const r = el.getBoundingClientRect();
+        el.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            pointerId: 7,
+            pointerType,
+            isPrimary: true,
+            clientX: r.left + r.width / 2,
+            clientY: r.top + r.height / 2,
+          }),
+        );
+      },
+      [type, pointerType],
+    );
+  await chip.scrollIntoViewIfNeeded();
+  await fire("pointerdown");
+  await page.waitForTimeout(700);
+  return async () => {
+    await fire("pointerup");
+    await chip.evaluate((el) => (el as HTMLElement).click());
+  };
+}
+
 /// The message key a row's id carries (`msg-<key>`), as the mobile surfaces'
 /// `data-target-row` names it.
 export async function rowKey(row: Locator): Promise<string> {
