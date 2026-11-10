@@ -27,8 +27,8 @@ import { callRiverTest, rekeyThenClick } from "./river-test";
 // Below Tailwind's `md` (48rem) a signed message's trailing Reply, Edit and
 // Delete are hidden; a tap on the row opens the modal message sheet
 // (mobile_message_sheet.rs): the emoji row, who reacted, then those actions.
-// Its one reaction + stays visible and opens the same sheet, and so does a
-// reaction chip (mobile-reaction-popup.spec.ts has the reaction half).
+// Its one reaction + stays visible and opens the same sheet; a reaction chip
+// reacts with its emoji (mobile-reaction-popup.spec.ts has the reaction half).
 // Width alone decides: a narrow mouse window is mobile, a wide touch screen
 // keeps the desktop footer. These run on every project at the widths they
 // set, so the desktop projects are narrow mouse windows here.
@@ -174,7 +174,7 @@ test.describe("Below 48rem", () => {
     }
   });
 
-  test("controls inside a row keep their own behaviour; its chip and + open the same sheet", async ({ page, context }) => {
+  test("controls inside a row keep their own behaviour: a chip reacts, the + opens the sheet", async ({ page, context }) => {
     await openRoomWithComposer(page);
     // A link and a mention in raw message HTML, a reply strip, an author
     // name and avatar, a chip and the +.
@@ -208,15 +208,15 @@ test.describe("Below 48rem", () => {
     await callRiverTest(page, "appendMessage", "chip row");
     const chipRow = committedRow(page, "chip row");
     await expect(chipRow).toHaveCount(1);
-    await callRiverTest(page, "addReactionsToNewest", ["🎉"]);
-    await press(page, chipRow.getByTestId("reaction-chip"));
-    await expect(sheet(page), "a chip opens the row's sheet").toBeVisible();
-    await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(chipRow));
-    await expect(page.getByTestId("reaction-owners"), "not the desktop reactor list").toHaveCount(0);
-    await page.keyboard.press("Escape");
-    await expect(sheet(page)).toBeHidden();
+    await callRiverTest(page, "memberReactsToNewest", "🎉");
+    const chip = chipRow.getByTestId("reaction-chip");
+    await expect(chip).toContainText("1");
+    await press(page, chip);
+    await expect(chip, "a chip reacts with its emoji").toContainText("2");
+    await expectNoSurface(page);
+    await expect(page.getByTestId("reaction-owners"), "not the reactor list").toHaveCount(0);
     await press(page, chipRow.getByTestId("message-react-button"));
-    await expect(sheet(page), "the + opens the same sheet").toBeVisible();
+    await expect(sheet(page), "the + opens the sheet").toBeVisible();
     await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(chipRow));
     await page.keyboard.press("Escape");
     await expect(sheet(page)).toBeHidden();

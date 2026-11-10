@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { asTouchTablet, coarsePointer, holdChip, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp } from "./example-room";
+import { asTouchTablet, coarsePointer, holdChip, keyboardFocus, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp, withFingers } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -10,16 +10,15 @@ import { callRiverTest } from "./river-test";
 // either). The chip of your own reaction removed it on click, so the one
 // gesture a phone has destroyed the reaction instead of saying who left it.
 //
-// The fix keeps the desktop path (hover `title`, click removes your own
-// reaction) and, where a finger can be the pointer, opens a list of names
-// with an explicit Remove. Same pointer query as main.css:
-// `(hover: none), (any-pointer: coarse)`.
+// The fix added a list of names with an explicit Remove. A press of any kind
+// on a chip now reacts with its emoji (a tap, a click, Enter, Space), so the
+// list has its own gestures: a finger or pen held on the chip, or
+// Shift+Enter. A mouse still has the hover `title`.
 //
-// CI never caught this. No test read the names back on a coarse pointer, and
-// a `title` attribute can be present while remaining unreachable. This test
-// fails on mobile if the tap still does nothing or still removes the chip,
-// and fails on desktop if the tap starts opening the list or stops removing
-// your own reaction.
+// CI never caught #714. No test read the names back on a coarse pointer, and
+// a `title` attribute can be present while remaining unreachable. These
+// tests fail if a held finger does not show the names, if a press opens the
+// list instead of reacting, or if the lift of a hold reacts.
 
 function namesFromTitle(title: string): string[] {
   return title
@@ -94,27 +93,24 @@ async function pressChip(chip: Locator) {
 
 async function removeOwnReaction(page: Page, chip: Locator) {
   await chip.scrollIntoViewIfNeeded();
-  const messageId = await chip.evaluate((el) => el.closest('[id^="msg-"]')?.id ?? "");
   await pressChip(chip);
-  const owners = page.getByTestId("reaction-owners");
-  if (await coarsePointer(page)) {
-    await expect(owners).toBeVisible();
-    await owners.getByTestId("reaction-remove").click();
-    await expect(owners).toHaveCount(0);
-    await expect(chip).toHaveCount(0);
-    // The chip that opened the list is gone, so focus stays on the reaction
-    // line rather than going nowhere: another chip while one remains, else
-    // the message's footer React.
-    const message = page.locator(`[id="${messageId}"]`);
-    const nearest =
-      (await message.getByTestId("reaction-chip").count()) > 0
-        ? message.getByTestId("reaction-chip").first()
-        : message.getByTestId("message-react-button");
-    await expect(nearest).toBeFocused();
-  } else {
-    await expect(owners).toHaveCount(0);
-  }
   await expect(chip).toHaveCount(0);
+  await expect(page.getByTestId("reaction-owners"), "a press opens no list").toHaveCount(0);
+}
+
+/// A chip another member signed, on the newest message. Unlike a fixture
+/// chip it survives the state rebuild a real toggle does.
+async function signedChip(page: Page): Promise<Locator> {
+  await callRiverTest(page, "memberReactsToNewest", "🦀");
+  const row = page
+    .locator('[id^="msg-"]')
+    .filter({ has: page.getByTestId("reaction-chip").filter({ hasText: "🦀" }) })
+    .last();
+  const id = await row.getAttribute("id");
+  const chip = page.locator(`[id="${id}"]`).getByTestId("reaction-chip").filter({ hasText: "🦀" });
+  await chip.scrollIntoViewIfNeeded();
+  await expect(chip).toContainText("1");
+  return chip;
 }
 
 /// Scroll the history so `chip` is just out of view, without leaving the
@@ -166,13 +162,13 @@ async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
   return chip;
 }
 
-// The reactor list exists at 48rem and wider: below it a chip opens the
-// mobile message sheet, which lists who reacted (mobile-reaction-popup.spec.ts).
+// The reactor list exists at 48rem and wider: below it there is none, and the
+// mobile message sheet lists who reacted (mobile-reaction-popup.spec.ts).
 // So a phone project runs these at a touch tablet's width.
 test.beforeEach(async ({ page }) => asTouchTablet(page));
 
 test.describe("Reaction owner list (#714)", () => {
-  test("a coarse pointer can read who reacted; a fine pointer still removes on click", async ({
+  test("a press reacts with any pointer; a held finger reads who reacted", async ({
     page,
   }) => {
     await page.goto("/");
@@ -193,13 +189,12 @@ test.describe("Reaction owner list (#714)", () => {
     // desktop half and pass (freenet/river#714 review).
     expect(coarse).toBe(test.info().project.name.startsWith("mobile"));
 
+    // Reading, on fixture chips. A held finger opens the list; a mouse has
+    // the title, checked above.
     if (coarse) {
-      const ownCount = await page
-        .locator('[data-testid="reaction-chip"][title*="click to remove"]')
-        .count();
       const chipHeight = (await other.boundingBox())?.height ?? 0;
 
-      await pressChip(other);
+      let lift = await holdChip(page, other);
       await expect(owners).toBeVisible();
       await expect(owners.getByTestId("reaction-remove")).toHaveCount(0);
       await expect(owners.getByTestId("reaction-owner")).toHaveCount(
@@ -216,6 +211,7 @@ test.describe("Reaction owner list (#714)", () => {
       const heightAfter = (await other.boundingBox())?.height ?? 0;
       expect(heightAfter).toBeCloseTo(chipHeight, 0);
       await expectOnScreen(page, owners);
+      await lift();
 
       // The backdrop covers the rest of the history, so this tap dismisses
       // and does not leave a second popover open.
@@ -223,47 +219,29 @@ test.describe("Reaction owner list (#714)", () => {
       await expect(owners).toHaveCount(0);
       await expect(page.getByTestId("emoji-picker")).toBeHidden();
 
-      await pressChip(own);
+      lift = await holdChip(page, own);
       await expect(owners).toBeVisible();
       await expect(
         owners.getByTestId("reaction-owner").filter({ hasText: exactName("You") })
       ).toHaveCount(1);
       await expect(owners.getByTestId("reaction-remove")).toBeVisible();
-      // Tap shows the names. It must not remove the reaction.
-      await expect(
-        page.locator('[data-testid="reaction-chip"][title*="click to remove"]')
-      ).toHaveCount(ownCount);
-
+      await lift();
       await page.mouse.click(8, 8);
       await expect(owners).toHaveCount(0);
-
-      const added = await addOwnReaction(page);
-      await removeOwnReaction(page, added);
-    } else {
-      const otherCount = await page
-        .locator('[data-testid="reaction-chip"]:not([title*="click to remove"])')
-        .count();
-
-      await other.click();
-      await expect(owners).toHaveCount(0);
-      await expect(
-        page.locator('[data-testid="reaction-chip"]:not([title*="click to remove"])')
-      ).toHaveCount(otherCount);
-
-      // A fine pointer does not open the list. The click removes this chip.
-      // Wait for that message to drop it before adding another: the toggle
-      // is deferred, and a room-wide count is not stable (fixture chips
-      // that were never signed messages leave with the first real toggle).
-      const ownMessageId = await own.evaluate((el) => el.closest('[id^="msg-"]')?.id ?? "");
-      await own.click();
-      await expect(owners).toHaveCount(0);
-      await expect(
-        page.locator(`[id="${ownMessageId}"]`).locator('[data-testid="reaction-chip"][title*="click to remove"]')
-      ).toHaveCount(0);
-
-      const added = await addOwnReaction(page);
-      await removeOwnReaction(page, added);
     }
+
+    // Pressing, on a signed chip: a tap on a touch project, a click otherwise.
+    const crab = await signedChip(page);
+    await pressChip(crab);
+    await expect(crab, "someone else's chip takes the reader's reaction").toContainText("2");
+    await expect(crab).toHaveAttribute("title", /click to remove/);
+    await expect(owners, "a press opens no list").toHaveCount(0);
+    await pressChip(crab);
+    await expect(crab, "and gives it back").toContainText("1");
+    await expect(owners).toHaveCount(0);
+
+    const added = await addOwnReaction(page);
+    await removeOwnReaction(page, added);
   });
 });
 
@@ -306,7 +284,7 @@ test.describe("Reaction chip held (#714)", () => {
 // leaves focus on that chip, not on the React action at the message's top.
 test.describe("Reaction removed from the owner list", () => {
   test("focus stays on the reaction line while a chip remains", async ({ page }) => {
-    test.skip(!(await coarsePointer(page)), "the list opens only on a coarse pointer");
+    test.skip(!(await coarsePointer(page)), "a held finger opens the list on a coarse pointer");
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
@@ -323,9 +301,10 @@ test.describe("Reaction removed from the owner list", () => {
     await expect(own).toHaveCount(1);
     await expect(chips).toHaveCount(2);
 
-    await pressChip(own);
+    const lift = await holdChip(page, own);
     const owners = page.getByTestId("reaction-owners");
     await expect(owners).toBeVisible();
+    await lift();
     await owners.getByTestId("reaction-remove").click();
     await expect(own).toHaveCount(0);
     await expect(chips).toHaveCount(1);
@@ -338,7 +317,7 @@ test.describe("Reaction removed from the owner list", () => {
 // without moving the history (only an arrival moves the view).
 test.describe("Last reaction removed from the owner list", () => {
   test("focus goes to the footer React and the history stays put", async ({ page }) => {
-    test.skip(!(await coarsePointer(page)), "the list opens only on a coarse pointer");
+    test.skip(!(await coarsePointer(page)), "a held finger opens the list on a coarse pointer");
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
@@ -348,9 +327,10 @@ test.describe("Last reaction removed from the owner list", () => {
     const message = page.locator(`[id="${messageId}"]`);
     await expect(message.getByTestId("reaction-chip"), "premise: the message's only chip").toHaveCount(1);
 
-    await pressChip(chip);
+    const lift = await holdChip(page, chip);
     const owners = page.getByTestId("reaction-owners");
     await expect(owners).toBeVisible();
+    await lift();
     // Park the message out of view, so a focus that scrolled would show.
     await scrollChipOutOfView(page, chip);
     const parked = await historyScrollTop(page);
@@ -365,7 +345,7 @@ test.describe("Last reaction removed from the owner list", () => {
 });
 
 test.describe("Reaction chip from the keyboard (#714)", () => {
-  test("Enter and Space open the list, and closing it does not scroll the history", async ({
+  test("Enter and Space react; Shift+Enter opens the list, and closing it does not scroll the history", async ({
     page,
   }) => {
     await page.goto("/");
@@ -379,14 +359,14 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
 
     const owners = page.getByTestId("reaction-owners");
 
-    // Your own reaction: a key press opens the list, with Remove in it, and
-    // does not remove the reaction the way a mouse click does.
+    // Your own reaction: Shift+Enter opens the list, with Remove in it, and
+    // does not remove the reaction the way Enter alone does.
     const own = await chipByOwnReaction(page, true);
     const ownCount = await page
       .locator('[data-testid="reaction-chip"][title*="click to remove"]')
       .count();
     await own.focus();
-    await own.press("Enter");
+    await own.press("Shift+Enter");
     await expect(owners).toBeVisible();
     await expect(owners.getByTestId("reaction-remove")).toBeVisible();
     await expect(owners).toBeFocused();
@@ -397,12 +377,12 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await expect(owners).toHaveCount(0);
     await expect(own).toBeFocused();
 
-    // Space too. Then move the history so the chip is out of view while the
+    // Someone else's too. Then move the history so the chip is out of view while the
     // list is open: closing it puts focus back on the chip, and that must
     // not scroll the history back to it (only an arrival moves the view).
     const other = await chipByOwnReaction(page, false);
     await other.focus();
-    await other.press(" ");
+    await other.press("Shift+Enter");
     await expect(owners).toBeVisible();
     await expect(owners).toBeFocused();
     await scrollChipOutOfView(page, other);
@@ -413,66 +393,86 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await expect(other).toBeFocused();
     await settle(page);
     expect(await historyScrollTop(page)).toBeCloseTo(parked, 0);
+
+    // Without Shift, Enter and Space react, and focus stays on the chip.
+    const crab = await signedChip(page);
+    // The room's first real toggle rebuilds its state from signed messages,
+    // which drops the fixture chips and re-mounts the rows. Make it here,
+    // before focus is on the chip.
+    await pressChip(crab);
+    await expect(crab).toContainText("2");
+    await pressChip(crab);
+    await expect(crab).toContainText("1");
+    await settle(page);
+    await keyboardFocus(page, crab);
+    await page.keyboard.press("Enter");
+    await expect(crab).toContainText("2");
+    await expect(owners).toHaveCount(0);
+    await expect(crab).toBeFocused();
+    await page.keyboard.press("Space");
+    await expect(crab).toContainText("1");
+
+    // The reader's only chip leaves with the reaction: focus goes to the +.
+    const sole = await addOwnReaction(page);
+    const messageId = await sole.evaluate((el) => el.closest('[id^="msg-"]')!.id);
+    await keyboardFocus(page, sole);
+    await page.keyboard.press("Enter");
+    await expect(sole).toHaveCount(0);
+    await expect(page.locator(`[id="${messageId}"]`).getByTestId("message-react-button")).toBeFocused();
   });
 });
 
-test.describe("Reaction chip activated without a press (#714)", () => {
-  test("a click with no fresh press of its own opens the list, never removes", async ({
-    page,
-  }) => {
+test.describe("Reaction chip activated without a press", () => {
+  test("a click with no press of its own reacts, as a press does", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     await waitSettledAtBottom(page);
 
     const owners = page.getByTestId("reaction-owners");
-    const ownSelector = '[data-testid="reaction-chip"][title*="click to remove"]';
-    const own = await chipByOwnReaction(page, true);
-    const ownCount = await page.locator(ownSelector).count();
-
+    const crab = await signedChip(page);
     // What assistive technology does: a click event with no pointerdown.
-    await own.evaluate((el) => (el as HTMLElement).click());
-    await expect(owners).toBeVisible();
-    await expect(owners.getByTestId("reaction-remove")).toBeVisible();
-    await expect(page.locator(ownSelector)).toHaveCount(ownCount);
-    await owners.press("Escape");
+    await crab.evaluate((el) => (el as HTMLElement).click());
+    await expect(crab).toContainText("2");
     await expect(owners).toHaveCount(0);
-
-    // A mouse press on the chip dragged off it (no click there, and no
-    // pointercancel), then later a click with no press of its own. The old
-    // "mouse" press must not decide that click.
-    const box = await own.boundingBox();
-    expect(box).not.toBeNull();
-    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(box!.x + box!.width / 2, box!.y - 120, { steps: 4 });
-    await page.mouse.up();
-    await page.waitForTimeout(1_800);
-    await own.evaluate((el) => (el as HTMLElement).click());
-    await expect(owners).toBeVisible();
-    await expect(page.locator(ownSelector)).toHaveCount(ownCount);
+    await crab.evaluate((el) => (el as HTMLElement).click());
+    await expect(crab).toContainText("1");
   });
 });
 
 test.describe("Touchscreen with a mouse (#714)", { tag: "@chromium-only" }, () => {
   test.use({ hasTouch: true, viewport: { width: 1280, height: 800 } });
 
-  test("a mouse click removes and a tap opens the list", async ({ page }) => {
+  test("a mouse click and a tap both react; a real held finger opens the list", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     await waitSettledAtBottom(page);
     expect(await coarsePointer(page)).toBe(true);
+    const owners = page.getByTestId("reaction-owners");
 
     const clicked = await addOwnReaction(page);
     await clicked.click();
-    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
     await expect(clicked).toHaveCount(0);
+    await expect(owners).toHaveCount(0);
 
     const tapped = await addOwnReaction(page);
     await tapped.tap();
-    await expect(page.getByTestId("reaction-owners")).toBeVisible();
-    await expect(tapped).toHaveCount(1);
+    await expect(tapped).toHaveCount(0);
+    await expect(owners).toHaveCount(0);
+
+    // A real finger, through Chromium's input protocol: it rests on the
+    // chip, the list opens, and the click its lift sends is not a press.
+    const held = await addOwnReaction(page);
+    const box = (await held.boundingBox())!;
+    await withFingers(page, async (fingers) => {
+      await fingers.press([1, Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2)]);
+      await expect(owners).toBeVisible();
+      await fingers.lift();
+    });
+    await settle(page);
+    await expect(owners, "the lift does not close it").toBeVisible();
+    await expect(held, "nor remove the reaction").toHaveCount(1);
   });
 });
 
@@ -560,7 +560,7 @@ test.describe("Reactor list and picker hand off", () => {
     await chip.focus();
     const parked = await historyScrollTop(page);
 
-    await chip.press("Enter");
+    await chip.press("Shift+Enter");
     await expect(page.getByTestId("reaction-owners")).toBeFocused();
     expect(await surfaces(page)).toEqual({ picker: [], pickerOpen: false, owners: [id] });
 
@@ -574,7 +574,7 @@ test.describe("Reactor list and picker hand off", () => {
 
     // Picker to list.
     await chip.focus();
-    await page.keyboard.press("Enter");
+    await page.keyboard.press("Shift+Enter");
     await expect.poll(() => surfaces(page)).toEqual({ picker: [], pickerOpen: false, owners: [id] });
     await expect(page.getByTestId("reaction-owners")).toBeFocused();
     await settle(page);
@@ -582,17 +582,18 @@ test.describe("Reactor list and picker hand off", () => {
   });
 
   test("by touch", async ({ page }) => {
-    test.skip(!mobileProject(), "a finger opens the list only on a touch project");
+    test.skip(!mobileProject(), "a held finger, on a touch project");
     const { message, id, chip } = await reactedMessage(page);
     const react = message.getByTestId("message-react-button");
     const parked = await historyScrollTop(page);
 
-    // Picker to list: the tap on the chip closes the picker and opens the
-    // list on that same tap.
+    // Picker to list: a held finger on the chip closes the picker and opens
+    // the list.
     await react.tap();
     await expect.poll(() => surfaces(page)).toEqual({ picker: [id], pickerOpen: true, owners: [] });
-    await chip.tap();
+    const lift = await holdChip(page, chip);
     await expect.poll(() => surfaces(page)).toEqual({ picker: [], pickerOpen: false, owners: [id] });
+    await lift();
 
     // List to picker: the list's backdrop takes the first tap, which only
     // closes it, as it always has; the next opens the picker.

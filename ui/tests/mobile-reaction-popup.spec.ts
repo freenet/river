@@ -3,12 +3,14 @@ import {
   committedRow,
   expectTouchHeldUntilClosed,
   historyPoint,
+  holdChip,
   keyboardFocus,
   openReactionPopup,
   openRoomWithComposer,
   panelAtRest,
   press,
   pressAt,
+  reactTo,
   rowKey,
   settle,
   withFingers,
@@ -16,9 +18,10 @@ import {
 import { deliver } from "./history-geometry";
 import { callRiverTest, rekeyThenClick } from "./river-test";
 
-// Below 48rem a message's reaction +, a reaction chip and a tap on the row
-// open one message sheet (mobile_message_sheet.rs); these are its reaction
-// half (mobile-message-actions.spec.ts has the row taps and the actions).
+// Below 48rem a message's reaction + and a tap on the row open one message
+// sheet (mobile_message_sheet.rs); these are its reaction half
+// (mobile-message-actions.spec.ts has the row taps and the actions). A
+// reaction chip opens nothing: a press on it reacts with its emoji.
 // On top, the 16 choices the desktop picker has, in one row that scrolls
 // sideways: a tap on one reacts and closes it. Then who reacted. It has no
 // field, so it never asks for the software keyboard. It has no title or
@@ -205,16 +208,16 @@ test.describe("The mobile reaction popup", () => {
     await expect(page.locator("#chat-scroll-container"), "the rooms panel did not open").toBeVisible();
   });
 
-  test("a chip opens the sheet, which lists who reacted; dismissed, focus returns to the chip", async ({ page }) => {
+  test("a chip tap reacts with its emoji and opens nothing; the + opens the sheet, which lists who reacted", async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "memberReactsToNewest", "🎉");
-    const chip = chips(row);
-    await expect(chip).toHaveCount(1);
+    const party = chips(row).filter({ hasText: "🎉" });
+    await expect(party).toContainText("1");
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    await press(page, chip);
-    await expect(popup(page)).toBeVisible();
+
+    // Who reacted is in the sheet the + opens: the member, not the reader.
+    await openReactionPopup(page, row);
     await expect(popup(page)).toHaveAttribute("data-target-row", await rowKey(row));
-    await expect(page.getByTestId("reaction-owners"), "not the desktop reactor list").toHaveCount(0);
     const list = popup(page).getByTestId("mobile-sheet-reactors");
     await expect(list).toHaveAccessibleName("Who reacted");
     await expect(list.getByTestId("mobile-sheet-reaction")).toHaveCount(1);
@@ -234,13 +237,38 @@ test.describe("The mobile reaction popup", () => {
     await expect(choices(page).first(), "an emoji takes focus").toBeFocused();
     await page.keyboard.press("Escape");
     await expect(popup(page)).toBeHidden();
-    await expect(chip, "focus back on the chip it opened from").toBeFocused();
+    await expect(row.getByTestId("message-react-button"), "focus back on the +").toBeFocused();
 
-    // The reader joins in: the list then names them too, as "You".
+    // No reaction of the reader's yet: the tap adds theirs to the chip.
+    await press(page, party);
+    await expect(party).toContainText("2");
+    await expect(popup(page), "a chip never opens the sheet").toBeHidden();
+    await expect(page.getByTestId("reaction-owners"), "nor the reactor list").toHaveCount(0);
+
+    // The same chip again takes it back.
+    await press(page, party);
+    await expect(party).toContainText("1");
+
+    // Below 48rem a held finger is a tap once it lifts.
+    const lift = await holdChip(page, party);
+    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
+    await lift();
+    await expect(party).toContainText("2");
+    await expect(popup(page)).toBeHidden();
+    await press(page, party);
+    await expect(party).toContainText("1");
+
+    // Reacted with another emoji: the tap moves the reaction to the chip's.
     await openReactionPopup(page, row);
-    await press(page, palette(page).getByRole("button", { name: "React with 🎉" }));
-    await expect(chip).toContainText("2");
-    await press(page, chip);
+    await press(page, palette(page).getByRole("button", { name: "React with 👍" }));
+    await expect(chips(row)).toHaveCount(2);
+    await press(page, party);
+    await expect(chips(row), "the 👍 left with the switch").toHaveCount(1);
+    await expect(party).toContainText("2");
+    await expect(popup(page)).toBeHidden();
+
+    // The sheet then names the reader too, as "You".
+    await openReactionPopup(page, row);
     await expect(popup(page).getByTestId("mobile-sheet-reactor")).toHaveCount(2);
     await expect(popup(page).getByTestId("mobile-sheet-reactor").filter({ hasText: /^You$/ })).toHaveCount(1);
     await expect(palette(page).getByRole("button", { name: "Remove 🎉 reaction" }), "and it is their current one").toBeVisible();
@@ -268,7 +296,7 @@ test.describe("The mobile reaction popup", () => {
     expect(await outline(), "the keyboard's focus ring").not.toBe("none");
   });
 
-  test("Enter on a chip opens the sheet too", async ({ page }) => {
+  test("Enter and Space on a chip react too; when the chip leaves, focus goes to the +", async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "memberReactsToNewest", "🎉");
     const chip = chips(row);
@@ -276,10 +304,26 @@ test.describe("The mobile reaction popup", () => {
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await keyboardFocus(page, chip);
     await page.keyboard.press("Enter");
-    await expect(popup(page)).toBeVisible();
+    await expect(chip).toContainText("2");
+    await expect(popup(page)).toBeHidden();
+    await expect(chip, "focus stays on the chip").toBeFocused();
+    await page.keyboard.press("Space");
+    await expect(chip).toContainText("1");
+    // No reactor list below 48rem: with Shift it still reacts.
+    await page.keyboard.press("Shift+Enter");
+    await expect(chip).toContainText("2");
     await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
-    await page.keyboard.press("Escape");
-    await expect(chip).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(chip).toContainText("1");
+
+    // The reader's own chip with no one else on it leaves with the reaction.
+    await deliver(page, "own chip target");
+    const own = committedRow(page, "own chip target");
+    const ownChip = await reactTo(page, own);
+    await keyboardFocus(page, ownChip);
+    await page.keyboard.press("Enter");
+    await expect(chips(own)).toHaveCount(0);
+    await expect(own.getByTestId("message-react-button")).toBeFocused();
   });
 
   test("its message leaving closes it; a remount keeps it", { tag: "@chromium-only" }, async ({ page }) => {

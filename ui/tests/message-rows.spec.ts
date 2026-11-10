@@ -752,8 +752,8 @@ test.describe("Message row hover band", () => {
     await expect.poll(opacity).toBe("1");
   });
 
-  // The narrowest width with a reactor list: below 48rem a chip opens the
-  // mobile message sheet instead (mobile-reaction-popup.spec.ts).
+  // The narrowest width with a reactor list: below 48rem there is none, and
+  // the mobile message sheet lists who reacted (mobile-reaction-popup.spec.ts).
   test.describe("at a narrow width", () => {
     test.use({ viewport: { width: 768, height: 800 } });
 
@@ -777,7 +777,7 @@ test.describe("Message row hover band", () => {
       await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).max - short);
       await expect(chip).toBeInViewport({ ratio: 1 });
       await chip.focus();
-      await page.keyboard.press("Enter");
+      await page.keyboard.press("Shift+Enter");
       const owners = page.getByTestId("reaction-owners");
       await expect(owners).toBeVisible();
       await expect(chip).toHaveAttribute("aria-expanded", "true");

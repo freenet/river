@@ -153,7 +153,7 @@ test("a second click on a reaction still being signed undoes it", { tag: "@chrom
 
   await callRiverTest(page, "holdMessageSigning");
   const chip = await reactTo(page, row);
-  // A fine pointer removes its own reaction on click.
+  // A click on its own chip takes the reaction back.
   await chip.click();
   await expect(row.getByTestId("reaction-chip"), "the pending reaction is undone").toHaveCount(0);
 
