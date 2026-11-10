@@ -33,7 +33,7 @@ const RELEASE_PUBKEY: [u8; 32] = [
 
 /// The oldest Freenet release this installer will install. Raise it to the current Freenet
 /// release with each River app release (see the module comment).
-pub const MIN_INSTALL_VERSION: Version = Version(0, 2, 155);
+pub const MIN_INSTALL_VERSION: Version = Version(0, 2, 156);
 
 /// The oldest running Freenet node River works with. Raise it only when River needs something
 /// a newer node provides: nodes update over hours to days, and raising it ahead of that tells
@@ -469,6 +469,12 @@ mod tests {
     #[test]
     fn river_never_requires_a_newer_node_than_it_would_install() {
         assert!(MIN_NODE_VERSION <= MIN_INSTALL_VERSION);
+    }
+
+    #[test]
+    fn the_installer_never_installs_a_freenet_without_app_grants() {
+        let grants = parse_version(river_app::rooms::grant::GRANT_NODE_VERSION).unwrap();
+        assert!(grants <= MIN_INSTALL_VERSION);
     }
 
     #[test]

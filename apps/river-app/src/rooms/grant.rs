@@ -26,6 +26,10 @@ pub const RIVER_WEB_APP: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
 /// The name the approval page shows (labelled there as unverified).
 pub const CLIENT_NAME: &str = "River desktop app";
 
+/// The first freenet-core release with app grants. A node that answers the grant routes with
+/// 404 or 405 ([`GrantOutcome::Unsupported`]) is older than this.
+pub const GRANT_NODE_VERSION: &str = "0.2.156";
+
 const ROUTE_REQUEST: &str = "/v1/app-grants/request";
 
 /// How long to wait before polling again after a refusal the node answered at once. The node
@@ -90,7 +94,7 @@ pub enum GrantOutcome {
     Denied,
     /// The request expired before it was answered (or the node forgot it).
     Expired,
-    /// The node has no grant routes: it is older than freenet-core 0.2.156.
+    /// The node has no grant routes: it is older than [`GRANT_NODE_VERSION`].
     Unsupported,
     /// The node refused for a reason the user has to act on (the message says what).
     Refused(String),
