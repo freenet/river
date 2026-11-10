@@ -345,6 +345,10 @@ fi
 
 strip_comments() { grep -v '^[[:space:]]*#'; }
 
+# Under `set -o pipefail`, never pipe into `grep -q`: it exits at the first
+# match, the writer can then die of SIGPIPE, and pipefail turns a match into a
+# failure, at random. Feed grep -q a here-string instead.
+
 if build_block="$(toml_task_block "$makefile" build-ui-example-no-sync)"; then
     build_block="$(printf '%s\n' "$build_block" | strip_comments)"
     deps="$(printf '%s\n' "$build_block" | grep '^dependencies = ' || true)"
@@ -359,9 +363,9 @@ if build_block="$(toml_task_block "$makefile" build-ui-example-no-sync)"; then
             "dependencies: ${deps:-<none>}" "missing: ${missing[*]:-}"
     fi
 
-    if printf '%s\n' "$build_block" | grep -qx 'command = "dx"' &&
-        printf '%s\n' "$build_block" | grep -qx 'cwd = "./ui"' &&
-        printf '%s\n' "$build_block" | grep -q 'UI_FEATURES = "example-data,no-sync"'; then
+    if grep -qx 'command = "dx"' <<<"$build_block" &&
+        grep -qx 'cwd = "./ui"' <<<"$build_block" &&
+        grep -q 'UI_FEATURES = "example-data,no-sync"' <<<"$build_block"; then
         ok "build-ui-example-no-sync still runs dx from ui/ with example-data,no-sync"
     else
         fail "build-ui-example-no-sync still runs dx from ui/ with example-data,no-sync" \
@@ -373,8 +377,8 @@ fi
 
 if clean_block="$(toml_task_block "$makefile" clean-ui-example-output)" &&
     clean_code="$(printf '%s\n' "$clean_block" | strip_comments)" &&
-    printf '%s\n' "$clean_code" | grep -qx 'command = "bash"' &&
-    printf '%s\n' "$clean_code" | grep -qx 'args = \["scripts/clean-ui-example-output\.sh"\]'; then
+    grep -qx 'command = "bash"' <<<"$clean_code" &&
+    grep -qx 'args = \["scripts/clean-ui-example-output\.sh"\]' <<<"$clean_code"; then
     ok "clean-ui-example-output runs scripts/clean-ui-example-output.sh"
 else
     fail "clean-ui-example-output runs scripts/clean-ui-example-output.sh" \
@@ -382,7 +386,7 @@ else
 fi
 
 if touch_block="$(toml_task_block "$makefile" touch-ui-files)" &&
-    printf '%s\n' "$touch_block" | strip_comments | grep -qx 'touch ui/src/main.rs'; then
+    grep -qx 'touch ui/src/main.rs' <<<"$(strip_comments <<<"$touch_block")"; then
     ok "touch-ui-files still touches ui/src/main.rs"
 else
     fail "touch-ui-files still touches ui/src/main.rs" "${touch_block:-<task not found>}"
@@ -421,7 +425,7 @@ fi
 serve_code="$(strip_comments <"$serve_script")"
 if [[ "$serve_code" == *"--bind 127.0.0.1"* && "$serve_code" == *"http.server 8082 "* &&
     "$serve_code" == *"http://127.0.0.1:8082/"* ]] &&
-    printf '%s\n' "$job_code" | grep -q 'PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082$'; then
+    grep -q 'PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082$' <<<"$job_code"; then
     ok "the server binds 127.0.0.1:8082 and Playwright targets it explicitly"
 else
     fail "the server binds 127.0.0.1:8082 and Playwright targets it explicitly"
