@@ -332,6 +332,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2245,7 +2251,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "axum",
- "bincode",
+ "bincode 1.3.3",
  "blake3",
  "boot-time",
  "bs58",
@@ -2398,7 +2404,7 @@ version = "0.1.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c76c2f57fed646bf8b70f34bf9390060227069cb8f3646533a273a634c5c5b69"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "blake3",
  "bs58",
  "byteorder",
@@ -2427,7 +2433,7 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c3ac04f50790cc912697afa60d303a9d3efff2a70e5f787192b7cd053ae2fb9"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "blake3",
  "bs58",
  "byteorder",
@@ -2457,7 +2463,7 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "blake3",
  "bs58",
  "byteorder",
@@ -4842,7 +4848,7 @@ version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
- "bincode",
+ "bincode 3.0.0",
  "blake3",
  "bs58",
  "ciborium",
