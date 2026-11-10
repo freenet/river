@@ -215,6 +215,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # This create/upload/publish logic has no automated test; it was exercised
+      # against a stub `gh` (as the desktop release step was, see AGENTS.md).
       - name: Create or update GitHub release
         run: |
           set -euo pipefail
@@ -233,14 +235,27 @@ jobs:
           # assets of the release that already exists. Existence is checked
           # first, so any other failure of `gh release create` fails the job
           # with its real error. The release list includes drafts.
-          existing="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
-                       --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
-          if [ -n "$existing" ]; then
-            echo "Release $TAG already exists; uploading assets with --clobber"
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" \
-              --title "riverctl v${VERSION}" \
-              "${notes_args[@]}" \
-              dist/*
-          fi
+          # $TAG is interpolated into the jq program. That is safe only because
+          # `verify` refuses any tag whose version is not cli/Cargo.toml's.
+          state="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                    --jq ".[] | select(.tag_name == \"$TAG\") | .draft")"
+          case "$state" in
+            "")
+              gh release create "$TAG" \
+                --title "riverctl v${VERSION}" \
+                "${notes_args[@]}" \
+                dist/* ;;
+            false)
+              echo "Release $TAG already exists; uploading assets with --clobber"
+              gh release upload "$TAG" dist/* --clobber ;;
+            true)
+              # `gh release create` makes a draft, uploads, then publishes; a
+              # run that died in between left this draft. riverctl releases are
+              # published, so finish the job.
+              echo "Release $TAG is a leftover draft; uploading assets and publishing it"
+              gh release upload "$TAG" dist/* --clobber
+              gh release edit "$TAG" --draft=false ;;
+            *)
+              echo "::error::More than one release exists for $TAG: $state"
+              exit 1 ;;
+          esac

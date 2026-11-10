@@ -556,6 +556,8 @@ jobs:
           # Does a release for this tag exist, and is it a draft? The release
           # list includes drafts (for a token with write access); any API error
           # fails the step here instead of being taken for "not found".
+          # $TAG is interpolated into the jq program. That is safe only because
+          # `verify` refuses any tag whose version is not apps/Cargo.toml's.
           state="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
                     --jq ".[] | select(.tag_name == \"$TAG\") | .draft")"
           case "$state" in
