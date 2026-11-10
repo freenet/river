@@ -68,7 +68,9 @@ if [ "${1:-}" = "--ci" ]; then
     echo ""
 
     # The head branch's legacy_delegates.toml must contain the base hash
-    if git show "$HEAD_SHA:$TOML_PATH" | known_hashes_from_stdin | grep -qF "$BASE_HASH"; then
+    # A here-string, not a pipe into grep -q: under pipefail the writer can die of
+    # SIGPIPE when grep -q exits early, turning a match into a failure.
+    if grep -qF "$BASE_HASH" <<<"$(git show "$HEAD_SHA:$TOML_PATH" | known_hashes_from_stdin || true)"; then
         echo "Old hash found in legacy_delegates.toml — migration entry exists."
         exit 0
     fi
@@ -106,7 +108,7 @@ else
     echo "Committed WASM was modified in working tree: $HEAD_HASH -> $WORKING_HASH"
     echo ""
 
-    if grep '^code_hash' "$TOML_PATH" | grep -qF "$HEAD_HASH"; then
+    if grep -qF "$HEAD_HASH" <<<"$(grep '^code_hash' "$TOML_PATH" || true)"; then
         echo "Old hash found in legacy_delegates.toml — migration entry exists."
         exit 0
     fi
