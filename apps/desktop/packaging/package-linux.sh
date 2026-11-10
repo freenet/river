@@ -66,7 +66,7 @@ EOF
 mtime="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" log -1 --format=%ct)}"
 mkdir -p "$OUT_DIR"
 ARCHIVE="$(cd "$OUT_DIR" && pwd)/$NAME.tar.gz"
-tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" \
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$mtime" --mode=u+rwX,go+rX,go-w \
     -C "$STAGE" -cf - "$NAME" | gzip -n -9 > "$ARCHIVE"
 
 # The newest glibc symbol version the binary needs is the oldest glibc it runs on.

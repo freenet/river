@@ -23,7 +23,10 @@ fn windows_resource() {
         .set("ProductName", "River")
         .set("FileDescription", "River")
         .set("CompanyName", "Freenet Project Inc")
-        .set("LegalCopyright", "Freenet Project Inc. Licensed under LGPL-3.0-only.")
+        .set(
+            "LegalCopyright",
+            "Freenet Project Inc. Licensed under LGPL-3.0-only.",
+        )
         .set("OriginalFilename", "river.exe")
         .set("InternalName", "river");
     // A build that silently ships without its icon and version would only be noticed by a
