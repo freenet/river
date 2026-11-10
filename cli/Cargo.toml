@@ -1,6 +1,6 @@
 [package]
 name = "riverctl"
-version = "0.2.25"
+version = "0.2.26"
 edition = "2021"
 authors = ["Freenet Project"]
 description = "Command-line interface for River decentralized chat on Freenet"
@@ -71,6 +71,14 @@ ciborium = "0.2.2"
 # Cryptography (for signing operations)
 blake3.workspace = true
 ed25519-dalek = "2.1.1"
+# For `private_room::try_decrypt_member_secret`, a non-panicking copy of
+# river-core's member-blob decrypt (#874). These are river-core's own `ecies`
+# dependencies, so the lockfile gains no packages. They are not a river-core
+# feature because changing river-core's version re-keys the room contract and
+# chat delegate (.claude/rules/delegate-migration.md).
+aes-gcm.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
 rand = "0.8.5"
 base64 = "0.22.1"
 bs58 = "0.5.1"
