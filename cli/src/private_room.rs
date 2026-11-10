@@ -107,7 +107,7 @@ pub fn collect_secrets_for_room(
 /// does not have that function, and bumping river-core's version re-keys the
 /// room contract and chat delegate (`.claude/rules/delegate-migration.md`).
 /// Switch to the river-core function at the next river-core release that
-/// re-keys anyway. `try_decrypt_matches_river_core_decrypt` pins the two
+/// re-keys anyway (#880). `try_decrypt_matches_river_core_decrypt` pins the two
 /// constructions together.
 fn try_decrypt_member_secret(
     ciphertext: &[u8],
@@ -2231,5 +2231,98 @@ mod tests {
             &fresh_signing_key()
         )
         .is_err());
+    }
+
+    /// State whose only current-version (v0) blob is addressed to `owner` but
+    /// does not decrypt, so the caller has to fall back or refuse.
+    fn state_with_damaged_current_blob(owner: &SigningKey) -> ChatRoomStateV1 {
+        let mut state = state_with_privacy(owner, PrivacyMode::Private);
+        let mut bad = owner_blob(owner, &owner.verifying_key(), 0, generate_room_secret());
+        bad.secret.ciphertext[0] ^= 0xff;
+        state.secrets.encrypted_secrets.push(bad);
+        state.secrets.current_version = 0;
+        state
+    }
+
+    /// `seal_invitee_nickname` falls back to the invitation secret when the
+    /// current-version blob does not decrypt (#874: before, the decrypt
+    /// panicked and the invitation secret was never reached).
+    #[test]
+    fn seal_invitee_nickname_falls_back_to_invitation_when_blob_is_damaged() {
+        let owner = fresh_signing_key();
+        let state = state_with_damaged_current_blob(&owner);
+        let invitation_secret = generate_room_secret();
+        let inv = HashMap::from([(0u32, invitation_secret)]);
+        let sealed = seal_invitee_nickname(&state, &owner, &inv, "alice")
+            .expect("the invitation secret seals the nickname");
+        let secrets = HashMap::from([(0u32, invitation_secret)]);
+        assert_eq!(
+            river_core::ecies::unseal_bytes_with_secrets(&sealed, &secrets).unwrap(),
+            b"alice"
+        );
+        assert_eq!(
+            seal_invitee_nickname(&state, &owner, &HashMap::new(), "alice"),
+            None,
+            "without an invitation secret there is nothing to seal under"
+        );
+    }
+
+    /// Sending into a private room whose current-version blob does not
+    /// decrypt returns the "no secret" error instead of aborting, and seals
+    /// under the invitation secret when there is one (#874).
+    #[test]
+    fn build_message_body_with_damaged_blob_errors_or_uses_invitation() {
+        let owner = fresh_signing_key();
+        let state = state_with_damaged_current_blob(&owner);
+
+        let err = build_message_body(&state, &owner, &HashMap::new(), "hi".to_string())
+            .expect_err("no usable secret, so the send is refused");
+        assert!(err.contains("no secret available"), "got: {err}");
+
+        let invitation_secret = generate_room_secret();
+        let inv = HashMap::from([(0u32, invitation_secret)]);
+        match build_message_body(&state, &owner, &inv, "hi".to_string())
+            .expect("the invitation secret seals the body")
+        {
+            RoomMessageBody::Private {
+                ciphertext, nonce, ..
+            } => {
+                let plaintext = decrypt_with_symmetric_key(&invitation_secret, &ciphertext, &nonce)
+                    .expect("sealed under the invitation secret");
+                assert_eq!(TextContentV1::decode(&plaintext).unwrap().text, "hi");
+            }
+            RoomMessageBody::Public { .. } => panic!("private room must seal the body"),
+        }
+    }
+
+    /// A blob that decrypts but is not 32 bytes is an error, not a panic.
+    /// `encrypt_secret_for_member` only makes 32-byte blobs, so this builds
+    /// one by hand with the same construction.
+    #[test]
+    fn try_decrypt_rejects_wrong_length_plaintext() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        use sha2::{Digest, Sha256, Sha512};
+
+        let member = fresh_signing_key();
+        let h = Sha512::digest(member.to_bytes());
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(&h[..32]);
+        let member_x = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(scalar));
+        let ephemeral_sk =
+            x25519_dalek::StaticSecret::from(rand::Rng::gen::<[u8; 32]>(&mut rand::thread_rng()));
+        let ephemeral_pk = x25519_dalek::PublicKey::from(&ephemeral_sk);
+        let key = Sha256::digest(ephemeral_sk.diffie_hellman(&member_x).as_bytes());
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = [7u8; 12];
+        for len in [31usize, 33] {
+            let ciphertext = cipher
+                .encrypt(&Nonce::from(nonce), vec![0x5au8; len].as_slice())
+                .unwrap();
+            let err =
+                try_decrypt_member_secret(&ciphertext, &nonce, &ephemeral_pk.to_bytes(), &member)
+                    .expect_err("a non-32-byte secret is rejected");
+            assert!(err.contains("invalid length"), "got: {err}");
+        }
     }
 }
