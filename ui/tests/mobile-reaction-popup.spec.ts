@@ -6,6 +6,7 @@ import {
   keyboardFocus,
   openReactionPopup,
   openRoomWithComposer,
+  panelAtRest,
   press,
   pressAt,
   rowKey,
@@ -221,6 +222,8 @@ test.describe("The mobile reaction popup", () => {
     const names = await list.getByTestId("mobile-sheet-reactor").allTextContents();
     expect(names, "the member who reacted, not the reader").toHaveLength(1);
     expect(names[0]).not.toBe("You");
+    // Not mid-slide: the three boxes are read one after another.
+    await panelAtRest(page, POPUP);
     const [paletteBox, listBox, actionsBox] = [
       await palette(page).boundingBox(),
       await list.boundingBox(),

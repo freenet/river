@@ -390,22 +390,27 @@ export async function tapRow(page: Page, row: Locator) {
   await pressAt(page, await plainPointOf(row));
 }
 
-/// Below 48rem: open `row`'s actions sheet with a tap on the row, and check
-/// it is for that row.
+/// Below 48rem: open `row`'s actions sheet with a tap on the row, check it
+/// is for that row, and wait for its opening slide to end: until then the
+/// panel is partly below the screen, so a point measured in it is not where
+/// it will be, or is on nothing.
 export async function openMessageActions(page: Page, row: Locator) {
   await tapRow(page, row);
   const sheet = page.getByTestId("mobile-message-sheet");
   await expect(sheet).toBeVisible();
   await expect(sheet).toHaveAttribute("data-target-row", await rowKey(row));
+  await panelAtRest(page, "mobile-message-sheet");
 }
 
-/// Below 48rem: open `row`'s reaction popup with its +, and check it is for
-/// that row.
+/// Below 48rem: open `row`'s reaction popup with its +, check it is for
+/// that row, and wait for its opening slide to end (see
+/// `openMessageActions`).
 export async function openReactionPopup(page: Page, row: Locator) {
   await press(page, row.getByTestId("message-react-button"));
   const popup = page.getByTestId("mobile-message-sheet");
   await expect(popup).toBeVisible();
   await expect(popup).toHaveAttribute("data-target-row", await rowKey(row));
+  await panelAtRest(page, "mobile-message-sheet");
 }
 
 /// A point over the history's top, below the header.
