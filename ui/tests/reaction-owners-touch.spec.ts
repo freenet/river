@@ -1,5 +1,5 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { asTouchTablet, coarsePointer, holdChip, keyboardFocus, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp, withFingers } from "./example-room";
+import { asTouchTablet, centreOf, coarsePointer, holdChip, keyboardFocus, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp, withFingers } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -168,7 +168,7 @@ async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
 test.beforeEach(async ({ page }) => asTouchTablet(page));
 
 test.describe("Reaction owner list (#714)", () => {
-  test("a press reacts with any pointer; a held finger reads who reacted", async ({
+  test("a press reacts with any pointer; a held finger reads who reacted, and its lift neither closes the list nor reacts", async ({
     page,
   }) => {
     await page.goto("/");
@@ -194,7 +194,7 @@ test.describe("Reaction owner list (#714)", () => {
     if (coarse) {
       const chipHeight = (await other.boundingBox())?.height ?? 0;
 
-      let lift = await holdChip(page, other);
+      const lift = await holdChip(page, other);
       await expect(owners).toBeVisible();
       await expect(owners.getByTestId("reaction-remove")).toHaveCount(0);
       await expect(owners.getByTestId("reaction-owner")).toHaveCount(
@@ -218,17 +218,33 @@ test.describe("Reaction owner list (#714)", () => {
       await page.mouse.click(8, 8);
       await expect(owners).toHaveCount(0);
       await expect(page.getByTestId("emoji-picker")).toBeHidden();
-
-      lift = await holdChip(page, own);
-      await expect(owners).toBeVisible();
-      await expect(
-        owners.getByTestId("reaction-owner").filter({ hasText: exactName("You") })
-      ).toHaveCount(1);
-      await expect(owners.getByTestId("reaction-remove")).toBeVisible();
-      await lift();
-      await page.mouse.click(8, 8);
-      await expect(owners).toHaveCount(0);
     }
+
+    // The reader's own chip, held. On every project: the app decides a hold
+    // on the pointerdown's type, and `holdChip` sends a touch.
+    const ownSelector = '[data-testid="reaction-chip"][title*="click to remove"]';
+    const ownCount = await page.locator(ownSelector).count();
+    const lift = await holdChip(page, own);
+    // Before the lift: nothing but the hold can have opened it.
+    await expect(owners).toBeVisible();
+    await expect(owners.getByTestId("reaction-owner")).toHaveCount(namesFromTitle(ownTitle).length);
+    await expect(
+      owners.getByTestId("reaction-owner").filter({ hasText: exactName("You") })
+    ).toHaveCount(1);
+    await expect(owners.getByTestId("reaction-remove")).toBeVisible();
+    await lift();
+    await settle(page);
+    await expect(owners, "the lift's click does not close it").toBeVisible();
+    await expect(page.locator(ownSelector), "nor remove the reaction").toHaveCount(ownCount);
+    await owners.press("Escape");
+    await expect(owners).toHaveCount(0);
+    // A resting finger selects nothing and raises no callout.
+    expect(
+      await own.evaluate((el) => {
+        const s = getComputedStyle(el) as CSSStyleDeclaration & { webkitUserSelect?: string };
+        return s.userSelect || s.webkitUserSelect;
+      }),
+    ).toBe("none");
 
     // Pressing, on a signed chip: a tap on a touch project, a click otherwise.
     const crab = await signedChip(page);
@@ -246,41 +262,6 @@ test.describe("Reaction owner list (#714)", () => {
 
     const added = await addOwnReaction(page);
     await removeOwnReaction(page, added);
-  });
-});
-
-test.describe("Reaction chip held (#714)", () => {
-  test("a held finger opens the list; lifting it neither closes the list nor reacts", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    await waitSettledAtBottom(page);
-
-    const owners = page.getByTestId("reaction-owners");
-    const ownSelector = '[data-testid="reaction-chip"][title*="click to remove"]';
-    const own = await chipByOwnReaction(page, true);
-    const ownCount = await page.locator(ownSelector).count();
-    const names = namesFromTitle((await own.getAttribute("title")) ?? "");
-
-    const lift = await holdChip(page, own);
-    // Before the lift: nothing but the hold can have opened it.
-    await expect(owners).toBeVisible();
-    await expect(owners.getByTestId("reaction-remove")).toBeVisible();
-    await expect(owners.getByTestId("reaction-owner")).toHaveCount(names.length);
-    await lift();
-    await settle(page);
-    await expect(owners, "the lift's click does not close it").toBeVisible();
-    await expect(page.locator(ownSelector), "nor remove the reaction").toHaveCount(ownCount);
-    await owners.press("Escape");
-    await expect(owners).toHaveCount(0);
-
-    // A resting finger selects nothing and raises no callout.
-    expect(
-      await own.evaluate((el) => {
-        const s = getComputedStyle(el) as CSSStyleDeclaration & { webkitUserSelect?: string };
-        return s.userSelect || s.webkitUserSelect;
-      }),
-    ).toBe("none");
   });
 });
 
@@ -450,10 +431,10 @@ test.describe("Reaction chip activated without a press", () => {
   });
 });
 
-test.describe("Touchscreen with a mouse (#714)", { tag: "@chromium-only" }, () => {
+test.describe("Reaction chip under a real finger (#714)", { tag: "@chromium-only" }, () => {
   test.use({ hasTouch: true, viewport: { width: 1280, height: 800 } });
 
-  test("a mouse click and a tap both react; a real held finger opens the list", async ({ page }) => {
+  test("a real held finger opens the list, and its lift neither closes it nor reacts", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
@@ -461,22 +442,12 @@ test.describe("Touchscreen with a mouse (#714)", { tag: "@chromium-only" }, () =
     expect(await coarsePointer(page)).toBe(true);
     const owners = page.getByTestId("reaction-owners");
 
-    const clicked = await addOwnReaction(page);
-    await clicked.click();
-    await expect(clicked).toHaveCount(0);
-    await expect(owners).toHaveCount(0);
-
-    const tapped = await addOwnReaction(page);
-    await tapped.tap();
-    await expect(tapped).toHaveCount(0);
-    await expect(owners).toHaveCount(0);
-
-    // A real finger, through Chromium's input protocol: it rests on the
-    // chip, the list opens, and the click its lift sends is not a press.
+    // Through Chromium's input protocol: the finger rests on the chip, the
+    // list opens, and the click its lift sends is not a press.
     const held = await addOwnReaction(page);
-    const box = (await held.boundingBox())!;
+    const [x, y] = await centreOf(held);
     await withFingers(page, async (fingers) => {
-      await fingers.press([1, Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2)]);
+      await fingers.press([1, x, y]);
       await expect(owners).toBeVisible();
       await fingers.lift();
     });

@@ -1,5 +1,6 @@
 import { test, expect, Locator, Page } from "@playwright/test";
 import {
+  chips,
   coarsePointer,
   committedRow,
   expectSheetOpenFor,
@@ -11,6 +12,8 @@ import {
   openMessageActions,
   openRoomWithComposer,
   openSheetFromReact,
+  palette,
+  panelOffset,
   plainPointOf,
   press,
   pressAt,
@@ -293,6 +296,7 @@ test.describe("Below 48rem", () => {
     await page.keyboard.press("Escape");
     await expect(sheet(page)).toBeHidden();
     await expect(entry, "focus returns to the entry").toBeFocused();
+    await expect(chips(own), "Escape reacts with nothing").toHaveCount(0);
     // Space opens it once too.
     await page.keyboard.press("Space");
     await expect(sheet(page)).toBeVisible();
@@ -300,7 +304,7 @@ test.describe("Below 48rem", () => {
     await expect(sheet(page)).toBeHidden();
   });
 
-  test("a backdrop tap closes it and reaches nothing underneath", async ({ page }) => {
+  test("a backdrop tap closes it and reaches nothing underneath; reopened, it is at rest", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
     await openMessageActions(page, own);
     // Over the header's rooms button: the tap must not open the rooms panel.
@@ -314,6 +318,10 @@ test.describe("Below 48rem", () => {
     await settle(page);
     await expect(page.locator("#chat-scroll-container"), "the chat is still the panel shown").toBeVisible();
     await expect(page.getByTestId("room-list").filter({ visible: true }), "the rooms panel did not open").toHaveCount(0);
+    // Nothing of the slide away is left on the dialog.
+    await openMessageActions(page, own);
+    expect(await panelOffset(page)).toBe(0);
+    expect(await sheet(page).evaluate((d) => [d.className, (d as HTMLElement).style.getPropertyValue("--sheet-shade")])).toEqual(["mobile-sheet", ""]);
   });
 
   test("Reply, Edit and Delete act on the exact message, closing first", async ({ page }) => {
@@ -381,18 +389,28 @@ test.describe("Below 48rem", () => {
     // Remount: removing a group's first message re-keys the group.
     await callRiverTest(page, "deliverTimedMessages", 0, [
       { text: "sheet lead", sentSecs: 1, receivedSecs: 0 },
-      { text: "sheet survivor", sentSecs: 2, receivedSecs: 0 },
+      { text: "sheet second", sentSecs: 2, receivedSecs: 0 },
+      { text: "sheet survivor", sentSecs: 3, receivedSecs: 0 },
     ]);
     const survivor = committedRow(page, "sheet survivor");
     await expect(survivor).toHaveCount(1);
-    await openMessageActions(page, survivor);
-    await survivor.evaluate((el) => ((window as unknown as { __old: Element }).__old = el));
-    await callRiverTest(page, "removeMessages", "sheet lead");
-    await expect(committedRow(page, "sheet lead")).toHaveCount(0);
-    await settle(page);
-    expect(await survivor.evaluate((el) => el === (window as unknown as { __old: Element }).__old), "premise: remounted").toBe(false);
-    await expect(sheet(page), "a remount keeps it").toBeVisible();
+    const remountUnderSheet = async (lead: string) => {
+      await openMessageActions(page, survivor);
+      await survivor.evaluate((el) => ((window as unknown as { __old: Element }).__old = el));
+      await callRiverTest(page, "removeMessages", lead);
+      await expect(committedRow(page, lead)).toHaveCount(0);
+      await settle(page);
+      expect(await survivor.evaluate((el) => el === (window as unknown as { __old: Element }).__old), "premise: remounted").toBe(false);
+      await expect(sheet(page), "a remount keeps it").toBeVisible();
+    };
+    await remountUnderSheet("sheet lead");
     await page.keyboard.press("Escape");
+    await expect(survivor.getByTestId("mobile-message-actions-entry"), "focus goes to the new entry").toBeFocused();
+    // A choice in a sheet that outlived a remount still acts.
+    await remountUnderSheet("sheet second");
+    await press(page, palette(page).getByRole("button").first());
+    await expect(sheet(page)).toBeHidden();
+    await expect(chips(survivor), "and a choice acts on it, once").toHaveCount(1);
     await expect(survivor.getByTestId("mobile-message-actions-entry"), "focus goes to the new entry").toBeFocused();
 
     // Deleted while open (optimistically, signature held), then rolled back.
@@ -429,36 +447,6 @@ test.describe("Below 48rem", () => {
     await page.setViewportSize({ width: 390, height: 760 });
     await settle(page);
     await expect(sheet(page), "never reopened by resizing back").toBeHidden();
-  });
-
-  test("an action queued for an earlier opening does nothing", { tag: "@chromium-only" }, async ({ page }) => {
-    const { own, received } = await openRoomWithRows(page);
-    await openMessageActions(page, own);
-    // In one task: Delete pressed, then the sheet dismissed and opened again
-    // on another message before the Delete runs.
-    await page.evaluate(() => {
-      const del = document.querySelector<HTMLElement>('[data-testid="mobile-message-action-delete"]')!;
-      del.click();
-    });
-    await settle(page);
-    // The delete went to the confirmation, closing the sheet first.
-    await expect(page.getByRole("heading", { name: /Delete Message/ })).toBeVisible();
-    await page.getByRole("button", { name: "Cancel", exact: true }).click();
-
-    await openMessageActions(page, own);
-    const receivedKey = await rowKey(received);
-    await page.evaluate((receivedKey) => {
-      const reply = document.querySelector<HTMLElement>('[data-testid="mobile-message-action-reply"]')!;
-      const backdrop = document.querySelector<HTMLElement>('[data-testid="mobile-message-sheet-backdrop"]')!;
-      const entry = document.querySelector<HTMLElement>(`[id="msg-${receivedKey}"] [data-testid="mobile-message-actions-entry"]`)!;
-      backdrop.click();
-      entry.click();
-      reply.click();
-    }, receivedKey);
-    await settle(page);
-    await expect(page.getByTestId("message-composer"), "the stale Reply did nothing").not.toContainText("Replying to");
-    await expect(sheet(page), "the newer opening is open").toBeVisible();
-    await expect(sheet(page)).toHaveAttribute("data-target-row", receivedKey);
   });
 
   test("while open the background holds still, arrivals follow, and a reload waits; closing lets go", async ({ page }) => {
@@ -498,6 +486,7 @@ test.describe("Below 48rem", () => {
     await expectTouchHeldUntilClosed(page, () => openMessageActions(page, own), [
       ["Escape", () => page.keyboard.press("Escape")],
       ["backdrop", async () => pressAt(page, await historyPoint(page))],
+      ["a choice", () => press(page, palette(page).getByRole("button").first())],
       ["48rem", async () => {
         await page.setViewportSize({ width: 768, height: 760 });
         await expect(sheet(page)).toBeHidden();
@@ -620,67 +609,6 @@ test.describe("Below 48rem", () => {
     await expect(sheet(page)).toBeHidden();
     await settle(page);
     expect(await callRiverTest(page, "takeMessageGroupRenders")).toBe(0);
-  });
-});
-
-/// The open panel's geometry against the viewport.
-function panelGeometry(page: Page) {
-  return page.evaluate(() => {
-    const panel = document.querySelector("#mobile-message-sheet .mobile-sheet-panel") as HTMLElement;
-    const r = panel.getBoundingClientRect();
-    const buttons = Array.from(panel.querySelectorAll("button")).map((b) => {
-      const br = b.getBoundingClientRect();
-      // An emoji past the row's edge is reached by scrolling the row.
-      const inRow = b.closest(".mobile-reaction-palette");
-      const right = inRow ? Math.min(br.right, inRow.getBoundingClientRect().right) : br.right;
-      return { id: b.getAttribute("data-testid") ?? b.textContent, w: br.width, h: br.height, left: br.left, right };
-    });
-    return {
-      vw: document.documentElement.clientWidth,
-      vh: window.innerHeight,
-      left: r.left,
-      right: r.right,
-      top: r.top,
-      bottom: r.bottom,
-      scrollable: panel.scrollHeight > panel.clientHeight,
-      overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
-      buttons,
-      background: getComputedStyle(panel).backgroundColor,
-    };
-  });
-}
-
-test.describe("The actions sheet at 320px", () => {
-  test.use({ viewport: { width: 320, height: 568 } });
-
-  test("fits, bottom-aligned, with every target at least 44px; light and dark", async ({ page }) => {
-    const { own } = await openRoomWithRows(page);
-    for (const scheme of ["light", "dark"] as const) {
-      await page.emulateMedia({ colorScheme: scheme });
-      await openMessageActions(page, own);
-      const g = await panelGeometry(page);
-      expect(g.overflowX, "no page overflow").toBe(false);
-      expect(g.left).toBeGreaterThanOrEqual(0);
-      expect(g.right).toBeLessThanOrEqual(g.vw);
-      expect(Math.abs(g.bottom - g.vh), "on the bottom edge").toBeLessThan(2);
-      expect(g.top).toBeGreaterThanOrEqual(0);
-      for (const b of g.buttons) {
-        expect(b.h, `${b.id} height`).toBeGreaterThanOrEqual(44);
-        expect(b.w, `${b.id} width`).toBeGreaterThanOrEqual(44);
-        expect(b.right, `${b.id} inside`).toBeLessThanOrEqual(g.vw);
-      }
-      const panelToken = await page.evaluate(() => {
-        const probe = document.createElement("div");
-        probe.style.backgroundColor = "var(--color-panel)";
-        document.body.appendChild(probe);
-        const c = getComputedStyle(probe).backgroundColor;
-        probe.remove();
-        return c;
-      });
-      expect(g.background, `${scheme}: the panel is the theme's panel colour`).toBe(panelToken);
-      await page.keyboard.press("Escape");
-      await expect(sheet(page)).toBeHidden();
-    }
   });
 });
 

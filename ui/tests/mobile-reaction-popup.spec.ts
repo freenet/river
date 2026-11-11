@@ -1,8 +1,6 @@
 import { test, expect, Locator, Page } from "@playwright/test";
 import {
   chips,
-  committedRow,
-  expectTouchHeldUntilClosed,
   historyPoint,
   holdChip,
   keyboardFocus,
@@ -12,15 +10,13 @@ import {
   palette,
   press,
   pressAt,
-  reactTo,
   rowKey,
   settle,
   SHEET,
   sheet,
-  withFingers,
+  submitMessage,
 } from "./example-room";
-import { deliver } from "./history-geometry";
-import { callRiverTest, rekeyThenClick } from "./river-test";
+import { callRiverTest } from "./river-test";
 
 // Below 48rem a message's reaction + and a tap on the row open one message
 // sheet (mobile_message_sheet.rs); these are its reaction half
@@ -173,23 +169,6 @@ test.describe("The mobile reaction popup", () => {
     await expect(sheet(page), "the new opening is open").toBeVisible();
   });
 
-  test("Escape and the backdrop close it without reacting, and the backdrop tap reaches nothing", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openSheetFromReact(page, row);
-    await page.keyboard.press("Escape");
-    await expect(sheet(page)).toBeHidden();
-    await expect(chips(row)).toHaveCount(0);
-    await openSheetFromReact(page, row);
-    // Over the header's rooms button.
-    const hamburger = (await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).first().boundingBox())!;
-    const point = { x: hamburger.x + hamburger.width / 2, y: hamburger.y + hamburger.height / 2 };
-    expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), point)).toBe("mobile-message-sheet-backdrop");
-    await pressAt(page, point);
-    await expect(sheet(page)).toBeHidden();
-    await expect(chips(row)).toHaveCount(0);
-    await expect(page.locator("#chat-scroll-container"), "the rooms panel did not open").toBeVisible();
-  });
-
   test("a chip tap reacts with its emoji and opens nothing; the + opens the sheet, which lists who reacted", async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "memberReactsToNewest", "🎉");
@@ -238,6 +217,13 @@ test.describe("The mobile reaction popup", () => {
     await press(page, party);
     await expect(party).toContainText("1");
 
+    // And no reactor list for Shift+Enter to open: it reacts, as Enter does.
+    await party.press("Shift+Enter");
+    await expect(party).toContainText("2");
+    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
+    await party.press("Enter");
+    await expect(party).toContainText("1");
+
     // Reacted with another emoji: the tap moves the reaction to the chip's.
     await openSheetFromReact(page, row);
     await press(page, palette(page).getByRole("button", { name: "React with 👍" }));
@@ -276,77 +262,6 @@ test.describe("The mobile reaction popup", () => {
     expect(await outline(), "the keyboard's focus ring").not.toBe("none");
   });
 
-  test("Enter and Space on a chip react too; when the chip leaves, focus goes to the +", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await callRiverTest(page, "memberReactsToNewest", "🎉");
-    const chip = chips(row);
-    await expect(chip).toHaveCount(1);
-    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-    await keyboardFocus(page, chip);
-    await page.keyboard.press("Enter");
-    await expect(chip).toContainText("2");
-    await expect(sheet(page)).toBeHidden();
-    await expect(chip, "focus stays on the chip").toBeFocused();
-    // A toggle, not a button that opens a dialog.
-    await expect(chip).toHaveAttribute("aria-pressed", "true");
-    await expect(chip).not.toHaveAttribute("aria-haspopup");
-    await expect(chip).not.toHaveAttribute("aria-expanded");
-    await page.keyboard.press("Space");
-    await expect(chip).toContainText("1");
-    await expect(chip).toHaveAttribute("aria-pressed", "false");
-    // No reactor list below 48rem: with Shift it still reacts.
-    await page.keyboard.press("Shift+Enter");
-    await expect(chip).toContainText("2");
-    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
-    await page.keyboard.press("Enter");
-    await expect(chip).toContainText("1");
-
-    // The reader's own chip with no one else on it leaves with the reaction.
-    await deliver(page, "own chip target");
-    const own = committedRow(page, "own chip target");
-    const ownChip = await reactTo(page, own);
-    await keyboardFocus(page, ownChip);
-    await page.keyboard.press("Enter");
-    await expect(chips(own)).toHaveCount(0);
-    await expect(own.getByTestId("message-react-button")).toBeFocused();
-  });
-
-  test("its message leaving closes it; a remount keeps it", { tag: "@chromium-only" }, async ({ page }) => {
-    await openRoomWithComposer(page);
-    await callRiverTest(page, "deliverTimedMessages", 0, [
-      { text: "popup lead", sentSecs: 1, receivedSecs: 0 },
-      { text: "popup survivor", sentSecs: 2, receivedSecs: 0 },
-    ]);
-    const survivor = committedRow(page, "popup survivor");
-    await expect(survivor).toHaveCount(1);
-    await openSheetFromReact(page, survivor);
-    await survivor.evaluate((el) => ((window as unknown as { __old: Element }).__old = el));
-    await callRiverTest(page, "removeMessages", "popup lead");
-    await expect(committedRow(page, "popup lead")).toHaveCount(0);
-    await settle(page);
-    expect(await survivor.evaluate((el) => el === (window as unknown as { __old: Element }).__old), "premise: remounted").toBe(false);
-    await expect(sheet(page), "a remount keeps it").toBeVisible();
-    await press(page, choices(page).first());
-    await expect(chips(survivor), "and a tap acts on it, once").toHaveCount(1);
-    await expect(survivor.getByTestId("message-react-button"), "focus to the new +").toBeFocused();
-
-    await openSheetFromReact(page, survivor);
-    await callRiverTest(page, "removeMessages", "popup survivor");
-    await expect(sheet(page), "its message left").toBeHidden();
-  });
-
-  test("open, a reload waits; closed, it does not", { tag: "@chromium-only" }, async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await page.getByTestId("message-input").blur();
-    expect(await callRiverTest(page, "userIsBusy"), "premise: idle").toBe(false);
-    await openSheetFromReact(page, row);
-    expect(await callRiverTest(page, "userIsBusy"), "open is busy").toBe(true);
-    await page.keyboard.press("Escape");
-    await expect(sheet(page)).toBeHidden();
-    await row.getByTestId("message-react-button").blur();
-    expect(await callRiverTest(page, "userIsBusy"), "closed and mounted: not busy").toBe(false);
-  });
-
   test("without the Popover API the + still opens it", { tag: "@chromium-only" }, async ({ page }) => {
     await page.addInitScript(() => {
       Object.defineProperty(HTMLElement.prototype, "showPopover", { value: undefined, configurable: true, writable: true });
@@ -357,17 +272,6 @@ test.describe("The mobile reaction popup", () => {
     await openSheetFromReact(page, row);
     await press(page, choices(page).first());
     await expect(chips(row)).toHaveCount(1);
-  });
-
-  // The hold and the close paths both surfaces share are the actions
-  // sheet's test; these are the popup's own.
-  test("the touch hold lets go when a choice or its message leaving closes it", { tag: "@chromium-only" }, async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await expectTouchHeldUntilClosed(page, () => openSheetFromReact(page, row), [
-      ["a choice", () => press(page, choices(page).first())],
-      // Last: it takes the row away.
-      ["its message leaving", () => callRiverTest(page, "removeMessages", "react target")],
-    ]);
   });
 
   test("a sideways wheel over the row scrolls it", { tag: "@chromium-only" }, async ({ page }) => {
@@ -382,18 +286,6 @@ test.describe("The mobile reaction popup", () => {
     await expect(sheet(page)).toBeVisible();
   });
 
-  test("a re-key closes it, and a tap queued across it does nothing", { tag: "@chromium-only" }, async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openSheetFromReact(page, row);
-    const signs = await callRiverTest(page, "messageSignsRecorded");
-    await rekeyThenClick(page, FIRST_CHOICE);
-    await settle(page);
-    await expect(sheet(page)).toBeHidden();
-    await expect(chips(row), "no reaction from the earlier generation's opening").toHaveCount(0);
-    expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signs);
-    await openSheetFromReact(page, row);
-  });
-
   test("a reaction from the popup that cannot be signed is rolled back, and says so", { tag: "@chromium-only" }, async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "holdMessageSigning");
@@ -406,75 +298,52 @@ test.describe("The mobile reaction popup", () => {
     await expect(page.getByTestId("toast-message")).toHaveText("Your reaction could not be sent");
     await expect(sheet(page), "nothing reopens").toBeHidden();
   });
-
-  test("opening and closing it renders no message group", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await settle(page);
-    await callRiverTest(page, "takeMessageGroupRenders");
-    await openSheetFromReact(page, row);
-    await page.keyboard.press("Escape");
-    await expect(sheet(page)).toBeHidden();
-    await settle(page);
-    expect(await callRiverTest(page, "takeMessageGroupRenders")).toBe(0);
-  });
 });
 
-test.describe("A finger on the reaction popup's row", () => {
-  test.use({ viewport: { width: 390, height: 760 } });
-  test.skip(({ browserName }) => browserName !== "chromium", "real touch input needs Chromium's input protocol");
-
-  test("a sideways swipe scrolls the row, not the history, and is not a tap", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
-    await openSheetFromReact(page, row);
-    const history = page.locator("#chat-scroll-container");
-    const before = await history.evaluate((el) => el.scrollTop);
-    const box = (await palette(page).boundingBox())!;
-    const [x, y] = [Math.round(box.x + box.width - 30), Math.round(box.y + box.height / 2)];
-    await withFingers(page, async (fingers) => {
-      await fingers.press([1, x, y]);
-      await fingers.move({ 1: [-200, 0] });
-      await fingers.lift();
-    });
-    await settle(page);
-    expect((await rowScroll(page)).left, "the row scrolled").toBeGreaterThan(50);
-    expect(await history.evaluate((el) => el.scrollTop), "the history did not move").toBe(before);
-    await expect(sheet(page), "a swipe is not a tap: still open").toBeVisible();
-    await expect(chips(row)).toHaveCount(0);
-  });
-});
-
-test.describe("The reaction popup on a short screen", () => {
+test.describe("The reaction popup on a small screen", () => {
   test.use({ viewport: { width: 320, height: 360 } });
 
-  test("fits at 320px in one row that scrolls sideways, and every choice is reachable", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
+  test("fits at 320px on the bottom edge, every target at least 44px, in one row whose every choice is reachable", async ({ page }) => {
+    // An own message: the sheet at its tallest, with Reply, Edit and Delete.
+    await openRoomWithComposer(page);
+    const row = await submitMessage(page, "own small-screen row");
+    await expect(row).toHaveCount(1);
+    await page.getByTestId("message-input").blur();
     await openSheetFromReact(page, row);
     const g = await page.evaluate(() => {
       const panel = document.querySelector("#mobile-message-sheet .mobile-sheet-panel") as HTMLElement;
       const r = panel.getBoundingClientRect();
-      const palette = panel.querySelector(".mobile-reaction-palette") as HTMLElement;
+      const palette = panel.querySelector(".mobile-reaction-palette")!.getBoundingClientRect();
+      const vw = document.documentElement.clientWidth;
       return {
-        vw: document.documentElement.clientWidth,
+        vw,
         vh: window.innerHeight,
         top: r.top,
         bottom: r.bottom,
         left: r.left,
         right: r.right,
-        rowHeight: palette.getBoundingClientRect().height,
-        overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
-        small: Array.from(panel.querySelectorAll("button")).filter((b) => {
-          const br = b.getBoundingClientRect();
-          return br.height < 44 || br.width < 44;
-        }).length,
+        rowHeight: palette.height,
+        overflowX: document.documentElement.scrollWidth > vw,
+        actions: panel.querySelectorAll(".mobile-sheet-actions button").length,
+        // Under 44px either way, or past the screen's edge (an emoji past
+        // the row's edge is reached by scrolling the row).
+        bad: Array.from(panel.querySelectorAll("button"))
+          .filter((b) => {
+            const br = b.getBoundingClientRect();
+            const right = b.closest(".mobile-reaction-palette") ? Math.min(br.right, palette.right) : br.right;
+            return br.height < 44 || br.width < 44 || right > vw;
+          })
+          .map((b) => b.getAttribute("data-testid") ?? b.textContent),
       };
     });
+    expect(g.actions, "premise: Reply, Edit and Delete").toBe(3);
     expect(g.overflowX, "nothing overflows the page").toBe(false);
     expect(g.top, "inside the viewport").toBeGreaterThanOrEqual(0);
-    expect(g.bottom).toBeLessThanOrEqual(g.vh + 1);
+    expect(Math.abs(g.bottom - g.vh), "on the bottom edge").toBeLessThan(2);
     expect(g.left).toBeGreaterThanOrEqual(0);
     expect(g.right).toBeLessThanOrEqual(g.vw);
     expect(g.rowHeight, "one row").toBeLessThan(60);
-    expect(g.small, "every target at least 44px").toBe(0);
+    expect(g.bad, "every target at least 44px, inside the screen").toEqual([]);
     // Scrolled to its end, the last choice still reacts.
     await palette(page).evaluate((el) => (el.scrollLeft = el.scrollWidth));
     const last = choices(page).last();

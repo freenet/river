@@ -14,7 +14,6 @@ import {
   settle,
   SHEET,
   sheet,
-  touchmovePrevented,
   withFingers,
 } from "./example-room";
 import { callRiverTest } from "./river-test";
@@ -62,17 +61,6 @@ test("the row shows no scroll bar, does not snap, and takes only sideways pans",
   expect(g.panel).toBe("none");
 });
 
-test("a tap outside slides it away and closes it; reopened, it is at rest", async ({ page }) => {
-  const row = await openPopup(page);
-  await pressAt(page, await historyPoint(page));
-  await expect(sheet(page)).toBeHidden();
-  await expect(chips(row)).toHaveCount(0);
-  await expect(row.getByTestId("message-react-button"), "focus back on the +").toBeFocused();
-  await openSheetFromReact(page, row);
-  expect(await panelOffset(page)).toBe(0);
-  expect(await sheet(page).evaluate((d) => [d.className, (d as HTMLElement).style.getPropertyValue("--sheet-shade")])).toEqual(["mobile-sheet", ""]);
-});
-
 test("with reduced motion it opens and closes without sliding", { tag: "@chromium-only" }, async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   const row = await openPopup(page);
@@ -86,15 +74,6 @@ test("with reduced motion it opens and closes without sliding", { tag: "@chromiu
   await expect(sheet(page)).toBeHidden();
   expect(await page.evaluate(() => (window as unknown as { __left: boolean }).__left), "it never slid away").toBe(false);
   await expect(chips(row)).toHaveCount(0);
-});
-
-test("a pinch over the popup is not held, and the panel is not either", { tag: "@chromium-only" }, async ({ page }) => {
-  await openPopup(page);
-  const h = await historyPoint(page);
-  const [px, py] = await handlePoint(page);
-  expect(await touchmovePrevented(page, h.x, h.y, 2), "a pinch over the backdrop zooms").toBe(false);
-  expect(await touchmovePrevented(page, px, py, 2), "a pinch over the panel zooms").toBe(false);
-  expect(await touchmovePrevented(page, px, py), "one finger on the panel is the drag's").toBe(false);
 });
 
 test.describe("A mouse on the reaction popup", () => {
@@ -252,6 +231,16 @@ test.describe("A finger on the reaction popup", () => {
     expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signs);
   });
 
+  test("a drag down that starts on Reply closes it without replying", async ({ page }) => {
+    // Opened by a tap on the row: the same sheet, the same drag.
+    await openMessageActions(page, await openRoomWithTarget(page));
+    const [x, y] = await centreOf(page.getByTestId("mobile-message-action-reply"));
+    await withFingers(page, (fingers) => fingers.drag(x, y, 150));
+    await expect(sheet(page)).toBeHidden();
+    await settle(page);
+    await expect(page.getByTestId("message-composer"), "no reply began").not.toContainText("Replying to");
+  });
+
   test("dragging up never lifts it above its rest position", async ({ page }) => {
     await openPopup(page);
     const [x, y] = await handlePoint(page);
@@ -288,8 +277,10 @@ test.describe("A finger on the reaction popup", () => {
     await expect(sheet(page), "still open").toBeVisible();
   });
 
-  test("a sideways swipe on the row scrolls it and leaves the panel where it is", async ({ page }) => {
-    await openPopup(page);
+  test("a sideways swipe on the row scrolls it, not the panel or the history, and is not a tap", async ({ page }) => {
+    const row = await openPopup(page);
+    const history = page.locator("#chat-scroll-container");
+    const before = await history.evaluate((el) => el.scrollTop);
     const box = (await palette(page).boundingBox())!;
     const [x, y] = [Math.round(box.x + box.width - 30), Math.round(box.y + box.height / 2)];
     await withFingers(page, async (fingers) => {
@@ -302,53 +293,8 @@ test.describe("A finger on the reaction popup", () => {
     await settle(page);
     expect(await palette(page).evaluate((el) => el.scrollLeft), "the row scrolled").toBeGreaterThan(50);
     expect(await panelOffset(page)).toBe(0);
-    await expect(sheet(page)).toBeVisible();
-  });
-});
-
-test.describe("The actions sheet's gestures", () => {
-  /// A received message, its actions sheet open and at rest.
-  async function openSheet(page: Page): Promise<Locator> {
-    const row = await openRoomWithTarget(page, "act target");
-    await openMessageActions(page, row);
-    return row;
-  }
-
-  test("it has no title or Close, and a tap outside slides it away", async ({ page }) => {
-    const row = await openSheet(page);
-    await expect(sheet(page)).toHaveAccessibleName("Message options");
-    await expect(sheet(page).getByRole("heading")).toHaveCount(0);
-    await expect(page.getByTestId("mobile-message-actions-close")).toHaveCount(0);
-    await pressAt(page, await historyPoint(page));
-    await expect(sheet(page)).toBeHidden();
-    await expect(row.getByTestId("mobile-message-actions-entry"), "focus back on the entry").toBeFocused();
-  });
-
-  test.describe("with a finger", () => {
-    test.skip(({ browserName }) => browserName !== "chromium", "real touch input needs Chromium's input protocol");
-
-    test("a drag down from the handle closes it; a slow short one springs back", async ({ page }) => {
-      await openSheet(page);
-      const [x, y] = await handlePoint(page);
-      await withFingers(page, async (fingers) => {
-        await fingers.press([1, x, y]);
-        await fingers.move({ 1: [0, 30] }, 20);
-        await fingers.lift();
-      });
-      await panelAtRest(page);
-      expect(await panelOffset(page), "sprung back").toBe(0);
-      await expect(sheet(page)).toBeVisible();
-      await withFingers(page, (fingers) => fingers.drag(x, y, 150));
-      await expect(sheet(page)).toBeHidden();
-    });
-
-    test("a drag down that starts on Reply closes it without replying", async ({ page }) => {
-      await openSheet(page);
-      const [x, y] = await centreOf(page.getByTestId("mobile-message-action-reply"));
-      await withFingers(page, (fingers) => fingers.drag(x, y, 150));
-      await expect(sheet(page)).toBeHidden();
-      await settle(page);
-      await expect(page.getByTestId("message-composer"), "no reply began").not.toContainText("Replying to");
-    });
+    expect(await history.evaluate((el) => el.scrollTop), "the history did not move").toBe(before);
+    await expect(sheet(page), "a swipe is not a tap: still open").toBeVisible();
+    await expect(chips(row)).toHaveCount(0);
   });
 });

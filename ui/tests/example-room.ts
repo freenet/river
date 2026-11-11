@@ -558,6 +558,7 @@ export async function expectTouchHeldUntilClosed(
     expect(await touchmovePrevented(page, h.x, h.y, 2), `${how}: a pinch is not`).toBe(false);
     const inside = await panelPoint(page);
     expect(await touchmovePrevented(page, inside.x, inside.y), `${how}: the panel scrolls`).toBe(false);
+    expect(await touchmovePrevented(page, inside.x, inside.y, 2), `${how}: and a pinch on it zooms`).toBe(false);
     await close();
     await expect(sheet(page)).toBeHidden();
     await settle(page);
