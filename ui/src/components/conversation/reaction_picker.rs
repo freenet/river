@@ -332,7 +332,7 @@ pub(super) fn ReactionInvoker(
     // focusable, `aria-disabled` rather than `disabled`, and its card shows
     // on keyboard focus) and a screen reader (`aria-describedby`). It has no
     // press or click handler, so nothing it does can open, anchor or hold
-    // anything. Below 48rem the popup needs no popover, so React works.
+    // anything. Below 48rem the sheet needs no popover, so React works.
     if !narrow && !popover_supported() {
         let tip_id = format!("react-unavailable-{}", target.row);
         return rsx! {
@@ -509,7 +509,7 @@ pub(super) fn ReactionPicker(
         }
     }
     // The window crossing below 48rem turns every React into the mobile
-    // popup's: an open picker closes, letting go of its hold and anchor, and
+    // sheet's: an open picker closes, letting go of its hold and anchor, and
     // nothing reopens it on the way back.
     let narrow = narrow_for_render();
     let was_narrow = use_hook(|| Rc::new(Cell::new(narrow)));

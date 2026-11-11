@@ -1084,7 +1084,7 @@ mod runtime {
     /// `fixed inset-0` overlay only while it is open, so any visible overlay
     /// means a dialog, picker or menu is up (with whatever is typed in it).
     /// The reaction picker, a native popover with no overlay, and the mobile
-    /// message surfaces, modal dialogs, are checked on their own.
+    /// message sheet, a modal dialog, are checked on their own.
     /// Beyond that: unsent text in the room composer, a message being edited,
     /// any focused text field with something in it, and an invitation being
     /// accepted.
@@ -1122,7 +1122,7 @@ mod runtime {
         // The mobile message sheet (below 48rem): open while its modal dialog
         // is. Asked directly rather than left to the overlay
         // check below, which looks for a class it does not carry. Closed, the
-        // dialogs stay mounted and hold nothing.
+        // dialog stays mounted and holds nothing.
         if crate::components::conversation::mobile_surface_is_open() {
             return true;
         }

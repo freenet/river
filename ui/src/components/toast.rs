@@ -12,7 +12,7 @@
 //! not a save receipt and gives no permission to reload; the generation-update
 //! banner keeps its own lifecycle and is never routed through here.
 
-use crate::components::icons::{line_icon, CLOSE_ICON_PATH};
+use crate::components::icons::line_icon;
 use dioxus::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,6 +26,8 @@ const HOST_ID: &str = "app-toast-host";
 /// Space left between the banner and a toast moved below it.
 #[cfg(any(target_arch = "wasm32", test))]
 const BANNER_GAP_PX: f64 = 8.0;
+
+const CLOSE_ICON_PATH: &str = "M18 6 6 18M6 6l12 12";
 
 /// An action's callback, taken out on its first run.
 type RunOnce = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;

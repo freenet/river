@@ -640,7 +640,7 @@
     height: 4px;
     margin: 2px auto 6px;
     border-radius: 9999px;
-    background: var(--color-border-hover, var(--color-border));
+    background: var(--color-border-hover);
 }
 
 /* Who reacted, between the emoji row and the actions: each emoji with its
@@ -751,7 +751,7 @@
 /* The sheet's 16 choices: one row that scrolls sideways, freely and with
  * momentum, no snapping and no scroll bar (a choice cut off at the edge shows
  * there are more). It takes only sideways pans: a vertical move on it is the
- * popup's drag (`mobile_sheet_drag.rs`). The padding keeps the focus ring
+ * sheet's drag (`mobile_sheet_drag.rs`). The padding keeps the focus ring
  * inside the row's clip. */
 .mobile-reaction-palette {
     display: flex;

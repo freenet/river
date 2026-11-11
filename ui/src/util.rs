@@ -239,7 +239,6 @@ pub fn watch_media(query: &'static str, signal: &'static dioxus::prelude::Global
             });
         });
         let _ = list.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
-        // Lives as long as the page.
         on_change.forget();
     }
     #[cfg(not(target_arch = "wasm32"))]

@@ -439,7 +439,7 @@ pub fn install_test_hooks() {
 
     // Give the current room a new contract key, as a room-contract re-key
     // does: the same room and messages under another generation. The mobile
-    // message surfaces close on it, and work queued for them does nothing.
+    // message sheet closes on it, and work queued for it does nothing.
     set_hook(
         "rekeyCurrentRoom",
         Closure::<dyn FnMut()>::new(move || {
