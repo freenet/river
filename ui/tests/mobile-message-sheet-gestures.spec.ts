@@ -5,7 +5,6 @@ import {
   chips,
   choices,
   historyPoint,
-  openSheetFromRow,
   openRoomWithTarget,
   openSheetFromReact,
   palette,
@@ -142,29 +141,14 @@ test.describe("The message sheet's opening slide", () => {
 test.describe("A finger on the message sheet", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "real touch input needs Chromium's input protocol");
 
-  test("a slow drag down moves the panel with the finger, and springs back when let go short", async ({ page }) => {
+  test("dragged past the threshold from Reply it slides away and closes, reacting and replying with nothing", async ({ page }) => {
     const row = await openSheet(page);
-    const [x, y] = await handlePoint(page);
-    await withFingers(page, async (fingers) => {
-      await fingers.press([1, x, y]);
-      await fingers.move({ 1: [0, 30] }, 20);
-      const held = await panelOffset(page);
-      expect(held, "it follows the finger").toBeGreaterThan(27);
-      expect(held).toBeLessThan(33);
-      await fingers.lift();
-    });
-    await panelAtRest(page);
-    expect(await panelOffset(page), "sprung back").toBe(0);
-    await expect(sheet(page)).toBeVisible();
-    await expect(chips(row)).toHaveCount(0);
-  });
-
-  test("dragged past the threshold it slides away and closes, reacting with nothing", async ({ page }) => {
-    const row = await openSheet(page);
-    const [x, y] = await handlePoint(page);
-    await withFingers(page, (fingers) => fingers.drag(x, y, 120));
+    const [x, y] = await centreOf(page.getByTestId("mobile-message-action-reply"));
+    await withFingers(page, (fingers) => fingers.drag(x, y, 150));
     await expect(sheet(page)).toBeHidden();
+    await settle(page);
     await expect(chips(row)).toHaveCount(0);
+    await expect(page.getByTestId("message-composer"), "no reply began").not.toContainText("Replying to");
     await expect(row.getByTestId("message-react-button"), "focus back on the +").toBeFocused();
   });
 
@@ -194,18 +178,8 @@ test.describe("A finger on the message sheet", () => {
     expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signs);
   });
 
-  test("a drag down that starts on Reply closes it without replying", async ({ page }) => {
-    // Opened by a tap on the row: the same sheet, the same drag.
-    await openSheetFromRow(page, await openRoomWithTarget(page));
-    const [x, y] = await centreOf(page.getByTestId("mobile-message-action-reply"));
-    await withFingers(page, (fingers) => fingers.drag(x, y, 150));
-    await expect(sheet(page)).toBeHidden();
-    await settle(page);
-    await expect(page.getByTestId("message-composer"), "no reply began").not.toContainText("Replying to");
-  });
-
-  test("dragging up never lifts it above its rest position", async ({ page }) => {
-    await openSheet(page);
+  test("dragging up never lifts it above its rest position; back down it follows the finger, and springs back let go short", async ({ page }) => {
+    const row = await openSheet(page);
     const [x, y] = await handlePoint(page);
     expect(await panelBottomGap(page), "premise: at rest on the bottom edge").toBeLessThan(1);
     await withFingers(page, async (fingers) => {
@@ -213,14 +187,18 @@ test.describe("A finger on the message sheet", () => {
       await fingers.move({ 1: [0, -100] });
       expect(await panelOffset(page), "no upward offset").toBe(0);
       expect(await panelBottomGap(page), "no gap under it").toBeLessThan(1);
-      // Back down past the start: it follows from where the finger went down.
-      await fingers.move({ 1: [0, 130] });
-      expect(await panelOffset(page)).toBeGreaterThan(20);
+      // Slowly back down, 30px past the start: it follows from where the
+      // finger went down.
+      await fingers.move({ 1: [0, 130] }, 40);
+      const held = await panelOffset(page);
+      expect(held, "it follows the finger").toBeGreaterThan(27);
+      expect(held).toBeLessThan(33);
       await fingers.lift();
     });
     await panelAtRest(page);
-    expect(await panelOffset(page)).toBe(0);
+    expect(await panelOffset(page), "sprung back").toBe(0);
     await expect(sheet(page)).toBeVisible();
+    await expect(chips(row)).toHaveCount(0);
   });
 
   test("a second finger cancels the drag", async ({ page }) => {

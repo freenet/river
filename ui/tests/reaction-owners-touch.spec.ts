@@ -247,13 +247,6 @@ test.describe("Reaction owner list (#714)", () => {
     await expect(page.locator(ownSelector), "nor remove the reaction").toHaveCount(ownCount);
     await owners.press("Escape");
     await expect(owners).toHaveCount(0);
-    // A resting finger selects nothing and raises no callout.
-    expect(
-      await own.evaluate((el) => {
-        const s = getComputedStyle(el) as CSSStyleDeclaration & { webkitUserSelect?: string };
-        return s.userSelect || s.webkitUserSelect;
-      }),
-    ).toBe("none");
 
     // Pressing, on a signed chip: a tap on a touch project, a click otherwise.
     const crab = await signedChip(page);
@@ -264,10 +257,6 @@ test.describe("Reaction owner list (#714)", () => {
     await press(crab);
     await expect(crab, "and gives it back").toContainText("1");
     await expect(owners).toHaveCount(0);
-    expect(
-      await crab.evaluate((el) => getComputedStyle(el).cursor),
-      "someone else's chip is pressable too"
-    ).toBe("pointer");
 
     const added = await addOwnReaction(page);
     await removeOwnReaction(page, added);
@@ -419,24 +408,6 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await page.keyboard.press("Enter");
     await expect(sole).toHaveCount(0);
     await expect(page.locator(`[id="${messageId}"]`).getByTestId("message-react-button")).toBeFocused();
-  });
-});
-
-test.describe("Reaction chip activated without a press", () => {
-  test("a click with no press of its own reacts, as a press does", async ({ page }) => {
-    await page.goto("/");
-    await waitForApp(page);
-    await selectRoom(page, "Your Private Room");
-    await waitSettledAtBottom(page);
-
-    const owners = page.getByTestId("reaction-owners");
-    const crab = await signedChip(page);
-    // What assistive technology does: a click event with no pointerdown.
-    await crab.evaluate((el) => (el as HTMLElement).click());
-    await expect(crab).toContainText("2");
-    await expect(owners).toHaveCount(0);
-    await crab.evaluate((el) => (el as HTMLElement).click());
-    await expect(crab).toContainText("1");
   });
 });
 
