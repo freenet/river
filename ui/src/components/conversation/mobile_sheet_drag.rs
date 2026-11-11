@@ -1,17 +1,19 @@
 //! Dragging the mobile message sheet down to dismiss it.
 //!
 //! A pointer that goes down anywhere in the open dialog (the backdrop, the
-//! panel, an action, an emoji) and then moves further down than sideways drags the panel
-//! with it, by the distance moved, and fades the dim behind it. Released far
-//! enough or fast enough ([`dismisses`]) the panel slides away and the sheet
-//! closes; otherwise it springs back. Upward it does not move: it never sits
-//! higher than at rest, fully visible on the bottom edge. A sideways move is left alone: on the emoji row the browser is
-//! already scrolling it (`touch-action: pan-x`, `main.css`). A second finger
-//! (a pinch) cancels the drag, and the zoom goes ahead.
+//! panel, an action, an emoji) and then moves further down than sideways
+//! drags the panel with it, by the distance moved, and fades the dim behind
+//! it. Released far enough or fast enough ([`dismisses`]) the panel slides
+//! away and the sheet closes; otherwise it springs back. Upward it does not
+//! move: it never sits higher than at rest, fully visible on the bottom edge.
+//! A sideways move is left alone: on the emoji row the browser is already
+//! scrolling it (`touch-action: pan-x`, `main.css`). A second finger (a
+//! pinch) cancels the drag, and the zoom goes ahead.
 //!
 //! A tap outside slides the panel away the same way ([`animate_out`]); Escape
-//! and a choice (an emoji, an action) close it at once. With `prefers-reduced-motion: reduce`
-//! nothing slides: a dismissal closes at once.
+//! and a choice (an emoji, an action) close it at once. With
+//! `prefers-reduced-motion: reduce` nothing slides: a dismissal closes at
+//! once.
 //!
 //! The listeners touch only the DOM and the thread-locals here. The one state
 //! change, the close, is deferred (dioxus-signal-safety.md) and names the
@@ -213,7 +215,7 @@ mod dom {
     }
 
     /// Clear what a drag or a slide left on the dialog, before it shows: a
-    /// surface closed mid-drag opens at rest.
+    /// sheet closed mid-drag opens at rest.
     pub(in super::super) fn reset() {
         GESTURE.with(|g| g.borrow_mut().take());
         SUPPRESS_CLICK.with(|s| s.set(false));

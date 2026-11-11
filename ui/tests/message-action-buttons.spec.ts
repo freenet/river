@@ -447,7 +447,7 @@ test.describe("Footer at 768px", () => {
   test.use({ viewport: { width: 768, height: 700 } });
 
   // The narrowest desktop footer: React after the chips, the cluster whole.
-  test("chips wrap with React after them, the cluster stays whole, and every target takes its own hits", async ({ page }) => {
+  test("React follows the chips, the cluster stays whole, and every target takes its own hits", async ({ page }) => {
     await openRoomWithComposer(page);
     const bare = await submitMessage(page, "tablet bare");
     await expect(bare).toHaveCount(1);

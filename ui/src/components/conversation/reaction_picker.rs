@@ -109,7 +109,7 @@ impl ReactionTarget {
 }
 
 /// The conversation's reaction surfaces: the picker's target, the group
-/// whose reactor list is open, and the open mobile surface
+/// whose reactor list is open, and the open mobile message sheet
 /// (`mobile_surface.rs`), so that opening any one closes the others. All are
 /// `Conversation`'s own signals; the handles compare by identity, so a
 /// group's props stay equal (#830).

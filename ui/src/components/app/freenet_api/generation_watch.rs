@@ -1120,9 +1120,9 @@ mod runtime {
             return true;
         }
         // The mobile message sheet (below 48rem): open while its modal dialog
-        // is. Asked directly rather than left to the overlay
-        // check below, which looks for a class it does not carry. Closed, the
-        // dialog stays mounted and holds nothing.
+        // is. Asked directly rather than left to the overlay check below,
+        // which looks for a class it does not carry. Closed, the dialog stays
+        // mounted and holds nothing.
         if crate::components::conversation::mobile_surface_is_open() {
             return true;
         }

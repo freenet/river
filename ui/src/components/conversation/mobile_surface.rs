@@ -29,13 +29,13 @@
 //! and reopening of the same message is a new token, so an older queued
 //! reaction does nothing.
 //!
-//! The sheet has no field, so it never brings up the software keyboard. It is
-//! committed deferred and shown after the render that fills it (the sheet's
-//! own effect), focus on the reader's current reaction or else the first
-//! emoji.
+//! The sheet is committed deferred and shown after the render that fills it
+//! (the sheet's own effect), focus on the reader's current reaction or else
+//! the first emoji.
 //!
-//! The sheet is a native modal `<dialog>` (`showModal`): it is in the top
-//! layer above the header, history, composer and Latest; the rest of the page
+//! The sheet is a native modal `<dialog>` (`showModal`), named by its
+//! `aria-label`: it is in the top layer above the header, history, composer
+//! and Latest; the rest of the page
 //! is inert, so a tap on the backdrop reaches nothing underneath and Tab stays
 //! inside (also wrapped here, [`dom::contain_tab`]). Escape closes it natively;
 //! the dialog's own `close` event brings the state back in line. While it is
@@ -45,8 +45,7 @@
 //! hold and reads go on underneath (history-scrolling.md); opening or closing
 //! it never moves the history.
 //!
-//! Dismissal. It has no title or Close button: its title is the dialog's
-//! accessible name. A tap outside slides the panel away, and a downward drag
+//! Dismissal. A tap outside slides the panel away, and a downward drag
 //! starting anywhere on the screen drags it and dismisses it once far or fast
 //! enough (`mobile_sheet_drag.rs`). Escape and a choice (an emoji, an action)
 //! close it at once.
@@ -215,8 +214,8 @@ impl ReactionSurfaces {
         dom::hold_background(true);
     }
 
-    /// Close the open mobile surface and let go of what it held: the dialog
-    /// and the input hold, then its state.
+    /// Close the open sheet and let go of what it held: the dialog and the
+    /// input hold, then its state.
     /// An ordinary dismissal (`restore`) returns focus, without scrolling, to
     /// the row's control it opened from if that is still live; a handoff
     /// (Reply, Edit, Delete) leaves focus to where it goes. Nothing is open
@@ -260,8 +259,8 @@ impl ReactionSurfaces {
         }
     }
 
-    /// Close the mobile surface if what it is for has gone. From a deferred
-    /// callback only.
+    /// Close the sheet if what it is for has gone. From a deferred callback
+    /// only.
     pub(super) fn close_mobile_if_stale(self) {
         if self.mobile_opening().is_some_and(|o| !opening_is_live(&o)) {
             self.close_mobile(false);
@@ -320,7 +319,7 @@ pub(super) fn narrow_now() -> bool {
 }
 
 /// Whether the window is below 48rem, for rendering: the invokers' route and
-/// labels, and the guard that closes a mobile surface at 48rem. Kept by a
+/// labels, and the guard that closes the sheet at 48rem. Kept by a
 /// `matchMedia` listener ([`crate::util::watch_media`], installed by
 /// [`MobileSurfaceGuard`]).
 static NARROW: GlobalSignal<bool> = Global::new(narrow_now);
@@ -339,21 +338,20 @@ pub(super) fn narrow_for_render() -> bool {
     }
 }
 
-/// Closes the open mobile surface when it no longer belongs on screen: the
-/// window reaching 48rem, another mobile panel replacing the chat, or the
-/// room's generation changing. A room switch closes it from `Conversation`'s
+/// Closes the open sheet when it no longer belongs on screen: the window
+/// reaching 48rem, another mobile panel replacing the chat, or the room's
+/// generation changing. A room switch closes it from `Conversation`'s
 /// room-change path, and its message leaving the history from the row's
 /// control unmounting. Rendered once by `Conversation`; renders nothing.
 ///
 /// It does not watch for an unrelated app modal opening, deliberately: while
-/// a mobile surface is open the rest of the page is inert under its modal
-/// dialog, so no control can open another modal, and the app's other modals
-/// open only from such controls (member info, room settings, invite, ban,
-/// delete confirmation, DM thread). Paths that open one without a press go
-/// through a room switch first (a notification click, an invitation link),
-/// which closes the surface in `Conversation`'s room-change path. A modal
-/// that could open programmatically over an open surface would need closing
-/// here.
+/// the sheet is open the rest of the page is inert under its modal dialog, so
+/// no control can open another modal, and the app's other modals open only
+/// from such controls (member info, room settings, invite, ban, delete
+/// confirmation, DM thread). Paths that open one without a press go through a
+/// room switch first (a notification click, an invitation link), which closes
+/// the sheet in `Conversation`'s room-change path. A modal that could open
+/// programmatically over the open sheet would need closing here.
 #[component]
 pub(super) fn MobileSurfaceGuard(
     surfaces: ReactionSurfaces,
@@ -563,7 +561,7 @@ pub(super) mod dom {
         }
     }
 
-    /// The listener that holds scrolling input while a surface is open.
+    /// The listener that holds scrolling input while the sheet is open.
     type Blocker = Closure<dyn FnMut(web_sys::Event)>;
 
     thread_local! {
@@ -573,11 +571,11 @@ pub(super) mod dom {
     const HELD_KINDS: [&str; 2] = ["wheel", "touchmove"];
 
     /// Hold the reader's wheel and one-finger touch scrolling outside the
-    /// open surface's panel, so the history behind it stays put while the
-    /// panel itself scrolls. A zoom is let through: a wheel with Ctrl down (Ctrl+wheel, a touchpad pinch) and a
-    /// touch with more than one finger. Nothing is captured, so turning it
-    /// off is only removing the listeners; one left behind holds nothing
-    /// while no surface is open.
+    /// sheet's panel, so the history behind it stays put while the panel
+    /// itself scrolls. A zoom is let through: a wheel with Ctrl down
+    /// (Ctrl+wheel, a touchpad pinch) and a touch with more than one finger.
+    /// Nothing is captured, so turning it off is only removing the
+    /// listeners; one left behind holds nothing while the sheet is closed.
     pub(super) fn hold_background(on: bool) {
         BLOCKER.with(|blocker| {
             let mut blocker = blocker.borrow_mut();
@@ -669,7 +667,7 @@ pub(super) mod dom {
     pub(in super::super) fn dialog_open() -> bool {
         false
     }
-    /// Natively every row control "exists", so openings stay live in tests.
+    /// Natively every row control "exists".
     pub(in super::super) fn row_control(_row: &str, _selector: &str) -> Option<()> {
         Some(())
     }

@@ -16,11 +16,10 @@
 //! cancelled), a second finger, a press too old to be this click, and a tap
 //! that completes a text selection open nothing; touch scrolling and text
 //! selection themselves are left alone. A tap or click opens at once, whatever
-//! the pointer: a mouse click does not wait out the double-click window, so in
-//! a narrow mouse window the first click of a double-click opens the sheet
-//! (the second click is never a tap). Rows take no double-tap zoom below
-//! 48rem (`touch-action: manipulation`, `main.css`), so iOS Safari does not
-//! hold the click back waiting for a second tap.
+//! the pointer: the first click of a double-click opens the sheet, and the
+//! second is never a tap. Rows take no double-tap zoom below 48rem
+//! (`touch-action: manipulation`, `main.css`), so iOS Safari does not hold the
+//! click back waiting for a second tap.
 //!
 //! Keyboard. Each row has one visually hidden native button
 //! ([`MobileActionsEntry`]), shown on keyboard focus, which opens the same

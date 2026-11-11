@@ -452,7 +452,7 @@ export async function plainPointOf(row: Locator): Promise<{ x: number; y: number
   return point!;
 }
 
-/// Tap (or click) `row` on a plain point, as a reader opening its actions.
+/// Tap (or click) `row` on a plain point, as a reader opening its sheet.
 export async function tapRow(page: Page, row: Locator) {
   await pressAt(page, await plainPointOf(row));
 }

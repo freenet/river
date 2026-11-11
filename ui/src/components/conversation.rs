@@ -4118,10 +4118,10 @@ fn MessageGroupComponent(
                     let Some((key, message_id)) = previous else {
                         return;
                     };
-                    // Closed because the picker or a mobile surface opened
+                    // Closed because the picker or the mobile sheet opened
                     // (React from the keyboard, a tap below 48rem): focus
-                    // stays where the reader put it, never pulled out of the
-                    // surface.
+                    // stays where the reader put it, never pulled out of
+                    // either.
                     if reaction_picker_is_open() || mobile_surface_is_open() {
                         return;
                     }
@@ -4306,7 +4306,7 @@ fn MessageGroupComponent(
                                         // button beside it is the accessible
                                         // control, so this is no tab stop either.
                                         // Its click opens the author's info, not
-                                        // the row's actions.
+                                        // the row's sheet.
                                         div {
                                             "data-testid": "message-author-avatar",
                                             "data-row-actions": "exclude",
@@ -4716,10 +4716,9 @@ fn MessageGroupComponent(
                                                 // React: the message's one way into the picker
                                                 // or the sheet. Taps here (a chip, its reactor
                                                 // list and that list's backdrop, React) never
-                                                // open the row's actions.
+                                                // open the row's sheet.
                                                 class: "msg-reaction-row",
                                                 "data-row-actions": "exclude",
-                                                // Existing reactions (clickable to toggle if user has reacted)
                                                 {
                                                     row_reactions.iter().map(|reaction| {
                                                         let emoji = &reaction.emoji;
@@ -4986,8 +4985,8 @@ fn MessageGroupComponent(
                                             }
                                             if show_actions {
                                                 // Below 48rem the cluster is hidden: a tap on the
-                                                // row opens its actions, and this hidden button
-                                                // is the keyboard's way in.
+                                                // row opens its sheet, and this hidden button is
+                                                // the keyboard's way in.
                                                 MobileActionsEntry {
                                                     surfaces: reactions,
                                                     target: sheet_target,

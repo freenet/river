@@ -13,8 +13,7 @@
 //! - **Reactions.** The 16 [`FREQUENT_EMOJIS`] the desktop picker offers, in
 //!   one row that scrolls sideways. A tap reacts, or on the reader's current
 //!   reaction removes it, and closes the sheet. It takes focus when the sheet
-//!   opens (the current reaction, centred in the row, else the first), so the
-//!   software keyboard never comes up.
+//!   opens (the current reaction, centred in the row, else the first).
 //! - **Who reacted.** For a message with reactions, each emoji with the
 //!   people behind it, the same names and ⚠ / 🛡 marks as the desktop chip's
 //!   list. It is how a phone sees who reacted: a chip tap reacts with its
@@ -27,7 +26,7 @@
 //!
 //! A choice acts once, for the opening it was made in and only while that is
 //! live: a duplicate event, or one queued before a dismissal and reopening,
-//! does nothing. The room composer is never touched.
+//! does nothing.
 
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::mobile_surface::{dom, SHEET_ID, SHEET_TITLE};
