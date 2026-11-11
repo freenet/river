@@ -117,7 +117,8 @@ Current behavior:
   the next wheel or one-finger drag closes it and scrolls as usual.
 - Below 48rem a row tap, the + or the row's keyboard entry opens the one
   mobile message sheet, a native modal `<dialog>`
-  (`conversation/mobile_surface.rs`). A reaction chip opens nothing: a
+  (`conversation/mobile_message_sheet.rs`; its state and input hold are in
+  `conversation/mobile_surface.rs`). A reaction chip opens nothing: a
   press on it reacts with its emoji, at every width. At 48rem and wider a
   finger held on a chip, or Shift+Enter, opens its reactor list. While the
   sheet is open the reader's wheel
