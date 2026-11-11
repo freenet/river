@@ -2,6 +2,7 @@ import { test, expect, Locator, Page } from "@playwright/test";
 import {
   coarsePointer,
   committedRow,
+  expectSheetOpenFor,
   expectTouchHeldUntilClosed,
   hasTouch,
   historyPoint,
@@ -9,16 +10,18 @@ import {
   narrowLayout,
   openMessageActions,
   openRoomWithComposer,
+  openSheetFromReact,
   plainPointOf,
   press,
   pressAt,
   rowKey,
   settle,
+  SHEET,
+  sheet,
   submitMessage,
   tapRow,
   touchmovePrevented,
   wheelCancelled,
-  panelAtRest,
 } from "./example-room";
 import { DM_PEER, openThread } from "./dm-thread";
 import { deliver, scrollMetrics } from "./history-geometry";
@@ -32,12 +35,6 @@ import { callRiverTest, rekeyThenClick } from "./river-test";
 // Width alone decides: a narrow mouse window is mobile, a wide touch screen
 // keeps the desktop footer. These run on every project at the widths they
 // set, so the desktop projects are narrow mouse windows here.
-
-const SHEET = "mobile-message-sheet";
-
-function sheet(page: Page): Locator {
-  return page.getByTestId(SHEET);
-}
 
 /// Whether nothing opened: no sheet, and no tap reached one.
 async function expectNoSurface(page: Page) {
@@ -215,9 +212,8 @@ test.describe("Below 48rem", () => {
     await expect(chip, "a chip reacts with its emoji").toContainText("2");
     await expectNoSurface(page);
     await expect(page.getByTestId("reaction-owners"), "not the reactor list").toHaveCount(0);
-    await press(page, chipRow.getByTestId("message-react-button"));
-    await expect(sheet(page), "the + opens the sheet").toBeVisible();
-    await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(chipRow));
+    // The + opens the sheet.
+    await openSheetFromReact(page, chipRow);
     await page.keyboard.press("Escape");
     await expect(sheet(page)).toBeHidden();
 
@@ -229,7 +225,7 @@ test.describe("Below 48rem", () => {
     const { own } = await openRoomWithRows(page);
     const { x, y } = await plainPointOf(own);
     // A press dragged past a tap's slop, released on the row.
-    if (await hasTouch(page)) {
+    if (hasTouch()) {
       await own.dispatchEvent("pointerdown", { pointerId: 7, pointerType: "touch", isPrimary: true, clientX: x, clientY: y, bubbles: true });
       await own.dispatchEvent("pointerup", { pointerId: 7, pointerType: "touch", isPrimary: true, clientX: x, clientY: y + 30, bubbles: true });
       await own.dispatchEvent("click", { clientX: x, clientY: y + 30, button: 0, bubbles: true });
@@ -283,8 +279,7 @@ test.describe("Below 48rem", () => {
     const box = (await entry.boundingBox())!;
     expect(box.width, "keyboard focus shows it").toBeGreaterThan(20);
     await page.keyboard.press("Enter");
-    await expect(sheet(page)).toBeVisible();
-    await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(own));
+    await expectSheetOpenFor(page, own);
     const first = sheet(page).getByTestId("mobile-reaction-palette").getByRole("button").first();
     const del = page.getByTestId("mobile-message-action-delete");
     await expect(first, "the first emoji takes focus").toBeFocused();
@@ -470,7 +465,7 @@ test.describe("Below 48rem", () => {
     const { own } = await openRoomWithRows(page);
     await openMessageActions(page, own);
     expect(await callRiverTest(page, "userIsBusy"), "busy while open").toBe(true);
-    if (!(await hasTouch(page))) {
+    if (!(hasTouch())) {
       const view = (await page.locator("#chat-scroll-container").boundingBox())!;
       const before = (await scrollMetrics(page)).top;
       expect(before, "premise: the history has room to scroll up").toBeGreaterThan(300);
@@ -489,7 +484,7 @@ test.describe("Below 48rem", () => {
     await expect(sheet(page)).toBeHidden();
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "closed: not busy" }).toBe(false);
-    if (!(await hasTouch(page))) {
+    if (!(hasTouch())) {
       const view = (await page.locator("#chat-scroll-container").boundingBox())!;
       const before = (await scrollMetrics(page)).top;
       await page.mouse.move(view.x + 30, view.y + 30);
@@ -500,7 +495,7 @@ test.describe("Below 48rem", () => {
 
   test("one-finger touch is held outside the panel, not inside it or for a pinch; every close path lets go", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
-    await expectTouchHeldUntilClosed(page, SHEET, () => openMessageActions(page, own), [
+    await expectTouchHeldUntilClosed(page, () => openMessageActions(page, own), [
       ["Escape", () => page.keyboard.press("Escape")],
       ["backdrop", async () => pressAt(page, await historyPoint(page))],
       ["48rem", async () => {
@@ -594,7 +589,7 @@ test.describe("Below 48rem", () => {
   });
 
   test("the second click of a double-click on a row is not a tap", async ({ page }) => {
-    test.skip(await hasTouch(page), "a mouse's multi-click");
+    test.skip(hasTouch(), "a mouse's multi-click");
     const { own } = await openRoomWithRows(page);
     const { x, y } = await plainPointOf(own);
     // Alone, with no first click before it: it opens nothing.
@@ -629,10 +624,9 @@ test.describe("Below 48rem", () => {
 });
 
 /// The open panel's geometry against the viewport.
-function panelGeometry(page: Page, id: string) {
-  return page.evaluate((id) => {
-    const dialog = document.getElementById(id)!;
-    const panel = dialog.querySelector(".mobile-sheet-panel") as HTMLElement;
+function panelGeometry(page: Page) {
+  return page.evaluate(() => {
+    const panel = document.querySelector("#mobile-message-sheet .mobile-sheet-panel") as HTMLElement;
     const r = panel.getBoundingClientRect();
     const buttons = Array.from(panel.querySelectorAll("button")).map((b) => {
       const br = b.getBoundingClientRect();
@@ -653,7 +647,7 @@ function panelGeometry(page: Page, id: string) {
       buttons,
       background: getComputedStyle(panel).backgroundColor,
     };
-  }, id);
+  });
 }
 
 test.describe("The actions sheet at 320px", () => {
@@ -664,8 +658,7 @@ test.describe("The actions sheet at 320px", () => {
     for (const scheme of ["light", "dark"] as const) {
       await page.emulateMedia({ colorScheme: scheme });
       await openMessageActions(page, own);
-      await panelAtRest(page, SHEET);
-      const g = await panelGeometry(page, SHEET);
+      const g = await panelGeometry(page);
       expect(g.overflowX, "no page overflow").toBe(false);
       expect(g.left).toBeGreaterThanOrEqual(0);
       expect(g.right).toBeLessThanOrEqual(g.vw);
@@ -710,7 +703,7 @@ test.describe("At 48rem and wider", () => {
     await expect(react).toHaveAttribute("aria-controls", "reaction-picker");
     await press(page, react);
     await expect(page.getByTestId("emoji-picker")).toBeVisible();
-    await expect(page.getByTestId(SHEET)).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
   });
 });
 

@@ -1,4 +1,5 @@
 import { CDPSession, expect, Locator, Page, test } from "@playwright/test";
+import { callRiverTest } from "./river-test";
 
 export async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
@@ -107,6 +108,16 @@ export async function openRoomWithComposer(page: Page) {
   await waitForApp(page);
   await selectRoom(page, "Your Private Room");
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
+}
+
+/// `openRoomWithComposer`, then a received message with no reactions at the
+/// end of the history. Returns its row.
+export async function openRoomWithTarget(page: Page, text = "react target"): Promise<Locator> {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "appendMessage", text);
+  const row = committedRow(page, text);
+  await expect(row).toBeVisible({ timeout: 5_000 });
+  return row;
 }
 
 /// The signed message in the room history holding `text` (a pending send is
@@ -246,7 +257,7 @@ export async function clickFooter(page: Page, row: Locator, testid: string) {
   if (sheetAction && (await narrowLayout(page))) {
     await openMessageActions(page, row);
     await press(page, page.getByTestId(sheetAction));
-    await expect(page.getByTestId("mobile-message-sheet")).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
     return;
   }
   await revealFooter(page, row);
@@ -258,8 +269,8 @@ export async function clickFooter(page: Page, row: Locator, testid: string) {
 /// its row of choices.
 export async function openInlinePicker(page: Page, row: Locator) {
   if (await narrowLayout(page)) {
-    await openReactionPopup(page, row);
-    await expect(page.getByTestId("mobile-reaction-palette")).toBeVisible();
+    await openSheetFromReact(page, row);
+    await expect(palette(page)).toBeVisible();
     return;
   }
   await clickFooter(page, row, "message-react-button");
@@ -268,7 +279,7 @@ export async function openInlinePicker(page: Page, row: Locator) {
 /// The emoji buttons of whichever reaction choices `openInlinePicker` opened.
 export async function reactionChoices(page: Page): Promise<Locator> {
   return (await narrowLayout(page))
-    ? page.getByTestId("mobile-reaction-palette").getByRole("button")
+    ? palette(page).getByRole("button")
     : page.getByTestId("emoji-picker").getByRole("button");
 }
 
@@ -277,7 +288,7 @@ export async function reactionChoices(page: Page): Promise<Locator> {
 export async function reactTo(page: Page, row: Locator): Promise<Locator> {
   await openInlinePicker(page, row);
   await press(page, (await reactionChoices(page)).first());
-  const chip = row.getByTestId("reaction-chip");
+  const chip = chips(row);
   await expect(chip).toHaveCount(1);
   return chip;
 }
@@ -300,21 +311,21 @@ export async function asTouchTablet(page: Page) {
 
 /// Whether this test's context has touch input, so `tap()` works: the
 /// project's device, whatever width a test sets.
-export async function hasTouch(_page: Page): Promise<boolean> {
+export function hasTouch(): boolean {
   return test.info().project.use.hasTouch === true;
 }
 
 /// Press `target` as the reader would: a tap where touch is available, else
 /// a click.
 export async function press(page: Page, target: Locator, options?: { position?: { x: number; y: number } }) {
-  if (await hasTouch(page)) await target.tap(options);
+  if (hasTouch()) await target.tap(options);
   else await target.click(options);
 }
 
 /// Press the page at a point as the reader would: a tap where touch is
 /// available, else a click.
 export async function pressAt(page: Page, { x, y }: { x: number; y: number }) {
-  if (await hasTouch(page)) await page.touchscreen.tap(x, y);
+  if (hasTouch()) await page.touchscreen.tap(x, y);
   else await page.mouse.click(x, y);
 }
 
@@ -323,26 +334,23 @@ export async function pressAt(page: Page, { x, y }: { x: number; y: number }) {
 /// the pointer lifts. Dispatched events: outside Chromium's input protocol
 /// Playwright has no touch hold, and the app decides a hold on the
 /// `pointerdown`'s type and a timer alone.
-export async function holdChip(page: Page, chip: Locator, pointerType: "touch" | "pen" | "mouse" = "touch"): Promise<() => Promise<void>> {
+export async function holdChip(page: Page, chip: Locator): Promise<() => Promise<void>> {
   const fire = (type: string) =>
-    chip.evaluate(
-      (el, [type, pointerType]) => {
-        const r = el.getBoundingClientRect();
-        el.dispatchEvent(
-          new PointerEvent(type, {
-            bubbles: true,
-            cancelable: true,
-            composed: true,
-            pointerId: 7,
-            pointerType,
-            isPrimary: true,
-            clientX: r.left + r.width / 2,
-            clientY: r.top + r.height / 2,
-          }),
-        );
-      },
-      [type, pointerType],
-    );
+    chip.evaluate((el, type) => {
+      const r = el.getBoundingClientRect();
+      el.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          pointerId: 7,
+          pointerType: "touch",
+          isPrimary: true,
+          clientX: r.left + r.width / 2,
+          clientY: r.top + r.height / 2,
+        }),
+      );
+    }, type);
   await chip.scrollIntoViewIfNeeded();
   await fire("pointerdown");
   await page.waitForTimeout(700);
@@ -352,10 +360,35 @@ export async function holdChip(page: Page, chip: Locator, pointerType: "touch" |
   };
 }
 
-/// The message key a row's id carries (`msg-<key>`), as the mobile surfaces'
+/// The mobile message sheet's id and test id: the one dialog a row tap, a
+/// row's + or its keyboard entry opens below 48rem.
+export const SHEET = "mobile-message-sheet";
+
+export function sheet(page: Page): Locator {
+  return page.getByTestId(SHEET);
+}
+
+/// The sheet's row of emoji choices.
+export function palette(page: Page): Locator {
+  return page.getByTestId("mobile-reaction-palette");
+}
+
+/// `row`'s reaction chips.
+export function chips(row: Locator): Locator {
+  return row.getByTestId("reaction-chip");
+}
+
+/// The message key a row's id carries (`msg-<key>`), as the sheet's
 /// `data-target-row` names it.
 export async function rowKey(row: Locator): Promise<string> {
   return (await row.getAttribute("id"))!.replace(/^msg-/, "");
+}
+
+/// The middle of `target`'s box, in whole px: where a finger or the mouse
+/// goes down on it.
+export async function centreOf(target: Locator): Promise<[number, number]> {
+  const box = (await target.boundingBox())!;
+  return [Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2)];
 }
 
 /// Footer test ids and the sheet action that replaces each below 48rem.
@@ -424,27 +457,27 @@ export async function tapRow(page: Page, row: Locator) {
   await pressAt(page, await plainPointOf(row));
 }
 
-/// Below 48rem: open `row`'s actions sheet with a tap on the row, check it
-/// is for that row, and wait for its opening slide to end: until then the
-/// panel is partly below the screen, so a point measured in it is not where
-/// it will be, or is on nothing.
-export async function openMessageActions(page: Page, row: Locator) {
-  await tapRow(page, row);
-  const sheet = page.getByTestId("mobile-message-sheet");
-  await expect(sheet).toBeVisible();
-  await expect(sheet).toHaveAttribute("data-target-row", await rowKey(row));
-  await panelAtRest(page, "mobile-message-sheet");
+/// The sheet is open for `row` and its opening slide has ended: until then
+/// the panel is partly below the screen, so a point measured in it is not
+/// where it will be, or is on nothing.
+export async function expectSheetOpenFor(page: Page, row: Locator) {
+  await expect(sheet(page)).toBeVisible();
+  await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(row));
+  await panelAtRest(page);
 }
 
-/// Below 48rem: open `row`'s reaction popup with its +, check it is for
-/// that row, and wait for its opening slide to end (see
-/// `openMessageActions`).
-export async function openReactionPopup(page: Page, row: Locator) {
+/// Below 48rem: open `row`'s sheet with a tap on the row, and wait until it
+/// is open for that row and at rest.
+export async function openMessageActions(page: Page, row: Locator) {
+  await tapRow(page, row);
+  await expectSheetOpenFor(page, row);
+}
+
+/// Below 48rem: open `row`'s sheet with its +, and wait until it is open
+/// for that row and at rest.
+export async function openSheetFromReact(page: Page, row: Locator) {
   await press(page, row.getByTestId("message-react-button"));
-  const popup = page.getByTestId("mobile-message-sheet");
-  await expect(popup).toBeVisible();
-  await expect(popup).toHaveAttribute("data-target-row", await rowKey(row));
-  await panelAtRest(page, "mobile-message-sheet");
+  await expectSheetOpenFor(page, row);
 }
 
 /// A point over the history's top, below the header.
@@ -453,37 +486,32 @@ export async function historyPoint(page: Page): Promise<{ x: number; y: number }
   return { x: view.x + 40, y: view.y + 30 };
 }
 
-/// How far the open panel of mobile dialog `id` sits below its rest
-/// position now, in px (its computed `transform`; the opening slide's
-/// `translate` is not counted).
-export function panelOffset(page: Page, id: string): Promise<number> {
-  return page.evaluate((id) => {
-    const panel = document.querySelector(`#${id} .mobile-sheet-panel`)!;
-    return new DOMMatrix(getComputedStyle(panel).transform).m42;
-  }, id);
+const PANEL = `#${SHEET} .mobile-sheet-panel`;
+
+/// How far the open sheet's panel sits below its rest position now, in px
+/// (its computed `transform`; the opening slide's `translate` is not
+/// counted).
+export function panelOffset(page: Page): Promise<number> {
+  return page.evaluate((panel) => new DOMMatrix(getComputedStyle(document.querySelector(panel)!).transform).m42, PANEL);
 }
 
-/// How far the open panel of mobile dialog `id` sits above the bottom of
-/// the viewport, in px (0 at rest; the opening slide counts).
-export function panelBottomGap(page: Page, id: string): Promise<number> {
-  return page.evaluate((id) => {
-    const panel = document.querySelector(`#${id} .mobile-sheet-panel`)!;
-    return window.innerHeight - panel.getBoundingClientRect().bottom;
-  }, id);
+/// How far the open sheet's panel sits above the bottom of the viewport, in
+/// px (0 at rest; the opening slide counts).
+export function panelBottomGap(page: Page): Promise<number> {
+  return page.evaluate((panel) => window.innerHeight - document.querySelector(panel)!.getBoundingClientRect().bottom, PANEL);
 }
 
-/// Wait until the open panel of mobile dialog `id` has no slide or
-/// transition running.
-export async function panelAtRest(page: Page, id: string) {
+/// Wait until the open sheet's panel has no slide or transition running.
+export async function panelAtRest(page: Page) {
   await page.waitForFunction(
-    (id) => document.querySelector(`#${id} .mobile-sheet-panel`)?.getAnimations().every((a) => a.playState !== "running") ?? false,
-    id,
+    (panel) => document.querySelector(panel)?.getAnimations().every((a) => a.playState !== "running") ?? false,
+    PANEL,
   );
 }
 
-/// A point inside the open panel of mobile dialog `id`, on no control.
-export async function panelPoint(page: Page, id: string): Promise<{ x: number; y: number }> {
-  const box = (await page.locator(`#${id} .mobile-sheet-panel`).boundingBox())!;
+/// A point inside the open sheet's panel, on no control.
+async function panelPoint(page: Page): Promise<{ x: number; y: number }> {
+  const box = (await page.locator(PANEL).boundingBox())!;
   return { x: box.x + box.width / 2, y: box.y + 6 };
 }
 
@@ -515,25 +543,23 @@ export function wheelCancelled(page: Page, x: number, y: number, ctrlKey: boolea
   );
 }
 
-/// For each `[how, close]`: open mobile dialog `id` with `open`, check that a
+/// For each `[how, close]`: open the sheet with `open`, check that a
 /// one-finger touch over the history is held while a pinch and a touch on
 /// its panel are not, close it with `close`, and check the hold let go.
 export async function expectTouchHeldUntilClosed(
   page: Page,
-  id: string,
   open: () => Promise<void>,
   closes: [string, () => Promise<void>][],
 ) {
-  const dialog = page.getByTestId(id);
   for (const [how, close] of closes) {
     await open();
     const h = await historyPoint(page);
     expect(await touchmovePrevented(page, h.x, h.y), `${how}: a finger over the history is held`).toBe(true);
     expect(await touchmovePrevented(page, h.x, h.y, 2), `${how}: a pinch is not`).toBe(false);
-    const inside = await panelPoint(page, id);
+    const inside = await panelPoint(page);
     expect(await touchmovePrevented(page, inside.x, inside.y), `${how}: the panel scrolls`).toBe(false);
     await close();
-    await expect(dialog).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
     await settle(page);
     const after = await historyPoint(page);
     expect(await page.evaluate(({ x, y }) => !!document.elementFromPoint(x, y)?.closest("#chat-scroll-container"), after), "premise: the history is under the point").toBe(true);
