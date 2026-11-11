@@ -2,13 +2,14 @@
 //! appears at, what it is open for, and the modal dialog it is drawn in.
 //!
 //! Below Tailwind's `md` (48rem) a message row's trailing Reply, Edit and
-//! Delete are hidden. A tap on the row, on its reaction +, or on one of its
-//! reaction chips, or its keyboard entry, opens the one **message sheet**
-//! (`mobile_message_sheet.rs`): the 16 emoji in a row that scrolls sideways,
-//! who reacted, then Reply, and Edit and Delete on your own. Row taps and the
-//! entry are `mobile_message_actions.rs`. At 48rem and wider it does not
-//! exist: the footer, the anchored reaction picker (`reaction_picker.rs`) and
-//! the chips' reactor lists are as before.
+//! Delete are hidden. A tap on the row or on its reaction +, or its keyboard
+//! entry, opens the one **message sheet** (`mobile_message_sheet.rs`): the 16
+//! emoji in a row that scrolls sideways, who reacted, then Reply, and Edit
+//! and Delete on your own. A press on a reaction chip opens nothing: it
+//! reacts with the chip's emoji, at every width (`conversation.rs`). Row taps
+//! and the entry are `mobile_message_actions.rs`. At 48rem and wider the
+//! sheet does not exist: the footer, the anchored reaction picker
+//! (`reaction_picker.rs`) and the chips' reactor lists are as before.
 //!
 //! Ownership. One [`MobileOpening`] at a time lives in the `mobile` signal of
 //! the conversation's [`ReactionSurfaces`], so opening the sheet closes the
@@ -83,8 +84,6 @@ pub(super) enum Origin {
     Entry,
     /// The row's reaction +.
     React,
-    /// One of its reaction chips, by element id.
-    Chip(String),
 }
 
 impl Origin {
@@ -94,7 +93,6 @@ impl Origin {
         match self {
             Self::Entry => ENTRY_SELECTOR.to_string(),
             Self::React => REACT_SELECTOR.to_string(),
-            Self::Chip(id) => format!("[id=\"{id}\"]"),
         }
     }
 }

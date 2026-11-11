@@ -1,7 +1,7 @@
-//! The mobile message sheet: below 48rem, a tap on a signed message row, on
-//! its reaction +, on one of its reaction chips, or its keyboard entry opens
-//! this one sheet for that message (`mobile_surface.rs` has its state, frame
-//! and lifecycle; `mobile_message_actions.rs` the row taps and the entry).
+//! The mobile message sheet: below 48rem, a tap on a signed message row or
+//! on its reaction +, or its keyboard entry, opens this one sheet for that
+//! message (`mobile_surface.rs` has its state, frame and lifecycle;
+//! `mobile_message_actions.rs` the row taps and the entry).
 //!
 //! From the top:
 //!
@@ -12,7 +12,8 @@
 //!   software keyboard never comes up.
 //! - **Who reacted.** For a message with reactions, each emoji with the
 //!   people behind it, the same names and ⚠ / 🛡 marks as the desktop chip's
-//!   list. It is how a phone sees who reacted: a chip tap opens this sheet.
+//!   list. It is how a phone sees who reacted: a chip tap reacts with its
+//!   emoji, so the names are here, behind a row tap or the +.
 //! - **Actions.** Reply, and Edit and Delete on your own message. Each closes
 //!   the sheet first and then hands over to the existing flow (the composer's
 //!   reply, the inline editor via `edit_trigger`, the delete confirmation),
@@ -110,8 +111,8 @@ fn act(
 }
 
 /// The conversation's one mobile message sheet. Rendered once by
-/// `Conversation`, closed until a row, its +, a chip or its entry opens it
-/// below 48rem.
+/// `Conversation`, closed until a row, its + or its entry opens it below
+/// 48rem.
 #[component]
 pub(super) fn MobileMessageSheet(
     surfaces: ReactionSurfaces,

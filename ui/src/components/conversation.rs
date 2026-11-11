@@ -3209,9 +3209,9 @@ pub fn Conversation() -> Element {
 
             // The one reaction picker, opened by a message's footer React.
             ReactionPicker { surfaces: reaction_surfaces, on_react: on_group_react }
-            // Below 48rem: the message sheet a row tap, its +, a chip or its
-            // entry opens, and what closes it at 48rem, outside the chat or
-            // across a re-key (`mobile_surface.rs`).
+            // Below 48rem: the message sheet a row tap, its + or its entry
+            // opens, and what closes it at 48rem, outside the chat or across
+            // a re-key (`mobile_surface.rs`).
             MobileMessageSheet { surfaces: reaction_surfaces, on_react: on_group_react, on_action: on_mobile_action }
             MobileSurfaceGuard {
                 surfaces: reaction_surfaces,
@@ -3702,9 +3702,9 @@ impl ChipHold {
     }
 }
 
-/// Where the reactor list for a chip opens, from a point on the chip (the
-/// tap, or the chip's centre for a key press): below unless there is more
-/// room above, and toward whichever side of the window has more room.
+/// Where the reactor list for a chip opens, from a point on the chip (its
+/// centre, for a held finger and for Shift+Enter): below unless there is
+/// more room above, and toward whichever side of the window has more room.
 fn reaction_owners_popover_at(
     key: String,
     message_id: String,
@@ -4743,11 +4743,11 @@ fn MessageGroupComponent(
                                                 class: "msg-footer",
                                             div {
                                                 "data-testid": "message-reaction-row",
-                                                // The chips, then React: the message's one way
-                                                // into the picker, which opens at it. Taps here
-                                                // (a chip, its reactor list and that list's
-                                                // backdrop, React) never open the row's
-                                                // actions.
+                                                // The chips, which react with their emoji, then
+                                                // React: the message's one way into the picker
+                                                // or the sheet. Taps here (a chip, its reactor
+                                                // list and that list's backdrop, React) never
+                                                // open the row's actions.
                                                 class: "msg-reaction-row",
                                                 "data-row-actions": "exclude",
                                                 // Existing reactions (clickable to toggle if user has reacted)

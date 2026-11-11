@@ -1,8 +1,8 @@
 //! How a row opens the mobile message sheet (`mobile_message_sheet.rs`):
 //! below 48rem, a tap on a signed message, or its keyboard entry, opens the
-//! sheet for that exact message. Its + and its chips open the same sheet
-//! (`reaction_picker.rs`, `conversation.rs`). `mobile_surface.rs` has the
-//! sheet's state and lifecycle.
+//! sheet for that exact message. Its + opens the same sheet
+//! (`reaction_picker.rs`); its chips react (`conversation.rs`).
+//! `mobile_surface.rs` has the sheet's state and lifecycle.
 //!
 //! Row taps ([`row_tap`], [`row_clicked`]). One ordinary tap on a message's
 //! non-interactive content or background opens it. Anything with a behaviour

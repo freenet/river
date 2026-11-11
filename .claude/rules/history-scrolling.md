@@ -115,9 +115,12 @@ Current behavior:
   mid-drag. A picker whose React is no longer inside the history's view
   (arrivals followed past it, or the conversation was hidden) holds nothing:
   the next wheel or one-finger drag closes it and scrolls as usual.
-- Below 48rem a row tap, the +, a reaction chip or the row's keyboard entry
-  opens the one mobile message sheet, a native modal `<dialog>`
-  (`conversation/mobile_surface.rs`). While it is open the reader's wheel
+- Below 48rem a row tap, the + or the row's keyboard entry opens the one
+  mobile message sheet, a native modal `<dialog>`
+  (`conversation/mobile_surface.rs`). A reaction chip opens nothing: a
+  press on it reacts with its emoji, at every width. At 48rem and wider a
+  finger held on a chip, or Shift+Enter, opens its reactor list. While the
+  sheet is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and parts of the panel still scroll (the emoji row
   sideways, a long reactor list vertically); a zoom (Ctrl+wheel, a pinch) is
