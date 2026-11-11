@@ -37,14 +37,14 @@ const STILL_MS: f64 = 80.0;
 
 /// Which way a pointer set off, once it is past the tap slop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Axis {
+enum Axis {
     Vertical,
     Horizontal,
 }
 
 /// The way a pointer moved `(dx, dy)` from where it went down is going, or
 /// `None` while it is still a tap. A tie is sideways: scrolling the row wins.
-pub(super) fn intent(dx: f64, dy: f64) -> Option<Axis> {
+fn intent(dx: f64, dy: f64) -> Option<Axis> {
     if dx.hypot(dy) <= TAP_SLOP_PX {
         None
     } else if dy.abs() > dx.abs() {
@@ -57,7 +57,7 @@ pub(super) fn intent(dx: f64, dy: f64) -> Option<Axis> {
 /// Where the panel sits for a pointer `dy` below where it went down: with
 /// the finger, downward only. It never sits higher than at rest, where it is
 /// fully visible on the bottom edge.
-pub(super) fn offset(dy: f64) -> f64 {
+fn offset(dy: f64) -> f64 {
     dy.max(0.0)
 }
 
@@ -65,7 +65,7 @@ pub(super) fn offset(dy: f64) -> f64 {
 /// pointer's recent `(time, y)` samples, oldest first: their displacement
 /// over their time, or none if the finger was held still for [`STILL_MS`]
 /// before it lifted.
-pub(super) fn velocity(samples: &[(f64, f64)], released_at: f64) -> f64 {
+fn velocity(samples: &[(f64, f64)], released_at: f64) -> f64 {
     let (Some(&(t0, y0)), Some(&(t1, y1))) = (samples.first(), samples.last()) else {
         return 0.0;
     };
@@ -77,14 +77,14 @@ pub(super) fn velocity(samples: &[(f64, f64)], released_at: f64) -> f64 {
 
 /// What a release does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Release {
+enum Release {
     Dismiss,
     SpringBack,
 }
 
 /// A release with the panel `offset` px down, moving at `velocity` px/ms
 /// (down is positive), for a panel `panel_height` px tall.
-pub(super) fn release(offset: f64, velocity: f64, panel_height: f64) -> Release {
+fn release(offset: f64, velocity: f64, panel_height: f64) -> Release {
     let far = offset >= MIN_DISMISS_PX.max(panel_height * DISMISS_FRACTION);
     let flick = offset >= MIN_FLICK_PX && velocity >= FLICK_PX_PER_MS;
     if far || flick {
@@ -99,6 +99,7 @@ pub(super) use self::dom::{animate_out, install, reset, Listeners};
 
 #[cfg(target_arch = "wasm32")]
 mod dom {
+    use super::super::mobile_surface::dom::sheet;
     use super::super::reaction_picker::ReactionSurfaces;
     use super::{intent, offset, release, velocity, Axis, Release, VELOCITY_WINDOW_MS};
     use std::cell::{Cell, RefCell};
@@ -145,14 +146,6 @@ mod dom {
                 );
             }
         }
-    }
-
-    fn element(id: &str) -> Option<web_sys::HtmlElement> {
-        web_sys::window()?
-            .document()?
-            .get_element_by_id(id)?
-            .dyn_into::<web_sys::HtmlElement>()
-            .ok()
     }
 
     fn panel(dialog: &web_sys::HtmlElement) -> Option<web_sys::HtmlElement> {
@@ -204,8 +197,8 @@ mod dom {
 
     /// Slide the panel away, then close the opening it shows. Once: a second
     /// call while it leaves does nothing. With reduced motion, close now.
-    pub(in super::super) fn animate_out(id: &str, surfaces: ReactionSurfaces) {
-        let Some(dialog) = element(id) else {
+    pub(in super::super) fn animate_out(surfaces: ReactionSurfaces) {
+        let Some(dialog) = sheet() else {
             return;
         };
         leave(&dialog, surfaces);
@@ -244,12 +237,12 @@ mod dom {
         });
     }
 
-    /// Clear what a drag or a slide left on dialog `id`, before it shows: a
+    /// Clear what a drag or a slide left on the dialog, before it shows: a
     /// surface closed mid-drag opens at rest.
-    pub(in super::super) fn reset(id: &str) {
+    pub(in super::super) fn reset() {
         GESTURE.with(|g| g.borrow_mut().take());
         SUPPRESS_CLICK.with(|s| s.set(false));
-        let Some(dialog) = element(id) else {
+        let Some(dialog) = sheet() else {
             return;
         };
         let _ = dialog.class_list().remove_2(DRAGGING, LEAVING);
@@ -397,26 +390,22 @@ mod dom {
         })
     }
 
-    /// The click after a gesture that moved, inside dialog `id`: swallowed
+    /// The click after a gesture that moved, inside the dialog: swallowed
     /// before anything in the page sees it.
-    fn on_click(id: &str, event: web_sys::Event) {
+    fn on_click(event: web_sys::Event) {
         let inside = event
             .target()
-            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-            .and_then(|el| el.closest(&format!("#{id}")).ok().flatten())
-            .is_some();
+            .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+            .is_some_and(|node| sheet().is_some_and(|dialog| dialog.contains(Some(&node))));
         if inside && SUPPRESS_CLICK.with(|s| s.replace(false)) {
             event.stop_immediate_propagation();
             event.prevent_default();
         }
     }
 
-    /// Listen for drags on dialog `id`, for as long as the result lives.
-    pub(in super::super) fn install(
-        id: &'static str,
-        surfaces: ReactionSurfaces,
-    ) -> Option<Listeners> {
-        let dialog = element(id)?;
+    /// Listen for drags on the dialog, for as long as the result lives.
+    pub(in super::super) fn install(surfaces: ReactionSurfaces) -> Option<Listeners> {
+        let dialog = sheet()?;
         let window: web_sys::EventTarget = web_sys::window()?.into();
         let on_dialog = |f: fn(&web_sys::HtmlElement, web_sys::Event)| -> Listener {
             let dialog = dialog.clone();
@@ -426,7 +415,7 @@ mod dom {
             let dialog = dialog.clone();
             Listener::new(move |event: web_sys::Event| on_up(&dialog, event, surfaces))
         };
-        let click = Listener::new(move |event: web_sys::Event| on_click(id, event));
+        let click = Listener::new(on_click);
         let target: web_sys::EventTarget = dialog.clone().into();
         let added = vec![
             (target.clone(), "pointerdown", on_dialog(on_down), false),
@@ -450,10 +439,10 @@ mod dom {
 
 /// Native builds have no DOM, and so no dialog to dismiss.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn animate_out(_id: &str, _surfaces: super::reaction_picker::ReactionSurfaces) {}
+pub(super) fn animate_out(_surfaces: super::reaction_picker::ReactionSurfaces) {}
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn reset(_id: &str) {}
+pub(super) fn reset() {}
 
 #[cfg(test)]
 mod tests {

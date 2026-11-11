@@ -1,5 +1,5 @@
-//! The mobile message sheet's state, frame and lifecycle: the width it
-//! appears at, what it is open for, and the modal dialog it is drawn in.
+//! The mobile message sheet's state and lifecycle: the width it appears at,
+//! what it is open for, and the DOM side of the modal dialog it is drawn in.
 //!
 //! Below Tailwind's `md` (48rem) a message row's trailing Reply, Edit and
 //! Delete are hidden. A tap on the row or on its reaction +, or its keyboard
@@ -30,9 +30,9 @@
 //! reaction does nothing.
 //!
 //! The sheet has no field, so it never brings up the software keyboard. It is
-//! committed deferred and shown after the render that fills it
-//! ([`use_show_on_open`]), focus on the reader's current reaction or else the
-//! first emoji.
+//! committed deferred and shown after the render that fills it (the sheet's
+//! own effect), focus on the reader's current reaction or else the first
+//! emoji.
 //!
 //! The sheet is a native modal `<dialog>` (`showModal`): it is in the top
 //! layer above the header, history, composer and Latest; the rest of the page
@@ -68,8 +68,8 @@ const NARROW_QUERY: &str = "not all and (min-width: 48rem)";
 
 /// The sheet's dialog.
 pub(super) const SHEET_ID: &str = "mobile-message-sheet";
-/// Its dialog's accessible name.
-const SHEET_TITLE: &str = "Message options";
+/// Its dialog's accessible name, and its entries'.
+pub(super) const SHEET_TITLE: &str = "Message options";
 /// The row's keyboard entry: rendered while the row has the sheet at all
 /// (signed, not being edited), so its presence is what keeps an opening live.
 const ENTRY_SELECTOR: &str = "[data-testid=\"mobile-message-actions-entry\"]";
@@ -100,7 +100,7 @@ impl Origin {
 /// What the sheet is open for: one press on one message.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct MobileOpening {
-    pub(super) origin: Origin,
+    origin: Origin,
     /// This opening, among every mobile opening on the page.
     pub(super) token: u64,
     room: Option<VerifyingKey>,
@@ -219,10 +219,10 @@ impl ReactionSurfaces {
 
     /// Open the sheet for `opening`, closing the desktop picker and a
     /// reactor list first. Nothing is opened for an opening already gone.
-    /// Whether it is open. From a deferred callback only.
-    pub(super) fn open_mobile(self, opening: MobileOpening) -> bool {
+    /// From a deferred callback only.
+    pub(super) fn open_mobile(self, opening: MobileOpening) {
         if !narrow_now() || !opening_is_live(&opening) {
-            return false;
+            return;
         }
         self.close();
         self.close_owner_list_now();
@@ -230,7 +230,6 @@ impl ReactionSurfaces {
         slot.set(Some(opening));
         dom::hold_background(true);
         dom::track_viewport(true);
-        true
     }
 
     /// Close the open mobile surface and let go of what it held: the dialog,
@@ -243,7 +242,7 @@ impl ReactionSurfaces {
     /// conversation may have unmounted.
     pub(super) fn close_mobile(self, restore: bool) {
         let open = self.mobile_opening();
-        dom::close_dialog(SHEET_ID);
+        dom::close_dialog();
         dom::hold_background(false);
         dom::track_viewport(false);
         let Some(open) = open else {
@@ -279,9 +278,9 @@ impl ReactionSurfaces {
     /// return focus. Nothing if it is open again by now (a close and an
     /// opening in one task). From a deferred callback only.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    fn mobile_dialog_closed(self) {
+    pub(super) fn mobile_dialog_closed(self) {
         let open = self.mobile_opening();
-        if open.is_some() && !dom::dialog_open(SHEET_ID) {
+        if open.is_some() && !dom::dialog_open() {
             self.close_mobile(true);
         }
     }
@@ -403,115 +402,11 @@ pub(super) fn MobileSurfaceGuard(
     rsx! {}
 }
 
-/// Show the sheet once per opening, after the render that filled it, and
-/// focus the first of `focus` that matches: a button, so never the keyboard.
-/// A new opening starts at rest, even in a dialog still open: one still
-/// sliding away from an earlier opening comes back. Once per token: an effect
-/// run after Escape closed it, before the state follows, must not show it
-/// again.
-pub(super) fn use_show_on_open(surfaces: ReactionSurfaces, focus: &'static [&'static str]) {
-    let shown_token = use_hook(|| std::rc::Rc::new(Cell::new(0u64)));
-    use_effect(move || {
-        // Infallible, deliberately: `Conversation`'s own `use_signal`, written
-        // only from deferred callbacks.
-        let opened = surfaces
-            .mobile
-            .read()
-            .as_ref()
-            .map(|o| (o.token, o.by_pointer));
-        let Some((token, by_pointer)) = opened else {
-            return;
-        };
-        if shown_token.replace(token) == token {
-            return;
-        }
-        super::mobile_sheet_drag::reset(SHEET_ID);
-        dom::mark_opened_by(SHEET_ID, by_pointer);
-        if !dom::dialog_open(SHEET_ID) && dom::show_dialog(SHEET_ID) {
-            dom::focus_in(SHEET_ID, focus);
-        }
-    });
-}
-
-/// The modal dialog the sheet is drawn in: the dialog (its own
-/// `close` event brings the state in line, Tab stays inside, and a downward
-/// drag anywhere on it dismisses it), the backdrop (a tap slides it away),
-/// and the panel with its handle. The sheet renders its body as `children`,
-/// after the handle.
-#[component]
-pub(super) fn MobileDialogFrame(
-    surfaces: ReactionSurfaces,
-    /// The open opening's row, if any.
-    target_row: String,
-    children: Element,
-) -> Element {
-    let (id, prefix, title) = (SHEET_ID, SHEET_ID, SHEET_TITLE);
-    // Infallible, deliberately: `Conversation`'s own `use_signal`, written
-    // only from deferred callbacks. The drag reads it from the DOM, so a
-    // slide away closes only the opening it began on.
-    let token = surfaces.mobile.read().as_ref().map_or(0, |o| o.token);
-    // The drag's listeners, for as long as the frame lives.
-    #[cfg(target_arch = "wasm32")]
-    let drag_listeners = use_hook(|| {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            None::<super::mobile_sheet_drag::Listeners>,
-        ))
-    });
-    // The dialog closing by itself (Escape): the state follows. The listener
-    // lives as long as the frame.
-    #[cfg(target_arch = "wasm32")]
-    let close_listener = use_hook(|| {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            None::<wasm_bindgen::closure::Closure<dyn FnMut()>>,
-        ))
-    });
-    rsx! {
-        dialog {
-            id: "{id}",
-            "data-testid": "{id}",
-            class: "mobile-sheet",
-            "aria-label": "{title}",
-            "data-target-row": "{target_row}",
-            "data-opening": "{token}",
-            onmounted: move |_| {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let listener = dom::on_dialog_close(id, move || {
-                        crate::util::defer(move || surfaces.mobile_dialog_closed());
-                    });
-                    *close_listener.borrow_mut() = listener;
-                    *drag_listeners.borrow_mut() =
-                        super::mobile_sheet_drag::install(id, surfaces);
-                }
-            },
-            onkeydown: move |e: KeyboardEvent| {
-                // A key in it: from now on its focus shows, however it opened.
-                dom::mark_opened_by(id, false);
-                #[cfg(target_arch = "wasm32")]
-                if e.key() == Key::Tab && dom::contain_tab(id, e.modifiers().shift()) {
-                    e.prevent_default();
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = e;
-            },
-            div {
-                "data-testid": "{prefix}-backdrop",
-                class: "mobile-sheet-backdrop",
-                onclick: move |_| super::mobile_sheet_drag::animate_out(id, surfaces),
-            }
-            div { class: "mobile-sheet-panel",
-                div { class: "mobile-sheet-handle", "aria-hidden": "true" }
-                {children}
-            }
-        }
-    }
-}
-
 /// Whether the sheet's dialog is open, for the reload's busy check and the
 /// reactor list's focus handoff.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn any_open() -> bool {
-    dom::dialog_open(SHEET_ID)
+    dom::dialog_open()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -525,19 +420,20 @@ pub(super) mod dom {
         web_sys::window()?.document()
     }
 
-    fn element(id: &str) -> Option<web_sys::HtmlElement> {
+    /// The sheet's dialog, if it is in the document.
+    pub(in super::super) fn sheet() -> Option<web_sys::HtmlElement> {
         document()?
-            .get_element_by_id(id)?
+            .get_element_by_id(super::SHEET_ID)?
             .dyn_into::<web_sys::HtmlElement>()
             .ok()
     }
 
-    pub(crate) fn dialog_open(id: &str) -> bool {
-        element(id).is_some_and(|d| d.has_attribute("open"))
+    pub(in super::super) fn dialog_open() -> bool {
+        sheet().is_some_and(|d| d.has_attribute("open"))
     }
 
     /// The control in `row` matching `selector`, as the document has it now.
-    pub(crate) fn row_control(row: &str, selector: &str) -> Option<web_sys::HtmlElement> {
+    pub(in super::super) fn row_control(row: &str, selector: &str) -> Option<web_sys::HtmlElement> {
         document()?
             .get_element_by_id(&format!("msg-{row}"))?
             .query_selector(selector)
@@ -556,11 +452,11 @@ pub(super) mod dom {
         }
     }
 
-    /// Show the dialog `id` as a modal. A browser without `showModal` (or
-    /// one that throws) gets it shown in place instead, still usable.
-    /// Whether it is open.
-    pub(super) fn show_dialog(id: &str) -> bool {
-        let Some(dialog) = element(id) else {
+    /// Show the dialog as a modal. A browser without `showModal` (or one
+    /// that throws) gets it shown in place instead, still usable. Whether it
+    /// is open.
+    pub(in super::super) fn show_dialog() -> bool {
+        let Some(dialog) = sheet() else {
             return false;
         };
         if dialog.has_attribute("open") {
@@ -576,8 +472,8 @@ pub(super) mod dom {
         dialog.has_attribute("open")
     }
 
-    pub(super) fn close_dialog(id: &str) {
-        let Some(dialog) = element(id) else {
+    pub(super) fn close_dialog() {
+        let Some(dialog) = sheet() else {
             return;
         };
         if !dialog.has_attribute("open") {
@@ -592,21 +488,21 @@ pub(super) mod dom {
         }
     }
 
-    /// Mark dialog `id` as opened by a pointer (its focus ring is hidden,
+    /// Mark the dialog as opened by a pointer (its focus ring is hidden,
     /// `main.css`) or by the keyboard. Kept on the element, not rendered:
     /// the first key pressed in it flips it, with no state to write.
-    pub(super) fn mark_opened_by(id: &str, pointer: bool) {
-        if let Some(dialog) = element(id) {
+    pub(in super::super) fn mark_opened_by(pointer: bool) {
+        if let Some(dialog) = sheet() {
             let by = if pointer { "pointer" } else { "keyboard" };
             let _ = dialog.set_attribute("data-opened-by", by);
         }
     }
 
-    /// Focus, without scrolling, the first element in dialog `id` matching
+    /// Focus, without scrolling, the first element in the dialog matching
     /// the first of `selectors` that matches anything. One inside a row that
     /// scrolls sideways is centred in it first.
-    pub(super) fn focus_in(id: &str, selectors: &[&str]) {
-        let Some(dialog) = element(id) else {
+    pub(in super::super) fn focus_in(selectors: &[&str]) {
+        let Some(dialog) = sheet() else {
             return;
         };
         let target = selectors.iter().find_map(|selector| {
@@ -640,11 +536,11 @@ pub(super) mod dom {
         row.set_scroll_left(row.scroll_left() + by.round() as i32);
     }
 
-    /// Keep Tab inside dialog `id`'s panel: from its last control Tab goes
+    /// Keep Tab inside the dialog's panel: from its last control Tab goes
     /// to the first, from the first Shift+Tab goes to the last. Whether it
     /// moved focus (the caller then prevents the default).
-    pub(super) fn contain_tab(id: &str, backwards: bool) -> bool {
-        let Some(dialog) = element(id) else {
+    pub(in super::super) fn contain_tab(backwards: bool) -> bool {
+        let Some(dialog) = sheet() else {
             return false;
         };
         let Ok(list) = dialog.query_selector_all(
@@ -731,7 +627,7 @@ pub(super) mod dom {
     /// listener for each of `kinds`. Adding it again is a no-op (the DOM
     /// keeps one listener per callback and phase), and so is removing one
     /// that is not there.
-    pub(crate) fn set_window_capture_listeners(
+    pub(in super::super) fn set_window_capture_listeners(
         kinds: &[&str],
         callback: &js_sys::Function,
         on: bool,
@@ -754,7 +650,7 @@ pub(super) mod dom {
     }
 
     /// How many fingers a touch event says are down.
-    pub(crate) fn touches(event: &web_sys::Event) -> u32 {
+    pub(in super::super) fn touches(event: &web_sys::Event) -> u32 {
         js_sys::Reflect::get(event, &"touches".into())
             .and_then(|list| js_sys::Reflect::get(&list, &"length".into()))
             .ok()
@@ -764,7 +660,7 @@ pub(super) mod dom {
 
     /// A wheel with Ctrl down: the browser zooms on it (Ctrl+wheel, and a
     /// touchpad pinch arrives as one), so it is never held.
-    pub(crate) fn is_zoom(wheel: &web_sys::Event) -> bool {
+    pub(in super::super) fn is_zoom(wheel: &web_sys::Event) -> bool {
         wheel
             .dyn_ref::<web_sys::MouseEvent>()
             .is_some_and(web_sys::MouseEvent::ctrl_key)
@@ -851,15 +747,14 @@ pub(super) mod dom {
             .set_property("--mobile-sheet-viewport", &format!("{height}px"));
     }
 
-    /// Listen for dialog `id` closing by itself (Escape), for as long as the
+    /// Listen for the dialog closing by itself (Escape), for as long as the
     /// returned closure lives. `on_close` runs from the listener; it defers
     /// any signal write.
-    pub(super) fn on_dialog_close(
-        id: &str,
+    pub(in super::super) fn on_dialog_close(
         on_close: impl FnMut() + 'static,
     ) -> Option<Closure<dyn FnMut()>> {
         let listener = Closure::<dyn FnMut()>::new(on_close);
-        element(id)?
+        sheet()?
             .add_event_listener_with_callback("close", listener.as_ref().unchecked_ref())
             .ok()?;
         Some(listener)
@@ -868,20 +763,20 @@ pub(super) mod dom {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) mod dom {
-    pub(crate) fn dialog_open(_id: &str) -> bool {
+    pub(in super::super) fn dialog_open() -> bool {
         false
     }
     /// Natively every row control "exists", so openings stay live in tests.
-    pub(crate) fn row_control(_row: &str, _selector: &str) -> Option<()> {
+    pub(in super::super) fn row_control(_row: &str, _selector: &str) -> Option<()> {
         Some(())
     }
     pub(super) fn focus_control(_row: &str, _selector: &str) {}
-    pub(super) fn close_dialog(_id: &str) {}
-    pub(super) fn show_dialog(_id: &str) -> bool {
+    pub(super) fn close_dialog() {}
+    pub(in super::super) fn show_dialog() -> bool {
         false
     }
-    pub(super) fn focus_in(_id: &str, _selectors: &[&str]) {}
-    pub(super) fn mark_opened_by(_id: &str, _pointer: bool) {}
+    pub(in super::super) fn focus_in(_selectors: &[&str]) {}
+    pub(in super::super) fn mark_opened_by(_pointer: bool) {}
     pub(super) fn hold_background(_on: bool) {}
     pub(super) fn track_viewport(_on: bool) {}
 }

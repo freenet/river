@@ -30,7 +30,7 @@
 //! sheet learns its message left.
 
 use super::mobile_message_sheet::SheetReaction;
-use super::mobile_surface::{narrow_now, MobileOpening, Origin, SHEET_ID};
+use super::mobile_surface::{narrow_now, MobileOpening, Origin, SHEET_ID, SHEET_TITLE};
 use super::reaction_picker::ReactionSurfaces;
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
@@ -176,9 +176,7 @@ pub(super) fn open_sheet(
     by_pointer: bool,
 ) {
     let opening = target.opening(origin, by_pointer);
-    crate::util::defer(move || {
-        surfaces.open_mobile(opening);
-    });
+    crate::util::defer(move || surfaces.open_mobile(opening));
 }
 
 /// A click on `target`'s row, from its handler: opens its sheet at once, or
@@ -368,7 +366,7 @@ pub(super) fn MobileActionsEntry(
             r#type: "button",
             "data-testid": "mobile-message-actions-entry",
             class: "mobile-actions-entry",
-            "aria-label": "Message options",
+            "aria-label": SHEET_TITLE,
             "aria-haspopup": "dialog",
             "aria-controls": SHEET_ID,
             "aria-expanded": "{expanded}",
