@@ -909,7 +909,6 @@ test.describe("While the reaction picker is open", () => {
   // closes the picker outright and lets go of its hold; widening again
   // reopens nothing.
   test("narrowing the window below 48rem closes it, lets go of the wheel, and widening reopens nothing", { tag: "@chromium-only" }, async ({ page }) => {
-    test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
     await page.setViewportSize({ width: 1280, height: 844 });
     await openRoomWithComposer(page);
     await deliver(page, "narrowed anchor");

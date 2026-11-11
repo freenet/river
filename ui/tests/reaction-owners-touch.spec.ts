@@ -2,7 +2,9 @@ import { expect, Locator, Page, test } from "@playwright/test";
 import {
   asTouchTablet,
   centreOf,
+  chips,
   coarsePointer,
+  hasTouch,
   holdChip,
   keyboardFocus,
   openInlinePicker,
@@ -83,7 +85,7 @@ async function addOwnReaction(page: Page): Promise<Locator> {
   const pinned = page.locator(`[id="${id}"]`);
   await pinned.scrollIntoViewIfNeeded();
   await openInlinePicker(page, pinned);
-  await press(page, (await reactionChoices(page)).first());
+  await press((await reactionChoices(page)).first());
   const chip = pinned.locator('[data-testid="reaction-chip"][title*="click to remove"]');
   await expect(chip).toHaveCount(1);
   return chip;
@@ -95,22 +97,11 @@ async function addOwnReaction(page: Page): Promise<Locator> {
 // real finger (WebKit bug 282988). That is why the app decides on the
 // pointerdown's type, and why this must stay a real tap(): a synthetic click
 // carrying pointerType "touch" feeds in the very value the code branches on
-// and passes whether or not that bug is handled.
-function mobileProject(): boolean {
-  return test.info().project.name.startsWith("mobile");
-}
-
-async function pressChip(chip: Locator) {
-  if (mobileProject()) {
-    await chip.tap();
-  } else {
-    await chip.click();
-  }
-}
+// and passes whether or not that bug is handled. `press` is that tap.
 
 async function removeOwnReaction(page: Page, chip: Locator) {
   await chip.scrollIntoViewIfNeeded();
-  await pressChip(chip);
+  await press(chip);
   await expect(chip).toHaveCount(0);
   await expect(page.getByTestId("reaction-owners"), "a press opens no list").toHaveCount(0);
 }
@@ -205,7 +196,7 @@ test.describe("Reaction owner list (#714)", () => {
     const coarse = await coarsePointer(page);
     // A mobile project that reports a fine pointer must not silently run the
     // desktop half and pass (freenet/river#714 review).
-    expect(coarse).toBe(test.info().project.name.startsWith("mobile"));
+    expect(coarse).toBe(hasTouch());
 
     // Reading, on fixture chips. A held finger opens the list; a mouse has
     // the title, checked above.
@@ -266,11 +257,11 @@ test.describe("Reaction owner list (#714)", () => {
 
     // Pressing, on a signed chip: a tap on a touch project, a click otherwise.
     const crab = await signedChip(page);
-    await pressChip(crab);
+    await press(crab);
     await expect(crab, "someone else's chip takes the reader's reaction").toContainText("2");
     await expect(crab).toHaveAttribute("title", /click to remove/);
     await expect(owners, "a press opens no list").toHaveCount(0);
-    await pressChip(crab);
+    await press(crab);
     await expect(crab, "and gives it back").toContainText("1");
     await expect(owners).toHaveCount(0);
     expect(
@@ -299,7 +290,7 @@ test.describe("Reaction removed from the owner list", () => {
     const chips = message.getByTestId("reaction-chip");
     await message.scrollIntoViewIfNeeded();
     await openInlinePicker(page, message);
-    await press(page, (await reactionChoices(page)).filter({ hasNotText: "🦀" }).first());
+    await press((await reactionChoices(page)).filter({ hasNotText: "🦀" }).first());
     const own = message.locator('[data-testid="reaction-chip"][title*="click to remove"]');
     await expect(own).toHaveCount(1);
     await expect(chips).toHaveCount(2);
@@ -403,9 +394,9 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     // The room's first real toggle rebuilds its state from signed messages,
     // which drops the fixture chips and re-mounts the rows. Make it here,
     // before focus is on the chip.
-    await pressChip(crab);
+    await press(crab);
     await expect(crab).toContainText("2");
-    await pressChip(crab);
+    await press(crab);
     await expect(crab).toContainText("1");
     await settle(page);
     await keyboardFocus(page, crab);
@@ -581,7 +572,7 @@ test.describe("Reactor list and picker hand off", () => {
   });
 
   test("by touch", async ({ page }) => {
-    test.skip(!mobileProject(), "a held finger, on a touch project");
+    test.skip(!hasTouch(), "a held finger, on a touch project");
     const { message, id, chip } = await reactedMessage(page);
     const react = message.getByTestId("message-react-button");
     const parked = await historyScrollTop(page);
@@ -614,20 +605,20 @@ test.describe("Reaction chip below 48rem", () => {
 
   test("a press reacts with its emoji and opens nothing: a tap toggles and switches, a held finger and Shift+Enter react too", async ({ page }) => {
     const row = await openRoomWithTarget(page);
-    const rowChips = row.getByTestId("reaction-chip");
+    const rowChips = chips(row);
     await callRiverTest(page, "memberReactsToNewest", "🎉");
     const party = rowChips.filter({ hasText: "🎉" });
     await expect(party).toContainText("1");
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
 
     // No reaction of the reader's yet: the tap adds theirs to the chip.
-    await press(page, party);
+    await press(party);
     await expect(party).toContainText("2");
     await expect(sheet(page), "a chip never opens the sheet").toBeHidden();
     await expect(page.getByTestId("reaction-owners"), "nor the reactor list").toHaveCount(0);
 
     // The same chip again takes it back.
-    await press(page, party);
+    await press(party);
     await expect(party).toContainText("1");
 
     // Below 48rem a held finger is a tap once it lifts.
@@ -636,7 +627,7 @@ test.describe("Reaction chip below 48rem", () => {
     await lift();
     await expect(party).toContainText("2");
     await expect(sheet(page)).toBeHidden();
-    await press(page, party);
+    await press(party);
     await expect(party).toContainText("1");
 
     // And no reactor list for Shift+Enter to open: it reacts, as Enter does.
@@ -648,9 +639,9 @@ test.describe("Reaction chip below 48rem", () => {
 
     // Reacted with another emoji: the tap moves the reaction to the chip's.
     await openSheetFromReact(page, row);
-    await press(page, palette(page).getByRole("button", { name: "React with 👍" }));
+    await press(palette(page).getByRole("button", { name: "React with 👍" }));
     await expect(rowChips).toHaveCount(2);
-    await press(page, party);
+    await press(party);
     await expect(rowChips, "the 👍 left with the switch").toHaveCount(1);
     await expect(party).toContainText("2");
     await expect(sheet(page)).toBeHidden();

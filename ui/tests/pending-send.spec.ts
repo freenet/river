@@ -128,7 +128,7 @@ test("an own reaction, a switch to another emoji, and an edit show while their s
   const second = (await reactionChoices(page)).nth(1);
   const secondEmoji = (await second.textContent())!.trim();
   expect(secondEmoji, "premise: another emoji").not.toBe(first.replace(/\d+$/, ""));
-  await press(page, second);
+  await press(second);
   await expect(chip).toHaveCount(1);
   await expect(chip, "the switch shows before it is signed").toContainText(secondEmoji);
 

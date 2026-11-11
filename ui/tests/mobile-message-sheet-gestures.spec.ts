@@ -1,12 +1,15 @@
 import { test, expect, Locator, Page } from "@playwright/test";
 import {
+  BACKDROP,
   centreOf,
   chips,
+  choices,
   historyPoint,
-  openMessageActions,
+  openSheetFromRow,
   openRoomWithTarget,
   openSheetFromReact,
   palette,
+  PANEL,
   panelAtRest,
   panelBottomGap,
   panelOffset,
@@ -16,6 +19,7 @@ import {
   sheet,
   withFingers,
 } from "./example-room";
+import { scrollMetrics } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
 // The mobile message sheet's gestures (mobile_sheet_drag.rs;
@@ -42,26 +46,17 @@ test.use({ viewport: { width: 390, height: 760 } });
 
 test("the row shows no scroll bar and takes only sideways pans", async ({ page }) => {
   await openSheet(page);
-  const g = await page.evaluate(() => {
-    const row = document.querySelector("#mobile-message-sheet .mobile-reaction-palette") as HTMLElement;
-    const css = (sel: string) => getComputedStyle(document.querySelector(sel)!);
-    return {
-      gutter: row.offsetHeight - row.clientHeight,
-      row: getComputedStyle(row).touchAction,
-      backdrop: css("#mobile-message-sheet .mobile-sheet-backdrop").touchAction,
-      panel: css("#mobile-message-sheet .mobile-sheet-panel").touchAction,
-    };
-  });
-  expect(g.gutter, "no scroll bar takes room under the row").toBe(0);
-  expect(g.row, "the row pans only sideways").toBe("pan-x");
-  expect(g.backdrop, "the backdrop leaves every move to the drag").toBe("none");
-  expect(g.panel).toBe("none");
+  const touchAction = (target: Locator) => target.evaluate((el) => getComputedStyle(el).touchAction);
+  expect(await palette(page).evaluate((row) => row.offsetHeight - row.clientHeight), "no scroll bar takes room under the row").toBe(0);
+  expect(await touchAction(palette(page)), "the row pans only sideways").toBe("pan-x");
+  expect(await touchAction(page.getByTestId(BACKDROP)), "the backdrop leaves every move to the drag").toBe("none");
+  expect(await touchAction(page.locator(PANEL))).toBe("none");
 });
 
 test("with reduced motion it opens and closes without sliding", { tag: "@chromium-only" }, async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   const row = await openSheet(page);
-  expect(await page.locator(`#${SHEET} .mobile-sheet-panel`).evaluate((p) => p.getAnimations().length), "no opening slide").toBe(0);
+  expect(await page.locator(PANEL).evaluate((p) => p.getAnimations().length), "no opening slide").toBe(0);
   await sheet(page).evaluate((d) => {
     const w = window as unknown as { __left: boolean };
     w.__left = false;
@@ -175,24 +170,23 @@ test.describe("A finger on the message sheet", () => {
 
   test("a drag down that starts over the history drags it and closes it, and scrolls nothing", async ({ page }) => {
     await openSheet(page);
-    const history = page.locator("#chat-scroll-container");
-    const before = await history.evaluate((el) => el.scrollTop);
+    const before = (await scrollMetrics(page)).top;
     const h = await historyPoint(page);
     await withFingers(page, async (fingers) => {
       await fingers.press([1, h.x, h.y]);
-      await fingers.move({ 1: [0, 60] }, 10);
+      await fingers.move({ 1: [0, 60] });
       expect(await panelOffset(page), "the panel moves with a finger above it").toBeGreaterThan(50);
-      await fingers.move({ 1: [0, 90] }, 10);
+      await fingers.move({ 1: [0, 90] });
       await fingers.lift();
     });
     await expect(sheet(page)).toBeHidden();
-    expect(await history.evaluate((el) => el.scrollTop), "the history did not move").toBe(before);
+    expect((await scrollMetrics(page)).top, "the history did not move").toBe(before);
   });
 
   test("a drag down that starts on an emoji closes it without reacting", async ({ page }) => {
     const row = await openSheet(page);
     const signs = await callRiverTest(page, "messageSignsRecorded");
-    const [x, y] = await centreOf(palette(page).getByRole("button").nth(2));
+    const [x, y] = await centreOf(choices(page).nth(2));
     await withFingers(page, (fingers) => fingers.drag(x, y, 120));
     await expect(sheet(page)).toBeHidden();
     await settle(page);
@@ -202,7 +196,7 @@ test.describe("A finger on the message sheet", () => {
 
   test("a drag down that starts on Reply closes it without replying", async ({ page }) => {
     // Opened by a tap on the row: the same sheet, the same drag.
-    await openMessageActions(page, await openRoomWithTarget(page));
+    await openSheetFromRow(page, await openRoomWithTarget(page));
     const [x, y] = await centreOf(page.getByTestId("mobile-message-action-reply"));
     await withFingers(page, (fingers) => fingers.drag(x, y, 150));
     await expect(sheet(page)).toBeHidden();
@@ -216,11 +210,11 @@ test.describe("A finger on the message sheet", () => {
     expect(await panelBottomGap(page), "premise: at rest on the bottom edge").toBeLessThan(1);
     await withFingers(page, async (fingers) => {
       await fingers.press([1, x, y]);
-      await fingers.move({ 1: [0, -100] }, 10);
+      await fingers.move({ 1: [0, -100] });
       expect(await panelOffset(page), "no upward offset").toBe(0);
       expect(await panelBottomGap(page), "no gap under it").toBeLessThan(1);
       // Back down past the start: it follows from where the finger went down.
-      await fingers.move({ 1: [0, 130] }, 10);
+      await fingers.move({ 1: [0, 130] });
       expect(await panelOffset(page)).toBeGreaterThan(20);
       await fingers.lift();
     });
@@ -234,12 +228,12 @@ test.describe("A finger on the message sheet", () => {
     const [x, y] = await handlePoint(page);
     await withFingers(page, async (fingers) => {
       await fingers.press([1, x, y]);
-      await fingers.move({ 1: [0, 30] }, 10);
+      await fingers.move({ 1: [0, 30] });
       expect(await panelOffset(page), "premise: dragging").toBeGreaterThan(20);
       await fingers.press([2, x + 60, y - 100]);
       await panelAtRest(page);
       expect(await panelOffset(page), "a pinch is no drag: back at rest").toBe(0);
-      await fingers.move({ 1: [0, 100], 2: [0, -100] }, 10);
+      await fingers.move({ 1: [0, 100], 2: [0, -100] });
       await fingers.lift();
     });
     await settle(page);
@@ -248,21 +242,20 @@ test.describe("A finger on the message sheet", () => {
 
   test("a sideways swipe on the row scrolls it, not the panel or the history, and is not a tap", async ({ page }) => {
     const row = await openSheet(page);
-    const history = page.locator("#chat-scroll-container");
-    const before = await history.evaluate((el) => el.scrollTop);
+    const before = (await scrollMetrics(page)).top;
     const box = (await palette(page).boundingBox())!;
     const [x, y] = [Math.round(box.x + box.width - 30), Math.round(box.y + box.height / 2)];
     await withFingers(page, async (fingers) => {
       await fingers.press([1, x, y]);
-      await fingers.move({ 1: [-100, 6] }, 10);
+      await fingers.move({ 1: [-100, 6] });
       expect(await panelOffset(page), "mid-swipe: the panel stays").toBe(0);
-      await fingers.move({ 1: [-100, 0] }, 10);
+      await fingers.move({ 1: [-100, 0] });
       await fingers.lift();
     });
     await settle(page);
     expect(await palette(page).evaluate((el) => el.scrollLeft), "the row scrolled").toBeGreaterThan(50);
     expect(await panelOffset(page)).toBe(0);
-    expect(await history.evaluate((el) => el.scrollTop), "the history did not move").toBe(before);
+    expect((await scrollMetrics(page)).top, "the history did not move").toBe(before);
     await expect(sheet(page), "a swipe is not a tap: still open").toBeVisible();
     await expect(chips(row)).toHaveCount(0);
   });

@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { asTouchTablet, clickFooter, coarsePointer, inlineFooter, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
+import { asTouchTablet, clickFooter, coarsePointer, inlineFooter, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, sheet, waitForApp } from "./example-room";
 import { deliver, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { expectAtReact, expectEveryEmojiUsable, measurePicker } from "./reaction-picker-geometry";
 import { callRiverTest } from "./river-test";
@@ -600,11 +600,11 @@ test.describe("Revealing a popover on a short phone view", () => {
     });
     const row = page.getByTestId("message-row").last();
     await openInlinePicker(page, row);
-    await expect(page.getByTestId("mobile-message-sheet")).toBeVisible();
+    await expect(sheet(page)).toBeVisible();
     await nextFrames(page);
     expect(await strayScroll(page), "message sheet").toEqual(NO_STRAY_SCROLL);
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId("mobile-message-sheet")).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
 
     await openOwnMessageEdit(page);
     await nextFrames(page);
@@ -957,7 +957,7 @@ test.describe("Latest over row controls at phone width", () => {
     expect(at, "Latest's centre is Latest's").toBe(true);
     await latest.click();
     await expect(latest).toBeHidden();
-    await expect(page.getByTestId("mobile-message-sheet")).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
   });
 });
 

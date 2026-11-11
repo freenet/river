@@ -112,10 +112,10 @@ export async function openRoomWithComposer(page: Page) {
 
 /// `openRoomWithComposer`, then a received message with no reactions at the
 /// end of the history. Returns its row.
-export async function openRoomWithTarget(page: Page, text = "react target"): Promise<Locator> {
+export async function openRoomWithTarget(page: Page): Promise<Locator> {
   await openRoomWithComposer(page);
-  await callRiverTest(page, "appendMessage", text);
-  const row = committedRow(page, text);
+  await callRiverTest(page, "appendMessage", "react target");
+  const row = committedRow(page, "react target");
   await expect(row).toBeVisible({ timeout: 5_000 });
   return row;
 }
@@ -249,14 +249,40 @@ export async function revealFooter(page: Page, row: Locator) {
   if (!(await coarsePointer(page))) await row.hover({ position: { x: 4, y: 4 } });
 }
 
+/// For each of `row`'s controls in `ids` (test ids): its opacity once its
+/// transitions end, and whether it takes a hit at its centre.
+export function controlStates(row: Locator, ids: string[]) {
+  return row.evaluate(async (el, ids) => {
+    const out: Record<string, { opacity: string; hit: boolean }> = {};
+    for (const id of ids) {
+      const b = el.querySelector(`[data-testid="${id}"]`) as HTMLElement;
+      await Promise.all(b.getAnimations().map((a) => a.finished));
+      const r = b.getBoundingClientRect();
+      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      out[id] = { opacity: getComputedStyle(b).opacity, hit: !!at && b.contains(at) };
+    }
+    return out;
+  }, ids);
+}
+
+/// A control `controlStates` found shown and taking its own hits.
+export const SHOWN = { opacity: "1", hit: true };
+
+/// Footer test ids and the sheet action that replaces each below 48rem.
+const SHEET_ACTIONS: Record<string, string> = {
+  "message-reply-button": "mobile-message-action-reply",
+  "message-edit-button": "mobile-message-action-edit",
+  "message-delete-button": "mobile-message-action-delete",
+};
+
 /// Click one of `row`'s footer controls by its test id, revealing it first.
 /// Below 48rem Reply, Edit and Delete are not in the footer: a tap on the
 /// row opens them in the message sheet, and this goes that way.
 export async function clickFooter(page: Page, row: Locator, testid: string) {
   const sheetAction = SHEET_ACTIONS[testid];
   if (sheetAction && (await narrowLayout(page))) {
-    await openMessageActions(page, row);
-    await press(page, page.getByTestId(sheetAction));
+    await openSheetFromRow(page, row);
+    await press(page.getByTestId(sheetAction));
     await expect(sheet(page)).toBeHidden();
     return;
   }
@@ -278,16 +304,14 @@ export async function openInlinePicker(page: Page, row: Locator) {
 
 /// The emoji buttons of whichever reaction choices `openInlinePicker` opened.
 export async function reactionChoices(page: Page): Promise<Locator> {
-  return (await narrowLayout(page))
-    ? palette(page).getByRole("button")
-    : page.getByTestId("emoji-picker").getByRole("button");
+  return (await narrowLayout(page)) ? choices(page) : page.getByTestId("emoji-picker").getByRole("button");
 }
 
 /// React to `row` with the picker's first emoji. Expects the row to end with
 /// exactly one reaction chip, so pass a row that has none.
 export async function reactTo(page: Page, row: Locator): Promise<Locator> {
   await openInlinePicker(page, row);
-  await press(page, (await reactionChoices(page)).first());
+  await press((await reactionChoices(page)).first());
   const chip = chips(row);
   await expect(chip).toHaveCount(1);
   return chip;
@@ -317,9 +341,9 @@ export function hasTouch(): boolean {
 
 /// Press `target` as the reader would: a tap where touch is available, else
 /// a click.
-export async function press(page: Page, target: Locator, options?: { position?: { x: number; y: number } }) {
-  if (hasTouch()) await target.tap(options);
-  else await target.click(options);
+export async function press(target: Locator) {
+  if (hasTouch()) await target.tap();
+  else await target.click();
 }
 
 /// Press the page at a point as the reader would: a tap where touch is
@@ -368,9 +392,21 @@ export function sheet(page: Page): Locator {
   return page.getByTestId(SHEET);
 }
 
+/// The test id of the backdrop inside it: what a tap outside the panel lands
+/// on.
+export const BACKDROP = `${SHEET}-backdrop`;
+
+/// Its panel, as a selector.
+export const PANEL = `#${SHEET} .mobile-sheet-panel`;
+
 /// The sheet's row of emoji choices.
 export function palette(page: Page): Locator {
   return page.getByTestId("mobile-reaction-palette");
+}
+
+/// The 16 emoji buttons in it.
+export function choices(page: Page): Locator {
+  return palette(page).getByRole("button");
 }
 
 /// `row`'s reaction chips.
@@ -390,13 +426,6 @@ export async function centreOf(target: Locator): Promise<[number, number]> {
   const box = (await target.boundingBox())!;
   return [Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2)];
 }
-
-/// Footer test ids and the sheet action that replaces each below 48rem.
-const SHEET_ACTIONS: Record<string, string> = {
-  "message-reply-button": "mobile-message-action-reply",
-  "message-edit-button": "mobile-message-action-edit",
-  "message-delete-button": "mobile-message-action-delete",
-};
 
 /// A point on `row` where a tap lands on the row itself: inside it, on
 /// nothing with a behaviour of its own (links, buttons, chips, the avatar).
@@ -468,7 +497,7 @@ export async function expectSheetOpenFor(page: Page, row: Locator) {
 
 /// Below 48rem: open `row`'s sheet with a tap on the row, and wait until it
 /// is open for that row and at rest.
-export async function openMessageActions(page: Page, row: Locator) {
+export async function openSheetFromRow(page: Page, row: Locator) {
   await tapRow(page, row);
   await expectSheetOpenFor(page, row);
 }
@@ -476,7 +505,7 @@ export async function openMessageActions(page: Page, row: Locator) {
 /// Below 48rem: open `row`'s sheet with its +, and wait until it is open
 /// for that row and at rest.
 export async function openSheetFromReact(page: Page, row: Locator) {
-  await press(page, row.getByTestId("message-react-button"));
+  await press(row.getByTestId("message-react-button"));
   await expectSheetOpenFor(page, row);
 }
 
@@ -485,8 +514,6 @@ export async function historyPoint(page: Page): Promise<{ x: number; y: number }
   const view = (await page.locator("#chat-scroll-container").boundingBox())!;
   return { x: view.x + 40, y: view.y + 30 };
 }
-
-const PANEL = `#${SHEET} .mobile-sheet-panel`;
 
 /// How far the open sheet's panel sits below its rest position now, in px
 /// (its computed `transform`; the opening slide's `translate` is not
@@ -507,12 +534,6 @@ export async function panelAtRest(page: Page) {
     (panel) => document.querySelector(panel)?.getAnimations().every((a) => a.playState !== "running") ?? false,
     PANEL,
   );
-}
-
-/// A point inside the open sheet's panel, on no control.
-async function panelPoint(page: Page): Promise<{ x: number; y: number }> {
-  const box = (await page.locator(PANEL).boundingBox())!;
-  return { x: box.x + box.width / 2, y: box.y + 6 };
 }
 
 /// Whether a one- (or two-) finger `touchmove` at the point is cancelled,
@@ -541,31 +562,6 @@ export function wheelCancelled(page: Page, x: number, y: number, ctrlKey: boolea
     },
     [x, y, ctrlKey] as const,
   );
-}
-
-/// For each `[how, close]`: open the sheet with `open`, check that a
-/// one-finger touch over the history is held while a pinch and a touch on
-/// its panel are not, close it with `close`, and check the hold let go.
-export async function expectTouchHeldUntilClosed(
-  page: Page,
-  open: () => Promise<void>,
-  closes: [string, () => Promise<void>][],
-) {
-  for (const [how, close] of closes) {
-    await open();
-    const h = await historyPoint(page);
-    expect(await touchmovePrevented(page, h.x, h.y), `${how}: a finger over the history is held`).toBe(true);
-    expect(await touchmovePrevented(page, h.x, h.y, 2), `${how}: a pinch is not`).toBe(false);
-    const inside = await panelPoint(page);
-    expect(await touchmovePrevented(page, inside.x, inside.y), `${how}: the panel scrolls`).toBe(false);
-    expect(await touchmovePrevented(page, inside.x, inside.y, 2), `${how}: and a pinch on it zooms`).toBe(false);
-    await close();
-    await expect(sheet(page)).toBeHidden();
-    await settle(page);
-    const after = await historyPoint(page);
-    expect(await page.evaluate(({ x, y }) => !!document.elementFromPoint(x, y)?.closest("#chat-scroll-container"), after), "premise: the history is under the point").toBe(true);
-    expect(await touchmovePrevented(page, after.x, after.y), `closed by ${how}: let go`).toBe(false);
-  }
 }
 
 /// How far a test finger drags by default.
