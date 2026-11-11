@@ -51,15 +51,13 @@
 //! enough (`mobile_sheet_drag.rs`). Escape and a choice (an emoji, an action)
 //! close it at once.
 
-use super::mobile_message_sheet::SheetReaction;
+use super::mobile_message_actions::RowTarget;
 use super::reaction_picker::{shown_room, ReactionSurfaces};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractKey;
-use river_core::room_state::message::MessageId;
 use std::cell::Cell;
-use std::rc::Rc;
 
 /// Below Tailwind's `md`: the exact complement of `(min-width: 48rem)`, so no
 /// fractional width between 767px and 768px belongs to neither. `main.css`
@@ -100,30 +98,20 @@ impl Origin {
 /// What the sheet is open for: one press on one message.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct MobileOpening {
+    /// The message, as its row last rendered it. Its current reaction and
+    /// reactor list are kept in step by the row's entry.
+    pub(super) target: RowTarget,
     origin: Origin,
+    /// A pointer opened it (a tap or a click, not a key): its focus shows no
+    /// ring until a key is pressed in it, so the focused emoji does not look
+    /// like the reader's current reaction.
+    pub(super) by_pointer: bool,
     /// This opening, among every mobile opening on the page.
     pub(super) token: u64,
     room: Option<VerifyingKey>,
     visit: u64,
     /// The room's contract key when it opened: its generation.
     contract: Option<ContractKey>,
-    /// The row's `msg-{row}` suffix.
-    pub(super) row: String,
-    pub(super) message: MessageId,
-    /// The message is the reader's own (the sheet offers Edit and Delete).
-    /// Shown from this; checked again against the room when an action runs.
-    pub(super) own: bool,
-    /// The reader's own reaction on it, as its footer last rendered it
-    /// (pending ones included). Only marks the sheet's current choice: the
-    /// pending-aware toggle decides from the room itself.
-    pub(super) current: Option<String>,
-    /// Its reactions and who made them, as its row last rendered them: what
-    /// the sheet lists. Kept in step by the row's entry.
-    pub(super) reactions: Rc<Vec<SheetReaction>>,
-    /// A pointer opened it (a tap or a click, not a key): its focus shows no
-    /// ring until a key is pressed in it, so the focused emoji does not look
-    /// like the reader's current reaction.
-    pub(super) by_pointer: bool,
 }
 
 thread_local! {
@@ -142,34 +130,22 @@ fn next_token() -> u64 {
 impl MobileOpening {
     /// A new opening, now: a fresh token, and the room, showing and
     /// generation the history shows.
-    pub(super) fn new(
-        origin: Origin,
-        row: String,
-        message: MessageId,
-        own: bool,
-        current: Option<String>,
-        reactions: Rc<Vec<SheetReaction>>,
-        by_pointer: bool,
-    ) -> Self {
+    pub(super) fn new(target: RowTarget, origin: Origin, by_pointer: bool) -> Self {
         let (room, visit) = shown_room();
         Self {
+            target,
             origin,
+            by_pointer,
             token: next_token(),
             room,
             visit,
             contract: live_contract_key(),
-            row,
-            message,
-            own,
-            current,
-            reactions,
-            by_pointer,
         }
     }
 
     /// Whether this is an opening for `row`.
     pub(super) fn is_for(&self, row: &str) -> bool {
-        self.row == row
+        self.target.row == row
     }
 }
 
@@ -191,7 +167,7 @@ pub(super) fn opening_is_live(opening: &MobileOpening) -> bool {
     let (shown, visit) = shown_room();
     let current_room = CURRENT_ROOM.try_peek().ok().and_then(|r| r.owner_key);
     opening_matches(opening, shown, visit, current_room, live_contract_key())
-        && dom::row_control(&opening.row, ENTRY_SELECTOR).is_some()
+        && dom::row_control(&opening.target.row, ENTRY_SELECTOR).is_some()
 }
 
 /// [`opening_is_live`]'s room and generation half, pure for native tests.
@@ -249,7 +225,7 @@ impl ReactionSurfaces {
             return;
         };
         if restore && opening_is_live(&open) {
-            dom::focus_control(&open.row, &open.origin.control_selector());
+            dom::focus_control(&open.target.row, &open.origin.control_selector());
         }
         let mut slot = self.mobile;
         // A statement, so the write guard drops before `slot` does.
@@ -784,6 +760,8 @@ pub(super) mod dom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use river_core::room_state::message::MessageId;
+    use std::rc::Rc;
 
     fn key(seed: u8) -> VerifyingKey {
         ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key()
@@ -801,17 +779,19 @@ mod tests {
         contract: Option<ContractKey>,
     ) -> MobileOpening {
         MobileOpening {
+            target: RowTarget {
+                row: "m".into(),
+                message: MessageId(freenet_scaffold::util::FastHash(7)),
+                own: false,
+                current: None,
+                reactions: Rc::new(Vec::new()),
+            },
             origin: Origin::React,
+            by_pointer: false,
             token: 1,
             room,
             visit,
             contract,
-            row: "m".into(),
-            message: MessageId(freenet_scaffold::util::FastHash(7)),
-            own: false,
-            current: None,
-            reactions: Rc::new(Vec::new()),
-            by_pointer: false,
         }
     }
 

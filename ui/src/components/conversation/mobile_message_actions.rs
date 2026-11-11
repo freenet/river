@@ -126,29 +126,21 @@ pub(super) fn note_row_release(e: &PointerEvent, cancelled: bool) {
 }
 
 /// The message a row opens the sheet for, as the row renders it.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct RowTarget {
+    /// The row's `msg-{row}` suffix.
     pub(super) row: String,
     pub(super) message: MessageId,
-    /// The message is the reader's own.
+    /// The message is the reader's own (the sheet offers Edit and Delete).
+    /// Shown from this; checked again against the room when an action runs.
     pub(super) own: bool,
-    /// The reader's own reaction on it.
+    /// The reader's own reaction on it, as its footer renders it (pending
+    /// ones included). Only marks the current choice: the pending-aware
+    /// toggle decides from the room itself.
     pub(super) current: Option<String>,
+    /// Its reactions and who made them, as its chips show them: what the
+    /// sheet lists.
     pub(super) reactions: Rc<Vec<SheetReaction>>,
-}
-
-impl RowTarget {
-    fn opening(self, origin: Origin, by_pointer: bool) -> MobileOpening {
-        MobileOpening::new(
-            origin,
-            self.row,
-            self.message,
-            self.own,
-            self.current,
-            self.reactions,
-            by_pointer,
-        )
-    }
 }
 
 /// Whether a click came from a pointer (a tap or a mouse click) rather than
@@ -175,7 +167,7 @@ pub(super) fn open_sheet(
     origin: Origin,
     by_pointer: bool,
 ) {
-    let opening = target.opening(origin, by_pointer);
+    let opening = MobileOpening::new(target, origin, by_pointer);
     crate::util::defer(move || surfaces.open_mobile(opening));
 }
 
@@ -320,36 +312,32 @@ fn press_makes_tap(press: Option<&RowPress>, row: &str, x: f64, y: f64, now: f64
 #[component]
 pub(super) fn MobileActionsEntry(
     surfaces: ReactionSurfaces,
-    /// The row's `msg-{row}` suffix.
-    row: String,
-    message: MessageId,
-    /// The message is the reader's own.
-    own: bool,
-    /// The reader's own reaction on it, if any.
-    current: Option<String>,
-    /// Its reactions, as its chips show them.
-    reactions: Rc<Vec<SheetReaction>>,
+    /// The row's message, as the row renders it.
+    target: RowTarget,
 ) -> Element {
+    // What the row shows of its reactions is not what `open` has.
+    let differs = |open: &MobileOpening, target: &RowTarget| {
+        open.target.current != target.current || open.target.reactions != target.reactions
+    };
     // Infallible, deliberately: `Conversation`'s own `use_signal`, written
     // only from deferred callbacks.
     let (expanded, stale) = match surfaces.mobile.read().as_ref() {
-        Some(open) if open.is_for(&row) => {
-            (true, open.current != current || open.reactions != reactions)
-        }
+        Some(open) if open.is_for(&target.row) => (true, differs(open, &target)),
         _ => (false, false),
     };
     if stale {
-        let (row, current, reactions) = (row.clone(), current.clone(), reactions.clone());
+        let target = target.clone();
         let mut opening = surfaces.mobile;
         crate::util::defer(move || {
-            let stale = opening.peek().as_ref().is_some_and(|o| {
-                o.is_for(&row) && (o.current != current || o.reactions != reactions)
-            });
+            let stale = opening
+                .peek()
+                .as_ref()
+                .is_some_and(|o| o.is_for(&target.row) && differs(o, &target));
             if stale {
                 opening.with_mut(|o| {
                     if let Some(o) = o.as_mut() {
-                        o.current = current;
-                        o.reactions = reactions;
+                        o.target.current = target.current;
+                        o.target.reactions = target.reactions;
                     }
                 });
             }
@@ -358,7 +346,7 @@ pub(super) fn MobileActionsEntry(
     // Its row leaving the history closes a sheet open for it; the row only
     // remounting keeps it, and focus returns to the new control.
     {
-        let row = row.clone();
+        let row = target.row.clone();
         use_drop(move || surfaces.mobile_control_unmounting(&row));
     }
     rsx! {
@@ -374,14 +362,7 @@ pub(super) fn MobileActionsEntry(
                 if !narrow_now() {
                     return;
                 }
-                let target = RowTarget {
-                    row: row.clone(),
-                    message: message.clone(),
-                    own,
-                    current: current.clone(),
-                    reactions: reactions.clone(),
-                };
-                open_sheet(surfaces, target, Origin::Entry, pointer_click(&e));
+                open_sheet(surfaces, target.clone(), Origin::Entry, pointer_click(&e));
             },
             "Options"
         }

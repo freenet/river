@@ -93,7 +93,7 @@ fn react(
     let live = opening_is_live(&opening);
     surfaces.close_mobile(true);
     if live {
-        on_react.call((opening.message, emoji));
+        on_react.call((opening.target.message, emoji));
     }
 }
 
@@ -113,7 +113,7 @@ fn act(
     let live = opening_is_live(&opening);
     surfaces.close_mobile(false);
     if live {
-        on_action.call((action, opening.row, opening.message));
+        on_action.call((action, opening.target.row, opening.target.message));
     }
 }
 
@@ -129,13 +129,11 @@ pub(super) fn MobileMessageSheet(
     // Infallible, deliberately: `Conversation`'s own `use_signal`, written
     // only from deferred callbacks, so no write is live during a render.
     let opening = surfaces.mobile.read().clone();
-    let own = opening.as_ref().is_some_and(|o| o.own);
-    let current = opening.as_ref().and_then(|o| o.current.clone());
-    let reactions = opening
-        .as_ref()
-        .map(|o| o.reactions.clone())
-        .unwrap_or_default();
-    let target_row = opening.as_ref().map(|o| o.row.clone()).unwrap_or_default();
+    let target = opening.as_ref().map(|o| &o.target);
+    let own = target.is_some_and(|t| t.own);
+    let current = target.and_then(|t| t.current.clone());
+    let reactions = target.map(|t| t.reactions.clone()).unwrap_or_default();
+    let target_row = target.map(|t| t.row.clone()).unwrap_or_default();
     // The drag reads it from the DOM, so a slide away closes only the
     // opening it began on.
     let token = opening.as_ref().map_or(0, |o| o.token);

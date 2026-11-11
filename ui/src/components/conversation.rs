@@ -4279,8 +4279,8 @@ fn MessageGroupComponent(
                         // toggle of someone else's.
                         let user_reaction: Option<String> =
                             row_reactions.iter().find(|r| r.mine).map(|r| r.emoji.clone());
-                        // What the row, its +, its chips and its entry open
-                        // the mobile sheet for.
+                        // What the row, its + and its entry open the mobile
+                        // sheet for.
                         let sheet_target = RowTarget {
                             row: msg.id.clone(),
                             message: msg.message_id.clone(),
@@ -4718,9 +4718,6 @@ fn MessageGroupComponent(
                                         let msg_id_react = msg.message_id.clone();
                                         // A row being edited has the form's own buttons.
                                         let show_actions = !row_editing;
-                                        let row_for_invoker = msg.id.clone();
-                                        let row_for_entry = msg.id.clone();
-                                        let msg_id_for_entry = msg.message_id.clone();
                                         let msg_id_str_for_edit = msg.id.clone();
                                         let msg_id_for_delete = msg.message_id.clone();
                                         let msg_id_for_reply = msg.message_id.clone();
@@ -4731,11 +4728,7 @@ fn MessageGroupComponent(
                                         let reply_preview_names = preview_names.clone();
                                         let reply_author_name = group.author_name.clone();
 
-                                        let user_reaction = user_reaction.clone();
-                                        let reactions_for_invoker = row_reactions.clone();
-                                        let reactions_for_entry = row_reactions.clone();
-                                        let current_for_entry = user_reaction.clone();
-                                        let msg_id_for_invoker = msg.message_id.clone();
+                                        let invoker_target = sheet_target.clone();
 
                                         rsx! {
                                             div {
@@ -5016,11 +5009,7 @@ fn MessageGroupComponent(
                                                 if show_actions {
                                                     ReactionInvoker {
                                                         surfaces: reactions,
-                                                        row: row_for_invoker,
-                                                        message: msg_id_for_invoker,
-                                                        current: user_reaction,
-                                                        own: is_self,
-                                                        reactions: reactions_for_invoker,
+                                                        target: invoker_target,
                                                     }
                                                 }
                                             }
@@ -5030,11 +5019,7 @@ fn MessageGroupComponent(
                                                 // is the keyboard's way in.
                                                 MobileActionsEntry {
                                                     surfaces: reactions,
-                                                    row: row_for_entry,
-                                                    message: msg_id_for_entry,
-                                                    own: is_self,
-                                                    current: current_for_entry,
-                                                    reactions: reactions_for_entry,
+                                                    target: sheet_target,
                                                 }
                                                 // Reply, Edit and Delete: one unit, which wraps
                                                 // onto its own line when it does not fit.

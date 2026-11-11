@@ -44,7 +44,6 @@
 
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::mobile_message_actions::{open_sheet, pointer_click, RowTarget};
-use super::mobile_message_sheet::SheetReaction;
 use super::mobile_surface::{narrow_for_render, narrow_now, MobileOpening, Origin, SHEET_ID};
 use super::{now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW};
@@ -268,15 +267,9 @@ fn target_matches_room(
 #[component]
 pub(super) fn ReactionInvoker(
     surfaces: ReactionSurfaces,
-    /// The row's `msg-{row}` suffix.
-    row: String,
-    message: MessageId,
-    /// The reader's own reaction on the message, if any.
-    current: Option<String>,
-    /// The message is the reader's own (the sheet offers Edit and Delete).
-    own: bool,
-    /// Its reactions, as its chips show them (the sheet lists them).
-    reactions: Rc<Vec<SheetReaction>>,
+    /// The row's message, as the row renders it: the picker uses its row,
+    /// message and current reaction, the sheet all of it.
+    target: RowTarget,
 ) -> Element {
     // This invoker's own signal reads: no other footer renders when the
     // picker opens or closes. Infallible, deliberately: `target` and the
@@ -284,19 +277,19 @@ pub(super) fn ReactionInvoker(
     // from deferred callbacks, so no write can be live during a render
     // (dioxus-signal-safety.md).
     let (desktop_expanded, current_stale) = match surfaces.target.read().as_ref() {
-        Some(target) if target.row == row => (true, target.current != current),
+        Some(open) if open.row == target.row => (true, open.current != target.current),
         _ => (false, false),
     };
     let mobile_expanded = surfaces
         .mobile
         .read()
         .as_ref()
-        .is_some_and(|open| open.is_for(&row));
+        .is_some_and(|open| open.is_for(&target.row));
     let narrow = narrow_for_render();
     // A reaction landing while the picker is open (the reader's own, from
     // another device or still being signed) moves the highlight with it.
     if current_stale {
-        let (row, current) = (row.clone(), current.clone());
+        let (row, current) = (target.row.clone(), target.current.clone());
         let mut target = surfaces.target;
         crate::util::defer(move || {
             let stale = target
@@ -320,7 +313,7 @@ pub(super) fn ReactionInvoker(
     // same message: the picker stays open and moves to it. (The mobile
     // sheet is kept or closed by the row's entry.)
     {
-        let row = row.clone();
+        let row = target.row.clone();
         use_drop(move || {
             // The opening this React was for, taken now, while its element is
             // still the one in the document: what runs later acts on that
@@ -343,7 +336,7 @@ pub(super) fn ReactionInvoker(
     // press or click handler, so nothing it does can open, anchor or hold
     // anything. Below 48rem the popup needs no popover, so React works.
     if !narrow && !popover_supported() {
-        let tip_id = format!("react-unavailable-{row}");
+        let tip_id = format!("react-unavailable-{}", target.row);
         return rsx! {
             button {
                 r#type: "button",
@@ -370,7 +363,7 @@ pub(super) fn ReactionInvoker(
             }
         };
     }
-    let press_row = row.clone();
+    let press_row = target.row.clone();
     let (haspopup, controls, expanded) = if narrow {
         ("dialog", SHEET_ID, mobile_expanded)
     } else {
@@ -392,31 +385,24 @@ pub(super) fn ReactionInvoker(
                 let activation = next_activation();
                 // Below 48rem, decided now: the sheet, never the picker.
                 if narrow_now() {
-                    let target = RowTarget {
-                        row: row.clone(),
-                        message: message.clone(),
-                        own,
-                        current: current.clone(),
-                        reactions: reactions.clone(),
-                    };
-                    open_sheet(surfaces, target, Origin::React, pointer_click(&e));
+                    open_sheet(surfaces, target.clone(), Origin::React, pointer_click(&e));
                     return;
                 }
                 // A pointer press on React while its picker is open closes
                 // it. A key press keeps it open.
-                if take_press_while_open(&row) {
+                if take_press_while_open(&target.row) {
                     crate::util::defer(move || surfaces.close());
                     return;
                 }
                 let (room, visit) = shown_room();
-                let target = ReactionTarget {
+                let picker_target = ReactionTarget {
                     room,
                     visit,
-                    row: row.clone(),
-                    message: message.clone(),
-                    current: current.clone(),
+                    row: target.row.clone(),
+                    message: target.message.clone(),
+                    current: target.current.clone(),
                 };
-                crate::util::defer(move || open_for(surfaces, target, activation));
+                crate::util::defer(move || open_for(surfaces, picker_target, activation));
             },
             {line_icon(REACT_ICON_PATH, 18)}
         }
