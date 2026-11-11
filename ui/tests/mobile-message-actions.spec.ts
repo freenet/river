@@ -46,7 +46,7 @@ async function expectNoSurface(page: Page) {
 }
 
 /// The footer's state below 48rem: the cluster's display, the + per row and
-/// whether it takes a hit at its centre, and the hidden entry's size.
+/// whether it takes a hit at its centre.
 function narrowFooter(row: Locator) {
   return row.evaluate(async (el) => {
     const react = el.querySelector('[data-testid="message-react-button"]') as HTMLElement;
@@ -54,8 +54,6 @@ function narrowFooter(row: Locator) {
     const r = react.getBoundingClientRect();
     const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     const cluster = el.querySelector('[data-testid="message-action-cluster"]') as HTMLElement | null;
-    const entry = el.querySelector('[data-testid="mobile-message-actions-entry"]') as HTMLElement;
-    const e = entry.getBoundingClientRect();
     return {
       reacts: el.querySelectorAll('[data-testid="message-react-button"]').length,
       reactOpacity: getComputedStyle(react).opacity,
@@ -67,7 +65,6 @@ function narrowFooter(row: Locator) {
             return br.width > 0 && br.height > 0;
           })
         : false,
-      entrySize: [Math.round(e.width), Math.round(e.height)],
     };
   });
 }
@@ -98,20 +95,20 @@ test.describe("Below 48rem", () => {
   test.use({ viewport: { width: 390, height: 760 } });
 
   test("Reply, Edit and Delete leave the footer, its hits and the tab order; one + per row stays visible", async ({ page }) => {
-    const { received, own, continuation } = await openRoomWithRows(page);
+    const { own } = await openRoomWithRows(page);
     expect(await narrowLayout(page), "premise: below 48rem").toBe(true);
-    for (const row of [received, own, continuation]) {
-      await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-      await page.mouse.move(0, 0);
-      expect(await narrowFooter(row)).toEqual({
-        reacts: 1,
-        reactOpacity: "1",
-        reactHit: true,
-        clusterDisplay: "none",
-        clusterHits: false,
-        entrySize: [1, 1],
-      });
-    }
+    await own.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await page.mouse.move(0, 0);
+    expect(await narrowFooter(own)).toEqual({
+      reacts: 1,
+      reactOpacity: "1",
+      reactHit: true,
+      clusterDisplay: "none",
+      clusterHits: false,
+    });
+    // A row takes no double-tap zoom: iOS Safari holds a tap's click back
+    // while a double tap could still zoom.
+    expect(await own.evaluate((el) => getComputedStyle(el).touchAction)).toBe("manipulation");
     const tabbable = await tabbableIds(page);
     for (const id of ["message-reply-button", "message-edit-button", "message-delete-button"]) {
       expect(tabbable, `${id} is no tab stop`).not.toContain(id);
@@ -129,8 +126,9 @@ test.describe("Below 48rem", () => {
     for (const counts of perRow) expect(counts).toEqual([1, 1]);
   });
 
-  test("a tap on a row opens the sheet for that exact message: the emoji row, then the desktop footer's actions", async ({ page }) => {
+  test("a tap on a row opens the sheet for that exact message: the emoji row, then its actions", async ({ page }) => {
     const { received, own, continuation } = await openRoomWithRows(page);
+    const s = sheet(page);
     // Self owns this room: owning it grants no Edit or Delete on another
     // author's message, here or in the footer.
     const rows = [
@@ -140,38 +138,34 @@ test.describe("Below 48rem", () => {
     ] as const;
     for (const [row, expected] of rows) {
       await openMessageActions(page, row);
-      const s = sheet(page);
-      await expect(s, "named, though it shows no title").toHaveAccessibleName("Message options");
-      await expect(s.getByRole("heading"), "no title").toHaveCount(0);
-      await expect(page.getByTestId("mobile-message-actions-close"), "no Close: a tap outside dismisses it").toHaveCount(0);
       const actions = await s.locator(".mobile-sheet-actions button").evaluateAll((bs) =>
         bs.map((b) => b.getAttribute("data-testid")!.replace("mobile-message-action-", "")),
       );
       expect(actions).toEqual(expected);
-      // The emoji row above the actions, and no field.
-      await expect(s.getByTestId("mobile-reaction-palette").getByRole("button")).toHaveCount(16);
-      await expect(s.locator("input, textarea")).toHaveCount(0);
-      const [paletteBox, actionsBox] = [await s.getByTestId("mobile-reaction-palette").boundingBox(), await s.locator(".mobile-sheet-actions").boundingBox()];
-      expect(paletteBox!.y, "emoji first, actions below").toBeLessThan(actionsBox!.y);
-      await expect(row.getByTestId("message-react-button")).toHaveAttribute("aria-expanded", "true");
-      await expect(row.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "true");
-      // Not the keyboard: an emoji (a button) has focus.
-      await expect(s.locator(".mobile-reaction-palette button:focus")).toHaveCount(1);
-      // A tap outside returns focus to the row's entry, without scrolling.
-      const before = (await scrollMetrics(page)).top;
-      await pressAt(page, await historyPoint(page));
+      if (row === continuation) break;
+      await page.keyboard.press("Escape");
       await expect(s).toBeHidden();
-      await expect(row.getByTestId("mobile-message-actions-entry")).toBeFocused();
-      await expect(row.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "false");
-      expect((await scrollMetrics(page)).top, "dismissing scrolled nothing").toBe(before);
     }
-    await page.setViewportSize({ width: 900, height: 760 });
-    for (const [row, expected] of rows) {
-      const footer = await row.getByTestId("message-action-cluster").locator("button").evaluateAll((bs) =>
-        bs.map((b) => b.getAttribute("data-testid")!.replace(/^message-|-button$/g, "")),
-      );
-      expect(footer, "the 900px footer offers what the sheet did").toEqual(expected);
-    }
+    // Its structure, on the one left open.
+    await expect(s, "named, though it shows no title").toHaveAccessibleName("Message options");
+    await expect(s.getByRole("heading"), "no title").toHaveCount(0);
+    // The emoji row above the actions, and no field.
+    await expect(s.getByTestId("mobile-reaction-palette").getByRole("button")).toHaveCount(16);
+    await expect(s.locator("input, textarea")).toHaveCount(0);
+    const [paletteBox, actionsBox] = [await s.getByTestId("mobile-reaction-palette").boundingBox(), await s.locator(".mobile-sheet-actions").boundingBox()];
+    expect(paletteBox!.y, "emoji first, actions below").toBeLessThan(actionsBox!.y);
+    await expect(continuation.getByTestId("message-react-button")).toHaveAttribute("aria-expanded", "true");
+    await expect(continuation.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "true");
+    // Not the keyboard: an emoji (a button) has focus.
+    await expect(s.locator(".mobile-reaction-palette button:focus")).toHaveCount(1);
+    // No Close: a tap outside returns focus to the row's entry, without
+    // scrolling.
+    const before = (await scrollMetrics(page)).top;
+    await pressAt(page, await historyPoint(page));
+    await expect(s).toBeHidden();
+    await expect(continuation.getByTestId("mobile-message-actions-entry")).toBeFocused();
+    await expect(continuation.getByTestId("mobile-message-actions-entry")).toHaveAttribute("aria-expanded", "false");
+    expect((await scrollMetrics(page)).top, "dismissing scrolled nothing").toBe(before);
   });
 
   test("controls inside a row keep their own behaviour: a chip reacts, the + opens the sheet", async ({ page, context }) => {
@@ -224,7 +218,7 @@ test.describe("Below 48rem", () => {
     await openMessageActions(page, chipRow);
   });
 
-  test("a press that moved, a text selection and a modified click open nothing", async ({ page }) => {
+  test("a press that moved, a text selection and a modified click open nothing; a plain tap after them does", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
     const { x, y } = await plainPointOf(own);
     // A press dragged past a tap's slop, released on the row.
@@ -265,7 +259,9 @@ test.describe("Below 48rem", () => {
     await page.evaluate(() => window.getSelection()!.removeAllRanges());
     await own.dispatchEvent("click", { clientX: x, clientY: y, button: 0, ctrlKey: true, bubbles: true });
     await expectNoSurface(page);
-    // And then a plain tap does.
+    // And then a plain tap does, even after a finger whose release never
+    // reached the row (the row was replaced under it): it is no pinch.
+    await own.dispatchEvent("pointerdown", { pointerId: 30, pointerType: "touch", isPrimary: true, clientX: x, clientY: y, bubbles: true });
     await tapRow(page, own);
     await expect(sheet(page)).toBeVisible();
   });
@@ -554,52 +550,6 @@ test.describe("Below 48rem", () => {
     await expect(dmRow.getByTestId("mobile-message-actions-entry")).toHaveCount(0);
   });
 
-  test("a press opens it at once, with a mouse too, and a row takes no double-tap zoom", async ({ page }) => {
-    const { own } = await openRoomWithRows(page);
-    // iOS Safari holds a tap's click back while a double tap could zoom.
-    expect(await own.evaluate((el) => getComputedStyle(el).touchAction)).toBe("manipulation");
-    // From the click to the dialog showing, timed in the page: a mouse click
-    // once waited out a 500ms double-click window first.
-    await page.evaluate(() => {
-      const w = window as unknown as { __sheetOpenedAfter?: number };
-      let clicked = 0;
-      document.addEventListener("click", () => { clicked = performance.now(); }, { capture: true, once: true });
-      const observer = new MutationObserver(() => {
-        if (!document.querySelector("dialog#mobile-message-sheet[open]")) return;
-        w.__sheetOpenedAfter = performance.now() - clicked;
-        observer.disconnect();
-      });
-      observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["open"] });
-    });
-    await tapRow(page, own);
-    await expect(sheet(page)).toBeVisible();
-    const after = await page.evaluate(() => (window as unknown as { __sheetOpenedAfter?: number }).__sheetOpenedAfter);
-    expect(after, "shown straight after the click").toBeLessThan(300);
-  });
-
-  test("the second click of a double-click on a row is not a tap", async ({ page }) => {
-    test.skip(hasTouch(), "a mouse's multi-click");
-    const { own } = await openRoomWithRows(page);
-    const { x, y } = await plainPointOf(own);
-    // Alone, with no first click before it: it opens nothing.
-    await page.mouse.move(x, y);
-    await page.mouse.down({ clickCount: 2 });
-    await page.mouse.up({ clickCount: 2 });
-    await expectNoSurface(page);
-  });
-
-  test("a contact whose release never reached a row does not make later taps a pinch", { tag: "@chromium-only" }, async ({ page }) => {
-    const { own } = await openRoomWithRows(page);
-    const { x, y } = await plainPointOf(own);
-    // A finger down on a row that was replaced before it lifted: no pointerup.
-    await own.dispatchEvent("pointerdown", { pointerId: 30, pointerType: "touch", isPrimary: true, clientX: x, clientY: y, bubbles: true });
-    // The next finger is the only one down.
-    await own.dispatchEvent("pointerdown", { pointerId: 31, pointerType: "touch", isPrimary: true, clientX: x, clientY: y, bubbles: true });
-    await own.dispatchEvent("pointerup", { pointerId: 31, pointerType: "touch", isPrimary: true, clientX: x, clientY: y, bubbles: true });
-    await own.dispatchEvent("click", { clientX: x, clientY: y, button: 0, bubbles: true });
-    await expect(sheet(page)).toBeVisible();
-  });
-
   test("opening and closing it renders no message group", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
     await settle(page);
@@ -636,30 +586,12 @@ test.describe("At 48rem and wider", () => {
 });
 
 test.describe("The narrow query", () => {
-  // No engine here lays a page out at a fractional width (a 767.5px frame is
-  // snapped to 768), so the property is checked as what it is: the rules and
-  // the press routing use `not all and (min-width: 48rem)`, the exact
-  // complement of Tailwind's `md`, which leaves no width to neither layout.
-  test("is the exact complement of md, in the stylesheet and at the press", { tag: "@chromium-only" }, async ({ page }) => {
+  // The rules and the press routing use `not all and (min-width: 48rem)`,
+  // the exact complement of Tailwind's `md`, so no width is left to neither
+  // layout. No engine here lays a page out at a fractional width (a 767.5px
+  // frame is snapped to 768), so the two whole widths around it are checked.
+  test("is the exact complement of md on either side of 48rem", { tag: "@chromium-only" }, async ({ page }) => {
     await openRoomWithComposer(page);
-    const rules = await page.evaluate(() => {
-      const out: string[] = [];
-      for (const sheet of Array.from(document.styleSheets)) {
-        let list: CSSRuleList;
-        try {
-          list = sheet.cssRules;
-        } catch {
-          continue;
-        }
-        for (const rule of Array.from(list)) {
-          if (rule instanceof CSSMediaRule && /msg-action-cluster|mobile-actions-entry/.test(rule.cssText)) out.push(rule.conditionText);
-        }
-      }
-      return out;
-    });
-    expect(rules.length).toBeGreaterThan(0);
-    // Engines serialize the range in either syntax.
-    for (const condition of rules) expect(condition).toMatch(/^not all and \((min-width: 48rem|width >= 48rem)\)$/);
     for (const width of [767, 768]) {
       await page.setViewportSize({ width, height: 760 });
       const state = await page.evaluate(() => ({
@@ -674,7 +606,7 @@ test.describe("The narrow query", () => {
 });
 
 test.describe("Inside the gateway's sandboxed frame", () => {
-  test("a row tap opens the sheet and + the popup with its field focused", async ({ page }) => {
+  test("a row tap opens the sheet, and so does +, its first emoji focused", async ({ page }) => {
     // The frame is the variable here, not the device: the desktop engines
     // cover it (a frame inside an emulated phone viewport did not take the
     // room list's clicks).

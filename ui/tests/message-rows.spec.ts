@@ -588,12 +588,12 @@ const NO_STRAY_SCROLL = { historyLeft: 0, root: [0, 0], page: [0, 0] };
 // the history's scrollTop alone: `scrollIntoView` also scrolled the
 // history's scrollLeft and overflow-hidden ancestors, which nothing scrolls
 // back. The overflow is forced (the form fits at every real width), so the
-// old behaviour would show. Below 48rem reactions are the modal popup, which
-// moves no scroller at all, palette out included.
+// old behaviour would show. Below 48rem reactions are in the modal message
+// sheet, which moves no scroller at all, palette out included.
 test.describe("Revealing a popover on a short phone view", () => {
   test.use({ viewport: { width: 320, height: 480 } });
 
-  test("the reaction popup and the edit form scroll nothing sideways or outside the history", async ({ page }) => {
+  test("the message sheet and the edit form scroll nothing sideways or outside the history", async ({ page }) => {
     await openRoomWithComposer(page);
     await page.addStyleTag({
       content: '[id^="edit-form-"] { min-width: 600px; }',
@@ -602,7 +602,7 @@ test.describe("Revealing a popover on a short phone view", () => {
     await openInlinePicker(page, row);
     await expect(page.getByTestId("mobile-message-sheet")).toBeVisible();
     await nextFrames(page);
-    expect(await strayScroll(page), "reaction popup").toEqual(NO_STRAY_SCROLL);
+    expect(await strayScroll(page), "message sheet").toEqual(NO_STRAY_SCROLL);
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("mobile-message-sheet")).toBeHidden();
 

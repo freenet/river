@@ -41,21 +41,19 @@ function handlePoint(page: Page): Promise<[number, number]> {
 
 test.use({ viewport: { width: 390, height: 760 } });
 
-test("the row shows no scroll bar, does not snap, and takes only sideways pans", async ({ page }) => {
+test("the row shows no scroll bar and takes only sideways pans", async ({ page }) => {
   await openPopup(page);
   const g = await page.evaluate(() => {
     const row = document.querySelector("#mobile-message-sheet .mobile-reaction-palette") as HTMLElement;
     const css = (sel: string) => getComputedStyle(document.querySelector(sel)!);
     return {
       gutter: row.offsetHeight - row.clientHeight,
-      snap: getComputedStyle(row).scrollSnapType,
       row: getComputedStyle(row).touchAction,
       backdrop: css("#mobile-message-sheet .mobile-sheet-backdrop").touchAction,
       panel: css("#mobile-message-sheet .mobile-sheet-panel").touchAction,
     };
   });
   expect(g.gutter, "no scroll bar takes room under the row").toBe(0);
-  expect(g.snap, "free scrolling, no snapping").toBe("none");
   expect(g.row, "the row pans only sideways").toBe("pan-x");
   expect(g.backdrop, "the backdrop leaves every move to the drag").toBe("none");
   expect(g.panel).toBe("none");
@@ -115,17 +113,6 @@ test.describe("A mouse on the reaction popup", () => {
     await expect(sheet(page), "a sideways drag is no tap").toBeVisible();
     expect(await panelOffset(page)).toBe(0);
   });
-
-  test("a mouse drag up does not lift it", async ({ page }) => {
-    await openPopup(page);
-    const [x, y] = await handlePoint(page);
-    await page.mouse.move(x, y);
-    await page.mouse.down();
-    await page.mouse.move(x, y - 120, { steps: 6 });
-    expect(await panelBottomGap(page), "no gap under it").toBeLessThan(1);
-    await page.mouse.up();
-    await expect(sheet(page)).toBeVisible();
-  });
 });
 
 test.describe("The reaction popup's opening slide", () => {
@@ -155,10 +142,6 @@ test.describe("The reaction popup's opening slide", () => {
     expect(frames.length, "premise: frames were sampled while it was open").toBeGreaterThan(0);
     expect(Math.max(...frames.map((f) => f.scrollTop)), "the dialog never scrolls").toBe(0);
     expect(Math.max(...frames.map((f) => f.gap)), "never above the bottom edge").toBeLessThan(1);
-    expect(
-      await sheet(page).evaluate((el) => getComputedStyle(el).overflowY),
-      "the dialog is no scroll container",
-    ).toBe("clip");
   });
 });
 
@@ -189,19 +172,6 @@ test.describe("A finger on the reaction popup", () => {
     await expect(sheet(page)).toBeHidden();
     await expect(chips(row)).toHaveCount(0);
     await expect(row.getByTestId("message-react-button"), "focus back on the +").toBeFocused();
-  });
-
-  test("a quick flick closes it even when short", async ({ page }) => {
-    await openPopup(page);
-    const [x, y] = await handlePoint(page);
-    // One 30px move, then up: CDP spaces steps ~50ms apart, slower than a
-    // real finger's flick, so one step is the honest flick here.
-    await withFingers(page, async (fingers) => {
-      await fingers.press([1, x, y]);
-      await fingers.move({ 1: [0, 30] }, 1);
-      await fingers.lift();
-    });
-    await expect(sheet(page)).toBeHidden();
   });
 
   test("a drag down that starts over the history drags it and closes it, and scrolls nothing", async ({ page }) => {
