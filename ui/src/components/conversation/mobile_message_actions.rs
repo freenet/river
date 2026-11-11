@@ -62,36 +62,17 @@ struct RowPress {
 thread_local! {
     static ROW_PRESS: std::cell::RefCell<Option<RowPress>> =
         const { std::cell::RefCell::new(None) };
-    /// The touch or pen contacts down on message rows, by pointer id.
-    static CONTACTS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A `pointerdown` on `row`. A second contact while one is down spoils the
-/// press: a pinch is no tap. A primary pointer is by definition the first
-/// contact down, so it starts the contact list afresh: a contact whose
-/// `pointerup` never reached a row (its row was replaced mid-touch) cannot
-/// leave every later press looking like a pinch.
+/// A `pointerdown` on `row`. A primary pointer, by definition the first
+/// contact down, starts the press. Any other pointer is a second finger,
+/// which spoils the press under way: a pinch is no tap.
 pub(super) fn note_row_press(row: &str, e: &PointerEvent) {
     let data = e.data();
-    let pointer = data.pointer_id();
-    let pointer_type = data.pointer_type();
-    let contact = matches!(pointer_type.as_str(), "touch" | "pen");
-    let primary = data.is_primary();
-    let down = CONTACTS.with(|c| {
-        let mut c = c.borrow_mut();
-        if primary {
-            c.clear();
-        }
-        if contact && !c.contains(&pointer) {
-            c.push(pointer);
-        }
-        c.len()
-    });
     let point = data.client_coordinates();
     ROW_PRESS.with(|p| {
         let mut p = p.borrow_mut();
-        if down > 1 || !primary {
-            // A second finger: the press under way is a pinch, not a tap.
+        if !data.is_primary() {
             if let Some(press) = p.as_mut() {
                 press.spoiled = true;
             }
@@ -99,7 +80,7 @@ pub(super) fn note_row_press(row: &str, e: &PointerEvent) {
         }
         *p = Some(RowPress {
             row: row.to_string(),
-            pointer,
+            pointer: data.pointer_id(),
             x: point.x,
             y: point.y,
             at: super::now_ms(),
@@ -108,21 +89,17 @@ pub(super) fn note_row_press(row: &str, e: &PointerEvent) {
     });
 }
 
-/// A contact on a row ended (`pointerup`) or was cancelled
-/// (`pointercancel`, the browser taking it for a scroll): a cancelled press
-/// opens nothing.
-pub(super) fn note_row_release(e: &PointerEvent, cancelled: bool) {
+/// A contact on a row was cancelled (`pointercancel`, the browser taking it
+/// for a scroll): its press opens nothing.
+pub(super) fn note_row_cancel(e: &PointerEvent) {
     let pointer = e.data().pointer_id();
-    CONTACTS.with(|c| c.borrow_mut().retain(|&down| down != pointer));
-    if cancelled {
-        ROW_PRESS.with(|p| {
-            if let Some(p) = p.borrow_mut().as_mut() {
-                if p.pointer == pointer {
-                    p.spoiled = true;
-                }
+    ROW_PRESS.with(|p| {
+        if let Some(p) = p.borrow_mut().as_mut() {
+            if p.pointer == pointer {
+                p.spoiled = true;
             }
-        });
-    }
+        }
+    });
 }
 
 /// The message a row opens the sheet for, as the row renders it.
@@ -187,29 +164,16 @@ pub(super) fn row_clicked(
     open_sheet(surfaces, target, Origin::Entry, pointer_click(e));
 }
 
-/// Whether a non-empty text selection touches `row`.
-fn row_has_selection(row: &str) -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let Some(row_el) = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id(&format!("msg-{row}")))
-        else {
-            return false;
-        };
-        web_sys::window()
-            .and_then(|w| w.get_selection().ok().flatten())
-            .is_some_and(|s| {
-                !s.is_collapsed()
-                    && (s.anchor_node().is_some_and(|n| row_el.contains(Some(&n)))
-                        || s.focus_node().is_some_and(|n| row_el.contains(Some(&n))))
-            })
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = row;
-        false
-    }
+/// Whether a non-empty text selection touches the row `row_el`.
+#[cfg(target_arch = "wasm32")]
+fn row_has_selection(row_el: &web_sys::Element) -> bool {
+    web_sys::window()
+        .and_then(|w| w.get_selection().ok().flatten())
+        .is_some_and(|s| {
+            !s.is_collapsed()
+                && (s.anchor_node().is_some_and(|n| row_el.contains(Some(&n)))
+                    || s.focus_node().is_some_and(|n| row_el.contains(Some(&n))))
+        })
 }
 
 /// Whether this click on `row` is a tap that opens its sheet: below 48rem,
@@ -270,7 +234,7 @@ fn row_tap(e: &MouseEvent, row: &str) -> bool {
         if excluded {
             return false;
         }
-        if row_has_selection(row) {
+        if row_has_selection(&row_el) {
             return false;
         }
         press_makes_tap(
@@ -319,10 +283,8 @@ pub(super) fn MobileActionsEntry(
     let differs = |open: &MobileOpening, target: &RowTarget| {
         open.target.current != target.current || open.target.reactions != target.reactions
     };
-    // Infallible, deliberately: `Conversation`'s own `use_signal`, written
-    // only from deferred callbacks.
-    let (expanded, stale) = match surfaces.mobile.read().as_ref() {
-        Some(open) if open.is_for(&target.row) => (true, differs(open, &target)),
+    let (expanded, stale) = match surfaces.mobile_for_render() {
+        Some(open) if open.is_for(&target.row) => (true, differs(&open, &target)),
         _ => (false, false),
     };
     if stale {
@@ -359,9 +321,6 @@ pub(super) fn MobileActionsEntry(
             "aria-controls": SHEET_ID,
             "aria-expanded": "{expanded}",
             onclick: move |e: MouseEvent| {
-                if !narrow_now() {
-                    return;
-                }
                 open_sheet(surfaces, target.clone(), Origin::Entry, pointer_click(&e));
             },
             "Options"

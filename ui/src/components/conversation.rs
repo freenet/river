@@ -3740,24 +3740,6 @@ fn element_centre(id: &str) -> Option<(f64, f64)> {
     ))
 }
 
-/// Focus `row`'s footer React without scrolling the history.
-fn focus_row_react(row: &str) {
-    #[cfg(target_arch = "wasm32")]
-    if let Some(react) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id(&format!("msg-{row}")))
-        .and_then(|r| {
-            r.query_selector(mobile_surface::REACT_SELECTOR)
-                .ok()
-                .flatten()
-        })
-    {
-        focus_without_scrolling(&react);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = row;
-}
-
 fn reaction_owners_dialog_id(key: &str) -> String {
     format!("reaction-owners-{key}")
 }
@@ -3942,6 +3924,15 @@ fn name_tag(
             }
             {label}
         }
+    }
+}
+
+/// A reactor's ⚠ and 🛡, after their name in a reactor list: a chip's, and
+/// the mobile sheet's.
+fn reactor_marks(reactor: &Reactor) -> Element {
+    rsx! {
+        {reactor.warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
+        {reactor.badge.as_ref().map(|badge| name_icon_mark("reaction-owner-deputy-badge", badge.tooltip(), SHIELD_ICON_PATH))}
     }
 }
 
@@ -4309,11 +4300,8 @@ fn MessageGroupComponent(
                                 onpointerdown: move |e: PointerEvent| {
                                     mobile_message_actions::note_row_press(&press_row, &e)
                                 },
-                                onpointerup: move |e: PointerEvent| {
-                                    mobile_message_actions::note_row_release(&e, false)
-                                },
                                 onpointercancel: move |e: PointerEvent| {
-                                    mobile_message_actions::note_row_release(&e, true)
+                                    mobile_message_actions::note_row_cancel(&e)
                                 },
                                 onclick: move |e: MouseEvent| {
                                     mobile_message_actions::row_clicked(
@@ -4751,14 +4739,10 @@ fn MessageGroupComponent(
                                                         let is_user_reaction = reaction.mine;
                                                         let emoji_for_click = emoji.clone();
                                                         let msg_id_for_click = msg_id_react.clone();
-                                                        let shown_reactors: Vec<_> = reaction
+                                                        let names_str = reaction
                                                             .reactors
                                                             .iter()
-                                                            .map(|r| (r.name.clone(), r.warning.clone(), r.badge.clone()))
-                                                            .collect();
-                                                        let names_str = shown_reactors
-                                                            .iter()
-                                                            .map(|(name, _, _)| name.as_str())
+                                                            .map(|reactor| reactor.name.as_str())
                                                             .collect::<Vec<_>>()
                                                             .join(", ");
                                                         let tooltip = if is_user_reaction {
@@ -4858,7 +4842,7 @@ fn MessageGroupComponent(
                                                                                 "Remove"
                                                                             }
                                                                         }
-                                                                        {shown_reactors.iter().enumerate().map(|(index, (name, warning, badge))| {
+                                                                        {reaction.reactors.iter().enumerate().map(|(index, reactor)| {
                                                                             rsx! {
                                                                                 div {
                                                                                     key: "{index}",
@@ -4866,10 +4850,9 @@ fn MessageGroupComponent(
                                                                                     span {
                                                                                         "data-testid": "reaction-owner",
                                                                                         class: "[overflow-wrap:anywhere]",
-                                                                                        "{name}"
+                                                                                        "{reactor.name}"
                                                                                     }
-                                                                                    {warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
-                                                                                    {badge.as_ref().map(|badge| name_icon_mark("reaction-owner-deputy-badge", badge.tooltip(), SHIELD_ICON_PATH))}
+                                                                                    {reactor_marks(reactor)}
                                                                                 }
                                                                             }
                                                                         })}
@@ -4991,7 +4974,10 @@ fn MessageGroupComponent(
                                                                                 // The reader's chip with no one else on it
                                                                                 // leaves with the reaction.
                                                                                 if is_user_reaction && count == 1 {
-                                                                                    focus_row_react(&row_id_for_owners_key);
+                                                                                    mobile_surface::dom::focus_control(
+                                                                                        &row_id_for_owners_key,
+                                                                                        mobile_surface::REACT_SELECTOR,
+                                                                                    );
                                                                                 }
                                                                                 let id = msg_id_for_key.clone();
                                                                                 let emoji = emoji_for_key.clone();

@@ -30,12 +30,10 @@
 //! does nothing. The room composer is never touched.
 
 use super::emoji_picker::FREQUENT_EMOJIS;
-use super::mobile_surface::{dom, opening_is_live, SHEET_ID, SHEET_TITLE};
+use super::mobile_surface::{dom, SHEET_ID, SHEET_TITLE};
 use super::reaction_picker::{choice_label, ReactionSurfaces};
-use super::{name_icon_mark, name_mark};
-use crate::components::icons::{
-    line_icon, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH, SHIELD_ICON_PATH,
-};
+use super::reactor_marks;
+use crate::components::icons::{line_icon, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH};
 use crate::components::members::DeputyBadge;
 use crate::util::confusable::ImpersonationWarning;
 use dioxus::prelude::*;
@@ -77,46 +75,6 @@ pub(super) struct SheetReaction {
     pub(super) reactors: Vec<Reactor>,
 }
 
-/// A choice for opening `token`, run deferred: it reacts with `emoji` only
-/// if that opening is still the open one and still live, and closes it
-/// either way, focus back on what it opened from, so a second event from the
-/// same opening finds nothing.
-fn react(
-    surfaces: ReactionSurfaces,
-    token: u64,
-    emoji: String,
-    on_react: EventHandler<(MessageId, String)>,
-) {
-    let Some(opening) = surfaces.mobile_opening_for(token) else {
-        return;
-    };
-    let live = opening_is_live(&opening);
-    surfaces.close_mobile(true);
-    if live {
-        on_react.call((opening.target.message, emoji));
-    }
-}
-
-/// An action for opening `token`, run deferred: the sheet closes first (the
-/// action's destination takes focus), then, if that opening was still the
-/// open one and still live, the action is handed to `Conversation`, which
-/// checks it against the room as it is now.
-fn act(
-    surfaces: ReactionSurfaces,
-    token: u64,
-    action: MobileAction,
-    on_action: Callback<(MobileAction, String, MessageId)>,
-) {
-    let Some(opening) = surfaces.mobile_opening_for(token) else {
-        return;
-    };
-    let live = opening_is_live(&opening);
-    surfaces.close_mobile(false);
-    if live {
-        on_action.call((action, opening.target.row, opening.target.message));
-    }
-}
-
 /// The conversation's one mobile message sheet. Rendered once by
 /// `Conversation`, closed until a row, its + or its entry opens it below
 /// 48rem.
@@ -126,9 +84,7 @@ pub(super) fn MobileMessageSheet(
     on_react: EventHandler<(MessageId, String)>,
     on_action: Callback<(MobileAction, String, MessageId)>,
 ) -> Element {
-    // Infallible, deliberately: `Conversation`'s own `use_signal`, written
-    // only from deferred callbacks, so no write is live during a render.
-    let opening = surfaces.mobile.read().clone();
+    let opening = surfaces.mobile_for_render();
     let target = opening.as_ref().map(|o| &o.target);
     let own = target.is_some_and(|t| t.own);
     let current = target.and_then(|t| t.current.clone());
@@ -145,21 +101,14 @@ pub(super) fn MobileMessageSheet(
     // must not show it again.
     let shown_token = use_hook(|| Rc::new(Cell::new(0u64)));
     use_effect(move || {
-        // Infallible, deliberately: `Conversation`'s own `use_signal`, written
-        // only from deferred callbacks.
-        let opened = surfaces
-            .mobile
-            .read()
-            .as_ref()
-            .map(|o| (o.token, o.by_pointer));
-        let Some((token, by_pointer)) = opened else {
+        let Some(opening) = surfaces.mobile_for_render() else {
             return;
         };
-        if shown_token.replace(token) == token {
+        if shown_token.replace(opening.token) == opening.token {
             return;
         }
         super::mobile_sheet_drag::reset();
-        dom::mark_opened_by(by_pointer);
+        dom::mark_opened_by(opening.by_pointer);
         if !dom::dialog_open() && dom::show_dialog() {
             dom::focus_in(FOCUS);
         }
@@ -179,18 +128,31 @@ pub(super) fn MobileMessageSheet(
             None::<wasm_bindgen::closure::Closure<dyn FnMut()>>,
         ))
     });
+    // A choice acts deferred, for the opening it was made in and only if
+    // that is still open and live then ([`ReactionSurfaces::take_mobile`]).
+    // An emoji reacts, focus back on what the sheet opened from.
     let pick = move |emoji: String| {
         move |_| {
             if let Some(token) = surfaces.mobile_token() {
                 let emoji = emoji.clone();
-                crate::util::defer(move || react(surfaces, token, emoji, on_react));
+                crate::util::defer(move || {
+                    if let Some(opening) = surfaces.take_mobile(token, true) {
+                        on_react.call((opening.target.message, emoji));
+                    }
+                });
             }
         }
     };
+    // An action is handed to `Conversation`, which checks it against the
+    // room as it is now; its destination takes focus.
     let action = move |action: MobileAction| {
         move |_| {
             if let Some(token) = surfaces.mobile_token() {
-                crate::util::defer(move || act(surfaces, token, action, on_action));
+                crate::util::defer(move || {
+                    if let Some(opening) = surfaces.take_mobile(token, false) {
+                        on_action.call((action, opening.target.row, opening.target.message));
+                    }
+                });
             }
         }
     };
@@ -269,8 +231,7 @@ pub(super) fn MobileMessageSheet(
                                             key: "{index}",
                                             class: "mobile-sheet-reactor",
                                             span { "data-testid": "mobile-sheet-reactor", "{reactor.name}" }
-                                            {reactor.warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
-                                            {reactor.badge.as_ref().map(|badge| name_icon_mark("reaction-owner-deputy-badge", badge.tooltip(), SHIELD_ICON_PATH))}
+                                            {reactor_marks(reactor)}
                                         }
                                     }
                                 }

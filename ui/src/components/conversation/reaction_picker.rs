@@ -272,18 +272,16 @@ pub(super) fn ReactionInvoker(
     target: RowTarget,
 ) -> Element {
     // This invoker's own signal reads: no other footer renders when the
-    // picker opens or closes. Infallible, deliberately: `target` and the
-    // mobile opening are `Conversation`'s own `use_signal`s, written only
-    // from deferred callbacks, so no write can be live during a render
+    // picker or the sheet opens or closes. Infallible, deliberately: `target`
+    // is `Conversation`'s own `use_signal`, written only from deferred
+    // callbacks, so no write can be live during a render
     // (dioxus-signal-safety.md).
     let (desktop_expanded, current_stale) = match surfaces.target.read().as_ref() {
         Some(open) if open.row == target.row => (true, open.current != target.current),
         _ => (false, false),
     };
     let mobile_expanded = surfaces
-        .mobile
-        .read()
-        .as_ref()
+        .mobile_for_render()
         .is_some_and(|open| open.is_for(&target.row));
     let narrow = narrow_for_render();
     // A reaction landing while the picker is open (the reader's own, from

@@ -86,11 +86,10 @@ pub(super) enum Origin {
 
 impl Origin {
     /// The control in the row, as a selector.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    fn control_selector(&self) -> String {
+    fn control_selector(&self) -> &'static str {
         match self {
-            Self::Entry => ENTRY_SELECTOR.to_string(),
-            Self::React => REACT_SELECTOR.to_string(),
+            Self::Entry => ENTRY_SELECTOR,
+            Self::React => REACT_SELECTOR,
         }
     }
 }
@@ -163,7 +162,7 @@ fn live_contract_key() -> Option<ContractKey> {
 /// Whether `opening` still stands: the same showing of the room the history
 /// shows, in the same generation, and its row's control still rendered (the
 /// message not deleted, out of the rendered range or being edited).
-pub(super) fn opening_is_live(opening: &MobileOpening) -> bool {
+fn opening_is_live(opening: &MobileOpening) -> bool {
     let (shown, visit) = shown_room();
     let current_room = CURRENT_ROOM.try_peek().ok().and_then(|r| r.owner_key);
     opening_matches(opening, shown, visit, current_room, live_contract_key())
@@ -187,6 +186,15 @@ fn opening_matches(
 }
 
 impl ReactionSurfaces {
+    /// The open mobile opening, read by a render or an effect, which then
+    /// runs again when it changes. Infallible, deliberately: it is
+    /// `Conversation`'s own `use_signal`, written only from deferred
+    /// callbacks, so no write is live during a render
+    /// (dioxus-signal-safety.md).
+    pub(super) fn mobile_for_render(self) -> Option<MobileOpening> {
+        self.mobile.read().clone()
+    }
+
     /// The open mobile opening, read fallibly (the conversation may have
     /// unmounted).
     fn mobile_opening(self) -> Option<MobileOpening> {
@@ -225,11 +233,23 @@ impl ReactionSurfaces {
             return;
         };
         if restore && opening_is_live(&open) {
-            dom::focus_control(&open.target.row, &open.origin.control_selector());
+            dom::focus_control(&open.target.row, open.origin.control_selector());
         }
         let mut slot = self.mobile;
         // A statement, so the write guard drops before `slot` does.
         let _ = slot.try_write().map(|mut slot| *slot = None);
+    }
+
+    /// A choice made in opening `token`, run deferred: if that is still the
+    /// open one it closes, so a second event from the same opening finds
+    /// nothing, and it is handed back if it was still live, for the choice
+    /// to act on. A reaction returns focus to what the sheet opened from
+    /// (`restore`); an action leaves it to where the action goes.
+    pub(super) fn take_mobile(self, token: u64, restore: bool) -> Option<MobileOpening> {
+        let opening = self.mobile_opening_for(token)?;
+        let live = opening_is_live(&opening);
+        self.close_mobile(restore);
+        live.then_some(opening)
     }
 
     /// Close opening `token`, focus back on its control, if it is still the
@@ -284,7 +304,7 @@ impl ReactionSurfaces {
     }
 
     /// The open opening, if `token` is it. Read when queued work runs.
-    pub(super) fn mobile_opening_for(self, token: u64) -> Option<MobileOpening> {
+    fn mobile_opening_for(self, token: u64) -> Option<MobileOpening> {
         self.mobile_opening().filter(|o| o.token == token)
     }
 
@@ -352,10 +372,7 @@ pub(super) fn MobileSurfaceGuard(
             true
         }
     };
-    // Infallible, deliberately: `Conversation`'s own `use_signal`, written
-    // only from deferred callbacks, so no write is live during a render.
-    let open = surfaces.mobile.read().clone();
-    if let Some(open) = open {
+    if let Some(open) = surfaces.mobile_for_render() {
         if !narrow || !in_chat || open.contract != contract_key {
             crate::util::defer(move || {
                 let still_open = surfaces.mobile_opening_for(open.token);
@@ -419,11 +436,9 @@ pub(super) mod dom {
     }
 
     /// Focus, without scrolling, the control in `row` matching `selector`,
-    /// else the row's +, if either is still there.
-    pub(super) fn focus_control(row: &str, selector: &str) {
-        if let Some(control) =
-            row_control(row, selector).or_else(|| row_control(row, super::REACT_SELECTOR))
-        {
+    /// if it is still there.
+    pub(in super::super) fn focus_control(row: &str, selector: &str) {
+        if let Some(control) = row_control(row, selector) {
             focus_without_scrolling(&control);
         }
     }
@@ -746,7 +761,7 @@ pub(super) mod dom {
     pub(in super::super) fn row_control(_row: &str, _selector: &str) -> Option<()> {
         Some(())
     }
-    pub(super) fn focus_control(_row: &str, _selector: &str) {}
+    pub(in super::super) fn focus_control(_row: &str, _selector: &str) {}
     pub(super) fn close_dialog() {}
     pub(in super::super) fn show_dialog() -> bool {
         false

@@ -7724,9 +7724,21 @@ mod tests {
             "the reactor list call site no longer passes `*reactor_id`. Passing \
              the viewer id would flag the real owner"
         );
+        // The element is rendered by `reactor_marks`, which both reactor
+        // lists call: a chip's, and the mobile sheet's.
+        let reactor_marks = between(conversation, "fn reactor_marks(", "\n}\n", "reactor_marks");
         assert!(
-            conversation.contains("name_mark(\"reaction-owner-impersonation-warning\""),
+            reactor_marks.contains("name_mark(\"reaction-owner-impersonation-warning\""),
             "the reactor list no longer renders the warning element"
+        );
+        assert!(
+            conversation.contains("{reactor_marks(reactor)}"),
+            "a reaction chip's reactor list no longer renders a reactor's marks"
+        );
+        assert!(
+            include_str!("conversation/mobile_message_sheet.rs")
+                .contains("{reactor_marks(reactor)}"),
+            "the mobile sheet's reactor list no longer renders a reactor's marks"
         );
     }
 
