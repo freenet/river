@@ -24,8 +24,8 @@ import { callRiverTest } from "./river-test";
 // hovered, holds keyboard focus or has its picker open, and shows a control
 // that has focus however it got it; a touch or hybrid pointer shows them at
 // rest. Reaction chips always show. Below 48rem the trailing cluster is
-// hidden and a tap on the row opens it in the actions sheet
-// (mobile-message-actions.spec.ts); a phone runs the desktop footer's checks
+// hidden and a tap on the row opens it in the message sheet
+// (mobile-message-sheet.spec.ts); a phone runs the desktop footer's checks
 // at a touch tablet's width.
 
 /// A received message (a fixed test identity, inserted before the newest)
@@ -396,7 +396,7 @@ test.describe("Footer at 320px", () => {
   test.use({ viewport: { width: 320, height: 700 } });
 
   // Below 48rem the footer is the chips and the +: Reply, Edit and Delete are
-  // a tap on the row away, in the actions sheet.
+  // a tap on the row away, in the message sheet.
   test("chips wrap with React after them, no trailing cluster, and every target takes its own hits", async ({ page }) => {
     await openRoomWithComposer(page);
     const bare = await submitMessage(page, "narrow bare");

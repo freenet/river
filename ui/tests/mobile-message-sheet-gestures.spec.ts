@@ -18,17 +18,16 @@ import {
 } from "./example-room";
 import { callRiverTest } from "./river-test";
 
-// The mobile surfaces' gestures (mobile_sheet_drag.rs), mostly through the
-// reaction popup; the actions sheet shares them (its own block at the end).
-// The popup's emoji row
-// scrolls sideways with no scroll bar, a downward drag that starts anywhere
-// on the screen drags the panel and dismisses it once far or fast enough
-// (else it springs back), and a tap outside slides it away. Real touch
-// input needs Chromium's input protocol (CDP), so the finger tests run on
-// chromium and mobile-chrome; the mouse tests run on the desktop engines.
+// The mobile message sheet's gestures (mobile_sheet_drag.rs;
+// mobile-message-sheet.spec.ts has the rest of it). Its emoji row scrolls
+// sideways with no scroll bar, and a downward drag that starts anywhere on
+// the screen drags the panel and dismisses it once far or fast enough (else
+// it springs back). Real touch input needs Chromium's input protocol (CDP),
+// so the finger tests run on chromium and mobile-chrome; the mouse tests run
+// on the desktop engines.
 
-/// A received message with no reactions, its popup open and at rest.
-async function openPopup(page: Page): Promise<Locator> {
+/// A received message with no reactions, its sheet open and at rest.
+async function openSheet(page: Page): Promise<Locator> {
   const row = await openRoomWithTarget(page);
   await openSheetFromReact(page, row);
   return row;
@@ -42,7 +41,7 @@ function handlePoint(page: Page): Promise<[number, number]> {
 test.use({ viewport: { width: 390, height: 760 } });
 
 test("the row shows no scroll bar and takes only sideways pans", async ({ page }) => {
-  await openPopup(page);
+  await openSheet(page);
   const g = await page.evaluate(() => {
     const row = document.querySelector("#mobile-message-sheet .mobile-reaction-palette") as HTMLElement;
     const css = (sel: string) => getComputedStyle(document.querySelector(sel)!);
@@ -61,7 +60,7 @@ test("the row shows no scroll bar and takes only sideways pans", async ({ page }
 
 test("with reduced motion it opens and closes without sliding", { tag: "@chromium-only" }, async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
-  const row = await openPopup(page);
+  const row = await openSheet(page);
   expect(await page.locator(`#${SHEET} .mobile-sheet-panel`).evaluate((p) => p.getAnimations().length), "no opening slide").toBe(0);
   await sheet(page).evaluate((d) => {
     const w = window as unknown as { __left: boolean };
@@ -74,11 +73,11 @@ test("with reduced motion it opens and closes without sliding", { tag: "@chromiu
   await expect(chips(row)).toHaveCount(0);
 });
 
-test.describe("A mouse on the reaction popup", () => {
+test.describe("A mouse on the message sheet", () => {
   test.skip(({ hasTouch }) => hasTouch, "a mouse drag, on the desktop engines");
 
   test("a mouse drag down closes it; a short or sideways one on the backdrop does not", async ({ page }) => {
-    const row = await openPopup(page);
+    const row = await openSheet(page);
     const [x, y] = await handlePoint(page);
     await page.mouse.move(x, y);
     await page.mouse.down();
@@ -115,7 +114,7 @@ test.describe("A mouse on the reaction popup", () => {
   });
 });
 
-test.describe("The reaction popup's opening slide", () => {
+test.describe("The message sheet's opening slide", () => {
   // `showModal()` focuses the first emoji while the slide still holds the
   // panel below the dialog. A dialog that can scroll is scrolled to reveal
   // it: WebKit kept that scroll for the whole slide, so the panel rose its
@@ -145,11 +144,11 @@ test.describe("The reaction popup's opening slide", () => {
   });
 });
 
-test.describe("A finger on the reaction popup", () => {
+test.describe("A finger on the message sheet", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "real touch input needs Chromium's input protocol");
 
   test("a slow drag down moves the panel with the finger, and springs back when let go short", async ({ page }) => {
-    const row = await openPopup(page);
+    const row = await openSheet(page);
     const [x, y] = await handlePoint(page);
     await withFingers(page, async (fingers) => {
       await fingers.press([1, x, y]);
@@ -166,7 +165,7 @@ test.describe("A finger on the reaction popup", () => {
   });
 
   test("dragged past the threshold it slides away and closes, reacting with nothing", async ({ page }) => {
-    const row = await openPopup(page);
+    const row = await openSheet(page);
     const [x, y] = await handlePoint(page);
     await withFingers(page, (fingers) => fingers.drag(x, y, 120));
     await expect(sheet(page)).toBeHidden();
@@ -175,7 +174,7 @@ test.describe("A finger on the reaction popup", () => {
   });
 
   test("a drag down that starts over the history drags it and closes it, and scrolls nothing", async ({ page }) => {
-    await openPopup(page);
+    await openSheet(page);
     const history = page.locator("#chat-scroll-container");
     const before = await history.evaluate((el) => el.scrollTop);
     const h = await historyPoint(page);
@@ -191,7 +190,7 @@ test.describe("A finger on the reaction popup", () => {
   });
 
   test("a drag down that starts on an emoji closes it without reacting", async ({ page }) => {
-    const row = await openPopup(page);
+    const row = await openSheet(page);
     const signs = await callRiverTest(page, "messageSignsRecorded");
     const [x, y] = await centreOf(palette(page).getByRole("button").nth(2));
     await withFingers(page, (fingers) => fingers.drag(x, y, 120));
@@ -212,7 +211,7 @@ test.describe("A finger on the reaction popup", () => {
   });
 
   test("dragging up never lifts it above its rest position", async ({ page }) => {
-    await openPopup(page);
+    await openSheet(page);
     const [x, y] = await handlePoint(page);
     expect(await panelBottomGap(page), "premise: at rest on the bottom edge").toBeLessThan(1);
     await withFingers(page, async (fingers) => {
@@ -231,7 +230,7 @@ test.describe("A finger on the reaction popup", () => {
   });
 
   test("a second finger cancels the drag", async ({ page }) => {
-    await openPopup(page);
+    await openSheet(page);
     const [x, y] = await handlePoint(page);
     await withFingers(page, async (fingers) => {
       await fingers.press([1, x, y]);
@@ -248,7 +247,7 @@ test.describe("A finger on the reaction popup", () => {
   });
 
   test("a sideways swipe on the row scrolls it, not the panel or the history, and is not a tap", async ({ page }) => {
-    const row = await openPopup(page);
+    const row = await openSheet(page);
     const history = page.locator("#chat-scroll-container");
     const before = await history.evaluate((el) => el.scrollTop);
     const box = (await palette(page).boundingBox())!;

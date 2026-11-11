@@ -251,7 +251,7 @@ export async function revealFooter(page: Page, row: Locator) {
 
 /// Click one of `row`'s footer controls by its test id, revealing it first.
 /// Below 48rem Reply, Edit and Delete are not in the footer: a tap on the
-/// row opens them in the actions sheet, and this goes that way.
+/// row opens them in the message sheet, and this goes that way.
 export async function clickFooter(page: Page, row: Locator, testid: string) {
   const sheetAction = SHEET_ACTIONS[testid];
   if (sheetAction && (await narrowLayout(page))) {
@@ -265,7 +265,7 @@ export async function clickFooter(page: Page, row: Locator, testid: string) {
 }
 
 /// Open `row`'s reaction choices through its footer React, the only way in:
-/// the anchored picker at 48rem and wider; below it, the reaction popup and
+/// the anchored picker at 48rem and wider; below it, the message sheet and
 /// its row of choices.
 export async function openInlinePicker(page: Page, row: Locator) {
   if (await narrowLayout(page)) {
@@ -294,15 +294,15 @@ export async function reactTo(page: Page, row: Locator): Promise<Locator> {
 }
 
 /// Below Tailwind's `md` (48rem), the query `main.css` and the app use: a
-/// row's Reply, Edit and Delete are in its actions sheet, its + opens the
-/// reaction popup.
+/// row's Reply, Edit and Delete are in its message sheet, which its + opens
+/// too.
 export function narrowLayout(page: Page): Promise<boolean> {
   return page.evaluate(() => window.matchMedia("not all and (min-width: 48rem)").matches);
 }
 
 /// A phone project's test of the desktop footer or the anchored reaction
 /// picker runs at a touch tablet's width: below 48rem a row's actions and
-/// reactions are the mobile sheet and popup instead. Keeps the height, and
+/// reactions are in the mobile message sheet instead. Keeps the height, and
 /// the device's touch input, so the wide coarse-pointer case stays covered.
 export async function asTouchTablet(page: Page) {
   const vp = page.viewportSize();

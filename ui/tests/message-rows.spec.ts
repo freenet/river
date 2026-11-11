@@ -753,7 +753,7 @@ test.describe("Message row hover band", () => {
   });
 
   // The narrowest width with a reactor list: below 48rem there is none, and
-  // the mobile message sheet lists who reacted (mobile-reaction-popup.spec.ts).
+  // the mobile message sheet lists who reacted (mobile-message-sheet.spec.ts).
   test.describe("at a narrow width", () => {
     test.use({ viewport: { width: 768, height: 800 } });
 
@@ -887,7 +887,7 @@ test.describe("Latest over row controls", () => {
   test("a row control aligned with Latest never takes its click", async ({ page }) => {
     const touch = await coarsePointer(page);
     // Touch: a tablet's width, where the cluster shows at rest (below 48rem
-    // it is in the actions sheet instead).
+    // it is in the message sheet instead).
     await page.setViewportSize(touch ? { width: 834, height: 800 } : { width: 1024, height: 800 });
     await openRoomWithComposer(page);
     const control = '[data-testid="message-action-cluster"]';

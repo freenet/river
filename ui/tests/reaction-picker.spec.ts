@@ -21,8 +21,8 @@ import { callRiverTest } from "./river-test";
 // wheel, a pinch) is not, arrivals are still followed, and closing lets go of
 // all of it.
 //
-// The picker exists from 48rem: below that a React opens the mobile reaction
-// popup instead (mobile-reaction-popup.spec.ts). So a phone project runs
+// The picker exists from 48rem: below that a React opens the mobile message
+// sheet instead (mobile-message-sheet.spec.ts). So a phone project runs
 // these at a touch tablet's width, keeping its touch input: the wide
 // coarse-pointer case.
 test.beforeEach(async ({ page }) => {
@@ -537,7 +537,7 @@ test.describe("The reaction picker", () => {
 
 test.describe("Reaction picker placement", () => {
   // The narrowest window the picker has (below 48rem a React opens the
-  // mobile popup). React is never at the window's left edge there, so the
+  // mobile sheet). React is never at the window's left edge there, so the
   // picker opens back from it, its right edge on React's.
   test.describe("at 768px", () => {
     test.use({ viewport: { width: 768, height: 700 } });
@@ -905,7 +905,7 @@ test.describe("While the reaction picker is open", () => {
     await expectClosed(page);
   });
 
-  // Below 48rem the React is the mobile popup's, so narrowing the window
+  // Below 48rem the React is the mobile sheet's, so narrowing the window
   // closes the picker outright and lets go of its hold; widening again
   // reopens nothing.
   test("narrowing the window below 48rem closes it, lets go of the wheel, and widening reopens nothing", { tag: "@chromium-only" }, async ({ page }) => {
@@ -918,7 +918,7 @@ test.describe("While the reaction picker is open", () => {
 
     await page.setViewportSize({ width: 390, height: 844 });
     await expectClosed(page);
-    await expect(row.getByTestId("message-react-button"), "now the popup's").toHaveAttribute("aria-controls", "mobile-message-sheet");
+    await expect(row.getByTestId("message-react-button"), "now the sheet's").toHaveAttribute("aria-controls", "mobile-message-sheet");
     const view = (await page.locator("#chat-scroll-container").boundingBox())!;
     const [x, y] = [view.x + 30, view.y + 30];
     expect(await wheelCancelled(page, x, y, false), "the wheel is not held").toBe(false);

@@ -1,5 +1,22 @@
 import { expect, Locator, Page, test } from "@playwright/test";
-import { asTouchTablet, centreOf, coarsePointer, holdChip, keyboardFocus, openInlinePicker, press, reactionChoices, selectRoom, settle, waitForApp, withFingers } from "./example-room";
+import {
+  asTouchTablet,
+  centreOf,
+  coarsePointer,
+  holdChip,
+  keyboardFocus,
+  openInlinePicker,
+  openRoomWithTarget,
+  openSheetFromReact,
+  palette,
+  press,
+  reactionChoices,
+  selectRoom,
+  settle,
+  sheet,
+  waitForApp,
+  withFingers,
+} from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -163,8 +180,9 @@ async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
 }
 
 // The reactor list exists at 48rem and wider: below it there is none, and the
-// mobile message sheet lists who reacted (mobile-reaction-popup.spec.ts).
-// So a phone project runs these at a touch tablet's width.
+// mobile message sheet lists who reacted (mobile-message-sheet.spec.ts).
+// So a phone project runs these at a touch tablet's width; the last block
+// goes back below 48rem.
 test.beforeEach(async ({ page }) => asTouchTablet(page));
 
 test.describe("Reaction owner list (#714)", () => {
@@ -477,7 +495,7 @@ async function expectOnScreen(page: Page, target: Locator) {
 // moving the history.
 test.describe("Reactor list and picker hand off", () => {
   // The anchored picker's hand-off, at a touch tablet's width (the file's
-  // beforeEach); mobile-reaction-popup.spec.ts has the mobile sheet's.
+  // beforeEach); mobile-message-sheet.spec.ts has the mobile sheet's.
   async function surfaces(page: Page) {
     return page.evaluate(() => ({
       picker: Array.from(document.querySelectorAll('[data-testid="message-react-button"][aria-expanded="true"]')).map(
@@ -585,5 +603,56 @@ test.describe("Reactor list and picker hand off", () => {
     await expect.poll(() => surfaces(page)).toEqual({ picker: [id], pickerOpen: true, owners: [] });
     await settle(page);
     expect(await historyScrollTop(page), "the history did not move").toBeCloseTo(parked, 0);
+  });
+});
+
+// Below 48rem a chip has no reactor list to open, by a hold or by
+// Shift+Enter: every press of it reacts.
+test.describe("Reaction chip below 48rem", () => {
+  // After the file's beforeEach, which widened a phone's viewport.
+  test.beforeEach(async ({ page }) => page.setViewportSize({ width: 390, height: 760 }));
+
+  test("a press reacts with its emoji and opens nothing: a tap toggles and switches, a held finger and Shift+Enter react too", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    const rowChips = row.getByTestId("reaction-chip");
+    await callRiverTest(page, "memberReactsToNewest", "🎉");
+    const party = rowChips.filter({ hasText: "🎉" });
+    await expect(party).toContainText("1");
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+
+    // No reaction of the reader's yet: the tap adds theirs to the chip.
+    await press(page, party);
+    await expect(party).toContainText("2");
+    await expect(sheet(page), "a chip never opens the sheet").toBeHidden();
+    await expect(page.getByTestId("reaction-owners"), "nor the reactor list").toHaveCount(0);
+
+    // The same chip again takes it back.
+    await press(page, party);
+    await expect(party).toContainText("1");
+
+    // Below 48rem a held finger is a tap once it lifts.
+    const lift = await holdChip(page, party);
+    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
+    await lift();
+    await expect(party).toContainText("2");
+    await expect(sheet(page)).toBeHidden();
+    await press(page, party);
+    await expect(party).toContainText("1");
+
+    // And no reactor list for Shift+Enter to open: it reacts, as Enter does.
+    await party.press("Shift+Enter");
+    await expect(party).toContainText("2");
+    await expect(page.getByTestId("reaction-owners")).toHaveCount(0);
+    await party.press("Enter");
+    await expect(party).toContainText("1");
+
+    // Reacted with another emoji: the tap moves the reaction to the chip's.
+    await openSheetFromReact(page, row);
+    await press(page, palette(page).getByRole("button", { name: "React with 👍" }));
+    await expect(rowChips).toHaveCount(2);
+    await press(page, party);
+    await expect(rowChips, "the 👍 left with the switch").toHaveCount(1);
+    await expect(party).toContainText("2");
+    await expect(sheet(page)).toBeHidden();
   });
 });
