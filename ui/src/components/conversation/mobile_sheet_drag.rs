@@ -3,7 +3,7 @@
 //! A pointer that goes down anywhere in the open dialog (the backdrop, the
 //! panel, an action, an emoji) and then moves further down than sideways drags the panel
 //! with it, by the distance moved, and fades the dim behind it. Released far
-//! enough or fast enough ([`release`]) the panel slides away and the sheet
+//! enough or fast enough ([`dismisses`]) the panel slides away and the sheet
 //! closes; otherwise it springs back. Upward it does not move: it never sits
 //! higher than at rest, fully visible on the bottom edge. A sideways move is left alone: on the emoji row the browser is
 //! already scrolling it (`touch-action: pan-x`, `main.css`). A second finger
@@ -35,23 +35,11 @@ const VELOCITY_WINDOW_MS: f64 = 100.0;
 /// A finger held still this long before it lifts released with no speed.
 const STILL_MS: f64 = 80.0;
 
-/// Which way a pointer set off, once it is past the tap slop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Axis {
-    Vertical,
-    Horizontal,
-}
-
-/// The way a pointer moved `(dx, dy)` from where it went down is going, or
-/// `None` while it is still a tap. A tie is sideways: scrolling the row wins.
-fn intent(dx: f64, dy: f64) -> Option<Axis> {
-    if dx.hypot(dy) <= TAP_SLOP_PX {
-        None
-    } else if dy.abs() > dx.abs() {
-        Some(Axis::Vertical)
-    } else {
-        Some(Axis::Horizontal)
-    }
+/// Whether a pointer moved `(dx, dy)` from where it went down is going up or
+/// down rather than sideways, or `None` while it is still a tap. A tie is
+/// sideways: scrolling the row wins.
+fn vertical(dx: f64, dy: f64) -> Option<bool> {
+    (dx.hypot(dy) > TAP_SLOP_PX).then_some(dy.abs() > dx.abs())
 }
 
 /// Where the panel sits for a pointer `dy` below where it went down: with
@@ -75,23 +63,13 @@ fn velocity(samples: &[(f64, f64)], released_at: f64) -> f64 {
     (y1 - y0) / (t1 - t0)
 }
 
-/// What a release does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Release {
-    Dismiss,
-    SpringBack,
-}
-
-/// A release with the panel `offset` px down, moving at `velocity` px/ms
-/// (down is positive), for a panel `panel_height` px tall.
-fn release(offset: f64, velocity: f64, panel_height: f64) -> Release {
+/// Whether a release with the panel `offset` px down, moving at `velocity`
+/// px/ms (down is positive), dismisses a panel `panel_height` px tall.
+/// Otherwise it springs back.
+fn dismisses(offset: f64, velocity: f64, panel_height: f64) -> bool {
     let far = offset >= MIN_DISMISS_PX.max(panel_height * DISMISS_FRACTION);
     let flick = offset >= MIN_FLICK_PX && velocity >= FLICK_PX_PER_MS;
-    if far || flick {
-        Release::Dismiss
-    } else {
-        Release::SpringBack
-    }
+    far || flick
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -101,7 +79,7 @@ pub(super) use self::dom::{animate_out, install, reset, Listeners};
 mod dom {
     use super::super::mobile_surface::dom::sheet;
     use super::super::reaction_picker::ReactionSurfaces;
-    use super::{intent, offset, release, velocity, Axis, Release, VELOCITY_WINDOW_MS};
+    use super::{dismisses, offset, velocity, vertical, VELOCITY_WINDOW_MS};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use wasm_bindgen::prelude::*;
@@ -112,7 +90,8 @@ mod dom {
         pointer: i32,
         x0: f64,
         y0: f64,
-        axis: Option<Axis>,
+        /// Past the tap slop, going up or down: it drags the panel.
+        dragging: bool,
         offset: f64,
         /// `(time, y)` over the last [`VELOCITY_WINDOW_MS`].
         samples: VecDeque<(f64, f64)>,
@@ -201,17 +180,13 @@ mod dom {
         let Some(dialog) = sheet() else {
             return;
         };
-        leave(&dialog, surfaces);
-    }
-
-    fn leave(dialog: &web_sys::HtmlElement, surfaces: ReactionSurfaces) {
-        let Some(token) = opening_token(dialog) else {
+        let Some(token) = opening_token(&dialog) else {
             return;
         };
         if dialog.class_list().contains(LEAVING) {
             return;
         }
-        let Some(panel) = panel(dialog).filter(|_| !reduced_motion()) else {
+        let Some(panel) = panel(&dialog).filter(|_| !reduced_motion()) else {
             close_later(surfaces, token);
             return;
         };
@@ -242,13 +217,9 @@ mod dom {
     pub(in super::super) fn reset() {
         GESTURE.with(|g| g.borrow_mut().take());
         SUPPRESS_CLICK.with(|s| s.set(false));
-        let Some(dialog) = sheet() else {
-            return;
-        };
-        let _ = dialog.class_list().remove_2(DRAGGING, LEAVING);
-        let _ = dialog.style().remove_property(SHADE);
-        if let Some(panel) = panel(&dialog) {
-            let _ = panel.style().remove_property("transform");
+        if let Some(dialog) = sheet() {
+            let _ = dialog.class_list().remove_1(LEAVING);
+            spring_back(&dialog);
         }
     }
 
@@ -281,7 +252,7 @@ mod dom {
             pointer: e.pointer_id(),
             x0: x,
             y0: y,
-            axis: None,
+            dragging: false,
             offset: 0.0,
             samples: VecDeque::from([(event.time_stamp(), y)]),
         };
@@ -307,20 +278,17 @@ mod dom {
             let mut slot = g.borrow_mut();
             let gesture = slot.as_mut().filter(|g| g.pointer == e.pointer_id())?;
             let (dx, dy) = (x - gesture.x0, y - gesture.y0);
-            if gesture.axis.is_none() {
-                match intent(dx, dy)? {
-                    Axis::Horizontal => {
-                        SUPPRESS_CLICK.with(|s| s.set(true));
-                        slot.take();
-                        return None;
-                    }
-                    Axis::Vertical => {
-                        gesture.axis = Some(Axis::Vertical);
-                        SUPPRESS_CLICK.with(|s| s.set(true));
-                        let _ = dialog.set_pointer_capture(gesture.pointer);
-                        let _ = dialog.class_list().add_1(DRAGGING);
-                    }
+            if !gesture.dragging {
+                let vertical = vertical(dx, dy)?;
+                SUPPRESS_CLICK.with(|s| s.set(true));
+                if !vertical {
+                    // Sideways: the row's own scrolling, not a drag.
+                    slot.take();
+                    return None;
                 }
+                gesture.dragging = true;
+                let _ = dialog.set_pointer_capture(gesture.pointer);
+                let _ = dialog.class_list().add_1(DRAGGING);
             }
             gesture.offset = offset(dy);
             gesture.samples.push_back((now, y));
@@ -347,16 +315,16 @@ mod dom {
         let Some(mut gesture) = take_gesture(e.pointer_id()) else {
             return;
         };
-        if gesture.axis != Some(Axis::Vertical) {
+        if !gesture.dragging {
             return;
         }
         let _ = dialog.release_pointer_capture(gesture.pointer);
-        let samples: Vec<_> = gesture.samples.drain(..).collect();
-        let speed = velocity(&samples, event.time_stamp());
+        let speed = velocity(gesture.samples.make_contiguous(), event.time_stamp());
         let height = panel(dialog).map_or(1.0, |p| f64::from(p.offset_height()));
-        match release(gesture.offset, speed, height) {
-            Release::Dismiss => leave(dialog, surfaces),
-            Release::SpringBack => spring_back(dialog),
+        if dismisses(gesture.offset, speed, height) {
+            animate_out(surfaces);
+        } else {
+            spring_back(dialog);
         }
     }
 
@@ -374,7 +342,7 @@ mod dom {
         if event.type_() == "lostpointercapture" && !on_dialog {
             return;
         }
-        if take_gesture(e.pointer_id()).is_some_and(|g| g.axis == Some(Axis::Vertical)) {
+        if take_gesture(e.pointer_id()).is_some_and(|g| g.dragging) {
             spring_back(dialog);
         }
     }
@@ -450,17 +418,17 @@ mod tests {
 
     #[test]
     fn a_move_inside_the_slop_is_still_a_tap() {
-        assert_eq!(intent(0.0, 0.0), None);
-        assert_eq!(intent(6.0, 6.0), None);
-        assert_eq!(intent(0.0, TAP_SLOP_PX), None);
+        assert_eq!(vertical(0.0, 0.0), None);
+        assert_eq!(vertical(6.0, 6.0), None);
+        assert_eq!(vertical(0.0, TAP_SLOP_PX), None);
     }
 
     #[test]
     fn past_the_slop_the_larger_move_decides_and_a_tie_scrolls() {
-        assert_eq!(intent(3.0, 20.0), Some(Axis::Vertical));
-        assert_eq!(intent(3.0, -20.0), Some(Axis::Vertical));
-        assert_eq!(intent(20.0, 3.0), Some(Axis::Horizontal));
-        assert_eq!(intent(-15.0, 15.0), Some(Axis::Horizontal));
+        assert_eq!(vertical(3.0, 20.0), Some(true));
+        assert_eq!(vertical(3.0, -20.0), Some(true));
+        assert_eq!(vertical(20.0, 3.0), Some(false));
+        assert_eq!(vertical(-15.0, 15.0), Some(false), "a tie");
     }
 
     #[test]
@@ -474,18 +442,18 @@ mod tests {
     #[test]
     fn a_release_far_enough_dismisses() {
         // A 90px panel: 40% is 36px, so the 48px floor decides.
-        assert_eq!(release(47.0, 0.1, 90.0), Release::SpringBack);
-        assert_eq!(release(48.0, 0.0, 90.0), Release::Dismiss);
+        assert!(!dismisses(47.0, 0.1, 90.0));
+        assert!(dismisses(48.0, 0.0, 90.0));
         // A 200px panel: 40% (80px) decides.
-        assert_eq!(release(79.0, 0.0, 200.0), Release::SpringBack);
-        assert_eq!(release(80.0, 0.0, 200.0), Release::Dismiss);
+        assert!(!dismisses(79.0, 0.0, 200.0));
+        assert!(dismisses(80.0, 0.0, 200.0));
     }
 
     #[test]
     fn a_flick_dismisses_once_it_has_moved_a_little() {
-        assert_eq!(release(20.0, 0.6, 90.0), Release::Dismiss);
-        assert_eq!(release(20.0, 0.4, 90.0), Release::SpringBack);
-        assert_eq!(release(10.0, 2.0, 90.0), Release::SpringBack);
+        assert!(dismisses(20.0, 0.6, 90.0));
+        assert!(!dismisses(20.0, 0.4, 90.0));
+        assert!(!dismisses(10.0, 2.0, 90.0));
     }
 
     #[test]
@@ -512,6 +480,6 @@ mod tests {
 
     #[test]
     fn upward_never_dismisses() {
-        assert_eq!(release(-20.0, -3.0, 90.0), Release::SpringBack);
+        assert!(!dismisses(-20.0, -3.0, 90.0));
     }
 }
