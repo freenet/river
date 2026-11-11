@@ -213,11 +213,10 @@ impl ReactionSurfaces {
         let mut slot = self.mobile;
         slot.set(Some(opening));
         dom::hold_background(true);
-        dom::track_viewport(true);
     }
 
-    /// Close the open mobile surface and let go of what it held: the dialog,
-    /// the input hold and the viewport tracking, then its state.
+    /// Close the open mobile surface and let go of what it held: the dialog
+    /// and the input hold, then its state.
     /// An ordinary dismissal (`restore`) returns focus, without scrolling, to
     /// the row's control it opened from if that is still live; a handoff
     /// (Reply, Edit, Delete) leaves focus to where it goes. Nothing is open
@@ -228,7 +227,6 @@ impl ReactionSurfaces {
         let open = self.mobile_opening();
         dom::close_dialog();
         dom::hold_background(false);
-        dom::track_viewport(false);
         let Some(open) = open else {
             return;
         };
@@ -388,10 +386,7 @@ pub(super) fn MobileSurfaceGuard(
         }
     }
     // Unmounted open: nothing held outlives it.
-    use_drop(|| {
-        dom::hold_background(false);
-        dom::track_viewport(false);
-    });
+    use_drop(|| dom::hold_background(false));
     rsx! {}
 }
 
@@ -534,9 +529,9 @@ pub(super) mod dom {
         let Some(dialog) = sheet() else {
             return false;
         };
-        let Ok(list) = dialog.query_selector_all(
-            "button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex=\"-1\"])",
-        ) else {
+        let Ok(list) =
+            dialog.query_selector_all("button:not([disabled]), [tabindex]:not([tabindex=\"-1\"])")
+        else {
             return false;
         };
         let controls: Vec<web_sys::HtmlElement> = (0..list.length())
@@ -573,15 +568,13 @@ pub(super) mod dom {
 
     thread_local! {
         static BLOCKER: RefCell<Option<Blocker>> = const { RefCell::new(None) };
-        static VIEWPORT: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
     }
 
     const HELD_KINDS: [&str; 2] = ["wheel", "touchmove"];
 
     /// Hold the reader's wheel and one-finger touch scrolling outside the
     /// open surface's panel, so the history behind it stays put while the
-    /// panel itself scrolls and its field takes selections. A zoom is let
-    /// through: a wheel with Ctrl down (Ctrl+wheel, a touchpad pinch) and a
+    /// panel itself scrolls. A zoom is let through: a wheel with Ctrl down (Ctrl+wheel, a touchpad pinch) and a
     /// touch with more than one finger. Nothing is captured, so turning it
     /// off is only removing the listeners; one left behind holds nothing
     /// while no surface is open.
@@ -657,87 +650,6 @@ pub(super) mod dom {
             .is_some_and(web_sys::MouseEvent::ctrl_key)
     }
 
-    /// While a surface is open, follow the visual viewport: the software
-    /// keyboard (and a pinch zoom) shrinks it without shrinking the layout
-    /// viewport the dialog is laid out in, so the panel is lifted by the part
-    /// of the layout viewport the visual one no longer covers
-    /// (`--mobile-sheet-keyboard`) and capped to the visual height
-    /// (`--mobile-sheet-viewport`). A browser without `visualViewport`
-    /// keeps the CSS fallbacks.
-    pub(super) fn track_viewport(on: bool) {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let Ok(viewport) = js_sys::Reflect::get(&window, &"visualViewport".into()) else {
-            return;
-        };
-        if viewport.is_undefined() || viewport.is_null() {
-            return;
-        }
-        let target: web_sys::EventTarget = viewport.unchecked_into();
-        VIEWPORT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if on {
-                if slot.is_some() {
-                    return;
-                }
-                let update = Closure::<dyn FnMut()>::new(update_viewport);
-                for kind in ["resize", "scroll"] {
-                    let _ = target
-                        .add_event_listener_with_callback(kind, update.as_ref().unchecked_ref());
-                }
-                *slot = Some(update);
-                update_viewport();
-            } else if let Some(update) = slot.take() {
-                for kind in ["resize", "scroll"] {
-                    let _ = target
-                        .remove_event_listener_with_callback(kind, update.as_ref().unchecked_ref());
-                }
-                if let Some(root) = document().and_then(|d| d.document_element()) {
-                    if let Ok(root) = root.dyn_into::<web_sys::HtmlElement>() {
-                        let _ = root.style().remove_property("--mobile-sheet-keyboard");
-                        let _ = root.style().remove_property("--mobile-sheet-viewport");
-                    }
-                }
-            }
-        });
-    }
-
-    fn update_viewport() {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let number = |object: &JsValue, key: &str| {
-            js_sys::Reflect::get(object, &key.into())
-                .ok()
-                .and_then(|v| v.as_f64())
-        };
-        let Ok(viewport) = js_sys::Reflect::get(&window, &"visualViewport".into()) else {
-            return;
-        };
-        let (Some(height), Some(offset_top)) =
-            (number(&viewport, "height"), number(&viewport, "offsetTop"))
-        else {
-            return;
-        };
-        let Some(layout_height) = window.inner_height().ok().and_then(|h| h.as_f64()) else {
-            return;
-        };
-        let keyboard = (layout_height - height - offset_top).max(0.0);
-        let Some(root) = document()
-            .and_then(|d| d.document_element())
-            .and_then(|r| r.dyn_into::<web_sys::HtmlElement>().ok())
-        else {
-            return;
-        };
-        let _ = root
-            .style()
-            .set_property("--mobile-sheet-keyboard", &format!("{keyboard}px"));
-        let _ = root
-            .style()
-            .set_property("--mobile-sheet-viewport", &format!("{height}px"));
-    }
-
     /// Listen for the dialog closing by itself (Escape), for as long as the
     /// returned closure lives. `on_close` runs from the listener; it defers
     /// any signal write.
@@ -769,7 +681,6 @@ pub(super) mod dom {
     pub(in super::super) fn focus_in(_selectors: &[&str]) {}
     pub(in super::super) fn mark_opened_by(_pointer: bool) {}
     pub(super) fn hold_background(_on: bool) {}
-    pub(super) fn track_viewport(_on: bool) {}
 }
 
 #[cfg(test)]

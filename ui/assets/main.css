@@ -535,10 +535,9 @@
  * viewport, transparent, so a tap outside the panel lands on the backdrop
  * inside it, which slides the panel away; `::backdrop` dims. Neither has a
  * title or Close button. Its panel sits at the bottom
- * with modest side spacing, rounded top corners and safe-area padding, lifted
- * above the software keyboard and capped to the visible height while open
- * (the two custom properties, set from `visualViewport`; `dvh` is only the
- * fallback, since the keyboard does not shrink it on every browser). A
+ * with modest side spacing, rounded top corners and safe-area padding, capped
+ * to the viewport's height (`dvh`; `vh` for a browser without it). It has no
+ * field, so the software keyboard never comes up under it. A
  * wheel scrolls it when it does not fit; scrolling it never scrolls the page.
  *
  * It slides up when it opens and can be dragged down from anywhere
@@ -590,11 +589,11 @@
     position: absolute;
     left: 8px;
     right: 8px;
-    bottom: var(--mobile-sheet-keyboard, 0px);
+    bottom: 0;
     max-width: 32rem;
     margin-inline: auto;
     max-height: calc(100vh - 16px);
-    max-height: calc(var(--mobile-sheet-viewport, 100dvh) - 16px);
+    max-height: calc(100dvh - 16px);
     overflow-y: auto;
     overscroll-behavior: contain;
     padding: 6px 12px max(12px, env(safe-area-inset-bottom));

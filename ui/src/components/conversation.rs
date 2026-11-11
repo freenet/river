@@ -4133,7 +4133,7 @@ fn MessageGroupComponent(
                     // Closed because the picker or a mobile surface opened
                     // (React from the keyboard, a tap below 48rem): focus
                     // stays where the reader put it, never pulled out of the
-                    // surface (or its field, which would close the keyboard).
+                    // surface.
                     if reaction_picker_is_open() || mobile_surface_is_open() {
                         return;
                     }
