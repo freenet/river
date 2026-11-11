@@ -239,6 +239,10 @@ test.describe("Reaction owner list (#714)", () => {
     await pressChip(crab);
     await expect(crab, "and gives it back").toContainText("1");
     await expect(owners).toHaveCount(0);
+    expect(
+      await crab.evaluate((el) => getComputedStyle(el).cursor),
+      "someone else's chip is pressable too"
+    ).toBe("pointer");
 
     const added = await addOwnReaction(page);
     await removeOwnReaction(page, added);
@@ -368,6 +372,7 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await own.focus();
     await own.press("Shift+Enter");
     await expect(owners).toBeVisible();
+    await expect(own, "the row's band keys on it").toHaveAttribute("aria-expanded", "true");
     await expect(owners.getByTestId("reaction-remove")).toBeVisible();
     await expect(owners).toBeFocused();
     await expect(
@@ -409,8 +414,13 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
     await expect(crab).toContainText("2");
     await expect(owners).toHaveCount(0);
     await expect(crab).toBeFocused();
+    // A toggle, not a button that opens a dialog.
+    await expect(crab).toHaveAttribute("aria-pressed", "true");
+    await expect(crab).not.toHaveAttribute("aria-haspopup");
+    await expect(crab).not.toHaveAttribute("aria-expanded");
     await page.keyboard.press("Space");
     await expect(crab).toContainText("1");
+    await expect(crab).toHaveAttribute("aria-pressed", "false");
 
     // The reader's only chip leaves with the reaction: focus goes to the +.
     const sole = await addOwnReaction(page);

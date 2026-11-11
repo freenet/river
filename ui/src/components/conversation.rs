@@ -4887,16 +4887,19 @@ fn MessageGroupComponent(
                                                                     "data-testid": "reaction-chip",
                                                                     role: "button",
                                                                     tabindex: "0",
-                                                                    "aria-expanded": if owners_open { "true" } else { "false" },
-                                                                    "aria-haspopup": "dialog",
+                                                                    // A toggle: a press reacts with this emoji.
+                                                                    "aria-pressed": if is_user_reaction { "true" } else { "false" },
+                                                                    // Only while its list is open: the row's band
+                                                                    // keys on it (main.css).
+                                                                    "aria-expanded": owners_open.then_some("true"),
                                                                     // A pill; your own reaction is the link
                                                                     // colour on the soft accent, like a mention.
                                                                     class: format!(
-                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold select-none [-webkit-touch-callout:none] {}",
+                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold cursor-pointer select-none [-webkit-touch-callout:none] {}",
                                                                         if is_user_reaction {
-                                                                            "cursor-pointer border-[color-mix(in_srgb,var(--color-link)_50%,transparent)] bg-accent-soft text-link"
+                                                                            "border-[color-mix(in_srgb,var(--color-link)_50%,transparent)] bg-accent-soft text-link"
                                                                         } else {
-                                                                            "cursor-default border-border bg-rail text-text-secondary"
+                                                                            "border-border bg-rail text-text-secondary"
                                                                         }
                                                                     ),
                                                                     title: "{tooltip}",

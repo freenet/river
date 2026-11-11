@@ -307,8 +307,13 @@ test.describe("The mobile reaction popup", () => {
     await expect(chip).toContainText("2");
     await expect(popup(page)).toBeHidden();
     await expect(chip, "focus stays on the chip").toBeFocused();
+    // A toggle, not a button that opens a dialog.
+    await expect(chip).toHaveAttribute("aria-pressed", "true");
+    await expect(chip).not.toHaveAttribute("aria-haspopup");
+    await expect(chip).not.toHaveAttribute("aria-expanded");
     await page.keyboard.press("Space");
     await expect(chip).toContainText("1");
+    await expect(chip).toHaveAttribute("aria-pressed", "false");
     // No reactor list below 48rem: with Shift it still reacts.
     await page.keyboard.press("Shift+Enter");
     await expect(chip).toContainText("2");
