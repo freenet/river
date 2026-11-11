@@ -89,8 +89,9 @@ pub(super) fn MobileMessageSheet(
     let current = target.and_then(|t| t.current.clone());
     let reactions = target.map(|t| t.reactions.clone()).unwrap_or_default();
     let target_row = target.map(|t| t.row.clone()).unwrap_or_default();
-    // The drag reads it from the DOM, so a slide away closes only the
-    // opening it began on.
+    // The opening this render shows (0: none, which no opening has). A
+    // choice made in it is for that opening; the drag reads it from the DOM,
+    // so a slide away closes only the opening it began on.
     let token = opening.as_ref().map_or(0, |o| o.token);
     // Show the sheet once per opening, after the render that filled it, and
     // focus the first of `FOCUS` that matches: a button, so never the
@@ -125,27 +126,23 @@ pub(super) fn MobileMessageSheet(
     // An emoji reacts, focus back on what the sheet opened from.
     let pick = move |emoji: String| {
         move |_| {
-            if let Some(token) = surfaces.mobile_token() {
-                let emoji = emoji.clone();
-                crate::util::defer(move || {
-                    if let Some(opening) = surfaces.take_mobile(token, true) {
-                        on_react.call((opening.target.message, emoji));
-                    }
-                });
-            }
+            let emoji = emoji.clone();
+            crate::util::defer(move || {
+                if let Some(opening) = surfaces.take_mobile(token, true) {
+                    on_react.call((opening.target.message, emoji));
+                }
+            });
         }
     };
     // An action is handed to `Conversation`, which checks it against the
     // room as it is now; its destination takes focus.
     let action = move |action: MobileAction| {
         move |_| {
-            if let Some(token) = surfaces.mobile_token() {
-                crate::util::defer(move || {
-                    if let Some(opening) = surfaces.take_mobile(token, false) {
-                        on_action.call((action, opening.target.row, opening.target.message));
-                    }
-                });
-            }
+            crate::util::defer(move || {
+                if let Some(opening) = surfaces.take_mobile(token, false) {
+                    on_action.call((action, opening.target.row, opening.target.message));
+                }
+            });
         }
     };
     rsx! {

@@ -291,12 +291,6 @@ impl ReactionSurfaces {
     fn mobile_opening_for(self, token: u64) -> Option<MobileOpening> {
         self.mobile_opening().filter(|o| o.token == token)
     }
-
-    /// The open opening's token, now. Taken by a press, which queues work
-    /// for that opening only.
-    pub(super) fn mobile_token(self) -> Option<u64> {
-        self.mobile_opening().map(|o| o.token)
-    }
 }
 
 /// Whether the window is below 48rem now. The authority for a press, which
