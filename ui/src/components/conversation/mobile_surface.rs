@@ -272,8 +272,7 @@ impl ReactionSurfaces {
     /// opening in one task). From a deferred callback only.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(super) fn mobile_dialog_closed(self) {
-        let open = self.mobile_opening();
-        if open.is_some() && !dom::dialog_open() {
+        if !dom::dialog_open() {
             self.close_mobile(true);
         }
     }
@@ -283,21 +282,9 @@ impl ReactionSurfaces {
     /// only remounted: it stays open, and focus returns to the new control
     /// when it closes. Otherwise it closes, silently.
     pub(super) fn mobile_control_unmounting(self, row: &str) {
-        let Some(token) = self
-            .mobile_opening()
-            .filter(|o| o.is_for(row))
-            .map(|o| o.token)
-        else {
-            return;
-        };
-        crate::util::defer(move || {
-            if self
-                .mobile_opening_for(token)
-                .is_some_and(|o| !opening_is_live(&o))
-            {
-                self.close_mobile(false);
-            }
-        });
+        if self.mobile_opening().is_some_and(|o| o.is_for(row)) {
+            crate::util::defer(move || self.close_mobile_if_stale());
+        }
     }
 
     /// The open opening, if `token` is it. Read when queued work runs.
@@ -436,16 +423,13 @@ pub(super) mod dom {
         }
     }
 
-    /// Show the dialog as a modal. A browser without `showModal` (or one
-    /// that throws) gets it shown in place instead, still usable. Whether it
-    /// is open.
+    /// Show the closed dialog as a modal. A browser without `showModal` (or
+    /// one that throws) gets it shown in place instead, still usable. Whether
+    /// it is open.
     pub(in super::super) fn show_dialog() -> bool {
         let Some(dialog) = sheet() else {
             return false;
         };
-        if dialog.has_attribute("open") {
-            return true;
-        }
         let shown = js_sys::Reflect::get(&dialog, &"showModal".into())
             .ok()
             .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
@@ -585,7 +569,7 @@ pub(super) mod dom {
     }
 
     fn on_held_input(event: web_sys::Event) {
-        if !super::any_open() {
+        if !dialog_open() {
             return;
         }
         let in_panel = event

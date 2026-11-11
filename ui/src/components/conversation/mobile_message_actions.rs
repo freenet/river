@@ -46,7 +46,6 @@ const EXCLUDED: &str = "a, button, input, textarea, select, option, label, summa
 /// A press on a message row, kept for the click it may become. Not a signal:
 /// nothing renders from it.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 struct RowPress {
     row: String,
     pointer: i32,
@@ -121,7 +120,7 @@ pub(super) struct RowTarget {
 
 /// Whether a click came from a pointer (a tap or a mouse click) rather than
 /// a key: a key's activation click has `detail` 0.
-pub(super) fn pointer_click(e: &MouseEvent) -> bool {
+fn pointer_click(e: &MouseEvent) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
         e.data()
@@ -135,32 +134,25 @@ pub(super) fn pointer_click(e: &MouseEvent) -> bool {
     }
 }
 
-/// Open the sheet for `target`, from `origin`'s handler, by a pointer or not
-/// ([`pointer_click`]). The opening is committed deferred.
+/// Open the sheet for `target`, from the handler of `origin`'s click `e`. The
+/// opening is committed deferred.
 pub(super) fn open_sheet(
     surfaces: ReactionSurfaces,
     target: RowTarget,
     origin: Origin,
-    by_pointer: bool,
+    e: &MouseEvent,
 ) {
-    let opening = MobileOpening::new(target, origin, by_pointer);
+    let opening = MobileOpening::new(target, origin, pointer_click(e));
     crate::util::defer(move || surfaces.open_mobile(opening));
 }
 
 /// A click on `target`'s row, from its handler: opens its sheet at once, or
-/// not at all ([`row_tap`]). A row being edited opens nothing.
-pub(super) fn row_clicked(
-    surfaces: ReactionSurfaces,
-    e: &MouseEvent,
-    target: RowTarget,
-    editing: bool,
-) {
-    // Always consumes the press, an editing row's too.
-    let tap = row_tap(e, &target.row);
-    if editing || !tap {
-        return;
+/// not at all ([`row_tap`]). A row being edited has no entry, so nothing
+/// opens for it (`opening_is_live`).
+pub(super) fn row_clicked(surfaces: ReactionSurfaces, e: &MouseEvent, target: RowTarget) {
+    if row_tap(e, &target.row) {
+        open_sheet(surfaces, target, Origin::Entry, e);
     }
-    open_sheet(surfaces, target, Origin::Entry, pointer_click(e));
 }
 
 /// Whether a non-empty text selection touches the row `row_el`.
@@ -320,7 +312,7 @@ pub(super) fn MobileActionsEntry(
             "aria-controls": SHEET_ID,
             "aria-expanded": "{expanded}",
             onclick: move |e: MouseEvent| {
-                open_sheet(surfaces, target.clone(), Origin::Entry, pointer_click(&e));
+                open_sheet(surfaces, target.clone(), Origin::Entry, &e);
             },
             "Options"
         }

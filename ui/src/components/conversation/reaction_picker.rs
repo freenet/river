@@ -43,7 +43,7 @@
 //! reactor list and the sheet is open (`mobile_surface.rs`).
 
 use super::emoji_picker::FREQUENT_EMOJIS;
-use super::mobile_message_actions::{open_sheet, pointer_click, RowTarget};
+use super::mobile_message_actions::{open_sheet, RowTarget};
 use super::mobile_surface::{narrow_for_render, narrow_now, MobileOpening, Origin, SHEET_ID};
 use super::{now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW};
@@ -383,7 +383,7 @@ pub(super) fn ReactionInvoker(
                 let activation = next_activation();
                 // Below 48rem, decided now: the sheet, never the picker.
                 if narrow_now() {
-                    open_sheet(surfaces, target.clone(), Origin::React, pointer_click(&e));
+                    open_sheet(surfaces, target.clone(), Origin::React, &e);
                     return;
                 }
                 // A pointer press on React while its picker is open closes

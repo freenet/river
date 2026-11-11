@@ -3573,7 +3573,6 @@ type PressRecord = Rc<std::cell::RefCell<Option<(String, f64)>>>;
 const PRESS_FRESH_MS: f64 = 1500.0;
 
 /// How far a press may wander and still be a tap, in CSS px.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const TAP_SLOP_PX: f64 = 10.0;
 
 /// Monotonic milliseconds (`performance.now()`), so a wall-clock change
@@ -3624,9 +3623,9 @@ fn shift_lists_reactors(narrow: bool, shift: bool) -> bool {
 /// Not a signal: nothing renders from it.
 #[derive(Default)]
 struct ChipHold {
-    /// The press being timed: its chip, and a generation that a later press
-    /// outdates.
-    pending: Option<(String, u32)>,
+    /// The chip of the press being timed.
+    pending: Option<String>,
+    /// That press, which a later press outdates.
     generation: u32,
     /// The chip whose hold opened the list. The click its lift sends is not
     /// a press, wherever it lands: on the chip, or on the list's backdrop,
@@ -3644,7 +3643,7 @@ impl ChipHold {
         if narrow || !matches!(pointer_type, "touch" | "pen") {
             return None;
         }
-        self.pending = Some((key.to_string(), self.generation));
+        self.pending = Some(key.to_string());
         Some(self.generation)
     }
 
@@ -3656,16 +3655,12 @@ impl ChipHold {
     /// The timer for `generation` ran out. The chip whose list opens, if
     /// that press is still down.
     fn fire(&mut self, generation: u32) -> Option<String> {
-        match self.pending.take() {
-            Some((key, pending)) if pending == generation => {
-                self.held = Some(key.clone());
-                Some(key)
-            }
-            other => {
-                self.pending = other;
-                None
-            }
+        if self.generation != generation {
+            return None;
         }
+        let key = self.pending.take()?;
+        self.held = Some(key.clone());
+        Some(key)
     }
 
     /// The pointer lifted. If its hold opened the list, the generation to
@@ -4296,7 +4291,6 @@ fn MessageGroupComponent(
                                         reactions,
                                         &e,
                                         tap_target.clone(),
-                                        row_editing,
                                     );
                                 },
                                 div {

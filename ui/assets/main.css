@@ -534,9 +534,9 @@
  * The dialog itself spans the viewport, transparent, so a tap outside the
  * panel lands on the backdrop inside it, which slides the panel away;
  * `::backdrop` dims. Its panel sits at the bottom with modest side spacing,
- * rounded top corners and safe-area padding, capped to the viewport's height
- * (`dvh`; `vh` for a browser without it). A wheel scrolls it when it does not
- * fit; scrolling it never scrolls the page.
+ * rounded top corners and safe-area padding, capped to the viewport's height.
+ * A wheel scrolls it when it does not fit; scrolling it never scrolls the
+ * page.
  *
  * It slides up when it opens and can be dragged down from anywhere
  * (`mobile_sheet_drag.rs`): the backdrop and panel take no pan
@@ -561,9 +561,7 @@
     color: var(--color-text);
     /* `clip`, not `hidden`: a `hidden` box can still be scrolled, and the
      * browser scrolls it to reveal the control `showModal()` focuses while
-     * the opening slide holds the panel below the dialog. `hidden` stays for
-     * a browser without `clip`. */
-    overflow: hidden;
+     * the opening slide holds the panel below the dialog. */
     overflow: clip;
 }
 
@@ -587,7 +585,6 @@
     bottom: 0;
     max-width: 32rem;
     margin-inline: auto;
-    max-height: calc(100vh - 16px);
     max-height: calc(100dvh - 16px);
     overflow-y: auto;
     overscroll-behavior: contain;
