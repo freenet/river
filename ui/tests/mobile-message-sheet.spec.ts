@@ -747,9 +747,11 @@ test.describe("Reacting from the message sheet", () => {
     await openSheetFromReact(page, row);
     await expect(choices(page).first()).toBeFocused();
     expect(await outline(), "no ring that reads as the current reaction").toBe("none");
-    // Any key in it: the reader is on the keyboard now.
+    // Any key in it: the reader is on the keyboard now. Read from the
+    // attribute the rule keys on: Firefox does not turn a lone modifier into
+    // `:focus-visible`, so the ring itself is not the same on every engine.
     await page.keyboard.press("Shift");
-    await expect.poll(outline, { message: "a key press shows the ring" }).not.toBe("none");
+    await expect(sheet(page)).toHaveAttribute("data-opened-by", "keyboard");
     await page.keyboard.press("Escape");
     await expect(sheet(page)).toBeHidden();
 
