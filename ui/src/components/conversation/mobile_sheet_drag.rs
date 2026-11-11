@@ -18,7 +18,8 @@
 //! The listeners touch only the DOM and the thread-locals here. The one state
 //! change, the close, is deferred (dioxus-signal-safety.md) and names the
 //! opening it is for, read from the dialog's `data-opening`, so it never
-//! closes a later one.
+//! closes a later one. The dialog's `close` listener (Escape) is installed
+//! and removed with them ([`install`]).
 
 // Natively only the tests use the decision functions (the DOM is wasm-only).
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -373,7 +374,8 @@ mod dom {
         }
     }
 
-    /// Listen for drags on the dialog, for as long as the result lives.
+    /// The dialog's listeners, for as long as the result lives: its drags,
+    /// and its closing by itself (Escape), after which the state follows.
     pub(in super::super) fn install(surfaces: ReactionSurfaces) -> Option<Listeners> {
         let dialog = sheet()?;
         let window: web_sys::EventTarget = web_sys::window()?.into();
@@ -386,13 +388,22 @@ mod dom {
             Listener::new(move |event: web_sys::Event| on_up(&dialog, event, surfaces))
         };
         let click = Listener::new(on_click);
+        let close = Listener::new(move |_| {
+            crate::util::defer(move || surfaces.mobile_dialog_closed());
+        });
         let target: web_sys::EventTarget = dialog.clone().into();
         let added = vec![
             (target.clone(), "pointerdown", on_dialog(on_down), false),
             (target.clone(), "pointermove", on_dialog(on_move), false),
             (target.clone(), "pointerup", up, false),
             (target.clone(), "pointercancel", on_dialog(on_cancel), false),
-            (target, "lostpointercapture", on_dialog(on_cancel), false),
+            (
+                target.clone(),
+                "lostpointercapture",
+                on_dialog(on_cancel),
+                false,
+            ),
+            (target, "close", close, false),
             // On the window, capturing: before any handler in the page.
             (window, "click", click, true),
         ];

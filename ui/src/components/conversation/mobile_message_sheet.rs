@@ -112,19 +112,12 @@ pub(super) fn MobileMessageSheet(
             dom::focus_in(FOCUS);
         }
     });
-    // The drag's listeners, for as long as the sheet lives.
+    // The dialog's listeners (its drags, and its closing by itself), for as
+    // long as the sheet lives.
     #[cfg(target_arch = "wasm32")]
-    let drag_listeners = use_hook(|| {
+    let listeners = use_hook(|| {
         Rc::new(std::cell::RefCell::new(
             None::<super::mobile_sheet_drag::Listeners>,
-        ))
-    });
-    // The dialog closing by itself (Escape): the state follows. The listener
-    // lives as long as the sheet.
-    #[cfg(target_arch = "wasm32")]
-    let close_listener = use_hook(|| {
-        Rc::new(std::cell::RefCell::new(
-            None::<wasm_bindgen::closure::Closure<dyn FnMut()>>,
         ))
     });
     // A choice acts deferred, for the opening it was made in and only if
@@ -166,11 +159,7 @@ pub(super) fn MobileMessageSheet(
             onmounted: move |_| {
                 #[cfg(target_arch = "wasm32")]
                 {
-                    let listener = dom::on_dialog_close(move || {
-                        crate::util::defer(move || surfaces.mobile_dialog_closed());
-                    });
-                    *close_listener.borrow_mut() = listener;
-                    *drag_listeners.borrow_mut() = super::mobile_sheet_drag::install(surfaces);
+                    *listeners.borrow_mut() = super::mobile_sheet_drag::install(surfaces);
                 }
             },
             onkeydown: move |e: KeyboardEvent| {

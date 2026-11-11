@@ -631,19 +631,6 @@ pub(super) mod dom {
             .dyn_ref::<web_sys::MouseEvent>()
             .is_some_and(web_sys::MouseEvent::ctrl_key)
     }
-
-    /// Listen for the dialog closing by itself (Escape), for as long as the
-    /// returned closure lives. `on_close` runs from the listener; it defers
-    /// any signal write.
-    pub(in super::super) fn on_dialog_close(
-        on_close: impl FnMut() + 'static,
-    ) -> Option<Closure<dyn FnMut()>> {
-        let listener = Closure::<dyn FnMut()>::new(on_close);
-        sheet()?
-            .add_event_listener_with_callback("close", listener.as_ref().unchecked_ref())
-            .ok()?;
-        Some(listener)
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
