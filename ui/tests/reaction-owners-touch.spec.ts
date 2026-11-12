@@ -675,3 +675,22 @@ test.describe("Reaction chip held while its group remounts", { tag: "@chromium-o
     await expect(chip, "the page is alive: a press reacts").toContainText("2");
   });
 });
+
+test.describe("Reactor list across 48rem", () => {
+  test("narrowing below 48rem closes an open list, and widening does not bring it back", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+    const chip = await signedChip(page);
+    const owners = page.getByTestId("reaction-owners");
+    await chip.press("Shift+Enter");
+    await expect(owners).toBeVisible();
+    const { width, height } = page.viewportSize()!;
+    await page.setViewportSize({ width: 390, height });
+    await expect(owners, "below 48rem there is no list").toHaveCount(0);
+    await page.setViewportSize({ width, height });
+    await settle(page);
+    await expect(owners, "nothing reopens it").toHaveCount(0);
+  });
+});

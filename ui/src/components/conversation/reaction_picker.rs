@@ -521,12 +521,16 @@ pub(super) fn ReactionPicker(
         }
     }
     // The window crossing below 48rem turns every React into the mobile
-    // sheet's: an open picker closes, letting go of its hold and anchor, and
-    // nothing reopens it on the way back.
+    // sheet's and leaves the chips no reactor list: an open picker closes,
+    // letting go of its hold and anchor, an open list closes, and nothing
+    // reopens either on the way back.
     let narrow = narrow_for_render();
     let was_narrow = use_hook(|| Rc::new(Cell::new(narrow)));
     if was_narrow.replace(narrow) != narrow && narrow {
-        crate::util::defer(move || surfaces.close());
+        crate::util::defer(move || {
+            surfaces.close();
+            surfaces.close_owner_list_now();
+        });
     }
     // Unmounted open: nothing held or captured outlives it.
     use_drop(|| {

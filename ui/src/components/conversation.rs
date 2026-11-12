@@ -3652,13 +3652,17 @@ impl ChipHold {
         self.pending = None;
     }
 
-    /// The timer for `generation` ran out. The chip whose list opens, if
-    /// that press is still down.
-    fn fire(&mut self, generation: u32) -> Option<String> {
+    /// The timer for `generation` ran out, the window `narrow` or not by
+    /// now. The chip whose list opens, if that press is still down and the
+    /// window is still 48rem or wider.
+    fn fire(&mut self, generation: u32, narrow: bool) -> Option<String> {
         if self.generation != generation {
             return None;
         }
         let key = self.pending.take()?;
+        if narrow {
+            return None;
+        }
         self.held = Some(key.clone());
         Some(key)
     }
@@ -4889,7 +4893,8 @@ fn MessageGroupComponent(
                                                                             let Some(chip) = chip.filter(|chip| chip.is_connected()) else {
                                                                                 return;
                                                                             };
-                                                                            let Some(key) = hold.borrow_mut().fire(generation) else {
+                                                                            let fired = hold.borrow_mut().fire(generation, mobile_surface::narrow_now());
+                                                                            let Some(key) = fired else {
                                                                                 return;
                                                                             };
                                                                             let (x, y) = centre_of(&chip);
@@ -5089,7 +5094,7 @@ mod tests {
     fn chip_hold_that_fires_swallows_its_own_release_once() {
         let mut hold = ChipHold::default();
         let generation = hold.press("a", "touch", false).unwrap();
-        assert_eq!(hold.fire(generation), Some("a".to_string()));
+        assert_eq!(hold.fire(generation, false), Some("a".to_string()));
         assert!(hold.take_release("a"));
         assert!(!hold.take_release("a"), "only once");
     }
@@ -5098,7 +5103,7 @@ mod tests {
     fn chip_hold_release_belongs_to_the_held_chip_only() {
         let mut hold = ChipHold::default();
         let generation = hold.press("a", "touch", false).unwrap();
-        hold.fire(generation);
+        hold.fire(generation, false);
         assert!(!hold.take_release("b"));
     }
 
@@ -5107,7 +5112,7 @@ mod tests {
         let mut hold = ChipHold::default();
         let generation = hold.press("a", "touch", false).unwrap();
         hold.cancel();
-        assert_eq!(hold.fire(generation), None);
+        assert_eq!(hold.fire(generation, false), None);
         assert!(!hold.take_release("a"), "its click is a press");
     }
 
@@ -5117,15 +5122,15 @@ mod tests {
         let first = hold.press("a", "touch", false).unwrap();
         hold.cancel();
         let second = hold.press("a", "touch", false).unwrap();
-        assert_eq!(hold.fire(first), None);
-        assert_eq!(hold.fire(second), Some("a".to_string()));
+        assert_eq!(hold.fire(first, false), None);
+        assert_eq!(hold.fire(second, false), Some("a".to_string()));
     }
 
     #[test]
     fn chip_hold_release_expires_when_no_click_follows_the_lift() {
         let mut hold = ChipHold::default();
         let generation = hold.press("a", "touch", false).unwrap();
-        hold.fire(generation);
+        hold.fire(generation, false);
         let lifted = hold.lift().expect("a fired hold's lift is timed");
         hold.expire(lifted);
         assert!(!hold.take_release("a"), "a later click is a press");
@@ -5136,18 +5141,18 @@ mod tests {
         let mut hold = ChipHold::default();
         hold.press("a", "touch", false).unwrap();
         assert_eq!(hold.lift(), None);
-        assert_eq!(hold.fire(1), None, "the lift ended the press");
+        assert_eq!(hold.fire(1, false), None, "the lift ended the press");
     }
 
     #[test]
     fn chip_hold_expiry_of_an_earlier_hold_leaves_a_later_one() {
         let mut hold = ChipHold::default();
         let first = hold.press("a", "touch", false).unwrap();
-        hold.fire(first);
+        hold.fire(first, false);
         let lifted = hold.lift().unwrap();
         assert!(hold.take_release("a"));
         let second = hold.press("a", "touch", false).unwrap();
-        hold.fire(second);
+        hold.fire(second, false);
         hold.expire(lifted);
         assert!(
             hold.take_release("a"),
@@ -5159,9 +5164,17 @@ mod tests {
     fn chip_hold_a_new_press_forgets_an_unclaimed_release() {
         let mut hold = ChipHold::default();
         let generation = hold.press("a", "touch", false).unwrap();
-        hold.fire(generation);
+        hold.fire(generation, false);
         hold.press("a", "mouse", false);
         assert!(!hold.take_release("a"));
+    }
+
+    #[test]
+    fn chip_hold_begun_wide_does_not_fire_once_narrow() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        assert_eq!(hold.fire(generation, true), None);
+        assert!(!hold.take_release("a"), "its click is a press");
     }
 
     /// A popover is revealed on the first mount after it opens, never on a
