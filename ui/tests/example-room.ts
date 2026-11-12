@@ -486,12 +486,18 @@ export async function tapRow(page: Page, row: Locator) {
   await pressAt(page, await plainPointOf(row));
 }
 
+/// How long after a pointer opens the sheet a pointer's click in it is
+/// ignored (OPEN_GUARD_MS, mobile_sheet_drag.rs): a double tap's second tap.
+export const SHEET_OPEN_GUARD_MS = 350;
+
 /// The sheet is open for `row` and its opening slide has ended: until then
 /// the panel is partly below the screen, so a point measured in it is not
 /// where it will be, or is on nothing.
 export async function expectSheetOpenFor(page: Page, row: Locator) {
   await expect(sheet(page)).toBeVisible();
   await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(row));
+  // Visible is never before shown, so this outlasts the guard.
+  await page.waitForTimeout(SHEET_OPEN_GUARD_MS);
   await panelAtRest(page);
 }
 

@@ -10,6 +10,11 @@
 //! scrolling it (`touch-action: pan-x`, `main.css`). A second finger (a
 //! pinch) cancels the drag, and the zoom goes ahead.
 //!
+//! A click in the dialog that is the tail of the press that opened it does
+//! nothing ([`stray_after_open`]): the second click of a double-click, and
+//! any pointer's click for a moment after a tap or click opened it, since a
+//! phone's second tap lands on the sheet the first one opened.
+//!
 //! A tap outside slides the panel away the same way ([`animate_out`]); Escape
 //! and a choice (an emoji, an action) close it at once. With
 //! `prefers-reduced-motion: reduce` nothing slides: a dismissal closes at
@@ -67,6 +72,18 @@ impl MovedClick {
     }
 }
 
+/// How long after a pointer opens the sheet a pointer's click in it is still
+/// that press's second tap.
+const OPEN_GUARD_MS: f64 = 350.0;
+
+/// Whether a click in the dialog is the tail of the press that opened it,
+/// not a choice: the second click of a double-click (`detail` over 1), or a
+/// pointer's click `since_pointer_opening` ms after a tap or click opened it
+/// (a phone's second tap counts 1). A key's click (`detail` 0) never is.
+fn stray_after_open(detail: i32, since_pointer_opening: Option<f64>) -> bool {
+    detail > 1 || (detail == 1 && since_pointer_opening.is_some_and(|ms| ms < OPEN_GUARD_MS))
+}
+
 /// Whether a pointer moved `(dx, dy)` from where it went down is going up or
 /// down rather than sideways, or `None` while it is still a tap. A tie is
 /// sideways: scrolling the row wins.
@@ -112,8 +129,10 @@ mod dom {
     use super::super::mobile_surface::dom::sheet;
     use super::super::now_ms;
     use super::super::reaction_picker::ReactionSurfaces;
-    use super::{dismisses, offset, velocity, vertical, MovedClick, VELOCITY_WINDOW_MS};
-    use std::cell::RefCell;
+    use super::{
+        dismisses, offset, stray_after_open, velocity, vertical, MovedClick, VELOCITY_WINDOW_MS,
+    };
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -136,6 +155,8 @@ mod dom {
         static GESTURE: RefCell<Option<Gesture>> = const { RefCell::new(None) };
         /// The click the last moved gesture's lift may send.
         static MOVED_CLICK: RefCell<MovedClick> = const { RefCell::new(MovedClick { until: None }) };
+        /// When the opening it shows was shown (ms), if a pointer opened it.
+        static POINTER_OPENED_AT: Cell<Option<f64>> = const { Cell::new(None) };
     }
 
     const DRAGGING: &str = "is-dragging";
@@ -246,11 +267,12 @@ mod dom {
         });
     }
 
-    /// Clear what a drag or a slide left on the dialog, before it shows: a
-    /// sheet closed mid-drag opens at rest.
-    pub(in super::super) fn reset() {
+    /// Clear what a drag or a slide left on the dialog, before it shows (a
+    /// sheet closed mid-drag opens at rest), and note how this opening began.
+    pub(in super::super) fn reset(by_pointer: bool) {
         GESTURE.with(|g| g.borrow_mut().take());
         MOVED_CLICK.with(|m| m.borrow_mut().clear());
+        POINTER_OPENED_AT.with(|at| at.set(by_pointer.then(now_ms)));
         if let Some(dialog) = sheet() {
             let _ = dialog.class_list().remove_1(LEAVING);
             spring_back(&dialog);
@@ -405,14 +427,25 @@ mod dom {
         })
     }
 
-    /// The click after a gesture that moved, inside the dialog: swallowed
-    /// before anything in the page sees it.
+    /// A click inside the dialog that is no choice, swallowed before
+    /// anything in the page sees it: the click after a gesture that moved,
+    /// and the tail of the press that opened the sheet ([`stray_after_open`]).
     fn on_click(event: web_sys::Event) {
         let inside = event
             .target()
             .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
             .is_some_and(|node| sheet().is_some_and(|dialog| dialog.contains(Some(&node))));
-        if inside && MOVED_CLICK.with(|m| m.borrow_mut().take(now_ms())) {
+        if !inside {
+            return;
+        }
+        let now = now_ms();
+        let detail = event
+            .dyn_ref::<web_sys::MouseEvent>()
+            .map_or(0, |mouse| mouse.detail());
+        let since_open = POINTER_OPENED_AT.with(Cell::get).map(|at| now - at);
+        // Read first: a moved gesture's click is consumed either way.
+        let moved = MOVED_CLICK.with(|m| m.borrow_mut().take(now));
+        if moved || stray_after_open(detail, since_open) {
             event.stop_immediate_propagation();
             event.prevent_default();
         }
@@ -467,7 +500,7 @@ mod dom {
 pub(super) fn animate_out(_surfaces: super::reaction_picker::ReactionSurfaces) {}
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn reset() {}
+pub(super) fn reset(_by_pointer: bool) {}
 
 #[cfg(test)]
 mod tests {
@@ -557,6 +590,24 @@ mod tests {
         moved.lifted(1_000.0);
         moved.clear();
         assert!(!moved.take(1_001.0), "cancelled, or a second finger");
+    }
+
+    #[test]
+    fn the_second_click_of_a_double_click_is_never_a_choice() {
+        assert!(stray_after_open(2, None));
+        assert!(stray_after_open(3, Some(10_000.0)));
+    }
+
+    #[test]
+    fn a_pointer_click_just_after_a_pointer_opening_is_its_double_tap() {
+        assert!(stray_after_open(1, Some(120.0)));
+        assert!(!stray_after_open(1, Some(OPEN_GUARD_MS)), "after the guard");
+        assert!(!stray_after_open(1, None), "opened by a key");
+    }
+
+    #[test]
+    fn a_key_is_never_guarded() {
+        assert!(!stray_after_open(0, Some(5.0)));
     }
 
     #[test]

@@ -25,6 +25,7 @@ import {
   settle,
   SHEET,
   sheet,
+  SHEET_OPEN_GUARD_MS,
   SHOWN,
   submitMessage,
   tapRow,
@@ -484,6 +485,43 @@ test.describe("Below 48rem", () => {
     await openSheetFromRow(page, own);
   });
 
+  test("the second tap of a double tap does nothing in the sheet; a tap after it does", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    const point = await plainPointOf(row);
+    const rowId = (await row.getAttribute("id"))!;
+    // Both clicks in one task chain, so the second always lands just after
+    // the sheet shows.
+    const second = async (selector: string) => {
+      await expect(sheet(page)).toBeHidden();
+      await page.evaluate(
+        async ({ point, rowId, selector, sheetId }) => {
+          const click = (el: Element) =>
+            el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, composed: true, detail: 1, clientX: point.x, clientY: point.y }));
+          const plain = document.elementFromPoint(point.x, point.y)!;
+          if (!document.getElementById(rowId)!.contains(plain)) throw new Error("premise: the point is on the row");
+          click(plain);
+          const dialog = document.getElementById(sheetId) as HTMLDialogElement;
+          while (!dialog.open) await new Promise((r) => requestAnimationFrame(r));
+          click(dialog.querySelector(selector)!);
+        },
+        { point, rowId, selector, sheetId: SHEET },
+      );
+      // Past a dismissal's slide.
+      await page.waitForTimeout(500);
+      await expect(sheet(page), `a second tap on ${selector} did nothing`).toBeVisible();
+      await expect(chips(row)).toHaveCount(0);
+      await expect(page.getByTestId("message-composer")).not.toContainText("Replying to");
+      await page.keyboard.press("Escape");
+    };
+    await second(`[data-testid="${BACKDROP}"]`);
+    await second(".mobile-reaction-choice");
+    await second('[data-testid="mobile-message-action-reply"]');
+    // Past the guard, the same tap is a choice.
+    await openSheetFromRow(page, row);
+    await press(choices(page).first());
+    await expect(chips(row)).toHaveCount(1);
+  });
+
   test("opening and closing it renders no message group", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
     await settle(page);
@@ -884,6 +922,8 @@ test.describe("Inside the gateway's sandboxed frame", () => {
     await expect(s).toHaveAttribute("data-target-row", await rowKey(row));
     const panel = await s.locator(".mobile-sheet-panel").boundingBox();
     expect(panel!.y + panel!.height, "bottom-aligned in the frame").toBeGreaterThan(740);
+    // Past the guard: sooner, this click would be the opening's second tap.
+    await page.waitForTimeout(SHEET_OPEN_GUARD_MS);
     await frame.getByTestId(BACKDROP).click({ position: { x: 40, y: 120 } });
     await expect(s).toBeHidden();
     await row.getByTestId("message-react-button").click();

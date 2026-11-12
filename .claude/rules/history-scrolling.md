@@ -123,13 +123,14 @@ Current behavior:
   finger held on a chip, or Shift+Enter, opens its reactor list. While the
   sheet is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
-  picker holds them, and parts of the panel still scroll (the emoji row
-  sideways); a zoom (Ctrl+wheel, a pinch) is
-  not held, nothing outside the dialog is captured, and every close path
+  picker holds them, and the emoji row in its panel still scrolls sideways;
+  a zoom (Ctrl+wheel, a pinch) is not held, nothing outside the dialog is captured, and every close path
   removes the listeners. It can be dragged down from anywhere on the screen
   to dismiss it (`conversation/mobile_sheet_drag.rs`): its backdrop and panel
   take no one-finger pan (`touch-action: pinch-zoom`), so the drag never
-  scrolls the history, and a second finger cancels it. Unlike the picker,
+  scrolls the history, and a second finger cancels it. For 350 ms after a
+  tap or click opens it, a pointer's click in it does nothing (a double
+  tap's second tap); a key's does. Unlike the picker,
   a modal keeps holding while its message is still rendered, even after
   arrivals carried that row out of the history's view: only the message
   leaving the history closes it. Arrivals, following, the end hold and reads

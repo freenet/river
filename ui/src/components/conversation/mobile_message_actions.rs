@@ -17,7 +17,8 @@
 //! that completes a text selection open nothing; touch scrolling and text
 //! selection themselves are left alone. A tap or click opens at once, whatever
 //! the pointer: the first click of a double-click opens the sheet, and the
-//! second is never a tap. Rows take no double-tap zoom below 48rem
+//! second does nothing, on the row or in the sheet it opened
+//! (`mobile_sheet_drag.rs`). Rows take no double-tap zoom below 48rem
 //! (`touch-action: manipulation`, `main.css`), so iOS Safari does not hold the
 //! click back waiting for a second tap.
 //!

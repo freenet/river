@@ -81,7 +81,7 @@ pub(super) fn MobileMessageSheet(
         if shown_token.replace(opening.token) == opening.token {
             return;
         }
-        super::mobile_sheet_drag::reset();
+        super::mobile_sheet_drag::reset(opening.by_pointer);
         dom::mark_opened_by(opening.by_pointer);
         if !dom::dialog_open() && dom::show_dialog() {
             dom::focus_in(FOCUS);
