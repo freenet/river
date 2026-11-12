@@ -130,13 +130,25 @@ pub(super) fn use_reaction_surfaces() -> ReactionSurfaces {
 }
 
 impl ReactionSurfaces {
-    /// A group opened a reactor list: the picker closes, and the list is
-    /// remembered so that opening the picker closes it. From a deferred
-    /// callback only.
-    pub(super) fn owner_list_opened(mut self, list: Signal<Option<ReactionOwnersPopover>>) {
+    /// Open `list`, a group's reactor list, with `popover`: the picker and
+    /// the sheet close, and the list is remembered so that opening either
+    /// closes it. Nothing if the group (or the conversation) has unmounted:
+    /// its signal is gone. From a deferred callback only.
+    pub(super) fn open_owner_list(
+        mut self,
+        mut list: Signal<Option<ReactionOwnersPopover>>,
+        popover: ReactionOwnersPopover,
+    ) {
+        if list.try_peek().is_err() {
+            return;
+        }
         self.close();
         self.close_mobile(false);
-        self.open_owner_list.set(Some(list));
+        if let Ok(mut slot) = self.open_owner_list.try_write() {
+            *slot = Some(list);
+        }
+        // A statement, so the write guard drops before `list` does.
+        let _ = list.try_write().map(|mut open| *open = Some(popover));
     }
 
     /// Close the picker and let go of everything an opening took. Every

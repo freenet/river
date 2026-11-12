@@ -4,10 +4,12 @@ import {
   centreOf,
   chips,
   coarsePointer,
+  committedRow,
   hasTouch,
   holdChip,
   keyboardFocus,
   openInlinePicker,
+  openRoomWithComposer,
   openRoomWithTarget,
   openSheetFromReact,
   palette,
@@ -616,5 +618,60 @@ test.describe("Reaction chip below 48rem", () => {
     await expect(rowChips, "the 👍 left with the switch").toHaveCount(1);
     await expect(party).toContainText("2");
     await expect(sheet(page)).toBeHidden();
+  });
+});
+
+// A continuation's chip keeps its id when its group's first message leaves
+// and the group remounts. A hold begun on the old chip must not open the new
+// group's list, or write to the old group's state.
+test.describe("Reaction chip held while its group remounts", { tag: "@chromium-only" }, () => {
+  test("the hold opens nothing, nothing panics, and the chip still reacts", async ({ page }) => {
+    const panics: string[] = [];
+    page.on("pageerror", (e) => panics.push(e.message));
+    page.on("console", (m) => {
+      if (m.type() === "error" && /panicked|unreachable/.test(m.text())) panics.push(m.text());
+    });
+    await openRoomWithComposer(page);
+    await callRiverTest(page, "deliverTimedMessages", 0, [
+      { text: "hold lead", sentSecs: 1, receivedSecs: 0 },
+      { text: "hold survivor", sentSecs: 2, receivedSecs: 0 },
+    ]);
+    const survivor = committedRow(page, "hold survivor");
+    await expect(survivor).toHaveCount(1);
+    await callRiverTest(page, "memberReactsToNewest", "🦀");
+    const chip = chips(survivor).filter({ hasText: "🦀" });
+    await expect(chip).toContainText("1");
+    await chip.scrollIntoViewIfNeeded();
+    // A finger goes down on the continuation's chip, then the group's first
+    // message leaves: the group remounts with a new chip under the same id.
+    await chip.evaluate((el) => {
+      const w = window as unknown as { __oldChip: Element; __riverTest: { removeMessages(text: string): void } };
+      w.__oldChip = el;
+      const r = el.getBoundingClientRect();
+      el.dispatchEvent(
+        new PointerEvent("pointerdown", {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          pointerId: 7,
+          pointerType: "touch",
+          isPrimary: true,
+          clientX: r.left + r.width / 2,
+          clientY: r.top + r.height / 2,
+        }),
+      );
+      w.__riverTest.removeMessages("hold lead");
+    });
+    await expect(committedRow(page, "hold lead")).toHaveCount(0);
+    expect(
+      await chip.evaluate((el) => el === (window as unknown as { __oldChip: Element }).__oldChip),
+      "premise: the chip remounted",
+    ).toBe(false);
+    // Past CHIP_HOLD_MS (500).
+    await page.waitForTimeout(700);
+    expect(panics, "the hold's timer did not panic").toEqual([]);
+    await expect(page.getByTestId("reaction-owners"), "no finger is on the new chip").toHaveCount(0);
+    await press(chip);
+    await expect(chip, "the page is alive: a press reacts").toContainText("2");
   });
 });

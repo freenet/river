@@ -3713,14 +3713,19 @@ fn reaction_owners_popover_at(
     }
 }
 
+/// The centre of `element`, in client coordinates.
+fn centre_of(element: &web_sys::Element) -> (f64, f64) {
+    let rect = element.get_bounding_client_rect();
+    (
+        rect.left() + rect.width() / 2.0,
+        rect.top() + rect.height() / 2.0,
+    )
+}
+
 /// The centre of the element with this id, in client coordinates.
 fn element_centre(id: &str) -> Option<(f64, f64)> {
     let element = web_sys::window()?.document()?.get_element_by_id(id)?;
-    let rect = element.get_bounding_client_rect();
-    Some((
-        rect.left() + rect.width() / 2.0,
-        rect.top() + rect.height() / 2.0,
-    ))
+    Some(centre_of(&element))
 }
 
 fn reaction_owners_dialog_id(key: &str) -> String {
@@ -4871,22 +4876,26 @@ fn MessageGroupComponent(
                                                                             return;
                                                                         };
                                                                         let hold = chip_hold_down.clone();
-                                                                        let chip_id = chip_id_for_hold.clone();
                                                                         let row = row_id_for_hold.clone();
+                                                                        // The chip this press is on, not whichever
+                                                                        // has its id later.
+                                                                        let chip = web_sys::window()
+                                                                            .and_then(|w| w.document())
+                                                                            .and_then(|d| d.get_element_by_id(&chip_id_for_hold));
                                                                         crate::util::safe_spawn_local(async move {
                                                                             crate::util::sleep(crate::util::millis(CHIP_HOLD_MS)).await;
-                                                                            // The chip, or its whole group, may have
-                                                                            // gone under the finger.
-                                                                            let Some((x, y)) = element_centre(&chip_id) else {
+                                                                            // Gone, or its group remounted under the
+                                                                            // finger: no hold.
+                                                                            let Some(chip) = chip.filter(|chip| chip.is_connected()) else {
                                                                                 return;
                                                                             };
                                                                             let Some(key) = hold.borrow_mut().fire(generation) else {
                                                                                 return;
                                                                             };
+                                                                            let (x, y) = centre_of(&chip);
                                                                             let popover = reaction_owners_popover_at(key, row, x, y);
                                                                             crate::util::defer(move || {
-                                                                                reactions.owner_list_opened(open_reaction_owners);
-                                                                                open_reaction_owners.set(Some(popover));
+                                                                                reactions.open_owner_list(open_reaction_owners, popover)
                                                                             });
                                                                         });
                                                                     },
@@ -4946,8 +4955,7 @@ fn MessageGroupComponent(
                                                                                 y,
                                                                             );
                                                                             crate::util::defer(move || {
-                                                                                reactions.owner_list_opened(open_reaction_owners);
-                                                                                open_reaction_owners.set(Some(popover));
+                                                                                reactions.open_owner_list(open_reaction_owners, popover)
                                                                             });
                                                                         } else {
                                                                             // The reader's chip with no one else on it
