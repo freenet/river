@@ -687,6 +687,57 @@ test.describe("Reacting from the message sheet", () => {
     await expect(page.getByTestId("toast-message")).toHaveText("Your reaction could not be sent");
     await expect(sheet(page), "nothing reopens").toBeHidden();
   });
+
+  test("a swipe or a pinch that sends no click does not swallow the next activation", { tag: "@chromium-only" }, async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    type Step = { type: string; id: number; primary: boolean; dx: number; dy: number };
+    const gestures: [string, Step[]][] = [
+      [
+        "a sideways swipe the browser takes",
+        [
+          { type: "pointerdown", id: 11, primary: true, dx: 0, dy: 0 },
+          { type: "pointermove", id: 11, primary: true, dx: -30, dy: 0 },
+          { type: "pointercancel", id: 11, primary: true, dx: -30, dy: 0 },
+        ],
+      ],
+      [
+        "a drag a second finger cancels",
+        [
+          { type: "pointerdown", id: 11, primary: true, dx: 0, dy: 0 },
+          { type: "pointermove", id: 11, primary: true, dx: 0, dy: 30 },
+          { type: "pointerdown", id: 12, primary: false, dx: 40, dy: -40 },
+          { type: "pointerup", id: 12, primary: false, dx: 40, dy: -40 },
+          { type: "pointerup", id: 11, primary: true, dx: 0, dy: 30 },
+        ],
+      ],
+    ];
+    for (const [what, steps] of gestures) {
+      await openSheetFromReact(page, row);
+      const before = await chips(row).count();
+      await palette(page).evaluate((el, steps) => {
+        const r = el.getBoundingClientRect();
+        for (const s of steps) {
+          el.dispatchEvent(
+            new PointerEvent(s.type, {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              pointerId: s.id,
+              pointerType: "touch",
+              isPrimary: s.primary,
+              clientX: r.left + 60 + s.dx,
+              clientY: r.top + r.height / 2 + s.dy,
+            }),
+          );
+        }
+        // An activation with no press of its own, as a key or a screen
+        // reader sends.
+        el.querySelector<HTMLElement>(".mobile-reaction-choice")!.click();
+      }, steps);
+      await expect(sheet(page), `${what}: the choice acted`).toBeHidden();
+      await expect(chips(row), "it toggled the first choice").toHaveCount(before === 0 ? 1 : 0);
+    }
+  });
 });
 
 test.describe("The message sheet on a small screen", () => {

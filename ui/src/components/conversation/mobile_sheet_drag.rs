@@ -38,6 +38,35 @@ const VELOCITY_WINDOW_MS: f64 = 100.0;
 /// A finger held still this long before it lifts released with no speed.
 const STILL_MS: f64 = 80.0;
 
+/// How long after a moved gesture's lift its click may still come.
+const CLICK_AFTER_LIFT_MS: f64 = 400.0;
+
+/// The click a gesture that moved sends when it lifts (a mouse's, mostly):
+/// not a tap on what it lands on. Only that click: a gesture that ends with
+/// none (cancelled, a second finger) leaves nothing armed, so it cannot
+/// swallow a later activation that has no press of its own (a key's).
+#[derive(Default)]
+struct MovedClick {
+    until: Option<f64>,
+}
+
+impl MovedClick {
+    /// A gesture that moved lifted at `now` (ms).
+    fn lifted(&mut self, now: f64) {
+        self.until = Some(now + CLICK_AFTER_LIFT_MS);
+    }
+
+    /// No click can follow: cancelled, a second finger, or a new press.
+    fn clear(&mut self) {
+        self.until = None;
+    }
+
+    /// A click at `now`: whether it is that lift's. Consumes it.
+    fn take(&mut self, now: f64) -> bool {
+        self.until.take().is_some_and(|until| now <= until)
+    }
+}
+
 /// Whether a pointer moved `(dx, dy)` from where it went down is going up or
 /// down rather than sideways, or `None` while it is still a tap. A tie is
 /// sideways: scrolling the row wins.
@@ -81,9 +110,10 @@ pub(super) use self::dom::{animate_out, install, reset, Listeners};
 #[cfg(target_arch = "wasm32")]
 mod dom {
     use super::super::mobile_surface::dom::sheet;
+    use super::super::now_ms;
     use super::super::reaction_picker::ReactionSurfaces;
-    use super::{dismisses, offset, velocity, vertical, VELOCITY_WINDOW_MS};
-    use std::cell::{Cell, RefCell};
+    use super::{dismisses, offset, velocity, vertical, MovedClick, VELOCITY_WINDOW_MS};
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -93,6 +123,8 @@ mod dom {
         pointer: i32,
         x0: f64,
         y0: f64,
+        /// Past the tap slop, either way: its lift's click is no tap.
+        moved: bool,
         /// Past the tap slop, going up or down: it drags the panel.
         dragging: bool,
         offset: f64,
@@ -102,9 +134,8 @@ mod dom {
 
     thread_local! {
         static GESTURE: RefCell<Option<Gesture>> = const { RefCell::new(None) };
-        /// A gesture moved past the tap slop: the click that may follow it
-        /// (a mouse's, mostly) is not a tap on what it lands on.
-        static SUPPRESS_CLICK: Cell<bool> = const { Cell::new(false) };
+        /// The click the last moved gesture's lift may send.
+        static MOVED_CLICK: RefCell<MovedClick> = const { RefCell::new(MovedClick { until: None }) };
     }
 
     const DRAGGING: &str = "is-dragging";
@@ -219,7 +250,7 @@ mod dom {
     /// sheet closed mid-drag opens at rest.
     pub(in super::super) fn reset() {
         GESTURE.with(|g| g.borrow_mut().take());
-        SUPPRESS_CLICK.with(|s| s.set(false));
+        MOVED_CLICK.with(|m| m.borrow_mut().clear());
         if let Some(dialog) = sheet() {
             let _ = dialog.class_list().remove_1(LEAVING);
             spring_back(&dialog);
@@ -237,8 +268,9 @@ mod dom {
         let other = GESTURE.with(|g| g.borrow().as_ref().map(|g| g.pointer));
         if let Some(other) = other {
             if other != e.pointer_id() {
-                // A second finger: a pinch, not a drag.
+                // A second finger: a pinch, not a drag, and no click.
                 GESTURE.with(|g| g.borrow_mut().take());
+                MOVED_CLICK.with(|m| m.borrow_mut().clear());
                 spring_back(dialog);
             }
             return;
@@ -249,12 +281,13 @@ mod dom {
         if dialog.class_list().contains(LEAVING) {
             return;
         }
-        SUPPRESS_CLICK.with(|s| s.set(false));
+        MOVED_CLICK.with(|m| m.borrow_mut().clear());
         let (x, y) = (f64::from(e.client_x()), f64::from(e.client_y()));
         let gesture = Gesture {
             pointer: e.pointer_id(),
             x0: x,
             y0: y,
+            moved: false,
             dragging: false,
             offset: 0.0,
             samples: VecDeque::from([(event.time_stamp(), y)]),
@@ -282,11 +315,14 @@ mod dom {
             let gesture = slot.as_mut().filter(|g| g.pointer == e.pointer_id())?;
             let (dx, dy) = (x - gesture.x0, y - gesture.y0);
             if !gesture.dragging {
+                if gesture.moved {
+                    // Sideways: the row's own scrolling, not a drag. Kept
+                    // until it lifts or is cancelled.
+                    return None;
+                }
                 let vertical = vertical(dx, dy)?;
-                SUPPRESS_CLICK.with(|s| s.set(true));
+                gesture.moved = true;
                 if !vertical {
-                    // Sideways: the row's own scrolling, not a drag.
-                    slot.take();
                     return None;
                 }
                 gesture.dragging = true;
@@ -318,6 +354,9 @@ mod dom {
         let Some(mut gesture) = take_gesture(e.pointer_id()) else {
             return;
         };
+        if gesture.moved {
+            MOVED_CLICK.with(|m| m.borrow_mut().lifted(now_ms()));
+        }
         if !gesture.dragging {
             return;
         }
@@ -345,7 +384,12 @@ mod dom {
         if event.type_() == "lostpointercapture" && !on_dialog {
             return;
         }
-        if take_gesture(e.pointer_id()).is_some_and(|g| g.dragging) {
+        let Some(gesture) = take_gesture(e.pointer_id()) else {
+            return;
+        };
+        // A cancelled gesture sends no click.
+        MOVED_CLICK.with(|m| m.borrow_mut().clear());
+        if gesture.dragging {
             spring_back(dialog);
         }
     }
@@ -368,7 +412,7 @@ mod dom {
             .target()
             .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
             .is_some_and(|node| sheet().is_some_and(|dialog| dialog.contains(Some(&node))));
-        if inside && SUPPRESS_CLICK.with(|s| s.replace(false)) {
+        if inside && MOVED_CLICK.with(|m| m.borrow_mut().take(now_ms())) {
             event.stop_immediate_propagation();
             event.prevent_default();
         }
@@ -489,6 +533,30 @@ mod tests {
             -3.0,
             "up is negative"
         );
+    }
+
+    #[test]
+    fn a_moved_lift_swallows_its_own_click_once() {
+        let mut moved = MovedClick::default();
+        moved.lifted(1_000.0);
+        assert!(moved.take(1_005.0));
+        assert!(!moved.take(1_010.0), "only once");
+    }
+
+    #[test]
+    fn a_click_long_after_the_lift_is_a_tap() {
+        let mut moved = MovedClick::default();
+        moved.lifted(1_000.0);
+        assert!(!moved.take(1_000.0 + CLICK_AFTER_LIFT_MS + 1.0));
+    }
+
+    #[test]
+    fn a_gesture_that_sends_no_click_swallows_nothing() {
+        let mut moved = MovedClick::default();
+        assert!(!moved.take(0.0), "nothing moved");
+        moved.lifted(1_000.0);
+        moved.clear();
+        assert!(!moved.take(1_001.0), "cancelled, or a second finger");
     }
 
     #[test]
