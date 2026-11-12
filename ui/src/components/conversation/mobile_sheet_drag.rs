@@ -47,9 +47,10 @@ const STILL_MS: f64 = 80.0;
 const CLICK_AFTER_LIFT_MS: f64 = 400.0;
 
 /// The click a gesture that moved sends when it lifts (a mouse's, mostly):
-/// not a tap on what it lands on. Only that click: a gesture that ends with
-/// none (cancelled, a second finger) leaves nothing armed, so it cannot
-/// swallow a later activation that has no press of its own (a key's).
+/// not a tap on what it lands on. Only that click: it is armed at the lift,
+/// so a gesture that ends without one (cancelled, a second finger) arms
+/// nothing and cannot swallow a later activation with no press of its own
+/// (a key's), and the next press disarms a lift whose click never came.
 #[derive(Default)]
 struct MovedClick {
     until: Option<f64>,
@@ -61,7 +62,7 @@ impl MovedClick {
         self.until = Some(now + CLICK_AFTER_LIFT_MS);
     }
 
-    /// No click can follow: cancelled, a second finger, or a new press.
+    /// A new press began: the last lift's click, if any, never came.
     fn clear(&mut self) {
         self.until = None;
     }
@@ -290,9 +291,8 @@ mod dom {
         let other = GESTURE.with(|g| g.borrow().as_ref().map(|g| g.pointer));
         if let Some(other) = other {
             if other != e.pointer_id() {
-                // A second finger: a pinch, not a drag, and no click.
+                // A second finger: a pinch, not a drag.
                 GESTURE.with(|g| g.borrow_mut().take());
-                MOVED_CLICK.with(|m| m.borrow_mut().clear());
                 spring_back(dialog);
             }
             return;
@@ -406,12 +406,7 @@ mod dom {
         if event.type_() == "lostpointercapture" && !on_dialog {
             return;
         }
-        let Some(gesture) = take_gesture(e.pointer_id()) else {
-            return;
-        };
-        // A cancelled gesture sends no click.
-        MOVED_CLICK.with(|m| m.borrow_mut().clear());
-        if gesture.dragging {
+        if take_gesture(e.pointer_id()).is_some_and(|g| g.dragging) {
             spring_back(dialog);
         }
     }
@@ -589,7 +584,7 @@ mod tests {
         assert!(!moved.take(0.0), "nothing moved");
         moved.lifted(1_000.0);
         moved.clear();
-        assert!(!moved.take(1_001.0), "cancelled, or a second finger");
+        assert!(!moved.take(1_001.0), "a new press began first");
     }
 
     #[test]

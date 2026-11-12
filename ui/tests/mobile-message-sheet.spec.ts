@@ -748,6 +748,19 @@ test.describe("Reacting from the message sheet", () => {
           { type: "pointerup", id: 11, primary: true, dx: 0, dy: 30 },
         ],
       ],
+      [
+        // Its lift sends no click (a finger's does not), and the next press
+        // comes at once.
+        "a drag let go short, then a press straight after",
+        [
+          { type: "pointerdown", id: 11, primary: true, dx: 0, dy: 0 },
+          // Past the tap slop, short of a flick's 16px.
+          { type: "pointermove", id: 11, primary: true, dx: 0, dy: 12 },
+          { type: "pointerup", id: 11, primary: true, dx: 0, dy: 12 },
+          { type: "pointerdown", id: 13, primary: true, dx: 0, dy: 0 },
+          { type: "pointerup", id: 13, primary: true, dx: 0, dy: 0 },
+        ],
+      ],
     ];
     for (const [what, steps] of gestures) {
       await openSheetFromReact(page, row);
@@ -768,8 +781,8 @@ test.describe("Reacting from the message sheet", () => {
             }),
           );
         }
-        // An activation with no press of its own, as a key or a screen
-        // reader sends.
+        // The click: with no press of its own in the first two, as a key or
+        // a screen reader sends.
         el.querySelector<HTMLElement>(".mobile-reaction-choice")!.click();
       }, steps);
       await expect(sheet(page), `${what}: the choice acted`).toBeHidden();
