@@ -752,8 +752,7 @@ test.describe("Message row hover band", () => {
     await expect.poll(opacity).toBe("1");
   });
 
-  // The narrowest width with a reactor list: below 48rem there is none, and
-  // the mobile message sheet lists who reacted (mobile-message-sheet.spec.ts).
+  // The narrowest width with a reactor list: below 48rem there is none.
   test.describe("at a narrow width", () => {
     test.use({ viewport: { width: 768, height: 800 } });
 

@@ -4,8 +4,8 @@
 //! Below Tailwind's `md` (48rem) a message row's trailing Reply, Edit and
 //! Delete are hidden. A tap on the row or on its reaction +, or its keyboard
 //! entry, opens the one **message sheet** (`mobile_message_sheet.rs`): the 16
-//! emoji in a row that scrolls sideways, who reacted, then Reply, and Edit
-//! and Delete on your own. A press on a reaction chip opens nothing: it
+//! emoji in a row that scrolls sideways, then Reply, and Edit and Delete on
+//! your own. A press on a reaction chip opens nothing: it
 //! reacts with the chip's emoji, at every width (`conversation.rs`). Row taps
 //! and the entry are `mobile_message_actions.rs`. At 48rem and wider the
 //! sheet does not exist: the footer, the anchored reaction picker
@@ -23,7 +23,7 @@
 //! showing of it ([`super::reaction_picker::note_room_shown`]), the room's
 //! contract key at the time (a re-key is another generation, which the showing
 //! counter does not see), the row, the control it opened from ([`Origin`]),
-//! and what the row showed of the message's reactions. Work queued for it (a
+//! and the reader's own reaction on the message. Work queued for it (a
 //! reaction, an action, focus) runs only while that same token is still the
 //! open one and the opening is still live ([`opening_is_live`]): a dismissal
 //! and reopening of the same message is a new token, so an older queued
@@ -650,7 +650,6 @@ pub(super) mod dom {
 mod tests {
     use super::*;
     use river_core::room_state::message::MessageId;
-    use std::rc::Rc;
 
     fn key(seed: u8) -> VerifyingKey {
         ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key()
@@ -673,7 +672,6 @@ mod tests {
                 message: MessageId(freenet_scaffold::util::FastHash(7)),
                 own: false,
                 current: None,
-                reactions: Rc::new(Vec::new()),
             },
             origin: Origin::React,
             by_pointer: false,

@@ -28,12 +28,10 @@
 //! the sheet's reactions in step with the row, and its unmounting is how the
 //! sheet learns its message left.
 
-use super::mobile_message_sheet::SheetReaction;
 use super::mobile_surface::{narrow_now, MobileOpening, Origin, SHEET_ID, SHEET_TITLE};
 use super::reaction_picker::ReactionSurfaces;
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
-use std::rc::Rc;
 
 /// The message's own controls and the marked exclusions: a click inside any
 /// of these is that control's, never the row's.
@@ -113,9 +111,6 @@ pub(super) struct RowTarget {
     /// ones included). Only marks the current choice: the pending-aware
     /// toggle decides from the room itself.
     pub(super) current: Option<String>,
-    /// Its reactions and who made them, as its chips show them: what the
-    /// sheet lists.
-    pub(super) reactions: Rc<Vec<SheetReaction>>,
 }
 
 /// Whether a click came from a pointer (a tap or a mouse click) rather than
@@ -262,7 +257,7 @@ fn press_makes_tap(press: Option<&RowPress>, row: &str, x: f64, y: f64, now: f64
 /// A row's keyboard way into its sheet: a native button, visually hidden
 /// until it has keyboard focus, below 48rem only (`main.css`). Rendered in
 /// every signed row not being edited. While the sheet is open for its row it
-/// keeps the sheet's current reaction and reactor list in step with the row
+/// keeps the sheet's current reaction in step with the row
 /// (a reaction landing from another device, or one still being signed).
 #[component]
 pub(super) fn MobileActionsEntry(
@@ -270,10 +265,8 @@ pub(super) fn MobileActionsEntry(
     /// The row's message, as the row renders it.
     target: RowTarget,
 ) -> Element {
-    // What the row shows of its reactions is not what `open` has.
-    let differs = |open: &MobileOpening, target: &RowTarget| {
-        open.target.current != target.current || open.target.reactions != target.reactions
-    };
+    // The row's current reaction is not the one `open` has.
+    let differs = |open: &MobileOpening, target: &RowTarget| open.target.current != target.current;
     let (expanded, stale) = match surfaces.mobile_for_render() {
         Some(open) if open.is_for(&target.row) => (true, differs(&open, &target)),
         _ => (false, false),
@@ -290,7 +283,6 @@ pub(super) fn MobileActionsEntry(
                 opening.with_mut(|o| {
                     if let Some(o) = o.as_mut() {
                         o.target.current = target.current;
-                        o.target.reactions = target.reactions;
                     }
                 });
             }

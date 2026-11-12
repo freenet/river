@@ -38,11 +38,10 @@ import { callRiverTest, rekeyThenClick } from "./river-test";
 // Delete are hidden; a tap on the row opens the modal message sheet
 // (mobile_message_sheet.rs). Its one reaction + stays visible and opens the
 // same sheet. On top, the 16 choices the desktop picker has, in one row that
-// scrolls sideways: a tap on one reacts and closes it. Then who reacted,
-// then those actions. It has no field, so it never asks for the software
-// keyboard; a tap outside dismisses it. A reaction
-// chip opens nothing: a press on it reacts with its emoji
-// (reaction-owners-touch.spec.ts); the sheet's drags are in
+// scrolls sideways: a tap on one reacts and closes it. Then those actions.
+// It has no field, so it never asks for the software keyboard; a tap outside
+// dismisses it. A reaction chip opens nothing: a press on it reacts with its
+// emoji (reaction-owners-touch.spec.ts); the sheet's drags are in
 // mobile-message-sheet-gestures.spec.ts.
 // Width alone decides: a narrow mouse window is mobile, a wide touch screen
 // keeps the desktop footer. These run on every project at the widths they
@@ -514,7 +513,6 @@ test.describe("Reacting from the message sheet", () => {
     await expect(react).toHaveAttribute("aria-expanded", "true");
     await expect(sheet(page), "named, though it shows no title").toHaveAccessibleName("Message options");
     await expect(sheet(page).getByTestId("mobile-message-action-reply"), "the actions below the emoji").toBeVisible();
-    await expect(sheet(page).getByTestId("mobile-sheet-reactors"), "no reactions, no list").toHaveCount(0);
     await expect(sheet(page).locator("input, textarea, [contenteditable]"), "no field to raise a keyboard").toHaveCount(0);
     await expect(palette(page)).toHaveAttribute("role", "group");
     await expect(palette(page)).toHaveAccessibleName("Reactions");
@@ -615,37 +613,21 @@ test.describe("Reacting from the message sheet", () => {
     await expect(sheet(page), "the new opening is open").toBeVisible();
   });
 
-  test("the sheet lists who reacted, between the emoji and the actions: a member by name, the reader as You", async ({ page }) => {
+  test("reactions add nothing to the sheet: the emoji and the actions, the same height with or without them", async ({ page }) => {
     const row = await openRoomWithTarget(page);
-    await callRiverTest(page, "memberReactsToNewest", "🎉");
-    await expect(chips(row)).toContainText("1");
+    await openSheetFromReact(page, row);
+    const bare = (await page.locator(PANEL).boundingBox())!.height;
+    await page.keyboard.press("Escape");
+    await expect(sheet(page)).toBeHidden();
+    await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "🎉"]);
+    await expect(chips(row)).toHaveCount(8);
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
-
-    // The member, not the reader.
     await openSheetFromReact(page, row);
-    const list = sheet(page).getByTestId("mobile-sheet-reactors");
-    await expect(list).toHaveAccessibleName("Who reacted");
-    await expect(list.getByTestId("mobile-sheet-reaction")).toHaveCount(1);
-    await expect(list.getByTestId("mobile-sheet-reaction")).toContainText("🎉");
-    const names = await list.getByTestId("mobile-sheet-reactor").allTextContents();
-    expect(names, "the member who reacted, not the reader").toHaveLength(1);
-    expect(names[0]).not.toBe("You");
-    const [paletteBox, listBox, actionsBox] = [
-      await palette(page).boundingBox(),
-      await list.boundingBox(),
-      await sheet(page).locator(".mobile-sheet-actions").boundingBox(),
-    ];
-    expect(paletteBox!.y, "emoji, then who reacted").toBeLessThan(listBox!.y);
-    expect(listBox!.y, "then the actions").toBeLessThan(actionsBox!.y);
+    const parts = await page.locator(PANEL).evaluate((panel) => Array.from(panel.children).map((c) => c.classList[0]));
+    expect(parts, "the handle, the emoji, the actions").toEqual(["mobile-sheet-handle", "mobile-reaction-palette", "mobile-sheet-actions"]);
+    await expect(sheet(page).getByText("Test Sender"), "nobody is named").toHaveCount(0);
+    expect((await page.locator(PANEL).boundingBox())!.height, "the same height as with no reactions").toBe(bare);
     await expect(choices(page).first(), "an emoji takes focus").toBeFocused();
-
-    // Once the reader reacts too, it names them as "You".
-    await press(palette(page).getByRole("button", { name: "React with 🎉" }));
-    await expect(chips(row)).toContainText("2");
-    await openSheetFromReact(page, row);
-    await expect(list.getByTestId("mobile-sheet-reactor")).toHaveCount(2);
-    await expect(list.getByTestId("mobile-sheet-reactor").filter({ hasText: /^You$/ })).toHaveCount(1);
-    await expect(palette(page).getByRole("button", { name: "Remove 🎉 reaction" }), "and it is their current one").toBeVisible();
   });
 
   test("opened by a tap its focused emoji shows no ring until a key is pressed; opened by a key it shows at once", async ({ page }) => {
@@ -757,6 +739,32 @@ test.describe("The message sheet on a small screen", () => {
     await press(last);
     await expect(sheet(page)).toBeHidden();
     await expect(chips(row)).toHaveCount(1);
+  });
+
+  test("an own message with many reactions keeps Delete on screen, with nothing to scroll", async ({ page }) => {
+    await openRoomWithComposer(page);
+    const row = await submitMessage(page, "own short-screen row");
+    await expect(row).toHaveCount(1);
+    await page.getByTestId("message-input").blur();
+    await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "🎉"]);
+    await expect(chips(row)).toHaveCount(8);
+    await openSheetFromRow(page, row);
+    const g = await page.locator(PANEL).evaluate((panel) => {
+      const del = panel.querySelector('[data-testid="mobile-message-action-delete"]')!.getBoundingClientRect();
+      return {
+        vh: window.innerHeight,
+        panelTop: panel.getBoundingClientRect().top,
+        panelOverflows: panel.scrollHeight > panel.clientHeight,
+        deleteTop: del.top,
+        deleteBottom: del.bottom,
+      };
+    });
+    expect(g.panelOverflows, "the panel has nothing to scroll").toBe(false);
+    expect(g.panelTop, "inside the viewport").toBeGreaterThanOrEqual(0);
+    expect(g.deleteTop).toBeGreaterThanOrEqual(0);
+    expect(g.deleteBottom, "Delete is on screen").toBeLessThanOrEqual(g.vh);
+    await press(page.getByTestId("mobile-message-action-delete"));
+    await expect(page.getByRole("heading", { name: /Delete Message/ })).toBeVisible();
   });
 });
 

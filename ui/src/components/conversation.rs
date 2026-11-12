@@ -72,7 +72,7 @@ use self::markdown::{
     render_message_html_cached, running_behind_freenet_gateway,
 };
 use self::mobile_message_actions::{MobileActionsEntry, RowTarget};
-use self::mobile_message_sheet::{MobileAction, MobileMessageSheet, Reactor, SheetReaction};
+use self::mobile_message_sheet::{MobileAction, MobileMessageSheet};
 use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
@@ -3613,7 +3613,7 @@ const CHIP_HOLD_RELEASE_MS: u64 = 400;
 
 /// Whether Enter or Space on a reaction chip opens its reactor list instead
 /// of reacting, as a press does: with Shift, at 48rem and wider. Below 48rem
-/// there is no list (the sheet lists who reacted).
+/// there is no list.
 fn shift_lists_reactors(narrow: bool, shift: bool) -> bool {
     shift && !narrow
 }
@@ -3919,8 +3919,26 @@ fn name_tag(
     }
 }
 
-/// A reactor's ⚠ and 🛡, after their name in a reactor list: a chip's, and
-/// the mobile sheet's.
+/// Someone who reacted, as the row shows them.
+#[derive(Clone, Debug, PartialEq)]
+struct Reactor {
+    /// Their nickname, or "You".
+    name: String,
+    warning: Option<ImpersonationWarning>,
+    badge: Option<DeputyBadge>,
+}
+
+/// One of a message's reactions: the emoji and who made it, in the order
+/// the row's chips show them.
+#[derive(Clone, Debug, PartialEq)]
+struct RowReaction {
+    emoji: String,
+    /// The reader is among them.
+    mine: bool,
+    reactors: Vec<Reactor>,
+}
+
+/// A reactor's ⚠ and 🛡, after their name in a chip's reactor list.
 fn reactor_marks(reactor: &Reactor) -> Element {
     rsx! {
         {reactor.warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
@@ -3947,22 +3965,22 @@ fn reaction_owner_marks(
     )
 }
 
-/// A message's reactions as its chips and the mobile sheet show them: by
+/// A message's reactions as its chips show them: by
 /// emoji, each with who made it ("You" for the reader, never checked for
 /// impersonation; everyone else with the same ⚠ / 🛡 as the author line).
-fn sheet_reactions(
+fn reactions_by_emoji(
     reactions: &HashMap<String, Vec<MemberId>>,
     self_member_id: Option<MemberId>,
     member_names: &HashMap<MemberId, String>,
     impersonation: &ImpersonationChecker,
     owner_id: MemberId,
     deputy_badges: &HashMap<MemberId, DeputyBadge>,
-) -> Vec<SheetReaction> {
+) -> Vec<RowReaction> {
     let mut sorted: Vec<_> = reactions.iter().collect();
     sorted.sort_by_key(|(emoji, _)| emoji.as_str());
     sorted
         .into_iter()
-        .map(|(emoji, reactors)| SheetReaction {
+        .map(|(emoji, reactors)| RowReaction {
             emoji: emoji.clone(),
             mine: self_member_id.is_some_and(|me| reactors.contains(&me)),
             reactors: reactors
@@ -4246,16 +4264,16 @@ fn MessageGroupComponent(
                         // has the form instead.
                         let row_editing = editing_message.read().as_ref() == Some(&msg.id);
                         let press_row = msg.id.clone();
-                        // Its reactions and who made them, once per render:
-                        // the chips and the mobile sheet show the same list.
-                        let row_reactions = Rc::new(sheet_reactions(
+                        // Its reactions and who made them, once per render,
+                        // as the chips show them.
+                        let row_reactions = reactions_by_emoji(
                             &msg.reactions,
                             self_member_id,
                             &member_names,
                             &impersonation,
                             owner_id,
                             &deputy_badges,
-                        ));
+                        );
                         // The reader's own reaction on it. No known identity
                         // means none is ours, so nothing is highlighted and
                         // the picker offers a fresh reaction rather than a
@@ -4269,7 +4287,6 @@ fn MessageGroupComponent(
                             message: msg.message_id.clone(),
                             own: is_self,
                             current: user_reaction.clone(),
-                            reactions: row_reactions.clone(),
                         };
                         let tap_target = sheet_target.clone();
 

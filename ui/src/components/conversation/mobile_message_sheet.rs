@@ -8,16 +8,13 @@
 //! anywhere on it dismisses it, `mobile_sheet_drag.rs`), the backdrop (a tap
 //! slides it away), and the panel with its handle.
 //!
-//! From the top:
+//! It does not list who reacted, so its height does not vary with the
+//! message's reactions. From the top:
 //!
 //! - **Reactions.** The 16 [`FREQUENT_EMOJIS`] the desktop picker offers, in
 //!   one row that scrolls sideways. A tap reacts, or on the reader's current
 //!   reaction removes it, and closes the sheet. It takes focus when the sheet
 //!   opens (the current reaction, centred in the row, else the first).
-//! - **Who reacted.** For a message with reactions, each emoji with the
-//!   people behind it, the same names and ⚠ / 🛡 marks as the desktop chip's
-//!   list. It is how a phone sees who reacted: a chip tap reacts with its
-//!   emoji, so the names are here, behind a row tap or the +.
 //! - **Actions.** Reply, and Edit and Delete on your own message. Each closes
 //!   the sheet first and then hands over to the existing flow (the composer's
 //!   reply, the inline editor via `edit_trigger`, the delete confirmation),
@@ -31,10 +28,7 @@
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::mobile_surface::{dom, SHEET_ID, SHEET_TITLE};
 use super::reaction_picker::{choice_label, ReactionSurfaces};
-use super::reactor_marks;
 use crate::components::icons::{line_icon, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH};
-use crate::components::members::DeputyBadge;
-use crate::util::confusable::ImpersonationWarning;
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
 use std::cell::Cell;
@@ -55,25 +49,6 @@ pub(super) enum MobileAction {
     Delete,
 }
 
-/// Someone who reacted, as the row shows them.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct Reactor {
-    /// Their nickname, or "You".
-    pub(super) name: String,
-    pub(super) warning: Option<ImpersonationWarning>,
-    pub(super) badge: Option<DeputyBadge>,
-}
-
-/// One of a message's reactions: the emoji and who made it, in the order
-/// the row's chips show them.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct SheetReaction {
-    pub(super) emoji: String,
-    /// The reader is among them.
-    pub(super) mine: bool,
-    pub(super) reactors: Vec<Reactor>,
-}
-
 /// The conversation's one mobile message sheet. Rendered once by
 /// `Conversation`, closed until a row, its + or its entry opens it below
 /// 48rem.
@@ -87,7 +62,6 @@ pub(super) fn MobileMessageSheet(
     let target = opening.as_ref().map(|o| &o.target);
     let own = target.is_some_and(|t| t.own);
     let current = target.and_then(|t| t.current.clone());
-    let reactions = target.map(|t| t.reactions.clone()).unwrap_or_default();
     let target_row = target.map(|t| t.row.clone()).unwrap_or_default();
     // The opening this render shows (0: none, which no opening has). A
     // choice made in it is for that opening; the drag reads it from the DOM,
@@ -194,31 +168,6 @@ pub(super) fn MobileMessageSheet(
                                     "aria-label": choice_label(&emoji, is_current),
                                     onclick: pick(emoji.clone()),
                                     "{emoji}"
-                                }
-                            }
-                        }
-                    }
-                }
-                if !reactions.is_empty() {
-                    ul {
-                        "data-testid": "mobile-sheet-reactors",
-                        class: "mobile-sheet-reactors",
-                        "aria-label": "Who reacted",
-                        for reaction in reactions.iter() {
-                            li {
-                                key: "{reaction.emoji}",
-                                "data-testid": "mobile-sheet-reaction",
-                                class: "mobile-sheet-reaction",
-                                span { class: "mobile-sheet-reaction-emoji", "{reaction.emoji}" }
-                                span { class: "mobile-sheet-reaction-names",
-                                    for (index, reactor) in reaction.reactors.iter().enumerate() {
-                                        span {
-                                            key: "{index}",
-                                            class: "mobile-sheet-reactor",
-                                            span { "data-testid": "mobile-sheet-reactor", "{reactor.name}" }
-                                            {reactor_marks(reactor)}
-                                        }
-                                    }
                                 }
                             }
                         }

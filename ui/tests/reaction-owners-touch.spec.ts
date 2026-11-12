@@ -172,8 +172,7 @@ async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
   return chip;
 }
 
-// The reactor list exists at 48rem and wider: below it there is none, and the
-// mobile message sheet lists who reacted (mobile-message-sheet.spec.ts).
+// The reactor list exists at 48rem and wider: below it there is none.
 // So a phone project runs these at a touch tablet's width; the last block
 // goes back below 48rem.
 test.beforeEach(async ({ page }) => asTouchTablet(page));

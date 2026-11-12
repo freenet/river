@@ -124,7 +124,7 @@ Current behavior:
   sheet is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and parts of the panel still scroll (the emoji row
-  sideways, a long reactor list vertically); a zoom (Ctrl+wheel, a pinch) is
+  sideways); a zoom (Ctrl+wheel, a pinch) is
   not held, nothing outside the dialog is captured, and every close path
   removes the listeners. It can be dragged down from anywhere on the screen
   to dismiss it (`conversation/mobile_sheet_drag.rs`): its backdrop and panel
