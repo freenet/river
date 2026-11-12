@@ -43,13 +43,25 @@ function handlePoint(page: Page): Promise<[number, number]> {
 
 test.use({ viewport: { width: 390, height: 760 } });
 
-test("the row shows no scroll bar and takes only sideways pans", async ({ page }) => {
+test("the row shows no scroll bar; one finger pans only the row, and a pinch zooms everywhere", async ({ page }) => {
   await openSheet(page);
   const touchAction = (target: Locator) => target.evaluate((el) => getComputedStyle(el).touchAction);
   expect(await palette(page).evaluate((row) => row.offsetHeight - row.clientHeight), "no scroll bar takes room under the row").toBe(0);
-  expect(await touchAction(palette(page)), "the row pans only sideways").toBe("pan-x");
-  expect(await touchAction(page.getByTestId(BACKDROP)), "the backdrop leaves every move to the drag").toBe("none");
-  expect(await touchAction(page.locator(PANEL))).toBe("none");
+  expect(await touchAction(palette(page)), "the row pans only sideways").toBe("pan-x pinch-zoom");
+  expect(await touchAction(page.getByTestId(BACKDROP)), "the backdrop takes no pan: the drag has every one-finger move").toBe("pinch-zoom");
+  expect(await touchAction(page.locator(PANEL))).toBe("pinch-zoom");
+  // Every element from a choice up to the root allows the zoom.
+  const blockers = await choices(page)
+    .first()
+    .evaluate((el) => {
+      const out: string[] = [];
+      for (let e: Element | null = el; e; e = e.parentElement) {
+        const t = getComputedStyle(e).touchAction;
+        if (!/auto|manipulation|pinch-zoom/.test(t)) out.push(`${e.tagName}.${e.className}: ${t}`);
+      }
+      return out;
+    });
+  expect(blockers, "nothing between a choice and the root forbids a pinch").toEqual([]);
 });
 
 test("with reduced motion it opens and closes without sliding", { tag: "@chromium-only" }, async ({ page }) => {
@@ -217,6 +229,25 @@ test.describe("A finger on the message sheet", () => {
     await settle(page);
     await expect(sheet(page), "still open").toBeVisible();
   });
+
+  for (const where of ["the backdrop", "the emoji row", "the actions"] as const) {
+    test(`a pinch over ${where} zooms the page and leaves the sheet open`, async ({ page }) => {
+      await openSheet(page);
+      const h = await historyPoint(page);
+      const [x, y] =
+        where === "the backdrop"
+          ? [h.x + 120, h.y + 100]
+          : await centreOf(where === "the emoji row" ? palette(page) : page.getByTestId("mobile-message-action-reply"));
+      expect(await page.evaluate(() => window.visualViewport!.scale), "premise: not zoomed").toBe(1);
+      await withFingers(page, async (fingers) => {
+        await fingers.press([1, x - 20, y], [2, x + 20, y]);
+        await fingers.move({ 1: [-80, 0], 2: [80, 0] });
+        await fingers.lift();
+      });
+      expect(await page.evaluate(() => window.visualViewport!.scale), "the pinch zoomed").toBeGreaterThan(1.5);
+      await expect(sheet(page), "still open").toBeVisible();
+    });
+  }
 
   test("a sideways swipe on the row scrolls it, not the panel or the history, and is not a tap", async ({ page }) => {
     const row = await openSheet(page);

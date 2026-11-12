@@ -539,9 +539,9 @@
  * page.
  *
  * It slides up when it opens and can be dragged down from anywhere
- * (`mobile_sheet_drag.rs`): the backdrop and panel take no pan
- * (`touch-action: none`), so the pointer events reach the drag and nothing
- * scrolls, and a pinch still zooms. The drag sets the
+ * (`mobile_sheet_drag.rs`): the backdrop and panel take no one-finger pan
+ * (`touch-action: pinch-zoom`), so the pointer events reach the drag and
+ * nothing scrolls, and a pinch still zooms. The drag sets the
  * panel's inline `transform` and `--sheet-shade` (the dim, 0 to 1); released
  * short it settles back through the transition below, dismissed it slides
  * away (`is-leaving`). `is-dragging` follows the finger with no transition.
@@ -598,7 +598,7 @@
 
 .mobile-sheet-backdrop,
 .mobile-sheet-panel {
-    touch-action: none;
+    touch-action: pinch-zoom;
 }
 
 @keyframes mobile-sheet-in {
@@ -753,7 +753,7 @@
     overflow-y: hidden;
     overscroll-behavior-x: contain;
     scrollbar-width: none;
-    touch-action: pan-x;
+    touch-action: pan-x pinch-zoom;
 }
 
 .mobile-reaction-palette::-webkit-scrollbar {

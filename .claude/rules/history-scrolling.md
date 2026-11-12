@@ -128,8 +128,8 @@ Current behavior:
   not held, nothing outside the dialog is captured, and every close path
   removes the listeners. It can be dragged down from anywhere on the screen
   to dismiss it (`conversation/mobile_sheet_drag.rs`): its backdrop and panel
-  take no pan (`touch-action: none`), so the drag never scrolls the
-  history, and a second finger cancels it. Unlike the picker,
+  take no one-finger pan (`touch-action: pinch-zoom`), so the drag never
+  scrolls the history, and a second finger cancels it. Unlike the picker,
   a modal keeps holding while its message is still rendered, even after
   arrivals carried that row out of the history's view: only the message
   leaving the history closes it. Arrivals, following, the end hold and reads
