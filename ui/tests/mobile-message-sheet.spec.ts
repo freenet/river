@@ -522,6 +522,52 @@ test.describe("Below 48rem", () => {
     await expect(chips(row)).toHaveCount(1);
   });
 
+  for (const origin of ["the +", "the keyboard entry"] as const) {
+    test(`closing a sheet opened from ${origin}, its row carried out of view, does not scroll the history`, async ({ page }) => {
+      const { own } = await openRoomWithRows(page);
+      const control = own.getByTestId(origin === "the +" ? "message-react-button" : "mobile-message-actions-entry");
+      if (origin === "the +") {
+        // Focused, as a click leaves it on most engines (not Safari, where
+        // nothing was focused and nothing is restored).
+        await control.focus();
+        await press(control);
+      } else {
+        await keyboardFocus(page, control);
+        await page.keyboard.press("Enter");
+      }
+      await expectSheetOpenFor(page, own);
+      const tall = Array.from({ length: 40 }, (_, i) => `tall arrival ${i}`).join("\n\n");
+      await callRiverTest(page, "appendMessage", tall);
+      await expect(page.getByTestId("message-row").filter({ hasText: "tall arrival 39" })).toHaveCount(1);
+      await settle(page);
+      const above = await own.evaluate(
+        (el) => el.getBoundingClientRect().bottom <= document.getElementById("chat-scroll-container")!.getBoundingClientRect().top,
+      );
+      expect(above, "premise: the row is above the history's view").toBe(true);
+      for (const close of ["Escape", "backdrop"] as const) {
+        const top = (await scrollMetrics(page)).top;
+        if (close === "Escape") await page.keyboard.press("Escape");
+        else await pressAt(page, await historyPoint(page));
+        await expect(sheet(page)).toBeHidden();
+        await settle(page);
+        expect((await scrollMetrics(page)).top, `closed by ${close}: the history did not move`).toBe(top);
+        await expect(control, "focus is back on the control").toBeFocused();
+        if (close === "Escape") {
+          await page.keyboard.press("Enter");
+          await expectSheetOpenFor(page, own);
+        }
+      }
+      // The measure can fail: a focus that does scroll moves the history.
+      const top = (await scrollMetrics(page)).top;
+      await control.evaluate((el: HTMLElement) => {
+        el.blur();
+        el.focus();
+      });
+      await settle(page);
+      expect((await scrollMetrics(page)).top, "premise: a scrolling focus would have shown").toBeLessThan(top);
+    });
+  }
+
   test("opening and closing it renders no message group", async ({ page }) => {
     const { own } = await openRoomWithRows(page);
     await settle(page);
