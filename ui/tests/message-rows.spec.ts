@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { clickFooter, coarsePointer, inlineFooter, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, waitForApp } from "./example-room";
+import { asTouchTablet, clickFooter, coarsePointer, inlineFooter, nextFrames, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, resolveColor, revealFooter, selectRoom, sheet, waitForApp } from "./example-room";
 import { deliver, readerLeavesTheEnd, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import { expectAtReact, expectEveryEmojiUsable, measurePicker } from "./reaction-picker-geometry";
 import { callRiverTest } from "./river-test";
@@ -433,7 +433,10 @@ test.describe("Avatars", () => {
 });
 
 // Placement at React is reaction-picker.spec.ts's (reaction-picker-geometry.ts).
+// The anchored picker exists from 48rem; a phone runs these at a touch
+// tablet's width.
 test.describe("The picker opens at React", () => {
+  test.beforeEach(async ({ page }) => asTouchTablet(page));
   // Opened upward, it stays upward and at React when a reaction moves React.
   test("opened upward, stays at React when a reaction arrives", async ({ page }) => {
     await openRoomWithComposer(page);
@@ -584,23 +587,24 @@ const NO_STRAY_SCROLL = { historyLeft: 0, root: [0, 0], page: [0, 0] };
 // A popover that overflows sideways, on a short phone view, is revealed by
 // the history's scrollTop alone: `scrollIntoView` also scrolled the
 // history's scrollLeft and overflow-hidden ancestors, which nothing scrolls
-// back. The overflow is forced (the picker and the form fit at every real
-// width), so the old behaviour would show.
+// back. The overflow is forced (the form fits at every real width), so the
+// old behaviour would show. Below 48rem reactions are in the modal message
+// sheet, which moves no scroller at all, palette out included.
 test.describe("Revealing a popover on a short phone view", () => {
   test.use({ viewport: { width: 320, height: 480 } });
 
-  test("the picker and the edit form scroll nothing sideways or outside the history", async ({ page }) => {
+  test("the message sheet and the edit form scroll nothing sideways or outside the history", async ({ page }) => {
     await openRoomWithComposer(page);
     await page.addStyleTag({
-      content: '[data-testid="emoji-picker"] { min-width: 520px; min-height: 700px; } [id^="edit-form-"] { min-width: 600px; }',
+      content: '[id^="edit-form-"] { min-width: 600px; }',
     });
     const row = page.getByTestId("message-row").last();
     await openInlinePicker(page, row);
-    await expect(page.getByTestId("emoji-picker")).toBeVisible();
+    await expect(sheet(page)).toBeVisible();
     await nextFrames(page);
-    expect(await strayScroll(page), "picker").toEqual(NO_STRAY_SCROLL);
+    expect(await strayScroll(page), "message sheet").toEqual(NO_STRAY_SCROLL);
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId("emoji-picker")).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
 
     await openOwnMessageEdit(page);
     await nextFrames(page);
@@ -608,10 +612,29 @@ test.describe("Revealing a popover on a short phone view", () => {
   });
 });
 
+// The anchored picker's half of the same check, where it exists: a touch
+// tablet's width, short.
+test.describe("Revealing the picker on a short wide view", () => {
+  test.use({ viewport: { width: 834, height: 480 } });
+
+  test("the picker scrolls nothing sideways or outside the history", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await page.addStyleTag({ content: '[data-testid="emoji-picker"] { min-width: 1100px; min-height: 700px; }' });
+    const row = page.getByTestId("message-row").last();
+    await openInlinePicker(page, row);
+    await expect(page.getByTestId("emoji-picker")).toBeVisible();
+    await nextFrames(page);
+    expect(await strayScroll(page), "picker").toEqual(NO_STRAY_SCROLL);
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("emoji-picker")).toBeHidden();
+  });
+});
+
 // #791 review: the picker opened from the keyboard reports no click
 // position, so its place must come from the control. The newest message, at
 // the bottom of the view, has no room for the picker below its React.
 test("the picker opened from the keyboard at the bottom of the view opens upward", async ({ page }) => {
+  await asTouchTablet(page);
   await openRoomWithComposer(page);
   await deliver(page, "keyboard picker");
   const row = page.getByTestId("message-row").filter({ hasText: "keyboard picker" });
@@ -729,8 +752,9 @@ test.describe("Message row hover band", () => {
     await expect.poll(opacity).toBe("1");
   });
 
+  // The narrowest width with a reactor list: below 48rem there is none.
   test.describe("at a narrow width", () => {
-    test.use({ viewport: { width: 480, height: 800 } });
+    test.use({ viewport: { width: 768, height: 800 } });
 
     test("the band stays while the row's reactor list is open, and removing the reaction does not scroll", async ({ page }) => {
       const { received } = await openRoomWithPairs(page);
@@ -752,7 +776,7 @@ test.describe("Message row hover band", () => {
       await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).max - short);
       await expect(chip).toBeInViewport({ ratio: 1 });
       await chip.focus();
-      await page.keyboard.press("Enter");
+      await page.keyboard.press("Shift+Enter");
       const owners = page.getByTestId("reaction-owners");
       await expect(owners).toBeVisible();
       await expect(chip).toHaveAttribute("aria-expanded", "true");
@@ -768,7 +792,7 @@ test.describe("Message row hover band", () => {
       expect(await resolveColor(page, await background(row)), "the band stays while the list is open").toEqual(band);
       const box = (await owners.boundingBox())!;
       expect(box.x).toBeGreaterThanOrEqual(-0.5);
-      expect(box.x + box.width).toBeLessThanOrEqual(480.5);
+      expect(box.x + box.width).toBeLessThanOrEqual(768.5);
 
       // Remove the reaction from the list: the chip and the band go with it,
       // and nothing scrolls.
@@ -786,6 +810,8 @@ test.describe("Message row hover band", () => {
 // React on a message taller than the view: the picker opens at React, inside
 // the viewport, and takes the next click. Opening it never moves the history.
 test.describe("React on a tall message", () => {
+  // The anchored picker's case; a phone runs it at a touch tablet's width.
+  test.beforeEach(async ({ page }) => asTouchTablet(page));
   test("the picker opens in view and takes the next click", async ({ page }) => {
     await openRoomWithComposer(page);
     // Tall but well under the room's message-size limit (an over-size
@@ -859,7 +885,9 @@ test.describe("React on a tall message", () => {
 test.describe("Latest over row controls", () => {
   test("a row control aligned with Latest never takes its click", async ({ page }) => {
     const touch = await coarsePointer(page);
-    await page.setViewportSize(touch ? { width: 390, height: 800 } : { width: 1024, height: 800 });
+    // Touch: a tablet's width, where the cluster shows at rest (below 48rem
+    // it is in the message sheet instead).
+    await page.setViewportSize(touch ? { width: 834, height: 800 } : { width: 1024, height: 800 });
     await openRoomWithComposer(page);
     const control = '[data-testid="message-action-cluster"]';
     await readerLeavesTheEnd(page);
@@ -888,6 +916,47 @@ test.describe("Latest over row controls", () => {
     // Playwright refuses the click if the control would take it there.
     await latest.click({ position: { x: (left + right) / 2 - l.x, y: (top + bottom) / 2 - l.y } });
     await expect(latest).toBeHidden();
+  });
+});
+
+// At phone width the footer keeps only the +, at the row's left, and the
+// row's actions entry is a 1px button at its top right until it has keyboard
+// focus. Neither may take Latest's click: the entry is scrolled under
+// Latest's centre, and the + shown to stay clear of it.
+test.describe("Latest over row controls at phone width", () => {
+  test.use({ viewport: { width: 390, height: 800 } });
+
+  test("neither the + nor the actions entry takes Latest's click", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await readerLeavesTheEnd(page);
+    const latest = page.getByTestId("scroll-to-bottom");
+    await expect(latest).toBeVisible();
+    const l = (await latest.boundingBox())!;
+    // Every +: clear of Latest across, whatever height it is scrolled to.
+    const reacts = await page.getByTestId("message-react-button").evaluateAll((bs) => bs.map((b) => b.getBoundingClientRect().right));
+    expect(reacts.length).toBeGreaterThan(0);
+    for (const right of reacts) expect(right, "a + ends left of Latest").toBeLessThan(l.x);
+    // An entry scrolled under Latest's centre.
+    const { id, target } = await page.evaluate(() => {
+      const scroller = document.getElementById("chat-scroll-container")!;
+      const lb = document.querySelector('[data-testid="scroll-to-bottom"]')!.getBoundingClientRect();
+      const mid = scroller.getBoundingClientRect().top + scroller.clientHeight / 2;
+      const rows = [...document.querySelectorAll<HTMLElement>('[data-testid="message-row"]')];
+      const dist = (r: HTMLElement) => Math.abs(r.getBoundingClientRect().top - mid);
+      const row = rows.reduce((a, b) => (dist(b) < dist(a) ? b : a));
+      const c = row.querySelector('[data-testid="mobile-message-actions-entry"]')!.getBoundingClientRect();
+      return { id: row.id, target: scroller.scrollTop + c.top + c.height / 2 - (lb.top + lb.height / 2) };
+    });
+    await readerScrollsWithoutGesture(page, target);
+    const entry = page.locator(`[id="${id}"]`).getByTestId("mobile-message-actions-entry");
+    const e = (await entry.boundingBox())!;
+    const overlapsDown = Math.min(e.y + e.height, l.y + l.height) - Math.max(e.y, l.y);
+    expect(overlapsDown, "premise: the entry is at Latest's height").toBeGreaterThan(0);
+    const at = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.closest('[data-testid="scroll-to-bottom"]') !== null, [l.x + l.width / 2, l.y + l.height / 2]);
+    expect(at, "Latest's centre is Latest's").toBe(true);
+    await latest.click();
+    await expect(latest).toBeHidden();
+    await expect(sheet(page)).toBeHidden();
   });
 });
 

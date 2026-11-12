@@ -1,6 +1,6 @@
-import { test, expect, CDPSession, Locator, Page } from "@playwright/test";
-import { coarsePointer, committedRow, inlineFooter, nextFrames, openRoomWithComposer, revealFooter, settle, submitMessage } from "./example-room";
-import { deliver, deliverOffscreen, expectFollowed, hideChatBehindMembers, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
+import { test, expect, Locator, Page } from "@playwright/test";
+import { asTouchTablet, coarsePointer, committedRow, DRAG_PX, Fingers, inlineFooter, nextFrames, openRoomWithComposer, revealFooter, rowKey, settle, submitMessage, wheelCancelled, withFingers } from "./example-room";
+import { deliver, deliverOffscreen, expectFollowed, readerScrollsWithoutGesture, scrollMetrics } from "./history-geometry";
 import {
   expectAtReact,
   expectEveryEmojiUsable,
@@ -20,6 +20,15 @@ import { callRiverTest } from "./river-test";
 // picker too, as the full-screen backdrop it replaced did, but a zoom (a Ctrl
 // wheel, a pinch) is not, arrivals are still followed, and closing lets go of
 // all of it.
+//
+// The picker exists from 48rem: below that a React opens the mobile message
+// sheet instead (mobile-message-sheet.spec.ts). So a phone project runs
+// these at a touch tablet's width, keeping its touch input: the wide
+// coarse-pointer case.
+test.beforeEach(async ({ page }) => {
+  const vp = page.viewportSize();
+  if (vp && vp.width === test.info().project.use.viewport?.width) await asTouchTablet(page);
+});
 
 const PICKER = '[data-testid="emoji-picker"]';
 
@@ -355,8 +364,7 @@ test.describe("The reaction picker", () => {
     ]);
     const [lead, middle, survivor] = ["remount lead", "remount middle", "remount survivor"].map((t) => committedRow(page, t));
     await expect(survivor).toHaveCount(1);
-    const keyOf = async (row: Locator) => (await row.getAttribute("id"))!.replace(/^msg-/, "");
-    const [leadKey, middleKey, survivorKey] = [await keyOf(lead), await keyOf(middle), await keyOf(survivor)];
+    const [leadKey, middleKey, survivorKey] = [await rowKey(lead), await rowKey(middle), await rowKey(survivor)];
     const groupKey = (row: Locator) => row.evaluate((el) => el.closest(".msg-group")?.getAttribute("data-item-key") ?? null);
     for (const row of [lead, middle, survivor]) expect(await groupKey(row), "premise: one group, keyed by its first message").toBe(leadKey);
     expect(
@@ -528,10 +536,13 @@ test.describe("The reaction picker", () => {
 });
 
 test.describe("Reaction picker placement", () => {
-  test.describe("at 320px", () => {
-    test.use({ viewport: { width: 320, height: 700 } });
+  // The narrowest window the picker has (below 48rem a React opens the
+  // mobile sheet). React is never at the window's left edge there, so the
+  // picker opens back from it, its right edge on React's.
+  test.describe("at 768px", () => {
+    test.use({ viewport: { width: 768, height: 700 } });
 
-    test("at a React with no chips it opens toward the free side, at one at the column's end back from it, and after wrapped chips at React", async ({ page }) => {
+    test("at a React with no chips it opens back from React, at one at the column's end too, and after wrapped chips at React", async ({ page }) => {
       await openRoomWithComposer(page);
       await deliverOffscreen(page, "start edge");
       // Room below it, so only the inline side has to give.
@@ -541,8 +552,8 @@ test.describe("Reaction picker placement", () => {
       await openFromKeyboard(page, start);
       let m = await measurePicker(start);
       expect(m.react.right - m.react.left, "premise").toBeGreaterThan(0);
-      expect(m.react.right - (m.picker.right - m.picker.left), "premise: no room back from React").toBeLessThan(0);
-      expect(placement(m)).toEqual({ block: "below", inline: "start" });
+      expect(m.react.right - (m.picker.right - m.picker.left), "premise: room back from React").toBeGreaterThan(0);
+      expect(placement(m)).toEqual({ block: "below", inline: "end" });
       expectEveryEmojiUsable(m);
       expectInvokerUncovered(m);
       await page.keyboard.press("Escape");
@@ -551,7 +562,7 @@ test.describe("Reaction picker placement", () => {
       // column's right edge: it opens back from React, its right edge on
       // React's. The count is measured: a fixed one fits a line in one engine
       // and wraps in another (WebKit's emoji chips are 3px wider).
-      const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"];
+      const emojis = ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯", "🦀", "🐙", "🌵", "🍕", "🚀", "⚡", "🎈", "🧩", "🎯", "🪐", "🌈", "🍀", "🐝", "🦄"];
       const end = committedRow(page, "start filler 2");
       const chips = end.getByTestId("reaction-chip");
       await callRiverTest(page, "addReactionsToNewest", emojis.slice(0, 1));
@@ -585,7 +596,7 @@ test.describe("Reaction picker placement", () => {
       const wrapped = committedRow(page, "wrap target");
       await expect(wrapped).toHaveCount(1);
       await callRiverTest(page, "addReactionsToNewest", emojis);
-      await expect(wrapped.getByTestId("reaction-chip")).toHaveCount(10);
+      await expect(wrapped.getByTestId("reaction-chip")).toHaveCount(emojis.length);
       await wrapped.evaluate((el) => el.scrollIntoView({ block: "end" }));
       const lines = await wrapped.getByTestId("reaction-chip").evaluateAll((els) => new Set(els.map((e) => Math.round(e.getBoundingClientRect().top))).size);
       expect(lines, "premise: the chips wrap").toBeGreaterThan(1);
@@ -597,18 +608,48 @@ test.describe("Reaction picker placement", () => {
     });
   });
 
-  test.describe("in a short landscape view", () => {
-    test.use({ viewport: { width: 740, height: 360 } });
+  // React at the window's left edge, with no room back from it, is no
+  // longer reachable by layout at 48rem and wider (the rooms rail is there);
+  // the rail is taken out here so the start-side fallback stays covered.
+  test.describe("with no room back from React", () => {
+    test.use({ viewport: { width: 900, height: 700 } });
 
-    test("at the newest message's React it opens above, and toward the free side", async ({ page }) => {
+    test("it opens from React's left edge toward the free side", async ({ page }) => {
+      await openRoomWithComposer(page);
+      // The rail and avatar gutter out, and the column against the window's left edge.
+      await page.evaluate(() => {
+        let rail: Element | null = document.querySelector('[data-testid="room-list"]');
+        while (rail && rail.parentElement && !rail.parentElement.classList.contains("app-root")) rail = rail.parentElement;
+        (rail as HTMLElement).style.setProperty("display", "none", "important");
+      });
+      await page.addStyleTag({ content: ".conversation-column { margin-inline: 0 !important; } .msg-row { --msg-gutter: 0px; } .msg-gutter { visibility: hidden; }" });
+      await deliverOffscreen(page, "start edge desktop");
+      // A reaction keeps React on the left-hand footer line on desktop too.
+      await callRiverTest(page, "addReactionsToNewest", ["👍"]);
+      const start = committedRow(page, "start edge desktop");
+      await expect(start.getByTestId("reaction-chip")).toHaveCount(1);
+      for (let i = 0; i < 3; i++) await deliverOffscreen(page, `start desktop filler ${i}: ${"s".repeat(200)}`);
+      await start.evaluate((el) => el.scrollIntoView({ block: "center" }));
+      await openFromKeyboard(page, start);
+      const m = await measurePicker(start);
+      expect(m.react.right - (m.picker.right - m.picker.left), "premise: no room back from React").toBeLessThan(0);
+      expect(placement(m)).toEqual({ block: "below", inline: "start" });
+      expectEveryEmojiUsable(m);
+      expectInvokerUncovered(m);
+    });
+  });
+
+  test.describe("in a short landscape view", () => {
+    test.use({ viewport: { width: 800, height: 360 } });
+
+    test("at the newest message's React it opens above, back from React", async ({ page }) => {
       await openRoomWithComposer(page);
       await deliver(page, "corner target");
       const row = committedRow(page, "corner target");
       await openFromKeyboard(page, row);
       const m = await measurePicker(row);
       expect(m.vh - m.react.bottom, "premise: no room below React").toBeLessThan(m.picker.bottom - m.picker.top + PICKER_GAP);
-      expect(m.react.right - (m.picker.right - m.picker.left), "premise: no room back from React").toBeLessThan(0);
-      expect(placement(m)).toEqual({ block: "above", inline: "start" });
+      expect(placement(m)).toEqual({ block: "above", inline: "end" });
       expectEveryEmojiUsable(m);
       expectInvokerUncovered(m);
     });
@@ -680,19 +721,6 @@ async function wheelAt(page: Page, x: number, y: number) {
   await page.mouse.move(x, y);
   await page.mouse.wheel(0, -WHEEL_DELTA);
   await settle(page);
-}
-
-/// Whether a synthetic, cancelable wheel dispatched where (x, y) lands was
-/// cancelled: the hold's handler contract, not the browser's scroll or zoom.
-function wheelCancelled(page: Page, x: number, y: number, ctrlKey: boolean): Promise<boolean> {
-  return page.evaluate(
-    ([x, y, ctrlKey]) => {
-      const at = document.elementFromPoint(x, y)!;
-      const wheel = new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: y, ctrlKey, bubbles: true, cancelable: true });
-      return !at.dispatchEvent(wheel);
-    },
-    [x, y, ctrlKey] as const,
-  );
 }
 
 test.describe("While the reaction picker is open", () => {
@@ -854,26 +882,49 @@ test.describe("While the reaction picker is open", () => {
     expect(await isOpen(page), "still open").toBe(true);
   });
 
-  test("once narrowing the window hides the conversation behind the members panel, a wheel is let through and closes it", async ({ page }) => {
+  // #863 with a desktop width: its React stops being laid out (its row
+  // collapsed here; the narrow-window version of this now closes the picker
+  // at 48rem instead). A zoom is let through and closes nothing; the next
+  // plain wheel is let through and closes it.
+  test("once its React is no longer laid out, a zoom closes nothing and the next wheel is let through and closes it", async ({ page }) => {
     test.skip(test.info().project.name.startsWith("mobile"), "no wheel on a phone");
-    await page.setViewportSize({ width: 390, height: 844 });
-    await openRoomWithComposer(page);
-    await deliver(page, "hidden anchor");
-    await hideChatBehindMembers(page);
     await page.setViewportSize({ width: 1280, height: 844 });
-    await expect(page.locator("#chat-scroll-container"), "premise: wide, the chat shows beside the members").toBeVisible();
-    const row = committedRow(page, "hidden anchor");
+    await openRoomWithComposer(page);
+    await deliver(page, "collapsed anchor");
+    const row = committedRow(page, "collapsed anchor");
     await openFromKeyboard(page, row);
-
-    await page.setViewportSize({ width: 390, height: 844 });
-    await expect(page.locator("#chat-scroll-container"), "premise: narrow again, the chat is hidden").toBeHidden();
-    expect(await isOpen(page), "premise: hiding the chat alone does not close it").toBe(true);
-    const rail = (await page.getByTestId("members-rail").boundingBox())!;
-    const [x, y] = [rail.x + rail.width / 2, rail.y + rail.height / 2];
+    await page.addStyleTag({ content: '.msg-group:has([data-testid="message-react-button"][aria-expanded="true"]) { display: none !important; }' });
+    await nextFrames(page);
+    expect(await row.evaluate((el) => el.getBoundingClientRect().height), "premise: its row is not laid out").toBe(0);
+    expect(await isOpen(page), "premise: hiding it alone does not close it").toBe(true);
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [view.x + 30, view.y + 30];
     expect(await wheelCancelled(page, x, y, true), "a zoom is let through").toBe(false);
     expect(await isOpen(page), "a zoom does not close it").toBe(true);
     expect(await wheelCancelled(page, x, y, false), "the wheel is not cancelled").toBe(false);
     await expectClosed(page);
+  });
+
+  // Below 48rem the React is the mobile sheet's, so narrowing the window
+  // closes the picker outright and lets go of its hold; widening again
+  // reopens nothing.
+  test("narrowing the window below 48rem closes it, lets go of the wheel, and widening reopens nothing", { tag: "@chromium-only" }, async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await openRoomWithComposer(page);
+    await deliver(page, "narrowed anchor");
+    const row = committedRow(page, "narrowed anchor");
+    await openFromKeyboard(page, row);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expectClosed(page);
+    await expect(row.getByTestId("message-react-button"), "now the sheet's").toHaveAttribute("aria-controls", "mobile-message-sheet");
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    const [x, y] = [view.x + 30, view.y + 30];
+    expect(await wheelCancelled(page, x, y, false), "the wheel is not held").toBe(false);
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await settle(page);
+    await expectClosed(page);
+    await expect(row.getByTestId("message-react-button")).toHaveAttribute("aria-controls", "reaction-picker");
   });
 
   test("an automatic reload waits, and closing it does not release one an unsent message holds", { tag: "@chromium-only" }, async ({ page }) => {
@@ -910,7 +961,7 @@ test.describe("While the reaction picker is open", () => {
   // where they overlap, and a press on an uncovered toast button closes the
   // picker and runs the button on that same press.
   test("an uncovered toast action runs once on the press that closes the picker; a covered one waits", async ({ page }) => {
-    await page.setViewportSize({ width: 320, height: 700 });
+    await page.setViewportSize({ width: 768, height: 700 });
     await openRoomWithComposer(page);
     await deliver(page, "toast target");
     const row = committedRow(page, "toast target");
@@ -946,78 +997,6 @@ test.describe("While the reaction picker is open", () => {
     expect(await callRiverTest(page, "takeToastActionRuns"), "the action ran once, after the picker closed").toBe(1);
   });
 });
-
-const DRAG_PX = 80;
-
-type Finger = { x: number; y: number };
-
-/// Fingers on the screen, through Chromium's input protocol: the browser
-/// hit-tests them, fires pointer and touch events, captures and scrolls as it
-/// does for a real finger. Spelled out as touchStart, touchMove a frame apart,
-/// touchEnd: `Input.synthesizeScrollGesture` with a touch source fires no
-/// touchmove and scrolls nothing in Linux headless Chromium (CI), picker open
-/// or not.
-class Fingers {
-  private down = new Map<number, Finger>();
-  constructor(readonly cdp: CDPSession) {}
-
-  private send(type: "touchStart" | "touchMove" | "touchEnd" | "touchCancel") {
-    const touchPoints = type === "touchEnd" || type === "touchCancel" ? [] : [...this.down].map(([id, p]) => ({ id, x: p.x, y: p.y }));
-    return this.cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
-  }
-
-  get anyDown(): boolean {
-    return this.down.size > 0;
-  }
-
-  /// Put fingers down, together.
-  async press(...fingers: [number, number, number][]) {
-    for (const [id, x, y] of fingers) this.down.set(id, { x, y });
-    await this.send("touchStart");
-  }
-
-  /// Move each finger by its own vertical distance, in steps a frame apart.
-  async move(dys: Record<number, number>, steps = 10) {
-    const from = new Map([...this.down].map(([id, p]) => [id, { ...p }]));
-    for (let i = 1; i <= steps; i++) {
-      for (const [id, dy] of Object.entries(dys)) this.down.get(Number(id))!.y = from.get(Number(id))!.y + (dy * i) / steps;
-      await this.send("touchMove");
-      await new Promise((r) => setTimeout(r, 16));
-    }
-  }
-
-  /// Every finger lifts.
-  async lift() {
-    this.down.clear();
-    await this.send("touchEnd");
-  }
-
-  /// The browser cancels every finger.
-  async cancel() {
-    this.down.clear();
-    await this.send("touchCancel");
-  }
-
-  /// One finger, down at (x, y), dragged `dy` and lifted.
-  async drag(x: number, y: number, dy = DRAG_PX) {
-    await this.press([1, x, y]);
-    await this.move({ 1: dy });
-    await this.lift();
-  }
-}
-
-/// Run `body` with fingers on `page`, every one lifted and the session
-/// detached afterwards, whatever happens.
-async function withFingers(page: Page, body: (fingers: Fingers) => Promise<void>) {
-  const cdp = await page.context().newCDPSession(page);
-  const fingers = new Fingers(cdp);
-  try {
-    await body(fingers);
-  } finally {
-    if (fingers.anyDown) await fingers.cancel().catch(() => {});
-    await cdp.detach();
-  }
-}
 
 /// Record the touch pointers pressed and every touchmove as the page last
 /// sees it (window, bubbling): how many fingers it had and whether it was
@@ -1505,7 +1484,7 @@ test.describe("Without a working Popover API", () => {
     const [lead, survivor] = [committedRow(page, "quiet lead"), committedRow(page, "quiet survivor")];
     await expect(survivor).toHaveCount(1);
     const groupKey = (row: Locator) => row.evaluate((el) => el.closest(".msg-group")?.getAttribute("data-item-key") ?? null);
-    const leadKey = (await lead.getAttribute("id"))!.replace(/^msg-/, "");
+    const leadKey = await rowKey(lead);
     expect(await groupKey(survivor), "premise: one group, keyed by the lead").toBe(leadKey);
     await page.getByTestId("message-input").blur();
     const signs = await callRiverTest(page, "messageSignsRecorded");

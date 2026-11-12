@@ -74,10 +74,12 @@ function rowLayout(row: Locator) {
     // The code block the message ends with, at the top level or in a last quote.
     const lastPre =
       last?.tagName === "PRE" ? last : last?.tagName === "BLOCKQUOTE" && last.lastElementChild?.tagName === "PRE" ? last.lastElementChild : null;
-    const controls = Array.from(footer.querySelectorAll("button")).map((b) => ({
-      id: b.getAttribute("data-testid") ?? "?",
-      box: box(b.getBoundingClientRect()),
-    }));
+    const controls = Array.from(footer.querySelectorAll("button"))
+      .map((b) => ({
+        id: b.getAttribute("data-testid") ?? "?",
+        box: box(b.getBoundingClientRect()),
+      }))
+      .filter((c) => c.box.right > c.box.left && c.box.bottom > c.box.top);
     const f = footer.getBoundingClientRect();
     const hit = document.elementFromPoint(f.left + f.width / 2, f.top + f.height / 2);
     const bodyText = textLines(body);

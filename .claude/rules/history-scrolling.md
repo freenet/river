@@ -96,8 +96,9 @@ Current behavior:
   (`reader_moved_up_since`) is the latch that caused #508.
 - The history follows under every dialog and popover, a DM thread over the
   room included, and is read under all of them except that DM thread: member
-  info, room settings, invite and ban dialogs, a reactor list and the
-  reaction picker. The reader is at the end anyway when the dialog
+  info, room settings, invite and ban dialogs, a reactor list, the
+  reaction picker, and below 48rem the mobile message sheet
+  (`conversation/mobile_surface.rs`). The reader is at the end anyway when the dialog
   closes, but those arrivals count as read without having been on screen
   unobstructed.
 - While the reaction picker is open the reader's own wheel and one-finger
@@ -114,6 +115,28 @@ Current behavior:
   mid-drag. A picker whose React is no longer inside the history's view
   (arrivals followed past it, or the conversation was hidden) holds nothing:
   the next wheel or one-finger drag closes it and scrolls as usual.
+- Below 48rem a row tap, the + or the row's keyboard entry opens the one
+  mobile message sheet, a native modal `<dialog>`
+  (`conversation/mobile_message_sheet.rs`; its state and input hold are in
+  `conversation/mobile_surface.rs`). A reaction chip opens nothing: a
+  press on it reacts with its emoji, at every width. At 48rem and wider a
+  finger held on a chip, or Shift+Enter, opens its reactor list. While the
+  sheet is open the reader's wheel
+  and one-finger touch scrolling outside its panel are held off, as the
+  picker holds them, and the emoji row in its panel still scrolls sideways;
+  a zoom (Ctrl+wheel, a pinch) is not held, nothing outside the dialog is captured, and every close path
+  removes the listeners. It can be dragged down from anywhere on the screen
+  to dismiss it (`conversation/mobile_sheet_drag.rs`): its backdrop and panel
+  take no one-finger pan (`touch-action: pinch-zoom`), so the drag never
+  scrolls the history, and a second finger cancels it. For 350 ms after a
+  tap or click opens it, a pointer's click in it does nothing (a double
+  tap's second tap); a key's does. Unlike the picker,
+  a modal keeps holding while its message is still rendered, even after
+  arrivals carried that row out of the history's view: only the message
+  leaving the history closes it. Arrivals, following, the end hold and reads
+  go on underneath as under the other dialogs, and opening or closing it
+  never scrolls the history (focus returns to the row's control with
+  `preventScroll`).
 
 Known limitations:
 

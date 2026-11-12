@@ -1,14 +1,18 @@
 import { test, expect, Locator, Page } from "@playwright/test";
 import {
+  asTouchTablet,
   clickFooter,
   coarsePointer,
   committedRow,
+  controlStates,
   FOOTER_CONTROLS,
+  inlineFooter,
   keyboardFocus,
   openRoomWithComposer,
   reactTo,
   revealFooter,
   settle,
+  SHOWN,
   submitMessage,
 } from "./example-room";
 import { callRiverTest } from "./river-test";
@@ -21,7 +25,10 @@ import { callRiverTest } from "./river-test";
 // anything. A fine pointer shows them while the row is
 // hovered, holds keyboard focus or has its picker open, and shows a control
 // that has focus however it got it; a touch or hybrid pointer shows them at
-// rest. Reaction chips always show.
+// rest. Reaction chips always show. Below 48rem the trailing cluster is
+// hidden and a tap on the row opens it in the message sheet
+// (mobile-message-sheet.spec.ts); a phone runs the desktop footer's checks
+// at a touch tablet's width.
 
 /// A received message (a fixed test identity, inserted before the newest)
 /// and an own one (sent from the composer), neither with reactions.
@@ -40,26 +47,10 @@ function testIds(container: Locator): Promise<string[]> {
   );
 }
 
-/// Whether each control is shown and takes a hit at its centre.
-function controlStates(row: Locator, ids: string[]) {
-  return row.evaluate(async (el, ids) => {
-    const out: Record<string, { opacity: string; hit: boolean }> = {};
-    for (const id of ids) {
-      const b = el.querySelector(`[data-testid="${id}"]`) as HTMLElement;
-      await Promise.all(b.getAnimations().map((a) => a.finished));
-      const r = b.getBoundingClientRect();
-      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      out[id] = { opacity: getComputedStyle(b).opacity, hit: !!at && b.contains(at) };
-    }
-    return out;
-  }, ids);
-}
-
 function allStates(ids: string[], state: { opacity: string; hit: boolean }) {
   return Object.fromEntries(ids.map((id) => [id, state]));
 }
 
-const SHOWN = { opacity: "1", hit: true };
 const HIDDEN = { opacity: "0", hit: false };
 
 function rowBox(row: Locator) {
@@ -72,6 +63,7 @@ function rowBox(row: Locator) {
 
 test.describe("Message footer", () => {
   test("every signed message has one footer: chips and one React, then Reply, with Edit and Delete only on your own", async ({ page }) => {
+    await asTouchTablet(page);
     const { received, own } = await openRoomWithBoth(page);
 
     for (const [row, cluster] of [
@@ -250,7 +242,11 @@ test.describe("Footer controls on a fine pointer", () => {
 });
 
 test.describe("Footer controls on a touch pointer", () => {
-  test.beforeEach(async ({ page }) => test.skip(!(await coarsePointer(page)), "hidden at rest on a fine pointer"));
+  test.beforeEach(async ({ page }) => {
+    test.skip(!(await coarsePointer(page)), "hidden at rest on a fine pointer");
+    // A touch tablet: wide enough for the trailing cluster.
+    await asTouchTablet(page);
+  });
 
   test("shown and tappable at rest", async ({ page }) => {
     const { received, own } = await openRoomWithBoth(page);
@@ -314,10 +310,50 @@ type Box = { left: number; right: number; top: number; bottom: number; width: nu
 const overlaps = (a: Box, b: Box) =>
   Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
 
-function expectUsableFooter(layout: Awaited<ReturnType<typeof footerLayout>>, what: string) {
-  const all = [...layout.left, ...layout.cluster];
-  // React follows the chips; the cluster is Reply, Edit, Delete.
+type Layout = Awaited<ReturnType<typeof footerLayout>>;
+type Control = Layout["left"][number];
+
+/// Targets of the footer's size, each taking every hit inside it.
+function expectTargets(controls: Control[], what: string) {
+  for (const c of controls) {
+    expect(c.box.width, `${what}: ${c.id} width`).toBeGreaterThanOrEqual(26);
+    expect(c.box.height, `${what}: ${c.id} height`).toBeGreaterThanOrEqual(26);
+    expect(c.misses, `${what}: a hit anywhere in ${c.id} reaches it`).toEqual([]);
+  }
+}
+
+/// None of `controls` overlaps another or the message, and each is inside
+/// the content column and the screen.
+function expectClear(controls: Control[], layout: Layout, what: string) {
+  for (let i = 0; i < controls.length; i++) {
+    expect(overlaps(controls[i].box, layout.body), `${what}: ${controls[i].id} clear of the message`).toBe(false);
+    for (let j = i + 1; j < controls.length; j++) {
+      expect(overlaps(controls[i].box, controls[j].box), `${what}: ${controls[i].id} #${i} and ${controls[j].id} #${j} overlap`).toBe(false);
+    }
+    expect(controls[i].box.left).toBeGreaterThanOrEqual(layout.content.left - 0.5);
+    expect(controls[i].box.right).toBeLessThanOrEqual(Math.min(layout.content.right, layout.scroller.right, layout.viewport) + 0.5);
+  }
+}
+
+/// The footer's left group: React after its chips, a footer-sized target,
+/// and every chip taking a hit at its centre.
+function expectUsableLeftGroup(layout: Layout, what: string) {
   expect(layout.left.at(-1)!.id, `${what}: React ends the left group`).toBe("message-react-button");
+  // React after its last chip: on the same line to its right, or below it.
+  const chips = layout.left.slice(0, -1);
+  const react = layout.left.at(-1)!.box;
+  if (chips.length) {
+    const last = chips.at(-1)!.box;
+    const sameLine = react.top < last.bottom && react.bottom > last.top;
+    expect(sameLine ? react.left >= last.right - 0.5 : react.top >= last.bottom - 0.5, `${what}: React follows the chips`).toBe(true);
+  }
+  expectTargets([layout.left.at(-1)!], what);
+  expect(layout.chipCentreMisses, `${what}: every chip takes a hit at its centre`).toBe(0);
+}
+
+/// A footer on its own line: the left group, then Reply, Edit and Delete.
+function expectUsableFooter(layout: Layout, what: string) {
+  expectUsableLeftGroup(layout, what);
   expect(layout.cluster.map((c) => c.id), `${what}: the trailing cluster`).toEqual([
     "message-reply-button",
     "message-edit-button",
@@ -331,73 +367,79 @@ function expectUsableFooter(layout: Awaited<ReturnType<typeof footerLayout>>, wh
       layout.cluster[i - 1].box.right - 0.5,
     );
   }
-  // React after its last chip: on the same line to its right, or below it.
-  const chips = layout.left.slice(0, -1);
-  const react = layout.left.at(-1)!.box;
-  if (chips.length) {
-    const last = chips.at(-1)!.box;
-    const sameLine = react.top < last.bottom && react.bottom > last.top;
-    expect(sameLine ? react.left >= last.right - 0.5 : react.top >= last.bottom - 0.5, `${what}: React follows the chips`).toBe(true);
-  }
-  // On a line it shares with the cluster, the left group ends 16px before it.
+  // Chips sharing the cluster's line stay 16px clear of it.
   const first = layout.cluster[0].box;
   const sharing = layout.left.filter((c) => c.box.top < first.bottom && c.box.bottom > first.top);
   if (sharing.length) {
     const end = Math.max(...sharing.map((c) => c.box.right));
     expect(first.left - end, `${what}: the gap before the cluster`).toBeGreaterThanOrEqual(16 - 0.5);
   }
-  // Targets of the footer's size, none overlapping another or the message.
-  for (const c of [layout.left.at(-1)!, ...layout.cluster]) {
-    expect(c.box.width, `${what}: ${c.id} width`).toBeGreaterThanOrEqual(26);
-    expect(c.box.height, `${what}: ${c.id} height`).toBeGreaterThanOrEqual(26);
-    expect(c.misses, `${what}: a hit anywhere in ${c.id} reaches it`).toEqual([]);
-  }
-  expect(layout.chipCentreMisses, `${what}: every chip takes a hit at its centre`).toBe(0);
-  for (let i = 0; i < all.length; i++) {
-    expect(overlaps(all[i].box, layout.body), `${what}: ${all[i].id} clear of the message`).toBe(false);
-    for (let j = i + 1; j < all.length; j++) {
-      expect(overlaps(all[i].box, all[j].box), `${what}: ${all[i].id} #${i} and ${all[j].id} #${j} overlap`).toBe(false);
-    }
-    // Inside the content column and the screen.
-    expect(all[i].box.left).toBeGreaterThanOrEqual(layout.content.left - 0.5);
-    expect(all[i].box.right).toBeLessThanOrEqual(Math.min(layout.content.right, layout.scroller.right, layout.viewport) + 0.5);
-  }
+  expectTargets(layout.cluster, what);
+  expectClear([...layout.left, ...layout.cluster], layout, what);
+}
+
+/// Two own messages at the end of the history: `<prefix> bare`, with no
+/// reactions, then `<prefix> chips`, with ten.
+async function openRoomWithBareAndChips(page: Page, prefix: string): Promise<{ bare: Locator; row: Locator }> {
+  await openRoomWithComposer(page);
+  const bare = await submitMessage(page, `${prefix} bare`);
+  await expect(bare).toHaveCount(1);
+  const row = await submitMessage(page, `${prefix} chips`);
+  await expect(row).toHaveCount(1);
+  await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"]);
+  await expect(row.getByTestId("reaction-chip")).toHaveCount(10);
+  return { bare, row };
 }
 
 test.describe("Footer at 320px", () => {
   test.use({ viewport: { width: 320, height: 700 } });
 
-  test("chips wrap with React after them, the cluster stays whole, and every target takes its own hits", async ({ page }) => {
-    await openRoomWithComposer(page);
-    const bare = await submitMessage(page, "narrow bare");
-    await expect(bare).toHaveCount(1);
-    const row = await submitMessage(page, "narrow chips");
-    await expect(row).toHaveCount(1);
-    await callRiverTest(page, "addReactionsToNewest", ["👍", "❤️", "😂", "🔥", "🎉", "👀", "😮", "😢", "🙏", "💯"]);
-    await expect(row.getByTestId("reaction-chip")).toHaveCount(10);
-
+  // Below 48rem the footer is the chips and the +: Reply, Edit and Delete are
+  // a tap on the row away, in the message sheet.
+  test("chips wrap with React after them, no trailing cluster, and every target takes its own hits", async ({ page }) => {
+    const { bare, row } = await openRoomWithBareAndChips(page, "narrow");
     for (const [what, target] of [
       ["no chips", bare],
       ["wrapped chips", row],
     ] as const) {
       await target.evaluate((el) => el.scrollIntoView({ block: "center" }));
-      await revealFooter(page, target);
       await settle(page);
       const layout = await footerLayout(target);
+      expect(
+        layout.cluster.filter((c) => c.box.width > 0 || c.box.height > 0),
+        `${what}: no visible trailing cluster`,
+      ).toEqual([]);
       if (what === "wrapped chips") {
         const lines = new Set(layout.left.filter((c) => c.id === "reaction-chip").map((c) => Math.round(c.box.top)));
         expect(lines.size, "premise: the chips wrap").toBeGreaterThan(1);
-        // Chips are `role="button"` spans; React is the line's one native button.
         expect(await testIds(target.getByTestId("message-reaction-row"))).toEqual(["message-react-button"]);
       } else {
-        expect(layout.left.length, "premise: no chips").toBe(1);
-        const [react, reply] = [layout.left[0].box, layout.cluster[0].box];
-        expect(Math.abs(react.top - reply.top), "with no chips React and the cluster share the line").toBeLessThan(1);
+        expect(layout.left.map((c) => c.id), "premise: no chips").toEqual(["message-react-button"]);
       }
-      expectUsableFooter(layout, what);
+      expectUsableLeftGroup(layout, what);
+      expectClear(layout.left, layout, what);
     }
+  });
+});
 
-    // The real controls answer real presses.
+test.describe("Footer at 768px", () => {
+  test.use({ viewport: { width: 768, height: 700 } });
+
+  // The narrowest desktop footer: React after the chips, the cluster whole.
+  test("React follows the chips, the cluster stays whole, and every target takes its own hits", async ({ page }) => {
+    const { bare, row } = await openRoomWithBareAndChips(page, "tablet");
+    for (const [what, target] of [
+      ["no chips", bare],
+      ["chips", row],
+    ] as const) {
+      // With a mouse a bare row has no footer line: its controls end its
+      // last line (message-actions-inline.spec.ts).
+      if (what === "no chips" && (await inlineFooter(page))) continue;
+      await target.evaluate((el) => el.scrollIntoView({ block: "center" }));
+      await revealFooter(page, target);
+      await settle(page);
+      expectUsableFooter(await footerLayout(target), what);
+    }
     await clickFooter(page, row, "message-react-button");
     await expect(page.getByTestId("emoji-picker")).toBeVisible();
     await page.keyboard.press("Escape");

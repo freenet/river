@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { committedRow, FOOTER_CONTROLS, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, reactTo, settle, submitMessage } from "./example-room";
+import { committedRow, FOOTER_CONTROLS, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, press, reactionChoices, reactTo, settle, submitMessage } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // An own message is signed by the chat delegate, which can take seconds. It
@@ -125,10 +125,10 @@ test("an own reaction, a switch to another emoji, and an edit show while their s
 
   // The reaction, still being signed, switches to another emoji from the footer.
   await openInlinePicker(page, row);
-  const second = page.getByTestId("emoji-picker").getByRole("button").nth(1);
+  const second = (await reactionChoices(page)).nth(1);
   const secondEmoji = (await second.textContent())!.trim();
   expect(secondEmoji, "premise: another emoji").not.toBe(first.replace(/\d+$/, ""));
-  await second.click();
+  await press(second);
   await expect(chip).toHaveCount(1);
   await expect(chip, "the switch shows before it is signed").toContainText(secondEmoji);
 
@@ -153,7 +153,7 @@ test("a second click on a reaction still being signed undoes it", { tag: "@chrom
 
   await callRiverTest(page, "holdMessageSigning");
   const chip = await reactTo(page, row);
-  // A fine pointer removes its own reaction on click.
+  // A click on its own chip takes the reaction back.
   await chip.click();
   await expect(row.getByTestId("reaction-chip"), "the pending reaction is undone").toHaveCount(0);
 
