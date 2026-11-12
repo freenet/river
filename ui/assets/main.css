@@ -535,9 +535,10 @@
  * panel lands on the backdrop inside it, which slides the panel away;
  * `::backdrop` dims. Its panel sits at the bottom with modest side spacing,
  * rounded top corners and safe-area padding, capped to the viewport's height.
- * Its height is fixed (it lists nobody who reacted): about 250px for the
- * reader's own message, which fits any viewport from about 265px tall. Under
- * that only a wheel scrolls it; scrolling it never scrolls the page.
+ * Its height is fixed (it lists nobody who reacted): 242px for the reader's
+ * own message, before any safe-area inset, which fits a viewport from 258px
+ * tall. Under that only a wheel scrolls it; scrolling it never scrolls the
+ * page.
  *
  * It slides up when it opens and can be dragged down from anywhere
  * (`mobile_sheet_drag.rs`): the backdrop and panel take no one-finger pan
