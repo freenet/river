@@ -288,7 +288,8 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.access = Access::PermissionRemoved;
     }),
-    // The node has no chat delegate under the key this build carries.
+    // The node has no chat delegate under the key this build carries, though River registered
+    // it.
     ("chat-no-store", |s| {
         connect(s);
         s.chat = Chat::new(
@@ -473,8 +474,11 @@ fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
         Access::Unsupported => panel(
             t,
             "Freenet needs an update",
-            "To open your rooms, River needs Freenet 0.2.156 or newer. Update it (run \
-             `freenet update`, or install the latest from freenet.org), then try again.",
+            &format!(
+                "To open your rooms, River needs Freenet {} or newer. Update it (run \
+                 `freenet update`, or install the latest from freenet.org), then try again.",
+                rooms::grant::GRANT_NODE_VERSION
+            ),
             None,
             vec![rooms_retry_button(k), manual_install_button(k)],
         ),

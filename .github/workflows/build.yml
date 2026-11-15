@@ -315,6 +315,19 @@ jobs:
       # is a guard that passes by default (freenet/river#614).
       run: ./scripts/tests/publish-guards-test.sh
 
+    - name: Test the desktop release gate (verify-release.sh)
+      # The gate that decides whether a river-desktop-v* tag may be released
+      # runs only when a tag is pushed, so this is the only place it runs
+      # before a release. It checks the tag version, main ancestry, that the
+      # baked-in WASM matches the last published web UI, and that the WASM
+      # hashes match pointer-records.toml. Same reasoning as above
+      # (freenet/river#614).
+      run: ./scripts/tests/verify-release-test.sh
+
+    - name: Test release-notes previous-tag selection
+      # --notes-start-tag for the riverctl and desktop releases; also tag-only.
+      run: ./scripts/tests/previous-tag-test.sh
+
   ui-playwright-tests:
     # Ubicloud, NOT a GitHub-hosted larger runner -- see the `build` job above.
     runs-on: ubicloud-standard-8

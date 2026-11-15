@@ -1,10 +1,13 @@
 //! The user's real rooms, read from the local Freenet node.
 //!
-//! The rooms live in River's chat delegate, stored there by the web UI under the River web
-//! app's identity. [`Link`] gets that identity through a user-approved app grant ([`grant`]),
-//! opens the node's client API with it ([`socket`]), reads the stored rooms ([`delegate`],
-//! `river_core::stored_rooms`), shows them, then subscribes to each room contract and keeps
-//! them current ([`room`]).
+//! The rooms live in River's chat delegate, under the River web app's identity, where the web
+//! UI keeps them too. [`Link`] gets that identity through a user-approved app grant
+//! ([`grant`]), opens the node's client API with it ([`socket`]), reads the stored rooms
+//! ([`delegate`], `river_core::stored_rooms`), shows them, then subscribes to each room
+//! contract and keeps them current ([`room`]). If the node has no chat delegate (River never
+//! ran in a browser on it), the app registers it on that connection, which sets up River's
+//! storage. It registers only on a grant connection: the node records the identity a
+//! delegate was first registered under, for good.
 //!
 //! It talks to whatever answers on the node's loopback port. A local program that took that
 //! port before Freenet could pose as the node: it would receive the grant token, and could show
@@ -15,16 +18,18 @@
 //! It sends what the user writes in a room they are a member of: messages, replies, edits and
 //! deletions of their own messages, and reactions, each as an UPDATE of the room contract
 //! ([`outbox`]). It makes invitations, creates rooms and joins them from invitations
-//! ([`create`], [`work`]). Those are the only times it writes the chat delegate's storage, which
-//! the web UI writes too, at the same time: it writes only with the web UI's generation
-//! compare-and-swap, only adds a room where none is stored, and in `rooms_meta` only changes the
-//! open room ([`work`] has the details). Its only PUT is the seed PUT of a room it has just
-//! created, under that room's own contract; it never seeds a room the network lacks, which the
-//! web UI does.
+//! ([`create`], [`work`]). Those are the only times it writes the chat delegate's storage,
+//! which the web UI writes too, at the same time: it writes only with the web UI's generation
+//! compare-and-swap, only adds a room where none is stored, and in `rooms_meta` only changes
+//! the open room ([`work`] has the details). The one other thing it writes is each room's signing
+//! key, in the delegate's own namespace for keys, only where the delegate holds none ([`keys`]).
+//! Its only PUT is the seed PUT of a room it has just created, under that room's own contract;
+//! it never seeds a room the network lacks, which the web UI does.
 
 pub mod create;
 pub mod delegate;
 pub mod grant;
+pub mod keys;
 pub mod outbox;
 pub mod room;
 #[cfg(test)]

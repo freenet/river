@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=River
+GenericName=Chat
+Comment=Decentralized group chat on Freenet
+Exec=river
+Icon=river
+Terminal=false
+Categories=Network;Chat;InstantMessaging;

@@ -24,3 +24,8 @@ flate2 = "1"
 tar = "0.4"
 tempfile = "3"
 directories = "6"
+
+# Icon and version resource for river.exe (build.rs). Windows only, so Linux and macOS builds
+# never compile it.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

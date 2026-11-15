@@ -22,6 +22,37 @@
 //! its open room changed, with every other field kept. A conflict never overwrites: what the
 //! other writer stored is read and worked from.
 //!
+//! **Rooms from an earlier River need no guard here.** On a node that also holds rooms in an
+//! older chat delegate (a re-key the web UI has not carried forward yet), a room this app
+//! stores does not hide them from the web UI. Since freenet/river#763 the web UI starts
+//! freenet-migrate's completeness journal on every load from the current delegate's room list
+//! (`start_journal_load`, `ui/src/components/app/freenet_api/migration_journal.rs`). With no
+//! journal stored, `begin_migration_journal` (freenet-migrate 0.8 `delegate_migrate.rs`)
+//! starts one with every predecessor pending, whatever the current delegate holds, and an
+//! incomplete journal runs the journaled walk (`walk_decision`; the rate limit applies only
+//! to predecessors found not installed). The walk imports each older delegate's rooms through
+//! `Rooms::merge_from_source` at that generation's rank, below the current delegate's, so a
+//! room stored here keeps its identity and a tombstone keeps a room left
+//! (`apply_recovered_rooms` in `delegate_migration.rs`). The comment in `chat_delegate.rs`
+//! saying legacy migration is skipped when the current delegate has data describes the older
+//! sweep and predates #763.
+//!
+//! Two limits on that, both open:
+//! - **Version skew.** A desktop build older than the node's web UI carries an older chat
+//!   delegate, registers it, and writes there. The walk reads only predecessors, and after the
+//!   journal resolves the newest one it re-reads that one only for its top-up window (14 days
+//!   or 30 loads, `TOPUP_WINDOW_MS` / `TOPUP_WINDOW_LOADS` in `migration_journal.rs`). A room
+//!   such a build creates after that window never reaches the web UI. Before the app
+//!   registered, that build showed "update this app" instead. Detecting a newer delegate
+//!   through River's pointer records and refusing to write (plan PR 3) closes this, and must
+//!   merge before any desktop release.
+//! - **Schema skew.** The walk runs only over a complete current room set
+//!   (`room_set_complete`), which needs every stored slot and `rooms_meta` to decode. A slot
+//!   or meta written by this app in a shape an older web UI cannot decode refuses the walk
+//!   on every load there. So anything this app stores must stay decodable by the web UI
+//!   builds still in use (`river_core::stored_rooms`, pinned to the web UI's types by the
+//!   `stored_rooms_drift` tests).
+//!
 //! **Matching answers.** Delegate answers carry no request id, and neither do contract
 //! answers. So one task works at a time, with one request out, and an answer is taken only if
 //! it is the kind awaited, for the key awaited: a `GetVersionedResponse` or `CasStoreResponse`
@@ -37,11 +68,11 @@
 //! **What the user sees.** A task working, failed (with why, Try again and Dismiss) or done
 //! ([`WorkView`]). Nothing fails without saying so.
 //!
-//! What this leaves to the web UI: storing the room's key in the delegate's `signing_key:`
-//! namespace and, for a room the user owns, asking the delegate to follow it
-//! (`EnsureRoomSubscription`). The web UI does both for every stored room each time it loads
-//! (`hydrate_loaded_rooms_with_authority` in `freenet_api/response_handler.rs`), and the room
-//! slot holds everything they are rebuilt from.
+//! What this leaves to the web UI: for a room the user owns, asking the delegate to follow it
+//! (`EnsureRoomSubscription`), which the web UI does for every stored room each time it loads
+//! (`hydrate_loaded_rooms_with_authority` in `freenet_api/response_handler.rs`). The room's
+//! signing key is stored in the delegate by the background sweep in [`super::keys`], not by
+//! these tasks, so a task is done as soon as the room is stored.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
@@ -460,6 +491,11 @@ impl Work {
         self.active_ref().and_then(Task::owner) == Some(*owner)
     }
 
+    /// Whether a read of the stored rooms is wanted because a task finished, without clearing it.
+    pub fn reload_pending(&self) -> bool {
+        self.reload
+    }
+
     /// Whether to read the stored rooms now, because a task finished. Asking clears it.
     pub fn take_reload(&mut self) -> bool {
         std::mem::take(&mut self.reload)
@@ -706,13 +742,17 @@ impl Work {
                 _ => return false,
             },
             // While a task works, nothing else on the connection asks the chat delegate.
+            // The session reconnects on this, which registers the store again. Only the chat
+            // delegate's own `Missing` (the session's `chat_delegate_missing`); another key's
+            // falls to the arm below.
             (
                 Out::Read(_) | Out::Store(_),
-                ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_))),
-            ) => "River's storage isn't on this computer's Freenet under the version this app \
-                  knows, so the room can't be saved. Open River in your browser on this \
-                  computer first, or update this app."
-                .to_owned(),
+                ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(key))),
+            ) if key == delegate::chat_delegate_key() => {
+                "River's storage went missing from this computer's Freenet, so the room \
+                  wasn't saved. River is setting it up again: try again in a moment."
+                    .to_owned()
+            }
             (
                 Out::Read(_) | Out::Store(_),
                 ErrorKind::RequestError(RequestError::DelegateError(d)),

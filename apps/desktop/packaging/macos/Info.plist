@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for River.app/Contents/Info.plist. package-macos.sh replaces @VERSION@ with the
+  [workspace.package] version from apps/Cargo.toml and refuses to build if any @...@ is left.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>River</string>
+    <key>CFBundleDisplayName</key><string>River</string>
+    <key>CFBundleIdentifier</key><string>org.freenet.River</string>
+    <key>CFBundleExecutable</key><string>river</string>
+    <key>CFBundleIconFile</key><string>River</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+    <key>CFBundleVersion</key><string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.social-networking</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSHumanReadableCopyright</key><string>Freenet Project Inc. Licensed under LGPL-3.0-only.</string>
+</dict>
+</plist>
