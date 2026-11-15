@@ -40,6 +40,8 @@ storage on your Freenet node itself. The first time, the app asks Freenet for
 permission, and approving it opens a tab in your browser on your Freenet node's
 own page (not River). Not in the app yet: direct messages, moderation, changing
 your nickname, and room upgrades; use River in your web browser for those.
+If you already used River in your web browser, rooms from an earlier version show
+up here after you open River in the browser once.
 
 Source: https://github.com/freenet/river
 "@ | Set-Content -Path (Join-Path $dir 'README.txt') -Encoding utf8

@@ -401,7 +401,8 @@ fn a_read_that_finds_no_store_or_no_rooms_keeps_the_list() {
     rooms.replace(loaded(vec![a.stored()]));
     assert!(rooms.replace(Loaded::missing()).is_empty());
     assert_eq!(rooms.list.len(), 1);
-    assert!(!rooms.issues().store_missing);
+    // Recorded, so the store is not registered again on every re-read; the list stays.
+    assert!(rooms.issues().store_missing);
     assert!(rooms.replace(loaded(vec![])).is_empty());
     assert_eq!(rooms.list.len(), 1);
     // Before anything was shown, a missing store is said as such.
@@ -3144,4 +3145,122 @@ fn the_read_after_registering_waits_out_the_missing_backoff() {
         "read again {:?} after the Missing",
         lists[1] - lists[0]
     );
+}
+
+fn registrations(w: &World) -> usize {
+    w.sent.iter().filter(|(_, k)| *k == "register").count()
+}
+
+/// A node that refuses the registration, or never answers it, is asked once per run, not
+/// again on every re-read of the stored rooms (each one re-sends the whole WASM, and an
+/// unanswered one waits out `register_wait` each time).
+#[test]
+fn a_refused_or_unanswered_registration_is_not_repeated_on_every_reread() {
+    for silent in [false, true] {
+        let node = fake_node(vec![]);
+        node.with(|w| {
+            w.unregistered = true;
+            w.delegate_missing = !silent;
+            w.silence_register = silent;
+        });
+        let dir = temp_dir(if silent {
+            "register-silent-loop"
+        } else {
+            "register-refused-loop"
+        });
+        let pace = Pace {
+            refresh: Duration::from_millis(30),
+            register_wait: Duration::from_millis(100),
+            ..quick()
+        };
+        let session = Running::start(&node, &dir, pace);
+        session.wait_rooms("the store is said to be missing", |r, issues, _| {
+            r.is_empty() && issues.store_missing
+        });
+        // Several refresh intervals' worth of re-reads.
+        let lists = node.with(|w| w.lists);
+        session.wait_until("eight more reads", || node.with(|w| w.lists >= lists + 8));
+        node.with(|w| {
+            assert_eq!(registrations(w), 1, "silent={silent}: {:?}", w.sent);
+        });
+        let (_, issues, _) = session.last_rooms().unwrap();
+        assert!(issues.store_missing);
+    }
+}
+
+/// A create or join the user asks for while the store is missing is a reason to try setting it
+/// up again: it reconnects, and the new connection registers first. The user decides how often.
+#[test]
+fn a_create_while_the_store_is_missing_tries_to_set_it_up_again() {
+    let node = fake_node(vec![]);
+    node.with(|w| {
+        w.unregistered = true;
+        w.delegate_missing = true;
+    });
+    let dir = temp_dir("missing-then-create");
+    let session = Running::start(&node, &dir, quick());
+    session.wait_rooms("the store is said to be missing", |r, issues, _| {
+        r.is_empty() && issues.store_missing
+    });
+    // The node now takes registrations.
+    node.with(|w| w.delegate_missing = false);
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_until("the create failed and the store was set up", || {
+        node.with(|w| registrations(w) == 2 && !w.unregistered)
+    });
+    let id = session.last_work()[0].id;
+    session.list(Action::RetryWork { id });
+    session.wait_rooms("the room is created", |r, issues, _| {
+        r.iter().any(|r| r.name == "Book club") && !issues.store_missing
+    });
+}
+
+/// A store that was there, goes missing, and then cannot be registered again: one attempt on
+/// the next connection, not one per re-read. The rooms stay shown.
+#[test]
+fn a_store_that_goes_missing_and_cannot_be_set_up_again_is_tried_once() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        refresh: Duration::from_millis(30),
+        register_wait: Duration::from_millis(100),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "gone-refused", pace);
+    node.with(|w| w.delegate_missing = true);
+    session.wait_until("one registration was tried", || {
+        node.with(|w| registrations(w) == 1)
+    });
+    let lists = node.with(|w| w.lists);
+    session.wait_until("eight more reads", || node.with(|w| w.lists >= lists + 8));
+    node.with(|w| assert_eq!(registrations(w), 1, "{:?}", w.sent));
+    let (rooms, _, _) = session.last_rooms().unwrap();
+    assert_eq!(names(&rooms), ["A"]);
+}
+
+#[test]
+fn only_the_chat_delegate_missing_counts_as_the_store_missing() {
+    let other = freenet_stdlib::prelude::Delegate::from((
+        &freenet_stdlib::prelude::DelegateCode::from(vec![1, 2, 3]),
+        &Parameters::from(Vec::<u8>::new()),
+    ))
+    .key()
+    .clone();
+    let theirs: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::Missing(other.clone()),
+    ))
+    .into();
+    assert!(delegate_error(&theirs).is_err());
+    assert!(!chat_delegate_missing(&theirs));
+    assert!(names_another_delegate(&theirs));
+    assert!(!names_another_delegate(&missing_delegate()));
+    let their_register: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::RegisterError(other),
+    ))
+    .into();
+    assert!(names_another_delegate(&their_register));
 }

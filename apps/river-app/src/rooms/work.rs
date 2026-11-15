@@ -37,6 +37,22 @@
 //! saying legacy migration is skipped when the current delegate has data describes the older
 //! sweep and predates #763.
 //!
+//! Two limits on that, both open:
+//! - **Version skew.** A desktop build older than the node's web UI carries an older chat
+//!   delegate, registers it, and writes there. The walk reads only predecessors, and after the
+//!   journal resolves the newest one it re-reads that one only for its top-up window (14 days
+//!   or 30 loads, `TOPUP_WINDOW_MS` / `TOPUP_WINDOW_LOADS` in `migration_journal.rs`). A room
+//!   such a build creates after that window never reaches the web UI. Before the app
+//!   registered, that build showed "update this app" instead. Detecting a newer delegate
+//!   through River's pointer records and refusing to write (plan PR 3) closes this, and must
+//!   merge before any desktop release.
+//! - **Schema skew.** The walk runs only over a complete current room set
+//!   (`room_set_complete`), which needs every stored slot and `rooms_meta` to decode. A slot
+//!   or meta written by this app in a shape an older web UI cannot decode refuses the walk
+//!   on every load there. So anything this app stores must stay decodable by the web UI
+//!   builds still in use (`river_core::stored_rooms`, pinned to the web UI's types by the
+//!   `stored_rooms_drift` tests).
+//!
 //! **Matching answers.** Delegate answers carry no request id, and neither do contract
 //! answers. So one task works at a time, with one request out, and an answer is taken only if
 //! it is the kind awaited, for the key awaited: a `GetVersionedResponse` or `CasStoreResponse`

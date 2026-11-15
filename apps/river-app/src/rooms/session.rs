@@ -42,8 +42,10 @@
 //!   waits for the node's answer for up to [`Pace::register_wait`], and lists again. Only a
 //!   grant connection can register ([`super::socket`] has why that matters). A refused or
 //!   unanswered registration does not stop the read, as in the web UI; a store still missing
-//!   then is said on screen. A store that goes missing later in a connection ends it, and the
-//!   next connection registers before it lists.
+//!   then is said on screen, and the re-reads do not register it again (each would re-send the
+//!   whole WASM). A new connection, or a create or join the user asks for, tries again. A store
+//!   that was there and goes missing later in a connection ends it, and the next connection
+//!   registers before it lists.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -809,6 +811,7 @@ fn follow_on(
                 // River's storage went missing from the node: whatever was waiting on it fails
                 // below, and the next connection registers it again before anything else.
                 let store_gone = chat_delegate_missing(&e);
+                let mut taken_by_work = false;
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
                 let alone = subs.pending.is_empty()
@@ -823,6 +826,7 @@ fn follow_on(
                     .on_error(&e, alone, &|id| subs.pending.contains_key(id))
                 {
                     changed = true;
+                    taken_by_work = true;
                 } else if let Some((id, cause)) = failed_update(&e) {
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some((id, cause)) =
@@ -841,7 +845,13 @@ fn follow_on(
                     reload = None;
                     last_read = Instant::now();
                 }
-                if store_gone {
+                // Only a store that was there, or a create or join the user asked for, is a
+                // reason to register again. A store this connection already failed to set up
+                // (`store_missing` shown) is not registered again on every re-read: that would
+                // re-send the whole WASM each refresh, and wait out `register_wait` each time
+                // when the node does not answer. A new connection for any other reason, or the
+                // user's own create or join, tries again.
+                if store_gone && (!rooms.store_missing || taken_by_work) {
                     rooms.register_first = true;
                     rooms.report(status, report);
                     return SocketError::Failed(
@@ -1120,10 +1130,23 @@ fn register(socket: &mut NodeSocket, pace: &Pace) -> Result<Registered, SocketEr
                 return Ok(Registered::Yes);
             }
             Ok(Ok(_)) => {}
+            // An error that names another delegate is not this registration's answer.
+            Ok(Err(e)) if names_another_delegate(&e) => {}
+            // Nothing else is out on the connection, so any other error answers it.
             Ok(Err(e)) => return Ok(Registered::Refused(e.to_string())),
             Err(SocketError::Timeout) => {}
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Whether an error names a delegate other than River's chat delegate.
+fn names_another_delegate(e: &ClientError) -> bool {
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::DelegateError(
+            DelegateError::Missing(key) | DelegateError::RegisterError(key),
+        )) => key != delegate::chat_delegate_key(),
+        _ => false,
     }
 }
 
@@ -1139,17 +1162,21 @@ fn chat_delegate_missing(e: &ClientError) -> bool {
 
 /// `Ok(())` when the error only says the delegate is missing; the error to stop on otherwise.
 fn delegate_error(e: &ClientError) -> Result<(), SocketError> {
-    if let ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_))) =
-        e.kind()
-    {
+    if chat_delegate_missing(e) {
         return Ok(());
     }
     let text = e.to_string();
     // The untyped wordings older nodes use for a delegate that is not installed (the web
     // UI's `is_missing_delegate_error`): "delegate <key> not found in store" and
     // "missing delegate <key>", here without regard to case.
+    // A typed `Missing` names its delegate and was answered above; only an untyped error is
+    // read by its words.
+    let typed_missing = matches!(
+        e.kind(),
+        ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_)))
+    );
     let lower = text.to_lowercase();
-    if lower.contains("missing delegate")
+    if !typed_missing && lower.contains("missing delegate")
         || (lower.contains("delegate") && lower.contains("not found in store"))
     {
         return Ok(());
@@ -1230,6 +1257,9 @@ impl Rooms {
     fn replace(&mut self, loaded: Loaded) -> Vec<ContractInstanceId> {
         if self.loaded && (loaded.store_missing || loaded.listed == 0) && !self.list.is_empty() {
             eprintln!("River: the stored rooms read as empty; keeping the list shown");
+            // Still recorded: a store that could not be set up again is not registered again
+            // on every re-read (`follow_on`).
+            self.store_missing = loaded.store_missing;
             return Vec::new();
         }
         let mut old: HashMap<VerifyingKey, LiveRoom> = self

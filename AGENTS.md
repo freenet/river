@@ -231,7 +231,9 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
   connection: the node records the identity a delegate was first registered
   under, for good. A room it stores does not hide older rooms from the web UI,
   whose journaled walk (#763) carries them forward whatever the current
-  delegate holds (`src/rooms/work.rs` has the details). In a room
+  delegate holds (`src/rooms/work.rs` has the details). So rooms from an
+  earlier River in the browser show up in the app after River has been opened
+  in the browser once. In a room
   the user can send in it sends messages, replies, edits and deletions of the
   user's own messages, and reactions, each as a room contract UPDATE built and
   signed as the web UI does (`src/rooms/outbox.rs`). It creates rooms, makes
