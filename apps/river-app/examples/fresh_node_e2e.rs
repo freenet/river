@@ -8,8 +8,9 @@
 //! with the app's grant) for the room's signing key, and must hold the key of that app's own
 //! member: the app's background key sweep puts it there.
 //!
-//! Then a newer River: on node A, a pointer record for the chat delegate is PUT, signed by a
-//! throwaway key and naming a generation above the one this build carries. A third app on node
+//! Then a newer River. On node A, pointer records signed by a throwaway key are PUT, first
+//! naming this build: an app trusting that key sends a message, which node B receives. Then the
+//! chat delegate's record moves to a generation above the one this build carries. A third app on node
 //! A, built to trust that throwaway key in place of River's, must notice it, show the room
 //! read-only, and refuse to send, create or join: none of it may reach the node. The record is
 //! PUT only to the local test node; River's own key and pointer addresses are never used. The
@@ -33,7 +34,8 @@ use freenet_stdlib::client_api::HostResponse;
 use river_app::chat::model::Room;
 use river_app::rooms::delegate::{self, Read};
 use river_app::rooms::generation::{
-    Artifact, BuildRecord, NodePointers, Records, UPDATE_REQUIRED, Watch, watched_pointers,
+    Artifact, BuildRecord, NodePointers, Records, UPDATE_REQUIRED, UPDATE_REQUIRED_WORK, Watch,
+    watched_pointers,
 };
 use river_app::rooms::socket::NodeSocket;
 use river_app::rooms::token::TokenStore;
@@ -328,7 +330,14 @@ fn put_test_pointer(
 /// On node A, a newer River named by a test pointer: a third app that trusts the test key
 /// shows the room, says an update is needed, and nothing it is asked to write reaches the
 /// node.
-fn newer_river(authority: &str, dir: &Path, dir_a: &Path, room: &str, room_key: &str) {
+fn newer_river(
+    authority: &str,
+    dir: &Path,
+    dir_a: &Path,
+    room: &str,
+    room_key: &str,
+    bob: &mut App,
+) {
     let path = std::env::var("POINTER_WASM").expect(
         "POINTER_WASM names the pointer contract WASM (apps/scripts/fresh-node-e2e.sh fetches it)",
     );
@@ -356,7 +365,9 @@ fn newer_river(authority: &str, dir: &Path, dir_a: &Path, room: &str, room_key: 
     };
     let watched = watched_pointers(&records, Artifact::embedded_wasm);
     assert_eq!(watched.len(), 2);
-    // The room contract's pointer names this build; the chat delegate's has moved on.
+    // First both pointers name this build. An app trusting the test key is current, and what
+    // it sends reaches node B: the check below that the outdated app's message does not can
+    // fail.
     put_test_pointer(
         authority,
         dir_a,
@@ -366,6 +377,39 @@ fn newer_river(authority: &str, dir: &Path, dir_a: &Path, room: &str, room_key: 
         1,
         records.records[0].code_hash,
     );
+    put_test_pointer(
+        authority,
+        dir_a,
+        &wasm,
+        &sk,
+        "river.chat-delegate",
+        1,
+        records.records[1].code_hash,
+    );
+    let dir_d = dir.join("app-d");
+    std::fs::create_dir_all(&dir_d).unwrap();
+    let current = Watch::new(
+        watched.clone(),
+        std::sync::Arc::new(NodePointers),
+        Some(&dir_d),
+    );
+    let mut dave = App::start_with("D", authority, &dir_d, Some(current));
+    dave.until("the room shows, and can be written to", |app| {
+        !app.issues.update_required && app.room(room).is_some_and(|r| r.send_block.is_none())
+    });
+    let sent = "Sent from a current app trusting the test key";
+    dave.send(
+        room_key,
+        Action::Send {
+            text: sent.into(),
+            reply_to: None,
+        },
+    );
+    bob.until("node B receives the current app's message", |app| {
+        app.has_text(room, sent)
+    });
+
+    // Then the chat delegate's pointer moves on.
     put_test_pointer(
         authority,
         dir_a,
@@ -416,10 +460,9 @@ fn newer_river(authority: &str, dir: &Path, dir_a: &Path, room: &str, room_key: 
                         .is_some_and(|p| p.failed.as_deref() == Some(UPDATE_REQUIRED))
             })
         });
-        let created = app
-            .work
-            .iter()
-            .any(|w| matches!(&w.state, WorkState::Failed { why, .. } if why == UPDATE_REQUIRED));
+        let created = app.work.iter().any(
+            |w| matches!(&w.state, WorkState::Failed { why, .. } if why == UPDATE_REQUIRED_WORK),
+        );
         sent && created
     });
     // The record is kept, so a later start knows without the network.
@@ -526,7 +569,7 @@ fn main() {
     let member = expect_signing_key("B", &bob.authority, &dir_b, &key);
     assert_ne!(owner, member, "the joiner's key is not the owner's");
 
-    newer_river(a, &dir, &dir_a, ROOM, &key);
+    newer_river(a, &dir, &dir_a, ROOM, &key, &mut bob);
     // Nothing the outdated app was asked to write reached the room: the app on node B, which
     // follows the room, never receives it.
     bob.drain(Duration::from_secs(15));

@@ -89,9 +89,18 @@ const RECORDS_TOML: &str = include_str!("../../../../pointer-records.toml");
 /// Prefix of `author_verifying_key` in `pointer-records.toml` and FREENET.md.
 const AUTHOR_VK_PREFIX: &str = "river:v1:vk:";
 
-/// What a write refused for this reason says, in the outbox and the create and join list.
-pub const UPDATE_REQUIRED: &str = "A newer version of River is out, and this version of the app \
-     can no longer save changes. Update this app, then try again.";
+/// Where River's desktop releases are.
+pub const RELEASES_URL: &str = "https://github.com/freenet/river/releases";
+
+/// What a message refused for this reason says. It keeps its Retry, which fails the same way
+/// until the app is updated, so the text does not promise more.
+pub const UPDATE_REQUIRED: &str = "Not sent: a newer version of River is out, and this version \
+     of the app can no longer send. Update this app from github.com/freenet/river/releases.";
+
+/// What a create or join refused for this reason says. It has no Try again.
+pub const UPDATE_REQUIRED_WORK: &str = "A newer version of River is out, and this version of \
+     the app can no longer create or join rooms. Update this app from \
+     github.com/freenet/river/releases, then create or join the room there.";
 
 /// What the composer says once River has moved on.
 pub const UPDATE_REQUIRED_SEND: &str = "A newer version of River is out. Update this app to \
@@ -280,7 +289,8 @@ pub enum Verdict {
     NoSignal,
 }
 
-/// Judge one served pointer state against this build. The web UI's `evaluate`, line for line.
+/// Judge one served pointer state against this build. The web UI's `evaluate`, with one
+/// difference: a higher version that names this build's OWN code hash is not newer here.
 pub fn evaluate(watched: &Watched, state: &[u8]) -> Verdict {
     let Ok(mut resolver) = PointerResolver::new(
         &watched.author_vk,
@@ -299,7 +309,14 @@ pub fn evaluate(watched: &Watched, state: &[u8]) -> Verdict {
         // lower-code-hash tiebreak (the author signed twice at one version). That is not a
         // newer generation, and no build could satisfy it, so only a strictly higher version
         // counts.
-        Some(Ok(PointerOutcome::Resolved(r))) if r.version() > watched.build_version() => {
+        //
+        // A higher version naming the WASM this build carries is not a re-key (the author
+        // re-signed the same code). The web UI reloads for it, which costs a reload. Here it
+        // would stop every write for good, though writing to that code splits nothing.
+        Some(Ok(PointerOutcome::Resolved(r)))
+            if r.version() > watched.build_version()
+                && Some(r.code_hash()) != watched.build_floor.code_hash() =>
+        {
             Verdict::Newer(r.version())
         }
         Some(Ok(PointerOutcome::Unchanged(_))) => Verdict::Current,
@@ -423,6 +440,10 @@ pub struct CheckPace {
     /// After a check that learned nothing, the first wait before the next, doubling up to
     /// `recheck`.
     pub retry_first: Duration,
+    /// Until every pointer has answered with a verdict, and within `first_wait`, how soon a
+    /// check that learned nothing is asked again. A node that has just started answers "not
+    /// found" at once, before it has asked the network.
+    pub first_retry: Duration,
 }
 
 impl Default for CheckPace {
@@ -432,8 +453,27 @@ impl Default for CheckPace {
             fetch_wait: Duration::from_secs(30),
             recheck: Duration::from_secs(15 * 60),
             retry_first: Duration::from_secs(30),
+            first_retry: Duration::from_secs(1),
         }
     }
+}
+
+/// When the next check is due after one, and the misses in a row after it. `answered`: every
+/// pointer gave a verdict. `settled`: the first check is settled (see [`Watch::writes_allowed`]).
+/// A miss before then is asked again after `first_retry`; after, after `retry_first`, doubling
+/// up to `recheck`. A full answer resets the misses and waits `recheck`.
+pub fn next_wait(pace: &CheckPace, misses: u32, answered: bool, settled: bool) -> (Duration, u32) {
+    if answered {
+        return (pace.recheck, 0);
+    }
+    if !settled {
+        return (pace.first_retry.min(pace.recheck), misses);
+    }
+    let wait = pace
+        .retry_first
+        .saturating_mul(1 << misses.min(16))
+        .min(pace.recheck);
+    (wait, misses.saturating_add(1))
 }
 
 /// File name of a kept newer record, per app id.
@@ -524,7 +564,8 @@ impl Watch {
         let Some(dir) = &self.dir else { return };
         for w in &self.watched {
             let path = dir.join(kept_name(w.artifact));
-            let Ok(bytes) = std::fs::read(&path) else {
+            // A record is 100 bytes; anything longer is not one, and is not read whole.
+            let Ok(bytes) = read_capped(&path, freenet_migrate::POINTER_STATE_LEN + 1) else {
                 continue;
             };
             match evaluate(w, &bytes) {
@@ -597,21 +638,17 @@ impl Watch {
                 answered += 1;
             }
         }
+        let all = answered == self.watched.len();
+        // Settled only by a verdict from every pointer (or by `first_wait` running out, in
+        // `settled`): a fast "not found" or error from a node that has not asked the network
+        // yet must not let the first writes out.
+        let settled = self.settled(pace, now) || all;
         let mut inner = self.inner();
-        inner.first_done = true;
-        let wait = if answered == self.watched.len() {
-            inner.misses = 0;
-            pace.recheck
-        } else {
-            // Something learned nothing (unreachable, absent, or no usable record): ask again
-            // sooner, backing off to the usual interval.
-            let wait = pace
-                .retry_first
-                .saturating_mul(1 << inner.misses.min(16))
-                .min(pace.recheck);
-            inner.misses = inner.misses.saturating_add(1);
-            wait
-        };
+        if all {
+            inner.first_done = true;
+        }
+        let (wait, misses) = next_wait(pace, inner.misses, all, settled);
+        inner.misses = misses;
         inner.next = Some(now + wait);
         !was_stale && self.is_stale()
     }
@@ -661,9 +698,10 @@ impl Watch {
     }
 
     /// Whether there is an answer to act on: River is known to have moved on (no check is
-    /// started then), or the first check has answered or had its `first_wait`.
-    fn settled(&self, pace: &CheckPace, now: Instant) -> bool {
-        if self.is_stale() {
+    /// started then), every pointer has answered with a verdict, or the first check has had
+    /// its `first_wait`.
+    pub fn settled(&self, pace: &CheckPace, now: Instant) -> bool {
+        if self.is_stale() || self.watched.is_empty() {
             return true;
         }
         let inner = self.inner();
@@ -673,8 +711,8 @@ impl Watch {
                 .is_some_and(|at| now.saturating_duration_since(at) >= pace.first_wait)
     }
 
-    /// Wait, polling, until the first check has answered or had its `first_wait`. Before the
-    /// first write of a run. True when this closed the gate.
+    /// Wait, polling, until [`Self::settled`]. For tests; the session never blocks on it.
+    #[cfg(test)]
     pub fn settle(
         &self,
         authority: &str,
@@ -695,6 +733,16 @@ impl Watch {
     pub fn writes_allowed(&self, pace: &CheckPace) -> bool {
         !self.is_stale() && (self.watched.is_empty() || self.settled(pace, Instant::now()))
     }
+}
+
+/// Read at most `cap` bytes of `path`.
+fn read_capped(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(cap as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]

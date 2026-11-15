@@ -329,6 +329,10 @@ signing secrets to `river-desktop-v*` tags, and the ruleset decides who can
 create those. Both sign jobs use the one `release` environment, so a
 required-reviewer rule on it asks for approval twice per release.
 
+A re-keying River publish needs a new desktop release ready first: once its
+pointer records are published, every installed desktop build is read-only until
+the user updates (`.claude/rules/river-publish.md`, step 7).
+
 Each release:
 
 1. In one PR, raise `MIN_INSTALL_VERSION` (above) to the current Freenet
@@ -557,6 +561,9 @@ read the module docs before changing any of it. This is why
 `cargo make publish-pointer-records` is not optional after a re-key
 (`.claude/rules/river-publish.md`, step 7). Tabs on builds older than this
 mechanism (30000403 and earlier) have none of it and need one manual reload.
+The desktop app watches the same records and, once one is newer than the WASM
+it carries, stops writing and asks the user to update
+(`apps/river-app/src/rooms/generation.rs`).
 
 **This only works if:**
 - The state format is backwards-compatible (see below)

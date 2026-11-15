@@ -837,6 +837,7 @@ fn what_the_node_rooms_are_missing_is_said_in_the_room_list() {
         not_following: vec!["Family".into()],
         unreadable: 2,
         update_required: true,
+        setting_up: false,
     };
     let rt = render(s, WINDOW_SIZE);
     for key in [

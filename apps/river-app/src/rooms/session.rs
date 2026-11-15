@@ -48,12 +48,16 @@
 //!   registers before it lists.
 //! - **A newer River.** Each run checks River's pointer records ([`super::generation`]) on a
 //!   connection of its own, before the first write and every [`Pace::pointers`]`.recheck`
-//!   after. Writes (registering, sending, creating, joining, the signing key sweep) wait up to
-//!   `first_wait` for the first answer, then go on without one. Once a verified record names a
-//!   newer delegate or room contract than this build carries, nothing is written again: what
-//!   the user sends or asks to create or join fails at once with [`super::generation::UPDATE_REQUIRED`],
-//!   the composer is blocked with why, and the store is not registered. The rooms still show
-//!   and still receive. Each connection's write gate refuses writes too.
+//!   after. Writes (registering, sending, creating, joining, the signing key sweep) wait until
+//!   every pointer has answered, or for `first_wait`, then go on without an answer. The wait
+//!   never blocks the connection: reads, subscriptions and the user's commands go on. A store
+//!   that needs registering meanwhile is registered once the wait is over, on a new
+//!   connection, which registers before anything else (as when the store goes missing); the
+//!   screen says River is setting up its storage. Once a verified record names a newer
+//!   delegate or room contract than this build carries, nothing is written again: what the
+//!   user sends, creates or joins fails at once with why, the composer is blocked with why,
+//!   and the store is not registered. The rooms still show and still receive. Each
+//!   connection's write gate refuses writes too.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -80,7 +84,9 @@ use river_core::stored_rooms::{
 };
 
 use super::delegate::{self, Read};
-use super::generation::{CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_SEND, Watch};
+use super::generation::{
+    CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_SEND, UPDATE_REQUIRED_WORK, Watch,
+};
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
 use super::outbox::{Action, Command, Outbox};
 use super::room::{LiveRoom, local_minutes};
@@ -237,6 +243,8 @@ pub struct Issues {
     /// River has moved to a newer chat delegate or room contract than this app carries: it
     /// writes nothing, and the user needs to update it.
     pub update_required: bool,
+    /// River's storage is not set up yet: the app is checking River's version first.
+    pub setting_up: bool,
 }
 
 /// What the background work reports to the window. Its `Debug` hides an invitation's link,
@@ -561,12 +569,9 @@ impl Watching<'_> {
         self.watch.poll(self.authority, self.token, &pace.pointers)
     }
 
-    /// Before registering: wait for the first check (bounded), then say whether registering
-    /// is allowed.
-    fn may_register(&self, pace: &Pace, stop: &dyn Fn() -> bool) -> bool {
-        self.watch
-            .settle(self.authority, self.token, &pace.pointers, stop);
-        !self.watch.is_stale()
+    /// Whether the first check is settled, so a registration may be decided now.
+    fn settled(&self, pace: &Pace) -> bool {
+        self.watch.settled(&pace.pointers, Instant::now())
     }
 
     fn writes_allowed(&self, pace: &Pace) -> bool {
@@ -694,17 +699,25 @@ fn follow_on(
     watching.poll(pace);
     // The store went missing on the last connection: register before anything else.
     let mut registered = false;
-    if std::mem::take(&mut rooms.register_first) && watching.may_register(pace, stop) {
-        if let Err(e) = register_logged(socket, pace) {
-            return e;
+    if std::mem::take(&mut rooms.register_first) {
+        if !watching.settled(pace) {
+            rooms.register_deferred = true;
+        } else if !watching.watch.is_stale() {
+            if let Err(e) = register_logged(socket, pace) {
+                return e;
+            }
+            registered = true;
         }
-        registered = true;
     }
     let mut loaded = match load(socket, pace) {
         Ok(l) => l,
         Err(e) => return e,
     };
-    if loaded.store_missing && !registered && watching.may_register(pace, stop) {
+    if loaded.store_missing && !registered && !watching.settled(pace) {
+        // Not decided yet whether this build may set up River's storage: read on, and register
+        // on a new connection once it is (below, in the loop).
+        rooms.register_deferred = true;
+    } else if loaded.store_missing && !registered && !watching.watch.is_stale() {
         // The node has no chat delegate: set it up, then read again once the backoff its
         // `Missing` armed has lapsed.
         let missing_at = Instant::now();
@@ -776,7 +789,22 @@ fn follow_on(
             changed |= !rooms.update_required;
             rooms.update_required = true;
             changed |= rooms.outbox.fail_queued(UPDATE_REQUIRED);
-            changed |= rooms.outbox.work.halt(UPDATE_REQUIRED);
+            changed |= rooms.outbox.work.halt(UPDATE_REQUIRED_WORK);
+        }
+        // A registration put off for the first check: once it is settled, register on a new
+        // connection, which does that before it sends anything else. A connection that only
+        // read so far has nothing out that a reconnect could lose. A build River has moved past
+        // does not register at all.
+        if rooms.register_deferred && watching.settled(pace) {
+            rooms.register_deferred = false;
+            changed = true;
+            if !watching.watch.is_stale() {
+                rooms.register_first = true;
+                rooms.report(status, report);
+                return SocketError::Failed(
+                    "registering River's storage now that its version is checked".into(),
+                );
+            }
         }
         changed |= rooms.outbox.expire(pace.update_wait, Instant::now());
         // A room that owes an answer sends nothing more on this connection; a new one owes
@@ -1459,6 +1487,8 @@ struct Rooms {
     keys: super::keys::KeySweep,
     /// River has moved on: nothing is written, and the screen says so.
     update_required: bool,
+    /// The store needs registering, and waits for the first pointer check to settle.
+    register_deferred: bool,
 }
 
 impl Rooms {
@@ -1839,6 +1869,7 @@ impl Rooms {
             not_following: self.names(&self.not_following),
             unreadable: self.unreadable,
             update_required: self.update_required,
+            setting_up: self.register_deferred,
         }
     }
 

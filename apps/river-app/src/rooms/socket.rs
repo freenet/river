@@ -388,9 +388,6 @@ impl NodeSocket {
     }
 }
 
-/// The `RegisterDelegate` for River's chat delegate. It takes the proof that the connection
-/// presented a grant, so it is built only for one.
-///
 /// What a write refused by a closed gate fails with.
 pub const STALE_REFUSAL: &str = "a newer River is out, so this build no longer writes to Freenet";
 
@@ -423,6 +420,9 @@ pub fn is_read(request: &ClientRequest<'_>) -> bool {
     }
 }
 
+/// The `RegisterDelegate` for River's chat delegate. It takes the proof that the connection
+/// presented a grant, so it is built only for one.
+///
 /// The node ignores `cipher` and `nonce` (freenet-core derives each delegate's key from its
 /// own; `secrets_store/store.rs`). Only nodes before freenet-core 0.2.60 used them, and River
 /// needs 0.2.156 for grants, so fixed values do.
@@ -591,6 +591,14 @@ mod tests {
                 }),
                 true,
             ),
+            (
+                "subscribe",
+                ClientRequest::ContractOp(ContractRequest::Subscribe {
+                    key: *key.id(),
+                    summary: None,
+                }),
+                true,
+            ),
             ("list rooms", delegate::request(&Read::List), true),
             (
                 "get a room",
@@ -641,6 +649,14 @@ mod tests {
                 false,
             ),
             (
+                "unregister a delegate",
+                ClientRequest::DelegateOp(DelegateRequest::UnregisterDelegate(
+                    delegate::chat_delegate_key().clone(),
+                )),
+                false,
+            ),
+            ("a read and a write in one message", mixed_batch(), false),
+            (
                 "an undecodable delegate message",
                 ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
                     key: delegate::chat_delegate_key().clone(),
@@ -654,6 +670,28 @@ mod tests {
                 false,
             ),
         ]
+    }
+
+    /// One delegate message carrying a read and a CAS store.
+    fn mixed_batch() -> ClientRequest<'static> {
+        use super::super::delegate::{self, Read, Versioned};
+        let inbound = |r: ClientRequest<'static>| match r {
+            ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) => {
+                inbound
+            }
+            _ => unreachable!(),
+        };
+        let mut all = inbound(delegate::request(&Read::List));
+        all.extend(inbound(delegate::versioned(&Versioned::Store {
+            key: b"room:x".to_vec(),
+            value: vec![1],
+            generation: 0,
+        })));
+        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+            key: delegate::chat_delegate_key().clone(),
+            params: freenet_stdlib::prelude::Parameters::from(Vec::<u8>::new()),
+            inbound: all,
+        })
     }
 
     /// The classification itself, for every request kind the app sends.

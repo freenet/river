@@ -319,10 +319,13 @@ fn a_withdrawal_is_no_signal() {
 
 // ---- the watch ---------------------------------------------------------------------------
 
-/// Answers every fetch with what the test set, counting fetches.
+/// Answers every fetch with what the test set, counting fetches: the next of `script` while
+/// any is left, then `answer`, each after `delay`.
 #[derive(Default)]
 pub(crate) struct FakePointers {
     pub answer: Mutex<Vec<(ContractInstanceId, Fetch)>>,
+    pub script: Mutex<std::collections::VecDeque<Vec<(ContractInstanceId, Fetch)>>>,
+    pub delay: Mutex<Duration>,
     pub fetches: AtomicUsize,
 }
 
@@ -334,8 +337,11 @@ impl PointerSource for FakePointers {
         ids: &[ContractInstanceId],
         _: Duration,
     ) -> Vec<(ContractInstanceId, Fetch)> {
+        let delay = *self.delay.lock().unwrap();
+        std::thread::sleep(delay);
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        let answer = self.answer.lock().unwrap().clone();
+        let scripted = self.script.lock().unwrap().pop_front();
+        let answer = scripted.unwrap_or_else(|| self.answer.lock().unwrap().clone());
         ids.iter()
             .map(|id| {
                 let f = answer
@@ -354,6 +360,7 @@ fn pace() -> CheckPace {
         fetch_wait: Duration::from_secs(1),
         recheck: Duration::from_millis(400),
         retry_first: Duration::from_millis(40),
+        first_retry: Duration::from_millis(10),
     }
 }
 
@@ -633,4 +640,166 @@ fn node_pointers_with_no_node_is_unreachable() {
     let ids: Vec<ContractInstanceId> = test_watched().iter().map(|w| w.pointer_id).collect();
     let found = NodePointers.fetch(&authority, &token(), &ids, Duration::from_millis(200));
     assert!(found.iter().all(|(_, f)| *f == Fetch::Unreachable));
+}
+
+// ---- review round 1 -----------------------------------------------------------------------
+
+/// Every pointer answering "not found" at once (a node that has just started, before it has
+/// asked the network) does not settle the first check: writes wait out `first_wait`, and the
+/// pointers are asked again meanwhile.
+#[test]
+fn a_fast_absent_does_not_settle_the_first_check() {
+    let source = Arc::new(FakePointers::default());
+    let watched = test_watched();
+    *source.answer.lock().unwrap() = watched
+        .iter()
+        .map(|w| (w.pointer_id, Fetch::Absent))
+        .collect();
+    let pace = CheckPace {
+        first_wait: Duration::from_millis(400),
+        ..pace()
+    };
+    let watch = Watch::new(watched, source.clone(), None);
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(250) {
+        watch.poll("a", &token(), &pace);
+        assert!(
+            !watch.writes_allowed(&pace),
+            "writes let out by a fast \"not found\""
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        source.fetches.load(Ordering::SeqCst) >= 3,
+        "asked again within the wait"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(watch.writes_allowed(&pace), "fails open after first_wait");
+}
+
+/// A fast "not found", then the newer record within the wait: no write is ever allowed.
+#[test]
+fn a_fast_absent_then_a_newer_record_never_lets_a_write_out() {
+    let source = Arc::new(FakePointers::default());
+    let watched = test_watched();
+    let absent: Vec<_> = watched
+        .iter()
+        .map(|w| (w.pointer_id, Fetch::Absent))
+        .collect();
+    source
+        .script
+        .lock()
+        .unwrap()
+        .extend([absent.clone(), absent]);
+    answer(&source, &watched, Some(Fetch::State(delegate_state(2))));
+    let watch = Watch::new(watched, source, None);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !watch.is_stale() {
+        assert!(Instant::now() < deadline, "the newer record was never seen");
+        watch.poll("a", &token(), &pace());
+        assert!(!watch.writes_allowed(&pace()), "a write was let out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A higher version that names this build's own WASM is not a re-key: the author re-signed
+/// the same code. It must not stop writes, now or from a kept file.
+#[test]
+fn a_higher_version_naming_this_builds_own_wasm_is_not_newer() {
+    let w = test_watched()[1];
+    let resigned = signed_state(
+        &test_key(),
+        "river.chat-delegate",
+        7,
+        *blake3::hash(DELEGATE_V1).as_bytes(),
+    );
+    assert_eq!(evaluate(&w, &resigned), Verdict::NoSignal);
+
+    let source = Arc::new(FakePointers::default());
+    let watched = test_watched();
+    answer(&source, &watched, Some(Fetch::State(resigned.clone())));
+    let watch = Watch::new(watched, source, None);
+    settle(&watch);
+    assert!(!watch.is_stale());
+    assert!(watch.writes_allowed(&pace()));
+
+    let dir = temp_dir("resigned");
+    let path = dir.join("newer-river.river.chat-delegate");
+    std::fs::write(&path, &resigned).unwrap();
+    let watch = Watch::new(
+        test_watched(),
+        Arc::new(FakePointers::default()),
+        Some(&dir),
+    );
+    assert!(!watch.is_stale());
+    assert!(!path.exists());
+}
+
+/// Against the SHIPPED watch: a higher-version record signed by another key, and River's own
+/// record with one bit flipped, are no signal.
+#[test]
+fn forged_and_tampered_records_are_no_signal_against_the_shipped_build() {
+    let stranger = SigningKey::from_bytes(&[9u8; 32]);
+    for w in watched_pointers(&Records::shipped().unwrap(), Artifact::embedded_wasm) {
+        let app = w.artifact.app_id();
+        let forged = signed_state(&stranger, app, w.build_version() + 5, [0x77; 32]);
+        assert_eq!(evaluate(&w, &forged), Verdict::NoSignal, "{app}: forged");
+        let shipped = shipped_state(app);
+        for bit in [0usize, 3 * 8, 10 * 8, 50 * 8, 99 * 8 + 7] {
+            let mut flipped = shipped.clone();
+            flipped[bit / 8] ^= 1 << (bit % 8);
+            assert_eq!(
+                evaluate(&w, &flipped),
+                Verdict::NoSignal,
+                "{app}: bit {bit} flipped"
+            );
+        }
+    }
+}
+
+/// The trust anchor, as a literal: changing River's author key must be a deliberate edit here.
+#[test]
+fn the_author_key_is_rivers() {
+    assert_eq!(
+        Records::shipped().unwrap().author,
+        "river:v1:vk:9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ"
+    );
+}
+
+#[test]
+fn the_retry_wait_grows_caps_and_resets() {
+    let p = pace();
+    // Before the first check settles: quick re-asks, misses not counted.
+    assert_eq!(next_wait(&p, 0, false, false), (p.first_retry, 0));
+    // After: doubling from retry_first.
+    assert_eq!(next_wait(&p, 0, false, true), (p.retry_first, 1));
+    assert_eq!(next_wait(&p, 1, false, true), (p.retry_first * 2, 2));
+    assert_eq!(next_wait(&p, 2, false, true), (p.retry_first * 4, 3));
+    // Capped at recheck, however many misses.
+    assert_eq!(next_wait(&p, 30, false, true).0, p.recheck);
+    // A full answer waits recheck and resets the count.
+    assert_eq!(next_wait(&p, 7, true, true), (p.recheck, 0));
+    assert_eq!(next_wait(&p, 7, true, false), (p.recheck, 0));
+}
+
+/// A kept file is read only as far as a record's length.
+#[test]
+fn a_huge_kept_file_is_not_read_whole() {
+    let dir = temp_dir("huge");
+    let path = dir.join("newer-river.river.chat-delegate");
+    let mut big = delegate_state(2);
+    big.extend(std::iter::repeat_n(0u8, 1 << 20));
+    std::fs::write(&path, &big).unwrap();
+    assert_eq!(
+        read_capped(&path, freenet_migrate::POINTER_STATE_LEN + 1)
+            .unwrap()
+            .len(),
+        freenet_migrate::POINTER_STATE_LEN + 1
+    );
+    let watch = Watch::new(
+        test_watched(),
+        Arc::new(FakePointers::default()),
+        Some(&dir),
+    );
+    assert!(!watch.is_stale(), "not a record");
 }

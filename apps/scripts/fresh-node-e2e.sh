@@ -46,7 +46,7 @@ echo "freenet: $("$FREENET_BIN" --version | head -n1)"
 POINTER_WASM_COMMIT=6b724f1badeed1891f4c09ddb1d6aa2c0921508f
 if [ -z "${POINTER_WASM:-}" ]; then
   POINTER_WASM="$WORK/pointer-v1.wasm"
-  curl -sfL -o "$POINTER_WASM" \
+  curl -sfL --retry 3 --retry-all-errors -o "$POINTER_WASM" \
     "https://raw.githubusercontent.com/freenet/freenet-migrate/$POINTER_WASM_COMMIT/contracts/pointer-contract/pointer-v1.wasm"
 fi
 export POINTER_WASM
