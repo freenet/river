@@ -137,7 +137,9 @@ more and asks the user to update. Until this step runs, every installed desktop
 build keeps registering and writing the old delegate and room contract, which
 the web UI only re-reads for its 14-day top-up window. After it, every installed
 desktop build is read-only until the new desktop release ships, so have that
-release built and its draft checked before running this step.
+release built and its draft checked before running this step. A record re-signed
+at a higher version that names the same code hash does not stop desktop builds
+(nothing splits); open tabs still reload for it.
 
 Order matters. The pre-flight below refuses unless the UI carrying the new WASM
 is live **as seen from the node you publish through**; it cannot see other

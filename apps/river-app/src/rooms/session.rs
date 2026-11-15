@@ -697,6 +697,8 @@ fn follow_on(
     }
     // The pointer check for this connection goes out now, beside the first reads.
     watching.poll(pace);
+    // A registration put off on an earlier connection is decided afresh on this one.
+    rooms.register_deferred = false;
     // The store went missing on the last connection: register before anything else.
     let mut registered = false;
     if std::mem::take(&mut rooms.register_first) {
@@ -1049,11 +1051,15 @@ fn follow_on(
                 let retry_due = store_gone
                     && rooms.store_missing
                     && rooms.register_retry_due(Instant::now(), pace);
-                // A store this build may no longer register is not a reason to reconnect.
-                if store_gone
+                // A store this build may no longer register is not a reason to reconnect, and
+                // one it may not register yet waits for the check here, on this connection.
+                let wants_register = store_gone
                     && !watching.watch.is_stale()
-                    && (!rooms.store_missing || taken_by_work || retry_due)
-                {
+                    && (!rooms.store_missing || taken_by_work || retry_due);
+                if wants_register && !watching.settled(pace) {
+                    rooms.register_deferred = true;
+                    changed = true;
+                } else if wants_register {
                     rooms.register_first = true;
                     rooms.report(status, report);
                     return SocketError::Failed(
@@ -1869,7 +1875,10 @@ impl Rooms {
             not_following: self.names(&self.not_following),
             unreadable: self.unreadable,
             update_required: self.update_required,
-            setting_up: self.register_deferred,
+            // Also across the reconnect that registers, so the screen does not flash "could not
+            // set up" in between.
+            setting_up: self.register_deferred
+                || (self.register_first && self.store_missing && !self.update_required),
         }
     }
 

@@ -326,6 +326,8 @@ pub(crate) struct FakePointers {
     pub answer: Mutex<Vec<(ContractInstanceId, Fetch)>>,
     pub script: Mutex<std::collections::VecDeque<Vec<(ContractInstanceId, Fetch)>>>,
     pub delay: Mutex<Duration>,
+    /// Pointers that never answer: the fetch waits out its whole `wait` for them.
+    pub silent: Mutex<Vec<ContractInstanceId>>,
     pub fetches: AtomicUsize,
 }
 
@@ -335,22 +337,26 @@ impl PointerSource for FakePointers {
         _: &str,
         _: &GrantToken,
         ids: &[ContractInstanceId],
-        _: Duration,
-    ) -> Vec<(ContractInstanceId, Fetch)> {
+        wait: Duration,
+        deliver: &dyn Fn(ContractInstanceId, Fetch),
+    ) {
         let delay = *self.delay.lock().unwrap();
         std::thread::sleep(delay);
         self.fetches.fetch_add(1, Ordering::SeqCst);
         let scripted = self.script.lock().unwrap().pop_front();
         let answer = scripted.unwrap_or_else(|| self.answer.lock().unwrap().clone());
-        ids.iter()
-            .map(|id| {
-                let f = answer
-                    .iter()
-                    .find(|(i, _)| i == id)
-                    .map_or(Fetch::Unreachable, |(_, f)| f.clone());
-                (*id, f)
-            })
-            .collect()
+        let silent = self.silent.lock().unwrap().clone();
+        for id in ids {
+            if silent.contains(id) {
+                continue;
+            }
+            if let Some((_, f)) = answer.iter().find(|(i, _)| i == id) {
+                deliver(*id, f.clone());
+            }
+        }
+        if !silent.is_empty() {
+            std::thread::sleep(wait);
+        }
     }
 }
 
@@ -518,9 +524,9 @@ fn a_silent_node_holds_writes_only_for_the_first_wait() {
             _: &GrantToken,
             _: &[ContractInstanceId],
             _: Duration,
-        ) -> Vec<(ContractInstanceId, Fetch)> {
+            _: &dyn Fn(ContractInstanceId, Fetch),
+        ) {
             std::thread::sleep(Duration::from_secs(30));
-            Vec::new()
         }
     }
     let pace = CheckPace {
@@ -626,9 +632,22 @@ fn node_pointers_reads_each_answer_by_its_contract() {
         while ws.read().is_ok() {}
         asked
     });
-    let found = NodePointers.fetch(&authority, &token(), &ids, Duration::from_secs(10));
-    assert_eq!(found[0], (ids[0], Fetch::Absent));
-    assert_eq!(found[1], (ids[1], Fetch::State(delegate_state(2))));
+    let found = Mutex::new(Vec::new());
+    NodePointers.fetch(
+        &authority,
+        &token(),
+        &ids,
+        Duration::from_secs(10),
+        &|id, f| found.lock().unwrap().push((id, f)),
+    );
+    let found = found.into_inner().unwrap();
+    assert_eq!(
+        found,
+        vec![
+            (ids[1], Fetch::State(delegate_state(2))),
+            (ids[0], Fetch::Absent)
+        ]
+    );
     assert_eq!(server.join().unwrap(), ids);
 }
 
@@ -638,8 +657,15 @@ fn node_pointers_with_no_node_is_unreachable() {
     let authority = listener.local_addr().unwrap().to_string();
     drop(listener);
     let ids: Vec<ContractInstanceId> = test_watched().iter().map(|w| w.pointer_id).collect();
-    let found = NodePointers.fetch(&authority, &token(), &ids, Duration::from_millis(200));
-    assert!(found.iter().all(|(_, f)| *f == Fetch::Unreachable));
+    let found = Mutex::new(Vec::new());
+    NodePointers.fetch(
+        &authority,
+        &token(),
+        &ids,
+        Duration::from_millis(200),
+        &|id, f| found.lock().unwrap().push((id, f)),
+    );
+    assert!(found.into_inner().unwrap().is_empty());
 }
 
 // ---- review round 1 -----------------------------------------------------------------------
@@ -713,7 +739,7 @@ fn a_higher_version_naming_this_builds_own_wasm_is_not_newer() {
         7,
         *blake3::hash(DELEGATE_V1).as_bytes(),
     );
-    assert_eq!(evaluate(&w, &resigned), Verdict::NoSignal);
+    assert_eq!(evaluate(&w, &resigned), Verdict::Current);
 
     let source = Arc::new(FakePointers::default());
     let watched = test_watched();
@@ -802,4 +828,124 @@ fn a_huge_kept_file_is_not_read_whole() {
         Some(&dir),
     );
     assert!(!watch.is_stale(), "not a record");
+}
+
+// ---- review round 2 -----------------------------------------------------------------------
+
+/// One pointer answers at once with a newer record and the other never answers: the gate
+/// closes at once, not when the fetch gives up on the silent one (long after `first_wait`).
+#[test]
+fn a_fast_newer_record_closes_the_gate_while_the_other_pointer_is_silent() {
+    let source = Arc::new(FakePointers::default());
+    let watched = test_watched();
+    answer(&source, &watched, Some(Fetch::State(delegate_state(2))));
+    source.silent.lock().unwrap().push(watched[0].pointer_id);
+    let pace = CheckPace {
+        first_wait: Duration::from_millis(300),
+        fetch_wait: Duration::from_secs(3),
+        ..pace()
+    };
+    let watch = Watch::new(watched, source, None);
+    let started = Instant::now();
+    while !watch.is_stale() {
+        watch.poll("a", &token(), &pace);
+        assert!(!watch.writes_allowed(&pace), "a write was let out");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the newer record waited behind the silent pointer"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// [`NodePointers`] hands over each answer as it arrives: the first comes long before the
+/// fetch gives up on a pointer that never answers.
+#[test]
+fn node_pointers_delivers_each_answer_as_it_arrives() {
+    use freenet_stdlib::prelude::{ContractKey, WrappedState};
+    use tungstenite::Message;
+    let watched = test_watched();
+    let ids: Vec<ContractInstanceId> = watched.iter().map(|w| w.pointer_id).collect();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority = listener.local_addr().unwrap().to_string();
+    let delegate = ids[1];
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut ws = tungstenite::accept(stream).unwrap();
+        let mut asked = 0;
+        while asked < 2 {
+            if let Ok(Message::Binary(_)) = ws.read() {
+                asked += 1;
+            }
+        }
+        let key = ContractKey::from_id_and_code(
+            delegate,
+            freenet_stdlib::prelude::CodeHash::from_code(&[1u8]),
+        );
+        let r: Result<HostResponse, freenet_stdlib::client_api::ClientError> = Ok(
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key,
+                contract: None,
+                state: WrappedState::new(delegate_state(2)),
+            }),
+        );
+        ws.send(Message::Binary(bincode::serialize(&r).unwrap().into()))
+            .unwrap();
+        // The room contract's pointer never answers.
+        while ws.read().is_ok() {}
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = Mutex::new(tx);
+    let fetching = std::thread::spawn(move || {
+        NodePointers.fetch(
+            &authority,
+            &token(),
+            &ids,
+            Duration::from_secs(8),
+            &|id, f| {
+                let _ = tx.lock().unwrap().send((id, f));
+            },
+        );
+    });
+    let first = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the delegate's answer waited for the silent pointer");
+    assert_eq!(first, (delegate, Fetch::State(delegate_state(2))));
+    drop(fetching);
+}
+
+/// A re-sign of this build's own code at a higher version settles the first check like this
+/// build's own record, and the next check waits the usual `recheck`.
+#[test]
+fn a_same_code_re_sign_settles_the_first_check() {
+    let source = Arc::new(FakePointers::default());
+    let watched = test_watched();
+    let resigned = signed_state(
+        &test_key(),
+        "river.chat-delegate",
+        7,
+        *blake3::hash(DELEGATE_V1).as_bytes(),
+    );
+    answer(&source, &watched, Some(Fetch::State(resigned.clone())));
+    assert_eq!(evaluate(&watched[1], &resigned), Verdict::Current);
+    let pace = CheckPace {
+        first_wait: Duration::from_secs(30),
+        recheck: Duration::from_secs(60),
+        ..pace()
+    };
+    let watch = Watch::new(watched, source.clone(), None);
+    let started = Instant::now();
+    while !watch.writes_allowed(&pace) {
+        assert!(started.elapsed() < Duration::from_secs(2), "held writes");
+        watch.poll("a", &token(), &pace);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Not asked again soon: a full answer waits `recheck`.
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        watch.poll("a", &token(), &pace);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+    assert!(!watch.is_stale());
 }

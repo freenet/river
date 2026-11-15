@@ -57,10 +57,11 @@
 //! |---|---|---|
 //! | A verified record above this build | stop | River moved on; writing here splits the data. |
 //! | This build's own record | go on | Current. |
+//! | A higher version naming this build's own code hash | go on | Current: the author re-signed the same code, so nothing splits. The web UI reloads for it. |
 //! | Older, forged, other app, malformed, competing, withdrawn | go on | No evidence of a newer River; the web UI does not act on these either. |
 //! | Pointer unreachable, absent, or the node too slow | go on | A network fault must not stop a current app. Retried with backoff. |
 //! | A newer record seen earlier (kept on disk) | stop | Known already; a blip does not undo it. |
-//! | No answer yet at startup | wait, then go on | Writes wait up to [`super::session::Pace`]'s `pointer_wait` for the first answer. |
+//! | No verdict yet at startup | wait, then go on | Writes wait until every pointer gives a verdict, or for `first_wait`. Each answer is judged as it arrives, so one newer record stops writes at once even while the other pointer is silent. |
 //!
 //! Failing open on an unreachable pointer leaves a window: a build that has never seen the
 //! newer record, on a node that cannot fetch it, writes. That is bounded: a re-key's pointer
@@ -81,7 +82,7 @@ use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractRespons
 use freenet_stdlib::prelude::ContractInstanceId;
 
 use super::grant::GrantToken;
-use super::socket::{NodeSocket, SocketError};
+use super::socket::NodeSocket;
 
 /// River's pointer records, as committed. CI checks each names the committed WASM.
 const RECORDS_TOML: &str = include_str!("../../../../pointer-records.toml");
@@ -319,6 +320,14 @@ pub fn evaluate(watched: &Watched, state: &[u8]) -> Verdict {
         {
             Verdict::Newer(r.version())
         }
+        // The author re-signed this build's own code at a higher version: current, so it
+        // settles the check like this build's own record does.
+        Some(Ok(PointerOutcome::Resolved(r)))
+            if r.version() > watched.build_version()
+                && Some(r.code_hash()) == watched.build_floor.code_hash() =>
+        {
+            Verdict::Current
+        }
         Some(Ok(PointerOutcome::Unchanged(_))) => Verdict::Current,
         _ => Verdict::NoSignal,
     }
@@ -338,14 +347,18 @@ pub enum Fetch {
 /// Fetches pointer states from the node. The session's own connection matches answers by kind,
 /// so a fetch has a connection of its own ([`NodePointers`]); tests supply their own.
 pub trait PointerSource: Send + Sync {
-    /// Fetch each of `ids` from the node at `authority`, waiting at most `wait` in all.
+    /// Fetch each of `ids` from the node at `authority`, waiting at most `wait` in all, and
+    /// hand each answer to `deliver` as it arrives. A pointer that does not answer is not
+    /// delivered. One fast newer record must not wait behind a silent pointer: it closes the
+    /// gate the moment it is judged.
     fn fetch(
         &self,
         authority: &str,
         token: &GrantToken,
         ids: &[ContractInstanceId],
         wait: Duration,
-    ) -> Vec<(ContractInstanceId, Fetch)>;
+        deliver: &dyn Fn(ContractInstanceId, Fetch),
+    );
 }
 
 /// Fetches pointers on a connection of its own, with the app's grant: a GET for each, without
@@ -360,12 +373,11 @@ impl PointerSource for NodePointers {
         token: &GrantToken,
         ids: &[ContractInstanceId],
         wait: Duration,
-    ) -> Vec<(ContractInstanceId, Fetch)> {
-        let mut found: Vec<(ContractInstanceId, Fetch)> =
-            ids.iter().map(|id| (*id, Fetch::Unreachable)).collect();
+        deliver: &dyn Fn(ContractInstanceId, Fetch),
+    ) {
         // This connection only reads, so its gate never needs closing.
         let Ok(mut socket) = NodeSocket::connect(authority, token, &WriteGate::default()) else {
-            return found;
+            return;
         };
         let deadline = Instant::now() + wait;
         for id in ids {
@@ -376,14 +388,14 @@ impl PointerSource for NodePointers {
                 blocking_subscribe: false,
             };
             if socket.send(&ClientRequest::ContractOp(get)).is_err() {
-                return found;
+                return;
             }
         }
-        let mut open = ids.len();
-        while open > 0 {
+        let mut open: Vec<ContractInstanceId> = ids.to_vec();
+        while !open.is_empty() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() || socket.set_read_timeout(left).is_err() {
-                break;
+                return;
             }
             let (id, fetch) = match socket.recv() {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -394,21 +406,24 @@ impl PointerSource for NodePointers {
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
                     instance_id,
                 }))) => (instance_id, Fetch::Absent),
-                // An error, or anything else: what it names stays unreachable.
+                // An error, or anything else: what it names stays unanswered.
                 Ok(_) => continue,
-                Err(SocketError::Timeout) => break,
-                Err(_) => break,
+                Err(_) => return,
             };
-            if let Some(slot) = found
-                .iter_mut()
-                .find(|(i, f)| *i == id && *f == Fetch::Unreachable)
-            {
-                slot.1 = fetch;
-                open -= 1;
+            if let Some(i) = open.iter().position(|o| *o == id) {
+                open.swap_remove(i);
+                deliver(id, fetch);
             }
         }
-        found
     }
+}
+
+/// What a check under way sends back to the watch.
+enum Event {
+    /// One pointer's answer.
+    One(ContractInstanceId, Fetch),
+    /// The fetch is over; what did not answer learned nothing.
+    Done,
 }
 
 /// Closed once River has moved on; every [`NodeSocket`] holds one and refuses writes while it
@@ -499,7 +514,9 @@ struct Inner {
     /// When the first check was started, and whether one has finished.
     first_started: Option<Instant>,
     first_done: bool,
-    in_flight: Option<Receiver<Vec<(ContractInstanceId, Fetch)>>>,
+    in_flight: Option<Receiver<Event>>,
+    /// The pointers that gave a verdict in the check under way.
+    heard: Vec<ContractInstanceId>,
     /// When the next check is due; `None` is now.
     next: Option<Instant>,
     /// Checks in a row that learned nothing.
@@ -612,33 +629,37 @@ impl Watch {
         }
     }
 
-    /// Judge what a fetch found. True when it closed the gate.
-    fn judge(&self, found: &[(ContractInstanceId, Fetch)], pace: &CheckPace, now: Instant) -> bool {
+    /// Judge one pointer's answer as it arrives. True when it closed the gate.
+    fn judge_one(&self, id: ContractInstanceId, fetch: &Fetch) -> bool {
+        let Some(w) = self.watched.iter().find(|w| w.pointer_id == id) else {
+            return false;
+        };
+        let Fetch::State(bytes) = fetch else {
+            return false;
+        };
         let was_stale = self.is_stale();
-        let mut answered = 0;
-        for w in &self.watched {
-            let verdict = match found.iter().find(|(id, _)| *id == w.pointer_id) {
-                Some((_, Fetch::State(bytes))) => {
-                    let v = evaluate(w, bytes);
-                    if let Verdict::Newer(version) = v {
-                        eprintln!(
-                            "River: {} moved to v{version}; this build is v{}. It no longer \
-                             writes.",
-                            w.artifact.app_id(),
-                            w.build_version()
-                        );
-                        self.keep(w, bytes);
-                        self.record(w, version);
-                    }
-                    v
-                }
-                _ => Verdict::NoSignal,
-            };
-            if verdict != Verdict::NoSignal {
-                answered += 1;
+        let verdict = evaluate(w, bytes);
+        if let Verdict::Newer(version) = verdict {
+            eprintln!(
+                "River: {} moved to v{version}; this build is v{}. It no longer writes.",
+                w.artifact.app_id(),
+                w.build_version()
+            );
+            self.keep(w, bytes);
+            self.record(w, version);
+        }
+        if verdict != Verdict::NoSignal {
+            let mut inner = self.inner();
+            if !inner.heard.contains(&id) {
+                inner.heard.push(id);
             }
         }
-        let all = answered == self.watched.len();
+        !was_stale && self.is_stale()
+    }
+
+    /// A check is over: schedule the next.
+    fn finish(&self, pace: &CheckPace, now: Instant) {
+        let all = self.all_heard();
         // Settled only by a verdict from every pointer (or by `first_wait` running out, in
         // `settled`): a fast "not found" or error from a node that has not asked the network
         // yet must not let the first writes out.
@@ -647,10 +668,17 @@ impl Watch {
         if all {
             inner.first_done = true;
         }
+        inner.heard.clear();
         let (wait, misses) = next_wait(pace, inner.misses, all, settled);
         inner.misses = misses;
         inner.next = Some(now + wait);
-        !was_stale && self.is_stale()
+    }
+
+    fn all_heard(&self) -> bool {
+        let inner = self.inner();
+        self.watched
+            .iter()
+            .all(|w| inner.heard.contains(&w.pointer_id))
     }
 
     /// Take the answer of a check under way, and start one if one is due. Never blocks. True
@@ -660,23 +688,37 @@ impl Watch {
             return false;
         }
         let now = Instant::now();
-        let found = {
+        // Everything the check under way has sent so far, taken under the lock and judged
+        // after it (judging takes the lock too).
+        let (events, over) = {
             let mut inner = self.inner();
-            match inner.in_flight.as_ref().map(Receiver::try_recv) {
-                Some(Ok(found)) => {
-                    inner.in_flight = None;
-                    Some(found)
+            let mut events = Vec::new();
+            let mut over = false;
+            if let Some(rx) = &inner.in_flight {
+                loop {
+                    match rx.try_recv() {
+                        Ok(Event::One(id, fetch)) => events.push((id, fetch)),
+                        // Over, or the fetch ended without saying so (it panicked).
+                        Ok(Event::Done) | Err(TryRecvError::Disconnected) => {
+                            over = true;
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                    }
                 }
-                Some(Err(TryRecvError::Empty)) => None,
-                // The fetch ended without an answer (it panicked): it learned nothing.
-                Some(Err(TryRecvError::Disconnected)) => {
-                    inner.in_flight = None;
-                    Some(Vec::new())
-                }
-                None => None,
             }
+            if over {
+                inner.in_flight = None;
+            }
+            (events, over)
         };
-        let closed = found.is_some_and(|found| self.judge(&found, pace, now));
+        let mut closed = false;
+        for (id, fetch) in &events {
+            closed |= self.judge_one(*id, fetch);
+        }
+        if over {
+            self.finish(pace, now);
+        }
         // Once River has moved on there is nothing more to learn in this run.
         if self.is_stale() {
             return closed;
@@ -690,7 +732,11 @@ impl Watch {
         let ids: Vec<ContractInstanceId> = self.watched.iter().map(|w| w.pointer_id).collect();
         let (authority, token, wait) = (authority.to_owned(), token.clone(), pace.fetch_wait);
         std::thread::spawn(move || {
-            let _ = tx.send(source.fetch(&authority, &token, &ids, wait));
+            let deliver = |id, fetch| {
+                let _ = tx.send(Event::One(id, fetch));
+            };
+            source.fetch(&authority, &token, &ids, wait, &deliver);
+            let _ = tx.send(Event::Done);
         });
         inner.in_flight = Some(rx);
         inner.first_started.get_or_insert(now);
@@ -701,7 +747,7 @@ impl Watch {
     /// started then), every pointer has answered with a verdict, or the first check has had
     /// its `first_wait`.
     pub fn settled(&self, pace: &CheckPace, now: Instant) -> bool {
-        if self.is_stale() || self.watched.is_empty() {
+        if self.is_stale() || self.watched.is_empty() || self.all_heard() {
             return true;
         }
         let inner = self.inner();

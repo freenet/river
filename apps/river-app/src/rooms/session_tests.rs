@@ -4383,9 +4383,9 @@ fn a_hung_pointer_fetch_holds_writes_only_for_the_first_wait() {
             _: &GrantToken,
             _: &[ContractInstanceId],
             _: Duration,
-        ) -> Vec<(ContractInstanceId, Fetch)> {
+            _: &dyn Fn(ContractInstanceId, Fetch),
+        ) {
             std::thread::sleep(Duration::from_secs(60));
-            Vec::new()
         }
     }
     let node = fake_node(vec![]);
@@ -4452,6 +4452,23 @@ fn a_fresh_node_is_registered_once_the_first_check_settles() {
     session.wait_rooms("registered and read", |r, issues, _| {
         r.is_empty() && !issues.store_missing && !issues.setting_up
     });
+    // From "setting up" to registered, the screen never said the store could not be set up
+    // (the reconnect in between included).
+    let shown: Vec<Issues> = session
+        .updates()
+        .into_iter()
+        .filter_map(|u| match u {
+            RoomsUpdate::Rooms { issues, .. } => Some(issues),
+            _ => None,
+        })
+        .skip_while(|i| !i.setting_up)
+        .take_while(|i| i.store_missing)
+        .collect();
+    assert!(!shown.is_empty());
+    assert!(
+        shown.iter().all(|i| i.setting_up),
+        "\"could not set up\" flashed before registering: {shown:?}"
+    );
     node.with(|w| {
         assert!(!w.unregistered);
         assert_registers_only_with_the_grant(w);
@@ -4468,4 +4485,35 @@ fn a_fresh_node_is_registered_once_the_first_check_settles() {
             "registered before anything else"
         );
     });
+}
+
+/// The connection drops while a registration waits for the first check. The next connection
+/// decides afresh: River's storage is registered once, not twice.
+#[test]
+fn a_drop_while_registration_waits_registers_once() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.unregistered = true);
+    let dir = temp_dir("deferred-drop");
+    let source = Arc::new(FakePointers::default());
+    *source.delay.lock().unwrap() = Duration::from_millis(500);
+    let watch = watched(&source, Some(1));
+    // The next connection starts after the check has settled: the case where a stale "put
+    // off" from the dropped connection would register a second time.
+    let pace = Pace {
+        backoff_first: Duration::from_millis(900),
+        backoff_max: Duration::from_millis(900),
+        ..quick()
+    };
+    let session = Running::start_watched(&node, &dir, pace, watch);
+    session.wait_rooms("setting up", |_, issues, _| issues.setting_up);
+    node.with(|w| w.drop_live = true);
+    session.wait_rooms("registered and read", |r, issues, _| {
+        r.is_empty() && !issues.store_missing && !issues.setting_up
+    });
+    // Time for a second, needless registration to show: past another reconnect's backoff.
+    std::thread::sleep(Duration::from_millis(2000));
+    let connections = node.with(|w| w.connections.len());
+    assert_eq!(connections, 2, "no needless reconnect");
+    let registers = node.with(|w| w.sent.iter().filter(|(_, k)| *k == "register").count());
+    assert_eq!(registers, 1);
 }
