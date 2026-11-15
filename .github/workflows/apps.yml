@@ -24,6 +24,8 @@ on:
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
+      # The older chat delegates the app checks for rooms (src/rooms/legacy.rs).
+      - 'legacy_delegates.toml'
       - '.github/workflows/apps.yml'
   push:
     branches: [main]
@@ -37,6 +39,8 @@ on:
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
+      # The older chat delegates the app checks for rooms (src/rooms/legacy.rs).
+      - 'legacy_delegates.toml'
       - '.github/workflows/apps.yml'
   workflow_dispatch:
 
@@ -171,3 +175,49 @@ jobs:
           name: setup-screens
           path: apps/snapshots/
           if-no-files-found: ignore
+
+  # The app on two Freenet nodes River never ran on (apps/scripts/fresh-node-e2e.sh):
+  # it registers the chat delegate on each, creates a room and an invitation on one,
+  # joins from it on the other, and each receives the other's message. Runs a pinned
+  # Freenet release, the oldest the desktop app installs or newer.
+  fresh-node-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FREENET_VERSION: '0.2.157'
+    defaults:
+      run:
+        working-directory: apps
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+
+      # Checked against the release's SHA256SUMS.txt. The app's own installer also
+      # verifies that file's signature; this job only needs the binary to be the one
+      # published.
+      - name: Download Freenet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/freenet"
+          cd "$RUNNER_TEMP/freenet"
+          gh release download "v$FREENET_VERSION" --repo freenet/freenet-core \
+            --pattern 'freenet-x86_64-unknown-linux-musl.tar.gz' --pattern 'SHA256SUMS.txt'
+          grep ' freenet-x86_64-unknown-linux-musl.tar.gz$' SHA256SUMS.txt | sha256sum -c -
+          tar xzf freenet-x86_64-unknown-linux-musl.tar.gz
+          ./freenet --version
+
+      - name: Fresh-node end-to-end
+        run: FREENET_BIN="$RUNNER_TEMP/freenet/freenet" ./scripts/fresh-node-e2e.sh "$RUNNER_TEMP/e2e"

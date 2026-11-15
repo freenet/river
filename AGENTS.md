@@ -224,8 +224,16 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
 - `apps/river-app`: the UI and setup state machine, shared by every platform.
   Once setup connects it reads the user's rooms from the local node
   (`src/rooms/`): it asks the node for the River web app's identity through a
-  user-approved app grant (freenet-core v0.2.156+), reads the rooms the web UI
-  stored in the chat delegate, and subscribes to each room contract. In a room
+  user-approved app grant (freenet-core v0.2.156+), registers the chat delegate
+  on that grant connection (on every connection, as the web UI does on every
+  load; never on a connection without the grant, because the node records the
+  identity a delegate was first registered under for good), reads the rooms
+  stored in the chat delegate, and subscribes to each room contract. While the
+  chat delegate holds no rooms, it first asks the older delegates in
+  `legacy_delegates.toml` (compiled in) whether they hold any; if one does, it
+  creates and joins nothing and asks the user to open River in the browser
+  once, since the web UI moves older rooms forward only into an empty delegate
+  (`src/rooms/legacy.rs`). In a room
   the user can send in it sends messages, replies, edits and deletions of the
   user's own messages, and reactions, each as a room contract UPDATE built and
   signed as the web UI does (`src/rooms/outbox.rs`). It creates rooms, makes
@@ -347,9 +355,8 @@ rule exists because the app compiles in the chat delegate and room contract
 WASM and cannot migrate between keys, so it must carry exactly what the live
 web UI carries. If the WASM changed since the last UI publish, publish the UI
 first. The release notes record the published web UI version and both
-hashes, and tell new users the known limitation: the app does not register
-the chat delegate, so someone who has never used River must open it in the
-browser once first.
+hashes, and say what the app does not do yet (direct messages, moderation,
+nickname edits, room upgrades).
 
 What CI does and does not check per platform: `river --version` is checked
 on Linux and on the arm64 slice of the macOS binary. The x86_64 macOS slice is
