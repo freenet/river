@@ -34,9 +34,15 @@ ureq = { version = "2", default-features = false }
 tungstenite = "0.27"
 # Message times in the local time zone.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Reading River's pointer records (`pointer-records.toml`, and the records the network serves),
+# to notice that River has moved to a newer chat delegate or room contract than this build
+# carries (src/rooms/generation.rs). The same crate and resolver the web UI's generation watch
+# uses; 0.8 is the freenet-stdlib 0.12 line, so it shares this app's one stdlib.
+freenet-migrate = "0.8"
+blake3 = "1"
+toml = "0.8"
 
 [dev-dependencies]
-blake3 = "1"
 # Encrypting test rooms needs the randomized helpers.
 river-core = { path = "../../common", features = ["ecies-randomized"] }
 serde = { version = "1", features = ["derive"] }

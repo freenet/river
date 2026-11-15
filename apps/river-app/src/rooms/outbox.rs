@@ -879,6 +879,20 @@ impl Outbox {
         None
     }
 
+    /// Fail everything waiting to be sent, with `why`: River has moved on and this build
+    /// writes nothing more ([`super::generation`]). What is out keeps its answer. True when
+    /// anything failed.
+    pub fn fail_queued(&mut self, why: &str) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if entry.status == Status::Queued {
+                entry.status = Status::Failed(why.to_owned());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The node answered an update for `room`: the oldest one it still owes an answer. If that
     /// entry is gone (settled by the network, or discarded) the answer is only consumed. Taken:
     /// its messages join the room at once, and the entry is done if the room kept them;

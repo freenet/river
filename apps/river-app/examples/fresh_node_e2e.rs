@@ -165,7 +165,8 @@ fn delegate_key(
     let token = TokenStore::in_dir(dir)
         .load()
         .ok_or("the app has no grant token")?;
-    let mut socket = NodeSocket::connect(authority, &token).map_err(|e| format!("{e:?}"))?;
+    let mut socket = NodeSocket::connect(authority, &token, &Default::default())
+        .map_err(|e| format!("{e:?}"))?;
     socket
         .set_read_timeout(Duration::from_secs(10))
         .map_err(|e| format!("{e:?}"))?;

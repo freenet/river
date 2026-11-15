@@ -417,6 +417,14 @@ fn source_status(chat: &Chat, p: &Palette) -> El {
         .child(label(text, st::SMALL, color).wrap().w_full());
     let issues = &chat.issues;
     let mut notes: Vec<(&str, String)> = Vec::new();
+    if issues.update_required {
+        notes.push((
+            "update-required",
+            "A newer version of River is out. Update this app to send messages and to create \
+             or join rooms. Until then it only shows your rooms."
+                .into(),
+        ));
+    }
     if !issues.not_updated.is_empty() {
         notes.push((
             "not-updated",
@@ -535,6 +543,10 @@ fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
 pub(super) fn no_rooms_hint(chat: &Chat) -> &'static str {
     match chat.source {
         Source::Example => "Create a room, or enter an invite code to join one.",
+        // River has moved to a newer delegate or room contract: this build writes nothing.
+        Source::Node(_) if chat.issues.update_required => {
+            "A newer version of River is out. Update this app to create or join rooms."
+        }
         // The node has no chat delegate under the key this build carries, though River
         // registered it: the node refused or lost it.
         Source::Node(_) if chat.issues.store_missing => {

@@ -1199,7 +1199,23 @@ fn quick() -> Pace {
             margin: Duration::ZERO,
             outage: Duration::from_secs(60),
         },
+        pointers: CheckPace {
+            first_wait: Duration::from_secs(5),
+            fetch_wait: Duration::from_secs(1),
+            recheck: Duration::from_millis(100),
+            retry_first: Duration::from_millis(20),
+        },
     }
+}
+
+/// A watch with nothing to watch: never holds or stops a write. The session tests that are
+/// not about a newer River use it, so they run as before.
+fn no_watch() -> Watch {
+    Watch::new(
+        Vec::new(),
+        Arc::new(crate::rooms::generation::NodePointers),
+        None,
+    )
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -1224,6 +1240,18 @@ impl Running {
         Running::start_with(node, dir, pace, Arc::default(), std::sync::mpsc::channel())
     }
 
+    /// Start with `watch` deciding whether River has moved on.
+    fn start_watched(node: &FakeNode, dir: &Path, pace: Pace, watch: Arc<Watch>) -> Running {
+        Running::start_full(
+            node,
+            dir,
+            pace,
+            Arc::default(),
+            std::sync::mpsc::channel(),
+            watch,
+        )
+    }
+
     /// Start with an outbox and a command channel that may outlive this run, as the link's do.
     fn start_with(
         node: &FakeNode,
@@ -1234,6 +1262,27 @@ impl Running {
             std::sync::mpsc::Sender<Command>,
             std::sync::mpsc::Receiver<Command>,
         ),
+    ) -> Running {
+        Running::start_full(
+            node,
+            dir,
+            pace,
+            outbox,
+            (commands, inbox),
+            Arc::new(no_watch()),
+        )
+    }
+
+    fn start_full(
+        node: &FakeNode,
+        dir: &Path,
+        pace: Pace,
+        outbox: Arc<Mutex<Outbox>>,
+        (commands, inbox): (
+            std::sync::mpsc::Sender<Command>,
+            std::sync::mpsc::Receiver<Command>,
+        ),
+        watch: Arc<Watch>,
     ) -> Running {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1250,6 +1299,7 @@ impl Running {
                     &|| stop.load(Ordering::Relaxed),
                     &inbox,
                     &mut outbox.lock().unwrap(),
+                    &watch,
                 )
             })
         };
@@ -2077,6 +2127,7 @@ fn a_run_that_panics_gives_the_outbox_back() {
             &|| true,
             &rx,
             &mut outbox,
+            &no_watch(),
         )
     }));
     assert!(ended.is_err());
@@ -3365,8 +3416,16 @@ fn the_sweep_gate_is_closed_by_each_thing_it_waits_for() {
         update_owed: false,
         complete_read: true,
         settled: true,
+        writes: true,
     };
     assert!(open.open());
+    assert!(
+        !SweepGate {
+            writes: false,
+            ..open
+        }
+        .open()
+    );
     assert!(
         !SweepGate {
             task_working: true,
@@ -4064,4 +4123,210 @@ fn a_store_refused_at_first_is_set_up_later_by_itself_on_a_backoff() {
     let lists = node.with(|w| w.lists);
     session.wait_until("twenty more reads", || node.with(|w| w.lists >= lists + 20));
     assert_eq!(node.with(|w| registrations(w)), after);
+}
+
+// A newer River ------------------------------------------------------------------------------
+
+use crate::rooms::generation::tests::{FakePointers, delegate_state, room_state, test_watched};
+use crate::rooms::generation::{CheckPace, Fetch};
+
+/// A watch over the test pointers, answered by `source`.
+fn watched(source: &Arc<FakePointers>, delegate_version: Option<u32>) -> Arc<Watch> {
+    let w = test_watched();
+    answer_pointers(source, delegate_version);
+    Arc::new(Watch::new(w, source.clone(), None))
+}
+
+/// The pointers answer: the room contract current, the chat delegate at `delegate_version`
+/// (`None`: nothing reachable at all).
+fn answer_pointers(source: &FakePointers, delegate_version: Option<u32>) {
+    let w = test_watched();
+    *source.answer.lock().unwrap() = match delegate_version {
+        Some(v) => vec![
+            (w[0].pointer_id, Fetch::State(room_state(1))),
+            (w[1].pointer_id, Fetch::State(delegate_state(v))),
+        ],
+        None => Vec::new(),
+    };
+}
+
+fn following_watched(
+    node: &FakeNode,
+    rooms: &[&TestRoom],
+    dir: &str,
+    outbox: Outbox,
+    watch: Arc<Watch>,
+) -> (Running, PathBuf) {
+    node.with(|w| {
+        for r in rooms {
+            w.add_room(r);
+        }
+    });
+    let dir = temp_dir(dir);
+    save_token(&dir, "kept-token");
+    let session = Running::start_full(
+        node,
+        &dir,
+        quick(),
+        Arc::new(Mutex::new(outbox)),
+        std::sync::mpsc::channel(),
+        watch,
+    );
+    let n = rooms.len();
+    session.wait_rooms("the rooms are live", move |r, _, s| {
+        r.len() == n && s == LinkStatus::Live
+    });
+    (session, dir)
+}
+
+/// What the node took that writes: UPDATEs, PUTs, CAS stores, signing key stores and
+/// registrations.
+fn writes_taken(node: &FakeNode) -> (usize, usize, usize, usize, usize) {
+    node.with(|w| {
+        (
+            w.updates.len(),
+            w.puts.len(),
+            w.cas.len(),
+            w.key_stores.len(),
+            w.sent.iter().filter(|(_, k)| *k == "register").count(),
+        )
+    })
+}
+
+/// Once a verified pointer names a newer chat delegate, nothing is written: not what was
+/// waiting from an earlier run, not a new message, a create, a join, nor the signing key the
+/// sweep would store. Each fails with why, the composer says why, and the rooms still show and
+/// are still subscribed.
+#[test]
+fn a_newer_river_stops_every_write_and_keeps_the_rooms_showing() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    // Left unsent by an earlier run.
+    let mut outbox = Outbox::default();
+    assert!(outbox.command(&LiveRoom::new(a.stored()), say("from before")));
+    // An invitation to another room, to try to join.
+    let room = TestRoom::new(3, "Garden", 1, &["t1"]);
+    let (_, link) =
+        super::super::create::invitation(&LiveRoom::new(room.stored()), "http://x/").unwrap();
+    let source = Arc::new(FakePointers::default());
+    let watch = watched(&source, Some(2));
+    let (session, _dir) = following_watched(&node, &[&a], "stale-all", outbox, watch.clone());
+    assert!(watch.is_stale());
+    session.wait_rooms("the update is asked for", |r, issues, _| {
+        issues.update_required && r[0].send_block.as_deref() == Some(UPDATE_REQUIRED_SEND)
+    });
+    session.wait_until("what was waiting fails, saying why", || {
+        matches!(delivery_of(&session, "from before"),
+            Some(Some(p)) if p.failed.as_deref() == Some(UPDATE_REQUIRED))
+    });
+
+    session.act(&a, say("written now"));
+    session.list(Action::CreateRoom {
+        name: "New".into(),
+        nickname: "Me".into(),
+        private: false,
+    });
+    session.list(Action::Join {
+        code: InviteCode(link),
+        nickname: "Me".into(),
+    });
+    session.wait_until("each fails, saying why", || {
+        let sent = matches!(delivery_of(&session, "written now"),
+            Some(Some(p)) if p.failed.as_deref() == Some(UPDATE_REQUIRED));
+        let work = session.last_work();
+        sent && work.len() == 2
+            && work.iter().all(|w| {
+                matches!(&w.state, WorkState::Failed { why, retry: false } if why == UPDATE_REQUIRED)
+            })
+    });
+    // Past the sweep's delay, which would otherwise store the room's signing key.
+    std::thread::sleep(quick().key_delay * 3);
+    assert_eq!(writes_taken(&node), (0, 0, 0, 0, 0));
+    // Still reading: the room is subscribed.
+    assert_eq!(node.with(|w| w.subscribes_to(a.id())), 1);
+}
+
+/// The control for the test above: with the same rooms and a current pointer, the same
+/// writes all go out.
+#[test]
+fn a_current_river_writes_as_usual() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut outbox = Outbox::default();
+    assert!(outbox.command(&LiveRoom::new(a.stored()), say("from before")));
+    let source = Arc::new(FakePointers::default());
+    let watch = watched(&source, Some(1));
+    let (session, _dir) = following_watched(&node, &[&a], "current-all", outbox, watch.clone());
+    session.wait_until("sent, and the key stored", || {
+        let (updates, _, _, key_stores, _) = writes_taken(&node);
+        updates == 1 && key_stores == 1
+    });
+    assert!(!watch.is_stale());
+    let (_, issues, _) = session.last_rooms().unwrap();
+    assert!(!issues.update_required);
+}
+
+/// A pointer that cannot be reached at all never stops the app writing.
+#[test]
+fn an_unreachable_pointer_does_not_stop_writes() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let source = Arc::new(FakePointers::default());
+    let watch = watched(&source, None);
+    let (session, _dir) = following_watched(
+        &node,
+        &[&a],
+        "unreachable",
+        Outbox::default(),
+        watch.clone(),
+    );
+    session.act(&a, say("still sent"));
+    session.wait_until("sent", || writes_taken(&node).0 == 1);
+    assert!(!watch.is_stale());
+}
+
+/// On a node River never ran on, a build River has moved past does not register its chat
+/// delegate: that would set up storage the web UI no longer reads.
+#[test]
+fn an_outdated_build_does_not_register_on_a_fresh_node() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.unregistered = true);
+    let dir = temp_dir("stale-fresh");
+    let source = Arc::new(FakePointers::default());
+    let session = Running::start_watched(&node, &dir, quick(), watched(&source, Some(2)));
+    session.wait_rooms("no store, and the update asked for", |r, issues, _| {
+        r.is_empty() && issues.store_missing && issues.update_required
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(writes_taken(&node), (0, 0, 0, 0, 0));
+    assert!(node.with(|w| w.unregistered));
+}
+
+/// A re-key published while the app runs is noticed by the periodic check, and writes stop
+/// from then on.
+#[test]
+fn a_re_key_while_running_stops_later_writes() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let source = Arc::new(FakePointers::default());
+    let watch = watched(&source, Some(1));
+    let (session, _dir) = following_watched(
+        &node,
+        &[&a],
+        "rekey-running",
+        Outbox::default(),
+        watch.clone(),
+    );
+    session.act(&a, say("before"));
+    session.wait_until("sent", || writes_taken(&node).0 == 1);
+    answer_pointers(&source, Some(3));
+    session.wait_rooms("the update is asked for", |_, issues, _| {
+        issues.update_required
+    });
+    session.act(&a, say("after"));
+    session.wait_until("refused, saying why", || {
+        matches!(delivery_of(&session, "after"),
+            Some(Some(p)) if p.failed.as_deref() == Some(UPDATE_REQUIRED))
+    });
+    assert_eq!(writes_taken(&node).0, 1);
 }
