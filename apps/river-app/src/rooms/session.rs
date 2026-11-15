@@ -133,6 +133,8 @@ pub(super) struct Pace {
     /// again, and the most that doubles to ([`super::keys`]).
     pub key_retry_first: Duration,
     pub key_retry_max: Duration,
+    /// How long after the stored rooms were read the signing key sweep waits before it starts.
+    pub key_delay: Duration,
     pub grant: GrantPacing,
 }
 
@@ -160,6 +162,7 @@ impl Default for Pace {
             register_retry_max: Duration::from_secs(15 * 60),
             key_retry_first: Duration::from_secs(60),
             key_retry_max: Duration::from_secs(30 * 60),
+            key_delay: Duration::from_secs(5),
             grant: GrantPacing::default(),
         }
     }
@@ -608,9 +611,9 @@ fn follow_on(
     commands: &Receiver<Command>,
 ) -> SocketError {
     let connected_at = Instant::now();
-    // Whatever the signing key sweep had out went with the last connection.
-    rooms.keys.connection_lost();
+    // Whatever the signing key sweep had out went with the last connection: a failure of it.
     let key_pace = (pace.key_retry_first, pace.key_retry_max);
+    rooms.keys.connection_lost(key_pace, Instant::now());
     if let Err(e) = socket.read_early(early_read) {
         return e;
     }
@@ -726,15 +729,6 @@ fn follow_on(
         {
             return e;
         }
-        // The signing key sweep: only on a complete read, with no task working and no read out.
-        // It sends one request and waits for its answer before the next.
-        let idle =
-            reload.is_none() && !rooms.outbox.work.busy() && rooms.complete && !rooms.store_missing;
-        if let Some(request) = rooms.keys.next_request(&rooms.list, idle, Instant::now())
-            && let Err(e) = socket.send(&request)
-        {
-            return e;
-        }
         // Read the stored rooms again now and then, for rooms joined or left elsewhere.
         // A read that took too long has requests still out, whose answers or errors could come
         // late and be taken for a create's or join's: start again on a new connection.
@@ -764,6 +758,29 @@ fn follow_on(
                 }
             }
             reload = Some((loader, Instant::now()));
+        }
+        // The signing key sweep comes last, after a read has had its chance to start: it is the
+        // lowest priority. It sends one request and waits for its answer before the next.
+        let gate = SweepGate {
+            task_working: rooms.outbox.work.busy(),
+            read_out: reload.is_some(),
+            read_pending_or_due: rooms.outbox.work.reload_pending()
+                || last_read.elapsed() >= pace.refresh,
+            subscribes_pending: !subs.pending.is_empty(),
+            update_owed: rooms
+                .list
+                .iter()
+                .any(|r| rooms.outbox.owes(&r.stored.owner_vk)),
+            complete_read: rooms.complete && !rooms.store_missing,
+            settled: last_read.elapsed() >= pace.key_delay,
+        };
+        if let Some(request) = rooms
+            .keys
+            .next_request(&rooms.list, gate.open(), Instant::now())
+            && let Err(e) = socket.send(&request)
+        {
+            rooms.keys.send_failed(key_pace, Instant::now());
+            return e;
         }
 
         let response = match socket.recv() {
@@ -818,10 +835,7 @@ fn follow_on(
                         changed = true;
                         continue;
                     }
-                    if rooms
-                        .keys
-                        .on_answer(&answer, &rooms.list, key_pace, Instant::now())
-                    {
+                    if rooms.keys.on_answer(&answer, key_pace, Instant::now()) {
                         continue;
                     }
                     if let Some((loader, _)) = &mut reload {
@@ -897,6 +911,11 @@ fn follow_on(
                     reload = None;
                     last_read = Instant::now();
                 }
+                // A `Missing` the signing key sweep took is a failure of its own (backed off for
+                // the whole sweep), and still lands here: it is a store that was there, as a
+                // read's `Missing` is, so it registers again by the same rules, and the sweep's
+                // wait keeps it from repeating faster than that wait.
+                //
                 // Only a store that was there, or a create or join the user asked for, is a
                 // reason to register again. A store this connection already failed to set up
                 // (`store_missing` shown) is not registered again on every re-read: that would
@@ -935,6 +954,37 @@ fn follow_on(
         if changed {
             rooms.report(status, report);
         }
+    }
+}
+
+/// What must hold before the signing key sweep sends a request: it is the lowest priority, so
+/// it waits for everything else, and its request is one nothing else may be beside.
+struct SweepGate {
+    /// A create or join works.
+    task_working: bool,
+    /// A read of the stored rooms is out.
+    read_out: bool,
+    /// A read is wanted (a task just finished) or due by the refresh interval.
+    read_pending_or_due: bool,
+    /// A subscribe is unanswered: an error that names nothing could be its.
+    subscribes_pending: bool,
+    /// An update's answer is owed, for the same reason.
+    update_owed: bool,
+    /// The last read of the stored rooms was complete, and the store is there.
+    complete_read: bool,
+    /// A few seconds have passed since that read.
+    settled: bool,
+}
+
+impl SweepGate {
+    fn open(&self) -> bool {
+        !self.task_working
+            && !self.read_out
+            && !self.read_pending_or_due
+            && !self.subscribes_pending
+            && !self.update_owed
+            && self.complete_read
+            && self.settled
     }
 }
 

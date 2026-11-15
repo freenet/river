@@ -4,7 +4,9 @@
 //! work ([`Link`]) asks for a grant (approved here as the user would approve it on the page),
 //! registers the chat delegate, and reads an empty room list. Then the app on node A creates a
 //! room and makes an invitation, the app on node B joins from it, and each sends a message the
-//! other receives.
+//! other receives. Last, each node's chat delegate is asked directly (on a connection of its own
+//! with the app's grant) for the room's signing key, and must hold the key of that app's own
+//! member: the app's background key sweep puts it there.
 //!
 //! ```text
 //! cargo run -p river-app --example fresh_node_e2e -- <node A host:port> <node B host:port> <dir>
@@ -200,7 +202,7 @@ fn delegate_key(
 }
 
 /// Wait until the delegate on `authority` holds, for the room, the public key of the member's
-/// own stored identity, then say so. Panics after a minute with what it last saw.
+/// own stored identity, then say so. Panics after [`STEP`] with what it last saw.
 fn expect_signing_key(name: &str, authority: &str, dir: &Path, room_key: &str) -> VerifyingKey {
     let bytes: [u8; 32] = bs58::decode(room_key)
         .into_vec()
@@ -208,7 +210,7 @@ fn expect_signing_key(name: &str, authority: &str, dir: &Path, room_key: &str) -
         .try_into()
         .expect("32 bytes");
     let owner = VerifyingKey::from_bytes(&bytes).expect("the room key is the owner's key");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + STEP;
     loop {
         let last = match delegate_key(authority, dir, &owner) {
             Ok((identity, Some(held))) if held == identity.to_bytes() => {

@@ -68,11 +68,11 @@
 //! **What the user sees.** A task working, failed (with why, Try again and Dismiss) or done
 //! ([`WorkView`]). Nothing fails without saying so.
 //!
-//! What this leaves to the web UI: storing the room's key in the delegate's `signing_key:`
-//! namespace and, for a room the user owns, asking the delegate to follow it
-//! (`EnsureRoomSubscription`). The web UI does both for every stored room each time it loads
-//! (`hydrate_loaded_rooms_with_authority` in `freenet_api/response_handler.rs`), and the room
-//! slot holds everything they are rebuilt from.
+//! What this leaves to the web UI: for a room the user owns, asking the delegate to follow it
+//! (`EnsureRoomSubscription`), which the web UI does for every stored room each time it loads
+//! (`hydrate_loaded_rooms_with_authority` in `freenet_api/response_handler.rs`). The room's
+//! signing key is stored in the delegate by the background sweep in [`super::keys`], not by
+//! these tasks, so a task is done as soon as the room is stored.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
@@ -489,6 +489,11 @@ impl Work {
     /// it: an answer names only the room, and the task's must not be taken for another's.
     pub fn holds(&self, owner: &VerifyingKey) -> bool {
         self.active_ref().and_then(Task::owner) == Some(*owner)
+    }
+
+    /// Whether a read of the stored rooms is wanted because a task finished, without clearing it.
+    pub fn reload_pending(&self) -> bool {
+        self.reload
     }
 
     /// Whether to read the stored rooms now, because a task finished. Asking clears it.

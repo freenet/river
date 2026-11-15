@@ -23,9 +23,8 @@
 //! compare-and-swap, only adds a room where none is stored, and in `rooms_meta` only changes
 //! the open room ([`work`] has the details). The one other thing it writes is each room's signing
 //! key, in the delegate's own namespace for keys, only where the delegate holds none ([`keys`]).
-//! Its only PUT is the seed PUT of a room it has just
-//! created, under that room's own contract; it never seeds a room the network lacks, which the
-//! web UI does.
+//! Its only PUT is the seed PUT of a room it has just created, under that room's own contract;
+//! it never seeds a room the network lacks, which the web UI does.
 
 pub mod create;
 pub mod delegate;
