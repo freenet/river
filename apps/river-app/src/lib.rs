@@ -288,7 +288,8 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.access = Access::PermissionRemoved;
     }),
-    // The node has no chat delegate under the key this build carries.
+    // The node has no chat delegate under the key this build carries, though River registered
+    // it.
     ("chat-no-store", |s| {
         connect(s);
         s.chat = Chat::new(

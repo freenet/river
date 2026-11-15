@@ -47,9 +47,13 @@ River $VERSION for Linux ($ARCH)
 Run ./river to start. River finds the Freenet node on this computer, or offers to
 install it.
 
-Before first use: this preview cannot set up River's storage on your Freenet node
-by itself. If you have never used River on this computer, open River in your web
-browser through Freenet once first, then start this app.
+New users do not need River in the browser first: this preview sets up River's
+storage on your Freenet node itself. The first time, the app asks Freenet for
+permission, and approving it opens a tab in your browser on your Freenet node's
+own page (not River). Not in the app yet: direct messages, moderation, changing
+your nickname, and room upgrades; use River in your web browser for those.
+If you already used River in your web browser, rooms from an earlier version show
+up here after you open River in the browser once.
 
 To add River to your applications menu:
 

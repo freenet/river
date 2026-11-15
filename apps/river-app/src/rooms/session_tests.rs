@@ -401,7 +401,8 @@ fn a_read_that_finds_no_store_or_no_rooms_keeps_the_list() {
     rooms.replace(loaded(vec![a.stored()]));
     assert!(rooms.replace(Loaded::missing()).is_empty());
     assert_eq!(rooms.list.len(), 1);
-    assert!(!rooms.issues().store_missing);
+    // Recorded, so the store is not registered again on every re-read; the list stays.
+    assert!(rooms.issues().store_missing);
     assert!(rooms.replace(loaded(vec![])).is_empty());
     assert_eq!(rooms.list.len(), 1);
     // Before anything was shown, a missing store is said as such.
@@ -526,7 +527,19 @@ struct World {
     /// One per WebSocket connection, in order; `Serve` once they run out.
     plays: VecDeque<Play>,
     slots: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// The node has no chat delegate and refuses to register it.
     delegate_missing: bool,
+    /// The node has no chat delegate until it is registered (a node River never ran on).
+    unregistered: bool,
+    /// The bearer token each WebSocket connection presented, by connection.
+    conn_bearer: Vec<Option<String>>,
+    /// What each connection was sent, in order, by connection: "register", "list", "get",
+    /// "versioned", "cas", "contract".
+    sent: Vec<(usize, &'static str)>,
+    /// Take registrations but answer nothing (the delegate stays unregistered).
+    silence_register: bool,
+    /// Called for every listing, as it arrives.
+    on_list: Option<Box<dyn FnMut() + Send>>,
     contracts: HashMap<ContractInstanceId, (ContractKey, Contract)>,
     /// When each WebSocket connection was accepted.
     connections: Vec<Instant>,
@@ -651,13 +664,15 @@ fn fake_node(plays: Vec<Play>) -> FakeNode {
             if lower.contains("upgrade: websocket") {
                 let (n, play) = {
                     let mut w = world.lock().unwrap();
-                    if let Some(bearer) = head.lines().find_map(|l| {
+                    let bearer = head.lines().find_map(|l| {
                         l.to_ascii_lowercase()
                             .starts_with("authorization: bearer ")
                             .then(|| l["authorization: bearer ".len()..].trim().to_owned())
-                    }) {
-                        w.bearers.push(bearer);
+                    });
+                    if let Some(bearer) = &bearer {
+                        w.bearers.push(bearer.clone());
                     }
+                    w.conn_bearer.push(bearer);
                     w.connections.push(Instant::now());
                     let n = w.connections.len() - 1;
                     if let Some(f) = &mut w.on_connect {
@@ -783,7 +798,7 @@ fn serve(mut ws: tungstenite::WebSocket<TcpStream>, n: usize, world: &Mutex<Worl
         }
         match ws.read() {
             Ok(Message::Binary(b)) => {
-                let replies = answer(world, &b);
+                let replies = answer(world, n, &b);
                 for r in replies {
                     if ws.send(Message::Binary(r.into())).is_err() {
                         return;
@@ -798,12 +813,41 @@ fn serve(mut ws: tungstenite::WebSocket<TcpStream>, n: usize, world: &Mutex<Worl
     }
 }
 
-fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
+fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
     let request: ClientRequest = bincode::deserialize(bytes).unwrap();
     let mut w = world.lock().unwrap();
     let mut out = Vec::new();
     let encode = |r: Result<HostResponse, ClientError>| bincode::serialize(&r).unwrap();
+    if matches!(request, ClientRequest::ContractOp(_)) {
+        w.sent.push((n, "contract"));
+    }
     match request {
+        // The node's answer to a registration: an empty response for the delegate's key.
+        ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate, .. }) => {
+            w.sent.push((n, "register"));
+            assert_eq!(delegate.key(), delegate::chat_delegate_key());
+            if w.silence_register {
+                // No answer, and nothing registered.
+            } else if w.delegate_missing {
+                out.push(encode(Err(ErrorKind::RequestError(
+                    RequestError::DelegateError(DelegateError::RegisterError(
+                        delegate.key().clone(),
+                    )),
+                )
+                .into())));
+            } else {
+                w.unregistered = false;
+                out.push(encode(Ok(HostResponse::DelegateResponse {
+                    key: delegate.key().clone(),
+                    values: vec![],
+                })));
+            }
+        }
+        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, .. })
+            if &key != delegate::chat_delegate_key() =>
+        {
+            panic!("the app only asks River's own chat delegate, but asked {key}");
+        }
         ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) => {
             for msg in inbound {
                 let InboundDelegateMsg::ApplicationMessage(m) = msg else {
@@ -811,9 +855,22 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                 };
                 let read: ChatDelegateRequestMsg =
                     ciborium::de::from_reader(m.payload.as_slice()).unwrap();
+                w.sent.push((
+                    n,
+                    match &read {
+                        ChatDelegateRequestMsg::ListRequest => "list",
+                        ChatDelegateRequestMsg::GetRequest { .. } => "get",
+                        ChatDelegateRequestMsg::GetVersionedRequest { .. } => "versioned",
+                        ChatDelegateRequestMsg::CasStoreRequest { .. } => "cas",
+                        _ => "other",
+                    },
+                ));
                 match &read {
                     ChatDelegateRequestMsg::ListRequest => {
                         w.lists += 1;
+                        if let Some(f) = &mut w.on_list {
+                            f();
+                        }
                         // The reader gets every room key and the meta it is told of.
                         w.reads_due = w
                             .slots
@@ -835,7 +892,7 @@ fn answer(world: &Mutex<World>, bytes: &[u8]) -> Vec<Vec<u8>> {
                     }
                     _ => {}
                 }
-                if w.delegate_missing {
+                if w.delegate_missing || w.unregistered {
                     out.push(encode(Err(missing_delegate())));
                     continue;
                 }
@@ -984,6 +1041,10 @@ fn quick() -> Pace {
         update_wait: Duration::from_secs(60),
         owed_limit: Duration::from_secs(180),
         delegate_deadline: Duration::from_secs(5),
+        register_wait: Duration::from_secs(5),
+        missing_lapse: Duration::ZERO,
+        register_retry_first: Duration::from_secs(60),
+        register_retry_max: Duration::from_secs(60),
         grant: GrantPacing {
             pause: Duration::ZERO,
             margin: Duration::ZERO,
@@ -2881,4 +2942,374 @@ fn an_invitation_for_a_room_gone_is_said_to_have_failed() {
         }
     );
     assert!(!shown.contains("SECRETCODE"), "{shown}");
+}
+
+// Setting up River's storage --------------------------------------------------------------------
+
+/// Every registration went out on a connection that presented the grant token: the node records
+/// the first registration's app identity for good, and a connection without the token has none
+/// (socket.rs).
+fn assert_registers_only_with_the_grant(w: &World) {
+    for (n, kind) in &w.sent {
+        if *kind == "register" {
+            assert!(
+                w.conn_bearer[*n].as_deref().is_some_and(|t| !t.is_empty()),
+                "connection {n} registered without the grant token"
+            );
+        }
+    }
+}
+
+/// What connection `n` sent, in order.
+fn sent_on(w: &World, n: usize) -> Vec<&'static str> {
+    w.sent
+        .iter()
+        .filter(|(c, _)| *c == n)
+        .map(|(_, k)| *k)
+        .collect()
+}
+
+#[test]
+fn a_node_river_never_ran_on_gets_the_store_registered_then_read() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.unregistered = true);
+    let dir = temp_dir("fresh-register");
+    // No saved token: the grant is asked for, approved, then used.
+    let session = Running::start(&node, &dir, quick());
+    session.wait_rooms("an empty list with nothing missing", |r, issues, s| {
+        r.is_empty() && !issues.store_missing && s == LinkStatus::Live
+    });
+    node.with(|w| {
+        assert!(!w.unregistered);
+        assert_registers_only_with_the_grant(w);
+        assert_eq!(w.conn_bearer[0].as_deref(), Some("fresh-token"));
+        // Listed, found missing, registered, listed again.
+        assert_eq!(sent_on(w, 0)[..3], ["list", "register", "list"]);
+    });
+}
+
+#[test]
+fn a_node_that_has_the_store_is_not_sent_a_registration() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (_session, _dir) = following(&node, &[&a], "registered-already", quick());
+    node.with(|w| {
+        assert!(
+            !w.sent.iter().any(|(_, k)| *k == "register"),
+            "{:?}",
+            w.sent
+        );
+    });
+}
+
+#[test]
+fn a_room_created_on_a_fresh_node_is_stored_and_shown() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.unregistered = true);
+    let dir = temp_dir("fresh-create");
+    let session = Running::start(&node, &dir, quick());
+    // Sent before the rooms are first read: it waits for them, then goes into the new store.
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_rooms("the room is created", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club")
+    });
+    node.with(|w| {
+        assert_eq!(w.puts.len(), 1);
+        assert_registers_only_with_the_grant(w);
+        let first_cas = w.sent.iter().position(|(_, k)| *k == "cas").unwrap();
+        let register = w.sent.iter().position(|(_, k)| *k == "register").unwrap();
+        assert!(register < first_cas, "stored before the store was set up");
+    });
+}
+
+#[test]
+fn a_store_that_cannot_be_registered_is_said() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.delegate_missing = true);
+    let dir = temp_dir("register-refused");
+    let session = Running::start(&node, &dir, quick());
+    session.wait_rooms("the store is said to be missing", |r, issues, _| {
+        r.is_empty() && issues.store_missing
+    });
+    node.with(|w| assert_eq!(sent_on(w, 0)[..3], ["list", "register", "list"]));
+}
+
+#[test]
+fn an_unanswered_registration_is_waited_out_and_the_rooms_read_anyway() {
+    let node = fake_node(vec![]);
+    node.with(|w| {
+        w.unregistered = true;
+        w.silence_register = true;
+    });
+    let dir = temp_dir("register-silent");
+    let pace = Pace {
+        register_wait: Duration::from_millis(300),
+        ..quick()
+    };
+    let started = Instant::now();
+    let session = Running::start(&node, &dir, pace);
+    session.wait_rooms("the store is said to be missing", |r, issues, _| {
+        r.is_empty() && issues.store_missing
+    });
+    // It waited for the answer before reading again.
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    node.with(|w| assert_eq!(sent_on(w, 0)[..3], ["list", "register", "list"]));
+}
+
+#[test]
+fn a_store_that_goes_missing_is_registered_first_on_a_new_connection() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        refresh: Duration::from_millis(50),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "store-gone", pace);
+    let before = node.with(|w| w.connections.len());
+    // The node loses the delegate (its data was reset); the stored rooms come back with it.
+    node.with(|w| w.unregistered = true);
+    session.wait_until("a new connection registered", || {
+        node.with(|w| {
+            w.connections.len() > before && !w.unregistered && sent_on(w, before).len() >= 2
+        })
+    });
+    node.with(|w| {
+        // The new connection registers before anything else, with the grant.
+        assert_eq!(sent_on(w, before)[..2], ["register", "list"]);
+        assert_registers_only_with_the_grant(w);
+    });
+    session.wait_rooms("the room is shown, nothing missing", |r, issues, _| {
+        names(r) == ["A"] && !issues.store_missing
+    });
+}
+
+/// A tripwire, not a proof: `RegisterDelegate` is built in one place in this app's production
+/// code, the grant socket. It catches a second builder written the usual way; a request
+/// smuggled in some other form would pass it. What enforces the invariant is
+/// `NodeSocket::send` refusing the request and `connect` requiring a grant token.
+#[test]
+fn only_the_grant_socket_registers_the_delegate() {
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    let mut found = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(src)];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".rs") || name.ends_with("_tests.rs") || name == "tests.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Production code only: stop at the file's test module.
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap();
+            if code.contains("RegisterDelegate {") {
+                found.push(name);
+            }
+        }
+    }
+    assert_eq!(found, ["socket.rs"]);
+}
+
+/// The read after registering waits out the backoff the `Missing` answer armed on the node, so
+/// the node does not refuse it as rate limited.
+#[test]
+fn the_read_after_registering_waits_out_the_missing_backoff() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.unregistered = true);
+    let dir = temp_dir("missing-lapse");
+    let pace = Pace {
+        missing_lapse: Duration::from_millis(400),
+        ..quick()
+    };
+    let lists = Arc::new(Mutex::new(Vec::<Instant>::new()));
+    {
+        let lists = lists.clone();
+        node.with(|w| {
+            w.on_list = Some(Box::new(move || lists.lock().unwrap().push(Instant::now())))
+        });
+    }
+    let session = Running::start(&node, &dir, pace);
+    session.wait_rooms("live", |r, issues, s| {
+        r.is_empty() && !issues.store_missing && s == LinkStatus::Live
+    });
+    let lists = lists.lock().unwrap();
+    assert!(lists.len() >= 2);
+    assert!(
+        lists[1] - lists[0] >= Duration::from_millis(400),
+        "read again {:?} after the Missing",
+        lists[1] - lists[0]
+    );
+}
+
+fn registrations(w: &World) -> usize {
+    w.sent.iter().filter(|(_, k)| *k == "register").count()
+}
+
+/// A node that refuses the registration, or never answers it, is not asked again on every
+/// re-read of the stored rooms; the app's own retries wait `register_retry_first` and longer (each one re-sends the whole WASM, and an
+/// unanswered one waits out `register_wait` each time).
+#[test]
+fn a_refused_or_unanswered_registration_is_not_repeated_on_every_reread() {
+    for silent in [false, true] {
+        let node = fake_node(vec![]);
+        node.with(|w| {
+            w.unregistered = true;
+            w.delegate_missing = !silent;
+            w.silence_register = silent;
+        });
+        let dir = temp_dir(if silent {
+            "register-silent-loop"
+        } else {
+            "register-refused-loop"
+        });
+        let pace = Pace {
+            refresh: Duration::from_millis(30),
+            register_wait: Duration::from_millis(100),
+            ..quick()
+        };
+        let session = Running::start(&node, &dir, pace);
+        session.wait_rooms("the store is said to be missing", |r, issues, _| {
+            r.is_empty() && issues.store_missing
+        });
+        // Several refresh intervals' worth of re-reads.
+        let lists = node.with(|w| w.lists);
+        session.wait_until("eight more reads", || node.with(|w| w.lists >= lists + 8));
+        node.with(|w| {
+            assert_eq!(registrations(w), 1, "silent={silent}: {:?}", w.sent);
+        });
+        let (_, issues, _) = session.last_rooms().unwrap();
+        assert!(issues.store_missing);
+    }
+}
+
+/// A create or join the user asks for while the store is missing is a reason to try setting it
+/// up again: it reconnects, and the new connection registers first. The user decides how often.
+#[test]
+fn a_create_while_the_store_is_missing_tries_to_set_it_up_again() {
+    let node = fake_node(vec![]);
+    node.with(|w| {
+        w.unregistered = true;
+        w.delegate_missing = true;
+    });
+    let dir = temp_dir("missing-then-create");
+    let session = Running::start(&node, &dir, quick());
+    session.wait_rooms("the store is said to be missing", |r, issues, _| {
+        r.is_empty() && issues.store_missing
+    });
+    // The node now takes registrations.
+    node.with(|w| w.delegate_missing = false);
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_until("the create failed and the store was set up", || {
+        node.with(|w| registrations(w) == 2 && !w.unregistered)
+    });
+    let id = session.last_work()[0].id;
+    session.list(Action::RetryWork { id });
+    session.wait_rooms("the room is created", |r, issues, _| {
+        r.iter().any(|r| r.name == "Book club") && !issues.store_missing
+    });
+}
+
+/// A store that was there, goes missing, and then cannot be registered again: one attempt on
+/// the next connection, not one per re-read. The rooms stay shown.
+#[test]
+fn a_store_that_goes_missing_and_cannot_be_set_up_again_is_tried_once() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        refresh: Duration::from_millis(30),
+        register_wait: Duration::from_millis(100),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "gone-refused", pace);
+    node.with(|w| w.delegate_missing = true);
+    session.wait_until("one registration was tried", || {
+        node.with(|w| registrations(w) == 1)
+    });
+    let lists = node.with(|w| w.lists);
+    session.wait_until("eight more reads", || node.with(|w| w.lists >= lists + 8));
+    node.with(|w| assert_eq!(registrations(w), 1, "{:?}", w.sent));
+    let (rooms, _, _) = session.last_rooms().unwrap();
+    assert_eq!(names(&rooms), ["A"]);
+}
+
+#[test]
+fn only_the_chat_delegate_missing_counts_as_the_store_missing() {
+    let other = freenet_stdlib::prelude::Delegate::from((
+        &freenet_stdlib::prelude::DelegateCode::from(vec![1, 2, 3]),
+        &Parameters::from(Vec::<u8>::new()),
+    ))
+    .key()
+    .clone();
+    let theirs: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::Missing(other.clone()),
+    ))
+    .into();
+    assert!(delegate_error(&theirs).is_err());
+    assert!(!chat_delegate_missing(&theirs));
+    assert!(names_another_delegate(&theirs));
+    assert!(!names_another_delegate(&missing_delegate()));
+    let their_register: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::RegisterError(other),
+    ))
+    .into();
+    assert!(names_another_delegate(&their_register));
+}
+
+/// A node that refused the registration at first and takes it later: the app sets the store
+/// up by itself on its retry backoff, without the user doing anything, and the registrations
+/// stay far fewer than the re-reads.
+#[test]
+fn a_store_refused_at_first_is_set_up_later_by_itself_on_a_backoff() {
+    let node = fake_node(vec![]);
+    node.with(|w| {
+        w.unregistered = true;
+        w.delegate_missing = true;
+    });
+    let dir = temp_dir("register-recovers");
+    let pace = Pace {
+        refresh: Duration::from_millis(20),
+        register_wait: Duration::from_millis(100),
+        register_retry_first: Duration::from_millis(150),
+        register_retry_max: Duration::from_millis(600),
+        ..quick()
+    };
+    let session = Running::start(&node, &dir, pace);
+    session.wait_rooms("the store is said to be missing", |r, issues, _| {
+        r.is_empty() && issues.store_missing
+    });
+    // Many re-reads while the node still refuses.
+    let lists = node.with(|w| w.lists);
+    session.wait_until("forty more reads", || node.with(|w| w.lists >= lists + 40));
+    let (refused, reads) = node.with(|w| (registrations(w), w.lists - lists));
+    assert!(refused >= 2, "the app retried by itself: {refused}");
+    assert!(
+        refused * 4 <= reads,
+        "{refused} registrations over {reads} re-reads"
+    );
+    // The node is healthy now: the next retry sets the store up, with no command sent.
+    node.with(|w| w.delegate_missing = false);
+    session.wait_rooms("the store is found", |r, issues, s| {
+        r.is_empty() && !issues.store_missing && s == LinkStatus::Live
+    });
+    node.with(|w| {
+        assert!(!w.unregistered);
+        assert_registers_only_with_the_grant(w);
+    });
+    // Found: no more registrations, however many re-reads follow.
+    let after = node.with(|w| registrations(w));
+    let lists = node.with(|w| w.lists);
+    session.wait_until("twenty more reads", || node.with(|w| w.lists >= lists + 20));
+    assert_eq!(node.with(|w| registrations(w)), after);
 }

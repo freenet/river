@@ -36,6 +36,16 @@
 //!   Commands that arrive while disconnected are shown and wait; commands that arrive before
 //!   the rooms were first read wait for them. What is unsent outlives the run (a stop, or a
 //!   panic), and a first read that finds no rooms does not drop it.
+//! - **Setting up River's storage.** A connection first lists the stored rooms, as the web UI
+//!   does since freenet/river#757. If the node says the chat delegate is missing (River never
+//!   ran on this node, or the node lost it), the app registers the delegate this build carries,
+//!   waits for the node's answer for up to [`Pace::register_wait`], and lists again. Only a
+//!   grant connection can register ([`super::socket`] has why that matters). A refused or
+//!   unanswered registration does not stop the read, as in the web UI; a store still missing
+//!   then is said on screen, and the re-reads do not register it again (each would re-send the
+//!   whole WASM). A new connection, or a create or join the user asks for, tries again. A store
+//!   that was there and goes missing later in a connection ends it, and the next connection
+//!   registers before it lists.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -106,6 +116,19 @@ pub(super) struct Pace {
     /// How long the chat delegate gets to answer a read. The web UI allows 10 seconds per
     /// request (first-time WASM compilation can be slow); a whole read gets a little more.
     pub delegate_deadline: Duration,
+    /// How long the node may take to answer registering the chat delegate before the rooms are
+    /// read anyway (the web UI's `REGISTER_ACK_TIMEOUT_MS`).
+    pub register_wait: Duration,
+    /// How long after a `Missing` answer the stored rooms are read again. That answer arms the
+    /// node's per-connection backoff for the delegate's other requests (100 ms after one
+    /// failure, +-20%, freenet-core `DelegateRateLimiter`), and a read inside it is refused as
+    /// rate limited. The web UI waits the same 250 ms (`MISSING_BACKOFF_LAPSE_MS`).
+    pub missing_lapse: Duration,
+    /// While the store could not be set up, how long until the app registers it again by
+    /// itself, and the most that doubles to. A node that was slow or refused at startup and
+    /// is healthy later is set up without the user doing anything, at most this often.
+    pub register_retry_first: Duration,
+    pub register_retry_max: Duration,
     pub grant: GrantPacing,
 }
 
@@ -127,6 +150,10 @@ impl Default for Pace {
             update_wait: Duration::from_secs(60),
             owed_limit: Duration::from_secs(180),
             delegate_deadline: Duration::from_secs(20),
+            register_wait: Duration::from_secs(15),
+            missing_lapse: Duration::from_millis(250),
+            register_retry_first: Duration::from_secs(60),
+            register_retry_max: Duration::from_secs(15 * 60),
             grant: GrantPacing::default(),
         }
     }
@@ -172,8 +199,8 @@ impl Access {
 /// What the rooms shown are missing, for the screen to say.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Issues {
-    /// The node has no chat delegate under the key this build carries. Either River in the
-    /// browser never ran on this node, or it runs a newer delegate than this build knows.
+    /// The node has no chat delegate under the key this build carries, even after River
+    /// registered it.
     pub store_missing: bool,
     /// Rooms (by name) whose latest from the network could not be applied; they show an
     /// older copy.
@@ -578,10 +605,34 @@ fn follow_on(
     if let Err(e) = socket.read_early(early_read) {
         return e;
     }
-    let loaded = match load(socket, pace) {
+    // The store went missing on the last connection: register before anything else.
+    let mut registered = false;
+    if std::mem::take(&mut rooms.register_first) {
+        if let Err(e) = register_logged(socket, pace) {
+            return e;
+        }
+        registered = true;
+    }
+    let mut loaded = match load(socket, pace) {
         Ok(l) => l,
         Err(e) => return e,
     };
+    if loaded.store_missing && !registered {
+        // The node has no chat delegate: set it up, then read again once the backoff its
+        // `Missing` armed has lapsed.
+        let missing_at = Instant::now();
+        if let Err(e) = register_logged(socket, pace) {
+            return e;
+        }
+        let lapse = pace.missing_lapse.saturating_sub(missing_at.elapsed());
+        if !lapse.is_zero() {
+            thread::sleep(lapse);
+        }
+        loaded = match load(socket, pace) {
+            Ok(l) => l,
+            Err(e) => return e,
+        };
+    }
     *unconfirmed = false;
     rooms.replace(loaded);
     // Every room is subscribed afresh on every connection: subscriptions belong to it.
@@ -764,6 +815,10 @@ fn follow_on(
                 }
             }
             Some(Err(e)) => {
+                // River's storage went missing from the node: whatever was waiting on it fails
+                // below, and the next connection registers it again before anything else.
+                let store_gone = chat_delegate_missing(&e);
+                let mut taken_by_work = false;
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
                 let alone = subs.pending.is_empty()
@@ -778,6 +833,7 @@ fn follow_on(
                     .on_error(&e, alone, &|id| subs.pending.contains_key(id))
                 {
                     changed = true;
+                    taken_by_work = true;
                 } else if let Some((id, cause)) = failed_update(&e) {
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some((id, cause)) =
@@ -795,6 +851,27 @@ fn follow_on(
                     }
                     reload = None;
                     last_read = Instant::now();
+                }
+                // Only a store that was there, or a create or join the user asked for, is a
+                // reason to register again. A store this connection already failed to set up
+                // (`store_missing` shown) is not registered again on every re-read: that would
+                // re-send the whole WASM each refresh, and wait out `register_wait` each time
+                // when the node does not answer. A new connection for any other reason, or the
+                // user's own create or join, tries again.
+                //
+                // A create or join against a node that keeps refusing reconnects on each press.
+                // That is accepted: it is the user's doing, and bounded by how often they press
+                // Try again. The app's own retries of a store that could not be set up follow
+                // `register_retry_first` / `register_retry_max`.
+                let retry_due = store_gone
+                    && rooms.store_missing
+                    && rooms.register_retry_due(Instant::now(), pace);
+                if store_gone && (!rooms.store_missing || taken_by_work || retry_due) {
+                    rooms.register_first = true;
+                    rooms.report(status, report);
+                    return SocketError::Failed(
+                        "River's storage went missing from Freenet; registering it again".into(),
+                    );
                 }
             }
         }
@@ -1022,20 +1099,102 @@ fn load(socket: &mut NodeSocket, pace: &Pace) -> Result<Loaded, SocketError> {
     }
 }
 
+/// What the node said to registering the chat delegate.
+#[derive(Debug, PartialEq, Eq)]
+enum Registered {
+    Yes,
+    Refused(String),
+    Unanswered,
+}
+
+/// [`register`], with its outcome logged. Only a broken connection stops the session: a refused
+/// or unanswered registration leaves the next read to say whether the store is there.
+fn register_logged(socket: &mut NodeSocket, pace: &Pace) -> Result<(), SocketError> {
+    match register(socket, pace)? {
+        Registered::Yes => {}
+        Registered::Refused(why) => {
+            eprintln!("River: Freenet refused to register River's storage: {why}")
+        }
+        Registered::Unanswered => {
+            eprintln!("River: no answer to registering River's storage; reading the rooms anyway")
+        }
+    }
+    Ok(())
+}
+
+/// Register the chat delegate and wait for the node's answer, for up to
+/// [`Pace::register_wait`]. Nothing else is out on the connection then (the stored rooms were
+/// read, or nothing was sent yet), so the answer is told apart without a request id: the node
+/// answers a registration with an empty `DelegateResponse` for the delegate's key (every chat
+/// delegate answer carries a message), and a refusal with an error. Since freenet-core 0.2.137
+/// (#5727) registrations have their own rate-limit lane, so the `Missing` that led here does
+/// not hold this one back.
+fn register(socket: &mut NodeSocket, pace: &Pace) -> Result<Registered, SocketError> {
+    socket.register_chat_delegate()?;
+    let deadline = Instant::now() + pace.register_wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(Registered::Unanswered);
+        }
+        socket.set_read_timeout(left.max(Duration::from_millis(1)))?;
+        match socket.recv() {
+            Ok(Ok(HostResponse::DelegateResponse { key, values }))
+                if &key == delegate::chat_delegate_key() && values.is_empty() =>
+            {
+                return Ok(Registered::Yes);
+            }
+            Ok(Ok(_)) => {}
+            // An error that names another delegate is not this registration's answer.
+            Ok(Err(e)) if names_another_delegate(&e) => {}
+            // Nothing else is out on the connection, so any other error answers it.
+            Ok(Err(e)) => return Ok(Registered::Refused(e.to_string())),
+            Err(SocketError::Timeout) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether an error names a delegate other than River's chat delegate.
+fn names_another_delegate(e: &ClientError) -> bool {
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::DelegateError(
+            DelegateError::Missing(key) | DelegateError::RegisterError(key),
+        )) => key != delegate::chat_delegate_key(),
+        _ => false,
+    }
+}
+
+/// Whether an error says River's own chat delegate is not on the node.
+fn chat_delegate_missing(e: &ClientError) -> bool {
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(key))) => {
+            key == delegate::chat_delegate_key()
+        }
+        _ => false,
+    }
+}
+
 /// `Ok(())` when the error only says the delegate is missing; the error to stop on otherwise.
 fn delegate_error(e: &ClientError) -> Result<(), SocketError> {
-    if let ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_))) =
-        e.kind()
-    {
+    if chat_delegate_missing(e) {
         return Ok(());
     }
     let text = e.to_string();
     // The untyped wordings older nodes use for a delegate that is not installed (the web
     // UI's `is_missing_delegate_error`): "delegate <key> not found in store" and
     // "missing delegate <key>", here without regard to case.
+    // A typed `Missing` names its delegate and was answered above; only an untyped error is
+    // read by its words.
+    let typed_missing = matches!(
+        e.kind(),
+        ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_)))
+    );
     let lower = text.to_lowercase();
-    if lower.contains("missing delegate")
-        || (lower.contains("delegate") && lower.contains("not found in store"))
+    // Either wording, and only for an untyped error.
+    if !typed_missing
+        && (lower.contains("missing delegate")
+            || (lower.contains("delegate") && lower.contains("not found in store")))
     {
         return Ok(());
     }
@@ -1097,6 +1256,11 @@ struct Rooms {
     web_app: String,
     /// Invitations made since the last report, by room key.
     invites: Vec<(String, Result<String, String>)>,
+    /// The store went missing on the last connection: the next one registers it first.
+    register_first: bool,
+    /// While the store could not be set up: when the app next registers it by itself, and
+    /// the wait after that one. `None` while the store is there.
+    register_retry: Option<(Instant, Duration)>,
 }
 
 impl Rooms {
@@ -1113,6 +1277,9 @@ impl Rooms {
     fn replace(&mut self, loaded: Loaded) -> Vec<ContractInstanceId> {
         if self.loaded && (loaded.store_missing || loaded.listed == 0) && !self.list.is_empty() {
             eprintln!("River: the stored rooms read as empty; keeping the list shown");
+            // Still recorded: a store that could not be set up again is not registered again
+            // on every re-read (`follow_on`).
+            self.store_missing = loaded.store_missing;
             return Vec::new();
         }
         let mut old: HashMap<VerifyingKey, LiveRoom> = self
@@ -1169,6 +1336,10 @@ impl Rooms {
             .filter(|k| shown.contains(k))
             .map(|k| bs58::encode(k.to_bytes()).into_string());
         self.store_missing = loaded.store_missing;
+        if !self.store_missing {
+            // Found: the next failure starts the retry wait from the beginning.
+            self.register_retry = None;
+        }
         self.unreadable = loaded.unreadable;
         self.loaded = true;
         // Only a complete read says which rooms are gone. A first read of a run that finds no
@@ -1436,6 +1607,25 @@ impl Rooms {
             .filter(|r| set.contains(&r.stored.owner_vk))
             .map(LiveRoom::name)
             .collect()
+    }
+
+    /// Whether the app's own retry of registering a store that could not be set up is due now.
+    /// Taking it doubles the next wait, up to [`Pace::register_retry_max`]. The first wait
+    /// starts at the first re-read that finds the store still missing.
+    fn register_retry_due(&mut self, now: Instant, pace: &Pace) -> bool {
+        match self.register_retry {
+            None => {
+                self.register_retry =
+                    Some((now + pace.register_retry_first, pace.register_retry_first));
+                false
+            }
+            Some((at, _)) if now < at => false,
+            Some((_, wait)) => {
+                let next = wait.saturating_mul(2).min(pace.register_retry_max);
+                self.register_retry = Some((now + next, next));
+                true
+            }
+        }
     }
 
     fn issues(&self) -> Issues {

@@ -10,6 +10,16 @@
 //! closes with 4401, 4403 or 4503 (freenet-core `client_events/websocket.rs`). Either one is
 //! reported as the matching [`SocketError::Closed`], so the caller decides on the token the
 //! same way whichever arrives first.
+//!
+//! **Registering the chat delegate happens only here, and only on a grant connection.** The
+//! node records the app a delegate was FIRST registered under, permanently (freenet-core
+//! `register_delegate_and_record_origin`). A connection with no token is local-scoped with no
+//! app identity, so a registration sent on one would record no origin for River's delegate on
+//! that node, for good. Every [`NodeSocket`] is opened by [`NodeSocket::connect`], which
+//! presents a grant token as a bearer token; the node rejects and closes a connection whose
+//! token it does not accept before it handles any request on it (freenet-core
+//! `websocket_commands`). [`NodeSocket::register_chat_delegate`] is the only way to send a
+//! `RegisterDelegate`, and [`NodeSocket::send`] refuses one, so no other path can send it.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -17,7 +27,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use freenet_stdlib::client_api::{
-    ClientError, ClientRequest, ErrorKind as NodeErrorKind, HostResponse,
+    ClientError, ClientRequest, DelegateRequest, ErrorKind as NodeErrorKind, HostResponse,
 };
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{Message, WebSocket};
@@ -86,8 +96,14 @@ impl std::fmt::Display for SocketError {
     }
 }
 
+/// Proof that a connection presented a grant token in its upgrade. Only
+/// [`NodeSocket::connect`] makes one, after setting the `Authorization` header.
+struct GrantPresented(());
+
 pub struct NodeSocket {
     ws: WebSocket<TcpStream>,
+    /// Every connection presented a grant: what lets it register the chat delegate.
+    grant: GrantPresented,
     /// Chunks of responses still arriving, by stream id.
     chunks: HashMap<u32, Chunks>,
     /// When anything (a response, a pong) last arrived.
@@ -142,6 +158,7 @@ impl NodeSocket {
             .map_err(|_| not_a_token())?;
         bearer.set_sensitive(true);
         request.headers_mut().insert("Authorization", bearer);
+        let grant = GrantPresented(());
         let (ws, _) = tungstenite::client(request, stream).map_err(|e| match e {
             tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)) => {
                 SocketError::Handshake(r.status().as_u16())
@@ -150,6 +167,7 @@ impl NodeSocket {
         })?;
         Ok(NodeSocket {
             ws,
+            grant,
             chunks: HashMap::new(),
             last_heard: Instant::now(),
             heard_anything: false,
@@ -164,7 +182,29 @@ impl NodeSocket {
             .map_err(|e| SocketError::Failed(e.to_string()))
     }
 
+    /// Send a request. A `RegisterDelegate` is refused: it goes only through
+    /// [`register_chat_delegate`](Self::register_chat_delegate) (see the module docs).
     pub fn send(&mut self, request: &ClientRequest<'_>) -> Result<(), SocketError> {
+        if matches!(
+            request,
+            ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { .. })
+        ) {
+            return Err(SocketError::Failed(
+                "River registers its storage only through register_chat_delegate".into(),
+            ));
+        }
+        self.write(request)
+    }
+
+    /// Register River's chat delegate (the WASM this build carries) on this grant connection,
+    /// as the web UI does on every load. Registering one the node already has changes
+    /// nothing. The node answers with an empty response for the delegate's key, or an error.
+    pub fn register_chat_delegate(&mut self) -> Result<(), SocketError> {
+        let request = registration(&self.grant);
+        self.write(&request)
+    }
+
+    fn write(&mut self, request: &ClientRequest<'_>) -> Result<(), SocketError> {
         let bytes = bincode::serialize(request).map_err(|e| SocketError::Failed(e.to_string()))?;
         self.ws
             .send(Message::Binary(bytes.into()))
@@ -324,6 +364,20 @@ impl NodeSocket {
     }
 }
 
+/// The `RegisterDelegate` for River's chat delegate. It takes the proof that the connection
+/// presented a grant, so it is built only for one.
+///
+/// The node ignores `cipher` and `nonce` (freenet-core derives each delegate's key from its
+/// own; `secrets_store/store.rs`). Only nodes before freenet-core 0.2.60 used them, and River
+/// needs 0.2.156 for grants, so fixed values do.
+fn registration(_grant: &GrantPresented) -> ClientRequest<'static> {
+    ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
+        delegate: super::delegate::chat_delegate_container(),
+        cipher: [0; 32],
+        nonce: [0; 24],
+    })
+}
+
 /// Whether `t` is a token68 (RFC 7235): letters, digits, `-._~+/`, then optional `=` padding.
 /// The node's grant tokens are base58, whose alphabet is a subset of this, so every token the
 /// node issues passes; this only refuses what no node could have issued.
@@ -444,6 +498,56 @@ mod tests {
             headers
         });
         (authority, handle)
+    }
+
+    /// A `RegisterDelegate` leaves only through `register_chat_delegate`, on a connection that
+    /// presented the grant, and carries the delegate this build reads rooms from.
+    #[test]
+    fn only_register_chat_delegate_sends_a_registration() {
+        let (authority, server) = serve(vec![]);
+        let mut socket =
+            NodeSocket::connect(&authority, &GrantToken::new("grant-t0k".into())).unwrap();
+        let register = registration(&GrantPresented(()));
+        let ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate, .. }) =
+            &register
+        else {
+            panic!("not a registration");
+        };
+        assert_eq!(delegate.key(), super::super::delegate::chat_delegate_key());
+        assert!(matches!(
+            socket.send(&register),
+            Err(SocketError::Failed(m)) if m.contains("register_chat_delegate")
+        ));
+        socket.register_chat_delegate().unwrap();
+        drop(socket);
+        let headers = server.join().unwrap();
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer grant-t0k"),
+            "{headers:?}"
+        );
+    }
+
+    /// A token the node could not take as a grant (empty, or not a bearer token) never opens a
+    /// connection, so nothing can be sent, a registration included, without one.
+    #[test]
+    fn no_connection_opens_without_a_grant_token() {
+        // A listener that never answers the upgrade: refusing the token comes first.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        for bad in ["", "   ", "a b", "tok\n"] {
+            assert!(
+                matches!(
+                    NodeSocket::connect(&authority, &GrantToken::new(bad.into())),
+                    Err(SocketError::Closed {
+                        code: Some(4401),
+                        ..
+                    })
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

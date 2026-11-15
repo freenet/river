@@ -850,7 +850,11 @@ fn an_empty_list_says_why_when_the_store_is_missing() {
     chat.issues.store_missing = true;
     let missing = super::view::no_rooms_hint(&chat);
     assert_ne!(usual, missing);
-    assert!(missing.contains("older than River on the web"), "{missing}");
+    assert!(missing.contains("couldn't set up its storage"), "{missing}");
+    // Nothing tells a new user to open River in the browser first: the app sets up the store.
+    for hint in [usual, missing] {
+        assert!(!hint.contains("browser first"), "{hint}");
+    }
     let rt = render(
         {
             let mut s = node_chat();
