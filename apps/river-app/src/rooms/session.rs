@@ -124,6 +124,11 @@ pub(super) struct Pace {
     /// failure, +-20%, freenet-core `DelegateRateLimiter`), and a read inside it is refused as
     /// rate limited. The web UI waits the same 250 ms (`MISSING_BACKOFF_LAPSE_MS`).
     pub missing_lapse: Duration,
+    /// While the store could not be set up, how long until the app registers it again by
+    /// itself, and the most that doubles to. A node that was slow or refused at startup and
+    /// is healthy later is set up without the user doing anything, at most this often.
+    pub register_retry_first: Duration,
+    pub register_retry_max: Duration,
     pub grant: GrantPacing,
 }
 
@@ -147,6 +152,8 @@ impl Default for Pace {
             delegate_deadline: Duration::from_secs(20),
             register_wait: Duration::from_secs(15),
             missing_lapse: Duration::from_millis(250),
+            register_retry_first: Duration::from_secs(60),
+            register_retry_max: Duration::from_secs(15 * 60),
             grant: GrantPacing::default(),
         }
     }
@@ -851,7 +858,15 @@ fn follow_on(
                 // re-send the whole WASM each refresh, and wait out `register_wait` each time
                 // when the node does not answer. A new connection for any other reason, or the
                 // user's own create or join, tries again.
-                if store_gone && (!rooms.store_missing || taken_by_work) {
+                //
+                // A create or join against a node that keeps refusing reconnects on each press.
+                // That is accepted: it is the user's doing, and bounded by how often they press
+                // Try again. The app's own retries of a store that could not be set up follow
+                // `register_retry_first` / `register_retry_max`.
+                let retry_due = store_gone
+                    && rooms.store_missing
+                    && rooms.register_retry_due(Instant::now(), pace);
+                if store_gone && (!rooms.store_missing || taken_by_work || retry_due) {
                     rooms.register_first = true;
                     rooms.report(status, report);
                     return SocketError::Failed(
@@ -1176,8 +1191,10 @@ fn delegate_error(e: &ClientError) -> Result<(), SocketError> {
         ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_)))
     );
     let lower = text.to_lowercase();
-    if !typed_missing && lower.contains("missing delegate")
-        || (lower.contains("delegate") && lower.contains("not found in store"))
+    // Either wording, and only for an untyped error.
+    if !typed_missing
+        && (lower.contains("missing delegate")
+            || (lower.contains("delegate") && lower.contains("not found in store")))
     {
         return Ok(());
     }
@@ -1241,6 +1258,9 @@ struct Rooms {
     invites: Vec<(String, Result<String, String>)>,
     /// The store went missing on the last connection: the next one registers it first.
     register_first: bool,
+    /// While the store could not be set up: when the app next registers it by itself, and
+    /// the wait after that one. `None` while the store is there.
+    register_retry: Option<(Instant, Duration)>,
 }
 
 impl Rooms {
@@ -1316,6 +1336,10 @@ impl Rooms {
             .filter(|k| shown.contains(k))
             .map(|k| bs58::encode(k.to_bytes()).into_string());
         self.store_missing = loaded.store_missing;
+        if !self.store_missing {
+            // Found: the next failure starts the retry wait from the beginning.
+            self.register_retry = None;
+        }
         self.unreadable = loaded.unreadable;
         self.loaded = true;
         // Only a complete read says which rooms are gone. A first read of a run that finds no
@@ -1583,6 +1607,25 @@ impl Rooms {
             .filter(|r| set.contains(&r.stored.owner_vk))
             .map(LiveRoom::name)
             .collect()
+    }
+
+    /// Whether the app's own retry of registering a store that could not be set up is due now.
+    /// Taking it doubles the next wait, up to [`Pace::register_retry_max`]. The first wait
+    /// starts at the first re-read that finds the store still missing.
+    fn register_retry_due(&mut self, now: Instant, pace: &Pace) -> bool {
+        match self.register_retry {
+            None => {
+                self.register_retry =
+                    Some((now + pace.register_retry_first, pace.register_retry_first));
+                false
+            }
+            Some((at, _)) if now < at => false,
+            Some((_, wait)) => {
+                let next = wait.saturating_mul(2).min(pace.register_retry_max);
+                self.register_retry = Some((now + next, next));
+                true
+            }
+        }
     }
 
     fn issues(&self) -> Issues {

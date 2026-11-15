@@ -1043,6 +1043,8 @@ fn quick() -> Pace {
         delegate_deadline: Duration::from_secs(5),
         register_wait: Duration::from_secs(5),
         missing_lapse: Duration::ZERO,
+        register_retry_first: Duration::from_secs(60),
+        register_retry_max: Duration::from_secs(60),
         grant: GrantPacing {
             pause: Duration::ZERO,
             margin: Duration::ZERO,
@@ -3151,8 +3153,8 @@ fn registrations(w: &World) -> usize {
     w.sent.iter().filter(|(_, k)| *k == "register").count()
 }
 
-/// A node that refuses the registration, or never answers it, is asked once per run, not
-/// again on every re-read of the stored rooms (each one re-sends the whole WASM, and an
+/// A node that refuses the registration, or never answers it, is not asked again on every
+/// re-read of the stored rooms; the app's own retries wait `register_retry_first` and longer (each one re-sends the whole WASM, and an
 /// unanswered one waits out `register_wait` each time).
 #[test]
 fn a_refused_or_unanswered_registration_is_not_repeated_on_every_reread() {
@@ -3263,4 +3265,51 @@ fn only_the_chat_delegate_missing_counts_as_the_store_missing() {
     ))
     .into();
     assert!(names_another_delegate(&their_register));
+}
+
+/// A node that refused the registration at first and takes it later: the app sets the store
+/// up by itself on its retry backoff, without the user doing anything, and the registrations
+/// stay far fewer than the re-reads.
+#[test]
+fn a_store_refused_at_first_is_set_up_later_by_itself_on_a_backoff() {
+    let node = fake_node(vec![]);
+    node.with(|w| {
+        w.unregistered = true;
+        w.delegate_missing = true;
+    });
+    let dir = temp_dir("register-recovers");
+    let pace = Pace {
+        refresh: Duration::from_millis(20),
+        register_wait: Duration::from_millis(100),
+        register_retry_first: Duration::from_millis(150),
+        register_retry_max: Duration::from_millis(600),
+        ..quick()
+    };
+    let session = Running::start(&node, &dir, pace);
+    session.wait_rooms("the store is said to be missing", |r, issues, _| {
+        r.is_empty() && issues.store_missing
+    });
+    // Many re-reads while the node still refuses.
+    let lists = node.with(|w| w.lists);
+    session.wait_until("forty more reads", || node.with(|w| w.lists >= lists + 40));
+    let (refused, reads) = node.with(|w| (registrations(w), w.lists - lists));
+    assert!(refused >= 2, "the app retried by itself: {refused}");
+    assert!(
+        refused * 4 <= reads,
+        "{refused} registrations over {reads} re-reads"
+    );
+    // The node is healthy now: the next retry sets the store up, with no command sent.
+    node.with(|w| w.delegate_missing = false);
+    session.wait_rooms("the store is found", |r, issues, s| {
+        r.is_empty() && !issues.store_missing && s == LinkStatus::Live
+    });
+    node.with(|w| {
+        assert!(!w.unregistered);
+        assert_registers_only_with_the_grant(w);
+    });
+    // Found: no more registrations, however many re-reads follow.
+    let after = node.with(|w| registrations(w));
+    let lists = node.with(|w| w.lists);
+    session.wait_until("twenty more reads", || node.with(|w| w.lists >= lists + 20));
+    assert_eq!(node.with(|w| registrations(w)), after);
 }

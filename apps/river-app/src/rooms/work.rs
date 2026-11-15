@@ -737,13 +737,17 @@ impl Work {
                 _ => return false,
             },
             // While a task works, nothing else on the connection asks the chat delegate.
+            // The session reconnects on this, which registers the store again. Only the chat
+            // delegate's own `Missing` (the session's `chat_delegate_missing`); another key's
+            // falls to the arm below.
             (
                 Out::Read(_) | Out::Store(_),
-                ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_))),
-                // The session reconnects on this, which registers the store again.
-            ) => "River's storage went missing from this computer's Freenet, so the room \
+                ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(key))),
+            ) if key == delegate::chat_delegate_key() => {
+                "River's storage went missing from this computer's Freenet, so the room \
                   wasn't saved. River is setting it up again: try again in a moment."
-                .to_owned(),
+                    .to_owned()
+            }
             (
                 Out::Read(_) | Out::Store(_),
                 ErrorKind::RequestError(RequestError::DelegateError(d)),
