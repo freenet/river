@@ -238,7 +238,8 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
   user's own messages, and reactions, each as a room contract UPDATE built and
   signed as the web UI does (`src/rooms/outbox.rs`). It creates rooms, makes
   invitations and joins rooms from them (`src/rooms/create.rs`,
-  `src/rooms/work.rs`). These are its only writes to the chat delegate's
+  `src/rooms/work.rs`). Besides each room's signing key (below), these are its
+  only writes to the chat delegate's
   storage, which the web UI writes at the same time: each is the web UI's
   generation compare-and-swap (`GetVersionedRequest`, then `CasStoreRequest`,
   reading again on a conflict), it only ADDS a room where the key holds nothing
@@ -246,7 +247,11 @@ their keys. `cargo make` tasks and `build.yml` do not build it;
   room (`river_core::stored_rooms`). The bytes it stores are pinned to the web
   UI's types by the `stored_rooms_drift` tests in `ui/src/room_data.rs`. Its
   only PUT is the seed PUT of a room it has just created, under that room's own
-  contract; joining sends an UPDATE where the web UI PUTs. The chat screen
+  contract; joining sends an UPDATE where the web UI PUTs. In the background
+  it stores each room's signing key (its own `self_sk`) in the delegate's
+  `signing_key:` namespace when the delegate holds none, as the web UI does, and
+  never replaces a key that is there (`src/rooms/keys.rs`: lowest priority, one
+  request at a time, backed off on failure). The chat screen
   (`src/chat/`) shows them; snapshots and tests use built-in example data
   (`chat::Source::Example`). Its colours and sizes follow the web UI in `ui/`.
   It depends on `river-core` (`common/`) by path, with the client-only

@@ -129,6 +129,15 @@ pub(super) struct Pace {
     /// is healthy later is set up without the user doing anything, at most this often.
     pub register_retry_first: Duration,
     pub register_retry_max: Duration,
+    /// After a failure about a room's signing key, how long until the app asks about that room
+    /// again, and the most that doubles to ([`super::keys`]).
+    pub key_retry_first: Duration,
+    pub key_retry_max: Duration,
+    /// How long after the stored rooms were read the signing key sweep waits before it starts.
+    pub key_delay: Duration,
+    /// How long an update's unanswered answer holds the signing key sweep back. After that the
+    /// update is taken to be lost, and the sweep goes on.
+    pub key_owed_cap: Duration,
     pub grant: GrantPacing,
 }
 
@@ -154,6 +163,10 @@ impl Default for Pace {
             missing_lapse: Duration::from_millis(250),
             register_retry_first: Duration::from_secs(60),
             register_retry_max: Duration::from_secs(15 * 60),
+            key_retry_first: Duration::from_secs(60),
+            key_retry_max: Duration::from_secs(30 * 60),
+            key_delay: Duration::from_secs(5),
+            key_owed_cap: Duration::from_secs(30),
             grant: GrantPacing::default(),
         }
     }
@@ -517,11 +530,26 @@ fn follow(
 struct Subscriptions {
     /// Asked, no answer yet, with when they were asked.
     pending: HashMap<ContractInstanceId, Instant>,
+    /// The ones asked when the connection was set up and not yet answered or given up on. Only
+    /// these hold the signing key sweep back: a room that never answers is asked again and again,
+    /// and would hold it back for good.
+    connect_time: HashSet<ContractInstanceId>,
     /// Failed or unanswered: how many times, and when to ask again.
     retry: HashMap<ContractInstanceId, (u32, Instant)>,
 }
 
 impl Subscriptions {
+    /// Ask for a room as the connection is set up.
+    fn ask_at_connect(
+        &mut self,
+        socket: &mut NodeSocket,
+        id: ContractInstanceId,
+    ) -> Result<(), SocketError> {
+        self.ask(socket, id)?;
+        self.connect_time.insert(id);
+        Ok(())
+    }
+
     fn ask(&mut self, socket: &mut NodeSocket, id: ContractInstanceId) -> Result<(), SocketError> {
         let get = ContractRequest::Get {
             key: id,
@@ -553,17 +581,20 @@ impl Subscriptions {
     /// asking for them.
     fn keep_only(&mut self, shown: &[ContractInstanceId]) {
         self.pending.retain(|id, _| shown.contains(id));
+        self.connect_time.retain(|id| shown.contains(id));
         self.retry.retain(|id, _| shown.contains(id));
     }
 
     fn answered(&mut self, id: &ContractInstanceId) {
         self.pending.remove(id);
+        self.connect_time.remove(id);
         self.retry.remove(id);
     }
 
     /// The subscribe failed, found nothing, or went unanswered: ask again later.
     fn failed(&mut self, id: ContractInstanceId, pace: &Pace) {
         self.pending.remove(&id);
+        self.connect_time.remove(&id);
         let attempts = self.retry.get(&id).map_or(0, |(n, _)| *n);
         let wait = pace
             .resubscribe_first
@@ -602,6 +633,9 @@ fn follow_on(
     commands: &Receiver<Command>,
 ) -> SocketError {
     let connected_at = Instant::now();
+    // Whatever the signing key sweep had out went with the last connection: a failure of it.
+    let key_pace = (pace.key_retry_first, pace.key_retry_max);
+    rooms.keys.connection_lost(key_pace, Instant::now());
     if let Err(e) = socket.read_early(early_read) {
         return e;
     }
@@ -638,7 +672,7 @@ fn follow_on(
     // Every room is subscribed afresh on every connection: subscriptions belong to it.
     let mut subs = Subscriptions::default();
     for id in rooms.contract_ids() {
-        if let Err(e) = subs.ask(socket, id) {
+        if let Err(e) = subs.ask_at_connect(socket, id) {
             return e;
         }
     }
@@ -712,7 +746,7 @@ fn follow_on(
         if let Some(request) = rooms
             .outbox
             .work
-            .next_request(reload.is_some(), Instant::now())
+            .next_request(reload.is_some() || rooms.keys.busy(), Instant::now())
             && let Err(e) = socket.send(&request)
         {
             return e;
@@ -726,7 +760,19 @@ fn follow_on(
             rooms.report(status, report);
             return SocketError::Failed("reading the stored rooms again took too long".into());
         }
-        if reload.is_none() && reload_due(&mut rooms.outbox.work, last_read.elapsed(), pace) {
+        // The signing key sweep's request went unanswered: its answer must not arrive late and
+        // be taken for another request's, so start again on a new connection.
+        if rooms
+            .keys
+            .expire(pace.delegate_deadline, key_pace, Instant::now())
+        {
+            rooms.report(status, report);
+            return SocketError::Failed("the delegate did not answer about a signing key".into());
+        }
+        if reload.is_none()
+            && !rooms.keys.busy()
+            && reload_due(&mut rooms.outbox.work, last_read.elapsed(), pace)
+        {
             let (loader, reads) = Loader::start();
             for read in reads {
                 if let Err(e) = socket.send(&delegate::request(&read)) {
@@ -734,6 +780,30 @@ fn follow_on(
                 }
             }
             reload = Some((loader, Instant::now()));
+        }
+        // The signing key sweep comes last, after a read has had its chance to start: it is the
+        // lowest priority. It sends one request and waits for its answer before the next.
+        let gate = SweepGate {
+            task_working: rooms.outbox.work.busy(),
+            read_out: reload.is_some(),
+            read_pending_or_due: rooms.outbox.work.reload_pending()
+                || last_read.elapsed() >= pace.refresh,
+            subscribes_pending: !subs.connect_time.is_empty(),
+            update_owed: rooms.list.iter().any(|r| {
+                rooms
+                    .outbox
+                    .owes_within(&r.stored.owner_vk, pace.key_owed_cap, Instant::now())
+            }),
+            complete_read: rooms.complete && !rooms.store_missing,
+            settled: last_read.elapsed() >= pace.key_delay,
+        };
+        if let Some(request) = rooms
+            .keys
+            .next_request(&rooms.list, gate.open(), Instant::now())
+            && let Err(e) = socket.send(&request)
+        {
+            rooms.keys.send_failed(key_pace, Instant::now());
+            return e;
         }
 
         let response = match socket.recv() {
@@ -788,6 +858,9 @@ fn follow_on(
                         changed = true;
                         continue;
                     }
+                    if rooms.keys.on_answer(&answer, key_pace, Instant::now()) {
+                        continue;
+                    }
                     if let Some((loader, _)) = &mut reload {
                         match loader.on_answer(answer) {
                             Step::Send(reads) => {
@@ -834,6 +907,15 @@ fn follow_on(
                 {
                     changed = true;
                     taken_by_work = true;
+                } else if rooms.keys.busy()
+                    && (matches!(
+                        e.kind(),
+                        ErrorKind::RequestError(RequestError::DelegateError(_))
+                    ) || (alone && matches!(e.kind(), ErrorKind::Unhandled { .. })))
+                {
+                    rooms
+                        .keys
+                        .on_error(&e.to_string(), key_pace, Instant::now());
                 } else if let Some((id, cause)) = failed_update(&e) {
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some((id, cause)) =
@@ -852,6 +934,11 @@ fn follow_on(
                     reload = None;
                     last_read = Instant::now();
                 }
+                // A `Missing` the signing key sweep took is a failure of its own (backed off for
+                // the whole sweep), and still lands here: it is a store that was there, as a
+                // read's `Missing` is, so it registers again by the same rules, and the sweep's
+                // wait keeps it from repeating faster than that wait.
+                //
                 // Only a store that was there, or a create or join the user asked for, is a
                 // reason to register again. A store this connection already failed to set up
                 // (`store_missing` shown) is not registered again on every re-read: that would
@@ -890,6 +977,38 @@ fn follow_on(
         if changed {
             rooms.report(status, report);
         }
+    }
+}
+
+/// What must hold before the signing key sweep sends a request: it is the lowest priority, so
+/// it waits for everything else, and its request is one nothing else may be beside.
+struct SweepGate {
+    /// A create or join works.
+    task_working: bool,
+    /// A read of the stored rooms is out.
+    read_out: bool,
+    /// A read is wanted (a task just finished) or due by the refresh interval.
+    read_pending_or_due: bool,
+    /// A subscribe asked as the connection was set up is unanswered: an error that names nothing
+    /// could be its. Later asks, for rooms that never answer, do not count.
+    subscribes_pending: bool,
+    /// An update's answer, asked for less than `key_owed_cap` ago, is owed, for the same reason.
+    update_owed: bool,
+    /// The last read of the stored rooms was complete, and the store is there.
+    complete_read: bool,
+    /// A few seconds have passed since that read.
+    settled: bool,
+}
+
+impl SweepGate {
+    fn open(&self) -> bool {
+        !self.task_working
+            && !self.read_out
+            && !self.read_pending_or_due
+            && !self.subscribes_pending
+            && !self.update_owed
+            && self.complete_read
+            && self.settled
     }
 }
 
@@ -1261,6 +1380,8 @@ struct Rooms {
     /// While the store could not be set up: when the app next registers it by itself, and
     /// the wait after that one. `None` while the store is there.
     register_retry: Option<(Instant, Duration)>,
+    /// Keeping the delegate's copy of each room's signing key.
+    keys: super::keys::KeySweep,
 }
 
 impl Rooms {

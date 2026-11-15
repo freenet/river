@@ -6,7 +6,9 @@
 # chat delegate), then runs apps/river-app/examples/fresh_node_e2e.rs against them: on each
 # node the app approves its grant, registers the chat delegate and reads an empty room list;
 # the app on the gateway creates a room and an invitation, the app on the peer joins from
-# it, and each receives the other's message.
+# it, and each receives the other's message. Last, the example asks each node's chat delegate for
+# the room's signing key and requires it to be that app's own member key (the app's background
+# sweep stores it).
 #
 # Usage: apps/scripts/fresh-node-e2e.sh <work dir>
 #   FREENET_BIN  the freenet binary to run (default: freenet on PATH)

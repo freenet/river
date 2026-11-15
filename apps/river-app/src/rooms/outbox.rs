@@ -970,6 +970,16 @@ impl Outbox {
         self.owed.get(room).is_some_and(|o| !o.is_empty())
     }
 
+    /// Whether `room` owes an answer that was asked for less than `cap` ago. An answer owed for
+    /// longer is taken to be one that will not come, which is not a reason to hold anything back
+    /// (the connection is dropped for it at [`Pace::owed_limit`](super::session::Pace)).
+    pub fn owes_within(&self, room: &VerifyingKey, cap: Duration, now: Instant) -> bool {
+        self.owed
+            .get(room)
+            .and_then(VecDeque::front)
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) < cap)
+    }
+
     /// The room's answers owed are for a contract it no longer uses (re-keyed): they will not
     /// come under its key.
     /// What was in flight for it goes again, unchanged, under the new contract.
