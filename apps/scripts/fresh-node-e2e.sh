@@ -6,8 +6,7 @@
 # chat delegate), then runs apps/river-app/examples/fresh_node_e2e.rs against them: on each
 # node the app approves its grant, registers the chat delegate and reads an empty room list;
 # the app on the gateway creates a room and an invitation, the app on the peer joins from
-# it, and each receives the other's message. Each app also stores the room's signing key in the
-# delegate, as the web UI does.
+# it, and each receives the other's message.
 #
 # Usage: apps/scripts/fresh-node-e2e.sh <work dir>
 #   FREENET_BIN  the freenet binary to run (default: freenet on PATH)
@@ -122,13 +121,4 @@ for n in gw peer; do
     exit 1
   fi
 done
-
-# The app stored the created room's signing key in the delegate (the example checks that neither
-# app was told otherwise). The delegate logs it when it does. Only the gateway's log is read: the
-# app that created the room there did so seconds before the run ended, while the peer's last
-# lines, written as the nodes shut down, are not reliably flushed.
-if ! grep -qh "Stored signing key for room" "$WORK"/gw/log/freenet.*.log; then
-  echo "the gateway's delegate never stored the created room's signing key" >&2
-  exit 1
-fi
 echo "fresh-node e2e passed"

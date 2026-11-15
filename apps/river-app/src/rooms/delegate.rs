@@ -104,7 +104,7 @@ pub fn public_key(owner: &VerifyingKey) -> ClientRequest<'static> {
 /// `StoreSigningKey` for a room, as the web UI's `store_signing_key` (`ui/src/signing.rs`)
 /// sends it: the room named by its owner's key bytes (`create_room_modal.rs` passes
 /// `new_room_key.to_bytes()`), the key as its 32 secret bytes. The delegate overwrites
-/// whatever it holds for the room, so [`super::work`] sends this only to an absent key.
+/// whatever it holds for the room, so [`super::keys`] sends this only to an absent key.
 pub fn store_signing_key(owner: &VerifyingKey, key: &SigningKey) -> ClientRequest<'static> {
     message(&ChatDelegateRequestMsg::StoreSigningKey {
         room_key: owner.to_bytes(),
@@ -246,7 +246,7 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
 
-        // The literal encoding: a map with the variant name, holding the two fields.
+        // The literal encodings: a map with the variant name, holding the fields.
         let mut want = hex("a1");
         want.extend(cbor_text("StoreSigningKey"));
         want.extend(hex("a2"));
@@ -255,6 +255,13 @@ mod tests {
         want.extend(cbor_text("signing_key_bytes"));
         want.extend(cbor_bytes_or_array(&[8u8; 32]));
         assert_eq!(store, want);
+
+        let mut want = hex("a1");
+        want.extend(cbor_text("GetPublicKey"));
+        want.extend(hex("a1"));
+        want.extend(cbor_text("room_key"));
+        want.extend(cbor_bytes_or_array(&owner.to_bytes()));
+        assert_eq!(get, want);
     }
 
     fn hex(s: &str) -> Vec<u8> {

@@ -129,6 +129,10 @@ pub(super) struct Pace {
     /// is healthy later is set up without the user doing anything, at most this often.
     pub register_retry_first: Duration,
     pub register_retry_max: Duration,
+    /// After a failure about a room's signing key, how long until the app asks about that room
+    /// again, and the most that doubles to ([`super::keys`]).
+    pub key_retry_first: Duration,
+    pub key_retry_max: Duration,
     pub grant: GrantPacing,
 }
 
@@ -154,6 +158,8 @@ impl Default for Pace {
             missing_lapse: Duration::from_millis(250),
             register_retry_first: Duration::from_secs(60),
             register_retry_max: Duration::from_secs(15 * 60),
+            key_retry_first: Duration::from_secs(60),
+            key_retry_max: Duration::from_secs(30 * 60),
             grant: GrantPacing::default(),
         }
     }
@@ -602,6 +608,9 @@ fn follow_on(
     commands: &Receiver<Command>,
 ) -> SocketError {
     let connected_at = Instant::now();
+    // Whatever the signing key sweep had out went with the last connection.
+    rooms.keys.connection_lost();
+    let key_pace = (pace.key_retry_first, pace.key_retry_max);
     if let Err(e) = socket.read_early(early_read) {
         return e;
     }
@@ -712,7 +721,16 @@ fn follow_on(
         if let Some(request) = rooms
             .outbox
             .work
-            .next_request(reload.is_some(), Instant::now())
+            .next_request(reload.is_some() || rooms.keys.busy(), Instant::now())
+            && let Err(e) = socket.send(&request)
+        {
+            return e;
+        }
+        // The signing key sweep: only on a complete read, with no task working and no read out.
+        // It sends one request and waits for its answer before the next.
+        let idle =
+            reload.is_none() && !rooms.outbox.work.busy() && rooms.complete && !rooms.store_missing;
+        if let Some(request) = rooms.keys.next_request(&rooms.list, idle, Instant::now())
             && let Err(e) = socket.send(&request)
         {
             return e;
@@ -726,7 +744,19 @@ fn follow_on(
             rooms.report(status, report);
             return SocketError::Failed("reading the stored rooms again took too long".into());
         }
-        if reload.is_none() && reload_due(&mut rooms.outbox.work, last_read.elapsed(), pace) {
+        // The signing key sweep's request went unanswered: its answer must not arrive late and
+        // be taken for another request's, so start again on a new connection.
+        if rooms
+            .keys
+            .expire(pace.delegate_deadline, key_pace, Instant::now())
+        {
+            rooms.report(status, report);
+            return SocketError::Failed("the delegate did not answer about a signing key".into());
+        }
+        if reload.is_none()
+            && !rooms.keys.busy()
+            && reload_due(&mut rooms.outbox.work, last_read.elapsed(), pace)
+        {
             let (loader, reads) = Loader::start();
             for read in reads {
                 if let Err(e) = socket.send(&delegate::request(&read)) {
@@ -788,6 +818,12 @@ fn follow_on(
                         changed = true;
                         continue;
                     }
+                    if rooms
+                        .keys
+                        .on_answer(&answer, &rooms.list, key_pace, Instant::now())
+                    {
+                        continue;
+                    }
                     if let Some((loader, _)) = &mut reload {
                         match loader.on_answer(answer) {
                             Step::Send(reads) => {
@@ -834,6 +870,15 @@ fn follow_on(
                 {
                     changed = true;
                     taken_by_work = true;
+                } else if rooms.keys.busy()
+                    && (matches!(
+                        e.kind(),
+                        ErrorKind::RequestError(RequestError::DelegateError(_))
+                    ) || (alone && matches!(e.kind(), ErrorKind::Unhandled { .. })))
+                {
+                    rooms
+                        .keys
+                        .on_error(&e.to_string(), key_pace, Instant::now());
                 } else if let Some((id, cause)) = failed_update(&e) {
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some((id, cause)) =
@@ -1261,6 +1306,8 @@ struct Rooms {
     /// While the store could not be set up: when the app next registers it by itself, and
     /// the wait after that one. `None` while the store is there.
     register_retry: Option<(Instant, Duration)>,
+    /// Keeping the delegate's copy of each room's signing key.
+    keys: super::keys::KeySweep,
 }
 
 impl Rooms {

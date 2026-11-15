@@ -68,30 +68,9 @@
 //! **What the user sees.** A task working, failed (with why, Try again and Dismiss) or done
 //! ([`WorkView`]). Nothing fails without saying so.
 //!
-//! **The signing key.** After the room is stored, published and opened (the `Key` step, the
-//! last), the task makes sure the delegate holds the room's signing key in its `signing_key:`
-//! namespace, as the web UI does when it creates or joins (`create_room_modal.rs`,
-//! `signing.rs`): `GetPublicKey`, then `StoreSigningKey` with the room's `self_sk` only if the
-//! delegate holds no key for the room, then `GetPublicKey` again to confirm. The delegate
-//! overwrites without comparing (`handle_store_signing_key`,
-//! `delegates/chat-delegate/src/handlers.rs`), so the check is the app's. A key already there
-//! is never replaced, whether it matches or not: a different one is what the web UI's
-//! `migrate_signing_key` (`ui/src/signing.rs`) reports as `StaleKeyOverwritten`, and that
-//! path also removes the messages the old key signed (`remove_unverifiable_messages`), which
-//! this app cannot do, so the replacement is left to the web UI. The room slot this task has
-//! just stored (or found already holding the same identity: `reconcile_new_room`) is what the
-//! key is taken from, so the key stored is the key the room is stored under. What is left is
-//! a window of one round trip between the check and the store, in which a browser would have
-//! to store a DIFFERENT key for the same room; the slot's CAS lets only one identity in, so
-//! both writers store the same bytes. The step never fails the task: the app signs with
-//! `self_sk` (the same signatures, as Ed25519 is deterministic), so a failure is shown as a
-//! note on the finished task and the web UI stores the key when it next loads the room. It is
-//! tried again only when the connection drops, which the task's reconnect budget bounds.
-//! Signing through the delegate (`SignMessage`) is not done here.
-//!
-//! What this leaves to the web UI: asking the delegate to follow a room the user owns
-//! (`EnsureRoomSubscription`) and storing keys for rooms this app did not create or join. The
-//! web UI does both for every stored room each time it loads
+//! What this leaves to the web UI: storing the room's key in the delegate's `signing_key:`
+//! namespace and, for a room the user owns, asking the delegate to follow it
+//! (`EnsureRoomSubscription`). The web UI does both for every stored room each time it loads
 //! (`hydrate_loaded_rooms_with_authority` in `freenet_api/response_handler.rs`), and the room
 //! slot holds everything they are rebuilt from.
 
@@ -164,9 +143,6 @@ pub enum WorkState {
     /// Done: the room (by key) is stored and on its way into the list.
     Done {
         room: String,
-        /// Something that did not work but does not matter to the room (its signing key was
-        /// not stored in River's storage).
-        note: Option<String>,
     },
 }
 
@@ -196,8 +172,6 @@ enum Step {
     Update,
     /// Point `rooms_meta` at the room.
     Meta,
-    /// Make sure the delegate holds the room's signing key. Never fails the task.
-    Key,
     Done,
 }
 
@@ -210,17 +184,6 @@ enum Phase {
     Store { value: Vec<u8>, generation: u64 },
 }
 
-/// Where the `Key` step stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyPhase {
-    /// Ask which key the delegate holds.
-    Check,
-    /// It holds none: store ours.
-    Store,
-    /// Stored: ask again, to be sure.
-    Verify,
-}
-
 /// What a task has out on the connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Out {
@@ -230,8 +193,6 @@ enum Out {
     Store(Vec<u8>),
     /// A GET, PUT or UPDATE of this room contract.
     Contract(ContractInstanceId),
-    /// A signing key request (see [`KeyPhase`]) for this task's room.
-    Key,
 }
 
 struct Task {
@@ -239,9 +200,6 @@ struct Task {
     kind: Kind,
     step: Step,
     phase: Phase,
-    key_phase: KeyPhase,
-    /// Why the signing key is not in the delegate, once the task has given up on it.
-    key_note: Option<String>,
     out: Option<(Out, Instant)>,
     /// Connections dropped for this task's unanswered requests.
     reconnects: u32,
@@ -262,8 +220,6 @@ impl Task {
             kind,
             step,
             phase: Phase::Read,
-            key_phase: KeyPhase::Check,
-            key_note: None,
             out: None,
             reconnects: 0,
             conflicts: 0,
@@ -307,7 +263,6 @@ impl Task {
             },
             (None, Step::Done, Some(owner)) => WorkState::Done {
                 room: bs58::encode(owner.to_bytes()).into_string(),
-                note: self.key_note.clone(),
             },
             _ => WorkState::Working,
         };
@@ -316,17 +271,6 @@ impl Task {
             what,
             state,
         }
-    }
-
-    /// The signing key could not be stored. The room is saved and works, so the task ends as
-    /// done, with a note.
-    fn give_up_key(&mut self, why: &str) {
-        self.key_note = Some(format!(
-            "The room is saved and works. This app could not store its signing key in River's \
-             storage ({why}); River in your browser will store it the next time it opens the room."
-        ));
-        self.out = None;
-        self.step = Step::Done;
     }
 
     fn fail(&mut self, why: impl Into<String>, retry: bool) {
@@ -339,7 +283,6 @@ impl Task {
     fn advance(&mut self) {
         self.out = None;
         self.phase = Phase::Read;
-        self.key_phase = KeyPhase::Check;
         self.conflicts = 0;
         self.step = match (&self.kind, self.step) {
             (Kind::Create(_), Step::Slot) => Step::Put,
@@ -356,8 +299,7 @@ impl Task {
             }
             (Kind::Join { .. }, Step::Slot) => Step::Update,
             (Kind::Join { .. }, Step::Update) => Step::Meta,
-            (_, Step::Meta) => Step::Key,
-            (_, Step::Key) => Step::Done,
+            (_, Step::Meta) => Step::Done,
             (_, step) => step,
         };
     }
@@ -560,7 +502,6 @@ impl Work {
         for t in &mut self.tasks {
             t.out = None;
             t.phase = Phase::Read;
-            t.key_phase = KeyPhase::Check;
         }
     }
 
@@ -608,21 +549,6 @@ impl Work {
                         }),
                     ),
                 }
-            }
-            (Step::Key, _) => {
-                let Some(room) = t.room() else {
-                    t.give_up_key("the room is not known");
-                    return None;
-                };
-                let request = match (t.key_phase, &room.self_sk) {
-                    (KeyPhase::Check | KeyPhase::Verify, _) => delegate::public_key(&owner),
-                    (KeyPhase::Store, Some(sk)) => delegate::store_signing_key(&owner, sk),
-                    (KeyPhase::Store, None) => {
-                        t.give_up_key("the room has no signing key here");
-                        return None;
-                    }
-                };
-                (Out::Key, request)
             }
             (Step::Put, Kind::Create(plan)) => (
                 Out::Contract(*plan.room.contract_key.id()),
@@ -701,39 +627,6 @@ impl Work {
                         format!("River's storage on this computer refused: {e}"),
                         true,
                     ),
-                }
-            }
-            (
-                Out::Key,
-                ChatDelegateResponseMsg::GetPublicKeyResponse {
-                    room_key,
-                    public_key,
-                },
-            ) if t.owner().is_some_and(|o| *room_key == o.to_bytes())
-                && t.key_phase != KeyPhase::Store =>
-            {
-                let ours = t
-                    .room()
-                    .and_then(NewRoom::self_verifying_key)
-                    .map(|vk| vk.to_bytes());
-                t.out = None;
-                match (t.key_phase, public_key) {
-                    // Nothing there: store ours.
-                    (KeyPhase::Check, None) => t.key_phase = KeyPhase::Store,
-                    // Ours is there, or another key is, which is the web UI's to replace.
-                    (KeyPhase::Check, Some(_)) => t.advance(),
-                    (_, Some(pk)) if Some(*pk) == ours => t.advance(),
-                    _ => t.give_up_key("the delegate did not keep it"),
-                }
-            }
-            (Out::Key, ChatDelegateResponseMsg::StoreSigningKeyResponse { room_key, result })
-                if t.owner().is_some_and(|o| *room_key == o.to_bytes())
-                    && t.key_phase == KeyPhase::Store =>
-            {
-                t.out = None;
-                match result {
-                    Ok(()) => t.key_phase = KeyPhase::Verify,
-                    Err(e) => t.give_up_key(&e.chars().take(200).collect::<String>()),
                 }
             }
             _ => return false,
@@ -822,10 +715,6 @@ impl Work {
             )
         );
         let why = match (out, e.kind()) {
-            (Out::Key, ErrorKind::RequestError(RequestError::DelegateError(d))) => {
-                short(&d.to_string())
-            }
-            (Out::Key, ErrorKind::Unhandled { cause }) if alone => short(cause),
             (Out::Contract(id), ErrorKind::RequestError(RequestError::ContractError(c))) => match c
             {
                 ContractError::Get { key, cause } if key.id() == id && t.step == Step::Get => {
@@ -876,13 +765,8 @@ impl Work {
             ) if alone => e.kind().to_string(),
             _ => return false,
         };
-        if matches!(out, Out::Key) {
-            t.give_up_key(&why);
-        } else {
-            t.fail(why, true);
-            t.refused = refused;
-        }
-        self.note_done();
+        t.fail(why, true);
+        t.refused = refused;
         true
     }
 
@@ -903,7 +787,7 @@ impl Work {
             return false;
         };
         let wait = match out {
-            Out::Read(_) | Out::Store(_) | Out::Key => delegate_wait,
+            Out::Read(_) | Out::Store(_) => delegate_wait,
             Out::Contract(_) => network_wait,
         };
         if now.saturating_duration_since(*at) < wait {
@@ -911,15 +795,9 @@ impl Work {
         }
         t.out = None;
         t.phase = Phase::Read;
-        t.key_phase = KeyPhase::Check;
         t.reconnects += 1;
         if t.reconnects > MAX_RECONNECTS {
-            if t.step == Step::Key {
-                t.give_up_key("Freenet didn't answer");
-                self.note_done();
-            } else {
-                t.fail("Freenet didn't answer.", true);
-            }
+            t.fail("Freenet didn't answer.", true);
         }
         true
     }

@@ -18,9 +18,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::client_api::HostResponse;
 use river_app::chat::model::Room;
+use river_app::rooms::delegate::{self, Read};
+use river_app::rooms::socket::NodeSocket;
+use river_app::rooms::token::TokenStore;
 use river_app::rooms::work::WorkState;
 use river_app::rooms::{Access, Action, Command, InviteCode, Issues, Link, RoomsUpdate};
+use river_core::chat_delegate::ChatDelegateResponseMsg;
+use river_core::stored_rooms::{StoredRoomSlot, decode_room_slot, room_storage_key};
 
 /// How long each step may take. Network operations between two loopback nodes take seconds;
 /// this is generous so a slow CI runner does not fail it.
@@ -37,10 +44,6 @@ struct App {
     work: Vec<river_app::rooms::work::WorkView>,
     invites: Vec<(String, Result<String, String>)>,
     access: Option<Access>,
-    /// Why a finished create or join could not store the room's signing key in the delegate,
-    /// each time one was seen. Empty when the delegate held the key (the app asks it again
-    /// after storing, and a task finishes without a note only when it answered with the key).
-    key_notes: Vec<String>,
 }
 
 impl App {
@@ -60,7 +63,6 @@ impl App {
             work: Vec::new(),
             invites: Vec::new(),
             access: None,
-            key_notes: Vec::new(),
         }
     }
 
@@ -95,11 +97,6 @@ impl App {
                 } => {
                     self.rooms = rooms;
                     self.issues = issues;
-                    for w in &work {
-                        if let WorkState::Done { note: Some(n), .. } = &w.state {
-                            self.key_notes.push(n.clone());
-                        }
-                    }
                     self.work = work;
                 }
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
@@ -152,6 +149,86 @@ fn approve(authority: &str, url: &str) {
         .map(|r| r.status())
         .unwrap_or_else(|e| panic!("allowing the grant failed: {e}"));
     println!("approved the grant on {authority} (HTTP {status})");
+}
+
+/// Ask node `authority` directly, on a connection of its own with the app's grant (read from
+/// `dir`, where the app keeps it), for the room's stored identity and the signing key River's
+/// chat delegate holds for it. `Ok((identity, held))`: the public half of `self_sk` as the
+/// stored room has it, and the public key the delegate answers with, if any.
+fn delegate_key(
+    authority: &str,
+    dir: &Path,
+    owner: &VerifyingKey,
+) -> Result<(VerifyingKey, Option<[u8; 32]>), String> {
+    let token = TokenStore::in_dir(dir)
+        .load()
+        .ok_or("the app has no grant token")?;
+    let mut socket = NodeSocket::connect(authority, &token).map_err(|e| format!("{e:?}"))?;
+    socket
+        .set_read_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("{e:?}"))?;
+    let mut ask = |request| -> Result<ChatDelegateResponseMsg, String> {
+        socket.send(&request).map_err(|e| format!("{e:?}"))?;
+        loop {
+            match socket.recv().map_err(|e| format!("{e:?}"))? {
+                Ok(response @ HostResponse::DelegateResponse { .. }) => {
+                    if let Some(answer) = delegate::answers(&response).pop() {
+                        return Ok(answer);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("the node answered with an error: {e}")),
+            }
+        }
+    };
+    let slot = match ask(delegate::request(&Read::Get(room_storage_key(owner))))? {
+        ChatDelegateResponseMsg::GetResponse { value: Some(v), .. } => v,
+        other => return Err(format!("no stored room: {other:?}")),
+    };
+    let StoredRoomSlot::Present(room) = decode_room_slot(&slot)? else {
+        return Err("the room is a tombstone".into());
+    };
+    let identity = room
+        .self_verifying_key()
+        .ok_or("the stored room has no identity")?;
+    match ask(delegate::public_key(owner))? {
+        ChatDelegateResponseMsg::GetPublicKeyResponse { public_key, .. } => {
+            Ok((identity, public_key))
+        }
+        other => Err(format!("unexpected answer: {other:?}")),
+    }
+}
+
+/// Wait until the delegate on `authority` holds, for the room, the public key of the member's
+/// own stored identity, then say so. Panics after a minute with what it last saw.
+fn expect_signing_key(name: &str, authority: &str, dir: &Path, room_key: &str) -> VerifyingKey {
+    let bytes: [u8; 32] = bs58::decode(room_key)
+        .into_vec()
+        .expect("a base58 room key")
+        .try_into()
+        .expect("32 bytes");
+    let owner = VerifyingKey::from_bytes(&bytes).expect("the room key is the owner's key");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let last = match delegate_key(authority, dir, &owner) {
+            Ok((identity, Some(held))) if held == identity.to_bytes() => {
+                println!("{name}: the delegate holds the member's own signing key");
+                return identity;
+            }
+            Ok((identity, held)) => {
+                format!(
+                    "identity {:?}, delegate holds {held:?}",
+                    identity.to_bytes()
+                )
+            }
+            Err(e) => e,
+        };
+        assert!(
+            Instant::now() < deadline,
+            "{name}: the delegate never held the room's signing key (last: {last})"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// A fresh store: registered (not missing), with no rooms.
@@ -247,15 +324,10 @@ fn main() {
         app.room(ROOM)
             .is_some_and(|r| r.members.iter().any(|m| m.nickname == "Bob"))
     });
-    // Each app stored its room's signing key in the delegate: the create and the join both
-    // ended without a note about the key.
-    for app in [&alice, &bob] {
-        assert!(
-            app.key_notes.is_empty(),
-            "{}: the signing key was not stored: {:?}",
-            app.name,
-            app.key_notes
-        );
-    }
+    // Each app's own key is in its node's delegate for the room, asked of the delegate itself:
+    // the creator's is the owner's, the joiner's is the invitee's own, and they differ.
+    let owner = expect_signing_key("A", &alice.authority, &dir_a, &key);
+    let member = expect_signing_key("B", &bob.authority, &dir_b, &key);
+    assert_ne!(owner, member, "the joiner's key is not the owner's");
     println!("E2E OK");
 }

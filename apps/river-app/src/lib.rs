@@ -1182,7 +1182,6 @@ mod tests {
                 what: "Creating “Book club”".into(),
                 state: rooms::work::WorkState::Done {
                     room: "not-yet-shown".into(),
-                    note: None,
                 },
             }])
         });
