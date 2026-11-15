@@ -178,11 +178,19 @@ impl KeySweep {
             if self.overall.is_some_and(|b| now < b.not_before) {
                 return None;
             }
-            let room = rooms.iter().filter_map(key_of).find(|k| {
-                self.backoff.get(k).is_none_or(|b| b.not_before <= now)
-                    && !self.verified.contains(k)
-                    && !self.mismatched.contains(k)
-            })?;
+            // Of the rooms that need asking and whose own wait is over, the one that has waited
+            // longest: a room never tried first, then the one whose wait ended earliest. Taking
+            // the first in the list would pick a room that always fails every time the sweep's
+            // wait ends, and the rooms after it would never be asked.
+            let room = rooms
+                .iter()
+                .filter_map(key_of)
+                .filter(|k| {
+                    self.backoff.get(k).is_none_or(|b| b.not_before <= now)
+                        && !self.verified.contains(k)
+                        && !self.mismatched.contains(k)
+                })
+                .min_by_key(|k| self.backoff.get(k).map(|b| b.not_before))?;
             self.current = Some(Current {
                 room,
                 phase: Phase::Check,
@@ -551,6 +559,51 @@ mod tests {
         assert!(sweep.next_request(&[], true, now).is_none());
         assert!(sweep.verified.is_empty() && sweep.mismatched.is_empty());
         assert!(sweep.next_request(&rooms, true, now).is_some());
+    }
+
+    /// The first room in the list always fails: the sweep still gets to the later, healthy room
+    /// each time it resumes, and the failing one is retried on its own wait.
+    #[test]
+    fn a_room_that_always_fails_does_not_keep_the_others_from_being_asked() {
+        let bad = room_of(1, 51);
+        let good = room_of(2, 52);
+        let (bad_owner, good_owner) = (bad.stored.owner_vk, good.stored.owner_vk);
+        let good_key = good.stored.self_sk.clone().unwrap().verifying_key();
+        let rooms = [bad, good];
+        let mut sweep = KeySweep::default();
+        let t0 = Instant::now();
+        let asked = |sweep: &mut KeySweep, now: Instant| -> Option<VerifyingKey> {
+            let r = sweep.next_request(&rooms, true, now)?;
+            let ChatDelegateRequestMsg::GetPublicKey { room_key } = msg(&r) else {
+                panic!("a check first");
+            };
+            Some(
+                [bad_owner, good_owner]
+                    .into_iter()
+                    .find(|o| o.to_bytes() == room_key)
+                    .unwrap(),
+            )
+        };
+        // The bad room is first and asked first; it fails.
+        assert_eq!(asked(&mut sweep, t0), Some(bad_owner));
+        assert!(sweep.on_error("boom", PACE, t0));
+        // When the sweep's wait is over, the good room is asked, not the bad one again.
+        assert_eq!(asked(&mut sweep, t0 + FIRST), Some(good_owner));
+        assert!(sweep.on_answer(
+            &got(&good_owner, Some(good_key.to_bytes())),
+            PACE,
+            t0 + FIRST
+        ));
+        // The bad room is retried on its own wait (60 s after its first failure, so now), and
+        // its second failure puts it 120 s back.
+        let t1 = t0 + FIRST;
+        assert_eq!(asked(&mut sweep, t1), Some(bad_owner));
+        assert!(sweep.on_error("boom", PACE, t1));
+        assert_eq!(
+            asked(&mut sweep, t1 + FIRST * 2 - Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(asked(&mut sweep, t1 + FIRST * 2), Some(bad_owner));
     }
 
     /// A store the delegate says yes to but does not then hold counts as a failure.
