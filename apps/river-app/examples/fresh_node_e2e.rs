@@ -144,12 +144,9 @@ fn approve(authority: &str, url: &str) {
     println!("approved the grant on {authority} (HTTP {status})");
 }
 
-/// A fresh store: registered (not missing), with no rooms, and nothing older waiting.
+/// A fresh store: registered (not missing), with no rooms.
 fn ready_and_empty(app: &App) -> bool {
-    app.access == Some(Access::Ready)
-        && app.rooms.is_empty()
-        && !app.issues.store_missing
-        && !app.issues.legacy_rooms
+    app.access == Some(Access::Ready) && app.rooms.is_empty() && !app.issues.store_missing
 }
 
 fn main() {

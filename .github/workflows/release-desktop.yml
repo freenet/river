@@ -271,9 +271,7 @@ jobs:
           cat > notes/header.md <<EOF
           Preview release of River for the desktop: Linux x86_64, macOS (Apple silicon and Intel; signed and notarized) and Windows x86_64 (signed). \`SHA256SUMS.txt\` lists the SHA-256 of each download.
 
-          This preview creates rooms, joins them from invitations, makes invitations, and sends and receives messages, replies, edits, deletions and reactions. It sets up River's storage on your Freenet node itself, so you do not need River in your browser first. Not in the app yet: direct messages, moderation (bans and room settings), changing your nickname, and room upgrades. Use River in your web browser for those.
-
-          If you used River in your web browser before its latest storage update and have not opened it since, the app asks you to open it there once, so your rooms move to the current version first.
+          This preview creates rooms, joins them from invitations, makes invitations, and sends and receives messages, replies, edits, deletions and reactions. New users do not need River in the browser first: the app sets up River's storage on your Freenet node itself. The first time, the app asks Freenet for permission, and approving it opens a tab in your browser on your Freenet node's own page (not River). Not in the app yet: direct messages, moderation (bans and room settings), changing your nickname, and room upgrades. Use River in your web browser for those.
 
           Built from ${GITHUB_SHA}. It carries the same chat delegate and room contract as the River web app published as version **${WEBAPP_VERSION}**:
 

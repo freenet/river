@@ -36,18 +36,14 @@
 //!   Commands that arrive while disconnected are shown and wait; commands that arrive before
 //!   the rooms were first read wait for them. What is unsent outlives the run (a stop, or a
 //!   panic), and a first read that finds no rooms does not drop it.
-//! - **Registering River's storage.** On every connection, before anything else is sent, the
-//!   chat delegate this build carries is registered, and its answer awaited for up to
-//!   [`Pace::register_wait`] (the web UI's `register_then_load`, which registers before it
-//!   lists and on every load). Registering one the node has changes nothing. Only a grant
-//!   connection can send it ([`super::socket`] has why that matters). A refused or unanswered
-//!   registration does not stop the read, as in the web UI; a store still missing then is said
-//!   on screen. A store that goes missing later is registered again, on a new connection.
-//! - **Rooms from an earlier River.** While the current delegate holds no rooms, each
-//!   connection first asks the older delegates whether they hold any ([`super::legacy`]). If
-//!   one does, or might, the app creates and joins nothing, and says to open River in the
-//!   browser once: the web UI moves older rooms forward only into an empty delegate, so a room
-//!   stored here first would hide them from it.
+//! - **Setting up River's storage.** A connection first lists the stored rooms, as the web UI
+//!   does since freenet/river#757. If the node says the chat delegate is missing (River never
+//!   ran on this node, or the node lost it), the app registers the delegate this build carries,
+//!   waits for the node's answer for up to [`Pace::register_wait`], and lists again. Only a
+//!   grant connection can register ([`super::socket`] has why that matters). A refused or
+//!   unanswered registration does not stop the read, as in the web UI; a store still missing
+//!   then is said on screen. A store that goes missing later in a connection ends it, and the
+//!   next connection registers before it lists.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -75,7 +71,6 @@ use river_core::stored_rooms::{
 
 use super::delegate::{self, Read};
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
-use super::legacy::{self, Legacy, Probe};
 use super::outbox::{Action, Command, Outbox};
 use super::room::{LiveRoom, local_minutes};
 use super::socket::{NodeSocket, SocketError, TokenVerdict, token_verdict};
@@ -118,11 +113,15 @@ pub(super) struct Pace {
     pub owed_limit: Duration,
     /// How long the chat delegate gets to answer a read. The web UI allows 10 seconds per
     /// request (first-time WASM compilation can be slow); a whole read gets a little more.
-    /// The check of the older delegates gets the same.
     pub delegate_deadline: Duration,
     /// How long the node may take to answer registering the chat delegate before the rooms are
     /// read anyway (the web UI's `REGISTER_ACK_TIMEOUT_MS`).
     pub register_wait: Duration,
+    /// How long after a `Missing` answer the stored rooms are read again. That answer arms the
+    /// node's per-connection backoff for the delegate's other requests (100 ms after one
+    /// failure, +-20%, freenet-core `DelegateRateLimiter`), and a read inside it is refused as
+    /// rate limited. The web UI waits the same 250 ms (`MISSING_BACKOFF_LAPSE_MS`).
+    pub missing_lapse: Duration,
     pub grant: GrantPacing,
 }
 
@@ -145,6 +144,7 @@ impl Default for Pace {
             owed_limit: Duration::from_secs(180),
             delegate_deadline: Duration::from_secs(20),
             register_wait: Duration::from_secs(15),
+            missing_lapse: Duration::from_millis(250),
             grant: GrantPacing::default(),
         }
     }
@@ -193,9 +193,6 @@ pub struct Issues {
     /// The node has no chat delegate under the key this build carries, even after River
     /// registered it.
     pub store_missing: bool,
-    /// The node holds rooms in an older River delegate that River in the browser has not moved
-    /// forward yet, so this app creates and joins nothing ([`super::legacy`]).
-    pub legacy_rooms: bool,
     /// Rooms (by name) whose latest from the network could not be applied; they show an
     /// older copy.
     pub not_updated: Vec<String>,
@@ -441,13 +438,6 @@ fn run_with(
 
 const REFUSED_PREFIX: &str = "River's storage on this computer refused";
 
-/// Why the app creates and joins nothing yet on a node with rooms from an earlier River.
-pub const LEGACY_ROOMS: &str = "This computer has rooms from an earlier version of River that \
-     haven't been moved to this version yet. Open River in your web browser once, through \
-     Freenet, so it moves them; they then show up here too. Until then this app doesn't create \
-     or join rooms, because a room saved first would stop River in your browser from moving \
-     them.";
-
 /// Wait out the backoff (waking early to stop, and to call `idle`), then double it.
 fn pause(backoff: &mut Duration, pace: &Pace, stop: &dyn Fn() -> bool, idle: &mut dyn FnMut()) {
     let until = Instant::now() + *backoff;
@@ -606,27 +596,35 @@ fn follow_on(
     if let Err(e) = socket.read_early(early_read) {
         return e;
     }
-    match register(socket, pace) {
-        Ok(Registered::Yes) => {}
-        Ok(Registered::Refused(why)) => {
-            eprintln!("River: Freenet refused to register River's storage: {why}")
+    // The store went missing on the last connection: register before anything else.
+    let mut registered = false;
+    if std::mem::take(&mut rooms.register_first) {
+        if let Err(e) = register_logged(socket, pace) {
+            return e;
         }
-        Ok(Registered::Unanswered) => {
-            eprintln!("River: no answer to registering River's storage; reading the rooms anyway")
-        }
-        Err(e) => return e,
+        registered = true;
     }
-    let loaded = match load(socket, pace) {
+    let mut loaded = match load(socket, pace) {
         Ok(l) => l,
         Err(e) => return e,
     };
-    *unconfirmed = false;
-    if loaded.holds_no_rooms() && rooms.legacy != Some(Legacy::Clear) {
-        rooms.legacy = match probe_legacy(socket, pace) {
-            Ok(found) => Some(found),
+    if loaded.store_missing && !registered {
+        // The node has no chat delegate: set it up, then read again once the backoff its
+        // `Missing` armed has lapsed.
+        let missing_at = Instant::now();
+        if let Err(e) = register_logged(socket, pace) {
+            return e;
+        }
+        let lapse = pace.missing_lapse.saturating_sub(missing_at.elapsed());
+        if !lapse.is_zero() {
+            thread::sleep(lapse);
+        }
+        loaded = match load(socket, pace) {
+            Ok(l) => l,
             Err(e) => return e,
         };
     }
+    *unconfirmed = false;
     rooms.replace(loaded);
     // Every room is subscribed afresh on every connection: subscriptions belong to it.
     let mut subs = Subscriptions::default();
@@ -730,9 +728,6 @@ fn follow_on(
         }
 
         let response = match socket.recv() {
-            // An older delegate's late answer to the check for earlier rooms: none of this
-            // loop's business.
-            Ok(Err(e)) if legacy::names_a_legacy_delegate(&e) => None,
             Ok(r) => Some(r),
             Err(SocketError::Timeout) => None,
             Err(e) => return e,
@@ -812,7 +807,7 @@ fn follow_on(
             }
             Some(Err(e)) => {
                 // River's storage went missing from the node: whatever was waiting on it fails
-                // below, and a new connection registers it again.
+                // below, and the next connection registers it again before anything else.
                 let store_gone = chat_delegate_missing(&e);
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
@@ -847,6 +842,7 @@ fn follow_on(
                     last_read = Instant::now();
                 }
                 if store_gone {
+                    rooms.register_first = true;
                     rooms.report(status, report);
                     return SocketError::Failed(
                         "River's storage went missing from Freenet; registering it again".into(),
@@ -923,8 +919,6 @@ struct Loaded {
     listed: usize,
     /// Stored rooms that could not be decoded.
     unreadable: usize,
-    /// The store holds the old single `rooms_data` record, which this app does not read.
-    has_blob: bool,
 }
 
 impl Loaded {
@@ -935,15 +929,7 @@ impl Loaded {
             store_missing: true,
             listed: 0,
             unreadable: 0,
-            has_blob: false,
         }
-    }
-
-    /// Whether the store is there and holds no room at all: no `room:` key (a tombstone
-    /// counts) and no `rooms_data` record. That is when the web UI moves rooms forward from
-    /// older delegates (`plan_load_from_keys`, `LoadPlan::ProbeLegacy`).
-    fn holds_no_rooms(&self) -> bool {
-        !self.store_missing && self.listed == 0 && !self.has_blob
     }
 }
 
@@ -954,7 +940,6 @@ struct Loader {
     /// `None` until the key list has arrived.
     wanted: Option<HashMap<Vec<u8>, Option<Vec<u8>>>>,
     rooms: Vec<VerifyingKey>,
-    has_blob: bool,
 }
 
 enum Step {
@@ -969,7 +954,6 @@ impl Loader {
             Loader {
                 wanted: None,
                 rooms: Vec::new(),
-                has_blob: false,
             },
             vec![Read::List],
         )
@@ -988,7 +972,6 @@ impl Loader {
                     wanted.insert(ROOMS_META_KEY.to_vec(), None);
                 }
                 self.rooms = plan.rooms;
-                self.has_blob = plan.has_blob;
                 let reads: Vec<Read> = wanted.keys().cloned().map(Read::Get).collect();
                 self.wanted = Some(wanted);
                 if reads.is_empty() {
@@ -1048,7 +1031,6 @@ impl Loader {
             store_missing: false,
             listed: self.rooms.len(),
             unreadable,
-            has_blob: self.has_blob,
         }
     }
 }
@@ -1100,11 +1082,28 @@ enum Registered {
     Unanswered,
 }
 
+/// [`register`], with its outcome logged. Only a broken connection stops the session: a refused
+/// or unanswered registration leaves the next read to say whether the store is there.
+fn register_logged(socket: &mut NodeSocket, pace: &Pace) -> Result<(), SocketError> {
+    match register(socket, pace)? {
+        Registered::Yes => {}
+        Registered::Refused(why) => {
+            eprintln!("River: Freenet refused to register River's storage: {why}")
+        }
+        Registered::Unanswered => {
+            eprintln!("River: no answer to registering River's storage; reading the rooms anyway")
+        }
+    }
+    Ok(())
+}
+
 /// Register the chat delegate and wait for the node's answer, for up to
-/// [`Pace::register_wait`]. Nothing else is out on the connection yet, so the answer is told
-/// apart without a request id: the node answers a registration with an empty
-/// `DelegateResponse` for the delegate's key (every chat delegate answer carries a message),
-/// and a refusal with an error.
+/// [`Pace::register_wait`]. Nothing else is out on the connection then (the stored rooms were
+/// read, or nothing was sent yet), so the answer is told apart without a request id: the node
+/// answers a registration with an empty `DelegateResponse` for the delegate's key (every chat
+/// delegate answer carries a message), and a refusal with an error. Since freenet-core 0.2.137
+/// (#5727) registrations have their own rate-limit lane, so the `Missing` that led here does
+/// not hold this one back.
 fn register(socket: &mut NodeSocket, pace: &Pace) -> Result<Registered, SocketError> {
     socket.register_chat_delegate()?;
     let deadline = Instant::now() + pace.register_wait;
@@ -1126,37 +1125,6 @@ fn register(socket: &mut NodeSocket, pace: &Pace) -> Result<Registered, SocketEr
             Err(e) => return Err(e),
         }
     }
-}
-
-/// Ask every older chat delegate for its key list, a wave at a time, and say whether any holds
-/// rooms ([`super::legacy`]). Gives up at [`Pace::delegate_deadline`] with
-/// [`Legacy::Found`]: an older delegate that is installed but slow may hold rooms. Answers that
-/// arrive after that are dropped by the follow loop.
-fn probe_legacy(socket: &mut NodeSocket, pace: &Pace) -> Result<Legacy, SocketError> {
-    let deadline = Instant::now() + pace.delegate_deadline;
-    let mut probe = Probe::default();
-    for request in probe.next_requests() {
-        socket.send(&request)?;
-    }
-    while !probe.complete() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            eprintln!("River: older River storage didn't all answer in time");
-            break;
-        }
-        socket.set_read_timeout(left.max(Duration::from_millis(1)))?;
-        let response = match socket.recv() {
-            Ok(r) => r,
-            Err(SocketError::Timeout) => continue,
-            Err(e) => return Err(e),
-        };
-        if probe.take(&response) {
-            for request in probe.next_requests() {
-                socket.send(&request)?;
-            }
-        }
-    }
-    Ok(probe.finding())
 }
 
 /// Whether an error says River's own chat delegate is not on the node.
@@ -1201,15 +1169,12 @@ fn delegate_error(e: &ClientError) -> Result<(), SocketError> {
 struct Plan {
     rooms: Vec<VerifyingKey>,
     has_meta: bool,
-    /// The old single `rooms_data` record is listed.
-    has_blob: bool,
 }
 
 fn plan<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Plan {
     let mut plan = Plan {
         rooms: Vec::new(),
         has_meta: false,
-        has_blob: false,
     };
     for key in keys {
         if let Some(vk) = parse_room_storage_key(key) {
@@ -1218,8 +1183,6 @@ fn plan<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Plan {
             }
         } else if key == ROOMS_META_KEY {
             plan.has_meta = true;
-        } else if key == legacy::ROOMS_BLOB_KEY {
-            plan.has_blob = true;
         }
     }
     plan
@@ -1249,11 +1212,8 @@ struct Rooms {
     web_app: String,
     /// Invitations made since the last report, by room key.
     invites: Vec<(String, Result<String, String>)>,
-    /// The last read found the store holding no room at all ([`Loaded::holds_no_rooms`]).
-    holds_no_rooms: bool,
-    /// What the older delegates hold, once checked this run. Only [`Legacy::Clear`] is kept
-    /// across connections; anything else is checked again on the next one.
-    legacy: Option<Legacy>,
+    /// The store went missing on the last connection: the next one registers it first.
+    register_first: bool,
 }
 
 impl Rooms {
@@ -1272,7 +1232,6 @@ impl Rooms {
             eprintln!("River: the stored rooms read as empty; keeping the list shown");
             return Vec::new();
         }
-        let holds_no_rooms = loaded.holds_no_rooms();
         let mut old: HashMap<VerifyingKey, LiveRoom> = self
             .list
             .drain(..)
@@ -1327,11 +1286,6 @@ impl Rooms {
             .filter(|k| shown.contains(k))
             .map(|k| bs58::encode(k.to_bytes()).into_string());
         self.store_missing = loaded.store_missing;
-        self.holds_no_rooms = holds_no_rooms;
-        if self.legacy == Some(Legacy::Found) && !self.holds_no_rooms {
-            // River in the browser moved them forward: check again if the store ever empties.
-            self.legacy = None;
-        }
         self.unreadable = loaded.unreadable;
         self.loaded = true;
         // Only a complete read says which rooms are gone. A first read of a run that finds no
@@ -1386,17 +1340,6 @@ impl Rooms {
     /// Create, join, or try again or drop one that failed ([`super::work`]). True when it
     /// changed what shows.
     fn list_command(&mut self, action: Action) -> bool {
-        if self.waits_for_browser() {
-            let what = match &action {
-                Action::CreateRoom { name, .. } => format!("Creating “{}”", name.trim()),
-                Action::Join { .. } => "Joining a room".to_owned(),
-                _ => String::new(),
-            };
-            if !what.is_empty() {
-                self.outbox.work.refuse(&what, LEGACY_ROOMS.into());
-                return true;
-            }
-        }
         match action {
             Action::CreateRoom {
                 name,
@@ -1612,16 +1555,9 @@ impl Rooms {
             .collect()
     }
 
-    /// Whether a room stored now could hide older rooms from River in the browser: the store
-    /// holds no room and the older delegates were not found clear ([`super::legacy`]).
-    fn waits_for_browser(&self) -> bool {
-        self.holds_no_rooms && self.legacy != Some(Legacy::Clear)
-    }
-
     fn issues(&self) -> Issues {
         Issues {
             store_missing: self.store_missing,
-            legacy_rooms: self.waits_for_browser(),
             not_updated: self.names(&self.not_updated),
             not_following: self.names(&self.not_following),
             unreadable: self.unreadable,

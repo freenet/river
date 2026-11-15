@@ -29,9 +29,6 @@ ciborium = "0.2"
 bincode = "1"
 bs58 = "0.5"
 serde_json = "1"
-# Reads the older chat delegates from the repository's legacy_delegates.toml, the file the web
-# UI's build reads (src/rooms/legacy.rs).
-toml = { version = "0.8", default-features = false, features = ["parse"] }
 # Blocking HTTP (the app grant) and WebSocket (the client API), on worker threads.
 ureq = { version = "2", default-features = false }
 tungstenite = "0.27"

@@ -35,11 +35,11 @@ River $Version for Windows (x86_64)
 Run river.exe to start. River finds the Freenet node on this computer, or offers to
 install it.
 
-This preview sets up River's storage on your Freenet node itself. Not in the
-app yet: direct messages, moderation, changing your nickname, and room upgrades;
-use River in your web browser for those. If you used River in your web browser
-before its latest storage update and have not opened it since, the app asks you
-to open it there once, so your rooms move to the current version first.
+New users do not need River in the browser first: this preview sets up River's
+storage on your Freenet node itself. The first time, the app asks Freenet for
+permission, and approving it opens a tab in your browser on your Freenet node's
+own page (not River). Not in the app yet: direct messages, moderation, changing
+your nickname, and room upgrades; use River in your web browser for those.
 
 Source: https://github.com/freenet/river
 "@ | Set-Content -Path (Join-Path $dir 'README.txt') -Encoding utf8

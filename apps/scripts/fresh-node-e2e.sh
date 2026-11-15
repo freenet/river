@@ -89,13 +89,19 @@ start gw "$GW_API" --is-gateway --network-port "$GW_NET" \
 start peer "$PEER_API" --network-port "$PEER_NET" --gateway "127.0.0.1:$GW_NET,$GW_PUB"
 
 # Wait for the peer to join the gateway before any room is created.
+joined=false
 for _ in $(seq 1 90); do
   if grep -qh "open_conns=[1-9]\|open_connections=[1-9]" "$WORK/peer/log/"freenet.*.log 2>/dev/null; then
+    joined=true
     echo "peer connected to the gateway"
     break
   fi
   sleep 1
 done
+if [ "$joined" != true ]; then
+  echo "the peer never connected to the gateway" >&2
+  exit 1
+fi
 
 # Neither node has River's chat delegate before the app runs.
 for n in gw peer; do

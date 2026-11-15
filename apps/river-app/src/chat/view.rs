@@ -535,9 +535,6 @@ fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
 pub(super) fn no_rooms_hint(chat: &Chat) -> &'static str {
     match chat.source {
         Source::Example => "Create a room, or enter an invite code to join one.",
-        // Rooms from an earlier River are waiting to be moved forward by River in the browser,
-        // and a room created here first would stop that (rooms/legacy.rs).
-        Source::Node(_) if chat.issues.legacy_rooms => crate::rooms::LEGACY_ROOMS,
         // The node has no chat delegate under the key this build carries, though River
         // registered it: the node refused or lost it.
         Source::Node(_) if chat.issues.store_missing => {

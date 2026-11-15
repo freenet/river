@@ -186,16 +186,14 @@ fn the_plan_reads_room_keys_and_meta_and_ignores_the_rest() {
         plan(keys.into_iter()),
         Plan {
             rooms: vec![vk(1), vk(2)],
-            has_meta: true,
-            has_blob: true,
+            has_meta: true
         }
     );
     assert_eq!(
         plan(std::iter::empty()),
         Plan {
             rooms: vec![],
-            has_meta: false,
-            has_blob: false,
+            has_meta: false
         }
     );
 }
@@ -336,7 +334,6 @@ fn loaded(slots: Vec<StoredRoom>) -> Loaded {
         meta: StoredRoomsMeta::default(),
         store_missing: false,
         unreadable: 0,
-        has_blob: false,
     }
 }
 
@@ -536,12 +533,12 @@ struct World {
     /// The bearer token each WebSocket connection presented, by connection.
     conn_bearer: Vec<Option<String>>,
     /// What each connection was sent, in order, by connection: "register", "list", "get",
-    /// "versioned", "cas", "legacy", "contract".
+    /// "versioned", "cas", "contract".
     sent: Vec<(usize, &'static str)>,
-    /// The older chat delegates installed on the node, with the keys each lists.
-    legacy: HashMap<Vec<u8>, Vec<Vec<u8>>>,
-    /// Older delegates that answer with an error (installed, but they no longer run).
-    legacy_broken: Vec<Vec<u8>>,
+    /// Take registrations but answer nothing (the delegate stays unregistered).
+    silence_register: bool,
+    /// Called for every listing, as it arrives.
+    on_list: Option<Box<dyn FnMut() + Send>>,
     contracts: HashMap<ContractInstanceId, (ContractKey, Contract)>,
     /// When each WebSocket connection was accepted.
     connections: Vec<Instant>,
@@ -828,7 +825,9 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
         ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate, .. }) => {
             w.sent.push((n, "register"));
             assert_eq!(delegate.key(), delegate::chat_delegate_key());
-            if w.delegate_missing {
+            if w.silence_register {
+                // No answer, and nothing registered.
+            } else if w.delegate_missing {
                 out.push(encode(Err(ErrorKind::RequestError(
                     RequestError::DelegateError(DelegateError::RegisterError(
                         delegate.key().clone(),
@@ -843,36 +842,10 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                 })));
             }
         }
-        // An older chat delegate, asked for its keys.
         ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, .. })
             if &key != delegate::chat_delegate_key() =>
         {
-            w.sent.push((n, "legacy"));
-            assert!(
-                crate::rooms::legacy::legacy_delegate_keys().contains(&key),
-                "only River's own older delegates are asked"
-            );
-            if w.legacy_broken.contains(&key.bytes().to_vec()) {
-                out.push(encode(Err(ErrorKind::Unhandled {
-                    cause: "the delegate trapped".into(),
-                }
-                .into())));
-            } else if let Some(keys) = w.legacy.get(key.bytes()).cloned() {
-                let reply = ChatDelegateResponseMsg::ListResponse {
-                    keys: keys.into_iter().map(ChatDelegateKey::new).collect(),
-                };
-                out.push(encode(Ok(HostResponse::DelegateResponse {
-                    key,
-                    values: vec![OutboundDelegateMsg::ApplicationMessage(
-                        ApplicationMessage::new(cbor(&reply)),
-                    )],
-                })));
-            } else {
-                out.push(encode(Err(ErrorKind::RequestError(
-                    RequestError::DelegateError(DelegateError::Missing(key)),
-                )
-                .into())));
-            }
+            panic!("the app only asks River's own chat delegate, but asked {key}");
         }
         ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) => {
             for msg in inbound {
@@ -894,6 +867,9 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                 match &read {
                     ChatDelegateRequestMsg::ListRequest => {
                         w.lists += 1;
+                        if let Some(f) = &mut w.on_list {
+                            f();
+                        }
                         // The reader gets every room key and the meta it is told of.
                         w.reads_due = w
                             .slots
@@ -1065,6 +1041,7 @@ fn quick() -> Pace {
         owed_limit: Duration::from_secs(180),
         delegate_deadline: Duration::from_secs(5),
         register_wait: Duration::from_secs(5),
+        missing_lapse: Duration::ZERO,
         grant: GrantPacing {
             pause: Duration::ZERO,
             margin: Duration::ZERO,
@@ -2964,60 +2941,61 @@ fn an_invitation_for_a_room_gone_is_said_to_have_failed() {
     assert!(!shown.contains("SECRETCODE"), "{shown}");
 }
 
-// Registering River's storage, and rooms from an earlier River ----------------------------------
+// Setting up River's storage --------------------------------------------------------------------
 
-/// The register is the first thing every connection sends, and only connections that
-/// presented the grant token send one: the node records the first registration's app identity
-/// for good, and a connection without the token has none (socket.rs).
-fn assert_registers_first_with_the_grant(w: &World) {
-    let connections: HashSet<usize> = w.sent.iter().map(|(n, _)| *n).collect();
-    assert!(!connections.is_empty());
-    for n in connections {
-        let first = w.sent.iter().find(|(c, _)| *c == n).map(|(_, k)| *k);
-        assert_eq!(first, Some("register"), "connection {n} sent {:?}", w.sent);
-        assert!(
-            w.conn_bearer[n].as_deref().is_some_and(|t| !t.is_empty()),
-            "connection {n} registered without the grant token"
-        );
+/// Every registration went out on a connection that presented the grant token: the node records
+/// the first registration's app identity for good, and a connection without the token has none
+/// (socket.rs).
+fn assert_registers_only_with_the_grant(w: &World) {
+    for (n, kind) in &w.sent {
+        if *kind == "register" {
+            assert!(
+                w.conn_bearer[*n].as_deref().is_some_and(|t| !t.is_empty()),
+                "connection {n} registered without the grant token"
+            );
+        }
     }
 }
 
+/// What connection `n` sent, in order.
+fn sent_on(w: &World, n: usize) -> Vec<&'static str> {
+    w.sent
+        .iter()
+        .filter(|(c, _)| *c == n)
+        .map(|(_, k)| *k)
+        .collect()
+}
+
 #[test]
-fn a_node_river_never_ran_on_gets_the_store_registered_before_anything_is_read() {
+fn a_node_river_never_ran_on_gets_the_store_registered_then_read() {
     let node = fake_node(vec![]);
     node.with(|w| w.unregistered = true);
     let dir = temp_dir("fresh-register");
     // No saved token: the grant is asked for, approved, then used.
     let session = Running::start(&node, &dir, quick());
     session.wait_rooms("an empty list with nothing missing", |r, issues, s| {
-        r.is_empty() && !issues.store_missing && !issues.legacy_rooms && s == LinkStatus::Live
+        r.is_empty() && !issues.store_missing && s == LinkStatus::Live
     });
     node.with(|w| {
         assert!(!w.unregistered);
-        assert_registers_first_with_the_grant(w);
+        assert_registers_only_with_the_grant(w);
         assert_eq!(w.conn_bearer[0].as_deref(), Some("fresh-token"));
-        // Then the rooms are listed, then every older delegate is asked once.
-        let kinds: Vec<&str> = w.sent.iter().map(|(_, k)| *k).collect();
-        assert_eq!(kinds[1], "list", "{kinds:?}");
-        let asked = kinds.iter().filter(|k| **k == "legacy").count();
-        assert_eq!(asked, crate::rooms::legacy::legacy_delegate_keys().len());
+        // Listed, found missing, registered, listed again.
+        assert_eq!(sent_on(w, 0)[..3], ["list", "register", "list"]);
     });
-    // A new connection registers again, first, and does not ask the older delegates again:
-    // they were found clear in this run.
-    let before = node.with(|w| w.sent.len());
-    node.with(|w| w.drop_live = true);
-    session.wait_until("a second connection registered and listed", || {
-        node.with(|w| {
-            w.sent[before..]
-                .iter()
-                .filter(|(_, k)| *k == "list")
-                .count()
-                >= 1
-        })
-    });
+}
+
+#[test]
+fn a_node_that_has_the_store_is_not_sent_a_registration() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (_session, _dir) = following(&node, &[&a], "registered-already", quick());
     node.with(|w| {
-        assert_registers_first_with_the_grant(w);
-        assert!(!w.sent[before..].iter().any(|(_, k)| *k == "legacy"));
+        assert!(
+            !w.sent.iter().any(|(_, k)| *k == "register"),
+            "{:?}",
+            w.sent
+        );
     });
 }
 
@@ -3027,7 +3005,7 @@ fn a_room_created_on_a_fresh_node_is_stored_and_shown() {
     node.with(|w| w.unregistered = true);
     let dir = temp_dir("fresh-create");
     let session = Running::start(&node, &dir, quick());
-    session.wait_rooms("live", |_, _, s| s == LinkStatus::Live);
+    // Sent before the rooms are first read: it waits for them, then goes into the new store.
     session.list(Action::CreateRoom {
         name: "Book club".into(),
         nickname: "Ada".into(),
@@ -3038,7 +3016,10 @@ fn a_room_created_on_a_fresh_node_is_stored_and_shown() {
     });
     node.with(|w| {
         assert_eq!(w.puts.len(), 1);
-        assert_registers_first_with_the_grant(w);
+        assert_registers_only_with_the_grant(w);
+        let first_cas = w.sent.iter().position(|(_, k)| *k == "cas").unwrap();
+        let register = w.sent.iter().position(|(_, k)| *k == "register").unwrap();
+        assert!(register < first_cas, "stored before the store was set up");
     });
 }
 
@@ -3049,126 +3030,64 @@ fn a_store_that_cannot_be_registered_is_said() {
     let dir = temp_dir("register-refused");
     let session = Running::start(&node, &dir, quick());
     session.wait_rooms("the store is said to be missing", |r, issues, _| {
-        r.is_empty() && issues.store_missing && !issues.legacy_rooms
+        r.is_empty() && issues.store_missing
     });
-    // A missing store holds no rooms the web UI could still move: nothing older is asked.
-    node.with(|w| assert!(!w.sent.iter().any(|(_, k)| *k == "legacy")));
-}
-
-fn a_room_key() -> Vec<u8> {
-    room_storage_key(&vk(40))
+    node.with(|w| assert_eq!(sent_on(w, 0)[..3], ["list", "register", "list"]));
 }
 
 #[test]
-fn rooms_in_an_older_delegate_stop_creating_and_joining_until_the_browser_moves_them() {
+fn an_unanswered_registration_is_waited_out_and_the_rooms_read_anyway() {
     let node = fake_node(vec![]);
-    let older = crate::rooms::legacy::legacy_delegate_keys()[30].clone();
     node.with(|w| {
         w.unregistered = true;
-        w.legacy.insert(
-            older.bytes().to_vec(),
-            vec![a_room_key(), b"rooms_meta".to_vec()],
-        );
+        w.silence_register = true;
     });
-    let dir = temp_dir("legacy-found");
-    let session = Running::start(&node, &dir, quick());
-    session.wait_rooms("the earlier rooms are said", |r, issues, _| {
-        r.is_empty() && issues.legacy_rooms
+    let dir = temp_dir("register-silent");
+    let pace = Pace {
+        register_wait: Duration::from_millis(300),
+        ..quick()
+    };
+    let started = Instant::now();
+    let session = Running::start(&node, &dir, pace);
+    session.wait_rooms("the store is said to be missing", |r, issues, _| {
+        r.is_empty() && issues.store_missing
     });
-    session.list(Action::CreateRoom {
-        name: "Book club".into(),
-        nickname: "Ada".into(),
-        private: false,
-    });
-    session.list(Action::Join {
-        code: InviteCode("whatever".into()),
-        nickname: "Ada".into(),
-    });
-    session.wait_until("both are refused", || {
-        let work = session.last_work();
-        work.len() == 2
-            && work.iter().all(|t| {
-                matches!(&t.state, WorkState::Failed { why, retry: false }
-                    if why == crate::rooms::LEGACY_ROOMS)
-            })
-    });
-    node.with(|w| {
-        assert!(
-            !w.sent
-                .iter()
-                .any(|(_, k)| matches!(*k, "versioned" | "cas")),
-            "nothing is written: {:?}",
-            w.sent
-        );
-        assert!(w.puts.is_empty());
-    });
-    // River in the browser moves the room forward into the current store; the next read
-    // finds it, and the app is free to write again.
-    let moved = TestRoom::new(40, "Moved", 1, &["hello"]);
-    node.with(|w| {
-        w.add_room(&moved);
-        w.drop_live = true;
-    });
-    session.wait_rooms("the moved room shows, nothing waits", |r, issues, _| {
-        names(r) == ["Moved"] && !issues.legacy_rooms
-    });
+    // It waited for the answer before reading again.
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    node.with(|w| assert_eq!(sent_on(w, 0)[..3], ["list", "register", "list"]));
 }
 
 #[test]
-fn an_older_delegate_that_answers_with_an_error_counts_as_holding_rooms() {
-    let node = fake_node(vec![]);
-    let older = crate::rooms::legacy::legacy_delegate_keys()[3].clone();
-    node.with(|w| {
-        w.legacy_broken.push(older.bytes().to_vec());
-        // The others are installed with nothing in them.
-        for k in crate::rooms::legacy::legacy_delegate_keys().iter().skip(10) {
-            w.legacy
-                .insert(k.bytes().to_vec(), vec![b"rooms_meta".to_vec()]);
-        }
-    });
-    let dir = temp_dir("legacy-broken");
-    let session = Running::start(&node, &dir, quick());
-    session.wait_rooms("the earlier rooms are said", |r, issues, _| {
-        r.is_empty() && issues.legacy_rooms
-    });
-}
-
-#[test]
-fn older_delegates_with_no_rooms_leave_the_app_free_to_write() {
-    let node = fake_node(vec![]);
-    node.with(|w| {
-        for k in crate::rooms::legacy::legacy_delegate_keys() {
-            w.legacy
-                .insert(k.bytes().to_vec(), vec![b"rooms_meta".to_vec()]);
-        }
-    });
-    let dir = temp_dir("legacy-empty");
-    let session = Running::start(&node, &dir, quick());
-    session.wait_rooms("live and free", |r, issues, s| {
-        r.is_empty() && !issues.legacy_rooms && s == LinkStatus::Live
-    });
-    session.list(Action::CreateRoom {
-        name: "Book club".into(),
-        nickname: "Ada".into(),
-        private: false,
-    });
-    session.wait_rooms("the room is created", |r, _, _| {
-        r.iter().any(|r| r.name == "Book club")
-    });
-}
-
-#[test]
-fn a_store_that_already_holds_rooms_does_not_ask_the_older_delegates() {
+fn a_store_that_goes_missing_is_registered_first_on_a_new_connection() {
     let node = fake_node(vec![]);
     let a = TestRoom::new(1, "A", 1, &["a1"]);
-    let (_session, _dir) = following(&node, &[&a], "legacy-skip", quick());
+    let pace = Pace {
+        refresh: Duration::from_millis(50),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "store-gone", pace);
+    let before = node.with(|w| w.connections.len());
+    // The node loses the delegate (its data was reset); the stored rooms come back with it.
+    node.with(|w| w.unregistered = true);
+    session.wait_until("a new connection registered", || {
+        node.with(|w| {
+            w.connections.len() > before && !w.unregistered && sent_on(w, before).len() >= 2
+        })
+    });
     node.with(|w| {
-        assert_registers_first_with_the_grant(w);
-        assert!(!w.sent.iter().any(|(_, k)| *k == "legacy"));
+        // The new connection registers before anything else, with the grant.
+        assert_eq!(sent_on(w, before)[..2], ["register", "list"]);
+        assert_registers_only_with_the_grant(w);
+    });
+    session.wait_rooms("the room is shown, nothing missing", |r, issues, _| {
+        names(r) == ["A"] && !issues.store_missing
     });
 }
 
-/// `RegisterDelegate` is built and sent in one place in this app's code, the grant socket.
+/// A tripwire, not a proof: `RegisterDelegate` is built in one place in this app's production
+/// code, the grant socket. It catches a second builder written the usual way; a request
+/// smuggled in some other form would pass it. What enforces the invariant is
+/// `NodeSocket::send` refusing the request and `connect` requiring a grant token.
 #[test]
 fn only_the_grant_socket_registers_the_delegate() {
     let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
@@ -3194,4 +3113,35 @@ fn only_the_grant_socket_registers_the_delegate() {
         }
     }
     assert_eq!(found, ["socket.rs"]);
+}
+
+/// The read after registering waits out the backoff the `Missing` answer armed on the node, so
+/// the node does not refuse it as rate limited.
+#[test]
+fn the_read_after_registering_waits_out_the_missing_backoff() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.unregistered = true);
+    let dir = temp_dir("missing-lapse");
+    let pace = Pace {
+        missing_lapse: Duration::from_millis(400),
+        ..quick()
+    };
+    let lists = Arc::new(Mutex::new(Vec::<Instant>::new()));
+    {
+        let lists = lists.clone();
+        node.with(|w| {
+            w.on_list = Some(Box::new(move || lists.lock().unwrap().push(Instant::now())))
+        });
+    }
+    let session = Running::start(&node, &dir, pace);
+    session.wait_rooms("live", |r, issues, s| {
+        r.is_empty() && !issues.store_missing && s == LinkStatus::Live
+    });
+    let lists = lists.lock().unwrap();
+    assert!(lists.len() >= 2);
+    assert!(
+        lists[1] - lists[0] >= Duration::from_millis(400),
+        "read again {:?} after the Missing",
+        lists[1] - lists[0]
+    );
 }

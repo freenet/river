@@ -24,8 +24,6 @@ on:
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
-      # The older chat delegates the app checks for rooms (src/rooms/legacy.rs).
-      - 'legacy_delegates.toml'
       - '.github/workflows/apps.yml'
   push:
     branches: [main]
@@ -39,8 +37,6 @@ on:
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
-      # The older chat delegates the app checks for rooms (src/rooms/legacy.rs).
-      - 'legacy_delegates.toml'
       - '.github/workflows/apps.yml'
   workflow_dispatch:
 

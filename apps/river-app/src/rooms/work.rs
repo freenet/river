@@ -22,6 +22,21 @@
 //! its open room changed, with every other field kept. A conflict never overwrites: what the
 //! other writer stored is read and worked from.
 //!
+//! **Rooms from an earlier River need no guard here.** On a node that also holds rooms in an
+//! older chat delegate (a re-key the web UI has not carried forward yet), a room this app
+//! stores does not hide them from the web UI. Since freenet/river#763 the web UI starts
+//! freenet-migrate's completeness journal on every load from the current delegate's room list
+//! (`start_journal_load`, `ui/src/components/app/freenet_api/migration_journal.rs`). With no
+//! journal stored, `begin_migration_journal` (freenet-migrate 0.8 `delegate_migrate.rs`)
+//! starts one with every predecessor pending, whatever the current delegate holds, and an
+//! incomplete journal runs the journaled walk (`walk_decision`; the rate limit applies only
+//! to predecessors found not installed). The walk imports each older delegate's rooms through
+//! `Rooms::merge_from_source` at that generation's rank, below the current delegate's, so a
+//! room stored here keeps its identity and a tombstone keeps a room left
+//! (`apply_recovered_rooms` in `delegate_migration.rs`). The comment in `chat_delegate.rs`
+//! saying legacy migration is skipped when the current delegate has data describes the older
+//! sweep and predates #763.
+//!
 //! **Matching answers.** Delegate answers carry no request id, and neither do contract
 //! answers. So one task works at a time, with one request out, and an answer is taken only if
 //! it is the kind awaited, for the key awaited: a `GetVersionedResponse` or `CasStoreResponse`
@@ -318,7 +333,7 @@ impl Work {
     }
 
     /// A task refused before it started: shown as failed, with nothing to try again.
-    pub(super) fn refuse(&mut self, what: &str, why: String) {
+    fn refuse(&mut self, what: &str, why: String) {
         self.next_id += 1;
         let mut t = Task::new(self.next_id, Kind::Refused(what.to_owned()), Step::Get);
         t.fail(why, false);

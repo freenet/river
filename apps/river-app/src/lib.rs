@@ -301,18 +301,6 @@ pub const SCENES: &[Scene] = &[
         );
         s.chat.issues.store_missing = true;
     }),
-    // The node holds rooms from an earlier River that River in the browser has not moved yet.
-    ("chat-legacy-rooms", |s| {
-        connect(s);
-        s.chat = Chat::new(
-            chat::Source::Node(chat::LinkStatus::Live),
-            Vec::new(),
-            0,
-            0,
-            0,
-        );
-        s.chat.issues.legacy_rooms = true;
-    }),
 ];
 
 fn connect(s: &mut RiverApp) {
