@@ -660,15 +660,19 @@ impl Shared {
             return false;
         };
         let was_stale = self.is_stale();
+        // On the fetch thread: if this panics, the thread ends, the session sees the fetch end
+        // without saying so, and the answer counts as no signal.
         let verdict = evaluate(w, bytes);
         if let Verdict::Newer(version) = verdict {
+            // The gate first: logging and keeping the record can block (a stderr nobody
+            // drains, a hung config directory), and writes must not go out meanwhile.
+            self.record(w, version);
             eprintln!(
                 "River: {} moved to v{version}; this build is v{}. It no longer writes.",
                 w.artifact.app_id(),
                 w.build_version()
             );
             self.keep(w, bytes);
-            self.record(w, version);
         }
         if verdict != Verdict::NoSignal {
             let mut inner = self.inner();

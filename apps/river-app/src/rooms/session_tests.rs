@@ -3113,9 +3113,14 @@ fn a_missing_answer_to_a_key_request_registers_the_store_again() {
     node.with(|w| w.key_play.missing = 1);
     let a = TestRoom::new(1, "A", 1, &["a1"]);
     let (session, _dir) = following(&node, &[&a], "key-missing", quick());
-    session.wait_until("the key is stored after registering again", || {
-        node.with(|w| w.signing_keys.len() == 1)
-    });
+    // The check after the store follows the store's answer, so it is waited for too: reading
+    // the count as soon as the key is stored raced it (1 in 60 on main).
+    session.wait_until(
+        "the key is stored after registering again, and checked",
+        || node.with(|w| w.signing_keys.len() == 1 && w.key_reads.len() >= 3),
+    );
+    // Time for an extra read, which would be a bug, to show.
+    std::thread::sleep(Duration::from_millis(100));
     node.with(|w| {
         assert_eq!(w.connections.len(), 2);
         assert!(w.sent.contains(&(1, "register")), "{:?}", w.sent);
@@ -4524,22 +4529,27 @@ fn a_drop_while_registration_waits_registers_once() {
 #[test]
 fn a_newer_record_during_a_slow_first_read_stops_the_registration() {
     let node = fake_node(vec![]);
+    let source = Arc::new(FakePointers::default());
+    *source.delay.lock().unwrap() = Duration::from_millis(100);
+    let watch = watched(&source, Some(2));
     let slow = Arc::new(AtomicBool::new(true));
     node.with(|w| {
         w.unregistered = true;
-        let slow = slow.clone();
-        // The first listing is answered after a long while.
+        let (slow, watch) = (slow.clone(), watch.clone());
+        // The first listing is answered only once the newer record has closed the gate (at
+        // most 5 s), and past `first_wait`: the session is blocked in that read meanwhile.
         w.on_list = Some(Box::new(move || {
             if slow.swap(false, Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(700));
+                let started = Instant::now();
+                while !watch.gate().is_closed() && started.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(300));
             }
         }));
     });
     let dir = temp_dir("slow-read-newer");
     save_token(&dir, "kept-token");
-    let source = Arc::new(FakePointers::default());
-    *source.delay.lock().unwrap() = Duration::from_millis(100);
-    let watch = watched(&source, Some(2));
     let pace = Pace {
         pointers: CheckPace {
             first_wait: Duration::from_millis(250),
