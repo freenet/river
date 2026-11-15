@@ -40,7 +40,11 @@
 //! every request that is not a read ([`super::socket::is_read`]). That is the one place every
 //! write passes through: delegate registration, the stored-room compare-and-swap, the signing
 //! key store, room UPDATEs and the seed PUT all go out through it. The session also stops
-//! asking for them and says why on screen; the gate is what holds if it ever did not. Reading
+//! asking for them and says why on screen; the gate is what holds if it ever did not. The
+//! fetch thread judges each answer the moment it arrives, so the gate can close while the
+//! session is in the middle of something (a slow read, a write it already decided on). A write
+//! caught that way is refused at the socket, the connection ends, and the next one fails what
+//! was waiting and says why: refused, never sent. Reading
 //! goes on: the rooms already stored still show and still receive messages. Reading writes
 //! nothing, so it cannot split anything, and a user who cannot update at once keeps their
 //! history.
@@ -418,10 +422,8 @@ impl PointerSource for NodePointers {
     }
 }
 
-/// What a check under way sends back to the watch.
+/// What a check under way sends back to the watch (its answers are judged where they arrive).
 enum Event {
-    /// One pointer's answer.
-    One(ContractInstanceId, Fetch),
     /// The fetch is over; what did not answer learned nothing.
     Done,
 }
@@ -499,12 +501,26 @@ fn kept_name(artifact: Artifact) -> String {
 /// Watches River's pointer records and holds the [`WriteGate`]. The link keeps one for its
 /// whole life, so what one session learned holds for the next.
 pub struct Watch {
-    watched: Vec<Watched>,
     source: Arc<dyn PointerSource>,
+    shared: Arc<Shared>,
+}
+
+/// What a fetch thread judges into as each answer arrives, and the session reads: the gate
+/// closes the moment a newer record is received, whatever the session thread is doing (a
+/// slow read of the stored rooms included).
+pub struct Shared {
+    watched: Vec<Watched>,
     gate: WriteGate,
     /// Where a newer record is kept, the app's config directory.
     dir: Option<PathBuf>,
     inner: Mutex<Inner>,
+}
+
+impl std::ops::Deref for Watch {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
 }
 
 #[derive(Default)]
@@ -515,6 +531,8 @@ struct Inner {
     first_started: Option<Instant>,
     first_done: bool,
     in_flight: Option<Receiver<Event>>,
+    /// Whether [`Watch::poll`] has reported the gate closed.
+    stale_reported: bool,
     /// The pointers that gave a verdict in the check under way.
     heard: Vec<ContractInstanceId>,
     /// When the next check is due; `None` is now.
@@ -546,16 +564,20 @@ impl Watch {
     /// A watch over `watched`, fetching through `source`, keeping what it learns in `dir`.
     pub fn new(watched: Vec<Watched>, source: Arc<dyn PointerSource>, dir: Option<&Path>) -> Watch {
         let watch = Watch {
-            watched,
             source,
-            gate: WriteGate::default(),
-            dir: dir.map(Path::to_owned),
-            inner: Mutex::new(Inner::default()),
+            shared: Arc::new(Shared {
+                watched,
+                gate: WriteGate::default(),
+                dir: dir.map(Path::to_owned),
+                inner: Mutex::new(Inner::default()),
+            }),
         };
         watch.load_kept();
         watch
     }
+}
 
+impl Shared {
     /// The gate every connection of this link holds.
     pub fn gate(&self) -> &WriteGate {
         &self.gate
@@ -681,68 +703,6 @@ impl Watch {
             .all(|w| inner.heard.contains(&w.pointer_id))
     }
 
-    /// Take the answer of a check under way, and start one if one is due. Never blocks. True
-    /// when this closed the gate.
-    pub fn poll(&self, authority: &str, token: &GrantToken, pace: &CheckPace) -> bool {
-        if self.watched.is_empty() {
-            return false;
-        }
-        let now = Instant::now();
-        // Everything the check under way has sent so far, taken under the lock and judged
-        // after it (judging takes the lock too).
-        let (events, over) = {
-            let mut inner = self.inner();
-            let mut events = Vec::new();
-            let mut over = false;
-            if let Some(rx) = &inner.in_flight {
-                loop {
-                    match rx.try_recv() {
-                        Ok(Event::One(id, fetch)) => events.push((id, fetch)),
-                        // Over, or the fetch ended without saying so (it panicked).
-                        Ok(Event::Done) | Err(TryRecvError::Disconnected) => {
-                            over = true;
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => break,
-                    }
-                }
-            }
-            if over {
-                inner.in_flight = None;
-            }
-            (events, over)
-        };
-        let mut closed = false;
-        for (id, fetch) in &events {
-            closed |= self.judge_one(*id, fetch);
-        }
-        if over {
-            self.finish(pace, now);
-        }
-        // Once River has moved on there is nothing more to learn in this run.
-        if self.is_stale() {
-            return closed;
-        }
-        let mut inner = self.inner();
-        if inner.in_flight.is_some() || inner.next.is_some_and(|at| now < at) {
-            return closed;
-        }
-        let (tx, rx) = channel();
-        let source = self.source.clone();
-        let ids: Vec<ContractInstanceId> = self.watched.iter().map(|w| w.pointer_id).collect();
-        let (authority, token, wait) = (authority.to_owned(), token.clone(), pace.fetch_wait);
-        std::thread::spawn(move || {
-            let deliver = |id, fetch| {
-                let _ = tx.send(Event::One(id, fetch));
-            };
-            source.fetch(&authority, &token, &ids, wait, &deliver);
-            let _ = tx.send(Event::Done);
-        });
-        inner.in_flight = Some(rx);
-        inner.first_started.get_or_insert(now);
-        closed
-    }
-
     /// Whether there is an answer to act on: River is known to have moved on (no check is
     /// started then), every pointer has answered with a verdict, or the first check has had
     /// its `first_wait`.
@@ -755,6 +715,61 @@ impl Watch {
             || inner
                 .first_started
                 .is_some_and(|at| now.saturating_duration_since(at) >= pace.first_wait)
+    }
+}
+
+impl Watch {
+    /// Take the answer of a check under way, and start one if one is due. Never blocks. True
+    /// when this closed the gate.
+    pub fn poll(&self, authority: &str, token: &GrantToken, pace: &CheckPace) -> bool {
+        if self.watched.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        // Answers were judged by the fetch thread as they arrived; only the end of a check
+        // comes this way.
+        let over = {
+            let mut inner = self.inner();
+            let over = inner.in_flight.as_ref().is_some_and(|rx| {
+                // Over, or the fetch ended without saying so (it panicked).
+                matches!(
+                    rx.try_recv(),
+                    Ok(Event::Done) | Err(TryRecvError::Disconnected)
+                )
+            });
+            if over {
+                inner.in_flight = None;
+            }
+            over
+        };
+        if over {
+            self.finish(pace, now);
+        }
+        let closed = self.is_stale() && !std::mem::replace(&mut self.inner().stale_reported, true);
+        // Once River has moved on there is nothing more to learn in this run.
+        if self.is_stale() {
+            return closed;
+        }
+        let mut inner = self.inner();
+        if inner.in_flight.is_some() || inner.next.is_some_and(|at| now < at) {
+            return closed;
+        }
+        let (tx, rx) = channel();
+        let source = self.source.clone();
+        let shared = self.shared.clone();
+        let ids: Vec<ContractInstanceId> = self.watched.iter().map(|w| w.pointer_id).collect();
+        let (authority, token, wait) = (authority.to_owned(), token.clone(), pace.fetch_wait);
+        std::thread::spawn(move || {
+            // Judged here, as each answer arrives: a newer record closes the gate at once.
+            let deliver = |id, fetch: Fetch| {
+                shared.judge_one(id, &fetch);
+            };
+            source.fetch(&authority, &token, &ids, wait, &deliver);
+            let _ = tx.send(Event::Done);
+        });
+        inner.in_flight = Some(rx);
+        inner.first_started.get_or_insert(now);
+        closed
     }
 
     /// Wait, polling, until [`Self::settled`]. For tests; the session never blocks on it.

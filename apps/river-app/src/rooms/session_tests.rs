@@ -4517,3 +4517,41 @@ fn a_drop_while_registration_waits_registers_once() {
     let registers = node.with(|w| w.sent.iter().filter(|(_, k)| *k == "register").count());
     assert_eq!(registers, 1);
 }
+
+/// The first read of the stored rooms takes longer than `first_wait` and finds no store. A
+/// newer record arrived while the session waited on that read: it was judged as it arrived,
+/// so no registration is sent, although the startup wait has run out.
+#[test]
+fn a_newer_record_during_a_slow_first_read_stops_the_registration() {
+    let node = fake_node(vec![]);
+    let slow = Arc::new(AtomicBool::new(true));
+    node.with(|w| {
+        w.unregistered = true;
+        let slow = slow.clone();
+        // The first listing is answered after a long while.
+        w.on_list = Some(Box::new(move || {
+            if slow.swap(false, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(700));
+            }
+        }));
+    });
+    let dir = temp_dir("slow-read-newer");
+    save_token(&dir, "kept-token");
+    let source = Arc::new(FakePointers::default());
+    *source.delay.lock().unwrap() = Duration::from_millis(100);
+    let watch = watched(&source, Some(2));
+    let pace = Pace {
+        pointers: CheckPace {
+            first_wait: Duration::from_millis(250),
+            ..quick().pointers
+        },
+        ..quick()
+    };
+    let session = Running::start_watched(&node, &dir, pace, watch);
+    session.wait_rooms("no store, and the update asked for", |_, issues, _| {
+        issues.store_missing && issues.update_required
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(writes_taken(&node), (0, 0, 0, 0, 0));
+    assert!(node.with(|w| w.unregistered));
+}
