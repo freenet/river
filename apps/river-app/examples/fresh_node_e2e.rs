@@ -8,6 +8,14 @@
 //! with the app's grant) for the room's signing key, and must hold the key of that app's own
 //! member: the app's background key sweep puts it there.
 //!
+//! Then a newer River: on node A, a pointer record for the chat delegate is PUT, signed by a
+//! throwaway key and naming a generation above the one this build carries. A third app on node
+//! A, built to trust that throwaway key in place of River's, must notice it, show the room
+//! read-only, and refuse to send, create or join: none of it may reach the node. The record is
+//! PUT only to the local test node; River's own key and pointer addresses are never used. The
+//! pointer contract WASM is `$POINTER_WASM` (the script fetches it), checked against
+//! freenet-migrate's frozen pointer code hash.
+//!
 //! ```text
 //! cargo run -p river-app --example fresh_node_e2e -- <node A host:port> <node B host:port> <dir>
 //! ```
@@ -24,6 +32,9 @@ use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::HostResponse;
 use river_app::chat::model::Room;
 use river_app::rooms::delegate::{self, Read};
+use river_app::rooms::generation::{
+    Artifact, BuildRecord, NodePointers, Records, UPDATE_REQUIRED, Watch, watched_pointers,
+};
 use river_app::rooms::socket::NodeSocket;
 use river_app::rooms::token::TokenStore;
 use river_app::rooms::work::WorkState;
@@ -50,10 +61,20 @@ struct App {
 
 impl App {
     fn start(name: &'static str, authority: &str, dir: &Path) -> App {
+        App::start_with(name, authority, dir, None)
+    }
+
+    /// Start an app; with `watch`, it judges whether River moved on by that instead of
+    /// River's own pointer records.
+    fn start_with(name: &'static str, authority: &str, dir: &Path, watch: Option<Watch>) -> App {
         let (tx, rx) = channel();
-        let link = Link::with_authority(authority, Some(dir.to_owned()), move |u| {
+        let report = move |u| {
             let _ = tx.send(u);
-        });
+        };
+        let link = match watch {
+            Some(w) => Link::with_watch(authority, Some(dir.to_owned()), w, report),
+            None => Link::with_authority(authority, Some(dir.to_owned()), report),
+        };
         link.start();
         App {
             name,
@@ -106,6 +127,14 @@ impl App {
             }
         }
         println!("{}: {what}", self.name);
+    }
+
+    /// Take updates for `wait`, whatever they are.
+    fn drain(&mut self, wait: Duration) {
+        let until = Instant::now() + wait;
+        let deadline = Instant::now() + wait + STEP;
+        self.until("the wait is over", |_| Instant::now() >= until);
+        assert!(Instant::now() < deadline);
     }
 
     fn send(&self, room: &str, action: Action) {
@@ -234,6 +263,170 @@ fn expect_signing_key(name: &str, authority: &str, dir: &Path, room_key: &str) -
     }
 }
 
+/// PUT a pointer record for `app_id` signed by `sk` at `version`, naming `code_hash`, to the
+/// test node at `authority`. Returns once the node answers the PUT.
+fn put_test_pointer(
+    authority: &str,
+    dir: &Path,
+    pointer_wasm: &[u8],
+    sk: &ed25519_dalek::SigningKey,
+    app_id: &str,
+    version: u32,
+    code_hash: [u8; 32],
+) {
+    use ed25519_dalek::Signer;
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse};
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, RelatedContracts,
+        WrappedContract, WrappedState,
+    };
+    let params = freenet_migrate::pointer_params(&sk.verifying_key(), app_id.as_bytes()).unwrap();
+    let msg = freenet_migrate::pointer_signing_message(&params, version, &code_hash);
+    let record = freenet_migrate::PointerRecord {
+        version,
+        code_hash,
+        signature: sk.sign(&msg).to_bytes(),
+    }
+    .encode()
+    .to_vec();
+    let contract = WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(pointer_wasm.to_vec())),
+        Parameters::from(params),
+    );
+    let expected =
+        freenet_migrate::pointer_contract_id(&sk.verifying_key(), app_id.as_bytes()).unwrap();
+    assert_eq!(
+        *contract.key().id(),
+        expected,
+        "the pointer WASM does not give the address freenet-migrate derives"
+    );
+    let token = TokenStore::in_dir(dir).load().expect("a grant token");
+    let mut socket = NodeSocket::connect(authority, &token, &Default::default()).unwrap();
+    socket.set_read_timeout(STEP).unwrap();
+    socket
+        .send(&ClientRequest::ContractOp(ContractRequest::Put {
+            contract: ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract)),
+            state: WrappedState::new(record),
+            related_contracts: RelatedContracts::default(),
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .unwrap();
+    loop {
+        match socket.recv().expect("an answer to the pointer PUT") {
+            Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key })) => {
+                assert_eq!(*key.id(), expected);
+                println!("put a test pointer for {app_id} at v{version}: {expected}");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("the pointer PUT failed: {e}"),
+        }
+    }
+}
+
+/// On node A, a newer River named by a test pointer: a third app that trusts the test key
+/// shows the room, says an update is needed, and nothing it is asked to write reaches the
+/// node.
+fn newer_river(authority: &str, dir: &Path, dir_a: &Path, room: &str, room_key: &str) {
+    let path = std::env::var("POINTER_WASM").expect(
+        "POINTER_WASM names the pointer contract WASM (apps/scripts/fresh-node-e2e.sh fetches it)",
+    );
+    let wasm = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    assert_eq!(
+        bs58::encode(blake3::hash(&wasm).as_bytes()).into_string(),
+        freenet_migrate::POINTER_CODE_HASH_B58,
+        "{path} is not the frozen pointer contract"
+    );
+    let sk = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+    // This build at version 1 of the test sequence, for the WASM it really carries.
+    let records = Records {
+        author: format!(
+            "river:v1:vk:{}",
+            bs58::encode(sk.verifying_key().as_bytes()).into_string()
+        ),
+        records: Artifact::ALL
+            .iter()
+            .map(|a| BuildRecord {
+                app_id: a.app_id().to_owned(),
+                version: 1,
+                code_hash: *blake3::hash(a.embedded_wasm()).as_bytes(),
+            })
+            .collect(),
+    };
+    let watched = watched_pointers(&records, Artifact::embedded_wasm);
+    assert_eq!(watched.len(), 2);
+    // The room contract's pointer names this build; the chat delegate's has moved on.
+    put_test_pointer(
+        authority,
+        dir_a,
+        &wasm,
+        &sk,
+        "river.room-contract",
+        1,
+        records.records[0].code_hash,
+    );
+    put_test_pointer(
+        authority,
+        dir_a,
+        &wasm,
+        &sk,
+        "river.chat-delegate",
+        2,
+        [0x42; 32],
+    );
+
+    let dir_c = dir.join("app-c");
+    std::fs::create_dir_all(&dir_c).unwrap();
+    let watch = Watch::new(watched, std::sync::Arc::new(NodePointers), Some(&dir_c));
+    let mut carol = App::start_with("C", authority, &dir_c, Some(watch));
+    carol.until(
+        "the room shows, read-only, and an update is asked for",
+        |app| {
+            app.issues.update_required
+                && app.room(room).is_some_and(|r| {
+                    r.send_block
+                        .as_deref()
+                        .is_some_and(|b| b.contains("Update"))
+                })
+        },
+    );
+    let text = "Sent from an outdated app";
+    carol.send(
+        room_key,
+        Action::Send {
+            text: text.into(),
+            reply_to: None,
+        },
+    );
+    carol.send(
+        "",
+        Action::CreateRoom {
+            name: "Outdated room".into(),
+            nickname: "Carol".into(),
+            private: false,
+        },
+    );
+    carol.until("both are refused, saying why", |app| {
+        let sent = app.room(room).is_some_and(|r| {
+            r.messages.iter().any(|m| {
+                m.text == text
+                    && m.pending
+                        .as_ref()
+                        .is_some_and(|p| p.failed.as_deref() == Some(UPDATE_REQUIRED))
+            })
+        });
+        let created = app
+            .work
+            .iter()
+            .any(|w| matches!(&w.state, WorkState::Failed { why, .. } if why == UPDATE_REQUIRED));
+        sent && created
+    });
+    // The record is kept, so a later start knows without the network.
+    assert!(dir_c.join("newer-river.river.chat-delegate").exists());
+    println!("C: an app River has moved past writes nothing");
+}
+
 /// A fresh store: registered (not missing), with no rooms.
 fn ready_and_empty(app: &App) -> bool {
     app.access == Some(Access::Ready) && app.rooms.is_empty() && !app.issues.store_missing
@@ -332,5 +525,14 @@ fn main() {
     let owner = expect_signing_key("A", &alice.authority, &dir_a, &key);
     let member = expect_signing_key("B", &bob.authority, &dir_b, &key);
     assert_ne!(owner, member, "the joiner's key is not the owner's");
+
+    newer_river(a, &dir, &dir_a, ROOM, &key);
+    // Nothing the outdated app was asked to write reached the room: the app on node B, which
+    // follows the room, never receives it.
+    bob.drain(Duration::from_secs(15));
+    assert!(
+        !bob.has_text(ROOM, "Sent from an outdated app"),
+        "a message from the outdated app reached the room"
+    );
     println!("E2E OK");
 }
