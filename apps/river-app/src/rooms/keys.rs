@@ -47,7 +47,8 @@
 //! after a wait that starts at [`super::session::Pace::key_retry_first`] and doubles to
 //! `key_retry_max`, so a delegate that keeps refusing is asked about once per cap. A dropped
 //! connection with a request out, and a request that could not be sent, count as failures
-//! too. On top of the per-room wait there is one for the whole sweep, with the same doubling,
+//! too, whatever dropped the connection: a drop that had nothing to do with the delegate
+//! bumps the waits as well, which only delays the key. On top of the per-room wait there is one for the whole sweep, with the same doubling,
 //! reset by any success: with many rooms and a delegate that fails, the app does not
 //! reconnect once per room back to back. A `Missing` answer is a failure here and then takes
 //! the same path as one to a read (the session registers the store again), so it is paced by
@@ -166,8 +167,11 @@ impl KeySweep {
         }
         if !idle {
             // Never hold a store (or a check of one) across a gap: what it was based on may
-            // change while it waits. It starts again from its check.
-            self.current = None;
+            // change while it waits. It starts again from its check. (Not while a request is
+            // out, which was returned above.)
+            if !self.busy() {
+                self.current = None;
+            }
             return None;
         }
         if self.current.is_none() {

@@ -135,6 +135,9 @@ pub(super) struct Pace {
     pub key_retry_max: Duration,
     /// How long after the stored rooms were read the signing key sweep waits before it starts.
     pub key_delay: Duration,
+    /// How long an update's unanswered answer holds the signing key sweep back. After that the
+    /// update is taken to be lost, and the sweep goes on.
+    pub key_owed_cap: Duration,
     pub grant: GrantPacing,
 }
 
@@ -163,6 +166,7 @@ impl Default for Pace {
             key_retry_first: Duration::from_secs(60),
             key_retry_max: Duration::from_secs(30 * 60),
             key_delay: Duration::from_secs(5),
+            key_owed_cap: Duration::from_secs(30),
             grant: GrantPacing::default(),
         }
     }
@@ -526,11 +530,26 @@ fn follow(
 struct Subscriptions {
     /// Asked, no answer yet, with when they were asked.
     pending: HashMap<ContractInstanceId, Instant>,
+    /// The ones asked when the connection was set up and not yet answered or given up on. Only
+    /// these hold the signing key sweep back: a room that never answers is asked again and again,
+    /// and would hold it back for good.
+    connect_time: HashSet<ContractInstanceId>,
     /// Failed or unanswered: how many times, and when to ask again.
     retry: HashMap<ContractInstanceId, (u32, Instant)>,
 }
 
 impl Subscriptions {
+    /// Ask for a room as the connection is set up.
+    fn ask_at_connect(
+        &mut self,
+        socket: &mut NodeSocket,
+        id: ContractInstanceId,
+    ) -> Result<(), SocketError> {
+        self.ask(socket, id)?;
+        self.connect_time.insert(id);
+        Ok(())
+    }
+
     fn ask(&mut self, socket: &mut NodeSocket, id: ContractInstanceId) -> Result<(), SocketError> {
         let get = ContractRequest::Get {
             key: id,
@@ -562,17 +581,20 @@ impl Subscriptions {
     /// asking for them.
     fn keep_only(&mut self, shown: &[ContractInstanceId]) {
         self.pending.retain(|id, _| shown.contains(id));
+        self.connect_time.retain(|id| shown.contains(id));
         self.retry.retain(|id, _| shown.contains(id));
     }
 
     fn answered(&mut self, id: &ContractInstanceId) {
         self.pending.remove(id);
+        self.connect_time.remove(id);
         self.retry.remove(id);
     }
 
     /// The subscribe failed, found nothing, or went unanswered: ask again later.
     fn failed(&mut self, id: ContractInstanceId, pace: &Pace) {
         self.pending.remove(&id);
+        self.connect_time.remove(&id);
         let attempts = self.retry.get(&id).map_or(0, |(n, _)| *n);
         let wait = pace
             .resubscribe_first
@@ -650,7 +672,7 @@ fn follow_on(
     // Every room is subscribed afresh on every connection: subscriptions belong to it.
     let mut subs = Subscriptions::default();
     for id in rooms.contract_ids() {
-        if let Err(e) = subs.ask(socket, id) {
+        if let Err(e) = subs.ask_at_connect(socket, id) {
             return e;
         }
     }
@@ -766,11 +788,12 @@ fn follow_on(
             read_out: reload.is_some(),
             read_pending_or_due: rooms.outbox.work.reload_pending()
                 || last_read.elapsed() >= pace.refresh,
-            subscribes_pending: !subs.pending.is_empty(),
-            update_owed: rooms
-                .list
-                .iter()
-                .any(|r| rooms.outbox.owes(&r.stored.owner_vk)),
+            subscribes_pending: !subs.connect_time.is_empty(),
+            update_owed: rooms.list.iter().any(|r| {
+                rooms
+                    .outbox
+                    .owes_within(&r.stored.owner_vk, pace.key_owed_cap, Instant::now())
+            }),
             complete_read: rooms.complete && !rooms.store_missing,
             settled: last_read.elapsed() >= pace.key_delay,
         };
@@ -966,9 +989,10 @@ struct SweepGate {
     read_out: bool,
     /// A read is wanted (a task just finished) or due by the refresh interval.
     read_pending_or_due: bool,
-    /// A subscribe is unanswered: an error that names nothing could be its.
+    /// A subscribe asked as the connection was set up is unanswered: an error that names nothing
+    /// could be its. Later asks, for rooms that never answer, do not count.
     subscribes_pending: bool,
-    /// An update's answer is owed, for the same reason.
+    /// An update's answer, asked for less than `key_owed_cap` ago, is owed, for the same reason.
     update_owed: bool,
     /// The last read of the stored rooms was complete, and the store is there.
     complete_read: bool,

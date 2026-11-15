@@ -595,6 +595,10 @@ struct World {
     key_store_times: Vec<Instant>,
     /// The connection of every key request.
     key_conns: Vec<usize>,
+    /// When each `GetPublicKey` arrived.
+    key_read_times: Vec<Instant>,
+    /// How long the node takes over each CAS store (slow task answers).
+    cas_delay: Duration,
     /// Take the next CAS store of a room key, but answer nothing (then clear this).
     silence_first_room_store: bool,
     /// Answer the next listing with nothing (then clear this).
@@ -998,6 +1002,7 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                         value,
                         expected_generation,
                     } => {
+                        std::thread::sleep(w.cas_delay);
                         if let Some(mut hook) = w.before_cas.take() {
                             let World {
                                 slots, generations, ..
@@ -1035,6 +1040,7 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                     // bytes reads as no key.
                     ChatDelegateRequestMsg::GetPublicKey { room_key } => {
                         w.key_reads.push(room_key);
+                        w.key_read_times.push(Instant::now());
                         w.key_conns.push(n);
                         let World {
                             key_play,
@@ -1187,6 +1193,7 @@ fn quick() -> Pace {
         key_retry_first: Duration::from_millis(30),
         key_retry_max: Duration::from_millis(120),
         key_delay: Duration::from_millis(200),
+        key_owed_cap: Duration::from_secs(60),
         grant: GrantPacing {
             pause: Duration::ZERO,
             margin: Duration::ZERO,
@@ -2961,15 +2968,21 @@ fn a_joined_rooms_signing_key_is_the_members_under_the_owner_key() {
     });
 }
 
-/// A delegate that never answers about keys does not hold up a create: the room is stored,
-/// shown and its task done within a bound far under the delegate deadline, on the one
-/// connection (no reconnect waiting for the key request).
+/// A delegate that never answers about keys does not hold up a create: the sweep does not start
+/// until its settle time after the read, which is far longer than the create takes here, so the
+/// room is stored, shown and its task done with no key request yet made, on the one connection.
+/// (A key step inside the task, or a sweep that starts at once, would be seen as a key request
+/// before the room shows, or a create that waits out the deadline.)
 #[test]
 fn a_silent_delegate_does_not_delay_a_create() {
     let node = fake_node(vec![]);
     node.with(|w| w.key_play.silent = true);
+    let pace = Pace {
+        key_delay: Duration::from_secs(30),
+        ..quick()
+    };
     let a = TestRoom::new(1, "A", 1, &["a1"]);
-    let (session, _dir) = following(&node, &[&a], "key-silent", quick());
+    let (session, _dir) = following(&node, &[&a], "key-silent", pace);
     let started = Instant::now();
     session.list(Action::CreateRoom {
         name: "Book club".into(),
@@ -2980,7 +2993,7 @@ fn a_silent_delegate_does_not_delay_a_create() {
         r.iter().any(|r| r.name == "Book club")
     });
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(4),
         "took {:?}, the delegate deadline is 5 s",
         started.elapsed()
     );
@@ -2990,8 +3003,11 @@ fn a_silent_delegate_does_not_delay_a_create() {
             if work.iter().any(|w| matches!(w.state, WorkState::Done { .. }))
     )));
     node.with(|w| {
+        assert!(
+            w.key_reads.is_empty(),
+            "a key request came before the room showed"
+        );
         assert_eq!(w.connections.len(), 1);
-        assert!(w.signing_keys.is_empty());
         assert_eq!(w.puts.len(), 1);
     });
 }
@@ -3146,25 +3162,38 @@ fn the_sweep_waits_for_pending_subscribes() {
     });
 }
 
-/// The sweep waits for an owed update: a message the node has not answered keeps it quiet.
+/// The sweep waits for an owed update, but only for `key_owed_cap`: an update the node never
+/// answers does not close the gate for good.
 #[test]
-fn the_sweep_waits_while_an_update_is_owed() {
+fn the_sweep_waits_while_an_update_is_owed_but_only_up_to_a_cap() {
     let node = fake_node(vec![]);
     node.with(|w| w.update_play = UpdatePlay::Ignore);
     let a = TestRoom::new(1, "A", 1, &["a1"]);
     let pace = Pace {
-        key_delay: Duration::from_millis(1000),
+        key_delay: Duration::from_millis(600),
+        key_owed_cap: Duration::from_millis(1500),
         ..quick()
     };
     let (session, _dir) = following(&node, &[&a], "key-owed", pace);
     session.act(&a, say("hello"));
+    let sent = Instant::now();
     session.wait_until("the update reached the node", || {
         node.with(|w| !w.updates.is_empty())
     });
-    std::thread::sleep(Duration::from_millis(1500));
+    // Past the settle time, the update is still owed: nothing asked.
+    std::thread::sleep(Duration::from_millis(1000));
     assert!(
         node.with(|w| w.key_reads.is_empty()),
         "asked while an update was owed"
+    );
+    // After the cap it is taken to be lost and the sweep goes on.
+    session.wait_until("asked after the cap", || {
+        node.with(|w| !w.key_reads.is_empty())
+    });
+    assert!(
+        sent.elapsed() >= Duration::from_millis(1450),
+        "{:?}",
+        sent.elapsed()
     );
 }
 
@@ -3181,6 +3210,147 @@ fn key_requests_go_only_on_connections_with_the_grant_token() {
         for n in &w.key_conns {
             assert_eq!(w.conn_bearer[*n].as_deref(), Some("kept-token"));
         }
+    });
+}
+
+/// A room that never answers its subscribe is asked again and again, and is pending most of the
+/// time; that must not keep the sweep from storing the keys of the other rooms.
+#[test]
+fn a_room_that_never_answers_does_not_starve_the_sweep() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let dead = TestRoom::new(2, "Dead", 1, &["d1"]);
+    node.with(|w| {
+        w.add_room(&a);
+        // Stored, but the node never answers for its contract (nor holds a key for it).
+        w.slots.insert(room_storage_key(&dead.vk()), dead.slot());
+    });
+    let pace = Pace {
+        catch_up: Duration::from_millis(300),
+        // Asked again at once, so one is always pending.
+        resubscribe_first: Duration::ZERO,
+        resubscribe_max: Duration::ZERO,
+        key_delay: Duration::from_millis(50),
+        ..quick()
+    };
+    let dir = temp_dir("key-starve");
+    save_token(&dir, "kept-token");
+    let session = Running::start(&node, &dir, pace);
+    session.wait_until(
+        "both keys are stored although one room never answers",
+        || {
+            node.with(|w| {
+                w.signing_keys.contains_key(&a.vk().to_bytes())
+                    && w.signing_keys.contains_key(&dead.vk().to_bytes())
+            })
+        },
+    );
+    // It really was asked again, and is still asked.
+    session.wait_until("the dead room is asked again", || {
+        node.with(|w| w.subscribes_to(dead.id()) >= 3)
+    });
+}
+
+/// After a create finishes, the read that shows the new room comes before any key request, even
+/// when another room's key is due and the settle time has long passed. (Both guards matter: the
+/// gate's "read pending" and the sweep coming after the read's start in the loop.)
+#[test]
+fn the_read_after_a_create_comes_before_a_key_request() {
+    let node = fake_node(vec![]);
+    // The first key request fails, so room B is unverified and held back for 700 ms.
+    node.with(|w| {
+        w.key_play.errors = 1;
+        w.cas_delay = Duration::from_millis(400);
+    });
+    let b = TestRoom::new(1, "B", 1, &["b1"]);
+    let pace = Pace {
+        key_delay: Duration::from_millis(50),
+        key_retry_first: Duration::from_millis(700),
+        key_retry_max: Duration::from_millis(700),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&b], "key-order", pace);
+    session.wait_until("B's first key request failed", || {
+        node.with(|w| w.key_reads.len() == 1 && w.key_play.errors == 0)
+    });
+    // A create whose answers are slow: it is done after B's wait is over.
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_rooms("the new room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club")
+    });
+    node.with(|w| {
+        let last_cas = w.sent.iter().rposition(|(_, k)| *k == "cas").unwrap();
+        let after = &w.sent[last_cas + 1..];
+        let list = after.iter().position(|(_, k)| *k == "list");
+        let key = after.iter().position(|(_, k)| *k == "other");
+        assert!(list.is_some(), "no read after the create: {after:?}");
+        assert!(
+            key.is_none_or(|k| list.unwrap() < k),
+            "a key request came before the read: {after:?}"
+        );
+    });
+}
+
+/// After a connection drops with a key request out, the room is asked about again only after the
+/// retry wait, on the new connection: the drop counted as a failure.
+#[test]
+fn a_dropped_connection_with_a_key_request_out_waits_before_the_next_ask() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.key_play.silent_first = 1);
+    let pace = Pace {
+        key_delay: Duration::from_millis(50),
+        key_retry_first: Duration::from_millis(600),
+        key_retry_max: Duration::from_millis(600),
+        ..quick()
+    };
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "key-drop-gap", pace);
+    session.wait_until("the key request is out", || {
+        node.with(|w| !w.key_reads.is_empty())
+    });
+    node.with(|w| w.drop_live = true);
+    session.wait_until("the key is stored", || {
+        node.with(|w| w.signing_keys.len() == 1)
+    });
+    node.with(|w| {
+        assert!(w.connections.len() >= 2);
+        let gap = w.key_read_times[1].duration_since(w.key_read_times[0]);
+        assert!(
+            gap >= Duration::from_millis(600),
+            "asked again after {gap:?}"
+        );
+        // The drop counted as the failure at once; it did not wait for the 5 s deadline.
+        assert!(gap < Duration::from_secs(3), "asked again after {gap:?}");
+    });
+}
+
+/// After a `Missing`, the next ask waits out the retry wait, though the store is registered
+/// again at once.
+#[test]
+fn a_missing_answer_to_a_key_request_waits_before_the_next_ask() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.key_play.missing = 1);
+    let pace = Pace {
+        key_delay: Duration::from_millis(50),
+        key_retry_first: Duration::from_millis(600),
+        key_retry_max: Duration::from_millis(600),
+        ..quick()
+    };
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "key-missing-gap", pace);
+    session.wait_until("the key is stored", || {
+        node.with(|w| w.signing_keys.len() == 1)
+    });
+    node.with(|w| {
+        let gap = w.key_read_times[1].duration_since(w.key_read_times[0]);
+        assert!(
+            gap >= Duration::from_millis(600),
+            "asked again after {gap:?}"
+        );
     });
 }
 
