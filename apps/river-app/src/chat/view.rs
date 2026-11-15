@@ -535,14 +535,15 @@ fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
 pub(super) fn no_rooms_hint(chat: &Chat) -> &'static str {
     match chat.source {
         Source::Example => "Create a room, or enter an invite code to join one.",
-        // The node has no chat delegate under the key this build carries: River in the browser
-        // never ran on this node, or it runs a newer delegate than this build knows (rooms
-        // migrate forward with the web UI, so an older app no longer finds them).
+        // Rooms from an earlier River are waiting to be moved forward by River in the browser,
+        // and a room created here first would stop that (rooms/legacy.rs).
+        Source::Node(_) if chat.issues.legacy_rooms => crate::rooms::LEGACY_ROOMS,
+        // The node has no chat delegate under the key this build carries, though River
+        // registered it: the node refused or lost it.
         Source::Node(_) if chat.issues.store_missing => {
-            "River's storage isn't on this computer's Freenet under the version this app knows. \
-             If you have never opened River in your browser on this computer, do that first. If \
-             you have, this app is probably older than River on the web: update it to see your \
-             rooms here."
+            "River couldn't set up its storage on this computer's Freenet, so it can't show or \
+             save rooms. Restart Freenet and then this app. If it keeps happening, update this \
+             app."
         }
         Source::Node(_) => {
             "Create a room, or enter an invite code to join one. Rooms you create or join in \

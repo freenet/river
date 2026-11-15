@@ -318,7 +318,7 @@ impl Work {
     }
 
     /// A task refused before it started: shown as failed, with nothing to try again.
-    fn refuse(&mut self, what: &str, why: String) {
+    pub(super) fn refuse(&mut self, what: &str, why: String) {
         self.next_id += 1;
         let mut t = Task::new(self.next_id, Kind::Refused(what.to_owned()), Step::Get);
         t.fail(why, false);
@@ -709,9 +709,9 @@ impl Work {
             (
                 Out::Read(_) | Out::Store(_),
                 ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_))),
-            ) => "River's storage isn't on this computer's Freenet under the version this app \
-                  knows, so the room can't be saved. Open River in your browser on this \
-                  computer first, or update this app."
+                // The session reconnects on this, which registers the store again.
+            ) => "River's storage went missing from this computer's Freenet, so the room \
+                  wasn't saved. River is setting it up again: try again in a moment."
                 .to_owned(),
             (
                 Out::Read(_) | Out::Store(_),

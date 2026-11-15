@@ -833,6 +833,7 @@ fn what_the_node_rooms_are_missing_is_said_in_the_room_list() {
     );
     s.chat.issues = crate::rooms::Issues {
         store_missing: false,
+        legacy_rooms: false,
         not_updated: vec!["Town Square".into()],
         not_following: vec!["Family".into()],
         unreadable: 2,
@@ -850,7 +851,19 @@ fn an_empty_list_says_why_when_the_store_is_missing() {
     chat.issues.store_missing = true;
     let missing = super::view::no_rooms_hint(&chat);
     assert_ne!(usual, missing);
-    assert!(missing.contains("older than River on the web"), "{missing}");
+    assert!(missing.contains("couldn't set up its storage"), "{missing}");
+    // Nothing tells a new user to open River in the browser first: the app sets up the store.
+    for hint in [usual, missing] {
+        assert!(!hint.contains("browser first"), "{hint}");
+    }
+    chat.issues.store_missing = false;
+    chat.issues.legacy_rooms = true;
+    let legacy = super::view::no_rooms_hint(&chat);
+    assert_eq!(legacy, crate::rooms::LEGACY_ROOMS);
+    assert!(
+        legacy.contains("Open River in your web browser once"),
+        "{legacy}"
+    );
     let rt = render(
         {
             let mut s = node_chat();

@@ -3,14 +3,16 @@
 //! Reads (`ListRequest`, `GetRequest`), and the web UI's generation compare-and-swap
 //! (`GetVersionedRequest`, `CasStoreRequest`), which is the only way this app writes. It never
 //! stores without a generation, deletes, or asks the delegate to sign; what it stores, and
-//! when, is [`super::work`]'s business.
+//! when, is [`super::work`]'s business. Registering the delegate is
+//! [`super::socket::NodeSocket::register_chat_delegate`]'s, which sends it only on a grant
+//! connection.
 
 use std::sync::OnceLock;
 
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
-    ApplicationMessage, Delegate, DelegateCode, DelegateKey, InboundDelegateMsg,
-    OutboundDelegateMsg, Parameters,
+    ApplicationMessage, Delegate, DelegateCode, DelegateContainer, DelegateKey,
+    DelegateWasmAPIVersion, InboundDelegateMsg, OutboundDelegateMsg, Parameters,
 };
 use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 
@@ -19,6 +21,15 @@ use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDel
 /// it cannot change the WASM. `apps.yml` runs when it changes.
 const CHAT_DELEGATE_WASM: &[u8] =
     include_bytes!("../../../../ui/public/contracts/chat_delegate.wasm");
+
+/// The chat delegate as the web UI registers it (`create_chat_delegate_container` in
+/// `ui/src/components/app/chat_delegate.rs`): the bundled WASM with empty parameters. Only
+/// [`super::socket::NodeSocket::register_chat_delegate`] sends it.
+pub fn chat_delegate_container() -> DelegateContainer {
+    let code = DelegateCode::from(CHAT_DELEGATE_WASM.to_vec());
+    let params = Parameters::from(Vec::<u8>::new());
+    DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((&code, &params))))
+}
 
 /// The chat delegate's key, as the web UI computes it (`CHAT_DELEGATE_KEY` in
 /// `ui/src/components/app/chat_delegate.rs`): the bundled WASM with empty parameters.

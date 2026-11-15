@@ -288,7 +288,8 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.access = Access::PermissionRemoved;
     }),
-    // The node has no chat delegate under the key this build carries.
+    // The node has no chat delegate under the key this build carries, though River registered
+    // it.
     ("chat-no-store", |s| {
         connect(s);
         s.chat = Chat::new(
@@ -299,6 +300,18 @@ pub const SCENES: &[Scene] = &[
             0,
         );
         s.chat.issues.store_missing = true;
+    }),
+    // The node holds rooms from an earlier River that River in the browser has not moved yet.
+    ("chat-legacy-rooms", |s| {
+        connect(s);
+        s.chat = Chat::new(
+            chat::Source::Node(chat::LinkStatus::Live),
+            Vec::new(),
+            0,
+            0,
+            0,
+        );
+        s.chat.issues.legacy_rooms = true;
     }),
 ];
 
