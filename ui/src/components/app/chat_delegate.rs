@@ -669,11 +669,11 @@ async fn set_up_chat_delegate_with(register_first: bool) -> Result<(), String> {
     // The earlier waiter is told it was superseded.
     cancel_register_ack();
 
-    // Legacy migration is NOT fired here. It is gated on the current
-    // delegate's response: if the current delegate has data, migration is
-    // skipped (current is authoritative); if it is empty, migration is fired
-    // then. This prevents legacy responses from racing with the current
-    // delegate and clobbering newer state (freenet/river#253).
+    // The legacy sweep is NOT fired here: it is gated on the current
+    // delegate's response (fired only if it is empty, #253). The journaled
+    // walk is separate and runs whatever the current delegate holds while the
+    // journal is incomplete (#763), through the ranked merge, so it cannot
+    // clobber newer state either (`migration_journal.rs`, river-publish.md).
     //
     // Only the list goes out now. The outbound-DM load follows once the
     // delegate is known to be there (`request_outbound_dms_once`, from the

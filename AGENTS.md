@@ -331,7 +331,11 @@ required-reviewer rule on it asks for approval twice per release.
 
 A re-keying River publish needs a new desktop release ready first: once its
 pointer records are published, every installed desktop build is read-only until
-the user updates (`.claude/rules/river-publish.md`, step 7).
+the user updates (`.claude/rules/river-publish.md`, step 7). That release must
+also carry a desktop-only user's rooms from the previous delegate key, which the
+app cannot do yet (freenet/river#889), so the first re-key after v0.1.0 waits
+on it. Anything the app stores in the chat delegate must stay decodable by the
+web UI builds in use, or their migration walk stops on every load.
 
 Each release:
 
