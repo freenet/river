@@ -345,17 +345,17 @@ fn work_row(w: &WorkView, p: &Palette, k: &Kit) -> El {
         }
         // Stored; it shows here once the stored rooms are read again. Should that not happen
         // (a read that keeps failing), the row can still be put away.
-        WorkState::Done { .. } => {
+        WorkState::Done { note, .. } => {
+            let saved = match note {
+                Some(note) => format!("Saved. It will show in your rooms in a moment. {note}"),
+                None => "Saved. It will show in your rooms in a moment.".to_owned(),
+            };
             r = r
                 .child(
-                    label(
-                        "Saved. It will show in your rooms in a moment.",
-                        st::SMALL,
-                        p.text_muted,
-                    )
-                    .wrap()
-                    .w_full()
-                    .key("work-status"),
+                    label(&saved, st::SMALL, p.text_muted)
+                        .wrap()
+                        .w_full()
+                        .key("work-status"),
                 )
                 .child(
                     Button::new("Dismiss")

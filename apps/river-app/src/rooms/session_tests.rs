@@ -3,7 +3,7 @@ use crate::rooms::outbox::InviteCode;
 use crate::rooms::outbox::{Action, Outbox};
 use crate::rooms::room::message_key;
 use crate::rooms::work::WorkState;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
     ApplicationMessage, CodeHash, ContractCode, ContractKey, InboundDelegateMsg,
@@ -568,6 +568,15 @@ struct World {
     cas: Vec<(Vec<u8>, bool)>,
     /// Every PUT received: the contract.
     puts: Vec<ContractKey>,
+    /// The signing key the chat delegate holds for each room (by owner key bytes).
+    signing_keys: HashMap<[u8; 32], [u8; 32]>,
+    /// Every `StoreSigningKey` received: the room, the key, and whether the room's slot was
+    /// already stored when it arrived.
+    key_stores: Vec<([u8; 32], [u8; 32], bool)>,
+    /// Every `GetPublicKey` received.
+    key_reads: usize,
+    /// How the delegate answers a `StoreSigningKey`.
+    key_play: KeyPlay,
     /// Take the next CAS store of a room key, but answer nothing (then clear this).
     silence_first_room_store: bool,
     /// Answer the next listing with nothing (then clear this).
@@ -576,6 +585,17 @@ struct World {
     reads_due: usize,
     /// Versioned reads and CAS stores that arrived while a reader was still reading.
     overlaps: usize,
+}
+
+/// How the fake node answers a `StoreSigningKey`.
+#[derive(Clone, Debug, Default)]
+enum KeyPlay {
+    #[default]
+    Store,
+    /// `StoreSigningKeyResponse` with this error, storing nothing.
+    Refuse(&'static str),
+    /// No answer at all (the key is not stored).
+    Ignore,
 }
 
 /// How the fake node answers an UPDATE.
@@ -643,6 +663,13 @@ fn consume_request(stream: &mut TcpStream, head: &str) {
         .unwrap_or(0);
     let mut sink = vec![0u8; head.len() + body];
     stream.read_exact(&mut sink).unwrap();
+}
+
+/// Whether a room (named by its owner's key bytes) has a stored slot.
+fn parse_room_key_slot(slots: &BTreeMap<Vec<u8>, Vec<u8>>, owner: &[u8; 32]) -> bool {
+    VerifyingKey::from_bytes(owner)
+        .map(|vk| slots.contains_key(&room_storage_key(&vk)))
+        .unwrap_or(false)
 }
 
 fn fake_node(plays: Vec<Play>) -> FakeNode {
@@ -957,7 +984,45 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                         };
                         ChatDelegateResponseMsg::CasStoreResponse { key, result }
                     }
-                    other => panic!("the app must only read and CAS-store, but sent {other:?}"),
+                    // The chat delegate's `handle_get_public_key`.
+                    ChatDelegateRequestMsg::GetPublicKey { room_key } => {
+                        w.key_reads += 1;
+                        let public_key = w.signing_keys.get(&room_key).map(|sk| {
+                            ed25519_dalek::SigningKey::from_bytes(sk)
+                                .verifying_key()
+                                .to_bytes()
+                        });
+                        ChatDelegateResponseMsg::GetPublicKeyResponse {
+                            room_key,
+                            public_key,
+                        }
+                    }
+                    // `handle_store_signing_key`: stores over whatever is there.
+                    ChatDelegateRequestMsg::StoreSigningKey {
+                        room_key,
+                        signing_key_bytes,
+                    } => {
+                        let slot_stored = parse_room_key_slot(&w.slots, &room_key);
+                        w.key_stores
+                            .push((room_key, signing_key_bytes, slot_stored));
+                        match w.key_play.clone() {
+                            KeyPlay::Ignore => continue,
+                            KeyPlay::Refuse(why) => {
+                                ChatDelegateResponseMsg::StoreSigningKeyResponse {
+                                    room_key,
+                                    result: Err(why.into()),
+                                }
+                            }
+                            KeyPlay::Store => {
+                                w.signing_keys.insert(room_key, signing_key_bytes);
+                                ChatDelegateResponseMsg::StoreSigningKeyResponse {
+                                    room_key,
+                                    result: Ok(()),
+                                }
+                            }
+                        }
+                    }
+                    other => panic!("the app sent a request it must not: {other:?}"),
                 };
                 out.push(encode(Ok(HostResponse::DelegateResponse {
                     key: delegate::chat_delegate_key().clone(),
@@ -2551,6 +2616,20 @@ fn a_room_created_here_is_stored_published_and_opened() {
         // Every write was a CAS store that was taken: one for the room, one for the meta.
         assert_eq!(w.cas.iter().filter(|(_, ok)| *ok).count(), 2);
         assert_eq!(w.overlaps, 0);
+        // Exactly one StoreSigningKey, for this room and its own key, after its slot was
+        // stored, and the delegate holds it.
+        assert_eq!(
+            w.key_stores,
+            [(
+                room.owner_vk.to_bytes(),
+                room.self_sk.as_ref().unwrap().to_bytes(),
+                true
+            )]
+        );
+        assert_eq!(
+            w.signing_keys.get(&room.owner_vk.to_bytes()),
+            Some(&room.self_sk.as_ref().unwrap().to_bytes())
+        );
         room
     });
     // Shown as the owner, private, and opened by the screen once (the task said it is done).
@@ -2564,7 +2643,7 @@ fn a_room_created_here_is_stored_published_and_opened() {
     assert!(session.updates().iter().any(|u| matches!(
         u,
         RoomsUpdate::Rooms { work, .. }
-            if work.iter().any(|w| w.state == WorkState::Done { room: shown.key.clone() })
+            if work.iter().any(|w| matches!(&w.state, WorkState::Done { room, .. } if *room == shown.key))
     )));
     session.wait_until("the finished task is dropped", || {
         session.last_work().is_empty()
@@ -2699,6 +2778,15 @@ fn joining_from_an_invitation_stores_the_room_sends_the_join_and_shows_it() {
         // One UPDATE to the room, adding the invitee; no PUT.
         assert!(w.puts.is_empty());
         assert_eq!(w.updates.len(), 1);
+        // One StoreSigningKey: the invitee's key, for the room, after the slot was stored.
+        assert_eq!(
+            w.key_stores,
+            [(
+                room.vk().to_bytes(),
+                inv.invitee_signing_key.to_bytes(),
+                true
+            )]
+        );
         let (key, delta) = &w.updates[0];
         assert_eq!(*key, real);
         assert_eq!(
@@ -2716,6 +2804,114 @@ fn joining_from_an_invitation_stores_the_room_sends_the_join_and_shows_it() {
             .any(|m| m.id == garden.me && m.nickname == "Bea")
     );
     assert!(garden.send_block.is_none());
+}
+
+/// Create a room in a session on `node` and wait for it to show.
+fn create_and_wait(node: &FakeNode, label: &str) -> (Running, PathBuf) {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, dir) = following(node, &[&a], label, quick());
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_rooms("the new room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club")
+    });
+    (session, dir)
+}
+
+/// The delegate refuses the key: the room is still created, published, opened and shown, the
+/// refusal is said on the finished task, and the key is not asked for again (no loop).
+#[test]
+fn a_refused_signing_key_does_not_lose_the_room_and_is_not_retried() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.key_play = KeyPlay::Refuse("no space"));
+    let s = create_and_wait(&node, "key-refused");
+    // Give a loop every chance to show itself.
+    std::thread::sleep(Duration::from_millis(500));
+    node.with(|w| {
+        assert_eq!(w.key_stores.len(), 1, "stored once, not retried");
+        assert!(w.signing_keys.is_empty());
+        assert_eq!(w.puts.len(), 1);
+        assert_eq!(w.updates.len(), 0);
+    });
+    let said = s.0.updates().iter().any(|u| {
+        matches!(u, RoomsUpdate::Rooms { work, .. }
+            if work.iter().any(|w| matches!(&w.state,
+                WorkState::Done { note: Some(n), .. } if n.contains("no space"))))
+    });
+    assert!(said, "the failure is said on the finished task");
+}
+
+/// A delegate that never answers the store: the connection is dropped, the step is asked again
+/// from its check on each new one, and after the budget the room is shown with a note.
+#[test]
+fn an_unanswered_signing_key_store_is_bounded() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.key_play = KeyPlay::Ignore);
+    let s = create_and_wait(&node, "key-silent");
+    let noted = |s: &Running| {
+        s.updates().iter().any(|u| {
+            matches!(u, RoomsUpdate::Rooms { work, .. }
+                if work.iter().any(|w| matches!(&w.state, WorkState::Done { note: Some(_), .. })))
+        })
+    };
+    s.0.wait_until("the key is given up on, with a note", || noted(&s.0));
+    std::thread::sleep(Duration::from_millis(500));
+    node.with(|w| {
+        // One store per connection the budget allows, then no more.
+        let stores = w.key_stores.len() as u32;
+        assert!(
+            (1..=crate::rooms::work::MAX_RECONNECTS + 1).contains(&stores),
+            "{stores}"
+        );
+        assert_eq!(w.puts.len(), 1, "the room was published once");
+    });
+}
+
+/// A key the web UI already put in the delegate for this room (a stale one from an earlier
+/// membership) is left for the web UI's own migration: never overwritten.
+#[test]
+fn a_key_already_in_the_delegate_is_not_overwritten_by_a_join() {
+    let node = fake_node(vec![]);
+    let room = TestRoom::new(3, "Garden", 1, &["t1"]);
+    let inviter = LiveRoom::new(room.stored());
+    let (_inv, link) = super::super::create::invitation(&inviter, "http://x/").unwrap();
+    let real = super::super::create::contract_key(&room.vk());
+    let stale = [99u8; 32];
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&room.state))));
+        w.signing_keys.insert(room.vk().to_bytes(), stale);
+    });
+    let other = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&other], "join-stale-key", quick());
+    session.list(Action::Join {
+        code: InviteCode(link),
+        nickname: "Bea".into(),
+    });
+    session.wait_rooms("the joined room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Garden")
+    });
+    node.with(|w| {
+        assert!(w.key_stores.is_empty());
+        assert_eq!(w.signing_keys.get(&room.vk().to_bytes()), Some(&stale));
+        assert_eq!(w.key_reads, 1);
+    });
+}
+
+/// Every connection that sends the key request carries the grant token (a grant connection),
+/// as every `NodeSocket` does; nothing is sent to the node without one.
+#[test]
+fn the_signing_key_goes_only_on_a_grant_connection() {
+    let node = fake_node(vec![]);
+    let _s = create_and_wait(&node, "key-grant");
+    node.with(|w| {
+        assert_eq!(w.key_stores.len(), 1);
+        assert!(!w.conn_bearer.is_empty());
+        assert!(w.conn_bearer.iter().all(Option::is_some));
+    });
 }
 
 #[test]

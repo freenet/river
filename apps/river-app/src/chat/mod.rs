@@ -653,7 +653,7 @@ impl Chat {
     /// in the list.
     pub fn show_work(&mut self, work: Vec<WorkView>) {
         for w in &work {
-            if let WorkState::Done { room } = &w.state
+            if let WorkState::Done { room, .. } = &w.state
                 && self.opened.insert(w.id)
             {
                 if self.rooms.iter().any(|r| &r.key == room) {
@@ -888,7 +888,10 @@ mod state_tests {
         vec![WorkView {
             id,
             what: String::new(),
-            state: WorkState::Done { room: room.into() },
+            state: WorkState::Done {
+                room: room.into(),
+                note: None,
+            },
         }]
     }
 

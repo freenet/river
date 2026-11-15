@@ -131,8 +131,23 @@ fn creating_stores_the_room_publishes_it_then_opens_it_in_the_web_ui() {
         ROOMS_META_KEY,
         CasStoreResult::Stored { generation: 5 }
     )));
+    // Last, the room's signing key: asked after, stored when absent, confirmed.
+    assert_eq!(state(&w), WorkState::Working);
+    let sk = store_key_when_absent(&mut w, &owner);
+    assert_eq!(sk.to_bytes(), room.self_sk.as_ref().unwrap().to_bytes());
+    assert_eq!(
+        sk.verifying_key(),
+        owner,
+        "a created room is signed by its owner"
+    );
     let key = bs58::encode(owner.to_bytes()).into_string();
-    assert_eq!(state(&w), WorkState::Done { room: key });
+    assert_eq!(
+        state(&w),
+        WorkState::Done {
+            room: key,
+            note: None
+        }
+    );
     assert!(!w.busy());
     assert!(w.take_reload(), "the stored rooms are read now");
     assert!(!w.take_reload());
@@ -457,7 +472,10 @@ fn joining_reads_the_room_stores_it_over_a_tombstone_then_sends_the_join() {
         ROOMS_META_KEY,
         CasStoreResult::Stored { generation: 1 },
     ));
-    assert!(matches!(state(&w), WorkState::Done { .. }));
+    let sk = store_key_when_absent(&mut w, &owner);
+    assert_eq!(sk.verifying_key(), inv.invitee_signing_key.verifying_key());
+    assert_eq!(sk.to_bytes(), inv.invitee_signing_key.to_bytes());
+    assert!(matches!(state(&w), WorkState::Done { note: None, .. }));
     assert!(!w.holds(&owner));
     assert!(w.views()[0].what.contains("Secret garden"));
 }
@@ -768,6 +786,183 @@ fn a_store_the_delegate_refuses_is_said_and_can_be_tried_again() {
         panic!("failed");
     };
     assert!(retry && why.contains("disk full"), "{why}");
+}
+
+fn key_msg(r: &ClientRequest<'_>) -> ChatDelegateRequestMsg {
+    delegate_msg(r).expect("a delegate request")
+}
+
+/// The next request asks which key the delegate holds for `owner`'s room.
+fn expect_get_public_key(w: &mut Work, owner: &VerifyingKey) {
+    match key_msg(&next(w)) {
+        ChatDelegateRequestMsg::GetPublicKey { room_key } => {
+            assert_eq!(room_key, owner.to_bytes())
+        }
+        other => panic!("expected GetPublicKey, got {other:?}"),
+    }
+}
+
+fn public_key_answer(owner: &VerifyingKey, held: Option<&SigningKey>) -> ChatDelegateResponseMsg {
+    ChatDelegateResponseMsg::GetPublicKeyResponse {
+        room_key: owner.to_bytes(),
+        public_key: held.map(|k| k.verifying_key().to_bytes()),
+    }
+}
+
+fn key_stored_answer(owner: &VerifyingKey, result: Result<(), String>) -> ChatDelegateResponseMsg {
+    ChatDelegateResponseMsg::StoreSigningKeyResponse {
+        room_key: owner.to_bytes(),
+        result,
+    }
+}
+
+/// The next request is a `StoreSigningKey` for `owner`'s room; the key it carries.
+fn expect_store_key(w: &mut Work, owner: &VerifyingKey) -> SigningKey {
+    match key_msg(&next(w)) {
+        ChatDelegateRequestMsg::StoreSigningKey {
+            room_key,
+            signing_key_bytes,
+        } => {
+            assert_eq!(room_key, owner.to_bytes());
+            SigningKey::from_bytes(&signing_key_bytes)
+        }
+        other => panic!("expected StoreSigningKey, got {other:?}"),
+    }
+}
+
+/// The key step on a delegate with no key for the room: asked, stored, confirmed. The key sent.
+fn store_key_when_absent(w: &mut Work, owner: &VerifyingKey) -> SigningKey {
+    expect_get_public_key(w, owner);
+    assert!(w.on_delegate(&public_key_answer(owner, None)));
+    let sk = expect_store_key(w, owner);
+    assert!(w.on_delegate(&key_stored_answer(owner, Ok(()))));
+    expect_get_public_key(w, owner);
+    assert!(w.on_delegate(&public_key_answer(owner, Some(&sk))));
+    assert!(w.next_request(false, Instant::now()).is_none());
+    sk
+}
+
+/// A create taken to its key step: the room stored, published and opened. Its owner.
+fn creating_to_key(w: &mut Work) -> VerifyingKey {
+    let owner = creating_to_meta(w);
+    w.on_delegate(&read_answer(ROOMS_META_KEY, None, 0));
+    expect_store(w, ROOMS_META_KEY, 0);
+    w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Stored { generation: 1 },
+    ));
+    assert_eq!(state(w), WorkState::Working);
+    owner
+}
+
+fn note(w: &Work) -> Option<String> {
+    match state(w) {
+        WorkState::Done { note, .. } => note,
+        other => panic!("expected a finished task, got {other:?}"),
+    }
+}
+
+/// A key already in the delegate is never replaced, whether it is ours or another's: the
+/// delegate overwrites without comparing, and replacing a stale key is the web UI's (it also
+/// removes what the old key signed).
+#[test]
+fn a_key_the_delegate_already_holds_is_never_overwritten() {
+    for other in [false, true] {
+        let mut w = Work::default();
+        let owner = creating_to_key(&mut w);
+        let ours = w.tasks[0].room().unwrap().self_sk.clone().unwrap();
+        let held = if other {
+            SigningKey::from_bytes(&[77; 32])
+        } else {
+            ours
+        };
+        expect_get_public_key(&mut w, &owner);
+        assert!(w.on_delegate(&public_key_answer(&owner, Some(&held))));
+        assert!(w.next_request(false, Instant::now()).is_none());
+        assert_eq!(note(&w), None);
+    }
+}
+
+/// Nothing about the key can lose the room or leave the task working: a refusal, an error and
+/// a delegate that keeps nothing each end it as saved, with a note.
+#[test]
+fn a_key_that_cannot_be_stored_ends_the_task_saved_with_a_note() {
+    // The delegate refuses the store.
+    let mut w = Work::default();
+    let owner = creating_to_key(&mut w);
+    expect_get_public_key(&mut w, &owner);
+    w.on_delegate(&public_key_answer(&owner, None));
+    expect_store_key(&mut w, &owner);
+    assert!(w.on_delegate(&key_stored_answer(&owner, Err("disk full".into()))));
+    assert!(note(&w).unwrap().contains("disk full"));
+    assert!(w.next_request(false, Instant::now()).is_none());
+    assert!(!w.busy());
+    assert!(w.take_reload(), "the room is shown all the same");
+
+    // The delegate says yes but does not hold it.
+    let mut w = Work::default();
+    let owner = creating_to_key(&mut w);
+    expect_get_public_key(&mut w, &owner);
+    w.on_delegate(&public_key_answer(&owner, None));
+    expect_store_key(&mut w, &owner);
+    w.on_delegate(&key_stored_answer(&owner, Ok(())));
+    expect_get_public_key(&mut w, &owner);
+    w.on_delegate(&public_key_answer(&owner, None));
+    assert!(note(&w).is_some());
+    assert!(w.next_request(false, Instant::now()).is_none());
+
+    // The delegate answers with an error.
+    let mut w = Work::default();
+    let owner = creating_to_key(&mut w);
+    expect_get_public_key(&mut w, &owner);
+    let e: ClientError = ErrorKind::Unhandled {
+        cause: "boom".into(),
+    }
+    .into();
+    assert!(w.on_error(&e, true, &|_| false));
+    assert!(note(&w).unwrap().contains("boom"));
+    assert!(w.take_reload());
+}
+
+/// An unanswered key request drops the connection like any other, and the step is asked again
+/// from its start on the next one, a bounded number of times, then given up with a note.
+#[test]
+fn an_unanswered_key_request_is_tried_again_a_few_times_then_given_up() {
+    let mut w = Work::default();
+    let owner = creating_to_key(&mut w);
+    let wait = Duration::from_secs(5);
+    for _ in 0..MAX_RECONNECTS {
+        expect_get_public_key(&mut w, &owner);
+        assert!(w.expire(wait, wait, Instant::now() + wait));
+        assert!(w.busy(), "still trying");
+    }
+    expect_get_public_key(&mut w, &owner);
+    assert!(w.expire(wait, wait, Instant::now() + wait));
+    assert!(note(&w).unwrap().contains("didn't answer"));
+    assert!(!w.busy());
+    assert!(w.next_request(false, Instant::now()).is_none());
+    assert!(w.take_reload());
+
+    // A connection lost midway starts the step over with the check, never with a bare store.
+    let mut w = Work::default();
+    let owner = creating_to_key(&mut w);
+    expect_get_public_key(&mut w, &owner);
+    w.on_delegate(&public_key_answer(&owner, None));
+    expect_store_key(&mut w, &owner);
+    w.connection_lost();
+    expect_get_public_key(&mut w, &owner);
+}
+
+/// Answers for another room, or of the wrong kind for the phase, are not the key step's.
+#[test]
+fn only_the_awaited_key_answer_is_taken() {
+    let mut w = Work::default();
+    let owner = creating_to_key(&mut w);
+    expect_get_public_key(&mut w, &owner);
+    let elsewhere = SigningKey::from_bytes(&[5; 32]).verifying_key();
+    assert!(!w.on_delegate(&public_key_answer(&elsewhere, None)));
+    assert!(!w.on_delegate(&key_stored_answer(&owner, Ok(()))));
+    assert!(w.on_delegate(&public_key_answer(&owner, None)));
 }
 
 /// Up to the meta step of a create.

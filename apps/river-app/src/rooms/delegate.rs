@@ -1,14 +1,16 @@
 //! Talking to River's chat delegate, the store that holds the user's rooms.
 //!
 //! Reads (`ListRequest`, `GetRequest`), and the web UI's generation compare-and-swap
-//! (`GetVersionedRequest`, `CasStoreRequest`), which is the only way this app writes. It never
-//! stores without a generation, deletes, or asks the delegate to sign; what it stores, and
-//! when, is [`super::work`]'s business. Registering the delegate is
+//! (`GetVersionedRequest`, `CasStoreRequest`), which is the only way this app writes its stored
+//! rooms, and the two signing-key requests the web UI sends (`GetPublicKey`, `StoreSigningKey`).
+//! It never stores a room without a generation, deletes, or asks the delegate to sign; what it
+//! stores, and when, is [`super::work`]'s business. Registering the delegate is
 //! [`super::socket::NodeSocket::register_chat_delegate`]'s, which sends it only on a grant
 //! connection.
 
 use std::sync::OnceLock;
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
     ApplicationMessage, Delegate, DelegateCode, DelegateContainer, DelegateKey,
@@ -90,6 +92,26 @@ pub fn versioned(v: &Versioned) -> ClientRequest<'static> {
     message(&msg)
 }
 
+/// `GetPublicKey` for a room: the public half of the signing key the delegate holds for it, if
+/// any. The room is named by its owner's key bytes, as the web UI's `get_public_key`
+/// (`ui/src/signing.rs`) names it.
+pub fn public_key(owner: &VerifyingKey) -> ClientRequest<'static> {
+    message(&ChatDelegateRequestMsg::GetPublicKey {
+        room_key: owner.to_bytes(),
+    })
+}
+
+/// `StoreSigningKey` for a room, as the web UI's `store_signing_key` (`ui/src/signing.rs`)
+/// sends it: the room named by its owner's key bytes (`create_room_modal.rs` passes
+/// `new_room_key.to_bytes()`), the key as its 32 secret bytes. The delegate overwrites
+/// whatever it holds for the room, so [`super::work`] sends this only to an absent key.
+pub fn store_signing_key(owner: &VerifyingKey, key: &SigningKey) -> ClientRequest<'static> {
+    message(&ChatDelegateRequestMsg::StoreSigningKey {
+        room_key: owner.to_bytes(),
+        signing_key_bytes: key.to_bytes(),
+    })
+}
+
 fn message(msg: &ChatDelegateRequestMsg) -> ClientRequest<'static> {
     let mut payload = Vec::new();
     ciborium::ser::into_writer(msg, &mut payload).expect("CBOR into a Vec cannot fail");
@@ -162,6 +184,105 @@ mod tests {
                 (other, _) => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    /// The CBOR the web UI sends for these two requests, built the way `ui/src/signing.rs`
+    /// builds them (`StoreSigningKey { room_key, signing_key_bytes }` and
+    /// `GetPublicKey { room_key }`, then `ciborium::ser::into_writer` into an
+    /// `ApplicationMessage`, `enqueue_delegate_request_inner`), with the room named as
+    /// `create_room_modal.rs` names it. Pinned as literal bytes too, so a change to the shared
+    /// type that moves the encoding fails here, and decoded with the type the delegate decodes.
+    #[test]
+    fn signing_key_requests_are_the_web_uis_bytes() {
+        let sk = SigningKey::from_bytes(&[8u8; 32]);
+        let owner = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let payload = |r: ClientRequest<'static>| {
+            let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+                key,
+                params,
+                inbound,
+            }) = r
+            else {
+                panic!("not a delegate request");
+            };
+            assert_eq!(&key, chat_delegate_key());
+            assert!(params.as_ref().is_empty());
+            let [InboundDelegateMsg::ApplicationMessage(m)] = inbound.as_slice() else {
+                panic!("one application message");
+            };
+            m.payload.clone()
+        };
+        let web = |msg: ChatDelegateRequestMsg| {
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(&msg, &mut out).unwrap();
+            out
+        };
+
+        let store = payload(store_signing_key(&owner, &sk));
+        assert_eq!(
+            store,
+            web(ChatDelegateRequestMsg::StoreSigningKey {
+                room_key: owner.to_bytes(),
+                signing_key_bytes: sk.to_bytes(),
+            })
+        );
+        let get = payload(public_key(&owner));
+        assert_eq!(
+            get,
+            web(ChatDelegateRequestMsg::GetPublicKey {
+                room_key: owner.to_bytes(),
+            })
+        );
+
+        // What the delegate decodes (`delegates/chat-delegate`, the same river-core type).
+        match ciborium::de::from_reader::<ChatDelegateRequestMsg, _>(store.as_slice()).unwrap() {
+            ChatDelegateRequestMsg::StoreSigningKey {
+                room_key,
+                signing_key_bytes,
+            } => {
+                assert_eq!(room_key, owner.to_bytes());
+                assert_eq!(signing_key_bytes, [8u8; 32]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // The literal encoding: a map with the variant name, holding the two fields.
+        let mut want = hex("a1");
+        want.extend(cbor_text("StoreSigningKey"));
+        want.extend(hex("a2"));
+        want.extend(cbor_text("room_key"));
+        want.extend(cbor_bytes_or_array(&owner.to_bytes()));
+        want.extend(cbor_text("signing_key_bytes"));
+        want.extend(cbor_bytes_or_array(&[8u8; 32]));
+        assert_eq!(store, want);
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn cbor_text(s: &str) -> Vec<u8> {
+        assert!(s.len() < 24);
+        let mut v = vec![0x60 + s.len() as u8];
+        v.extend(s.as_bytes());
+        v
+    }
+
+    /// A `[u8; 32]` field as serde encodes it with no bytes adapter: a CBOR array of 32
+    /// unsigned integers (a header 0x98 0x20, then each byte as an integer).
+    fn cbor_bytes_or_array(b: &[u8; 32]) -> Vec<u8> {
+        let mut v = vec![0x98, 0x20];
+        for byte in b {
+            if *byte < 24 {
+                v.push(*byte);
+            } else {
+                v.extend([0x18, *byte]);
+            }
+        }
+        v
     }
 
     #[test]

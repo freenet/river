@@ -37,6 +37,10 @@ struct App {
     work: Vec<river_app::rooms::work::WorkView>,
     invites: Vec<(String, Result<String, String>)>,
     access: Option<Access>,
+    /// Why a finished create or join could not store the room's signing key in the delegate,
+    /// each time one was seen. Empty when the delegate held the key (the app asks it again
+    /// after storing, and a task finishes without a note only when it answered with the key).
+    key_notes: Vec<String>,
 }
 
 impl App {
@@ -56,6 +60,7 @@ impl App {
             work: Vec::new(),
             invites: Vec::new(),
             access: None,
+            key_notes: Vec::new(),
         }
     }
 
@@ -90,6 +95,11 @@ impl App {
                 } => {
                     self.rooms = rooms;
                     self.issues = issues;
+                    for w in &work {
+                        if let WorkState::Done { note: Some(n), .. } = &w.state {
+                            self.key_notes.push(n.clone());
+                        }
+                    }
                     self.work = work;
                 }
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
@@ -237,5 +247,15 @@ fn main() {
         app.room(ROOM)
             .is_some_and(|r| r.members.iter().any(|m| m.nickname == "Bob"))
     });
+    // Each app stored its room's signing key in the delegate: the create and the join both
+    // ended without a note about the key.
+    for app in [&alice, &bob] {
+        assert!(
+            app.key_notes.is_empty(),
+            "{}: the signing key was not stored: {:?}",
+            app.name,
+            app.key_notes
+        );
+    }
     println!("E2E OK");
 }

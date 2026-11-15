@@ -21,7 +21,8 @@
 //! ([`create`], [`work`]). Those are the only times it writes the chat delegate's storage,
 //! which the web UI writes too, at the same time: it writes only with the web UI's generation
 //! compare-and-swap, only adds a room where none is stored, and in `rooms_meta` only changes
-//! the open room ([`work`] has the details). Its only PUT is the seed PUT of a room it has just
+//! the open room ([`work`] has the details). It also stores each such room's signing key in the
+//! delegate when the delegate holds none for it, as the web UI does. Its only PUT is the seed PUT of a room it has just
 //! created, under that room's own contract; it never seeds a room the network lacks, which the
 //! web UI does.
 
