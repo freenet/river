@@ -72,7 +72,7 @@ use super::room::LiveRoom;
 /// The room contract the web UI ships. A room's contract key is a hash of these bytes and the
 /// owner's parameters, so this is the web UI's contract and key. A file read, not a crate
 /// dependency: it cannot change the WASM. `apps.yml` runs when it changes.
-const ROOM_CONTRACT_WASM: &[u8] =
+pub(crate) const ROOM_CONTRACT_WASM: &[u8] =
     include_bytes!("../../../../ui/public/contracts/room_contract.wasm");
 
 fn params_bytes(owner: &VerifyingKey) -> Vec<u8> {

@@ -25,9 +25,14 @@
 //! key, in the delegate's own namespace for keys, only where the delegate holds none ([`keys`]).
 //! Its only PUT is the seed PUT of a room it has just created, under that room's own contract;
 //! it never seeds a room the network lacks, which the web UI does.
+//!
+//! It writes none of that once River has moved to a newer chat delegate or room contract than
+//! the one it carries ([`generation`]): it would be writing where the web UI no longer reads.
+//! It then only shows the rooms and asks the user to update it.
 
 pub mod create;
 pub mod delegate;
+pub mod generation;
 pub mod grant;
 pub mod keys;
 pub mod outbox;
@@ -68,6 +73,8 @@ struct Inner {
     inbox: Mutex<Receiver<Command>>,
     /// What the user sent that the node has not taken, kept while no session runs.
     outbox: Mutex<outbox::Outbox>,
+    /// Whether River has moved on, for every session of this link.
+    watch: generation::Watch,
 }
 
 impl Link {
@@ -87,6 +94,19 @@ impl Link {
         config_dir: Option<PathBuf>,
         report: impl Fn(RoomsUpdate) + Send + Sync + 'static,
     ) -> Self {
+        let watch = generation::Watch::shipped(config_dir.as_deref());
+        Link::with_watch(authority, config_dir, watch, report)
+    }
+
+    /// A link that watches for a newer River with `watch` rather than River's own pointer
+    /// records: for end-to-end tests against a node holding test records. The app itself uses
+    /// [`Link::new`].
+    pub fn with_watch(
+        authority: &str,
+        config_dir: Option<PathBuf>,
+        watch: generation::Watch,
+        report: impl Fn(RoomsUpdate) + Send + Sync + 'static,
+    ) -> Self {
         let (tx, rx) = channel();
         Link {
             inner: Arc::new(Inner {
@@ -97,6 +117,7 @@ impl Link {
                 commands: Mutex::new(tx),
                 inbox: Mutex::new(rx),
                 outbox: Mutex::new(outbox::Outbox::default()),
+                watch,
             }),
         }
     }
@@ -138,6 +159,7 @@ impl Link {
                     &|| false,
                     &inbox,
                     &mut outbox,
+                    &inner.watch,
                 )
             }))
             .unwrap_or_else(|_| {

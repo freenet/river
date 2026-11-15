@@ -249,6 +249,24 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
     }),
+    // River has moved to a newer chat delegate or room contract than this build carries: the
+    // rooms show, and nothing can be written.
+    ("chat-update-required", |s| {
+        connect(s);
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+        s.chat.issues.update_required = true;
+        let block = rooms::generation::UPDATE_REQUIRED_SEND;
+        let rooms: Vec<_> = chat::example::data()
+            .rooms
+            .into_iter()
+            .map(|mut r| {
+                r.send_block = Some(block.into());
+                r
+            })
+            .collect();
+        s.chat
+            .show_node_rooms(rooms, None, chat::LinkStatus::Live, 29_000_000);
+    }),
     // Getting at the rooms, once a node answered.
     ("rooms-connecting", |s| {
         connect(s);

@@ -8,11 +8,15 @@
 # the app on the gateway creates a room and an invitation, the app on the peer joins from
 # it, and each receives the other's message. Last, the example asks each node's chat delegate for
 # the room's signing key and requires it to be that app's own member key (the app's background
-# sweep stores it).
+# sweep stores it). Then, on the gateway, a pointer record signed by a throwaway key names a
+# newer chat delegate, and a third app that trusts that key must show the room read-only and
+# write nothing (the record goes to the local test node only, never to River's addresses).
 #
 # Usage: apps/scripts/fresh-node-e2e.sh <work dir>
 #   FREENET_BIN  the freenet binary to run (default: freenet on PATH)
 #   E2E_PORT_BASE  first of the four ports used (default 39400): two network, two API
+#   POINTER_WASM   the frozen pointer contract WASM (default: fetched from freenet-migrate at
+#                  a pinned commit; the example checks its hash either way)
 #
 # Needs openssl (for the gateway's transport key) and curl. Nothing outside <work dir> is
 # written, apart from cargo's build output.
@@ -36,6 +40,16 @@ mkdir -p "$WORK/gw/cfg" "$WORK/gw/data" "$WORK/gw/log" \
   "$WORK/peer/cfg" "$WORK/peer/data" "$WORK/peer/log" "$WORK/apps"
 
 echo "freenet: $("$FREENET_BIN" --version | head -n1)"
+
+# The pointer contract is frozen: freenet-migrate pins its code hash, and the example refuses
+# any other bytes, so where it comes from does not matter for trust.
+POINTER_WASM_COMMIT=6b724f1badeed1891f4c09ddb1d6aa2c0921508f
+if [ -z "${POINTER_WASM:-}" ]; then
+  POINTER_WASM="$WORK/pointer-v1.wasm"
+  curl -sfL --retry 3 --retry-all-errors -o "$POINTER_WASM" \
+    "https://raw.githubusercontent.com/freenet/freenet-migrate/$POINTER_WASM_COMMIT/contracts/pointer-contract/pointer-v1.wasm"
+fi
+export POINTER_WASM
 
 # The gateway's transport key, made here so the peer can be told its public half.
 openssl genpkey -algorithm X25519 -out "$WORK/gw/x25519.pem" 2>/dev/null

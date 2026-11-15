@@ -20,6 +20,13 @@
 //! token it does not accept before it handles any request on it (freenet-core
 //! `websocket_commands`). [`NodeSocket::register_chat_delegate`] is the only way to send a
 //! `RegisterDelegate`, and [`NodeSocket::send`] refuses one, so no other path can send it.
+//!
+//! **Every write passes through here, and stops here once River has moved on.** Each
+//! [`NodeSocket`] holds the link's [`WriteGate`] from the moment it opens. Once a verified
+//! pointer record names a newer chat delegate or room contract than this build carries
+//! ([`super::generation`]), the gate is closed and [`NodeSocket::send`] refuses everything
+//! [`is_read`] does not name a read, and [`NodeSocket::register_chat_delegate`] refuses too. The
+//! session stops asking for writes on its own; this is what holds if a path ever does not.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -32,6 +39,7 @@ use freenet_stdlib::client_api::{
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{Message, WebSocket};
 
+use super::generation::WriteGate;
 use super::grant::GrantToken;
 
 /// The node's client API, in native encoding.
@@ -104,6 +112,8 @@ pub struct NodeSocket {
     ws: WebSocket<TcpStream>,
     /// Every connection presented a grant: what lets it register the chat delegate.
     grant: GrantPresented,
+    /// Closed once River has moved on: then only reads leave.
+    writes: WriteGate,
     /// Chunks of responses still arriving, by stream id.
     chunks: HashMap<u32, Chunks>,
     /// When anything (a response, a pong) last arrived.
@@ -123,7 +133,12 @@ struct Chunks {
 impl NodeSocket {
     /// Open `ws://<authority><COMMAND_PATH>` presenting `token` as a bearer grant. `authority`
     /// is `host:port` and must be a loopback address: the node honours a grant only there.
-    pub fn connect(authority: &str, token: &GrantToken) -> Result<NodeSocket, SocketError> {
+    /// `writes` is the link's gate: while it is closed, the connection only reads.
+    pub fn connect(
+        authority: &str,
+        token: &GrantToken,
+        writes: &WriteGate,
+    ) -> Result<NodeSocket, SocketError> {
         let fail = |e: &dyn std::fmt::Display| SocketError::Failed(e.to_string());
         let addr = authority
             .to_socket_addrs()
@@ -168,6 +183,7 @@ impl NodeSocket {
         Ok(NodeSocket {
             ws,
             grant,
+            writes: writes.clone(),
             chunks: HashMap::new(),
             last_heard: Instant::now(),
             heard_anything: false,
@@ -183,7 +199,8 @@ impl NodeSocket {
     }
 
     /// Send a request. A `RegisterDelegate` is refused: it goes only through
-    /// [`register_chat_delegate`](Self::register_chat_delegate) (see the module docs).
+    /// [`register_chat_delegate`](Self::register_chat_delegate) (see the module docs). While
+    /// the write gate is closed, anything but a read ([`is_read`]) is refused.
     pub fn send(&mut self, request: &ClientRequest<'_>) -> Result<(), SocketError> {
         if matches!(
             request,
@@ -193,13 +210,20 @@ impl NodeSocket {
                 "River registers its storage only through register_chat_delegate".into(),
             ));
         }
+        if self.writes.is_closed() && !is_read(request) {
+            return Err(SocketError::Failed(STALE_REFUSAL.into()));
+        }
         self.write(request)
     }
 
     /// Register River's chat delegate (the WASM this build carries) on this grant connection,
     /// as the web UI does on every load. Registering one the node already has changes
     /// nothing. The node answers with an empty response for the delegate's key, or an error.
+    /// Refused while the write gate is closed: this build's delegate is no longer River's.
     pub fn register_chat_delegate(&mut self) -> Result<(), SocketError> {
+        if self.writes.is_closed() {
+            return Err(SocketError::Failed(STALE_REFUSAL.into()));
+        }
         let request = registration(&self.grant);
         self.write(&request)
     }
@@ -364,6 +388,38 @@ impl NodeSocket {
     }
 }
 
+/// What a write refused by a closed gate fails with.
+pub const STALE_REFUSAL: &str = "a newer River is out, so this build no longer writes to Freenet";
+
+/// Whether `request` only reads: a GET or a subscription of a contract, or one of the chat
+/// delegate's four read requests (`ListRequest`, `GetRequest`, `GetVersionedRequest`,
+/// `GetPublicKey`) and nothing else in the same message. Everything else counts as a write,
+/// a request this app never sends included, and so does a delegate message that does not
+/// decode: what is not known to read is refused while the gate is closed.
+pub fn is_read(request: &ClientRequest<'_>) -> bool {
+    use freenet_stdlib::client_api::ContractRequest;
+    use freenet_stdlib::prelude::InboundDelegateMsg;
+    use river_core::chat_delegate::ChatDelegateRequestMsg as Msg;
+    match request {
+        ClientRequest::ContractOp(ContractRequest::Get { .. })
+        | ClientRequest::ContractOp(ContractRequest::Subscribe { .. }) => true,
+        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) => {
+            !inbound.is_empty()
+                && inbound.iter().all(|m| match m {
+                    InboundDelegateMsg::ApplicationMessage(m) => matches!(
+                        ciborium::de::from_reader::<Msg, _>(m.payload.as_slice()),
+                        Ok(Msg::ListRequest
+                            | Msg::GetRequest { .. }
+                            | Msg::GetVersionedRequest { .. }
+                            | Msg::GetPublicKey { .. })
+                    ),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
 /// The `RegisterDelegate` for River's chat delegate. It takes the proof that the connection
 /// presented a grant, so it is built only for one.
 ///
@@ -500,13 +556,219 @@ mod tests {
         (authority, handle)
     }
 
+    impl NodeSocket {
+        /// A connection whose write gate is open, as on a current build.
+        fn connect_open(authority: &str, token: &GrantToken) -> Result<NodeSocket, SocketError> {
+            NodeSocket::connect(authority, token, &WriteGate::default())
+        }
+    }
+
+    /// Every kind of request this app sends, by name, with whether it only reads.
+    fn every_request_kind() -> Vec<(&'static str, ClientRequest<'static>, bool)> {
+        use super::super::delegate::{self, Read, Versioned};
+        use freenet_stdlib::client_api::ContractRequest;
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters,
+            RelatedContracts, StateDelta, UpdateData, WrappedContract, WrappedState,
+        };
+        let key = ContractKey::from_params_and_code(
+            Parameters::from(vec![1u8]),
+            ContractCode::from(vec![2u8]),
+        );
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(vec![2u8])),
+            Parameters::from(vec![1u8]),
+        )));
+        vec![
+            (
+                "subscribe GET",
+                ClientRequest::ContractOp(ContractRequest::Get {
+                    key: *key.id(),
+                    return_contract_code: false,
+                    subscribe: true,
+                    blocking_subscribe: false,
+                }),
+                true,
+            ),
+            (
+                "subscribe",
+                ClientRequest::ContractOp(ContractRequest::Subscribe {
+                    key: *key.id(),
+                    summary: None,
+                }),
+                true,
+            ),
+            ("list rooms", delegate::request(&Read::List), true),
+            (
+                "get a room",
+                delegate::request(&Read::Get(b"room:x".to_vec())),
+                true,
+            ),
+            (
+                "versioned read",
+                delegate::versioned(&Versioned::Read(b"room:x".to_vec())),
+                true,
+            ),
+            (
+                "signing key check",
+                delegate::public_key(&owner.verifying_key()),
+                true,
+            ),
+            (
+                "message UPDATE",
+                ClientRequest::ContractOp(ContractRequest::Update {
+                    key,
+                    data: UpdateData::Delta(StateDelta::from(vec![0u8])),
+                }),
+                false,
+            ),
+            (
+                "seed PUT",
+                ClientRequest::ContractOp(ContractRequest::Put {
+                    contract,
+                    state: WrappedState::new(vec![0u8]),
+                    related_contracts: RelatedContracts::default(),
+                    subscribe: false,
+                    blocking_subscribe: false,
+                }),
+                false,
+            ),
+            (
+                "stored-room CAS",
+                delegate::versioned(&Versioned::Store {
+                    key: b"room:x".to_vec(),
+                    value: vec![1],
+                    generation: 0,
+                }),
+                false,
+            ),
+            (
+                "signing key store",
+                delegate::store_signing_key(&owner.verifying_key(), &owner),
+                false,
+            ),
+            (
+                "unregister a delegate",
+                ClientRequest::DelegateOp(DelegateRequest::UnregisterDelegate(
+                    delegate::chat_delegate_key().clone(),
+                )),
+                false,
+            ),
+            ("a read and a write in one message", mixed_batch(), false),
+            (
+                "an undecodable delegate message",
+                ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+                    key: delegate::chat_delegate_key().clone(),
+                    params: Parameters::from(Vec::<u8>::new()),
+                    inbound: vec![
+                        freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(
+                            freenet_stdlib::prelude::ApplicationMessage::new(vec![0xff, 0x00]),
+                        ),
+                    ],
+                }),
+                false,
+            ),
+        ]
+    }
+
+    /// One delegate message carrying a read and a CAS store.
+    fn mixed_batch() -> ClientRequest<'static> {
+        use super::super::delegate::{self, Read, Versioned};
+        let inbound = |r: ClientRequest<'static>| match r {
+            ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) => {
+                inbound
+            }
+            _ => unreachable!(),
+        };
+        let mut all = inbound(delegate::request(&Read::List));
+        all.extend(inbound(delegate::versioned(&Versioned::Store {
+            key: b"room:x".to_vec(),
+            value: vec![1],
+            generation: 0,
+        })));
+        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+            key: delegate::chat_delegate_key().clone(),
+            params: freenet_stdlib::prelude::Parameters::from(Vec::<u8>::new()),
+            inbound: all,
+        })
+    }
+
+    /// The classification itself, for every request kind the app sends.
+    #[test]
+    fn reads_and_writes_are_told_apart() {
+        for (name, request, read) in every_request_kind() {
+            assert_eq!(is_read(&request), read, "{name}");
+        }
+        assert!(!is_read(&registration(&GrantPresented(()))));
+    }
+
+    /// While the gate is closed, every write kind is refused at the socket and never reaches
+    /// the node, registration included; reads still go. With the gate open, all of them go.
+    #[test]
+    fn a_closed_gate_refuses_every_write_kind() {
+        let gate = WriteGate::default();
+        gate.close();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let mut got = Vec::new();
+            while let Ok(m) = ws.read() {
+                if let Message::Binary(b) = m {
+                    got.push(
+                        bincode::deserialize::<ClientRequest>(&b)
+                            .unwrap()
+                            .into_owned(),
+                    );
+                }
+            }
+            got
+        });
+        let mut socket =
+            NodeSocket::connect(&authority, &GrantToken::new("t".into()), &gate).unwrap();
+        let mut reads = 0;
+        for (name, request, read) in every_request_kind() {
+            let sent = socket.send(&request);
+            if read {
+                assert!(sent.is_ok(), "{name}: a read was refused: {sent:?}");
+                reads += 1;
+            } else {
+                assert!(
+                    matches!(&sent, Err(SocketError::Failed(m)) if m == STALE_REFUSAL),
+                    "{name}: a write was not refused: {sent:?}"
+                );
+            }
+        }
+        assert!(matches!(
+            socket.register_chat_delegate(),
+            Err(SocketError::Failed(m)) if m == STALE_REFUSAL
+        ));
+        drop(socket);
+        let got = server.join().unwrap();
+        assert_eq!(got.len(), reads, "only the reads reached the node");
+        assert!(got.iter().all(is_read), "{got:?}");
+
+        // The same requests on an open gate all leave.
+        let (authority, server) = serve(vec![]);
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+        for (name, request, _) in every_request_kind() {
+            assert!(socket.send(&request).is_ok(), "{name}");
+        }
+        socket.register_chat_delegate().unwrap();
+        drop(socket);
+        server.join().unwrap();
+    }
+
     /// A `RegisterDelegate` leaves only through `register_chat_delegate`, on a connection that
     /// presented the grant, and carries the delegate this build reads rooms from.
     #[test]
     fn only_register_chat_delegate_sends_a_registration() {
         let (authority, server) = serve(vec![]);
         let mut socket =
-            NodeSocket::connect(&authority, &GrantToken::new("grant-t0k".into())).unwrap();
+            NodeSocket::connect_open(&authority, &GrantToken::new("grant-t0k".into())).unwrap();
         let register = registration(&GrantPresented(()));
         let ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate, .. }) =
             &register
@@ -539,7 +801,7 @@ mod tests {
         for bad in ["", "   ", "a b", "tok\n"] {
             assert!(
                 matches!(
-                    NodeSocket::connect(&authority, &GrantToken::new(bad.into())),
+                    NodeSocket::connect_open(&authority, &GrantToken::new(bad.into())),
                     Err(SocketError::Closed {
                         code: Some(4401),
                         ..
@@ -572,7 +834,8 @@ mod tests {
             })),
         ];
         let (authority, server) = serve(script);
-        let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t0k".into())).unwrap();
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t0k".into())).unwrap();
         assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
         let closed = socket.recv().unwrap_err();
         assert_eq!(
@@ -619,7 +882,8 @@ mod tests {
             Message::Binary(vec![0xff, 0xff, 0xff, 0xff, 0xff].into()),
             Message::Binary(bincode::serialize(&ok).unwrap().into()),
         ]);
-        let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t".into())).unwrap();
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
         assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
         drop(socket);
         server.join().unwrap();
@@ -633,7 +897,8 @@ mod tests {
             chunk(1, 0, 999, b"x"),
         ] {
             let (authority, server) = serve(vec![Message::Binary(bad.into())]);
-            let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t".into())).unwrap();
+            let mut socket =
+                NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
             assert!(matches!(socket.recv(), Err(SocketError::Failed(_))));
             drop(socket);
             server.join().unwrap();
@@ -664,7 +929,8 @@ mod tests {
             ("AUTH_TOKEN_UNAVAILABLE", 4503, TokenVerdict::Retry),
         ] {
             let (authority, server) = serve(rejection(prefix, code));
-            let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t".into())).unwrap();
+            let mut socket =
+                NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
             let err = socket.recv().unwrap_err();
             assert_eq!(
                 err,
@@ -693,7 +959,8 @@ mod tests {
             let (authority, server) = serve(vec![Message::Binary(
                 bincode::serialize(&error).unwrap().into(),
             )]);
-            let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t".into())).unwrap();
+            let mut socket =
+                NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
             assert!(matches!(socket.recv(), Ok(Err(_))), "{cause}");
             drop(socket);
             server.join().unwrap();
@@ -718,7 +985,7 @@ mod tests {
             conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
-        let err = match NodeSocket::connect(&authority, &GrantToken::new("t".into())) {
+        let err = match NodeSocket::connect_open(&authority, &GrantToken::new("t".into())) {
             Err(e) => e,
             Ok(_) => panic!("the upgrade was refused"),
         };
@@ -743,7 +1010,8 @@ mod tests {
         let ok: HostResult = Ok(HostResponse::Ok);
         script.push(Message::Binary(bincode::serialize(&ok).unwrap().into()));
         let (authority, server) = serve(script);
-        let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t".into())).unwrap();
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
         assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
         assert_eq!(socket.streams_in_progress(), MAX_STREAMS);
         drop(socket);
@@ -753,7 +1021,8 @@ mod tests {
     #[test]
     fn a_pong_counts_as_hearing_from_the_node() {
         let (authority, server) = serve(Vec::new());
-        let mut socket = NodeSocket::connect(&authority, &GrantToken::new("t".into())).unwrap();
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
         let before = socket.last_heard();
         thread::sleep(Duration::from_millis(20));
         socket.ping().unwrap();
@@ -771,7 +1040,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let authority = listener.local_addr().unwrap().to_string();
         for bad in ["bad\ntoken", "tökén", "has space", "", "=="] {
-            let err = match NodeSocket::connect(&authority, &GrantToken::new(bad.into())) {
+            let err = match NodeSocket::connect_open(&authority, &GrantToken::new(bad.into())) {
                 Err(e) => e,
                 Ok(_) => panic!("{bad:?} is not a bearer token"),
             };

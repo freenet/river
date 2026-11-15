@@ -460,6 +460,21 @@ impl Work {
         true
     }
 
+    /// Fail every task still working with nothing out, with `why` and no Try again: River has
+    /// moved on and this build writes nothing more ([`super::generation`]). A task with a
+    /// request out keeps it until its answer or its deadline, so that answer is never taken
+    /// for another's; it is failed here the next time. True when anything failed.
+    pub fn halt(&mut self, why: &str) -> bool {
+        let mut changed = false;
+        for t in &mut self.tasks {
+            if t.running() && t.out.is_none() {
+                t.fail(why, false);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Drop a failed or finished task. A working one stays: its request may be out.
     pub fn dismiss(&mut self, id: u64) -> bool {
         let before = self.tasks.len();

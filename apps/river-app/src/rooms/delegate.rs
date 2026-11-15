@@ -21,7 +21,7 @@ use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDel
 /// The chat delegate the web UI ships. Its key is a hash of these bytes, so it is the same
 /// delegate, and the same stored rooms, as the web UI's. A file read, not a crate dependency:
 /// it cannot change the WASM. `apps.yml` runs when it changes.
-const CHAT_DELEGATE_WASM: &[u8] =
+pub(crate) const CHAT_DELEGATE_WASM: &[u8] =
     include_bytes!("../../../../ui/public/contracts/chat_delegate.wasm");
 
 /// The chat delegate as the web UI registers it (`create_chat_delegate_container` in

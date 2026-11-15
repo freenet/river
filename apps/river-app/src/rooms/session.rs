@@ -46,6 +46,18 @@
 //!   whole WASM). A new connection, or a create or join the user asks for, tries again. A store
 //!   that was there and goes missing later in a connection ends it, and the next connection
 //!   registers before it lists.
+//! - **A newer River.** Each run checks River's pointer records ([`super::generation`]) on a
+//!   connection of its own, before the first write and every [`Pace::pointers`]`.recheck`
+//!   after. Writes (registering, sending, creating, joining, the signing key sweep) wait until
+//!   every pointer has answered, or for `first_wait`, then go on without an answer. The wait
+//!   never blocks the connection: reads, subscriptions and the user's commands go on. A store
+//!   that needs registering meanwhile is registered once the wait is over, on a new
+//!   connection, which registers before anything else (as when the store goes missing); the
+//!   screen says River is setting up its storage. Once a verified record names a newer
+//!   delegate or room contract than this build carries, nothing is written again: what the
+//!   user sends, creates or joins fails at once with why, the composer is blocked with why,
+//!   and the store is not registered. The rooms still show and still receive. Each
+//!   connection's write gate refuses writes too.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -72,6 +84,9 @@ use river_core::stored_rooms::{
 };
 
 use super::delegate::{self, Read};
+use super::generation::{
+    CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_SEND, UPDATE_REQUIRED_WORK, Watch,
+};
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
 use super::outbox::{Action, Command, Outbox};
 use super::room::{LiveRoom, local_minutes};
@@ -139,6 +154,8 @@ pub(super) struct Pace {
     /// update is taken to be lost, and the sweep goes on.
     pub key_owed_cap: Duration,
     pub grant: GrantPacing,
+    /// Checking River's pointer records for a newer River ([`super::generation`]).
+    pub pointers: CheckPace,
 }
 
 impl Default for Pace {
@@ -168,6 +185,7 @@ impl Default for Pace {
             key_delay: Duration::from_secs(5),
             key_owed_cap: Duration::from_secs(30),
             grant: GrantPacing::default(),
+            pointers: CheckPace::default(),
         }
     }
 }
@@ -222,6 +240,11 @@ pub struct Issues {
     pub not_following: Vec<String>,
     /// Stored rooms this computer could not read at all.
     pub unreadable: usize,
+    /// River has moved to a newer chat delegate or room contract than this app carries: it
+    /// writes nothing, and the user needs to update it.
+    pub update_required: bool,
+    /// River's storage is not set up yet: the app is checking River's version first.
+    pub setting_up: bool,
 }
 
 /// What the background work reports to the window. Its `Debug` hides an invitation's link,
@@ -292,6 +315,7 @@ pub(super) fn run(
     stop: &dyn Fn() -> bool,
     commands: &Receiver<Command>,
     outbox: &mut Outbox,
+    watch: &Watch,
 ) -> Access {
     let mut kept = KeepOutbox {
         rooms: Rooms {
@@ -312,6 +336,7 @@ pub(super) fn run(
         stop,
         commands,
         &mut kept.rooms,
+        watch,
     )
 }
 
@@ -329,6 +354,7 @@ impl Drop for KeepOutbox<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_with(
     authority: &str,
     config_dir: Option<&Path>,
@@ -337,6 +363,7 @@ fn run_with(
     stop: &dyn Fn() -> bool,
     commands: &Receiver<Command>,
     rooms: &mut Rooms,
+    watch: &Watch,
 ) -> Access {
     let store = config_dir.map(TokenStore::in_dir);
     let http = NodeHttp::new(&format!("http://{authority}"));
@@ -393,8 +420,11 @@ fn run_with(
         };
         token = Some(current.clone());
         let ended = follow(
-            authority,
-            &current,
+            &Watching {
+                watch,
+                authority,
+                token: &current,
+            },
             rooms,
             report,
             &mut backoff,
@@ -483,8 +513,7 @@ struct Ended {
 /// `unconfirmed` is cleared once the node has accepted the token.
 #[allow(clippy::too_many_arguments)]
 fn follow(
-    authority: &str,
-    token: &GrantToken,
+    watching: &Watching,
     rooms: &mut Rooms,
     report: &dyn Fn(RoomsUpdate),
     backoff: &mut Duration,
@@ -494,18 +523,20 @@ fn follow(
     stop: &dyn Fn() -> bool,
     commands: &Receiver<Command>,
 ) -> Ended {
-    let mut socket = match NodeSocket::connect(authority, token) {
-        Ok(s) => s,
-        Err(error) => {
-            return Ended {
-                error,
-                connected: false,
-                heard_anything: false,
-            };
-        }
-    };
+    let mut socket =
+        match NodeSocket::connect(watching.authority, watching.token, watching.watch.gate()) {
+            Ok(s) => s,
+            Err(error) => {
+                return Ended {
+                    error,
+                    connected: false,
+                    heard_anything: false,
+                };
+            }
+        };
     let error = follow_on(
         &mut socket,
+        watching,
         rooms,
         report,
         backoff,
@@ -521,6 +552,30 @@ fn follow(
         error,
         connected: true,
         heard_anything: socket.heard_anything(),
+    }
+}
+
+/// The link's [`Watch`], with what a check of the pointers needs: the node and the grant.
+struct Watching<'a> {
+    watch: &'a Watch,
+    authority: &'a str,
+    token: &'a GrantToken,
+}
+
+impl Watching<'_> {
+    /// Take a check's answer, and start one if due. True when River was just found to have
+    /// moved on.
+    fn poll(&self, pace: &Pace) -> bool {
+        self.watch.poll(self.authority, self.token, &pace.pointers)
+    }
+
+    /// Whether the first check is settled, so a registration may be decided now.
+    fn settled(&self, pace: &Pace) -> bool {
+        self.watch.settled(&pace.pointers, Instant::now())
+    }
+
+    fn writes_allowed(&self, pace: &Pace) -> bool {
+        self.watch.writes_allowed(&pace.pointers)
     }
 }
 
@@ -623,6 +678,7 @@ impl Subscriptions {
 #[allow(clippy::too_many_arguments)]
 fn follow_on(
     socket: &mut NodeSocket,
+    watching: &Watching,
     rooms: &mut Rooms,
     report: &dyn Fn(RoomsUpdate),
     backoff: &mut Duration,
@@ -639,19 +695,31 @@ fn follow_on(
     if let Err(e) = socket.read_early(early_read) {
         return e;
     }
+    // The pointer check for this connection goes out now, beside the first reads.
+    watching.poll(pace);
+    // A registration put off on an earlier connection is decided afresh on this one.
+    rooms.register_deferred = false;
     // The store went missing on the last connection: register before anything else.
     let mut registered = false;
     if std::mem::take(&mut rooms.register_first) {
-        if let Err(e) = register_logged(socket, pace) {
-            return e;
+        if !watching.settled(pace) {
+            rooms.register_deferred = true;
+        } else if !watching.watch.is_stale() {
+            if let Err(e) = register_logged(socket, pace) {
+                return e;
+            }
+            registered = true;
         }
-        registered = true;
     }
     let mut loaded = match load(socket, pace) {
         Ok(l) => l,
         Err(e) => return e,
     };
-    if loaded.store_missing && !registered {
+    if loaded.store_missing && !registered && !watching.settled(pace) {
+        // Not decided yet whether this build may set up River's storage: read on, and register
+        // on a new connection once it is (below, in the loop).
+        rooms.register_deferred = true;
+    } else if loaded.store_missing && !registered && !watching.watch.is_stale() {
         // The node has no chat delegate: set it up, then read again once the backoff its
         // `Missing` armed has lapsed.
         let missing_at = Instant::now();
@@ -669,6 +737,7 @@ fn follow_on(
     }
     *unconfirmed = false;
     rooms.replace(loaded);
+    rooms.update_required = watching.watch.is_stale();
     // Every room is subscribed afresh on every connection: subscriptions belong to it.
     let mut subs = Subscriptions::default();
     for id in rooms.contract_ids() {
@@ -714,6 +783,31 @@ fn follow_on(
         }
         // What the user did, then the updates it makes.
         let mut changed = rooms.take_commands(commands);
+        // A newer River: nothing more is written, and what waits to be fails, saying why.
+        // Until the first check answers (or its wait is over) writes only wait.
+        changed |= watching.poll(pace);
+        let writes = watching.writes_allowed(pace);
+        if watching.watch.is_stale() {
+            changed |= !rooms.update_required;
+            rooms.update_required = true;
+            changed |= rooms.outbox.fail_queued(UPDATE_REQUIRED);
+            changed |= rooms.outbox.work.halt(UPDATE_REQUIRED_WORK);
+        }
+        // A registration put off for the first check: once it is settled, register on a new
+        // connection, which does that before it sends anything else. A connection that only
+        // read so far has nothing out that a reconnect could lose. A build River has moved past
+        // does not register at all.
+        if rooms.register_deferred && watching.settled(pace) {
+            rooms.register_deferred = false;
+            changed = true;
+            if !watching.watch.is_stale() {
+                rooms.register_first = true;
+                rooms.report(status, report);
+                return SocketError::Failed(
+                    "registering River's storage now that its version is checked".into(),
+                );
+            }
+        }
         changed |= rooms.outbox.expire(pace.update_wait, Instant::now());
         // A room that owes an answer sends nothing more on this connection; a new one owes
         // nothing. So a retry of an unanswered update, or an answer owed for too long, is a
@@ -737,16 +831,19 @@ fn follow_on(
             rooms.report(status, report);
             return SocketError::Failed("reconnecting to finish creating or joining a room".into());
         }
-        match rooms.send_updates(socket) {
-            Ok(failed) => changed |= failed,
-            Err(e) => return e,
+        if writes {
+            match rooms.send_updates(socket) {
+                Ok(failed) => changed |= failed,
+                Err(e) => return e,
+            }
         }
         // The create or join under way sends its next request, unless the stored rooms are
         // being read: their answers and its are told apart by kind, but an error names neither.
-        if let Some(request) = rooms
-            .outbox
-            .work
-            .next_request(reload.is_some() || rooms.keys.busy(), Instant::now())
+        if writes
+            && let Some(request) = rooms
+                .outbox
+                .work
+                .next_request(reload.is_some() || rooms.keys.busy(), Instant::now())
             && let Err(e) = socket.send(&request)
         {
             return e;
@@ -796,6 +893,7 @@ fn follow_on(
             }),
             complete_read: rooms.complete && !rooms.store_missing,
             settled: last_read.elapsed() >= pace.key_delay,
+            writes,
         };
         if let Some(request) = rooms
             .keys
@@ -953,7 +1051,15 @@ fn follow_on(
                 let retry_due = store_gone
                     && rooms.store_missing
                     && rooms.register_retry_due(Instant::now(), pace);
-                if store_gone && (!rooms.store_missing || taken_by_work || retry_due) {
+                // A store this build may no longer register is not a reason to reconnect, and
+                // one it may not register yet waits for the check here, on this connection.
+                let wants_register = store_gone
+                    && !watching.watch.is_stale()
+                    && (!rooms.store_missing || taken_by_work || retry_due);
+                if wants_register && !watching.settled(pace) {
+                    rooms.register_deferred = true;
+                    changed = true;
+                } else if wants_register {
                     rooms.register_first = true;
                     rooms.report(status, report);
                     return SocketError::Failed(
@@ -998,6 +1104,8 @@ struct SweepGate {
     complete_read: bool,
     /// A few seconds have passed since that read.
     settled: bool,
+    /// The app may write: River has not moved on, and the first pointer check is settled.
+    writes: bool,
 }
 
 impl SweepGate {
@@ -1009,6 +1117,7 @@ impl SweepGate {
             && !self.update_owed
             && self.complete_read
             && self.settled
+            && self.writes
     }
 }
 
@@ -1382,6 +1491,10 @@ struct Rooms {
     register_retry: Option<(Instant, Duration)>,
     /// Keeping the delegate's copy of each room's signing key.
     keys: super::keys::KeySweep,
+    /// River has moved on: nothing is written, and the screen says so.
+    update_required: bool,
+    /// The store needs registering, and waits for the first pointer check to settle.
+    register_deferred: bool,
 }
 
 impl Rooms {
@@ -1718,7 +1831,13 @@ impl Rooms {
     fn views(&self) -> Vec<Room> {
         self.list
             .iter()
-            .map(|r| self.outbox.view(r, &local_minutes))
+            .map(|r| {
+                let mut view = self.outbox.view(r, &local_minutes);
+                if self.update_required {
+                    view.send_block = Some(UPDATE_REQUIRED_SEND.to_owned());
+                }
+                view
+            })
             .collect()
     }
 
@@ -1755,6 +1874,11 @@ impl Rooms {
             not_updated: self.names(&self.not_updated),
             not_following: self.names(&self.not_following),
             unreadable: self.unreadable,
+            update_required: self.update_required,
+            // Also across the reconnect that registers, so the screen does not flash "could not
+            // set up" in between.
+            setting_up: self.register_deferred
+                || (self.register_first && self.store_missing && !self.update_required),
         }
     }
 

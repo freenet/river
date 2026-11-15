@@ -836,11 +836,29 @@ fn what_the_node_rooms_are_missing_is_said_in_the_room_list() {
         not_updated: vec!["Town Square".into()],
         not_following: vec!["Family".into()],
         unreadable: 2,
+        update_required: true,
+        setting_up: false,
     };
     let rt = render(s, WINDOW_SIZE);
-    for key in ["not-updated", "not-following", "unreadable"] {
+    for key in [
+        "update-required",
+        "not-updated",
+        "not-following",
+        "unreadable",
+    ] {
         assert!(rt.find(key).is_some(), "{key}");
     }
+}
+
+/// An app River has moved past says so before anything else, even with no store.
+#[test]
+fn an_empty_list_asks_for_an_update_when_river_has_moved_on() {
+    let mut chat = node_chat().chat;
+    chat.issues.store_missing = true;
+    chat.issues.update_required = true;
+    let hint = super::view::no_rooms_hint(&chat);
+    assert!(hint.contains("newer version of River"), "{hint}");
+    assert!(hint.contains("Update this app"), "{hint}");
 }
 
 #[test]

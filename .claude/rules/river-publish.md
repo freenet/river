@@ -130,6 +130,17 @@ when a record newer than its own lands (freenet/river#580,
 those tabs stay on the old room contract and old delegate with no signal: the
 room looks quiet, and their delegate writes are stranded.
 
+**It is also what stops outdated desktop apps writing.** The desktop app
+(`apps/`) watches the same two records (`apps/river-app/src/rooms/generation.rs`)
+and, once one names a generation newer than the WASM it carries, writes nothing
+more and asks the user to update. Until this step runs, every installed desktop
+build keeps registering and writing the old delegate and room contract, which
+the web UI only re-reads for its 14-day top-up window. After it, every installed
+desktop build is read-only until the new desktop release ships, so have that
+release built and its draft checked before running this step. A record re-signed
+at a higher version that names the same code hash does not stop desktop builds
+(nothing splits); open tabs still reload for it.
+
 Order matters. The pre-flight below refuses unless the UI carrying the new WASM
 is live **as seen from the node you publish through**; it cannot see other
 nodes, so the wait is advice, not enforcement. Nothing enforces that this step
@@ -174,7 +185,7 @@ The river repo publishes **two things on independent cadences** — do not confl
 
 They are NOT 1:1 — a CLI-only fix ships riverctl without touching the UI, and a UI-only change publishes to Freenet without a new riverctl. The one coupling is room-contract WASM: when it changes, BOTH must be republished (they embed the WASM and derive the contract key from it).
 
-**A River UI publish that changes `chat_delegate.wasm` or `room_contract.wasm` needs a new desktop app release.** The app compiles both files in (the delegate key it reads the user's rooms under, and part of every room's contract key) and has no migration code, so once the web UI moves users to new keys, existing app builds stop finding their rooms until a new build ships. Tag `river-desktop-v<version>` on a main commit at or after that publish's `chore(publish): bump webapp contract version` commit; the release workflow refuses a tag whose `ui/public/contracts/` differs from the last published UI.
+**A River UI publish that changes `chat_delegate.wasm` or `room_contract.wasm` needs a new desktop app release.** The app compiles both files in (the delegate key it reads the user's rooms under, and part of every room's contract key) and has no migration code, so once the web UI moves users to new keys, existing app builds still read the old keys: they show the rooms as they were before the re-key and miss what is written after it. Once the pointer records are published (Step 7), every installed build is read-only until the new desktop release ships, so build that release and check its draft before Step 7. Tag `river-desktop-v<version>` on a main commit at or after that publish's `chore(publish): bump webapp contract version` commit; the release workflow refuses a tag whose `ui/public/contracts/` differs from the last published UI.
 
 ## Releasing riverctl (crates.io + GitHub release) — tag-triggered
 

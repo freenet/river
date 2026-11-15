@@ -24,6 +24,10 @@ on:
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
+      # The app reads River's pointer records to tell when River has moved past the WASM
+      # it carries, and a test checks the author key against FREENET.md.
+      - 'pointer-records.toml'
+      - 'FREENET.md'
       - '.github/workflows/apps.yml'
   push:
     branches: [main]
@@ -37,6 +41,10 @@ on:
       - 'ui/assets/river_logo.svg'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
+      # The app reads River's pointer records to tell when River has moved past the WASM
+      # it carries, and a test checks the author key against FREENET.md.
+      - 'pointer-records.toml'
+      - 'FREENET.md'
       - '.github/workflows/apps.yml'
   workflow_dispatch:
 
