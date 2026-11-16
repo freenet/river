@@ -312,7 +312,7 @@ description = "Build the Dioxus UI with example data and no Freenet sync"
 env = { UI_FEATURES = "example-data,no-sync" }
 # build-chat-delegate is required because UI includes delegate WASM via include_bytes!
 # build-tailwind is required — see the note on build-ui-example. This is the
-# task AGENTS.md tells you to run before the Playwright suite, so it has to
+# task .claude/rules/ui-testing.md tells you to run before the Playwright suite, so it has to
 # work from a clean checkout.
 # clean-ui-example-output: see scripts/clean-ui-example-output.sh. touch-ui-files
 # is the established trigger (see compress-webapp-test) that makes dx rebuild

@@ -216,7 +216,7 @@ jobs:
           path: dist
           merge-multiple: true
       # This create/upload/publish logic has no automated test; it was exercised
-      # against a stub `gh` (as the desktop release step was, see AGENTS.md).
+      # against a stub `gh`.
       - name: Create or update GitHub release
         run: |
           set -euo pipefail

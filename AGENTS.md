@@ -1,638 +1,122 @@
-# Claude Guide for River
+# Agent guide for River
 
-## Freenet Node Operation
-- Use `freenet local` for routine River UI development and manual testing. Local mode exercises the app without spinning up multiple network peers.
-- Use `freenet network` only when validating peer-to-peer sync or multi-node behaviour. Document the scenario when you switch modes.
+River is a decentralized group chat on Freenet. Rooms are contracts on the network; there is no server.
 
-## Project Overview
-River is a decentralized group chat application built on Freenet and consists of:
-- Rust + Dioxus web UI compiled to WebAssembly
-- Smart contracts (room and web container) deployed on Freenet
-- Delegates that execute contract logic and perform background tasks
-- Shared `common/` crate with data types and crypto helpers used across UI and contracts
+- `common/` (`river-core`) is compiled into the room contract and chat delegate WASM, except modules behind client-only features (`invitation`, `stored-rooms`, `ecies-client`, ...).
+- `apps/` is **a separate Cargo workspace** with its own lockfile. `cargo make` does not build it.
 
-## Essential Commands
-
-### Development
-```bash
-cargo make dev-example             # UI with example data, no Freenet connection
-cargo make dev                     # Standard development server
-cargo make build                   # Full release build
-cargo make build-ui                # UI artifacts only
-cargo make build-ui-example-no-sync# UI build with example data and no sync
-```
-
-### Testing
-```bash
-cargo make test                    # Full workspace tests
-cargo make test-room-contract
-cargo make test-web-container
-cargo make test-common
-cargo make test-chat-delegate
-cargo make test-web-container-integration
-cargo make test-ui                 # river-ui crate native unit tests (CI-gated)
-```
-
-`cargo test -p river-ui --bins` alone needs `ui/assets/styles.css`, a
-gitignored build product: on a clean tree it fails to compile with "Asset at
-/assets/styles.css doesn't exist" until `cargo make build-tailwind` (or any
-UI build) has generated it. `cargo make test-ui` runs that first.
-
-### Local UI Testing with dx serve
-
-For rapid UI iteration without publishing to Freenet:
+## Commands
 
 ```bash
-# From the ui/ directory
-cd ui
-
-# Local only (127.0.0.1)
-dx serve --port 8082 --features example-data,no-sync
-
-# Accessible from other machines (0.0.0.0)
-dx serve --port 8082 --addr 0.0.0.0 --features example-data,no-sync
+cargo make dev-example               # dx serve with example data (Freenet sync stays on)
+cargo make build-ui-example-no-sync  # UI with example data, no Freenet connection
+cargo make build                     # UI + web container; embeds the committed contract/delegate WASM
+cargo make sync-wasm                 # the only task that rebuilds the committed WASM (re-keys: see below)
+cargo make test                      # contracts, common, delegate; run before every PR
+cargo make test-ui                   # river-ui native unit tests (CI-gated)
+cd common && cargo test private_room # after touching encryption or secret distribution
+cargo make clippy && cargo fmt
 ```
 
-**Features:**
-- `example-data` - Populates UI with sample rooms, members, messages, and reactions
-- `no-sync` - Disables Freenet sync (no WebSocket connection required)
+`cargo test -p river-ui --bins` alone fails on a clean tree with "Asset at /assets/styles.css doesn't exist": `ui/assets/styles.css` is a gitignored build product. `cargo make test-ui` runs `cargo make build-tailwind` first.
 
-**Tips:**
-- dx serve auto-rebuilds on file changes, but sometimes needs manual restart
-- Check `/tmp/dx-serve-new.log` for build errors if UI doesn't update
-- Use `--addr 0.0.0.0` when testing from remote machines (e.g., technic → nova)
-- Example data includes reactions on messages for testing the emoji picker UI
+Use `freenet local` for routine UI work and manual testing. Use `freenet network` only to validate peer-to-peer sync or multi-node behaviour, and say in the PR that you did.
 
-### Playwright UI Tests (REQUIRED before publishing)
+## Read before you touch
 
-**Always run Playwright tests before publishing to Freenet.** Republishing takes minutes, so catch layout issues locally first.
+Rule files in `.claude/rules/` load automatically only when you open a matching file. A command-driven task (publishing, releasing, a dependency bump) may open none, and other tools load none, so read the rule for your task first.
 
-```bash
-# One-time setup: install browsers
-cargo make test-ui-playwright-setup
+| If you are about to... | Read |
+|---|---|
+| Commit anything | `wasm-safety.md` |
+| Edit `ui/src/` | `dioxus-signal-safety.md` |
+| Run, write or debug UI tests | `ui-testing.md`, then the `local-dev` skill |
+| Change room history or DM thread scrolling | `history-scrolling.md` |
+| Edit `common/src/room_state/` or `contracts/room-contract/` | `merge-laws.md`, `contract-summary-determinism.md` |
+| Touch direct messages | `direct-messages.md` |
+| Touch private rooms, secrets or `member_info` | `private-rooms.md` |
+| Change anything under `common/`, `contracts/`, `delegates/`, or root `Cargo.toml`/`Cargo.lock` | `delegate-migration.md` |
+| Change how clients follow a room to a new contract key | `contract-upgrade.md` |
+| Publish the UI or release riverctl | `river-publish.md` |
+| Edit `apps/` | `native-apps.md` |
+| Release the desktop app | `desktop-release.md` |
 
-# Build UI with example data (no Freenet connection needed)
-cargo make build-ui-example-no-sync
+## Hard rules
 
-# Serve built files (do NOT use dx serve — it auto-rebuilds and can serve stale content)
-cd target/dx/river-ui/release/web/public && python3 -m http.server 8082 &
+### WASM changes re-key
 
-# Run all tests across Chromium, Firefox, WebKit, mobile Chrome, mobile Safari
-cd ui/tests && npx playwright test
+A change under `delegates/`, `contracts/` or `common/`, and most changes to the root `Cargo.toml`/`Cargo.lock`, change the delegate or contract WASM and so its key. **Without a migration entry, users lose all room data.** A comment-only edit can re-key the room contract.
 
-# Run specific browser or test
-npx playwright test --project=chromium
-npx playwright test --project=webkit --grep "iframe"
-npx playwright test --project=mobile-safari --grep "Mobile"
-```
+Run `cargo make add-migration` before the WASM changes, and `cargo make sign-pointer-records` with it. CI's `check-pointer-freshness` fails a PR that changes a pointed-at WASM without a new record. A migration entry carries our users' data forward; a pointer record says where the artifact moved (addressing only). Do not blur the two. Full workflow: `delegate-migration.md`.
 
-**Verify what you are actually testing.** Three ways a run silently measures
-the wrong thing, all hit in one session (2026-07-25):
+`apps/Cargo.toml` and `apps/Cargo.lock` cannot change a key: the WASM builds from the root workspace and lockfile.
 
-- **`dx serve` can serve a stale build.** The warning above is not theoretical.
-  A mutation check — reintroduce a bug and expect the test to go red — "passed"
-  only because the watcher never rebuilt and the browser was still running the
-  previous binary. That inverts the result of the one technique that proves a
-  test is not vacuous. Prefer the static-server flow above; if you must use
-  `dx serve`, read a marker out of the DOM (a row's `class` attribute is
-  enough) to confirm which build is loaded before believing a pass OR a fail.
-- **A stale `dx` earlier on PATH.** `/opt/rust/bin/dx` was once 0.7.3 against
-  the crate's dioxus 0.7.9. `dx serve` then serves a 404 "dx is not serving a
-  web app" page that reads exactly like a broken change, and `dx build` prints
-  "incompatible" and builds anyway. Every dx task now depends on
-  `check-dx-version`, which fails unless `dx --version` equals the dioxus
-  version `Cargo.lock` resolves; run `cargo make check-dx-version` to check by
-  hand. Compare against `Cargo.lock`, not the requirement in `ui/Cargo.toml`.
-- **Port 8082 is shared.** It is the suite's default `baseURL`, so if another
-  worktree already has a server on it, `npx playwright test` silently tests
-  THAT build. Use a free port and set `PLAYWRIGHT_BASE_URL`.
+Never `git add -A`, `.` or `-u`: it picks up rebuilt, non-reproducible WASM. Add files by name (`wasm-safety.md`).
 
-**Test coverage:**
-- Desktop 1280px: 3-column layout, no overflow
-- Tablet 768px: narrower sidebars via CSS clamp
-- Breakpoint 767px: mobile mode (single panel)
-- Mobile 480px: view switching (hamburger, members, back buttons)
-- Mobile 320px: small screen readability
-- Desktop recovery after mobile resize
-- Sandboxed iframe embedding (matching Freenet gateway)
+### State authorization rule
 
-**Important Tailwind v4 note:** The `@source "../src/**/*.rs"` directive in `ui/assets/tailwind.css` is REQUIRED. Without it, Tailwind v4 won't scan Rust files for class names, and responsive utilities like `md:flex` won't be generated.
+**Every piece of data in contract state must be cryptographically authorized. Never accept unauthorized data, even as a "temporary" or "lenient" measure.**
 
-**Two test directories exist:**
-- `ui/tests/` — Layout/visual tests against `dx build` with example data (runs in CI)
-- `e2e-test/` — Integration tests against a real Freenet node (manual)
+| Record | Must have |
+|---|---|
+| Message | A valid signature from a verified member at the time it is added |
+| Member | A valid invitation chain back to the room owner |
+| Ban | Authorization from the room owner's tree |
 
-### Interactive Playwright MCP (for debugging and verification)
+Verify at insertion time, never "when the data arrives later". If a delta would add data that cannot be verified (a message whose author is not in the member list), include the authorization data in the delta (the member entry beside the message); do not relax verification.
 
-The Playwright MCP plugin is enabled in `.claude/settings.local.json`. Use it
-to interactively test the UI against a running local node — no manual browser
-needed.
+Fully authorized state is what makes contract migration permissionless: anyone can move a room's state to a new contract key, and the new contract checks every signature (`contract-upgrade.md`).
 
-**Testing against example data (no Freenet node required):**
-```bash
-# Build and serve with example data
-cargo make build-ui-example-no-sync
-cd target/dx/river-ui/release/web/public && python3 -m http.server 8082 &
-```
-Then use Playwright MCP tools:
-1. `browser_navigate` → `http://127.0.0.1:8082/`
-2. `browser_snapshot` → inspect DOM state, verify layout
-3. `browser_click` / `browser_fill_form` → interact with UI elements
-4. `browser_console_messages` → check for WASM panics or JS errors
+### Backwards compatibility rule
 
-**Testing against a local Freenet node (full integration):**
-```bash
-# Publish to local node first
-./scripts/local-republish.sh
-# Script outputs the URL, e.g.:
-#   http://127.0.0.1:7510/v1/contract/web/{CONTRACT_ID}/
-```
-Then use Playwright MCP tools to navigate to the published URL. This tests
-the full stack: WASM ↔ WebSocket ↔ Freenet node ↔ contract/delegate.
+`ChatRoomStateV1` and all its sub-types must stay backwards-compatible.
 
-**Common verification tasks with Playwright MCP:**
-- **After UI changes**: Navigate, take snapshot, verify layout renders correctly
-- **After message send fixes**: Fill message input, click send, verify message appears
-- **After crash fixes**: Navigate, send message, check `browser_console_messages` for panics
-- **Mobile simulation**: Use `browser_resize` to test responsive breakpoints (767px, 480px, 320px)
-- **Debug overlay**: Navigate to `?debug=1` URL, verify overlay appears and logs render
+- New fields use `#[serde(default)]`.
+- **On an individually signed sub-struct** (`MemberInfo`, `Member`, `UserBan`, `MessageV1`, `Configuration`: anything in an `Authorized…` wrapper whose signature covers its ciborium bytes), a new field needs **both** `#[serde(default)]` **and** `#[serde(skip_serializing_if = …)]`, so the empty value serializes byte-identically to the old record. Plain `#[serde(default)]` re-serializes a wider struct, every existing signature fails, and every room migrates to empty; it is safe only on unsigned containers. Put the field last, never reorder, and add a byte-identity test (see `member_info.rs::empty_deputies_serializes_identically_to_legacy_member_info`, #410).
+- Never remove or rename a field, or change how an existing field serializes.
+- A truly breaking change needs a V2 type with an explicit migration (a separate project).
 
-**When to use Playwright MCP vs Playwright test suite:**
-- **MCP** (interactive): Exploratory testing, debugging specific issues, verifying a fix before publishing
-- **Test suite** (`npx playwright test`): Regression testing across all browsers/viewports before publishing
+This keeps any old state, normalized by `ChatRoomStateV1::normalized`, acceptable to a new WASM's `validate_state()`.
 
-### Code Quality
-```bash
-cargo make clippy
-cargo fmt
-```
+### Dioxus WASM signal safety rules
 
-### Publishing & Verification
+The UI is single-threaded WASM, so a re-entrant `RefCell` borrow is a panic. Full rules with examples: `dioxus-signal-safety.md`.
 
-There are **two independent release surfaces** (see `.claude/rules/river-publish.md`):
-- **River UI** (Dioxus webapp → Freenet): `cargo make publish-river`.
-- **riverctl** (CLI → crates.io + GitHub release): **tag-triggered CI**. Bump
-  `cli/Cargo.toml`, merge, then `git tag riverctl-v<version> && git push origin
-  riverctl-v<version>`. The `release-riverctl.yml` workflow publishes to crates.io
-  and cuts the GitHub release with prebuilt binaries. (Requires the
-  `CARGO_REGISTRY_TOKEN` repo secret.) Do NOT wire UI publishing into that
-  workflow — they release on independent cadences.
+- Read signals with `try_read()`, and guard memos and effects with `signal_guard::anchor()` and `schedule_nudge()`.
+- Never call `spawn_local` inside a polled future; use `crate::util::safe_spawn_local`.
+- Wrap signal mutations from `spawn_local` tasks and event handlers in `crate::util::defer()`.
+- Never use raw `setTimeout` for signal mutations.
+- Never defer signal clears in `use_effect`.
+- Never `use_memo` against non-signal values in an always-mounted component.
 
-```bash
-cargo make publish-river                    # Publish UI release build to Freenet
-```
+### Summaries are deterministic
 
-The web container contract requires signed metadata with a version
-number strictly higher than the current published version. The version
-is tracked by a committed counter at
-`published-contract/contract-version.txt`; `cargo make sign-webapp`
-increments it. Commit the bumped counter alongside other publish
-artifacts — **including when the publish reports a failure**. The counter
-is forward-only: a reported failure is not evidence the state did not
-land, and re-using a version is what forked the site on 2026-08-04.
-`publish-river` prints an advisory read-back of what is actually live;
-read it before retrying. See `.claude/rules/river-publish.md`.
+Every field of a contract `Summary` serializes deterministically: `BTreeMap`/`BTreeSet`/sorted `Vec`, never `HashMap`/`HashSet`. freenet-core byte-compares summaries to decide staleness (`contract-summary-determinism.md`).
 
-**Contract ID:** `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`
+## UI conventions
 
-**Verify deployment:**
+Automation targets `data-testid`, never `data-dioxus-id`, which is a render-order index (freenet/river#25). Give every new interactive surface one; it is additive markup only and never changes rendering or logic. Use kebab-case `<surface>-<role>` (`send-message-button`), a plain id for list containers (`room-list`), and `<entity>-item-{id}` for list items (`room-item-{base58(owner_vk)}`, matched by `[data-testid^="room-item-"]`).
+
+`@source "../src/**/*.rs"` in `ui/assets/tailwind.css` is required, or Tailwind v4 drops responsive utilities like `md:flex`.
+
+Freenet share links in message text render as links to the reader's own node. `ui/src/util/share_link.rs` must accept exactly what freenet.org/open and freenet-core's `freenet:` handler accept; all three test against one vector file, copied at `ui/src/util/share-link-vectors.json`, and the `share-link-vectors.yml` workflow fails when it drifts. Change a rule only together with that file and the other two sides.
+
+## Releasing
+
+| Surface | Goes to | How |
+|---|---|---|
+| River UI | Freenet, contract `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv` | Run the Playwright suite, then `cargo make publish-river` (`river-publish.md`) |
+| riverctl | crates.io and a GitHub release | Bump `cli/Cargo.toml`, merge, push a `riverctl-v<version>` tag; `release-riverctl.yml` publishes. Never wire UI publishing into that workflow |
+| Desktop app | GitHub release (draft) | Push a `river-desktop-v<version>` tag (`desktop-release.md`) |
+
+**The publish counter `published-contract/contract-version.txt` only moves forward.** `cargo make sign-webapp` increments it. Commit the bump even when the publish reports a failure: re-using a version forked the site on 2026-08-04.
+
+Check what is live:
+
 ```bash
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | grep -o 'Built: [^<]*' | head -1
 ```
 
-Full publish workflow (including delegate-migration coupling, manual
-fallback when `publish-river` fails, the legacy-migration probe gate,
-and the version-number policy) lives in
-**`.claude/rules/river-publish.md`**.
+## PRs
 
-## Architecture Highlights
-1. `common/`: shared state types (`RoomState`, `Member`, `Message`) and cryptography helpers. (`Invitation` is NOT here — it is a `ui/`-only type, with a separate copy in `cli/`; it is not compiled into contract/delegate WASM.)
-2. `contracts/room-contract`: manages room membership, permissions, and message history.
-3. `contracts/web-container-contract`: serves the compiled UI as a Freenet contract asset.
-4. `delegates/chat-delegate`: handles chat-specific workflows and background tasks.
-5. `ui/`: Dioxus UI, including `example-data` and `no-sync` modes for offline testing.
-6. `apps/`: native apps built with Rune (see below).
-
-## Native Apps (`apps/`)
-
-`apps/` is a **separate Cargo workspace** with its own `Cargo.lock` and
-`rust-toolchain.toml`. It is separate so its UI dependencies can never change
-the root lockfile, which fixes the contract/delegate WASM bytes and therefore
-their keys. `cargo make` tasks and `build.yml` do not build it;
-`.github/workflows/apps.yml` does.
-
-- `apps/river-app`: the UI and setup state machine, shared by every platform.
-  Once setup connects it reads the user's rooms from the local node
-  (`src/rooms/`): it asks the node for the River web app's identity through a
-  user-approved app grant (freenet-core v0.2.156+), reads the rooms stored in
-  the chat delegate, and subscribes to each room contract. When the node has no
-  chat delegate it registers the one it carries, as the web UI does since
-  #757 (list first, register on a missing delegate), and only on that grant
-  connection: the node records the identity a delegate was first registered
-  under, for good. A room it stores does not hide older rooms from the web UI,
-  whose journaled walk (#763) carries them forward whatever the current
-  delegate holds (`src/rooms/work.rs` has the details). So rooms from an
-  earlier River in the browser show up in the app after River has been opened
-  in the browser once. In a room
-  the user can send in it sends messages, replies, edits and deletions of the
-  user's own messages, and reactions, each as a room contract UPDATE built and
-  signed as the web UI does (`src/rooms/outbox.rs`). It creates rooms, makes
-  invitations and joins rooms from them (`src/rooms/create.rs`,
-  `src/rooms/work.rs`). Besides each room's signing key (below), these are its
-  only writes to the chat delegate's
-  storage, which the web UI writes at the same time: each is the web UI's
-  generation compare-and-swap (`GetVersionedRequest`, then `CasStoreRequest`,
-  reading again on a conflict), it only ADDS a room where the key holds nothing
-  (or a tombstone, when joining), and in `rooms_meta` it changes only the open
-  room (`river_core::stored_rooms`). The bytes it stores are pinned to the web
-  UI's types by the `stored_rooms_drift` tests in `ui/src/room_data.rs`. Its
-  only PUT is the seed PUT of a room it has just created, under that room's own
-  contract; joining sends an UPDATE where the web UI PUTs. In the background
-  it stores each room's signing key (its own `self_sk`) in the delegate's
-  `signing_key:` namespace when the delegate holds none, as the web UI does, and
-  never replaces a key that is there (`src/rooms/keys.rs`: lowest priority, one
-  request at a time, backed off on failure). The chat screen
-  (`src/chat/`) shows them; snapshots and tests use built-in example data
-  (`chat::Source::Example`). Its colours and sizes follow the web UI in `ui/`.
-  It depends on `river-core` (`common/`) by path, with the client-only
-  features `ecies-randomized`, `ecies-client`, `mentions`, `stored-rooms`
-  and `invitation`, so a change under `common/` (or to the root `Cargo.toml`,
-  which river-core inherits versions from) runs `apps.yml`. It compiles in
-  three `ui/` files with
-  `include_bytes!`: the logo `ui/assets/river_logo.svg`, the chat delegate
-  `ui/public/contracts/chat_delegate.wasm`, whose hash is the delegate key it
-  reads rooms from, and the room contract `ui/public/contracts/room_contract.wasm`,
-  whose hash is part of every room's contract key. An edit to any of them runs
-  `apps.yml`; nothing else under `ui/` is read by `apps/`. A test checks
-  that its `freenet-stdlib` (the client API's wire format) is the version
-  river-core resolves to in the root `Cargo.lock`.
-- `apps/desktop`: the desktop shell (binary `river`), including the Freenet
-  installer, which verifies the release's signed checksums.
-
-```bash
-cd apps
-cargo test --locked                  # unit tests
-cargo run -p river-desktop           # the app
-cargo run -p river-desktop -- --list-scenes
-cargo run -p river-desktop -- --snap out.png --scene not-installed   # headless render
-cargo run -p river-desktop -- --snap out.png --scene chat-narrow --size 820x720
-```
-
-The window opens at 1280x800 and can shrink to 640x480. Every screen, setup
-included, uses one dark palette (`apps/river-app/src/chat/style.rs`); there is
-no light theme yet. A scene cannot set the window size, so the `*narrow*`
-scenes need `--size 820x720` to render as CI renders them (`scene_size` in
-`apps/river-app/src/lib.rs`, checked against `apps.yml` by a test).
-
-Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders
-without a GPU need a software Vulkan driver (`mesa-vulkan-drivers`, then point
-`VK_ICD_FILENAMES` at its `lvp_icd*.json`).
-
-**When releasing the desktop app**, raise `MIN_INSTALL_VERSION` in
-`apps/desktop/src/release.rs` to the current Freenet release. It is the oldest
-Freenet the installer will install, and the only thing stopping someone who
-can edit GitHub releases (but not sign them) from steering new users to an old
-signed release. Leave `MIN_NODE_VERSION`, the oldest running node River
-accepts, alone unless River needs something newer: nodes update over hours to
-days, and raising it early tells people with a working node that theirs is
-too old. The tests derive from both constants, so raising either needs no
-test changes. Reading rooms needs app grants (freenet-core v0.2.156), and
-`MIN_NODE_VERSION` deliberately stays below that: an older node passes setup
-and then shows a "Freenet needs an update" screen for the rooms, which says
-what to do, rather than failing setup for a node that otherwise works.
-
-The installer ties a release's signed checksums to its tag by finding
-`Freenet-<version>.dmg` in them, on every platform (`check_manifest_version`
-in `release.rs`). If freenet-core ever stops shipping that DMG, River refuses
-every release until that check changes.
-
-### Releasing the desktop app
-
-Releases are GitHub releases under `river-desktop-v<version>` tags, built and
-signed by `.github/workflows/release-desktop.yml`: a Linux x86_64 tarball, a
-signed and notarized universal macOS `River.app` (zipped), a signed Windows
-x86_64 zip, and `SHA256SUMS.txt`. The workflow creates the release as a
-**draft**; a maintainer publishes it.
-
-Setup before the first release (repository admin), in this order:
-
-1. Create the `release` environment.
-2. Give it a deployment policy that allows only `river-desktop-v*` tags.
-3. Add a tag ruleset that restricts creating `river-desktop-v*` tags to admins.
-4. Only then add the signing secrets (listed below) to the environment.
-
-The `if: github.event_name == 'push'` conditions on the sign and release jobs
-are not a security boundary: every branch and tag runs its own copy of the
-workflow file, so whoever can push one can remove them. The environment's
-deployment policy, which GitHub enforces outside the file, is what keeps the
-signing secrets to `river-desktop-v*` tags, and the ruleset decides who can
-create those. Both sign jobs use the one `release` environment, so a
-required-reviewer rule on it asks for approval twice per release.
-
-A re-keying River publish needs a new desktop release ready first: once its
-pointer records are published, every installed desktop build is read-only until
-the user updates (`.claude/rules/river-publish.md`, step 7). That release must
-also carry a desktop-only user's rooms from the previous delegate key, which the
-app cannot do yet (freenet/river#889), so the first re-key after v0.1.0 waits
-on it. Anything the app stores in the chat delegate must stay decodable by the
-web UI builds in use, or their migration walk stops on every load.
-
-Each release:
-
-1. In one PR, raise `MIN_INSTALL_VERSION` (above) to the current Freenet
-   release (check the latest freenet-core release; nothing automates this) and
-   bump `[workspace.package] version` in `apps/Cargo.toml`. Merge it.
-2. `git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>`
-3. Download the draft's assets, check them against `SHA256SUMS.txt`, and run
-   them on a real Mac and a real Windows PC (install Freenet, approve the
-   grant, see rooms, send a message).
-4. Publish the draft with "Set as the latest release" unticked (from the
-   command line: `gh release edit <tag> --draft=false --latest=false`; through
-   the API: `make_latest=false`). The workflow cannot enforce this. Every
-   desktop release, including from 1.0, stays off "Latest" because riverctl
-   releases hold the repo's "Latest" badge. 0.x versions are prereleases.
-
-To rehearse, run the workflow by hand (`workflow_dispatch`) on any branch. This
-DRY RUN runs every `verify` check except "the commit is on main", builds,
-packages and writes the notes header. It does not exercise the secrets check,
-signing, or the draft-release logic: those have no rehearsal path other than a
-real tag, and the draft is what makes a first run safe.
-
-The workflow's `verify` job (`apps/desktop/packaging/verify-release.sh`,
-tested by `scripts/tests/verify-release-test.sh` in `build.yml`) refuses the
-tag unless its version matches `apps/Cargo.toml`, the commit is on main,
-`ui/public/contracts/` is byte-identical to the latest
-`chore(publish): bump webapp contract version` commit on main's first-parent
-history, and both WASMs' BLAKE3 hashes match `pointer-records.toml`. The WASM
-rule exists because the app compiles in the chat delegate and room contract
-WASM and cannot migrate between keys, so it must carry exactly what the live
-web UI carries. If the WASM changed since the last UI publish, publish the UI
-first. The release notes record the published web UI version and both
-hashes, and say what the app does not do yet (direct messages, moderation,
-nickname edits, room upgrades).
-
-What CI does and does not check per platform: `river --version` is checked
-on Linux and on the arm64 slice of the macOS binary. The x86_64 macOS slice is
-compiled and linked but never executed in CI. On Windows `river.exe
---version` prints nothing (release builds use the GUI subsystem, so there is
-no console), so the exe's `ProductVersion` resource is the version check
-there.
-
-Packaging lives in `apps/desktop/packaging/`. The icons in `icons/` are
-generated from `ui/assets/river_logo.svg` and committed: whoever changes the
-logo runs `generate-icons.sh` and commits the result, and `apps.yml` fails a
-PR that changes the logo without the icons. The Windows icon and version
-resource are embedded by `apps/desktop/build.rs`. Pull requests that touch the
-packaging run the build and package jobs on all three platforms, without
-secrets. Signing runs only for tags, in jobs that use the `release`
-environment, which holds `APPLE_DEVELOPER_ID_P12_BASE64`,
-`APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ASC_API_KEY_P8_BASE64`,
-`APPLE_ASC_API_KEY_ID`, `APPLE_ASC_API_KEY_ISSUER_ID`, `AZURE_CLIENT_ID`,
-`AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID`; the Entra federated credential
-is for `repo:freenet/river:environment:release`. `SHA256SUMS.txt` is not
-signed: `FREENET_RELEASE_SIGNING_KEY` is the Freenet updater's trust root and
-must not be used here.
-
-## Share Links in Messages
-
-Freenet share links in message text (`https://freenet.org/open#<id>…`,
-`freenet:<id>…`, `freenet://<id>…`) render as links to the reader's own node.
-The validator in `ui/src/util/share_link.rs` must accept exactly what the
-freenet.org/open page (freenet/web) and freenet-core's `freenet:` handler
-accept; all three test against one vector file, whose copy lives at
-`ui/src/util/share-link-vectors.json` (the `share-link-vectors.yml` workflow
-fails when it drifts from freenet-core main). Change a rule only together with
-that file and the other two sides.
-
-## In-Room Direct Messages
-
-End-to-end-encrypted DMs between two members of the same room, carried
-inside `ChatRoomStateV1` (NOT a separate contract). Wire-format invariants,
-the outbound-plaintext cache, and the archive (hide) state are documented
-in **`.claude/rules/direct-messages.md`** — read it before touching anything
-under `common/src/room_state/direct_messages.rs`,
-`ui/src/components/direct_messages/`, or `cli/src/commands/dm.rs`.
-
-## Private Room Support
-
-Messages, metadata, and member nicknames are encrypted with AES-256-GCM.
-Room secrets are distributed via owner-signed `encrypted_secrets` blobs
-in the room contract (ECIES-wrapped per member) AND embedded in the
-`Invitation` artifact so a new invitee can read immediately on join.
-The contract blob is authoritative and supersedes the invitation-carried
-copy.
-
-The full invariants — secret rotation paths (UI fast-path vs delegate
-catch-up), the shared `build_rotation_encrypted_secrets` helper, the
-`post_apply_cleanup` encrypted_secrets exemption, the `member_info`
-coupling rule, in-memory `repopulate_secrets_from_state`, and the
-riverctl parity surface — are documented in
-**`.claude/rules/private-rooms.md`**. Read it before touching anything
-under `common/src/room_state/`, `common/src/key_derivation.rs`,
-`ui/src/room_data.rs`, or `cli/src/private_room.rs`.
-
-## Delegate & Contract WASM Migration
-
-Changes to delegate or contract WASM (anything under `delegates/`,
-`contracts/`, or `common/`, plus most changes to the root
-Cargo.toml/Cargo.lock) alter the delegate/contract key. Without a migration
-entry, **users lose all room data**.
-
-Changes to `apps/Cargo.toml` and `apps/Cargo.lock` cannot alter the key:
-the WASM is built from the root workspace with the root `Cargo.lock`, and the
-apps' lockfile is never consulted there, even though `apps/river-app` depends
-on `river-core` by path (see the note in `apps/Cargo.toml`). Any client-only
-feature it enables (`stored-rooms`, `invitation`, `ecies-client`, ...) must
-stay off for the room-contract and chat-delegate builds.
-
-The full workflow — `cargo make add-migration` BEFORE rebuilding, the
-two single-source-of-truth TOMLs, CI validation, and the key files —
-lives in **`.claude/rules/delegate-migration.md`**. Read it before
-publishing any change that touches those paths. The publish-side
-counterpart is **`.claude/rules/river-publish.md`**.
-
-**The same change also invalidates River's pointer records.** A migration
-entry carries OUR users' data forward; a pointer record says where the
-artifact moved to. Two audiences read it: THIRD PARTIES, who resolve it
-instead of pinning a key that re-keys weekly, and OUR users' already-open tabs,
-which reload into the new build only when a newer record lands
-(freenet/river#580). Run `cargo make sign-pointer-records` alongside
-`add-migration`, and `cargo make publish-pointer-records` from main after the
-merge and after the UI publish (`.claude/rules/river-publish.md`, step 7).
-CI's `check-pointer-freshness` fails the PR if a pointed-at WASM changed and no
-new record was signed. See `pointer-records.toml` and `FREENET.md`.
-
-A pointer solves **addressing only** — it says nothing about whether state or
-secrets under the old key survived, which is what the migration registries are
-for. Do not let the two blur together; conflating them is the specific error
-this mechanism exists to prevent.
-
-## Testing Notes
-- Run `cd common && cargo test private_room` when modifying encryption or secret distribution.
-- Use `cargo make test` before every PR to ensure all components still build and pass tests.
-
-## UI Test IDs (`data-testid`)
-
-Stable hooks for automation (Playwright, debugging, external tools). Dioxus'
-`data-dioxus-id` attributes are render-order indices that change between
-renders, so automation MUST target `data-testid` instead (freenet/river#25).
-
-Naming convention:
-- **kebab-case**, scoped by surface: `<surface>-<role>` (e.g.
-  `create-room-name-input`, `send-message-button`, `member-info-modal`).
-- **List containers** get a plain id: `room-list`, `member-list`.
-- **List items** use the entity-ID pattern `<entity>-item-{id}` so a specific
-  row is addressable: `room-item-{base58(owner_vk)}`,
-  `member-item-{member_id}`. Selecting any item: `[data-testid^="room-item-"]`.
-
-Test IDs are additive markup only — never change rendering or logic. When
-adding a new interactive surface, give it a `data-testid` following the above.
-Existing coverage spans the room list + items, member list + items, the
-create-room / edit-room / invite-member / member-info / receive-invitation
-modals and their primary inputs/buttons, and the message input + send button.
-
-## State Authorization Rule
-
-**Every piece of data in contract state must be cryptographically authorized. Never accept
-unauthorized data into state, even as a "temporary" or "lenient" measure.**
-
-- Messages must have a valid signature from a verified member at the time they are added
-- Members must have a valid invitation chain back to the room owner
-- Bans must be authorized by the room owner
-- Verification must happen at insertion time — never defer verification to "when the data arrives later"
-
-If a delta would introduce data that cannot be verified (e.g., a message whose author is not in
-the members list), the fix must ensure the authorization data is included in the delta (e.g.,
-include the member entry alongside the message), NOT relax verification to accept unauthorized data.
-
-Relaxing verification creates security holes that are exploitable by malicious peers. A contract
-that accepts unverified messages is vulnerable to spam, impersonation, and state pollution.
-
-A key benefit of fully-authorized state: it enables **permissionless contract migration**. When
-contract WASM changes, anyone can migrate state from the old contract to the new one because
-the state is self-validating (see Contract Upgrade below).
-
-## Contract Upgrade (WASM changes)
-
-When the room contract WASM changes, the contract key changes (`key = BLAKE3(WASM_hash || params)`).
-Both the UI and riverctl detect this automatically via `regenerate_contract_key()`.
-
-**Because all state is cryptographically self-authorized, contract migration is permissionless:**
-- ANY node (not just the room owner) can GET state from the old contract key and PUT it to the
-  new contract key. The new contract validates all signatures and accepts it, provided the state
-  is in canonical form: `validate_state` accepts only states `post_apply_cleanup` leaves
-  unchanged (compared as bytes), so a client sends `ChatRoomStateV1::normalized(&params)`,
-  never raw old bytes, in any whole-state PUT or full-state UPDATE (freenet-core validates
-  every incoming whole state before merging it). Every state a peer holds is then canonical.
-- The room owner does NOT need to be online or take any special action.
-- The `OptionalUpgradeV1` pointer on the old contract is a courtesy for clients still running
-  old versions — it tells them where the new contract lives. But updated clients already know
-  the new key because they have the new WASM bundled.
-
-**Upgrade flow for an updated client (UI, freenet/river#769):**
-1. On load, `regenerate_contract_key()` detects old_key != new_key and records the old key
-   in `RoomData::rekey_merge.owed` (kept if an older merge is still owed). A room whose
-   `previous_contract_key` is a registry generation also owes one merge from it, once
-   (`RekeyMerge::previous_queued`), which recovers devices that re-keyed on a build without
-   this merge (freenet/river#771).
-2. Before the subscribe sweep, `process_rooms` holds the room `Subscribing` and
-   `start_rekey_merge` GETs every generation from the newest legacy one down to the owed key,
-   CRDT-merging what it finds into the room. Then the room's seed PUT is sent, once, carrying
-   the merged state (a PUT onto a key someone already seeded merges, never clobbers); the
-   subscribe that follows GETs the new key's state. The walk holds the seed for at most
-   `REKEY_SEED_WAIT` (5 s); one still running then seeds what the room holds and finishes in
-   the background, and what it merges later goes out as an ordinary update.
-3. The marker clears only once the owed key itself returned the room's state and it merged.
-   A slow, unreachable or `NotFound` old key seeds the local snapshot and is asked again, in
-   the background (only the owed keys), on later loads. A key is given up only after
-   `MAX_UNFINISHED_REKEY_LOADS` (5) unfinished loads AND `REKEY_GIVE_UP_AFTER` (3 days) since
-   the room first owed it. Do not seal on a `NotFound`: on Freenet it is routinely a routing dead-end, and
-   this device synced the room under that key. Owed merges that do not block a seed (retries,
-   the predecessor merge) run alongside the subscribe and never delay the room.
-4. If room owner: also sends an `OptionalUpgradeV1` pointer on the old key for stragglers
-
-**A tab that is already open does none of this**: it runs the build it loaded,
-with the old WASM compiled in. It notices a re-key through River's pointer
-records and reloads into the new build, which then runs the flow above
-(freenet/river#580, `ui/src/components/app/freenet_api/generation_watch.rs`).
-It reloads rather than following the new key in place for the same reason
-riverctl restarts (`cli/src/pointer.rs`, `Recheck`): the new generation can
-change the state format and validation, and the delegate cannot be followed
-without the new build's migration. The reload is capped (tries per target with
-backoff, an hourly ceiling, one reload per page, never while the reader is
-busy) and goes through the shell's `navigate` so the old page's sockets close;
-read the module docs before changing any of it. This is why
-`cargo make publish-pointer-records` is not optional after a re-key
-(`.claude/rules/river-publish.md`, step 7). Tabs on builds older than this
-mechanism (30000403 and earlier) have none of it and need one manual reload.
-The desktop app watches the same records and, once one is newer than the WASM
-it carries, stops writing and asks the user to update
-(`apps/river-app/src/rooms/generation.rs`).
-
-**This only works if:**
-- The state format is backwards-compatible (see below)
-- All state data is cryptographically authorized (see above)
-
-## Backwards Compatibility Rule
-
-`ChatRoomStateV1` and all sub-types must remain backwards-compatible:
-- New fields must use `#[serde(default)]`
-- **On an INDIVIDUALLY-SIGNED sub-struct (`MemberInfo`, `Member`, `UserBan`,
-  `MessageV1`, `Configuration` — anything wrapped in an `Authorized…` whose
-  signature covers its ciborium bytes), a new field needs BOTH
-  `#[serde(default)]` AND `#[serde(skip_serializing_if = …)]` so that the
-  default/empty value serializes byte-identically to the old record.** A plain
-  `#[serde(default)]` alone re-serializes a wider struct, so every existing
-  member's/message's/ban's signature fails verification and every existing room
-  migrates to empty. Put the new field LAST, never reorder existing fields, and
-  gate it with a byte-identity regression test (see
-  `member_info.rs::empty_deputies_serializes_identically_to_legacy_member_info`,
-  #410). Plain `#[serde(default)]` is only safe on UNSIGNED containers.
-- Never remove or rename existing fields
-- Never change serialization format of existing fields
-- If a breaking change is truly needed, create a V2 type with explicit migration (separate project)
-
-This ensures any client can re-PUT old state, normalized by `ChatRoomStateV1::normalized`, and
-the new WASM's `validate_state()` accepts it, which is critical for the permissionless contract
-migration system described above.
-
-## Contract `Summary` / `Delta` Determinism
-
-Every field of a contract's `ComposableState::Summary` MUST serialize
-deterministically — `BTreeMap`/`BTreeSet`/sorted `Vec`, never `HashMap`/`HashSet`
-or an unsorted `Vec`. freenet-core byte-compares `summarize_state` output to
-decide peer staleness, so a nondeterministically-ordered summary makes two
-identical states compare unequal → spurious anti-entropy full-state heals for
-every room (and feeds the update-drop divergence in freenet/freenet-core#4857).
-
-Full rule (why, the `BTreeMap`/`BTreeSet`/sorted-`Vec` fix, the required
-determinism test, and the WASM-migration coupling) lives in
-**`.claude/rules/contract-summary-determinism.md`**. Read it before touching any
-`type Summary` / `type Delta` under `common/src/room_state/`.
-
-The merge-law rules (a validly signed record never fails a merge; use the
-room's own `merge`, never `ComposableState::merge`; summaries carry a rank
-with a digest tie-break; held state is normalized on every apply;
-`FORK_SEEDS=1000` is the real check) live in
-**`.claude/rules/merge-laws.md`**.
-
-## Dioxus WASM Signal Safety Rules
-
-The UI runs as single-threaded WASM and Firefox mobile fires Dioxus
-signal subscriber notifications synchronously during Drop. There is a
-small set of strict rules (use `try_read()`, never `spawn_local` inside
-a polled future, always wrap signal mutations from spawn_local / event
-handlers in `crate::util::defer()`, never raw `setTimeout`, never defer
-clears in `use_effect`, never `use_memo` against non-signal values in
-always-mounted components) that prevent re-entrant `RefCell` panics and
-empty-scope_stack crashes.
-
-Full rules with WRONG/RIGHT examples live in
-**`.claude/rules/dioxus-signal-safety.md`**. Read it before touching
-anything under `ui/src/`.
-
-## PR Expectations
-- Follow Conventional Commit style for PR titles (e.g., `fix(ui): correct room timestamp format`).
-- Include a brief description of test coverage in the PR body.
-- When touching contracts, note any required redeploy steps.
-
+Conventional Commit titles (`fix(ui): ...`). The body says why, what tests cover the change, and, when touching contracts, any redeploy steps.

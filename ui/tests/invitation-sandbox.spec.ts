@@ -34,7 +34,7 @@ import { test, expect, Page, FrameLocator } from "@playwright/test";
 // the processed fingerprint is present in the top-level hash. Without PR #220's
 // hash-bridge dedup the second load would re-show the modal.
 //
-// Sandbox caveat (documented in AGENTS.md / project memory): the real gateway
+// Sandbox caveat: the real gateway
 // omits `allow-same-origin`, but a different-origin sandboxed iframe can't load
 // WASM from the dev server, so we add `allow-same-origin` here. That does NOT
 // weaken what we're testing: the dedup path goes through the postMessage shell

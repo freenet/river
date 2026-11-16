@@ -1,10 +1,10 @@
 # River: group chat with no backend
 
 River is a group chat app whose backend is a global peer-to-peer network instead of cloud servers.
-Nobody runs a server for River, and nobody self-hosts: every room lives on Freenet, a network
-made up of the computers of the people who run it. Because the network
-caches and serves each room from nodes near whoever's asking, a busy room gets *more* capacity as it
-gets more popular, the opposite of the server model where traffic is a bill someone has to pay.
+Nobody runs a server for River, and nobody self-hosts. Every room lives on Freenet, a network
+made up of the computers of the people who run it. The network caches and serves each room from
+nodes near whoever is asking, so a busy room gets *more* capacity as it gets more popular. In the
+server model, that traffic is a bill someone has to pay.
 
 ![Screenshot of chat interface](screenshot.png)
 
@@ -14,11 +14,11 @@ gets more popular, the opposite of the server model where traffic is a bill some
 - [How it works](#how-it-works)
 - [Why not Matrix, Discord, or Signal?](#why-not-matrix-discord-or-signal)
 - [Features](#features)
-- [Getting Started](#getting-started)
+- [Getting started](#getting-started)
 - [Command-line client (optional)](#command-line-client-optional)
 - [Building from source](#building-from-source)
-- [Access Control](#access-control)
-- [Privacy Model](#privacy-model)
+- [Access control](#access-control)
+- [Privacy model](#privacy-model)
 - [Architecture](#architecture)
 - [License](#license)
 
@@ -37,45 +37,43 @@ your browser  ──▶  Freenet, a global peer-to-peer network
                    (that nobody operates for River)
 ```
 
-There is no backend behind River that anyone runs or pays for. River is the chat app, but the thing
-it demonstrates is bigger: an application built this way doesn't need a backend at all. You install
-Freenet once, and any number of apps can run on it the same way.
+There is no backend behind River that anyone runs or pays for. River is a chat app, and it also
+shows that an application built this way needs no backend at all. You install Freenet once, and
+any number of apps can run on it the same way.
 
-River is decentralized in the original sense of the word: no servers, no company, and no blockchain,
-token, or coins anywhere. It is just code running on a shared network.
+River is decentralized in the original sense of the word: no servers, no company, and no
+blockchain, token, or coins anywhere. It is code running on a shared network.
 
 ## How it works
 
 On Freenet, the unit of deployment is a *contract*: a small piece of WebAssembly that defines what
 valid state looks like and how it is allowed to change. A River room is one such contract. Its state
 (members, messages, bans, encryption keys) lives on the network, replicated across the nodes that
-care about it, and every change is cryptographically signed so any node can verify it without
+care about it. Every change is cryptographically signed, so any node can verify it without
 trusting anyone.
 
-That design has a few consequences worth calling out:
+That design has three consequences:
 
 - **A room outlives its creator's session.** It stays available on the network whether or not the
   person who made it is online.
 - **Popularity adds capacity.** A room in demand is cached on more nodes, so it gets faster and more
   resilient as it grows, not slower.
-- **State is self-validating.** Because every message and membership change carries its own
-  signature, anyone can host or migrate a room's data without being able to forge it.
+- **State is self-validating.** Every message and membership change carries its own signature, so
+  anyone can host or migrate a room's data without being able to forge it.
 
-Global scalability is the property Freenet is designed around, using small-world routing so any
-node can locate any contract in a logarithmic number of hops. River inherits it for free.
+Freenet uses small-world routing, so any node can locate any contract in a logarithmic number of
+hops. That is how River rooms scale without servers.
 
 ## Why not Matrix, Discord, or Signal?
 
 Those systems decentralize to different degrees, but each keeps servers somewhere:
 
-- **Discord, Slack, Signal:** central servers operated by a company.
-- **Matrix:** federated homeservers, each one run by someone.
-- **Nostr:** relays, which are servers.
-- **Briar, Tox:** genuinely serverless, but device-to-device, so both parties have to be online and
-  there is no persistent shared room hosted by the network.
-
-River keeps each room as state hosted by the Freenet network itself: no company server, no
-homeserver to choose or operate, and rooms that persist when their creator is offline.
+| System | Where the servers are | What River does instead |
+|---|---|---|
+| Discord, Slack, Signal | Central servers operated by a company | No company server. The Freenet network hosts each room |
+| Matrix | Federated homeservers, each one run by someone | No homeserver to choose or operate |
+| Nostr | Relays, which are servers | No relays. Nodes cache the rooms people ask for |
+| Briar, Tox | None, but device to device, so both parties must be online | Rooms persist on the network when their creator is offline |
 
 ## Features
 
@@ -86,7 +84,7 @@ homeserver to choose or operate, and rooms that persist when their creator is of
 - Runs in the browser, on desktop and mobile
 - Scriptable from the command line with `riverctl` (useful for bots and AI agents)
 
-## Getting Started
+## Getting started
 
 The only thing you need to use River is Freenet. There is no River server to sign up for and no
 account to create.
@@ -95,35 +93,18 @@ account to create.
 2. Click the invite link on that page to join the official River room.
 
 River opens in your browser and works on both desktop and mobile. From there you can create your
-own rooms and share their invite links; to join someone else's room you need an invitation from a
+own rooms and share their invite links. To join someone else's room you need an invitation from a
 current member.
 
-## Command-Line Client (optional)
+## Command-line client (optional)
 
-`riverctl` is a command-line client for driving River rooms from a terminal or script, handy for
-automation, bots, and AI agents. It is an alternative to the browser UI, not a requirement for
-using River.
+`riverctl` drives River rooms from a terminal or a script, for automation, bots and AI agents. It
+needs the [Rust toolchain](https://rustup.rs/). Install it with `cargo install riverctl`, then see
+[cli/README.md](cli/README.md) for its commands and JSON output.
 
-It is a Rust crate, so install the [Rust toolchain](https://rustup.rs/) first, then:
+## Building from source
 
-```bash
-cargo install riverctl
-```
-
-Commands include:
-- `riverctl room` - Room management (create, list, info)
-- `riverctl message` - Send and receive messages
-- `riverctl dm` - End-to-end-encrypted direct messages to a co-member (send, invite, list, purge, accept)
-- `riverctl member` - Member management
-- `riverctl invite` - Create and accept invitations
-- `riverctl identity whoami` - Your own member ID in a room (matches the `author` on your messages)
-
-Use `--format json` for machine-readable output. Run `riverctl --help` for full documentation.
-
-## Building from Source
-
-You only need this to hack on River itself; using River needs nothing but Freenet (above). To build
-and run the UI locally:
+You only need this to work on River itself. Using River needs nothing but Freenet (above).
 
 1. Install dependencies:
 
@@ -134,14 +115,11 @@ and run the UI locally:
    # Add the wasm target
    rustup target add wasm32-unknown-unknown
 
-   # Install ssl development library
-   # This example is for Ubuntu and may be different on your system
+   # Install the OpenSSL development library (Ubuntu shown; varies by system)
    sudo apt-get install libssl-dev
 
-   # Install Node.js (v20+) and npm
-   # See https://nodejs.org/en/download for installation instructions.
-   # Note: system packages (e.g. `apt-get install npm`) may ship outdated
-   # versions that don't work. Install from the official site instead.
+   # Install Node.js (v20+) and npm from https://nodejs.org/en/download.
+   # System packages (e.g. `apt-get install npm`) may ship versions too old to work.
 
    # Install build tools. dx must be the exact dioxus version Cargo.lock
    # resolves (`cargo make check-dx-version` checks it; every build runs it).
@@ -149,181 +127,124 @@ and run the UI locally:
    cargo install --locked cargo-make
    ```
 
-2. Build and run with example data:
+2. Clone, install the Tailwind CSS dependencies, and start the development server:
 
    ```bash
-   # Clone the repository
    git clone git@github.com:freenet/river.git
-
-   # Enter the repository
    cd river
-
-   # Initialize freenet submodule
-   git submodule init
-   git submodule update
-
-   # Install Node.js dependencies (Tailwind CSS)
    cd ui && npm install && cd ..
-
-   # Run development server with example data
    cargo make dev-example
    ```
 
-3. Open http://localhost:8080 in your browser
+3. Open http://localhost:8080 in your browser.
 
-The UI runs with example data and without syncing to Freenet, which is ideal for development. Two
-feature flags control that behavior:
+Two UI features control where the data comes from. `example-data` fills the UI with sample rooms
+and messages. `no-sync` turns off the connection to Freenet. Each task below sets them:
 
-- **example-data**: populates the UI with sample rooms and messages
-- **no-sync**: disables Freenet synchronization for local testing
+| Task | Example data | Freenet sync |
+|---|---|---|
+| `cargo make dev` (development server) | No | On |
+| `cargo make dev-example` (development server) | Yes | On |
+| `cargo make build-ui-example` | Yes | On |
+| `cargo make build-ui-no-sync` | No | Off |
+| `cargo make build-ui-example-no-sync` | Yes | Off |
 
-They can be combined when building:
+## Access control
 
-```bash
-# Build with example data
-cargo make build-ui-example
+River manages room membership with an **invitation tree**. The room owner sits at the root, and
+any member can invite others, creating branches. A member can manage or ban anyone they invited,
+or anyone further down their branch, so authority cascades down the tree.
 
-# Build without Freenet sync
-cargo make build-ui-no-sync
-
-# Build with both features
-cargo make build-ui-example-no-sync
-```
-
-## Access Control
-
-River manages room membership with an **invitation tree**:
-
-- The room owner sits at the root.
-- Any member can invite others, creating branches.
-- A member can manage or ban anyone they invited, or anyone further down their branch.
-
-```
-Room: freenet (Owner: owner)
-│
-├─── User: alice
-│    │
-│    ├─── User: bob
-│    │    │
-│    │    └─── User: charlie
-│    │
-│    ├─── User: dave
-│    │
-│    └─── User: eve
-│
-└─── User: frank
-```
-
-For example, if alice invited bob, who then invited charlie, alice can ban charlie directly, because
+For example, alice invited bob, who then invited charlie. Alice can ban charlie directly, because
 charlie is downstream of her in the tree:
 
 ```
 Room: freenet (Owner: owner)
-│
 ├─── User: alice
-│    │
 │    ├─── User: bob
-│    │    │
 │    │    └─── Banned User: charlie
-│    │
 │    ├─── User: dave
-│    │
 │    └─── User: eve
-│
 └─── User: frank
 ```
 
-Permissioning cascades down the tree: anyone higher in the chain has authority over those beneath
-them.
+## Privacy model
 
-## Privacy Model
+Anyone with a public room's contract address can read it. Private rooms are end-to-end encrypted.
 
-- **Public Rooms**: Readable by anyone with the contract address
-- **Private Rooms**: End-to-end encrypted using symmetric AES-256-GCM keys
-  - Room secrets distributed to members using ECIES (X25519 + AES-256-GCM)
-  - Automatic secret rotation every 7 days
-  - Rotation triggered when members are banned for forward secrecy
-  - Manual rotation available to room owners
-  - Encrypted room names, member nicknames, and messages
+### What private rooms hide, and what they don't
 
-### What Private Rooms Hide, and What They Don't
+Private rooms encrypt every message body, every member nickname, and the room's name and
+description with a member-only AES-256-GCM secret. Without that secret, none of that content is
+readable: not by the network, not by Freenet nodes, not by anyone who happens to be storing the
+contract. The owner distributes the secret to each member with ECIES (X25519 + AES-256-GCM). The
+owner's client rotates it when the member set changes, immediately when a member is banned, and
+on demand.
 
-Private rooms encrypt every message body, every member nickname, and
-the room's name and description using a member-only AES-256-GCM
-secret. Without that secret, none of that content is readable: not
-by the network, not by Freenet nodes, not by anyone who happens to be
-storing the contract. The secret is rotated weekly, immediately when
-a member is banned, and on demand by the owner.
+We use a shared room secret with rotation rather than a per-message ratcheting scheme like
+Signal's double ratchet or MLS. The shared-secret design fits Freenet's state-based contract
+model: any member can decrypt the room's current state and history on demand without needing to
+be online for every message. The cost is the finer-grained forward secrecy those protocols provide
+between rotations.
 
-We use a shared room secret with scheduled rotation rather than a
-per-message ratcheting scheme like Signal's double ratchet or MLS.
-The shared-secret design fits Freenet's state-based contract model:
-any member can decrypt the room's current state and history on demand
-without needing to be online for every message, at the cost of the
-finer-grained forward secrecy those protocols provide between
-rotations.
+What private rooms *don't* hide is metadata. Anyone who can read the room's contract from the
+network sees the visible column:
 
-What private rooms *don't* hide is metadata. Anyone who can read the
-room's contract from the network can still observe:
+| Hidden | Visible |
+|---|---|
+| Message bodies | That the room exists |
+| Member nicknames | How many members it has, and the shape of the invitation and ban tree |
+| Room name and description | The size of each message and roughly when it was sent |
+| | Overall activity volume and patterns |
 
-- That the room exists, how many members it has, and the shape of the
-  invitation and ban tree connecting them
-- The size of each message and roughly when it was sent
-- Overall activity volume and patterns
-
-Each member is identified by a per-room key, not a global identity, so
-those keys don't by themselves link a member to anything outside the
-room. If your threat model requires unobservability, not just
-confidentiality, River alone is not sufficient today.
+Each member is identified by a per-room key, not a global identity, so those keys don't by
+themselves link a member to anything outside the room. If your threat model requires
+unobservability, not just confidentiality, River alone is not sufficient today.
 
 ## Architecture
 
-### Project Structure
+### Project structure
 
-- [common](common/): Shared code for contracts and UI
-- [ui](ui/): Web-based user interface, built with [Dioxus](https://dioxuslabs.com) and compiled to
-  WebAssembly
-- [contracts](contracts/): River chat room contract implementation
+| Directory | What it holds |
+|---|---|
+| [common](common/) | `river-core`: room state types and crypto helpers shared by the contracts, delegate, UI and CLI |
+| [contracts](contracts/) | `room-contract` (one room's state) and `web-container-contract` (serves the compiled UI from Freenet) |
+| [delegates/chat-delegate](delegates/chat-delegate/) | Private per-user storage on the user's own node: rooms, signing keys, and secret rotation |
+| [ui](ui/) | Web UI, built with [Dioxus](https://dioxuslabs.com) and compiled to WebAssembly |
+| [cli](cli/) | `riverctl`, the command-line client |
+| [apps](apps/) | Native desktop app, in a separate Cargo workspace with its own `Cargo.lock` |
 
-River is built with:
+Contract state is composed with [freenet-scaffold](https://github.com/freenet/freenet-scaffold),
+signed with elliptic-curve keys, and stored as CBOR (via [ciborium](https://crates.io/crates/ciborium)).
 
-- **[freenet-scaffold](https://github.com/freenet/freenet-scaffold)**: a Rust macro/crate for
-  composable contract development
-- **Elliptic-curve cryptography**: for authentication and message signing
-- **CBOR serialization** (via [ciborium](https://crates.io/crates/ciborium)): an efficient binary
-  format for state storage
-- **[Dioxus](https://dioxuslabs.com)**: a Rust framework for building reactive web UIs
+### Contract state
 
-### Contract State
-
-The chat room contract uses Freenet's composable state pattern. The core state structure is defined
-in [common/src/room_state.rs](common/src/room_state.rs):
+The room contract uses Freenet's composable state pattern. The core state structure is defined in
+[common/src/room_state.rs](common/src/room_state.rs):
 
 ```rust
 pub struct ChatRoomStateV1 {
-    pub configuration: AuthorizedConfigurationV1, // Room settings and privacy mode
-    pub bans: BansV1,                             // List of banned users
-    pub members: MembersV1,                       // Current room members
-    pub member_info: MemberInfoV1,                // Member metadata like nicknames
-    pub secrets: RoomSecretsV1,                   // Encrypted room secrets for private rooms
-    pub recent_messages: MessagesV1,              // Recent chat messages
-    pub upgrade: OptionalUpgradeV1,               // Optional upgrade to new contract
+    pub configuration: AuthorizedConfigurationV1, // Owner-signed room settings
+    pub bans: BansV1,                             // Banned members
+    pub members: MembersV1,                       // Members and who invited them
+    pub ban_evidence: BanEvidenceV1,              // Absent members a stored ban still needs
+    pub member_info: MemberInfoV1,                // Nicknames, set by each member
+    pub secrets: RoomSecretsV1,                   // Secret distribution for private rooms
+    pub recent_messages: MessagesV1,              // Recent messages, capped by configuration
+    pub direct_messages: DirectMessagesV1,        // Encrypted direct messages between members
+    pub upgrade: OptionalUpgradeV1,               // Pointer to a replacement contract
+    pub version: StateVersion,                    // State format version
 }
 ```
 
-Each component is a separate module with its own state management:
-
-- [Configuration](common/src/room_state/configuration.rs): Room settings, privacy mode, and display metadata
-- [Bans](common/src/room_state/ban.rs): User banning and moderation
-- [Members](common/src/room_state/member.rs): Room membership and invitations
-- [Member Info](common/src/room_state/member_info.rs): Member metadata and nicknames
-- [Secrets](common/src/room_state/secret.rs): Encrypted room secrets and key rotation for private rooms
-- [Messages](common/src/room_state/message.rs): Chat message handling with encryption support
-- [Privacy](common/src/room_state/privacy.rs): Encryption primitives and sealed data types
-- [Upgrades](common/src/room_state/upgrade.rs): Contract upgrade mechanism
-
-All state changes are signed using elliptic-curve cryptography. That is what makes a room's data
-self-validating: any node can host or migrate it without being able to forge it.
+Each field's type has its own module under [common/src/room_state/](common/src/room_state/), in
+field order: [configuration](common/src/room_state/configuration.rs),
+[ban](common/src/room_state/ban.rs), [member](common/src/room_state/member.rs),
+[ban_evidence](common/src/room_state/ban_evidence.rs),
+[member_info](common/src/room_state/member_info.rs), [secret](common/src/room_state/secret.rs),
+[message](common/src/room_state/message.rs),
+[direct_messages](common/src/room_state/direct_messages.rs),
+[upgrade](common/src/room_state/upgrade.rs) and [version](common/src/room_state/version.rs).
 
 ## License
 

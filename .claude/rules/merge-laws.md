@@ -4,6 +4,10 @@ globs:
   - common/src/room_state/**/*.rs
   - common/src/room_state.rs
   - contracts/room-contract/src/**/*.rs
+paths:
+  - "common/src/room_state/**/*.rs"
+  - "common/src/room_state.rs"
+  - "contracts/room-contract/src/**/*.rs"
 ---
 
 # Room-contract merge laws (freenet/river#703)

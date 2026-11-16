@@ -11,7 +11,7 @@ run-name: >-
 # web UI is published to Freenet with `cargo make publish-river`
 # (.claude/rules/river-publish.md).
 #
-# Release flow (AGENTS.md, "Releasing the desktop app", is the full version):
+# Release flow (.claude/rules/desktop-release.md is the full version):
 #   1. Raise MIN_INSTALL_VERSION (apps/desktop/src/release.rs) to the current
 #      Freenet release and bump [workspace.package] version in apps/Cargo.toml,
 #      through a normal PR; merge to main.

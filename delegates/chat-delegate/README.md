@@ -1,229 +1,136 @@
-# ChatDelegate Overview
+# Chat delegate
 
-The ChatDelegate is a key-value storage system for chat applications in Freenet. It provides origin-based data partitioning similar to a web browser's localStorage API, ensuring data isolation between different applications. This document explains how the delegate handles different types of messages and the overall flow of operations.
+The chat delegate is River's private storage and signing service on the user's own Freenet node.
+It has two jobs: a key-value store with compare-and-swap, and background secret rotation for private rooms the user owns.
+It also holds each room's signing key and signs with it, so the private key never leaves the delegate.
+It answers application messages from a web app origin, and contract notifications from the node (`process` in `src/lib.rs`).
 
-## Overview
+## Requests
 
-The ChatDelegate provides four main operations:
-1. **Store** - Save data with a specific key
-2. **Get** - Retrieve data for a key
-3. **Delete** - Remove data for a key
-4. **List** - Get all available keys
+`ChatDelegateRequestMsg` and `ChatDelegateResponseMsg` live in `common/src/chat_delegate.rs`.
+The handlers are in `src/handlers.rs`, except `EnsureRoomSubscription`, which is in `src/subscription.rs`.
 
-Each operation involves a multi-step process due to the asynchronous nature of the delegate system.
+| Request | What the delegate does | Answers with |
+|---|---|---|
+| `StoreRequest` | Stores the value unconditionally and bumps its generation | `StoreResponse` |
+| `GetRequest` | Reads the value, without its generation | `GetResponse`, `value: None` when absent |
+| `DeleteRequest` | Removes the value and drops the key from the index | `DeleteResponse` |
+| `ListRequest` | Returns the keys in this origin's index | `ListResponse`, or an error starting with `LIST_REFUSED_MARKER` |
+| `GetVersionedRequest` | Reads the value and its generation | `GetVersionedResponse`, generation `0` when absent |
+| `CasStoreRequest` | Stores only if `expected_generation` matches the stored generation | `CasStoreResponse` with a `CasStoreResult` |
+| `StoreSigningKey` | Stores a room's 32-byte signing key, overwriting any earlier one | `StoreSigningKeyResponse` |
+| `GetPublicKey` | Derives the verifying key from the stored signing key | `GetPublicKeyResponse`, `public_key: None` when absent |
+| `SignMessage`, `SignMember`, `SignBan`, `SignConfig`, `SignMemberInfo`, `SignSecretVersion`, `SignEncryptedSecret`, `SignUpgrade` | Signs the bytes it is given with the room's signing key. It does not decode them | `SignResponse`, echoing `request_id` |
+| `EnsureRoomSubscription` | Records the room's contract ID and subscribes to that contract. It refuses when no signing key is on file | `EnsureRoomSubscriptionResponse`, plus a `SubscribeContractRequest` to the node |
 
-## Origin-Based Data Partitioning
+`CasStoreResult` is `Stored { generation }`, `Conflict { current_generation, current_value }` or `Failed(String)`.
+A conflict writes nothing.
 
-A key security feature of the ChatDelegate is that all data is partitioned by "origin contract" - the contract key from which the user interface was downloaded. This works similarly to a web browser's localStorage, where data is partitioned by the hostname/port of the website:
+## Origin partitioning
 
-1. Each piece of data is stored with a composite key that includes the origin contract ID
-2. Applications can only access data that was stored by the same origin
-3. This prevents different applications from accessing each other's data
-4. The partitioning happens automatically and is transparent to the application
+The node attests which web app sent a request (`MessageOrigin::WebApp`).
+`check_origin` turns that contract ID into an `Origin` and rejects a missing origin or another delegate as caller.
+`create_origin_key` prefixes every key-value key with the origin in base58 and the `:` separator (`ORIGIN_KEY_SEPARATOR`).
+A web app with a different contract ID therefore reads and lists a different set of keys.
 
-This design ensures that even if multiple chat applications use the same delegate, their data remains isolated and secure from each other.
+With an origin of `abc123`:
 
-## Message Flow Architecture
+| Client key | Stored under |
+|---|---|
+| `user123` | `abc123:user123` |
+| the key index (`KEY_INDEX_SUFFIX`) | `abc123:::key_index` |
+| the crash-safety intent (`KV_INTENT_SUFFIX`) | `abc123:::kv_intent` |
+| signing key for room `R` | `signing_key:abc123:R` (`create_signing_key_secret_key`) |
 
-The delegate uses a state machine pattern where:
-1. Initial application messages trigger operations
-2. State is stored in a context object between operations
-3. Responses from the storage system trigger follow-up actions
+`create_origin_key` decodes the client key as lossy UTF-8.
+Clients must use text keys: River encodes room keys and predecessor keys as base58 or hex for this reason.
 
-## Processing Inbound Messages
+## What River stores
 
-The entry point is the `process` method in `lib.rs`, which handles four types of messages:
+| Key | Holds | Written by |
+|---|---|---|
+| `room:<base58 owner vk>` | One room as a `StoredRoomSlot`, present or tombstoned | `save_rooms_to_delegate` in the UI, and the native app, by CAS |
+| `rooms_meta` | Current room, notification modes, room order | Same as above |
+| `rooms_data` | The legacy single-blob room list | Nothing now. The UI reads it to migrate |
+| `outbound_dms` | `OutboundDmStore`: plaintext of DMs the user sent, and archived threads | `save_outbound_dms_to_delegate`, by `StoreRequest` |
+| `river_avatar_colour_seed_v1` | This device's avatar colour seed | `avatar_salt.rs`, by CAS |
+| `\0freenet-migrate-journal/v1` | The migration journal (`MIGRATION_JOURNAL_KEY`) | `store_journal` in `delegate_migration.rs` |
+| `__migrate_pred_done__:<hex>`, `__migrate_pred_wip__:<hex>` | Per-predecessor migration markers | The migration walk. The in-progress marker goes by CAS |
+| `__river_migration_walk_skips__`, `__river_migration_topup_window__`, `__river_migration_short_index__` | Migration cadence and top-up bookkeeping | `delegate_migration.rs` |
+| `signing_key:<origin>:<room>` | The room's signing key | `store_signing_key` in `ui/src/signing.rs`, and the native app |
+| `room_sub:<room>`, `room_sub_by_cid:<contract>` | The subscription record and its reverse index | `handle_ensure_room_subscription` |
+| `room_members:<room>`, `room_secret:<room>:<version>` | The last member set seen, and each secret a rotation derived | `handle_contract_notification` |
 
-```rust
-match message {
-    InboundDelegateMsg::ApplicationMessage(app_msg) => {
-        // Handle client requests (Store/Get/Delete/List)
-        handle_application_message(app_msg, &origin)
-    }
-    InboundDelegateMsg::GetSecretResponse(response) => {
-        // Handle responses from the storage system
-        handle_get_secret_response(response)
-    }
-    InboundDelegateMsg::UserResponse(_) => {
-        // Not used in this delegate
-        Ok(vec![])
-    }
-    InboundDelegateMsg::GetSecretRequest(_) => {
-        // Not handled directly
-        Err(DelegateError::Other("unexpected message type: get secret request".into()))
-    }
-}
+The first eight rows are key-value entries under the origin prefix, listed in the index.
+Signing keys and rotation state are written directly, outside the index, and `ListRequest` never returns them.
+Rotation state has no origin prefix: there is one subscription record per room.
+
+## Write path
+
+Every key-value value is stored in an envelope: a tag byte, a little-endian `u64` generation, then the data (`encode_versioned`).
+`GetRequest` and `GetVersionedRequest` strip it, so clients never see it.
+The UI's read-merge-write loop is `cas_write_key`:
+
+```mermaid
+sequenceDiagram
+    participant UI
+    participant D as Chat delegate
+    loop up to ROOMS_CAS_MAX_ATTEMPTS (8)
+        UI->>D: GetVersionedRequest { key }
+        D-->>UI: GetVersionedResponse { value, generation }
+        UI->>UI: merge local changes into value
+        UI->>D: CasStoreRequest { key, value, expected_generation: generation }
+        D->>D: open_kv: recover any intent, create the index if missing
+        alt generation matches
+            D->>D: write_value at generation + 1
+            D-->>UI: Stored { generation }
+        else another writer got there first
+            D-->>UI: Conflict { current_generation, current_value }
+            Note over UI: read again and merge again
+        end
+    end
 ```
 
-## Key Concepts
+Two tabs that write the same key can no longer overwrite each other: the stale one gets `Conflict` and merges.
 
-Before diving into specific flows, let's understand some key concepts:
+A delete removes the envelope, so a re-created key starts again at generation 1.
+River's UI never sends `DeleteRequest`, so no CAS key meets this today.
+The module docs in `src/versioning.rs` say what a delete-safe CAS would need.
 
-1. **Origin**: The contract ID that identifies the application
-2. **ChatDelegateKey**: A wrapper around a byte vector that represents a key
-3. **KeyIndex**: A list of all keys for a specific origin
-4. **PendingOperation**: State stored in the context to track ongoing operations
+## Crash safety
 
-## 1. Store Operation Flow
+A node restart can stop the delegate between any two writes.
+The key-value handlers stay consistent anyway:
 
-When a client wants to store data:
+1. A write path creates the empty index before it writes any value (`get_key_index`). `ListRequest` on a fresh delegate writes nothing.
+2. Storing a key the index does not list records an `Add` intent, writes the value, adds the key to the index, then clears the intent (`write_value`). A key already listed takes one write.
+3. Deleting a listed key records a `Delete` intent, removes the key from the index, removes the value, then clears the intent (`handle_delete_request`). The index never lists a key with no value.
+4. Store, CAS, delete and list first roll a recorded intent forward (`open_kv_with`). An `Add` indexes the key if its value landed. A `Delete` finishes the removal. Recovery is idempotent.
+5. An index that does not decode is an error, never an empty index (`decode_key_index`).
+6. An index that reads back absent beside a key River always stores (`INDEX_WITNESS_KEYS`) is a read fault. The delegate refuses the request rather than rewrite a short index.
 
-1. **Client sends a StoreRequest**:
-   ```rust
-   ChatDelegateRequestMsg::StoreRequest { key, value }
-   ```
+Signing keys and rotation state are single writes outside this scheme.
 
-2. **Delegate processes the request** (`handle_store_request`):
-    - Creates a unique storage key by combining the origin and client key
-    - Stores the operation in context for later processing
-    - Immediately sends back a success response to the client
-    - Sends a request to store the actual value
-    - Requests the current key index to update it
+## Rotation
 
-3. **Delegate receives the key index** (`handle_key_index_response`):
-    - Adds the new key to the index if it doesn't exist
-    - Updates the index in storage
-    - The operation is complete
+The UI sends `EnsureRoomSubscription` for each room where it holds the owner's signing key.
+The delegate refuses it until `StoreSigningKey` has stored that key.
+The node then sends the delegate a `ContractNotification` whenever that room contract's state changes.
+`handle_contract_notification` rotates the room secret when the room is private and its member set differs from `room_members:<room>`.
+It derives the next secret with `derive_room_secret` at `current_version + 1`, and signs a `SecretVersionRecordV1` with the owner's key.
+With the shared `build_rotation_encrypted_secrets`, it encrypts each secret version a current member or the owner is missing.
+It emits one `UpdateContractRequest` whose delta carries only the secrets.
+It updates the member-set cache only after it has built that update, so a failed rotation is retried on the next notification.
 
-## 2. Get Operation Flow
+The UI's fast path, `RoomData::rotate_secret`, calls the same two functions with the same inputs.
+Both paths therefore emit byte-identical secrets and encrypted blobs.
+Their version records differ only in `created_at`, and the contract keeps the record with the greater signature digest.
+See [private-rooms.md](../../.claude/rules/private-rooms.md).
 
-When a client wants to retrieve data:
+## Changing this crate
 
-1. **Client sends a GetRequest**:
-   ```rust
-   ChatDelegateRequestMsg::GetRequest { key }
-   ```
-
-2. **Delegate processes the request** (`handle_get_request`):
-    - Creates the unique storage key
-    - Stores the operation in context
-    - Sends a request to get the value from storage
-
-3. **Delegate receives the value** (`handle_regular_get_response`):
-    - Retrieves the pending operation from context
-    - Sends the value back to the client
-    - The operation is complete
-
-## 3. Delete Operation Flow
-
-When a client wants to delete data:
-
-1. **Client sends a DeleteRequest**:
-   ```rust
-   ChatDelegateRequestMsg::DeleteRequest { key }
-   ```
-
-2. **Delegate processes the request** (`handle_delete_request`):
-    - Creates the unique storage key
-    - Stores the operation in context
-    - Immediately sends back a success response to the client
-    - Sends a request to delete the value (by setting it to None)
-    - Requests the current key index to update it
-
-3. **Delegate receives the key index** (`handle_key_index_response`):
-    - Removes the key from the index
-    - Updates the index in storage
-    - The operation is complete
-
-## 4. List Operation Flow
-
-When a client wants to list all keys:
-
-1. **Client sends a ListRequest**:
-   ```rust
-   ChatDelegateRequestMsg::ListRequest
-   ```
-
-2. **Delegate processes the request** (`handle_list_request`):
-    - Stores the operation in context
-    - Requests the current key index
-
-3. **Delegate receives the key index** (`handle_key_index_response`):
-    - Sends the list of keys back to the client
-    - The operation is complete
-
-## Key Management
-
-A critical aspect of the delegate is how it manages keys:
-
-1. **Origin-Based Key Namespacing**: Each key is prefixed with the origin contract ID to enforce data partitioning:
-   ```rust
-   pub(crate) fn create_origin_key(origin: &Origin, key: &ChatDelegateKey) -> SecretsId {
-       SecretsId::new(
-           format!("{}{}{}", origin.to_b58(), ORIGIN_KEY_SEPARATOR, 
-                  String::from_utf8_lossy(key.as_bytes()).to_string()).into_bytes()
-       )
-   }
-   ```
-   
-   This ensures that:
-   - Data from different origins is completely isolated
-   - Applications can only access their own data
-   - Key collisions between different applications are impossible
-
-2. **Origin-Specific Key Index**: Each origin has its own separate key index:
-   ```rust
-   pub(crate) fn create_index_key(origin: &Origin) -> SecretsId {
-       SecretsId::new(format!(
-           "{}{}{}",
-           origin.to_b58(),
-           ORIGIN_KEY_SEPARATOR,
-           KEY_INDEX_SUFFIX
-       ).into_bytes())
-   }
-   ```
-   
-   This means:
-   - Each application has its own isolated list of keys
-   - The ListRequest operation only returns keys for the calling application's origin
-   - Applications cannot enumerate keys from other origins
-
-## Context Management
-
-The delegate uses a context object to maintain state between operations:
-
-```rust
-pub(super) struct ChatDelegateContext {
-    pub(super) pending_ops: HashMap<SecretIdKey, PendingOperation>,
-}
-```
-
-This context is serialized and passed along with requests, then deserialized when responses are received.
-
-## Tying It All Together
-
-The overall flow for any operation follows this pattern:
-
-1. **Client Request**: Application sends a request to the delegate
-2. **Initial Processing**: Delegate creates necessary storage keys and stores state in context
-3. **Storage Operations**: Delegate interacts with the storage system
-4. **Response Handling**: Delegate processes storage responses and updates state
-5. **Client Response**: Delegate sends final response back to the application
-
-This asynchronous, multi-step approach allows the delegate to maintain consistency while providing a simple interface to client applications.
-
-## Example: Complete Store Flow
-
-Let's trace a complete store operation with origin partitioning:
-
-1. Client sends `StoreRequest { key: "user123", value: [profile data] }`
-2. Delegate:
-    - Identifies the origin contract ID (e.g., `abc123`) from which the request came
-    - Creates storage key: `abc123:user123` (prefixing the client key with origin)
-    - Creates index key: `abc123::key_index` (origin-specific index)
-    - Stores pending operation in context
-    - Sends success response to client
-    - Sends request to store value at `abc123:user123`
-    - Sends request to get current index at `abc123::key_index`
-3. Delegate receives index (or empty if first key)
-4. Delegate:
-    - Adds "user123" to index if not present
-    - Updates index in storage
-    - Operation complete
-
-If a different application with origin `xyz789` tries to access this data:
-- It would use key `xyz789:user123` which is different from `abc123:user123`
-- It would not find the data stored by the first application
-- It would have its own separate key index at `xyz789::key_index`
-
-This architecture ensures both data consistency and security through origin-based isolation, while providing a responsive experience for client applications.
+**Any change that alters `chat_delegate.wasm` changes the delegate key.**
+That covers this crate, the parts of `common/` it compiles in, and the root `Cargo.lock`.
+Without a migration entry, users lose their rooms.
+Run `cargo make add-migration` before you rebuild, and follow [delegate-migration.md](../../.claude/rules/delegate-migration.md).
+A new storage key also needs migration probes: see "Adding new storage keys" in [river-publish.md](../../.claude/rules/river-publish.md).
