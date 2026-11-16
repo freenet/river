@@ -1,6 +1,14 @@
 ---
 description: When publishing River to Freenet, deploying updates, or discussing the publish/deploy workflow
 globs: []
+paths:
+  - "published-contract/**"
+  - "scripts/*publish*"
+  - "scripts/sign-*"
+  - "pointer-records.toml"
+  - "legacy_delegates.toml"
+  - "common/legacy_room_contracts.toml"
+  - ".github/workflows/release-*.yml"
 ---
 
 # River Publish Workflow
@@ -106,7 +114,7 @@ The bumped counter lands through a small PR, like #686 and #701.
 # the counter. Commit it — EVEN IF the publish reported a failure. See
 # "Version policy" below: the counter is forward-only, because a reported
 # failure is not evidence the state did not land.
-curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | head -5
+curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | grep -o 'Built: [^<]*' | head -1
 git switch -c chore/publish-counter-$(cat published-contract/contract-version.txt)
 git add published-contract/contract-version.txt
 git commit -m "chore(publish): bump webapp contract version to $(cat published-contract/contract-version.txt)"
@@ -181,7 +189,7 @@ The river repo publishes **two things on independent cadences** — do not confl
 |----------|---------------|-------------------|
 | **riverctl** (the CLI) | crates.io (`river-core` + `riverctl`) + GitHub release with prebuilt binaries | **tag-triggered CI** — see below |
 | **River UI** (Dioxus webapp) | Freenet (contract key `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv`) | `cargo make publish-river` (the checklist above) |
-| **Desktop app** (`apps/`, binary `river`) | GitHub release (`river-desktop-v*`) | **tag-triggered CI**, `.github/workflows/release-desktop.yml`; see AGENTS.md "Releasing the desktop app" |
+| **Desktop app** (`apps/`, binary `river`) | GitHub release (`river-desktop-v*`) | **tag-triggered CI**, `.github/workflows/release-desktop.yml`; see `.claude/rules/desktop-release.md` |
 
 They are NOT 1:1 — a CLI-only fix ships riverctl without touching the UI, and a UI-only change publishes to Freenet without a new riverctl. The one coupling is room-contract WASM: when it changes, BOTH must be republished (they embed the WASM and derive the contract key from it).
 

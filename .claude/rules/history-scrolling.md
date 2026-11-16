@@ -11,6 +11,17 @@ globs:
   - ui/tests/*scroll*.spec.ts
   - ui/tests/conversation-history-position.spec.ts
   - ui/tests/room-unread-badge.spec.ts
+paths:
+  - "ui/src/components/conversation.rs"
+  - "ui/src/components/conversation/history_scroll.rs"
+  - "ui/src/components/conversation/history_window.rs"
+  - "ui/src/components/scroll_to_latest.rs"
+  - "ui/src/components/foreground.rs"
+  - "ui/src/components/app/document_title.rs"
+  - "ui/src/components/direct_messages/dm_thread_modal.rs"
+  - "ui/tests/*scroll*.spec.ts"
+  - "ui/tests/conversation-history-position.spec.ts"
+  - "ui/tests/room-unread-badge.spec.ts"
 ---
 
 # History scrolling

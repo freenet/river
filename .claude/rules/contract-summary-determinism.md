@@ -1,3 +1,15 @@
+---
+description: Contract Summary and Delta types must serialize deterministically, and summary digests are wire format
+globs:
+  - common/src/room_state/**
+  - common/src/room_state.rs
+  - common/tests/summary_determinism_test.rs
+paths:
+  - "common/src/room_state/**"
+  - "common/src/room_state.rs"
+  - "common/tests/summary_determinism_test.rs"
+---
+
 # Contract `Summary` / `Delta` Determinism
 
 **Every field in a contract's `ComposableState::Summary` (and any `Delta` whose

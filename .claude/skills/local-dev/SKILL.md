@@ -160,7 +160,8 @@ to verify UI changes without manually opening a browser.
 2. `browser_snapshot` → verify layout and content render correctly
 3. `browser_fill_form` + `browser_click` → test message sending
 4. `browser_console_messages` → check for WASM panics or errors
-5. `browser_resize` → test mobile breakpoints (767px, 480px)
+5. `browser_resize` → test mobile breakpoints (767px, 480px, 320px)
+6. Navigate to `?debug=1` → the debug overlay appears and logs render
 
 **Against example data (no node needed):**
 ```bash
