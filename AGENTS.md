@@ -2,17 +2,8 @@
 
 River is a decentralized group chat on Freenet. Rooms are contracts on the network; there is no server.
 
-## Layout
-
-| Path | What it is |
-|---|---|
-| `common/` | `river-core`: room state types (`ChatRoomStateV1`, members, messages), crypto helpers. Compiled into the contract and delegate WASM |
-| `contracts/room-contract` | Room membership, permissions, message history |
-| `contracts/web-container-contract` | Serves the compiled UI from Freenet |
-| `delegates/chat-delegate` | Per-user private storage, signing, background secret rotation |
-| `ui/` | Dioxus web UI, compiled to WASM. `Invitation` lives here (and a copy in `cli/`), not in `common/` |
-| `cli/` | `riverctl`, the command-line client |
-| `apps/` | Native desktop app. **A separate Cargo workspace** with its own lockfile |
+- `common/` (`river-core`) is compiled into the room contract and chat delegate WASM. `Invitation` is not there: it lives in `ui/`, with a copy in `cli/`.
+- `apps/` is **a separate Cargo workspace** with its own lockfile. `cargo make` does not build it.
 
 ## Commands
 
@@ -23,13 +14,13 @@ cargo make build-ui                  # UI only; keeps the committed contract/del
 cargo make build                     # everything, REBUILDS the contract/delegate WASM
 cargo make test                      # full workspace; run before every PR
 cargo make test-ui                   # river-ui native unit tests (CI-gated)
-cargo make test-room-contract        # also: test-web-container, test-common,
-                                     # test-chat-delegate, test-web-container-integration
 cd common && cargo test private_room # after touching encryption or secret distribution
 cargo make clippy && cargo fmt
 ```
 
 `cargo test -p river-ui --bins` alone fails on a clean tree with "Asset at /assets/styles.css doesn't exist": `ui/assets/styles.css` is a gitignored build product. `cargo make test-ui` runs `cargo make build-tailwind` first.
+
+Use `freenet local` for routine UI work and manual testing. Use `freenet network` only to validate peer-to-peer sync or multi-node behaviour, and say in the PR that you did.
 
 ## Read before you touch
 
@@ -60,6 +51,8 @@ Run `cargo make add-migration` before the WASM changes, and `cargo make sign-poi
 
 `apps/Cargo.toml` and `apps/Cargo.lock` cannot change a key: the WASM builds from the root workspace and lockfile.
 
+Never `git add -A`, `.` or `-u`: it picks up rebuilt, non-reproducible WASM. Add files by name (`wasm-safety.md`).
+
 ### State authorization rule
 
 **Every piece of data in contract state must be cryptographically authorized. Never accept unauthorized data, even as a "temporary" or "lenient" measure.**
@@ -70,7 +63,7 @@ Run `cargo make add-migration` before the WASM changes, and `cargo make sign-poi
 | Member | A valid invitation chain back to the room owner |
 | Ban | Authorization from the room owner's tree |
 
-Verify at insertion time, never "when the data arrives later". If a delta would add data that cannot be verified (a message whose author is not in the member list), include the authorization data in the delta (the member entry beside the message). Do not relax verification: a contract that accepts unverified messages is open to spam, impersonation and state pollution.
+Verify at insertion time, never "when the data arrives later". If a delta would add data that cannot be verified (a message whose author is not in the member list), include the authorization data in the delta (the member entry beside the message); do not relax verification.
 
 Fully authorized state is what makes contract migration permissionless: anyone can move a room's state to a new contract key, and the new contract checks every signature (`contract-upgrade.md`).
 
@@ -102,49 +95,28 @@ Every field of a contract `Summary` serializes deterministically: `BTreeMap`/`BT
 
 ## UI conventions
 
-### Test IDs (`data-testid`)
+Automation targets `data-testid`, never `data-dioxus-id`, which is a render-order index (freenet/river#25). Give every new interactive surface one; it is additive markup only and never changes rendering or logic. Use kebab-case `<surface>-<role>` (`send-message-button`), a plain id for list containers (`room-list`), and `<entity>-item-{id}` for list items (`room-item-{base58(owner_vk)}`, matched by `[data-testid^="room-item-"]`).
 
-Automation targets `data-testid`, never `data-dioxus-id`, which is a render-order index (freenet/river#25). Test IDs are additive markup only: never change rendering or logic for them. Give every new interactive surface one.
+`@source "../src/**/*.rs"` in `ui/assets/tailwind.css` is required, or Tailwind v4 drops responsive utilities like `md:flex`.
 
-| Kind | Pattern | Example |
-|---|---|---|
-| Element | kebab-case `<surface>-<role>` | `create-room-name-input`, `send-message-button`, `member-info-modal` |
-| List container | plain id | `room-list`, `member-list` |
-| List item | `<entity>-item-{id}` | `room-item-{base58(owner_vk)}`, `member-item-{member_id}`; any item: `[data-testid^="room-item-"]` |
-
-### Other UI rules
-
-- `@source "../src/**/*.rs"` in `ui/assets/tailwind.css` is required, or Tailwind v4 drops responsive utilities like `md:flex`.
-- Port 8082 is the Playwright suite's default `baseURL` and is shared between worktrees. Use a free port and `PLAYWRIGHT_BASE_URL` (`ui-testing.md`).
-- Freenet share links in message text (`https://freenet.org/open#<id>…`, `freenet:<id>…`, `freenet://<id>…`) render as links to the reader's own node. `ui/src/util/share_link.rs` must accept exactly what freenet.org/open and freenet-core's `freenet:` handler accept. All three test against one vector file, copied at `ui/src/util/share-link-vectors.json`; the `share-link-vectors.yml` workflow fails when it drifts. Change a rule only together with that file and the other two sides.
-
-## Freenet node
-
-Use `freenet local` for routine UI work and manual testing. Use `freenet network` only to validate peer-to-peer sync or multi-node behaviour, and say in the PR that you did.
+Freenet share links in message text render as links to the reader's own node. `ui/src/util/share_link.rs` must accept exactly what freenet.org/open and freenet-core's `freenet:` handler accept; all three test against one vector file, copied at `ui/src/util/share-link-vectors.json`, and the `share-link-vectors.yml` workflow fails when it drifts. Change a rule only together with that file and the other two sides.
 
 ## Releasing
 
 | Surface | Goes to | How |
 |---|---|---|
-| River UI | Freenet, contract `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv` | `cargo make publish-river` (`river-publish.md`) |
+| River UI | Freenet, contract `raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv` | Run the Playwright suite, then `cargo make publish-river` (`river-publish.md`) |
 | riverctl | crates.io and a GitHub release | Bump `cli/Cargo.toml`, merge, push a `riverctl-v<version>` tag; `release-riverctl.yml` publishes. Never wire UI publishing into that workflow |
-| Desktop app | GitHub release | Push a `river-desktop-v<version>` tag (`desktop-release.md`) |
+| Desktop app | GitHub release (draft) | Push a `river-desktop-v<version>` tag (`desktop-release.md`) |
 
 **The publish counter `published-contract/contract-version.txt` only moves forward.** `cargo make sign-webapp` increments it. Commit the bump even when the publish reports a failure: re-using a version forked the site on 2026-08-04.
 
-Run the Playwright suite before every UI publish. Check what is live:
+Check what is live:
 
 ```bash
 curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/ | grep -o 'Built: [^<]*' | head -1
 ```
 
-### Releasing the desktop app
+## PRs
 
-The full checklist, version floors (`MIN_INSTALL_VERSION`, `MIN_NODE_VERSION`) and signing setup are in `.claude/rules/desktop-release.md`. `.github/workflows/release-desktop.yml` builds and signs the release as a draft.
-
-## PR expectations
-
-- Conventional Commit titles, for example `fix(ui): correct room timestamp format`.
-- Say in the PR body what tests cover the change.
-- When touching contracts, note any redeploy steps.
-- `git add` files by name, never `-A`, `.` or `-u` (`wasm-safety.md`).
+Conventional Commit titles (`fix(ui): ...`). When touching contracts, note any redeploy steps in the body.
