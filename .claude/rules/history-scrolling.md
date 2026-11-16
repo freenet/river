@@ -118,9 +118,14 @@ Current behavior:
 - Below 48rem a row tap, the + or the row's keyboard entry opens the one
   mobile message sheet, a native modal `<dialog>`
   (`conversation/mobile_message_sheet.rs`; its state and input hold are in
-  `conversation/mobile_surface.rs`). A reaction chip opens nothing: a
-  press on it reacts with its emoji, at every width. At 48rem and wider a
-  finger held on a chip, or Shift+Enter, opens its reactor list. While the
+  `conversation/mobile_surface.rs`). A reaction chip never opens the sheet.
+  At every width a touch tap or the keyboard (Enter or Space, no Shift)
+  inspects: it opens the chip's reactor list, which holds the action. A
+  mouse press, or a pen on a fine-pointer screen, reacts with the chip's
+  emoji directly. At 48rem and wider a finger or pen held on a chip opens
+  its list without waiting for the lift. Opening or closing a reactor list,
+  and focus moving along a message's reaction line when a chip is removed,
+  never scroll the history. While the
   sheet is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and the emoji row in its panel still scrolls sideways;

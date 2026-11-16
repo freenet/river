@@ -1180,20 +1180,66 @@ mod tests {
     /// reacted in the example app.
     #[test]
     fn seeded_reactions_survive_a_rebuild_from_signed_actions() {
-        for self_is in [SelfIs::Owner, SelfIs::Member, SelfIs::Observer] {
-            let room = create_room(
-                &"Reaction Room".to_string(),
-                self_is,
-                None,
-                HistoryDepth::Standard,
-            );
-            let mut messages = room.room_data.room_state.recent_messages.clone();
+        let fixtures = [
+            (SelfIs::Owner, HistoryDepth::Standard),
+            (SelfIs::Member, HistoryDepth::Standard),
+            (SelfIs::Observer, HistoryDepth::Standard),
+            (SelfIs::Member, HistoryDepth::Deep),
+            (SelfIs::Member, HistoryDepth::AtCap),
+            (SelfIs::Member, HistoryDepth::TallHead),
+            (SelfIs::Member, HistoryDepth::UnevenTail),
+        ];
+        for (self_is, depth) in fixtures {
+            let can_react = self_is != SelfIs::Observer;
+            let room = create_room(&"Reaction Room".to_string(), self_is, None, depth);
+            let state = &room.room_data.room_state;
+            let mut messages = state.recent_messages.clone();
             let seeded = messages.actions_state.reactions.clone();
             assert_eq!(seeded.len(), 2, "premise: two messages carry reactions");
             messages.rebuild_actions_state();
             assert_eq!(
                 messages.actions_state.reactions, seeded,
                 "a rebuild must reproduce every seeded reaction"
+            );
+
+            // The observer has no authorized signing identity. The other
+            // fixtures also exercise the real accepted-delta path that
+            // rebuilds the projection after a new reaction arrives.
+            if !can_react {
+                continue;
+            }
+            let newest = messages.display_messages().last().unwrap().id();
+            assert!(!seeded.contains_key(&newest));
+            let signing_key = room.room_data.self_sk.as_ref().unwrap();
+            let author = MemberId::from(&signing_key.verifying_key());
+            let action = AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(&room.owner_vk),
+                    author,
+                    time: messages.messages.last().unwrap().message.time + Duration::from_secs(1),
+                    content: RoomMessageBody::reaction(newest.clone(), "🦀".to_string()),
+                },
+                signing_key,
+            );
+            let action_id = action.id();
+            messages
+                .apply_delta(
+                    state,
+                    &ChatRoomParametersV1 {
+                        owner: room.owner_vk,
+                    },
+                    &Some(vec![action]),
+                )
+                .unwrap();
+            assert!(messages.messages.iter().any(|m| m.id() == action_id));
+            assert_eq!(messages.display_messages().last().unwrap().id(), newest);
+            assert_eq!(
+                messages.actions_state.reactions.remove(&newest).unwrap()["🦀"],
+                vec![author]
+            );
+            assert_eq!(
+                messages.actions_state.reactions, seeded,
+                "a real reaction delta must preserve the other standing reactions ({depth:?})"
             );
         }
     }

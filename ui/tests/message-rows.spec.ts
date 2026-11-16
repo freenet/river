@@ -776,7 +776,7 @@ test.describe("Message row hover band", () => {
       await readerScrollsWithoutGesture(page, (await scrollMetrics(page)).max - short);
       await expect(chip).toBeInViewport({ ratio: 1 });
       await chip.focus();
-      await page.keyboard.press("Shift+Enter");
+      await page.keyboard.press("Enter");
       const owners = page.getByTestId("reaction-owners");
       await expect(owners).toBeVisible();
       await expect(chip).toHaveAttribute("aria-expanded", "true");

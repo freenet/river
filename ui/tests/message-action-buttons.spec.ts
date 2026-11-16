@@ -5,7 +5,12 @@ import {
   coarsePointer,
   committedRow,
   controlStates,
+  expectClear,
+  expectTargets,
+  expectUsableLeftGroup,
   FOOTER_CONTROLS,
+  FooterLayout,
+  footerLayout,
   inlineFooter,
   keyboardFocus,
   openRoomWithComposer,
@@ -258,101 +263,8 @@ test.describe("Footer controls on a touch pointer", () => {
   });
 });
 
-/// Every chip and footer control of `row`, with where a hit at its centre and
-/// 1px inside each corner lands, and the boxes it must stay clear of.
-function footerLayout(row: Locator) {
-  return row.evaluate((el) => {
-    const box = (e: Element) => {
-      const r = e.getBoundingClientRect();
-      return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
-    };
-    const hits = (e: Element) => {
-      const r = e.getBoundingClientRect();
-      const points = [
-        [r.left + r.width / 2, r.top + r.height / 2],
-        [r.left + 1, r.top + 1],
-        [r.right - 1, r.top + 1],
-        [r.left + 1, r.bottom - 1],
-        [r.right - 1, r.bottom - 1],
-      ];
-      return points.filter(([x, y]) => {
-        const at = document.elementFromPoint(x, y);
-        return !(at && e.contains(at));
-      });
-    };
-    const left = Array.from(el.querySelectorAll('[data-testid="message-reaction-row"] > *'))
-      .map((wrapper) => wrapper.matches("button") ? wrapper : wrapper.querySelector('[data-testid="reaction-chip"]'))
-      .filter((e): e is Element => !!e)
-      .map((e) => ({ id: e.getAttribute("data-testid")!, box: box(e), misses: e.matches("button") ? hits(e) : [] }));
-    const cluster = Array.from(el.querySelectorAll('[data-testid="message-action-cluster"] button')).map((e) => ({
-      id: e.getAttribute("data-testid")!,
-      box: box(e),
-      misses: hits(e),
-    }));
-    const chipCentreMisses = Array.from(el.querySelectorAll('[data-testid="reaction-chip"]')).filter((c) => {
-      const r = c.getBoundingClientRect();
-      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      return !(at && c.contains(at));
-    }).length;
-    return {
-      left,
-      cluster,
-      chipCentreMisses,
-      body: box(el.querySelector('[data-testid="message-body"]')!),
-      content: box(el.querySelector('[data-testid="message-content"]')!),
-      scroller: box(document.getElementById("chat-scroll-container")!),
-      viewport: document.documentElement.clientWidth,
-    };
-  });
-}
-
-type Box = { left: number; right: number; top: number; bottom: number; width: number; height: number };
-const overlaps = (a: Box, b: Box) =>
-  Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
-
-type Layout = Awaited<ReturnType<typeof footerLayout>>;
-type Control = Layout["left"][number];
-
-/// Targets of the footer's size, each taking every hit inside it.
-function expectTargets(controls: Control[], what: string) {
-  for (const c of controls) {
-    expect(c.box.width, `${what}: ${c.id} width`).toBeGreaterThanOrEqual(26);
-    expect(c.box.height, `${what}: ${c.id} height`).toBeGreaterThanOrEqual(26);
-    expect(c.misses, `${what}: a hit anywhere in ${c.id} reaches it`).toEqual([]);
-  }
-}
-
-/// None of `controls` overlaps another or the message, and each is inside
-/// the content column and the screen.
-function expectClear(controls: Control[], layout: Layout, what: string) {
-  for (let i = 0; i < controls.length; i++) {
-    expect(overlaps(controls[i].box, layout.body), `${what}: ${controls[i].id} clear of the message`).toBe(false);
-    for (let j = i + 1; j < controls.length; j++) {
-      expect(overlaps(controls[i].box, controls[j].box), `${what}: ${controls[i].id} #${i} and ${controls[j].id} #${j} overlap`).toBe(false);
-    }
-    expect(controls[i].box.left).toBeGreaterThanOrEqual(layout.content.left - 0.5);
-    expect(controls[i].box.right).toBeLessThanOrEqual(Math.min(layout.content.right, layout.scroller.right, layout.viewport) + 0.5);
-  }
-}
-
-/// The footer's left group: React after its chips, a footer-sized target,
-/// and every chip taking a hit at its centre.
-function expectUsableLeftGroup(layout: Layout, what: string) {
-  expect(layout.left.at(-1)!.id, `${what}: React ends the left group`).toBe("message-react-button");
-  // React after its last chip: on the same line to its right, or below it.
-  const chips = layout.left.slice(0, -1);
-  const react = layout.left.at(-1)!.box;
-  if (chips.length) {
-    const last = chips.at(-1)!.box;
-    const sameLine = react.top < last.bottom && react.bottom > last.top;
-    expect(sameLine ? react.left >= last.right - 0.5 : react.top >= last.bottom - 0.5, `${what}: React follows the chips`).toBe(true);
-  }
-  expectTargets([layout.left.at(-1)!], what);
-  expect(layout.chipCentreMisses, `${what}: every chip takes a hit at its centre`).toBe(0);
-}
-
 /// A footer on its own line: the left group, then Reply, Edit and Delete.
-function expectUsableFooter(layout: Layout, what: string) {
+function expectUsableFooter(layout: FooterLayout, what: string) {
   expectUsableLeftGroup(layout, what);
   expect(layout.cluster.map((c) => c.id), `${what}: the trailing cluster`).toEqual([
     "message-reply-button",
@@ -412,7 +324,10 @@ test.describe("Footer at 320px", () => {
       if (what === "wrapped chips") {
         const lines = new Set(layout.left.filter((c) => c.id === "reaction-chip").map((c) => Math.round(c.box.top)));
         expect(lines.size, "premise: the chips wrap").toBeGreaterThan(1);
-        expect(await testIds(target.getByTestId("message-reaction-row"))).toEqual(["message-react-button"]);
+        // Chips are native buttons too; there is still exactly one picker invoker.
+        expect(await testIds(target.getByTestId("message-reaction-row"))).toEqual([
+          ...Array(10).fill("reaction-chip"), "message-react-button",
+        ]);
       } else {
         expect(layout.left.map((c) => c.id), "premise: no chips").toEqual(["message-react-button"]);
       }

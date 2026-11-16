@@ -164,6 +164,17 @@
     min-width: 0;
 }
 
+/* Native reaction buttons retain the existing pill's dimensions. */
+.reaction-chip {
+    flex: none;
+    line-height: normal;
+}
+
+.reaction-chip:focus-visible {
+    outline: 2px solid var(--color-link);
+    outline-offset: 2px;
+}
+
 .msg-action-cluster {
     display: flex;
     flex: none;

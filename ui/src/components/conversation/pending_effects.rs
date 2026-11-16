@@ -41,6 +41,9 @@ pub(super) fn apply_pending_effects(
             }
             PendingEffect::React { target, emoji } => {
                 if let Some(m) = find(items, target) {
+                    if !m.reactions.contains_key(emoji) {
+                        m.reaction_order.push(emoji.clone());
+                    }
                     let reactors = m.reactions.entry(emoji.clone()).or_default();
                     if !reactors.contains(&self_id) {
                         reactors.push(self_id);
@@ -53,6 +56,7 @@ pub(super) fn apply_pending_effects(
                         reactors.retain(|r| *r != self_id);
                         if reactors.is_empty() {
                             m.reactions.remove(emoji);
+                            m.reaction_order.retain(|e| e != emoji);
                         }
                     }
                 }
@@ -115,6 +119,7 @@ mod tests {
             message_id: id(n),
             edited: false,
             reactions: HashMap::new(),
+            reaction_order: Vec::new(),
             reply_strip: ReplyStrip::NotAReply,
             receive_delay_secs: None,
         }
@@ -274,5 +279,41 @@ mod tests {
             &HashMap::new(),
         );
         assert!(shown == before);
+    }
+    #[test]
+    fn pending_new_emojis_append_and_removed_then_readded_emojis_restart_at_the_end() {
+        let mut m = message(1, "one");
+        m.reactions.insert("z".into(), vec![me()]);
+        m.reactions.insert(
+            "a".into(),
+            vec![MemberId(freenet_scaffold::util::FastHash(7))],
+        );
+        m.reaction_order = vec!["z".into(), "a".into()];
+        let mut shown = items(vec![m]);
+        apply_pending_effects(
+            &mut shown,
+            &[
+                PendingEffect::Unreact {
+                    target: id(1),
+                    emoji: "z".into(),
+                },
+                PendingEffect::React {
+                    target: id(1),
+                    emoji: "z".into(),
+                },
+                PendingEffect::React {
+                    target: id(1),
+                    emoji: "z".into(),
+                },
+                PendingEffect::React {
+                    target: id(1),
+                    emoji: "b".into(),
+                },
+            ],
+            me(),
+            &HashMap::new(),
+        );
+        assert_eq!(only(&shown)[0].reaction_order, vec!["a", "z", "b"]);
+        assert_eq!(only(&shown)[0].reactions["z"], vec![me()]);
     }
 }

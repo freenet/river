@@ -45,7 +45,7 @@
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::mobile_message_actions::{open_sheet, RowTarget};
 use super::mobile_surface::{narrow_for_render, narrow_now, MobileOpening, Origin, SHEET_ID};
-use super::{now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
+use super::{close_reaction_owners, now_ms, ReactionOwnersPopover, PRESS_FRESH_MS};
 use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW};
 use crate::components::icons::{line_icon, REACT_ICON_PATH};
 use dioxus::prelude::*;
@@ -102,6 +102,11 @@ struct ReactionTarget {
 }
 
 impl ReactionTarget {
+    /// The showing this target was opened in.
+    fn showing(&self) -> Showing {
+        (self.room, self.visit)
+    }
+
     /// The same opening: room, showing and message.
     fn same_opening(&self, other: &Self) -> bool {
         self.room == other.room && self.visit == other.visit && self.row == other.row
@@ -139,11 +144,12 @@ impl ReactionSurfaces {
         mut list: Signal<Option<ReactionOwnersPopover>>,
         popover: ReactionOwnersPopover,
     ) {
-        if list.try_peek().is_err() {
+        if list.try_peek().is_err() || !showing_is_current(popover.showing) {
             return;
         }
         self.close();
         self.close_mobile(false);
+        self.close_owner_list_now();
         if let Ok(mut slot) = self.open_owner_list.try_write() {
             *slot = Some(list);
         }
@@ -181,6 +187,12 @@ impl ReactionSurfaces {
     /// only.
     pub(super) fn close_if_stale(self) {
         self.close_mobile_if_stale();
+        let owners_stale = self
+            .open_owner_showing()
+            .is_some_and(|showing| !showing_is_current(showing));
+        if owners_stale {
+            self.close_owner_list_now();
+        }
         let stale = self
             .target
             .peek()
@@ -215,20 +227,29 @@ impl ReactionSurfaces {
         }
     }
 
-    /// Close whichever group's reactor list is open. A list its group has
-    /// already closed, or a group no longer mounted, is left alone: a write
-    /// notifies its subscribers even when it changes nothing, so it is only
-    /// taken for a list still open, and fallibly, since the group's signal
-    /// may be gone.
+    /// The showing the open reactor list belongs to. `None` when no list is
+    /// open, or when its group (or the conversation) has unmounted: either
+    /// signal may be gone. Only the tuple is copied, never the popover.
+    fn open_owner_showing(self) -> Option<Showing> {
+        let list = (*self.open_owner_list.try_peek().ok()?)?;
+        let open = list.try_peek().ok()?;
+        open.as_ref().map(|popup| popup.showing)
+    }
+
+    /// Whether a live owner list currently owns inspection focus.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn owner_list_is_open(self) -> bool {
+        self.open_owner_showing().is_some()
+    }
+
+    /// Close whichever group's reactor list holds the conversation's slot,
+    /// and empty the slot. A list its group has already closed, or a group no
+    /// longer mounted, is left alone ([`close_reaction_owners`]). A group
+    /// closing its own list calls that directly instead: the slot may by then
+    /// belong to another group.
     pub(super) fn close_owner_list_now(mut self) {
-        let Some(mut list) = self.open_owner_list.take() else {
-            return;
-        };
-        let open = list.try_peek().is_ok_and(|open| open.is_some());
-        if open {
-            if let Ok(mut open) = list.try_write() {
-                *open = None;
-            }
+        if let Some(list) = self.open_owner_list.take() {
+            close_reaction_owners(list);
         }
     }
 }
@@ -248,8 +269,27 @@ pub(super) fn note_room_shown(room: Option<VerifyingKey>) {
     });
 }
 
-pub(super) fn shown_room() -> (Option<VerifyingKey>, u64) {
+/// A room, and which showing of it ([`note_room_shown`]).
+pub(super) type Showing = (Option<VerifyingKey>, u64);
+
+pub(super) fn shown_room() -> Showing {
     SHOWN_ROOM.with(Cell::get)
+}
+
+/// Whether `showing` is still the one on screen: the showing the history
+/// renders now, of the room that is still current. What a reaction surface
+/// (the picker's target, a chip's action, a reactor list) checks inside its
+/// deferred task, before it acts. A `CURRENT_ROOM` that cannot be read is not
+/// current.
+pub(super) fn showing_is_current(showing: Showing) -> bool {
+    CURRENT_ROOM
+        .try_peek()
+        .is_ok_and(|room| showing_matches(showing, shown_room(), room.owner_key))
+}
+
+/// [`showing_is_current`], pure for native tests.
+fn showing_matches(showing: Showing, shown: Showing, current_room: Option<VerifyingKey>) -> bool {
+    showing == shown && showing.0 == current_room
 }
 
 /// Whether `target` is still what the reader opened the picker for: the same
@@ -257,19 +297,7 @@ pub(super) fn shown_room() -> (Option<VerifyingKey>, u64) {
 /// history with its React (not deleted, not out of the rendered range, not
 /// being edited).
 fn target_is_live(target: &ReactionTarget) -> bool {
-    let (room, visit) = shown_room();
-    let current_room = CURRENT_ROOM.try_peek().ok().and_then(|r| r.owner_key);
-    target_matches_room(target, room, visit, current_room) && react_button_exists(&target.row)
-}
-
-/// [`target_is_live`]'s room half, pure for native tests.
-fn target_matches_room(
-    target: &ReactionTarget,
-    shown: Option<VerifyingKey>,
-    visit: u64,
-    current_room: Option<VerifyingKey>,
-) -> bool {
-    target.room == shown && target.visit == visit && target.room == current_room
+    showing_is_current(target.showing()) && react_button_exists(&target.row)
 }
 
 /// The footer React of one message: the only way into the picker, and where
@@ -521,15 +549,13 @@ pub(super) fn ReactionPicker(
         }
     }
     // The window crossing below 48rem turns every React into the mobile
-    // sheet's and leaves the chips no reactor list: an open picker closes,
-    // letting go of its hold and anchor, an open list closes, and nothing
-    // reopens either on the way back.
+    // popup's: close an open desktop picker and release its hold/anchor.
+    // Chip inspection is available at every width; its list stays open.
     let narrow = narrow_for_render();
     let was_narrow = use_hook(|| Rc::new(Cell::new(narrow)));
     if was_narrow.replace(narrow) != narrow && narrow {
         crate::util::defer(move || {
             surfaces.close();
-            surfaces.close_owner_list_now();
         });
     }
     // Unmounted open: nothing held or captured outlives it.
@@ -1206,17 +1232,24 @@ mod tests {
     #[test]
     fn a_target_is_live_only_in_the_showing_it_was_opened_in() {
         let (a, b) = (Some(key(1)), Some(key(2)));
-        let t = target(a, 3, "m");
-        assert!(target_matches_room(&t, a, 3, a));
-        assert!(!target_matches_room(&t, b, 4, b), "another room");
-        assert!(
-            !target_matches_room(&t, a, 5, a),
-            "the same room, shown again"
-        );
-        assert!(
-            !target_matches_room(&t, a, 3, b),
-            "switched, not yet rendered"
-        );
+        let t = target(a, 3, "m").showing();
+        assert_eq!(t, (a, 3), "a target's showing is its room and visit");
+        assert!(showing_matches(t, (a, 3), a));
+        assert!(!showing_matches(t, (b, 4), b), "another room");
+        assert!(!showing_matches(t, (a, 5), a), "the same room, shown again");
+        assert!(!showing_matches(t, (a, 3), b), "switched, not yet rendered");
+        assert!(!showing_matches(t, (a, 3), None), "no current room");
+    }
+
+    /// With no room on either side the comparison still holds, so the caller
+    /// decides what an unreadable current room means: [`showing_is_current`]
+    /// answers false there without asking.
+    #[test]
+    fn a_showing_with_no_room_matches_only_no_current_room() {
+        let a = Some(key(1));
+        assert!(showing_matches((None, 2), (None, 2), None));
+        assert!(!showing_matches((None, 2), (None, 2), a));
+        assert!(!showing_matches((None, 2), (None, 3), None));
     }
 
     /// A pick acts on the opening it was made in, whatever the reader's
