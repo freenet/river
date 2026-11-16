@@ -24,7 +24,7 @@ Use `freenet local` for routine UI work and manual testing. Use `freenet network
 
 ## Read before you touch
 
-Rule files in `.claude/rules/` load automatically when you open a matching file. If your tool does not load them, read the one for your task first.
+Rule files in `.claude/rules/` load automatically only when you open a matching file. A command-driven task (publishing, releasing, a dependency bump) may open none, and other tools load none, so read the rule for your task first.
 
 | If you are about to... | Read |
 |---|---|
@@ -72,7 +72,7 @@ Fully authorized state is what makes contract migration permissionless: anyone c
 `ChatRoomStateV1` and all its sub-types must stay backwards-compatible.
 
 - New fields use `#[serde(default)]`.
-- **On an individually signed sub-struct** (`MemberInfo`, `Member`, `UserBan`, `MessageV1`, `Configuration`: anything in an `Authorized…` wrapper whose signature covers its ciborium bytes), a new field needs **both** `#[serde(default)]` **and** `#[serde(skip_serializing_if = …)]`, so the empty value serializes byte-identically to the old record. Plain `#[serde(default)]` re-serializes a wider struct, every existing signature fails, and every room migrates to empty. Put the field last, never reorder, and add a byte-identity test (see `member_info.rs::empty_deputies_serializes_identically_to_legacy_member_info`, #410).
+- **On an individually signed sub-struct** (`MemberInfo`, `Member`, `UserBan`, `MessageV1`, `Configuration`: anything in an `Authorized…` wrapper whose signature covers its ciborium bytes), a new field needs **both** `#[serde(default)]` **and** `#[serde(skip_serializing_if = …)]`, so the empty value serializes byte-identically to the old record. Plain `#[serde(default)]` re-serializes a wider struct, every existing signature fails, and every room migrates to empty; it is safe only on unsigned containers. Put the field last, never reorder, and add a byte-identity test (see `member_info.rs::empty_deputies_serializes_identically_to_legacy_member_info`, #410).
 - Never remove or rename a field, or change how an existing field serializes.
 - A truly breaking change needs a V2 type with an explicit migration (a separate project).
 
@@ -119,4 +119,4 @@ curl -s http://127.0.0.1:7509/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSW
 
 ## PRs
 
-Conventional Commit titles (`fix(ui): ...`). When touching contracts, note any redeploy steps in the body.
+Conventional Commit titles (`fix(ui): ...`). The body says why, what tests cover the change, and, when touching contracts, any redeploy steps.

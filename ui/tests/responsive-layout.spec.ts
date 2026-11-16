@@ -240,7 +240,7 @@ test.describe("Sandboxed iframe embedding", () => {
   // `src` is the only thing pointing at the app — `baseURL` does not apply to
   // it automatically. Hardcoding `http://localhost:8082` made them test
   // whatever happened to be on the suite's DEFAULT port rather than the build
-  // under test, which is exactly the shared-port trap AGENTS.md warns about:
+  // under test, which is exactly the shared-port trap .claude/rules/ui-testing.md warns about:
   // run the suite against a second checkout on another port (or with 8082
   // already taken by someone else's server) and these two silently measured a
   // different build. Read the same env var the other specs use.

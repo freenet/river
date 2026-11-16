@@ -579,7 +579,7 @@ fn escape_html_attr(s: &str) -> String {
 /// `/v1/contract/web/` (or `/v2/…`), which is what gateway hosting looks like to the
 /// browser. Returning false here suppresses the host-stripping href rewrite
 /// for `dx serve`, `cargo make dev-example`, and the static-server flows
-/// documented in AGENTS.md, where rewriting `https://gw.example/v1/...` to
+/// documented in .claude/rules/ui-testing.md, where rewriting `https://gw.example/v1/...` to
 /// `/v1/...` would only break the link (the dev server has no gateway
 /// behind it). Label beautification is unconditional — that's purely
 /// cosmetic and doesn't depend on the hosting environment.

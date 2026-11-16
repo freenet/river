@@ -12,6 +12,8 @@ globs:
   - cli/src/storage.rs
   - delegates/chat-delegate/src/subscription.rs
   - common/tests/private_room_test.rs
+  - common/src/room_state/member_info.rs
+  - common/src/room_state/member.rs
 paths:
   - "common/src/room_state/privacy.rs"
   - "common/src/room_state/secret.rs"
@@ -24,6 +26,8 @@ paths:
   - "cli/src/storage.rs"
   - "delegates/chat-delegate/src/subscription.rs"
   - "common/tests/private_room_test.rs"
+  - "common/src/room_state/member_info.rs"
+  - "common/src/room_state/member.rs"
 ---
 
 # Private Room Support
