@@ -23,7 +23,7 @@ The handlers are in `src/handlers.rs`, except `EnsureRoomSubscription`, which is
 | `SignMessage`, `SignMember`, `SignBan`, `SignConfig`, `SignMemberInfo`, `SignSecretVersion`, `SignEncryptedSecret`, `SignUpgrade` | Signs the bytes it is given with the room's signing key. It does not decode them | `SignResponse`, echoing `request_id` |
 | `EnsureRoomSubscription` | Records the room's contract ID and subscribes to that contract. It refuses when no signing key is on file | `EnsureRoomSubscriptionResponse`, plus a `SubscribeContractRequest` to the node |
 
-`CasStoreResult` is `Stored { generation }`, `Conflict { current_generation, current_value }` or `Failed`.
+`CasStoreResult` is `Stored { generation }`, `Conflict { current_generation, current_value }` or `Failed(String)`.
 A conflict writes nothing.
 
 ## Origin partitioning

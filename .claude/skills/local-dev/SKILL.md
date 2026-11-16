@@ -81,7 +81,7 @@ cargo build --release --target wasm32-unknown-unknown -p web-container-contract 
 
 ```bash
 cargo make dev                     # dx serve with hot reload (localhost:8080)
-cargo make dev-example             # dx serve with example data (no network needed)
+cargo make dev-example             # dx serve with example data (Freenet sync stays on)
 ```
 
 ## Fast Iteration Loop

@@ -416,7 +416,7 @@ running and keeps retrying.
 ## Configuration
 
 - `--node-url <URL>`: override the Freenet node URL (default `ws://127.0.0.1:7509/...`).
-- `--config-dir <PATH>`: override where `riverctl` stores room data and signing keys (default follows `XDG_CONFIG_HOME` conventions).
+- `--config-dir <PATH>`: override where `riverctl` stores room data and signing keys (then the `RIVER_CONFIG_DIR` env var; default is the platform data dir, e.g. `~/.local/share/river` on Linux).
 - `--log-file <PATH>`: write logs to a file instead of stderr (stdout is reserved for command output).
 - `RIVERCTL_LOG_FILE` env var: same as `--log-file`.
 
@@ -438,7 +438,7 @@ rebuilding. Two tasks keep the CLI's bundled copy in sync:
 | `cargo make sync-wasm` | Rebuilds every contract and delegate WASM and copies each to its committed locations, `cli/contracts/` included |
 | `cargo make sync-cli-wasm` | Copies `ui/public/contracts/room_contract.wasm` to `cli/contracts/` |
 
-The CLI build panics if the bundled WASM drifts from the most recently built
+The CLI build fails if the bundled WASM drifts from the most recently built
 artifact.
 
 An integration smoke test lives at `tests/message_flow.rs`. It is `#[ignore]` by

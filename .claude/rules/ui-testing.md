@@ -22,7 +22,7 @@ paths:
 | `example-data` | Sample rooms, members, messages and reactions (enough to test the emoji picker) |
 | `no-sync` | No Freenet connection, no WebSocket |
 
-`dx serve` sometimes needs a manual restart. Check `/tmp/dx-serve-new.log` for build errors when the UI does not update.
+`dx serve` sometimes needs a manual restart. Check its output for build errors when the UI does not update.
 
 ## Playwright suite
 
@@ -46,10 +46,7 @@ npx playwright test --project=webkit --grep "iframe"
 | 1280px after mobile | Desktop layout recovers |
 | Sandboxed iframe | Matches the Freenet gateway's embedding |
 
-| Directory | Runs against | Where |
-|---|---|---|
-| `ui/tests/` | `dx build` with example data | CI |
-| `e2e-test/` | A real Freenet node | Manual |
+The suite in `ui/tests/` runs against a `dx build` with example data, in CI.
 
 ## Know which build you are testing
 
@@ -63,7 +60,7 @@ Three ways a run measures the wrong thing. All three hit in one session (2026-07
 
 ## Playwright MCP
 
-The Playwright MCP plugin is enabled in `.claude/settings.local.json`. The `local-dev` skill has the step-by-step flows. Use MCP for exploratory checks and debugging one issue. Use the suite for regressions across browsers and viewports.
+The Playwright MCP plugin is enabled in `.claude/settings.json`. The `local-dev` skill has the step-by-step flows. Use MCP for exploratory checks and debugging one issue. Use the suite for regressions across browsers and viewports.
 
 ## Tailwind
 

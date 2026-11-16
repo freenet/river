@@ -2,7 +2,7 @@
 
 River is a decentralized group chat on Freenet. Rooms are contracts on the network; there is no server.
 
-- `common/` (`river-core`) is compiled into the room contract and chat delegate WASM. `Invitation` is not there: it lives in `ui/`, with a copy in `cli/`.
+- `common/` (`river-core`) is compiled into the room contract and chat delegate WASM, except modules behind client-only features (`invitation`, `stored-rooms`, `ecies-client`, ...).
 - `apps/` is **a separate Cargo workspace** with its own lockfile. `cargo make` does not build it.
 
 ## Commands
@@ -10,9 +10,9 @@ River is a decentralized group chat on Freenet. Rooms are contracts on the netwo
 ```bash
 cargo make dev-example               # dx serve with example data (Freenet sync stays on)
 cargo make build-ui-example-no-sync  # UI with example data, no Freenet connection
-cargo make build-ui                  # UI only; keeps the committed contract/delegate WASM
-cargo make build                     # everything, REBUILDS the contract/delegate WASM
-cargo make test                      # full workspace; run before every PR
+cargo make build                     # UI + web container; embeds the committed contract/delegate WASM
+cargo make sync-wasm                 # the only task that rebuilds the committed WASM (re-keys: see below)
+cargo make test                      # contracts, common, delegate; run before every PR
 cargo make test-ui                   # river-ui native unit tests (CI-gated)
 cd common && cargo test private_room # after touching encryption or secret distribution
 cargo make clippy && cargo fmt
