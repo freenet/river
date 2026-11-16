@@ -7,6 +7,13 @@ globs:
   - ui/src/components/direct_messages/**
   - cli/src/commands/dm.rs
   - cli/src/private_room.rs
+paths:
+  - "common/src/room_state/direct_messages.rs"
+  - "common/src/ecies.rs"
+  - "common/src/chat_delegate.rs"
+  - "ui/src/components/direct_messages/**"
+  - "cli/src/commands/dm.rs"
+  - "cli/src/private_room.rs"
 ---
 
 # In-Room Direct Messages

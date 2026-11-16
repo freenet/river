@@ -6,6 +6,12 @@ globs:
   - contracts/**
   - Cargo.toml
   - Cargo.lock
+paths:
+  - "common/**"
+  - "delegates/**"
+  - "contracts/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
 ---
 
 # Delegate & Contract WASM Migration Required
@@ -55,16 +61,11 @@ the same `freenet_migrate_build::codegen()` call; the `river-core`
 the `common` crate (not the repo root) so it ships with the published
 `river-core` crate and riverctl keeps the full registry.
 
-The UI also uses it on every room-contract re-key, not only for dormant rooms:
-`start_rekey_merge` (`ui/src/components/app/freenet_api/backward_probe.rs`)
-reads the generations from the newest down to the one a room was last synced
-under and merges them in before seeding the new key (freenet/river#769). Its
-durable marker is `RoomData::rekey_merge` (`RekeyMerge::owed`), deliberately
-separate from `previous_contract_key` (which older builds set on every re-key
-and never cleared). A room whose `previous_contract_key` is a registry
-generation owes one merge from it even when nothing else was recorded, which
-recovers devices that re-keyed on a build without the merge
-(freenet/river#771).
+The UI also reads it on every room-contract re-key, in `start_rekey_merge`
+(`ui/src/components/app/freenet_api/backward_probe.rs`). Its durable marker is
+`RoomData::rekey_merge` (`RekeyMerge::owed`), deliberately separate from
+`previous_contract_key`, which older builds set on every re-key and never
+cleared. The full flow is in `.claude/rules/contract-upgrade.md`.
 
 ## Upgrade Workflow
 

@@ -2,6 +2,8 @@
 description: When working on UI components, signal mutations, or Dioxus runtime interactions — required reading for any change under ui/src/components/ or ui/src/util.rs
 globs:
   - ui/src/**/*.rs
+paths:
+  - "ui/src/**/*.rs"
 ---
 
 # Dioxus WASM Signal Safety Rules

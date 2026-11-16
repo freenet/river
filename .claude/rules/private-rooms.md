@@ -12,6 +12,18 @@ globs:
   - cli/src/storage.rs
   - delegates/chat-delegate/src/subscription.rs
   - common/tests/private_room_test.rs
+paths:
+  - "common/src/room_state/privacy.rs"
+  - "common/src/room_state/secret.rs"
+  - "common/src/room_state/configuration.rs"
+  - "common/src/key_derivation.rs"
+  - "common/src/ecies.rs"
+  - "ui/src/util/ecies.rs"
+  - "ui/src/room_data.rs"
+  - "cli/src/private_room.rs"
+  - "cli/src/storage.rs"
+  - "delegates/chat-delegate/src/subscription.rs"
+  - "common/tests/private_room_test.rs"
 ---
 
 # Private Room Support
