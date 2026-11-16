@@ -1,4 +1,5 @@
-import { expect, Locator, Page } from "@playwright/test";
+import { CDPSession, expect, Locator, Page, test } from "@playwright/test";
+import { callRiverTest } from "./river-test";
 
 export async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
@@ -109,6 +110,16 @@ export async function openRoomWithComposer(page: Page) {
   await expect(page.getByTestId("message-composer")).toBeVisible({ timeout: 5_000 });
 }
 
+/// `openRoomWithComposer`, then a received message with no reactions at the
+/// end of the history. Returns its row.
+export async function openRoomWithTarget(page: Page): Promise<Locator> {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "appendMessage", "react target");
+  const row = committedRow(page, "react target");
+  await expect(row).toBeVisible({ timeout: 5_000 });
+  return row;
+}
+
 /// The signed message in the room history holding `text` (a pending send is
 /// a `pending-message`, not one of these).
 export function committedRow(page: Page, text: string): Locator {
@@ -153,8 +164,7 @@ export async function openOwnMessageEdit(page: Page, message?: Locator): Promise
   const ownRow = message ?? page.locator('[id^="msg-"][data-message-self="true"]').first();
   await expect(ownRow).toBeVisible();
   if (!message) await ownRow.scrollIntoViewIfNeeded();
-  await revealFooter(page, ownRow);
-  await ownRow.getByTestId("message-edit-button").click();
+  await clickFooter(page, ownRow, "message-edit-button");
   const editArea = page.locator('textarea[id^="edit-msg-"]');
   await expect(editArea).toBeVisible({ timeout: 5_000 });
   return editArea;
@@ -239,24 +249,402 @@ export async function revealFooter(page: Page, row: Locator) {
   if (!(await coarsePointer(page))) await row.hover({ position: { x: 4, y: 4 } });
 }
 
+/// For each of `row`'s controls in `ids` (test ids): its opacity once its
+/// transitions end, and whether it takes a hit at its centre.
+export function controlStates(row: Locator, ids: string[]) {
+  return row.evaluate(async (el, ids) => {
+    const out: Record<string, { opacity: string; hit: boolean }> = {};
+    for (const id of ids) {
+      const b = el.querySelector(`[data-testid="${id}"]`) as HTMLElement;
+      await Promise.all(b.getAnimations().map((a) => a.finished));
+      const r = b.getBoundingClientRect();
+      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      out[id] = { opacity: getComputedStyle(b).opacity, hit: !!at && b.contains(at) };
+    }
+    return out;
+  }, ids);
+}
+
+/// A control `controlStates` found shown and taking its own hits.
+export const SHOWN = { opacity: "1", hit: true };
+
+/// Footer test ids and the sheet action that replaces each below 48rem.
+const SHEET_ACTIONS: Record<string, string> = {
+  "message-reply-button": "mobile-message-action-reply",
+  "message-edit-button": "mobile-message-action-edit",
+  "message-delete-button": "mobile-message-action-delete",
+};
+
 /// Click one of `row`'s footer controls by its test id, revealing it first.
+/// Below 48rem Reply, Edit and Delete are not in the footer: a tap on the
+/// row opens them in the message sheet, and this goes that way.
 export async function clickFooter(page: Page, row: Locator, testid: string) {
+  const sheetAction = SHEET_ACTIONS[testid];
+  if (sheetAction && (await narrowLayout(page))) {
+    await openSheetFromRow(page, row);
+    await press(page.getByTestId(sheetAction));
+    await expect(sheet(page)).toBeHidden();
+    return;
+  }
   await revealFooter(page, row);
   await row.getByTestId(testid).click();
 }
 
-/// Open `row`'s inline reaction picker through its footer React, the only
-/// way in.
+/// Open `row`'s reaction choices through its footer React, the only way in:
+/// the anchored picker at 48rem and wider; below it, the message sheet and
+/// its row of choices.
 export async function openInlinePicker(page: Page, row: Locator) {
+  if (await narrowLayout(page)) {
+    await openSheetFromReact(page, row);
+    await expect(palette(page)).toBeVisible();
+    return;
+  }
   await clickFooter(page, row, "message-react-button");
+}
+
+/// The emoji buttons of whichever reaction choices `openInlinePicker` opened.
+export async function reactionChoices(page: Page): Promise<Locator> {
+  return (await narrowLayout(page)) ? choices(page) : page.getByTestId("emoji-picker").getByRole("button");
 }
 
 /// React to `row` with the picker's first emoji. Expects the row to end with
 /// exactly one reaction chip, so pass a row that has none.
 export async function reactTo(page: Page, row: Locator): Promise<Locator> {
   await openInlinePicker(page, row);
-  await page.getByTestId("emoji-picker").getByRole("button").first().click();
-  const chip = row.getByTestId("reaction-chip");
+  await press((await reactionChoices(page)).first());
+  const chip = chips(row);
   await expect(chip).toHaveCount(1);
   return chip;
+}
+
+/// Below Tailwind's `md` (48rem), the query `main.css` and the app use: a
+/// row's Reply, Edit and Delete are in its message sheet, which its + opens
+/// too.
+export function narrowLayout(page: Page): Promise<boolean> {
+  return page.evaluate(() => window.matchMedia("not all and (min-width: 48rem)").matches);
+}
+
+/// A phone project's test of the desktop footer or the anchored reaction
+/// picker runs at a touch tablet's width: below 48rem a row's actions and
+/// reactions are in the mobile message sheet instead. Keeps the height, and
+/// the device's touch input, so the wide coarse-pointer case stays covered.
+export async function asTouchTablet(page: Page) {
+  const vp = page.viewportSize();
+  if (vp && vp.width < 768) await page.setViewportSize({ width: 834, height: vp.height });
+}
+
+/// Whether this test's context has touch input, so `tap()` works: the
+/// project's device, whatever width a test sets.
+export function hasTouch(): boolean {
+  return test.info().project.use.hasTouch === true;
+}
+
+/// Press `target` as the reader would: a tap where touch is available, else
+/// a click.
+export async function press(target: Locator) {
+  if (hasTouch()) await target.tap();
+  else await target.click();
+}
+
+/// Press the page at a point as the reader would: a tap where touch is
+/// available, else a click.
+export async function pressAt(page: Page, { x, y }: { x: number; y: number }) {
+  if (hasTouch()) await page.touchscreen.tap(x, y);
+  else await page.mouse.click(x, y);
+}
+
+/// A pointer down on `chip`, held past the app's hold time (CHIP_HOLD_MS,
+/// 500). Returns the lift, which also sends the click a browser sends when
+/// the pointer lifts. Dispatched events: outside Chromium's input protocol
+/// Playwright has no touch hold, and the app decides a hold on the
+/// `pointerdown`'s type and a timer alone.
+export async function holdChip(page: Page, chip: Locator): Promise<() => Promise<void>> {
+  const fire = (type: string) =>
+    chip.evaluate((el, type) => {
+      const r = el.getBoundingClientRect();
+      el.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          pointerId: 7,
+          pointerType: "touch",
+          isPrimary: true,
+          clientX: r.left + r.width / 2,
+          clientY: r.top + r.height / 2,
+        }),
+      );
+    }, type);
+  await chip.scrollIntoViewIfNeeded();
+  await fire("pointerdown");
+  await page.waitForTimeout(700);
+  return async () => {
+    await fire("pointerup");
+    await chip.evaluate((el) => (el as HTMLElement).click());
+  };
+}
+
+/// The mobile message sheet's id and test id: the one dialog a row tap, a
+/// row's + or its keyboard entry opens below 48rem.
+export const SHEET = "mobile-message-sheet";
+
+export function sheet(page: Page): Locator {
+  return page.getByTestId(SHEET);
+}
+
+/// The test id of the backdrop inside it: what a tap outside the panel lands
+/// on.
+export const BACKDROP = `${SHEET}-backdrop`;
+
+/// Its panel, as a selector.
+export const PANEL = `#${SHEET} .mobile-sheet-panel`;
+
+/// The sheet's row of emoji choices.
+export function palette(page: Page): Locator {
+  return page.getByTestId("mobile-reaction-palette");
+}
+
+/// The 16 emoji buttons in it.
+export function choices(page: Page): Locator {
+  return palette(page).getByRole("button");
+}
+
+/// `row`'s reaction chips.
+export function chips(row: Locator): Locator {
+  return row.getByTestId("reaction-chip");
+}
+
+/// The message key a row's id carries (`msg-<key>`), as the sheet's
+/// `data-target-row` names it.
+export async function rowKey(row: Locator): Promise<string> {
+  return (await row.getAttribute("id"))!.replace(/^msg-/, "");
+}
+
+/// The middle of `target`'s box, in whole px: where a finger or the mouse
+/// goes down on it.
+export async function centreOf(target: Locator): Promise<[number, number]> {
+  const box = (await target.boundingBox())!;
+  return [Math.round(box.x + box.width / 2), Math.round(box.y + box.height / 2)];
+}
+
+/// A point on `row` where a tap lands on the row itself: inside it, on
+/// nothing with a behaviour of its own (links, buttons, chips, the avatar).
+export async function plainPointOf(row: Locator): Promise<{ x: number; y: number }> {
+  await row.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    const view = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    if (r.top < view.top || r.bottom > view.bottom) el.scrollIntoView({ block: "center" });
+  });
+  const find = () => row.evaluate((el) => {
+    const interactive =
+      'a, button, input, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"]), [data-row-actions="exclude"], [data-member-id]';
+    const content = el.querySelector('[data-testid="message-content"]')!.getBoundingClientRect();
+    const body = el.querySelector('[data-testid="message-body"]')?.getBoundingClientRect() ?? content;
+    // Hover can reveal inline controls between measuring and pressing.
+    const controlBoxes = Array.from(el.querySelectorAll(interactive)).map((e) => e.getBoundingClientRect());
+    const candidates: [number, number][] = [];
+    // The body's lines, then the empty end of the content column, then its edges.
+    for (const fy of [0.5, 0.25, 0.75, 0.1, 0.9]) {
+      for (const fx of [0.98, 0.9, 0.75, 0.5, 0.25, 0.05]) {
+        candidates.push([body.left + body.width * fx, body.top + body.height * fy]);
+      }
+    }
+    for (const fy of [0.05, 0.5, 0.95]) candidates.push([content.right - 3, content.top + content.height * fy]);
+    for (const [x, y] of candidates) {
+      if (controlBoxes.some((r) => x >= r.left && x < r.right && y >= r.top && y < r.bottom)) continue;
+      const at = document.elementFromPoint(x, y);
+      if (!at || !el.contains(at)) continue;
+      const control = at.closest(interactive);
+      if (control && el.contains(control)) continue;
+      return { x, y };
+    }
+    return null;
+  });
+  // Still: a row that just committed, or a history still following, can
+  // move between measuring the point and pressing it.
+  await expect
+    .poll(
+      () =>
+        row.evaluate(
+          (el) =>
+            new Promise<boolean>((resolve) => {
+              const a = el.getBoundingClientRect().top;
+              requestAnimationFrame(() => requestAnimationFrame(() => resolve(el.getBoundingClientRect().top === a)));
+            }),
+        ),
+      { message: "the row holds still", timeout: 5_000 },
+    )
+    .toBe(true);
+  // Polled: a dialog closing a moment ago may still cover it.
+  let point: { x: number; y: number } | null = null;
+  await expect.poll(async () => (point = await find()) !== null, { message: "a plain point on the row to tap", timeout: 5_000 }).toBe(true);
+  return point!;
+}
+
+/// Tap (or click) `row` on a plain point, as a reader opening its sheet.
+export async function tapRow(page: Page, row: Locator) {
+  await pressAt(page, await plainPointOf(row));
+}
+
+/// How long after a pointer opens the sheet a pointer's click in it is
+/// ignored (OPEN_GUARD_MS, mobile_sheet_drag.rs): a double tap's second tap.
+export const SHEET_OPEN_GUARD_MS = 350;
+
+/// The sheet is open for `row` and its opening slide has ended: until then
+/// the panel is partly below the screen, so a point measured in it is not
+/// where it will be, or is on nothing.
+export async function expectSheetOpenFor(page: Page, row: Locator) {
+  await expect(sheet(page)).toBeVisible();
+  await expect(sheet(page)).toHaveAttribute("data-target-row", await rowKey(row));
+  // Visible is never before shown, so this outlasts the guard.
+  await page.waitForTimeout(SHEET_OPEN_GUARD_MS);
+  await panelAtRest(page);
+}
+
+/// Below 48rem: open `row`'s sheet with a tap on the row, and wait until it
+/// is open for that row and at rest.
+export async function openSheetFromRow(page: Page, row: Locator) {
+  await tapRow(page, row);
+  await expectSheetOpenFor(page, row);
+}
+
+/// Below 48rem: open `row`'s sheet with its +, and wait until it is open
+/// for that row and at rest.
+export async function openSheetFromReact(page: Page, row: Locator) {
+  await press(row.getByTestId("message-react-button"));
+  await expectSheetOpenFor(page, row);
+}
+
+/// A point over the history's top, below the header.
+export async function historyPoint(page: Page): Promise<{ x: number; y: number }> {
+  const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+  return { x: view.x + 40, y: view.y + 30 };
+}
+
+/// How far the open sheet's panel sits below its rest position now, in px
+/// (its computed `transform`; the opening slide's `translate` is not
+/// counted).
+export function panelOffset(page: Page): Promise<number> {
+  return page.evaluate((panel) => new DOMMatrix(getComputedStyle(document.querySelector(panel)!).transform).m42, PANEL);
+}
+
+/// How far the open sheet's panel sits above the bottom of the viewport, in
+/// px (0 at rest; the opening slide counts).
+export function panelBottomGap(page: Page): Promise<number> {
+  return page.evaluate((panel) => window.innerHeight - document.querySelector(panel)!.getBoundingClientRect().bottom, PANEL);
+}
+
+/// Wait until the open sheet's panel has no slide or transition running.
+export async function panelAtRest(page: Page) {
+  await page.waitForFunction(
+    (panel) => document.querySelector(panel)?.getAnimations().every((a) => a.playState !== "running") ?? false,
+    PANEL,
+  );
+}
+
+/// Whether a one- (or two-) finger `touchmove` at the point is cancelled,
+/// dispatched on whatever is there, as the browser would.
+export function touchmovePrevented(page: Page, x: number, y: number, fingers = 1): Promise<boolean> {
+  return page.evaluate(
+    ({ x, y, fingers }) => {
+      const target = document.elementFromPoint(x, y)!;
+      const e = new Event("touchmove", { bubbles: true, cancelable: true });
+      Object.defineProperty(e, "touches", { value: { length: fingers } });
+      target.dispatchEvent(e);
+      return e.defaultPrevented;
+    },
+    { x, y, fingers },
+  );
+}
+
+/// Whether a synthetic, cancelable wheel dispatched where (x, y) lands was
+/// cancelled: the hold's handler contract, not the browser's scroll or zoom.
+export function wheelCancelled(page: Page, x: number, y: number, ctrlKey: boolean): Promise<boolean> {
+  return page.evaluate(
+    ([x, y, ctrlKey]) => {
+      const at = document.elementFromPoint(x, y)!;
+      const wheel = new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: y, ctrlKey, bubbles: true, cancelable: true });
+      return !at.dispatchEvent(wheel);
+    },
+    [x, y, ctrlKey] as const,
+  );
+}
+
+/// How far a test finger drags by default.
+export const DRAG_PX = 80;
+
+type Finger = { x: number; y: number };
+
+/// Fingers on the screen, through Chromium's input protocol: the browser
+/// hit-tests them, fires pointer and touch events, captures and scrolls as it
+/// does for a real finger. Spelled out as touchStart, touchMove a frame apart,
+/// touchEnd: `Input.synthesizeScrollGesture` with a touch source fires no
+/// touchmove and scrolls nothing in Linux headless Chromium (CI), picker open
+/// or not.
+export class Fingers {
+  private down = new Map<number, Finger>();
+  constructor(readonly cdp: CDPSession) {}
+
+  private send(type: "touchStart" | "touchMove" | "touchEnd" | "touchCancel") {
+    const touchPoints = type === "touchEnd" || type === "touchCancel" ? [] : [...this.down].map(([id, p]) => ({ id, x: p.x, y: p.y }));
+    return this.cdp.send("Input.dispatchTouchEvent", { type, touchPoints });
+  }
+
+  get anyDown(): boolean {
+    return this.down.size > 0;
+  }
+
+  /// Put fingers down, together.
+  async press(...fingers: [number, number, number][]) {
+    for (const [id, x, y] of fingers) this.down.set(id, { x, y });
+    await this.send("touchStart");
+  }
+
+  /// Move each finger by its own distance, vertical alone or `[dx, dy]`, in
+  /// steps a frame apart.
+  async move(moves: Record<number, number | [number, number]>, steps = 10) {
+    const from = new Map([...this.down].map(([id, p]) => [id, { ...p }]));
+    for (let i = 1; i <= steps; i++) {
+      for (const [id, by] of Object.entries(moves)) {
+        const [dx, dy] = typeof by === "number" ? [0, by] : by;
+        const [f, at] = [from.get(Number(id))!, this.down.get(Number(id))!];
+        at.x = f.x + (dx * i) / steps;
+        at.y = f.y + (dy * i) / steps;
+      }
+      await this.send("touchMove");
+      await new Promise((r) => setTimeout(r, 16));
+    }
+  }
+
+  /// Every finger lifts.
+  async lift() {
+    this.down.clear();
+    await this.send("touchEnd");
+  }
+
+  /// The browser cancels every finger.
+  async cancel() {
+    this.down.clear();
+    await this.send("touchCancel");
+  }
+
+  /// One finger, down at (x, y), dragged `dy` and lifted.
+  async drag(x: number, y: number, dy = DRAG_PX) {
+    await this.press([1, x, y]);
+    await this.move({ 1: dy });
+    await this.lift();
+  }
+}
+
+/// Run `body` with fingers on `page`, every one lifted and the session
+/// detached afterwards, whatever happens.
+export async function withFingers(page: Page, body: (fingers: Fingers) => Promise<void>) {
+  const cdp = await page.context().newCDPSession(page);
+  const fingers = new Fingers(cdp);
+  try {
+    await body(fingers);
+  } finally {
+    if (fingers.anyDown) await fingers.cancel().catch(() => {});
+    await cdp.detach();
+  }
 }

@@ -196,13 +196,11 @@ pub static MEMBERS_PANEL_OPEN: GlobalSignal<Option<bool>> = Global::new(|| None)
 
 /// Whether the window is at least `lg` wide (64rem, 1024px at the default
 /// font size), the automatic member panel's breakpoint, kept current by a
-/// `matchMedia` change listener
-/// (`install_wide_viewport_listener`). Read for the toggle's pressed state;
-/// the panel itself is shown or hidden by CSS.
+/// `matchMedia` change listener (installed from `App`). Read for the toggle's
+/// pressed state; the panel itself is shown or hidden by CSS.
 pub static WIDE_VIEWPORT: GlobalSignal<bool> = Global::new(wide_viewport_now);
 
 /// The media query behind [`WIDE_VIEWPORT`]; Tailwind's `lg`.
-#[cfg(target_arch = "wasm32")]
 /// In rem, as Tailwind's `lg:` is, so both follow the reader's font size.
 const WIDE_VIEWPORT_QUERY: &str = "(min-width: 64rem)";
 
@@ -213,49 +211,7 @@ pub fn members_panel_shown(open: Option<bool>, wide: bool) -> bool {
 }
 
 fn wide_viewport_now() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window()
-            .and_then(|w| w.match_media(WIDE_VIEWPORT_QUERY).ok().flatten())
-            .is_none_or(|m| m.matches())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        true
-    }
-}
-
-/// Keep [`WIDE_VIEWPORT`] current as the window crosses 64rem (a rotation,
-/// a resize). The write is deferred (dioxus-signal-safety.md). Installs once.
-fn install_wide_viewport_listener() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use wasm_bindgen::JsCast;
-        thread_local! {
-            static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        }
-        if INSTALLED.with(|i| i.replace(true)) {
-            return;
-        }
-        let Some(query) =
-            web_sys::window().and_then(|w| w.match_media(WIDE_VIEWPORT_QUERY).ok().flatten())
-        else {
-            return;
-        };
-        let watched = query.clone();
-        let on_change = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-            let wide = watched.matches();
-            crate::util::defer(move || {
-                if *WIDE_VIEWPORT.peek() != wide {
-                    *WIDE_VIEWPORT.write() = wide;
-                }
-            });
-        });
-        let _ =
-            query.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
-        // Lives as long as the page.
-        on_change.forget();
-    }
+    crate::util::media_matches(WIDE_VIEWPORT_QUERY).unwrap_or(true)
 }
 
 // Build metadata from build.rs
@@ -295,8 +251,9 @@ pub fn App() -> Element {
     // Clicking a chip opens the member-info modal. Idempotent.
     crate::components::mention_click_interceptor::install_mention_click_interceptor();
 
-    // Track the automatic member panel's breakpoint. Idempotent.
-    install_wide_viewport_listener();
+    // Track the automatic member panel's breakpoint (a rotation, a resize).
+    // Idempotent.
+    crate::util::watch_media(WIDE_VIEWPORT_QUERY, &WIDE_VIEWPORT);
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 

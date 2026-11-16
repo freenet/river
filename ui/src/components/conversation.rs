@@ -45,6 +45,12 @@ pub(crate) use self::outbox_commit::clear_room_now as clear_outbox_for_room_now;
 pub(crate) use self::outbox_commit::{
     has_signing as outbox_has_signing, has_unsent as outbox_has_unsent,
 };
+mod mobile_message_actions;
+mod mobile_message_sheet;
+mod mobile_sheet_drag;
+mod mobile_surface;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 mod pending_effects;
 mod pending_sends;
 mod reaction_picker;
@@ -65,6 +71,9 @@ use self::markdown::{
     clean_reply_preview, description_to_html, member_names_fingerprint, prune_message_html_cache,
     render_message_html_cached, running_behind_freenet_gateway,
 };
+use self::mobile_message_actions::{MobileActionsEntry, RowTarget};
+use self::mobile_message_sheet::{MobileAction, MobileMessageSheet};
+use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
@@ -2394,6 +2403,43 @@ pub fn Conversation() -> Element {
             }
         }
     });
+    // The mobile message sheet's actions (`mobile_message_sheet.rs`), run
+    // after the sheet has closed. Checked here against the messages as they
+    // are now, not as the sheet opened on them: the row must still hold that
+    // message, and Edit and Delete must still be on your own. Each then goes
+    // the way the footer's control does.
+    let on_mobile_action = use_callback(
+        move |(action, row, message): (MobileAction, String, MessageId)| {
+            let groups = message_groups.peek();
+            let Some((items, _, member_names, _, _, _)) = groups.as_deref() else {
+                return;
+            };
+            let Some((group, msg)) = items.iter().find_map(|item| match item {
+                DisplayItem::Messages(group) => group
+                    .messages
+                    .iter()
+                    .find(|m| m.id == row && m.message_id == message)
+                    .map(|m| (group, m)),
+                DisplayItem::Event(_) => None,
+            }) else {
+                return;
+            };
+            match action {
+                MobileAction::Reply => on_group_reply.call(ReplyContext {
+                    message_id: msg.message_id.clone(),
+                    author_name: group.author_name.clone(),
+                    content_preview: reply_preview(&msg.content_text, member_names),
+                }),
+                MobileAction::Edit if group.is_self => {
+                    edit_trigger.set(Some((msg.id.clone(), msg.content_text.clone())));
+                }
+                MobileAction::Delete if group.is_self => {
+                    on_group_request_delete.call(msg.message_id.clone());
+                }
+                MobileAction::Edit | MobileAction::Delete => {}
+            }
+        },
+    );
 
     rsx! {
         div { class: "flex-1 flex flex-col min-w-0 bg-panel",
@@ -2511,7 +2557,7 @@ pub fn Conversation() -> Element {
                                                 onpointerdown: {
                                                     let pressed = description_pressed_with.clone();
                                                     move |e: PointerEvent| {
-                                                        record_press(&pressed, "description", e.data().pointer_type());
+                                                        record_press(&pressed, e.data().pointer_type());
                                                     }
                                                 },
                                                 onpointercancel: {
@@ -2530,7 +2576,7 @@ pub fn Conversation() -> Element {
                                                         // toggle still waiting below.
                                                         let armed = toggle_gen.get().wrapping_add(1);
                                                         toggle_gen.set(armed);
-                                                        let pressed_with = take_fresh_press(&pressed, "description");
+                                                        let pressed_with = take_fresh_press(&pressed);
                                                         if description_click_is_link(&evt)
                                                             || description_click_is_multi(&evt)
                                                             || !description_selection_is_collapsed()
@@ -3163,6 +3209,14 @@ pub fn Conversation() -> Element {
 
             // The one reaction picker, opened by a message's footer React.
             ReactionPicker { surfaces: reaction_surfaces, on_react: on_group_react }
+            // Below 48rem: the message sheet a row tap, its + or its entry
+            // opens, and what closes it at 48rem, outside the chat or across
+            // a re-key (`mobile_surface.rs`).
+            MobileMessageSheet { surfaces: reaction_surfaces, on_react: on_group_react, on_action: on_mobile_action }
+            MobileSurfaceGuard {
+                surfaces: reaction_surfaces,
+                contract_key: current_room_data.as_ref().map(|room| room.contract_key),
+            }
 
             // Message input or status
             {
@@ -3508,26 +3562,18 @@ struct ReactionOwnersPopover {
 
 const REACTION_OWNERS_POPOVER_HEIGHT_PX: f64 = 160.0;
 
-fn coarse_pointer() -> bool {
-    web_sys::window()
-        .and_then(|w| {
-            w.match_media("(hover: none), (any-pointer: coarse)")
-                .ok()
-                .flatten()
-        })
-        .is_some_and(|mq| mq.matches())
-}
-
-/// The last `pointerdown` on one of a component's controls: the control's
-/// key, the `pointerType`, and when (ms). A click reads it to learn what
-/// pressed it. Not a signal: nothing renders from it.
-type PressRecord = Rc<std::cell::RefCell<Option<(String, String, f64)>>>;
+/// The last `pointerdown` on a control: its `pointerType`, and when (ms). A
+/// click reads it to learn what pressed it. Not a signal: nothing renders
+/// from it.
+type PressRecord = Rc<std::cell::RefCell<Option<(String, f64)>>>;
 
 /// A press older than this belongs to some other gesture: a press dragged
 /// off the control (no click, and no `pointercancel` either), followed later
-/// by a click that had no press of its own. A mouse held on a reaction chip
-/// for longer than this therefore opens the list rather than removing.
+/// by a click that had no press of its own.
 const PRESS_FRESH_MS: f64 = 1500.0;
+
+/// How far a press may wander and still be a tap, in CSS px.
+const TAP_SLOP_PX: f64 = 10.0;
 
 /// Monotonic milliseconds (`performance.now()`), so a wall-clock change
 /// cannot make a press look fresh or stale.
@@ -3544,51 +3590,108 @@ fn now_ms() -> f64 {
     }
 }
 
-fn record_press(record: &PressRecord, key: &str, pointer_type: String) {
-    *record.borrow_mut() = Some((key.to_string(), pointer_type, now_ms()));
+fn record_press(record: &PressRecord, pointer_type: String) {
+    *record.borrow_mut() = Some((pointer_type, now_ms()));
 }
 
-/// The `pointerType` of `key`'s own press, if it was recent. Consumes the
-/// record either way, so one press answers one click.
-fn take_fresh_press(record: &PressRecord, key: &str) -> Option<String> {
+/// The `pointerType` of the control's own press, if it was recent. Consumes
+/// the record either way, so one press answers one click.
+fn take_fresh_press(record: &PressRecord) -> Option<String> {
     record
         .borrow_mut()
         .take()
-        .filter(|(pressed, _, at)| pressed == key && now_ms() - at <= PRESS_FRESH_MS)
-        .map(|(_, pointer_type, _)| pointer_type)
+        .filter(|(_, at)| now_ms() - at <= PRESS_FRESH_MS)
+        .map(|(pointer_type, _)| pointer_type)
 }
 
-/// What a pointer of this type does to a chip: `Some(true)` opens the list,
-/// `Some(false)` removes, `None` is unknown.
-fn pointer_type_opens_owner_list(pointer_type: &str) -> Option<bool> {
-    match pointer_type {
-        "touch" => Some(true),
-        // A pencil has no hover tooltip. On a touch device it should open
-        // the list, the same as a finger.
-        "pen" => Some(coarse_pointer()),
-        "mouse" => Some(false),
-        _ => None,
+/// How long a finger rests on a reaction chip before its reactor list opens.
+const CHIP_HOLD_MS: u64 = 500;
+
+/// How long after a hold's lift its click may still come. Past this the
+/// lift sent none, and the next click is a press of its own.
+const CHIP_HOLD_RELEASE_MS: u64 = 400;
+
+/// Whether Enter or Space on a reaction chip opens its reactor list instead
+/// of reacting, as a press does: with Shift, at 48rem and wider. Below 48rem
+/// there is no list.
+fn shift_lists_reactors(narrow: bool, shift: bool) -> bool {
+    shift && !narrow
+}
+
+/// A finger or pen held on a reaction chip, at 48rem and wider, opens its
+/// reactor list (#714): a press reacts, and touch has no hover `title`.
+/// Not a signal: nothing renders from it.
+#[derive(Default)]
+struct ChipHold {
+    /// The chip of the press being timed.
+    pending: Option<String>,
+    /// That press, which a later press outdates.
+    generation: u32,
+    /// The chip whose hold opened the list. The click its lift sends is not
+    /// a press, wherever it lands: on the chip, or on the list's backdrop,
+    /// which by then covers the chip.
+    held: Option<String>,
+}
+
+impl ChipHold {
+    /// A pointer went down on `key`. The generation to time, if this press
+    /// can become a hold.
+    fn press(&mut self, key: &str, pointer_type: &str, narrow: bool) -> Option<u32> {
+        self.held = None;
+        self.pending = None;
+        self.generation = self.generation.wrapping_add(1);
+        if narrow || !matches!(pointer_type, "touch" | "pen") {
+            return None;
+        }
+        self.pending = Some(key.to_string());
+        Some(self.generation)
+    }
+
+    /// The press lifted, left the chip or was cancelled (a scroll) first.
+    fn cancel(&mut self) {
+        self.pending = None;
+    }
+
+    /// The timer for `generation` ran out, the window `narrow` or not by
+    /// now. The chip whose list opens, if that press is still down and the
+    /// window is still 48rem or wider.
+    fn fire(&mut self, generation: u32, narrow: bool) -> Option<String> {
+        if self.generation != generation {
+            return None;
+        }
+        let key = self.pending.take()?;
+        if narrow {
+            return None;
+        }
+        self.held = Some(key.clone());
+        Some(key)
+    }
+
+    /// The pointer lifted. If its hold opened the list, the generation to
+    /// [`expire`](Self::expire) should no click follow.
+    fn lift(&mut self) -> Option<u32> {
+        self.pending = None;
+        self.held.as_ref().map(|_| self.generation)
+    }
+
+    /// No click followed the lift of `generation`'s hold.
+    fn expire(&mut self, generation: u32) {
+        if self.generation == generation {
+            self.held = None;
+        }
+    }
+
+    /// A click on `key` or on its list's backdrop: whether it is the lift
+    /// of the hold that opened that chip's list.
+    fn take_release(&mut self, key: &str) -> bool {
+        self.pending = None;
+        self.held.take().is_some_and(|held| held == key)
     }
 }
 
-/// A finger, or a pen on a coarse screen, opens the list. A mouse removes.
-///
-/// `pressed_with` is the `pointerType` of the chip's own fresh `pointerdown`
-/// (see [`take_fresh_press`]), never the click's: iOS Safari 18.2 and later
-/// report a tap's `click` as `"mouse"` while its `pointerdown` says `"touch"`
-/// (WebKit bug 282988), and so does Playwright's WebKit. A click with no
-/// fresh press of its own (assistive technology activating the chip) opens
-/// the list: only a mouse removes in one step, and only when it is known to
-/// be a mouse.
-fn gesture_opens_owner_list(pressed_with: Option<&str>) -> bool {
-    pressed_with
-        .and_then(pointer_type_opens_owner_list)
-        .unwrap_or(true)
-}
-
-/// Where the reactor list for a chip opens, from a point on the chip (the
-/// tap, or the chip's centre for a key press): below unless there is more
-/// room above, and toward whichever side of the window has more room.
+/// Where the reactor list for a chip opens, from a point on the chip (its
+/// centre, for a held finger and for Shift+Enter): below unless there is
+/// more room above, and toward whichever side of the window has more room.
 fn reaction_owners_popover_at(
     key: String,
     message_id: String,
@@ -3614,14 +3717,19 @@ fn reaction_owners_popover_at(
     }
 }
 
+/// The centre of `element`, in client coordinates.
+fn centre_of(element: &web_sys::Element) -> (f64, f64) {
+    let rect = element.get_bounding_client_rect();
+    (
+        rect.left() + rect.width() / 2.0,
+        rect.top() + rect.height() / 2.0,
+    )
+}
+
 /// The centre of the element with this id, in client coordinates.
 fn element_centre(id: &str) -> Option<(f64, f64)> {
     let element = web_sys::window()?.document()?.get_element_by_id(id)?;
-    let rect = element.get_bounding_client_rect();
-    Some((
-        rect.left() + rect.width() / 2.0,
-        rect.top() + rect.height() / 2.0,
-    ))
+    Some(centre_of(&element))
 }
 
 fn reaction_owners_dialog_id(key: &str) -> String {
@@ -3811,6 +3919,33 @@ fn name_tag(
     }
 }
 
+/// Someone who reacted, as the row shows them.
+#[derive(Clone, Debug, PartialEq)]
+struct Reactor {
+    /// Their nickname, or "You".
+    name: String,
+    warning: Option<ImpersonationWarning>,
+    badge: Option<DeputyBadge>,
+}
+
+/// One of a message's reactions: the emoji and who made it, in the order
+/// the row's chips show them.
+#[derive(Clone, Debug, PartialEq)]
+struct RowReaction {
+    emoji: String,
+    /// The reader is among them.
+    mine: bool,
+    reactors: Vec<Reactor>,
+}
+
+/// A reactor's ⚠ and 🛡, after their name in a chip's reactor list.
+fn reactor_marks(reactor: &Reactor) -> Element {
+    rsx! {
+        {reactor.warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
+        {reactor.badge.as_ref().map(|badge| name_icon_mark("reaction-owner-deputy-badge", badge.tooltip(), SHIELD_ICON_PATH))}
+    }
+}
+
 /// ⚠ and 🛡 for one reactor. `reactor_id` is the member whose name is shown.
 fn reaction_owner_marks(
     reactor_id: MemberId,
@@ -3828,6 +3963,58 @@ fn reaction_owner_marks(
         ),
         deputy_badges.get(&reactor_id).cloned(),
     )
+}
+
+/// A message's reactions as its chips show them: by
+/// emoji, each with who made it ("You" for the reader, never checked for
+/// impersonation; everyone else with the same ⚠ / 🛡 as the author line).
+fn reactions_by_emoji(
+    reactions: &HashMap<String, Vec<MemberId>>,
+    self_member_id: Option<MemberId>,
+    member_names: &HashMap<MemberId, String>,
+    impersonation: &ImpersonationChecker,
+    owner_id: MemberId,
+    deputy_badges: &HashMap<MemberId, DeputyBadge>,
+) -> Vec<RowReaction> {
+    let mut sorted: Vec<_> = reactions.iter().collect();
+    sorted.sort_by_key(|(emoji, _)| emoji.as_str());
+    sorted
+        .into_iter()
+        .map(|(emoji, reactors)| RowReaction {
+            emoji: emoji.clone(),
+            mine: self_member_id.is_some_and(|me| reactors.contains(&me)),
+            reactors: reactors
+                .iter()
+                .map(|reactor_id| {
+                    let is_you = Some(*reactor_id) == self_member_id;
+                    let name = if is_you {
+                        "You".to_string()
+                    } else {
+                        member_names
+                            .get(reactor_id)
+                            .cloned()
+                            .unwrap_or_else(|| "Unknown".to_string())
+                    };
+                    let (warning, badge) = if is_you {
+                        (None, deputy_badges.get(reactor_id).cloned())
+                    } else {
+                        reaction_owner_marks(
+                            *reactor_id,
+                            &name,
+                            impersonation,
+                            owner_id,
+                            deputy_badges,
+                        )
+                    };
+                    Reactor {
+                        name,
+                        warning,
+                        badge,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// A reply's snapshot of the message it answers. Cleaned (mentions -> @name,
@@ -3914,10 +4101,8 @@ fn MessageGroupComponent(
             });
         }
     }
-    // The last `pointerdown` on a reaction chip in this group. The chip's
-    // click consumes it; see `gesture_opens_owner_list` for why the click's
-    // own type is not used.
-    let chip_pressed_with: PressRecord = use_hook(|| Rc::new(std::cell::RefCell::new(None)));
+    // A finger resting on a reaction chip in this group; see `ChipHold`.
+    let chip_hold = use_hook(|| Rc::new(std::cell::RefCell::new(ChipHold::default())));
     {
         // (key, message id) of the list that was open on the last run.
         let owners_focus = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
@@ -3955,9 +4140,11 @@ fn MessageGroupComponent(
                     let Some((key, message_id)) = previous else {
                         return;
                     };
-                    // Closed because the picker opened (React from the
-                    // keyboard): focus stays where the reader put it.
-                    if reaction_picker_is_open() {
+                    // Closed because the picker or the mobile sheet opened
+                    // (React from the keyboard, a tap below 48rem): focus
+                    // stays where the reader put it, never pulled out of
+                    // either.
+                    if reaction_picker_is_open() || mobile_surface_is_open() {
                         return;
                     }
                     if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
@@ -4072,6 +4259,36 @@ fn MessageGroupComponent(
                         let is_first = idx == 0;
                         let reply_strip_val = msg.reply_strip.clone();
                         let row_time = row_time_labels(&msg);
+                        // Below 48rem a tap on the row opens its sheet
+                        // (`mobile_message_actions.rs`); a row being edited
+                        // has the form instead.
+                        let row_editing = editing_message.read().as_ref() == Some(&msg.id);
+                        let press_row = msg.id.clone();
+                        // Its reactions and who made them, once per render,
+                        // as the chips show them.
+                        let row_reactions = reactions_by_emoji(
+                            &msg.reactions,
+                            self_member_id,
+                            &member_names,
+                            &impersonation,
+                            owner_id,
+                            &deputy_badges,
+                        );
+                        // The reader's own reaction on it. No known identity
+                        // means none is ours, so nothing is highlighted and
+                        // the picker offers a fresh reaction rather than a
+                        // toggle of someone else's.
+                        let user_reaction: Option<String> =
+                            row_reactions.iter().find(|r| r.mine).map(|r| r.emoji.clone());
+                        // What the row, its + and its entry open the mobile
+                        // sheet for.
+                        let sheet_target = RowTarget {
+                            row: msg.id.clone(),
+                            message: msg.message_id.clone(),
+                            own: is_self,
+                            current: user_reaction.clone(),
+                        };
+                        let tap_target = sheet_target.clone();
 
                         rsx! {
                             // One row per message (`.msg-row` in main.css): the
@@ -4089,14 +4306,30 @@ fn MessageGroupComponent(
                                 // instead of on a footer line of their own.
                                 "data-has-reactions": "{!msg.reactions.is_empty()}",
                                 class: "msg-row group",
+                                onpointerdown: move |e: PointerEvent| {
+                                    mobile_message_actions::note_row_press(&press_row, &e)
+                                },
+                                onpointercancel: move |e: PointerEvent| {
+                                    mobile_message_actions::note_row_cancel(&e)
+                                },
+                                onclick: move |e: MouseEvent| {
+                                    mobile_message_actions::row_clicked(
+                                        reactions,
+                                        &e,
+                                        tap_target.clone(),
+                                    );
+                                },
                                 div {
                                     class: "msg-gutter",
                                     if is_first {
                                         // Decorative for assistive tech: the name
                                         // button beside it is the accessible
                                         // control, so this is no tab stop either.
+                                        // Its click opens the author's info, not
+                                        // the row's sheet.
                                         div {
                                             "data-testid": "message-author-avatar",
+                                            "data-row-actions": "exclude",
                                             "aria-hidden": "true",
                                             class: "{avatar_class}",
                                             style: avatar_style.clone(),
@@ -4480,8 +4713,7 @@ fn MessageGroupComponent(
                                         let row_id_for_chips = msg.id.clone();
                                         let msg_id_react = msg.message_id.clone();
                                         // A row being edited has the form's own buttons.
-                                        let show_actions = editing_message.read().as_ref() != Some(&msg.id);
-                                        let row_for_invoker = msg.id.clone();
+                                        let show_actions = !row_editing;
                                         let msg_id_str_for_edit = msg.id.clone();
                                         let msg_id_for_delete = msg.message_id.clone();
                                         let msg_id_for_reply = msg.message_id.clone();
@@ -4492,19 +4724,7 @@ fn MessageGroupComponent(
                                         let reply_preview_names = preview_names.clone();
                                         let reply_author_name = group.author_name.clone();
 
-                                        // Find user's current reaction on this message (if any)
-                                        // No known identity ⇒ no reaction is ours,
-                                        // so nothing is highlighted and the picker
-                                        // offers a fresh reaction rather than a
-                                        // toggle of someone else's.
-                                        let user_reaction: Option<String> = msg.reactions.iter().find_map(|(emoji, reactors)| {
-                                            if self_member_id.is_some_and(|me| reactors.contains(&me)) {
-                                                Some(emoji.clone())
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                        let msg_id_for_invoker = msg.message_id.clone();
+                                        let invoker_target = sheet_target.clone();
 
                                         rsx! {
                                             div {
@@ -4512,47 +4732,24 @@ fn MessageGroupComponent(
                                                 class: "msg-footer",
                                             div {
                                                 "data-testid": "message-reaction-row",
-                                                // The chips, then React: the message's one way
-                                                // into the picker, which opens at it.
+                                                // The chips, which react with their emoji, then
+                                                // React: the message's one way into the picker
+                                                // or the sheet. Taps here (a chip, its reactor
+                                                // list and that list's backdrop, React) never
+                                                // open the row's sheet.
                                                 class: "msg-reaction-row",
-                                                // Existing reactions (clickable to toggle if user has reacted)
+                                                "data-row-actions": "exclude",
                                                 {
-                                                    let mut sorted_reactions: Vec<_> = msg.reactions.iter().collect();
-                                                    sorted_reactions.sort_by_key(|(emoji, _)| emoji.as_str());
-                                                    sorted_reactions.into_iter().map(|(emoji, reactors)| {
-                                                        let count = reactors.len();
-                                                        let is_user_reaction = self_member_id.is_some_and(|me| reactors.contains(&me));
+                                                    row_reactions.iter().map(|reaction| {
+                                                        let emoji = &reaction.emoji;
+                                                        let count = reaction.reactors.len();
+                                                        let is_user_reaction = reaction.mine;
                                                         let emoji_for_click = emoji.clone();
                                                         let msg_id_for_click = msg_id_react.clone();
-
-                                                        // "You" is not a nickname, so it is not checked
-                                                        // for impersonation. Everyone else gets the
-                                                        // same ⚠ / 🛡 as the author line.
-                                                        let shown_reactors: Vec<_> = reactors.iter().map(|reactor_id| {
-                                                            let is_you = Some(*reactor_id) == self_member_id;
-                                                            let name = if is_you {
-                                                                "You".to_string()
-                                                            } else {
-                                                                member_names.get(reactor_id)
-                                                                    .cloned()
-                                                                    .unwrap_or_else(|| "Unknown".to_string())
-                                                            };
-                                                            let (warning, badge) = if is_you {
-                                                                (None, deputy_badges.get(reactor_id).cloned())
-                                                            } else {
-                                                                reaction_owner_marks(
-                                                                    *reactor_id,
-                                                                    &name,
-                                                                    &impersonation,
-                                                                    owner_id,
-                                                                    &deputy_badges,
-                                                                )
-                                                            };
-                                                            (name, warning, badge)
-                                                        }).collect();
-                                                        let names_str = shown_reactors
+                                                        let names_str = reaction
+                                                            .reactors
                                                             .iter()
-                                                            .map(|(name, _, _)| name.as_str())
+                                                            .map(|reactor| reactor.name.as_str())
                                                             .collect::<Vec<_>>()
                                                             .join(", ");
                                                         let tooltip = if is_user_reaction {
@@ -4583,13 +4780,20 @@ fn MessageGroupComponent(
                                                         let owners_key_for_click = owners_key.clone();
                                                         let owners_key_for_key = owners_key.clone();
                                                         let owners_key_for_press = owners_key.clone();
-                                                        let chip_pressed_with_click = chip_pressed_with.clone();
-                                                        let chip_pressed_with_down = chip_pressed_with.clone();
-                                                        let chip_pressed_with_cancel = chip_pressed_with.clone();
-                                                        let row_id_for_owners = row_id_for_chips.clone();
+                                                        let msg_id_for_key = msg_id_for_click.clone();
+                                                        let emoji_for_key = emoji_for_click.clone();
                                                         let row_id_for_owners_key = row_id_for_chips.clone();
                                                         let chip_id = reaction_chip_id(&owners_key);
                                                         let chip_id_for_key = chip_id.clone();
+                                                        let chip_id_for_hold = chip_id.clone();
+                                                        let row_id_for_hold = row_id_for_chips.clone();
+                                                        let chip_hold_down = chip_hold.clone();
+                                                        let chip_hold_up = chip_hold.clone();
+                                                        let chip_hold_leave = chip_hold.clone();
+                                                        let chip_hold_cancel = chip_hold.clone();
+                                                        let chip_hold_click = chip_hold.clone();
+                                                        let chip_hold_backdrop = chip_hold.clone();
+                                                        let owners_key_for_backdrop = owners_key.clone();
                                                         let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
 
                                                         rsx! {
@@ -4603,6 +4807,11 @@ fn MessageGroupComponent(
                                                                     div {
                                                                         class: "fixed inset-0 z-40",
                                                                         onclick: move |_| {
+                                                                            // The finger whose hold opened the list
+                                                                            // lifts over this backdrop: not a dismissal.
+                                                                            if chip_hold_backdrop.borrow_mut().take_release(&owners_key_for_backdrop) {
+                                                                                return;
+                                                                            }
                                                                             crate::util::defer(move || open_reaction_owners.set(None));
                                                                         },
                                                                     }
@@ -4640,7 +4849,7 @@ fn MessageGroupComponent(
                                                                                 "Remove"
                                                                             }
                                                                         }
-                                                                        {shown_reactors.iter().enumerate().map(|(index, (name, warning, badge))| {
+                                                                        {reaction.reactors.iter().enumerate().map(|(index, reactor)| {
                                                                             rsx! {
                                                                                 div {
                                                                                     key: "{index}",
@@ -4648,10 +4857,9 @@ fn MessageGroupComponent(
                                                                                     span {
                                                                                         "data-testid": "reaction-owner",
                                                                                         class: "[overflow-wrap:anywhere]",
-                                                                                        "{name}"
+                                                                                        "{reactor.name}"
                                                                                     }
-                                                                                    {warning.as_ref().map(|warning| name_mark("reaction-owner-impersonation-warning", "cursor-default", warning.tooltip(), crate::util::confusable::WARNING_GLYPH))}
-                                                                                    {badge.as_ref().map(|badge| name_icon_mark("reaction-owner-deputy-badge", badge.tooltip(), SHIELD_ICON_PATH))}
+                                                                                    {reactor_marks(reactor)}
                                                                                 }
                                                                             }
                                                                         })}
@@ -4662,63 +4870,81 @@ fn MessageGroupComponent(
                                                                     "data-testid": "reaction-chip",
                                                                     role: "button",
                                                                     tabindex: "0",
-                                                                    "aria-expanded": if owners_open { "true" } else { "false" },
-                                                                    "aria-haspopup": "dialog",
+                                                                    // A toggle: a press reacts with this emoji.
+                                                                    "aria-pressed": if is_user_reaction { "true" } else { "false" },
+                                                                    // Only while its list is open: the row's band
+                                                                    // keys on it (main.css).
+                                                                    "aria-expanded": owners_open.then_some("true"),
                                                                     // A pill; your own reaction is the link
                                                                     // colour on the soft accent, like a mention.
                                                                     class: format!(
-                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold {}",
+                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold cursor-pointer select-none [-webkit-touch-callout:none] {}",
                                                                         if is_user_reaction {
-                                                                            "cursor-pointer border-[color-mix(in_srgb,var(--color-link)_50%,transparent)] bg-accent-soft text-link"
+                                                                            "border-[color-mix(in_srgb,var(--color-link)_50%,transparent)] bg-accent-soft text-link"
                                                                         } else {
-                                                                            "cursor-default border-border bg-rail text-text-secondary"
+                                                                            "border-border bg-rail text-text-secondary"
                                                                         }
                                                                     ),
                                                                     title: "{tooltip}",
                                                                     onpointerdown: move |e: PointerEvent| {
-                                                                        record_press(
-                                                                            &chip_pressed_with_down,
+                                                                        let pointer_type = e.data().pointer_type();
+                                                                        let started = chip_hold_down.borrow_mut().press(
                                                                             &owners_key_for_press,
-                                                                            e.data().pointer_type(),
+                                                                            &pointer_type,
+                                                                            mobile_surface::narrow_now(),
                                                                         );
+                                                                        let Some(generation) = started else {
+                                                                            return;
+                                                                        };
+                                                                        let hold = chip_hold_down.clone();
+                                                                        let row = row_id_for_hold.clone();
+                                                                        // The chip this press is on, not whichever
+                                                                        // has its id later.
+                                                                        let chip = web_sys::window()
+                                                                            .and_then(|w| w.document())
+                                                                            .and_then(|d| d.get_element_by_id(&chip_id_for_hold));
+                                                                        crate::util::safe_spawn_local(async move {
+                                                                            crate::util::sleep(crate::util::millis(CHIP_HOLD_MS)).await;
+                                                                            // Gone, or its group remounted under the
+                                                                            // finger: no hold.
+                                                                            let Some(chip) = chip.filter(|chip| chip.is_connected()) else {
+                                                                                return;
+                                                                            };
+                                                                            let fired = hold.borrow_mut().fire(generation, mobile_surface::narrow_now());
+                                                                            let Some(key) = fired else {
+                                                                                return;
+                                                                            };
+                                                                            let (x, y) = centre_of(&chip);
+                                                                            let popover = reaction_owners_popover_at(key, row, x, y);
+                                                                            crate::util::defer(move || {
+                                                                                reactions.open_owner_list(open_reaction_owners, popover)
+                                                                            });
+                                                                        });
                                                                     },
+                                                                    onpointerup: move |_| {
+                                                                        let Some(generation) = chip_hold_up.borrow_mut().lift() else {
+                                                                            return;
+                                                                        };
+                                                                        let hold = chip_hold_up.clone();
+                                                                        crate::util::safe_spawn_local(async move {
+                                                                            crate::util::sleep(crate::util::millis(CHIP_HOLD_RELEASE_MS)).await;
+                                                                            hold.borrow_mut().expire(generation);
+                                                                        });
+                                                                    },
+                                                                    onpointerleave: move |_| chip_hold_leave.borrow_mut().cancel(),
                                                                     onpointercancel: move |_| {
-                                                                        chip_pressed_with_cancel.borrow_mut().take();
+                                                                        // A scroll that starts on the chip ends here.
+                                                                        chip_hold_cancel.borrow_mut().cancel();
                                                                     },
-                                                                    onclick: move |e: MouseEvent| {
-                                                                        let click_y = e.client_coordinates().y;
-                                                                        let click_x = e.client_coordinates().x;
-                                                                        // Only this chip's own recent press counts.
-                                                                        let pressed_with = take_fresh_press(
-                                                                            &chip_pressed_with_click,
-                                                                            &owners_key_for_click,
-                                                                        );
-                                                                        if gesture_opens_owner_list(pressed_with.as_deref()) {
-                                                                            let popover = reaction_owners_popover_at(
-                                                                                owners_key_for_click.clone(),
-                                                                                row_id_for_owners.clone(),
-                                                                                click_x,
-                                                                                click_y,
-                                                                            );
-                                                                            crate::util::defer(move || {
-                                                                                let already_open = open_reaction_owners
-                                                                                    .peek()
-                                                                                    .as_ref()
-                                                                                    .is_some_and(|popup| popup.key == popover.key);
-                                                                                if already_open {
-                                                                                    open_reaction_owners.set(None);
-                                                                                } else {
-                                                                                    reactions.owner_list_opened(open_reaction_owners);
-                                                                                    open_reaction_owners.set(Some(popover));
-                                                                                }
-                                                                            });
-                                                                        } else if is_user_reaction {
-                                                                            let id = msg_id_for_click.clone();
-                                                                            let emoji = emoji_for_click.clone();
-                                                                            crate::util::defer(move || {
-                                                                                on_react.call((id, emoji));
-                                                                            });
+                                                                    onclick: move |_| {
+                                                                        // The lift of the hold that opened the list is
+                                                                        // not a press.
+                                                                        if chip_hold_click.borrow_mut().take_release(&owners_key_for_click) {
+                                                                            return;
                                                                         }
+                                                                        let id = msg_id_for_click.clone();
+                                                                        let emoji = emoji_for_click.clone();
+                                                                        crate::util::defer(move || on_react.call((id, emoji)));
                                                                     },
                                                                     onkeydown: move |e: KeyboardEvent| {
                                                                         let key = e.key();
@@ -4732,28 +4958,40 @@ fn MessageGroupComponent(
                                                                             }
                                                                             return;
                                                                         }
-                                                                        // A `role="button"` answers Enter and Space.
-                                                                        // Both open the list, never remove: removing
-                                                                        // stays one step away, behind the list's
-                                                                        // Remove, and a key press has no hover title
-                                                                        // to say who reacted.
+                                                                        // A `role="button"` answers Enter and Space. Both
+                                                                        // react, as a press does. With Shift, at 48rem and
+                                                                        // wider, they open the list instead: a key press
+                                                                        // has no hover title to say who reacted.
                                                                         let space = matches!(&key, Key::Character(c) if c == " ");
                                                                         if key != Key::Enter && !space {
                                                                             return;
                                                                         }
                                                                         // Space would scroll the history.
                                                                         e.prevent_default();
-                                                                        let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
-                                                                        let popover = reaction_owners_popover_at(
-                                                                            owners_key_for_key.clone(),
-                                                                            row_id_for_owners_key.clone(),
-                                                                            x,
-                                                                            y,
-                                                                        );
-                                                                        crate::util::defer(move || {
-                                                                            reactions.owner_list_opened(open_reaction_owners);
-                                                                            open_reaction_owners.set(Some(popover));
-                                                                        });
+                                                                        if shift_lists_reactors(mobile_surface::narrow_now(), e.modifiers().shift()) {
+                                                                            let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
+                                                                            let popover = reaction_owners_popover_at(
+                                                                                owners_key_for_key.clone(),
+                                                                                row_id_for_owners_key.clone(),
+                                                                                x,
+                                                                                y,
+                                                                            );
+                                                                            crate::util::defer(move || {
+                                                                                reactions.open_owner_list(open_reaction_owners, popover)
+                                                                            });
+                                                                        } else {
+                                                                            // The reader's chip with no one else on it
+                                                                            // leaves with the reaction.
+                                                                            if is_user_reaction && count == 1 {
+                                                                                mobile_surface::dom::focus_control(
+                                                                                    &row_id_for_owners_key,
+                                                                                    mobile_surface::REACT_SELECTOR,
+                                                                                );
+                                                                            }
+                                                                            let id = msg_id_for_key.clone();
+                                                                            let emoji = emoji_for_key.clone();
+                                                                            crate::util::defer(move || on_react.call((id, emoji)));
+                                                                        }
                                                                     },
                                                                     span { class: "text-[15px] leading-none", "{emoji}" }
                                                                     span { class: "tabular-nums", "{count}" }
@@ -4765,15 +5003,20 @@ fn MessageGroupComponent(
                                                 if show_actions {
                                                     ReactionInvoker {
                                                         surfaces: reactions,
-                                                        row: row_for_invoker,
-                                                        message: msg_id_for_invoker,
-                                                        current: user_reaction,
+                                                        target: invoker_target,
                                                     }
                                                 }
                                             }
-                                            // Reply, Edit and Delete: one unit, which wraps
-                                            // onto its own line when it does not fit.
                                             if show_actions {
+                                                // Below 48rem the cluster is hidden: a tap on the
+                                                // row opens its sheet, and this hidden button is
+                                                // the keyboard's way in.
+                                                MobileActionsEntry {
+                                                    surfaces: reactions,
+                                                    target: sheet_target,
+                                                }
+                                                // Reply, Edit and Delete: one unit, which wraps
+                                                // onto its own line when it does not fit.
                                                 div {
                                                     "data-testid": "message-action-cluster",
                                                     class: "msg-action-cluster",
@@ -4843,6 +5086,113 @@ fn MessageGroupComponent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chip_key_reacts_except_shift_at_48rem_and_wider() {
+        assert!(!shift_lists_reactors(false, false));
+        assert!(
+            shift_lists_reactors(false, true),
+            "Shift, at 48rem and wider"
+        );
+        assert!(!shift_lists_reactors(true, false));
+        assert!(!shift_lists_reactors(true, true), "below 48rem: no list");
+    }
+
+    #[test]
+    fn chip_hold_times_a_finger_or_pen_at_48rem_and_wider_only() {
+        let mut hold = ChipHold::default();
+        assert!(hold.press("a", "touch", false).is_some());
+        assert!(hold.press("a", "pen", false).is_some());
+        assert!(hold.press("a", "mouse", false).is_none());
+        assert!(hold.press("a", "touch", true).is_none());
+    }
+
+    #[test]
+    fn chip_hold_that_fires_swallows_its_own_release_once() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        assert_eq!(hold.fire(generation, false), Some("a".to_string()));
+        assert!(hold.take_release("a"));
+        assert!(!hold.take_release("a"), "only once");
+    }
+
+    #[test]
+    fn chip_hold_release_belongs_to_the_held_chip_only() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.fire(generation, false);
+        assert!(!hold.take_release("b"));
+    }
+
+    #[test]
+    fn chip_hold_ended_early_never_fires() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.cancel();
+        assert_eq!(hold.fire(generation, false), None);
+        assert!(!hold.take_release("a"), "its click is a press");
+    }
+
+    #[test]
+    fn chip_hold_timer_of_an_earlier_press_does_not_fire_a_later_one() {
+        let mut hold = ChipHold::default();
+        let first = hold.press("a", "touch", false).unwrap();
+        hold.cancel();
+        let second = hold.press("a", "touch", false).unwrap();
+        assert_eq!(hold.fire(first, false), None);
+        assert_eq!(hold.fire(second, false), Some("a".to_string()));
+    }
+
+    #[test]
+    fn chip_hold_release_expires_when_no_click_follows_the_lift() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.fire(generation, false);
+        let lifted = hold.lift().expect("a fired hold's lift is timed");
+        hold.expire(lifted);
+        assert!(!hold.take_release("a"), "a later click is a press");
+    }
+
+    #[test]
+    fn chip_hold_lift_of_a_plain_tap_is_not_timed() {
+        let mut hold = ChipHold::default();
+        hold.press("a", "touch", false).unwrap();
+        assert_eq!(hold.lift(), None);
+        assert_eq!(hold.fire(1, false), None, "the lift ended the press");
+    }
+
+    #[test]
+    fn chip_hold_expiry_of_an_earlier_hold_leaves_a_later_one() {
+        let mut hold = ChipHold::default();
+        let first = hold.press("a", "touch", false).unwrap();
+        hold.fire(first, false);
+        let lifted = hold.lift().unwrap();
+        assert!(hold.take_release("a"));
+        let second = hold.press("a", "touch", false).unwrap();
+        hold.fire(second, false);
+        hold.expire(lifted);
+        assert!(
+            hold.take_release("a"),
+            "the second hold's release still counts"
+        );
+    }
+
+    #[test]
+    fn chip_hold_a_new_press_forgets_an_unclaimed_release() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.fire(generation, false);
+        hold.press("a", "mouse", false);
+        assert!(!hold.take_release("a"));
+    }
+
+    #[test]
+    fn chip_hold_begun_wide_does_not_fire_once_narrow() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        assert_eq!(hold.fire(generation, true), None);
+        assert!(!hold.take_release("a"), "its click is a press");
+    }
 
     /// A popover is revealed on the first mount after it opens, never on a
     /// re-mount, and another popover's mount does not use up the request.

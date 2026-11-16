@@ -464,6 +464,270 @@
     box-shadow: 0 0 0 2px var(--color-accent);
 }
 
+/* The row's keyboard way into its message sheet: below 48rem only, visually
+ * hidden until it has keyboard focus, then a small pill at the row's top
+ * right. At 48rem and wider it is not there at all. */
+.mobile-actions-entry {
+    display: none;
+}
+
+/* Below Tailwind's `md` (48rem; the same query as `mobile_surface.rs`, the
+ * exact complement of `(min-width: 48rem)`, so no fractional width falls
+ * between): a message's trailing Reply, Edit and Delete are gone, hits and
+ * tab stops included, and a tap on the row opens them in the message sheet.
+ * Its one reaction + stays, visible and tappable at rest on any pointer (a
+ * narrow mouse window too), after its chips. The footer keeps its line for
+ * the + alone. DM rows have no footer and are untouched. The keyboard entry
+ * above is shown. */
+@media not all and (min-width: 48rem) {
+    .msg-action-cluster {
+        display: none;
+    }
+
+    /* A tap on a row opens its sheet, so a double tap is not a zoom there.
+     * While double-tap zoom is on, iOS Safari holds a tap's click back until
+     * it knows no second tap is coming, and the sheet opened that much late.
+     * Panning and pinch zoom are unchanged. */
+    .msg-row {
+        touch-action: manipulation;
+    }
+
+    .msg-reaction-row > .msg-action {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .mobile-actions-entry {
+        display: block;
+        position: absolute;
+        top: 0;
+        right: 0;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        border: 0;
+    }
+
+    .mobile-actions-entry:focus-visible {
+        width: auto;
+        height: auto;
+        min-height: 32px;
+        padding: 4px 12px;
+        clip-path: none;
+        border-radius: 9999px;
+        border: 1px solid var(--color-border);
+        background: var(--color-panel);
+        color: var(--color-text);
+        font-size: 13px;
+        font-weight: 600;
+        outline: 2px solid var(--color-link);
+        outline-offset: 1px;
+        z-index: 1;
+    }
+}
+
+/* The mobile message sheet (`mobile_message_sheet.rs`): a native modal
+ * <dialog>, in the top layer over the header, history, composer and Latest.
+ * The dialog itself spans the viewport, transparent, so a tap outside the
+ * panel lands on the backdrop inside it, which slides the panel away;
+ * `::backdrop` dims. Its panel sits at the bottom with modest side spacing,
+ * rounded top corners and safe-area padding, capped to the viewport's height.
+ * Its height is fixed (it lists nobody who reacted): 242px for the reader's
+ * own message, before any safe-area inset, which fits a viewport from 258px
+ * tall. Under that only a wheel scrolls it; scrolling it never scrolls the
+ * page.
+ *
+ * It slides up when it opens and can be dragged down from anywhere
+ * (`mobile_sheet_drag.rs`): the backdrop and panel take no one-finger pan
+ * (`touch-action: pinch-zoom`), so the pointer events reach the drag and
+ * nothing scrolls, and a pinch still zooms. The drag sets the
+ * panel's inline `transform` and `--sheet-shade` (the dim, 0 to 1); released
+ * short it settles back through the transition below, dismissed it slides
+ * away (`is-leaving`). `is-dragging` follows the finger with no transition.
+ * The opening slide uses `translate`, which composes with the drag's
+ * `transform`, so a drag during it does not jump. */
+.mobile-sheet {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--color-text);
+    /* `clip`, not `hidden`: a `hidden` box can still be scrolled, and the
+     * browser scrolls it to reveal the control `showModal()` focuses while
+     * the opening slide holds the panel below the dialog. */
+    overflow: clip;
+}
+
+.mobile-sheet:not([open]) {
+    display: none;
+}
+
+.mobile-sheet::backdrop {
+    background: rgb(0 0 0 / calc(0.5 * var(--sheet-shade, 1)));
+}
+
+.mobile-sheet-backdrop {
+    position: absolute;
+    inset: 0;
+}
+
+.mobile-sheet-panel {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: 0;
+    max-width: 32rem;
+    margin-inline: auto;
+    max-height: calc(100dvh - 16px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 6px 12px max(12px, env(safe-area-inset-bottom));
+    border: 1px solid var(--color-border);
+    border-bottom: 0;
+    border-radius: 16px 16px 0 0;
+    background: var(--color-panel);
+    box-shadow: 0 -8px 24px rgb(0 0 0 / 0.18);
+}
+
+.mobile-sheet-backdrop,
+.mobile-sheet-panel {
+    touch-action: pinch-zoom;
+}
+
+@keyframes mobile-sheet-in {
+    from {
+        translate: 0 100%;
+    }
+}
+
+.mobile-sheet[open] .mobile-sheet-panel {
+    animation: mobile-sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    transition: transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.mobile-sheet.is-dragging .mobile-sheet-panel {
+    transition: none;
+}
+
+.mobile-sheet.is-leaving .mobile-sheet-panel {
+    transition: transform 180ms ease-in;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .mobile-sheet[open] .mobile-sheet-panel {
+        animation: none;
+        transition: none;
+    }
+}
+
+.mobile-sheet-handle {
+    width: 36px;
+    height: 4px;
+    margin: 2px auto 6px;
+    border-radius: 9999px;
+    background: var(--color-border-hover);
+}
+
+.mobile-sheet-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--color-border);
+}
+
+.mobile-sheet-action {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-height: 48px;
+    padding: 0 12px;
+    border-radius: 10px;
+    font-size: 16px;
+    text-align: left;
+    color: var(--color-text);
+}
+
+.mobile-sheet-action > svg {
+    color: var(--color-text-muted);
+}
+
+.mobile-sheet-action:focus-visible {
+    background: var(--color-surface);
+}
+
+/* Hover backgrounds only where something really hovers: a tap leaves an
+ * emulated pointer, and on some touch browsers a sticky :hover, under the
+ * finger, which is where the sheet's first emoji or action appears. */
+@media (hover: hover) {
+    .mobile-sheet-action:hover,
+    .mobile-reaction-choice:hover {
+        background: var(--color-surface);
+    }
+}
+
+.mobile-sheet-action--danger,
+.mobile-sheet-action--danger > svg {
+    color: var(--color-danger-text);
+}
+
+.mobile-sheet :focus-visible {
+    outline: 2px solid var(--color-link);
+    outline-offset: 1px;
+}
+
+/* Opened by a tap or a click: the emoji focused on opening shows no ring,
+ * which would read as the reader's current reaction, until a key is pressed
+ * in the sheet (`mobile_surface.rs`, `mark_opened_by`). */
+.mobile-sheet[data-opened-by="pointer"] :focus-visible {
+    outline: none;
+}
+
+/* The sheet's 16 choices: one row that scrolls sideways, freely and with
+ * momentum, with no scroll bar (a choice cut off at the edge shows there are
+ * more). It takes only sideways pans: a vertical move on it is the
+ * sheet's drag (`mobile_sheet_drag.rs`). The padding keeps the focus ring
+ * inside the row's clip. */
+.mobile-reaction-palette {
+    display: flex;
+    gap: 4px;
+    padding: 3px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    touch-action: pan-x pinch-zoom;
+}
+
+.mobile-reaction-palette::-webkit-scrollbar {
+    display: none;
+}
+
+.mobile-reaction-choice {
+    flex: none;
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    font-size: 22px;
+    line-height: 1;
+}
+
+.mobile-reaction-choice--current {
+    background-color: color-mix(in srgb, var(--color-accent) 20%, transparent);
+    box-shadow: inset 0 0 0 2px var(--color-accent);
+}
+
 /* Join notices: one quiet line, the icon in the avatar gutter. */
 .msg-event {
     display: grid;

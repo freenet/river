@@ -22,6 +22,10 @@ type RiverTestHooks = {
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
+  // The current room under a new contract key, as a room-contract re-key leaves it.
+  rekeyCurrentRoom(): void;
+  // Show one mobile panel, as its buttons do, whatever covers them.
+  setMobileView(view: "rooms" | "chat" | "members"): void;
   // The next own message signature arrives corrupted, so the room does not admit it.
   forgeNextSendSignature(): void;
   // Own-message signing requests wait (a slow chat delegate) until released.
@@ -106,4 +110,13 @@ export async function callRiverTest<K extends keyof RiverTestHooks>(
     },
     { name: name as string, args: args as unknown[] }
   ) as Promise<ReturnType<RiverTestHooks[K]>>;
+}
+
+/// Re-key the current room and click the first control matching `selector`
+/// in one task, the re-key first, so the click is queued across it.
+export async function rekeyThenClick(page: Page, selector: string) {
+  await page.evaluate((selector) => {
+    (window as unknown as { __riverTest: RiverTestHooks }).__riverTest.rekeyCurrentRoom();
+    document.querySelector<HTMLElement>(selector)!.click();
+  }, selector);
 }
