@@ -23,6 +23,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Cancel a pull request's run when a newer push to the same PR supersedes it;
+# only the newest commit's result can gate a merge. In Oct-Nov 2026, 206 of 516
+# PR runs were superseded while still running (freenet/freenet-core#6244).
+# Every other event gets a group of its own (run_id), so pushes to main and
+# release branches are never cancelled or queued behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     # Ubicloud, NOT a GitHub-hosted larger runner. GitHub bills larger
