@@ -45,11 +45,11 @@ riverctl message delete <room-owner-vk> <message-id>
 
 End-to-end-encrypted one-to-one messages between two members of the same room.
 They travel inside the room's contract state, so both people must already be
-members — there is no cross-room DM.
+members. There is no cross-room DM.
 
-The recipient is a member: either the short 8-character ID that
-`riverctl member list` prints, or the member's full verifying key (also from
-`member list`), which names them unambiguously.
+The recipient is the short 8-character ID or the full verifying key that
+`riverctl member list` prints. The full key names them unambiguously
+([Member IDs and verifying keys](#member-ids-and-verifying-keys)).
 
 ```bash
 riverctl member list <room-owner-vk>             # Find the recipient's member ID.
@@ -67,20 +67,20 @@ shows as ciphertext-only there.
 
 ### Inviting someone via DM
 
-You can hand a room invitation to a co-member *as a DM*. The recipient's River
-UI renders it as a clickable **Invitation card** with an Accept button — unlike a
-bare invite code pasted into `dm send`, which just shows up as raw text.
+You can hand a room invitation to a co-member as a DM. The recipient's River
+UI renders it as a clickable Invitation card with an Accept button. A bare
+invite code pasted into `dm send` shows up as raw text instead.
 
 ```bash
 # Invite <recipient> (a member of the carrier room) to <target-room>.
 riverctl dm invite <carrier-room-vk> <recipient> --room <target-room-vk> -m "come join!"
 ```
 
-- `<carrier-room-vk>` is the room the DM travels in — you and the recipient must
+- `<carrier-room-vk>` is the room the DM travels in. You and the recipient must
   both be members of it.
 - `--room <target-room-vk>` is the room you are inviting them to. It must be a
-  *different* room you're a member of (the recipient is already in the carrier
-  room). A fresh single-use invite credential is minted, exactly as
+  different room you're a member of (the recipient is already in the carrier
+  room). riverctl mints a fresh single-use invite credential, exactly as
   `invite create` does.
 - `-m/--message` is an optional note shown above the Accept button.
 
@@ -94,7 +94,7 @@ The recipient accepts with `dm accept` (below), or clicks the card in the UI.
 riverctl dm accept <carrier-room-vk>
 ```
 
-`<carrier-room-vk>` is the room whose DM thread **contains** the invitation, not
+`<carrier-room-vk>` is the room whose DM thread holds the invitation, not
 the room you are joining. If you have invite DMs for several rooms, narrow with
 `--from <sender>` or `--room <target-room>`.
 
@@ -107,7 +107,7 @@ riverctl invite accept <invite-code>             # On the recipient's machine.
 
 ## Managing your identity
 
-Each room uses a separate signing key, so there is no single global member ID —
+Each room uses a separate signing key, so there is no single global member ID.
 `whoami` is per-room:
 
 ```bash
@@ -115,8 +115,9 @@ riverctl identity whoami <room-owner-vk>         # Your member ID in one room.
 riverctl identity whoami                         # Every room you're in.
 ```
 
-`whoami` reports both identifiers, and they pair with two different fields — a
-bridge filtering out its own echo should use the full key:
+`whoami` reports your member ID and your verifying key
+([Member IDs and verifying keys](#member-ids-and-verifying-keys)). A bridge
+filtering out its own echo should use the full key:
 
 ```bash
 me=$(riverctl identity whoami <room-owner-vk> --format json | jq -r .verifying_key)
@@ -124,27 +125,10 @@ riverctl message stream <room-owner-vk> --format json --no-version-check |
   jq -c --arg me "$me" 'select(.author_verifying_key != $me)'
 ```
 
-For a bot that runs unattended, wrap this in something that restarts it — see
-"Running `message stream` as a long-lived bot" below. Note that a pipeline's exit
-status is the LAST command's, so a wrapper around this one sees `jq`'s status, not
-riverctl's; use `set -o pipefail` in bash, or restart on any exit.
-
-`message list` and `message stream --format json` both carry
-`author_verifying_key` — the author's full base58 key, comparable to `whoami`'s
-`verifying_key` and to `member list`'s. It is `null` when the author is no longer
-in the room, so a `select` on it drops nothing you wanted to keep.
-
-**Pair the two halves correctly.** `whoami`'s `member_id` compares against the
-event's `author`; its `verifying_key` compares against `author_verifying_key`.
-Crossing them (`member_id` against `author_verifying_key`) is never equal, which
-silently disables an echo filter and can put a bridge in a feedback loop.
-
-The short id is fine for recognising your own messages if you pair it correctly,
-but a bot deciding whether to *trust* a member must compare the full key: the
-short id is a 40-bit truncation of a 64-bit non-cryptographic hash.
-
-(The `author` inside `reply_to` is a display nickname, not a member ID — only
-the top-level `author` is comparable.)
+A pipeline's exit status is its LAST command's, so a wrapper around this one
+sees `jq`'s status, not riverctl's. Use `set -o pipefail` in bash, or restart on
+any exit. For a bot that runs unattended, see
+[Running `message stream` as a long-lived bot](#running-message-stream-as-a-long-lived-bot).
 
 `whoami` needs no node: it resolves from local storage, so it works with the
 peer stopped and before any message has arrived. It does need a *writable*
@@ -153,11 +137,15 @@ bundled contract WASM has changed. Pass `--no-version-check` (or set
 `RIVERCTL_NO_VERSION_CHECK`) if you poll it, so it never makes the once-a-day
 crates.io version request.
 
-It reports the identity that will actually **sign**, across all three override
-mechanisms, using the same precedence `message send` does — inline
-`--signing-key` / `RIVER_SIGNING_KEY` beats `--signing-key-file` /
-`RIVER_SIGNING_KEY_FILE`, which beats the per-room key in `rooms.json`. The
-winner is reported as `signing_key_source` (`inline` / `override` / `stored`).
+`whoami` reports the identity that will actually sign, using the same
+precedence as `message send`. It names the winner in `signing_key_source`:
+
+| Source | Flag or env | `signing_key_source` | Wins over |
+|---|---|---|---|
+| Inline key | `--signing-key` / `RIVER_SIGNING_KEY` | `inline` | `override`, `stored` |
+| Key file | `--signing-key-file` / `RIVER_SIGNING_KEY_FILE` | `override` | `stored` |
+| Per-room key in `rooms.json` | none | `stored` | nothing |
+
 With `--signing-key` the room need not be in local storage at all, matching
 `message send --signing-key`:
 
@@ -167,15 +155,9 @@ RIVER_SIGNING_KEY=<base64-key> riverctl identity whoami <room-owner-vk> --format
 
 `room list --format json` carries the same `self_member_id` (plus
 `signing_key_source`) and honours the same `--signing-key` / `RIVER_SIGNING_KEY`,
-so one call covers every room and always agrees with `whoami`. Note that an
-override applies to *every* room, including ones that identity is not a member
-of — which is what `signing_key_source` is there to tell you.
-
-**On comparing IDs.** A `MemberId` renders as 8 base32 characters — a truncated,
-non-cryptographic hash of the verifying key. That is fine for recognising your
-own messages, which is what it is for. Do not treat it as a security boundary:
-it is short enough to collide deliberately, so don't grant trust based on an
-`author` match alone.
+so one call covers every room and always agrees with `whoami`. An override
+applies to *every* room, including rooms that identity is not a member of.
+`signing_key_source` shows when one is in effect.
 
 Export your identity to move between machines or back it up:
 
@@ -183,6 +165,45 @@ Export your identity to move between machines or back it up:
 riverctl identity export <room-owner-vk> > my-identity.token
 riverctl identity import < my-identity.token     # On another machine.
 ```
+
+## Member IDs and verifying keys
+
+A member has two identifiers:
+
+- The member ID (`MemberId`): 8 base32 characters, a 40-bit truncation of a
+  64-bit non-cryptographic hash of the verifying key. Two members can share
+  one, and it is short enough to collide deliberately.
+- The verifying key: the member's full base58 ed25519 key. It names exactly one
+  member.
+
+Compare each `whoami` field only against fields of the same kind:
+
+| `whoami` field | Compares against | Use for |
+|---|---|---|
+| `member_id` | An event's top-level `author`; `member list`'s `member_id`; `room list`'s `self_member_id` | Recognising your own messages |
+| `verifying_key` | An event's `author_verifying_key`; `member list`'s `verifying_key` | Echo filters, and any decision about who to trust |
+
+**Never cross them.** `member_id` compared against `author_verifying_key` is
+never equal, which silently disables an echo filter and can put a bridge in a
+feedback loop.
+
+**Never grant trust on a member ID match alone.** A bot deciding whether to
+trust a member (for example, allow-listing which members may issue commands)
+must compare the full verifying key.
+
+`message list` and `message stream --format json` both carry
+`author_verifying_key`. It is `null` when the author is no longer in the room,
+so a `select` on it drops nothing you wanted to keep.
+
+Wherever a command takes `<member-id>` (`ban`, `deputize`, `revoke-deputy`,
+`deputies`, `deputized-by`, and `dm send`'s recipient), you can pass either the
+8-character short ID or the full verifying key that `member list` prints. The
+short ID can be ambiguous; the full key cannot.
+
+Two event fields are not identities you can trust on:
+
+- `reactors` carries short IDs only ([event types](#message-stream---format-json-event-types)).
+- `reply_to.author` is a display nickname, not an ID ([`reply_to`](#reply_to)).
 
 ## Member management
 
@@ -194,20 +215,13 @@ riverctl member ban          <room-owner-vk> <member-id>
 
 `member ban` is not owner-only: the room owner can ban anyone, and so can a
 member banning within their own invite subtree, or a deputy of such a member
-(see below).
-
-Wherever a command takes `<member-id>` (`ban`, `deputize`, `revoke-deputy`,
-`deputies`, `deputized-by`, and `dm send`'s recipient), you can pass either the
-8-character short ID or the member's full **verifying key** — the base58 key
-`member list` prints. The short ID is a 40-bit truncation that two members can
-share (so it can be ambiguous); the full key names exactly one member. Compare
-the full `verifying_key` whenever you must be sure who a member is — for example
-a bot allow-listing which members may issue commands.
+(see below). `<member-id>` takes a short ID or a full verifying key
+([Member IDs and verifying keys](#member-ids-and-verifying-keys)).
 
 ### Deputies
 
 A deputy can ban within their deputizer's invite subtree. Deputies are
-**per-deputizer**, not a room-wide flag: "is X a deputy?" is only meaningful as
+per-deputizer, not a room-wide flag: "is X a deputy?" is only meaningful as
 "whose deputy is X?", so both queries name the deputizer explicitly.
 
 ```bash
@@ -229,12 +243,12 @@ Both accept `--format json`, emitting `{room_id, direction, subject, grants[]}`.
 Each grant carries `deputizer`, `deputy`, `scope` (`room-wide` /
 `invite-subtree`), `active`, and `members_deputy_can_ban`.
 
-`members_deputy_can_ban` is how many **other** members this deputy can ban
-within the grant's scope. Each candidate is decided by the contract's own authorization rule
-rather than by a summary of it: `0` for an inactive grant; every other member
+`members_deputy_can_ban` is how many other members this deputy can ban
+within the grant's scope. The contract's own authorization rule decides each
+candidate, not a summary of it: `0` for an inactive grant; every other member
 for an owner grant; otherwise the members of the deputizer's invite subtree the
 contract authorizes this deputy to ban. The deputy is never counted against
-themselves — banning yourself is permitted but is not moderation authority. It
+themselves: banning yourself is permitted but is not moderation authority. It
 is often `0` even for a live grant, because most members have invited nobody.
 `members_deputy_can_ban > 0` is the check for "this member actually has moderation
 authority here".
@@ -258,7 +272,7 @@ faithful nickname.
 fields `deputies` (who this member deputized) and `deputized_by` (who deputized
 them). `debug room-state` gains `deputy_grant_count` and `deputy_grants`.
 
-Two caveats worth knowing:
+Caveats:
 
 - The read commands reject an ambiguous partial member ID and list the matches;
   the write commands (`ban`, `deputize`, `revoke-deputy`) still resolve a
@@ -275,9 +289,9 @@ Two caveats worth knowing:
 | `message`  | `send`, `list`, `stream`, `edit`, `delete`, `react`, `unreact`, `reply` |
 | `member`   | `list`, `set-nickname`, `ban`, `deputize`, `revoke-deputy`, `deputies`, `deputized-by` |
 | `invite`   | `create`, `accept`                                                      |
-| `dm`       | `send`, `list`, `purge`, `accept`                                       |
+| `dm`       | `send`, `list`, `invite`, `purge`, `accept`                             |
 | `identity` | `whoami`, `export`, `import`                                            |
-| `debug`    | troubleshooting utilities                                               |
+| `debug`    | Troubleshooting: `contract-get`, `websocket`, `contract-key`, `room-state`, `bans`, `config` |
 
 Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags. All commands accept `--format json` for scripting.
 
@@ -292,25 +306,48 @@ Run `riverctl <group> --help` or `riverctl <group> <cmd> --help` for full flags.
 | `delete` | A previously-streamed message was deleted | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `timestamp` (no `content`) |
 | `reaction` | A surfaced message's reactions changed | `message_id`, `room`, `author`, `author_verifying_key`, `nickname`, `timestamp`, `reactions` (emoji → count), `reactors` (emoji → member IDs) |
 
+`author` is the sender's member ID and `author_verifying_key` their full key.
+Compare each only with its own kind from `riverctl identity whoami`
+([Member IDs and verifying keys](#member-ids-and-verifying-keys)).
+
 On a `reaction` event, `author` and `author_verifying_key` identify the author of
-the message that was **reacted to**, not the person who reacted — read `reactors`
+the message that was reacted to, not the person who reacted. Read `reactors`
 for that.
 
-**`reactors` carries short ids only.** So a bot that acts on *who reacted* — a
-moderation sweep, an "admin reacted ✅ to approve" flow — is deciding on 40 bits,
-and must resolve those ids through `member list`'s `verifying_key` before
+**`reactors` carries short IDs only.** A bot that acts on who reacted (a
+moderation sweep, an "admin reacted ✅ to approve" flow) is deciding on 40 bits.
+It must resolve those IDs through `member list`'s `verifying_key` before
 treating one as an identity. Do not substitute the event's
 `author_verifying_key`: on a reaction event it names an uninvolved party.
 
-`reply_to` is `{ "author", "author_id", "message_id", "preview" }` only when the quoted message could be read back from live room state. It is `null` both for non-replies **and** for a reply whose quoted message could not be verified — its author was banned (which purges their messages), it was deleted, it aged out of the room's `max_recent_messages` window, or it could not be decrypted. The quoted author and preview stored in a reply are a snapshot written by the *replier* and validated by nothing, so riverctl never emits them unverified; a bridge would otherwise republish a banned member's text after the ban. The human-readable output marks a reply it could not verify with a `[reply to an unavailable message]` prefix; the JSON deliberately does not distinguish it from a non-reply, so no existing consumer breaks on a new shape. The one exception is a private room `riverctl` holds no secrets for at all: there it emits no marker either, since it cannot read any of the room's messages and every body already renders `<encrypted>`.
+`edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types **and unknown fields**. New fields are added to these events (this table has grown twice), so a strict schema that rejects them will break on an ordinary riverctl upgrade.
 
-`edit`/`delete` events are emitted only for messages the stream actually surfaced. Bridges should key off `type` and tolerate unknown future types **and unknown fields** — new fields are added to these events (this table has grown twice), so a strict schema that rejects them will break on an ordinary riverctl upgrade.
+#### `reply_to`
 
-The top-level `author` is the sending member's ID and `author_verifying_key` is
-their full key; get your own with `riverctl identity whoami <room-owner-vk>` and
-compare like against like (see "Managing your identity" above). Inside `reply_to`,
-`author` is a display **nickname**, not an ID — the id there is `author_id`, and
-it has no full-key sibling, so it is not something to trust on.
+`reply_to` is `{ "author", "author_id", "message_id", "preview" }` only when
+riverctl could read the quoted message back from live room state. Inside it,
+`author` is a display **nickname**, not a member ID. The ID there is
+`author_id`, and it has no full-key sibling, so it is not something to trust on.
+
+`reply_to` is `null` for a message that is not a reply, and also for a reply
+whose quoted message riverctl could not verify because:
+
+- its author was banned (which purges their messages);
+- it was deleted;
+- it aged out of the room's `max_recent_messages` window;
+- it could not be decrypted.
+
+The replier writes the quoted author and preview into the reply, and nothing
+validates them. riverctl never emits them unverified; otherwise a bridge would
+republish a banned member's text after the ban.
+
+The human-readable output marks a reply it could not verify with a
+`[reply to an unavailable message]` prefix. The JSON deliberately does not
+distinguish it from a non-reply, so no existing consumer breaks on a new shape.
+
+The one exception is a private room `riverctl` holds no secrets for at all.
+There the human-readable output adds no marker either: riverctl cannot read any
+of the room's messages, and every body already renders `<encrypted>`.
 
 ### Running `message stream` as a long-lived bot
 
@@ -326,12 +363,11 @@ Exiting with status 75 so it can be restarted; a restarted riverctl uses the cur
 ```
 
 A restarted `riverctl` looks up the new address and carries on streaming from
-it. So **run a bot under something that restarts it on any failure, with a short
-delay** — not only on status 75. A bot with no restart wrapper at all will now
-**stop** after a re-key, where it used to keep running but silently stop receiving
-messages. Right after a re-key the restarted process can
-fail until the room has been moved to the new address, and a wrapper that gives up
-on anything other than 75 would stop the bot for good.
+it. **Run a bot under something that restarts it on any failure, with a short
+delay, not only on status 75.** Right after a re-key the restarted process can
+fail until the room has moved to the new address, and a wrapper that gives up
+on anything other than 75 would stop the bot for good. A bot with no restart
+wrapper stops after a re-key.
 
 With systemd, the relevant `[Service]` lines:
 
@@ -342,8 +378,8 @@ Restart=on-failure
 RestartSec=5
 ```
 
-`RestartSec` matters: without it, a few quick failures in a row can trip
-systemd's start limit and leave the unit stopped.
+Without `RestartSec`, a few quick failures in a row can trip systemd's start
+limit and leave the unit stopped.
 
 Or as a script (save it to a file rather than pasting it into an interactive
 shell):
@@ -358,24 +394,24 @@ while true; do
 done
 ```
 
-Status 75 is `EX_TEMPFAIL` ("temporary failure, retry"), distinct from the status
-1 every other failure uses. It is there so a wrapper can tell an expected restart
-from a real failure — for example, to alert only on the latter — not because other
-failures should be left stopped.
+Status 75 is `EX_TEMPFAIL` ("temporary failure, retry"). Every other failure
+exits with status 1. The distinct status lets a wrapper tell an expected restart
+from a real failure, for example to alert only on the latter. Other failures
+still need a restart.
 
-**Restarting can re-deliver messages.** A restarted stream starts with no memory
-of what it already emitted. With `--initial-messages N`, it re-emits the last N
-messages as new, which covers up to N messages sent while it was restarting but
-repeats what you had already seen. If the bot acts on messages, deduplicate on
-`message_id`. Without `--initial-messages`, nothing is repeated, but messages sent
-during the restart are not shown.
+**Restarting can re-deliver messages.** A restarted stream has no memory of what
+it already emitted. With `--initial-messages N`, it re-emits the last N messages
+as new: that covers up to N messages sent while it was restarting, and repeats
+ones you had already seen. If the bot acts on messages, deduplicate on
+`message_id`. Without `--initial-messages`, nothing is repeated, but messages
+sent during the restart are not shown.
 
-If River has re-keyed to a version **newer than your riverctl**, the restarted
+If River has re-keyed to a version newer than your riverctl, the restarted
 process still streams the room once it has been moved to the new address, and
-prints a warning telling you to upgrade (`cargo install riverctl`). Until the room
-has been moved — which an up-to-date River client does when someone opens it —
-`--subscribe` keeps failing and being restarted, while polling mode stays running
-and keeps retrying.
+prints a warning telling you to upgrade (`cargo install riverctl`). An
+up-to-date River client moves the room when someone opens it. Until then,
+`--subscribe` keeps failing and being restarted, while polling mode stays
+running and keeps retrying.
 
 ## Configuration
 
@@ -392,18 +428,27 @@ and keeps retrying.
 
 ## For contributors
 
-If you change `common/`, `contracts/`, or `delegates/` code and rebuild WASM, you must keep the CLI's bundled copy in sync:
+A change to `common/`, `contracts/` or `delegates/` can change the WASM, and
+with it the contract or delegate key. Follow the migration workflow in
+`.claude/rules/delegate-migration.md` (at the repository root) before
+rebuilding. Two tasks keep the CLI's bundled copy in sync:
 
-```bash
-cargo make sync-cli-wasm
-```
+| Task | What it does |
+|---|---|
+| `cargo make sync-wasm` | Rebuilds every contract and delegate WASM and copies each to its committed locations, `cli/contracts/` included |
+| `cargo make sync-cli-wasm` | Copies `ui/public/contracts/room_contract.wasm` to `cli/contracts/` |
 
-The CLI build double-checks and panics if the bundled WASM drifts from the most recently built artifact. See the top-level `AGENTS.md` ("Delegate & Contract WASM Migration") for the full migration workflow.
+The CLI build panics if the bundled WASM drifts from the most recently built
+artifact.
 
-An integration smoke test lives at `tests/message_flow.rs`. It is `#[ignore]` by default; run it manually with:
+An integration smoke test lives at `tests/message_flow.rs`. It is `#[ignore]` by
+default; run it manually with:
 
 ```bash
 cargo test --test message_flow -- --ignored --nocapture
 ```
 
-Prerequisite: `~/code/freenet/freenet-core/main` must exist (the harness builds the Freenet binary from there).
+The harness builds the Freenet binary from a freenet-core checkout. It reads
+`FREENET_CORE_PATH`, and otherwise assumes `../../../freenet-core/main` relative
+to `cli/`, which is `~/code/freenet/freenet-core/main` when River is checked out
+at `~/code/freenet/river/main`.

@@ -1,16 +1,9 @@
-# River CLI Contracts
+# riverctl bundled contract
 
-This directory contains the WASM contracts used by the River CLI.
+`room_contract.wasm` is a byte-for-byte copy of `ui/public/contracts/room_contract.wasm`.
+riverctl derives every room's contract key from it, and crates.io packages need it committed.
+`cli/build.rs` embeds the `ui/public/contracts/` copy in a workspace build and this one in a crates.io build.
 
-## room_contract.wasm
-
-This is a copy of the room contract from `../ui/public/contracts/room_contract.wasm`.
-
-**Important:** This file MUST be kept in sync with the UI version and committed to the repository for crates.io publishing.
-
-To update:
-```bash
-cp ../ui/public/contracts/room_contract.wasm contracts/
-```
-
-The build.rs script will use this file when building from a crates.io package, and will use the UI version when building from the workspace.
+**Never copy or rebuild it by hand.** A changed WASM changes the contract key.
+Run `cargo make sync-wasm` and follow `.claude/rules/delegate-migration.md`.
+CI's `check-cli-wasm` fails when the two copies differ.
