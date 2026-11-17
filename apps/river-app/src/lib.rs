@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod node;
+pub mod notify;
 pub mod rooms;
 pub mod setup;
 
@@ -31,7 +32,22 @@ pub struct RiverApp {
     /// River's logo, rasterized once by [`load_logo`]. `None` until then, and in tests, which
     /// draw an empty square in its place.
     logo: Option<Logo>,
+    /// Shows notifications and the unread count with the operating system. [`notify::Silent`]
+    /// in snapshots, tests and shells without one.
+    notifier: Box<dyn notify::Notifier>,
+    /// Whether the window has focus. False until the first focus event, so a window that never
+    /// reports one errs toward notifying.
+    focused: bool,
+    /// Messages that arrived in the open room while the window was not focused. The room counts
+    /// them as read the moment they land, so the title adds them back until the person returns.
+    missed: (String, usize),
+    /// The unread count last given to the notifier, so it hears only changes.
+    reported_unread: Option<usize>,
+    prefs: rune::prefs::Prefs,
 }
+
+/// The preference that holds [`Chat::notifications`].
+const PREF_NOTIFICATIONS: &str = "notifications";
 
 /// The logo and the cache that keeps its pixels alive.
 struct Logo {
@@ -76,12 +92,18 @@ impl RiverApp {
             ctl: None,
             link: None,
             logo: None,
+            notifier: Box::new(notify::Silent),
+            focused: false,
+            missed: Default::default(),
+            reported_unread: None,
+            prefs: rune::prefs::Prefs::memory(),
         }
     }
 
     /// The live app: starts checking for a node straight away, and reads the user's rooms
     /// through `link` once one answers.
     pub fn attached(ctl: Controller, link: rooms::Link) -> Self {
+        let prefs = rune::prefs::Prefs::open("org.freenet.River");
         ctl.check();
         let mut chat = Chat::new(
             chat::Source::Node(chat::LinkStatus::Loading),
@@ -90,6 +112,7 @@ impl RiverApp {
             0,
             0,
         );
+        chat.notifications = prefs.get(PREF_NOTIFICATIONS).unwrap_or(true);
         // What the user does in a room goes to the background work, which sends it.
         let sink = link.clone();
         chat.set_sink(Box::new(move |command| sink.send(command)));
@@ -100,6 +123,82 @@ impl RiverApp {
             ctl: Some(ctl),
             link: Some(link),
             logo: None,
+            notifier: Box::new(notify::Silent),
+            focused: false,
+            missed: Default::default(),
+            reported_unread: None,
+            prefs,
+        }
+    }
+
+    /// Show notifications and the unread count through `notifier`.
+    pub fn with_notifier(mut self, notifier: Box<dyn notify::Notifier>) -> Self {
+        self.notifier = notifier;
+        self
+    }
+
+    /// The window gained or lost focus.
+    pub fn focus_changed(&mut self, focused: bool) {
+        self.focused = focused;
+        if focused {
+            self.missed = Default::default();
+        }
+    }
+
+    /// Turn notifications on or off, and keep the choice.
+    pub fn set_notifications(&mut self, on: bool) {
+        self.chat.notifications = on;
+        if let Err(e) = self.prefs.set(PREF_NOTIFICATIONS, &on) {
+            eprintln!("river: could not save the notification setting: {e}");
+        }
+    }
+
+    /// Open the room a notification was about. The shell calls this when it is clicked.
+    pub fn open_room(&mut self, key: &str) {
+        self.chat.open_room(key);
+    }
+
+    /// Unread messages across all rooms, counting the open room's while the window was away.
+    pub fn unread(&self) -> usize {
+        self.chat.unread_total() + self.missed.1
+    }
+
+    /// Notify about `arrived`, unless the person is looking at that room right now.
+    fn notify_arrivals(&mut self, arrived: Vec<notify::Arrival>) {
+        let open = self.chat.room().map(|r| r.key.clone());
+        let mut shown = Vec::new();
+        for a in arrived {
+            let in_front = self.focused && open.as_deref() == Some(a.room_key.as_str());
+            if in_front {
+                continue;
+            }
+            if open.as_deref() == Some(a.room_key.as_str()) {
+                if self.missed.0 != a.room_key {
+                    self.missed = (a.room_key.clone(), 0);
+                }
+                self.missed.1 += a.count;
+            }
+            shown.push(a);
+        }
+        if !self.chat.notifications {
+            return;
+        }
+        for n in notify::compose(shown) {
+            self.notifier.notify(n);
+        }
+    }
+
+    /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
+    /// the start of every frame, so it sees every change however it came about.
+    fn sync_unread(&mut self, tx: &mut Tx) {
+        if !matches!(self.chat.source, chat::Source::Node(_)) {
+            return;
+        }
+        let unread = self.unread();
+        tx.set_title(notify::window_title(unread));
+        if self.reported_unread != Some(unread) {
+            self.reported_unread = Some(unread);
+            self.notifier.set_unread(unread);
         }
     }
 
@@ -129,9 +228,11 @@ impl RiverApp {
                 work,
             } => {
                 self.chat.issues = issues;
-                self.chat
+                let arrived = self
+                    .chat
                     .show_node_rooms(rooms, open.as_deref(), status, now);
                 self.chat.show_work(work);
+                self.notify_arrivals(arrived);
             }
             RoomsUpdate::Status(status) => {
                 if let chat::Source::Node(_) = self.chat.source {
@@ -374,13 +475,17 @@ pub fn spec() -> AppSpec<RiverApp> {
         scenes: SCENES,
         min_size: Some((640.0, 480.0)),
         setup: Some(load_logo),
+        poll: Some(|s, _, tx| {
+            s.sync_unread(tx);
+            false
+        }),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
 }
 
 /// Build the live app: `init` receives the app's own handle so background work can report back.
 pub fn app(make: impl FnOnce(AppHandle<RiverApp>) -> RiverApp + 'static) -> rune::App<RiverApp> {
-    let app = rune::App::new(spec());
+    let app = rune::App::new(spec()).on_focus(|s, focused, _| s.focus_changed(focused));
     let handle = app.handle();
     app.init(move || make(handle))
 }
@@ -818,12 +923,9 @@ mod tests {
         });
         let ctl = Controller::reporting_to(host.clone(), |_| {});
         let state = RiverApp {
-            setup,
-            chat: Chat::example(),
-            access: Access::Example,
             ctl: Some(ctl),
-            link: None,
-            logo: None,
+            setup,
+            ..RiverApp::detached()
         };
         let env = Env {
             system_dark: true,

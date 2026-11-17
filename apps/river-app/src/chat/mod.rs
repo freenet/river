@@ -207,6 +207,9 @@ pub struct Chat {
     open_when_shown: Option<String>,
     /// The invitation asked for, by the room it was asked for in.
     pub invite: Option<(String, InviteState)>,
+    /// Whether new messages produce notifications: the switch in the room list's footer. The
+    /// app keeps it across runs.
+    pub notifications: bool,
 }
 
 impl Chat {
@@ -245,6 +248,7 @@ impl Chat {
             opened: HashSet::new(),
             open_when_shown: None,
             invite: None,
+            notifications: true,
         };
         chat.set_rooms(rooms);
         chat
@@ -312,7 +316,18 @@ impl Chat {
         open: Option<&str>,
         status: LinkStatus,
         now: u32,
-    ) {
+    ) -> Vec<crate::notify::Arrival> {
+        // Only an update that follows a live one can carry news. The first rooms, the catch-up
+        // that ends "Catching up", and what arrives after a reconnect are history, not messages
+        // to interrupt the person with.
+        let arrived = if matches!(self.source, Source::Node(LinkStatus::Live))
+            && status == LinkStatus::Live
+            && self.node_rooms_shown
+        {
+            crate::notify::arrivals(&self.rooms, &rooms)
+        } else {
+            Vec::new()
+        };
         self.source = Source::Node(status);
         // The menu belongs to what was on screen; a new list may have removed it.
         self.link_menu = None;
@@ -345,6 +360,24 @@ impl Chat {
         {
             self.read.insert(room.key.clone(), mark);
         }
+        arrived
+    }
+
+    /// Unread messages across all rooms.
+    pub fn unread_total(&self) -> usize {
+        self.rooms.iter().map(|r| r.unread).sum()
+    }
+
+    /// Bring the room keyed `key` to the front, as a click on its notification does: open it,
+    /// and show the conversation rather than the members panel on a narrow window. False if
+    /// there is no such room.
+    pub fn open_room(&mut self, key: &str) -> bool {
+        if !self.rooms.iter().any(|r| r.key == key) {
+            return false;
+        }
+        self.select(key);
+        self.members_overlay = false;
+        true
     }
 
     /// Change the rooms in place, then settle the open room as [`Chat::set_rooms`] does.

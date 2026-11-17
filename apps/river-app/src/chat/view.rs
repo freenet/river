@@ -4,7 +4,7 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, Pixels, ScrollSpec, col, el, icon, row, spacer, text};
-use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, Switch, TextInput};
 
 use super::conversation::{avatar, conversation};
 use super::icons;
@@ -332,7 +332,9 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
     for w in &chat.work {
         footer = footer.child(work_row(w, p, k));
     }
-    let footer = footer.child(source_status(chat, p, k));
+    let footer = footer
+        .child(notifications_switch(chat, p, k))
+        .child(source_status(chat, p, k));
     let column = col()
         .key("rooms")
         .w(width)
@@ -354,6 +356,31 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         .h_full()
         .child(column)
         .child(vline(p))
+}
+
+/// The switch for notifications. Hidden for the example rooms, which have nothing to notify of.
+fn notifications_switch(chat: &Chat, p: &Palette, k: &Kit) -> El {
+    if chat.source == Source::Example {
+        return el().key("notifications-none");
+    }
+    row()
+        .key("notifications")
+        .px(4.0)
+        .gap(8.0)
+        .center_y()
+        .child(icon(&icons::BELL, 15.0).color(p.text_muted))
+        .child(label("Notifications", st::SMALL, p.text_secondary))
+        .child(spacer())
+        .child(
+            Switch::new(chat.notifications)
+                .label("Notifications")
+                .hide_label()
+                .on_toggle(|s: &mut RiverApp| {
+                    let on = !s.chat.notifications;
+                    s.set_notifications(on);
+                })
+                .build(k),
+        )
 }
 
 /// A room being created or joined: working, or failed with why, Try again and Dismiss.
