@@ -175,6 +175,12 @@ pub fn render(
     } else {
         src.to_owned()
     };
+    // Links to Freenet apps behave as in the web UI (see `links`).
+    let src = if is_cheap(&src) {
+        super::links::prepare(&src)
+    } else {
+        src
+    };
     let (accent, soft, line, muted) = (p.accent, p.accent_soft, p.accent_line, p.text_muted);
     Markdown::new(src)
         .on_link_tx(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
