@@ -332,6 +332,188 @@ test.describe("Native reaction chip actions", () => {
   });
 });
 
+// A message's chips are keyed siblings, so a change of standing order moves
+// some of them in the DOM. A moved node is detached on the way and loses
+// focus: the app puts it back on the chip, or on the open reactor list, the
+// move took it from.
+test.describe("Standing-order move keeps focus", () => {
+  test.beforeEach(async ({ page }) => asTouchTablet(page));
+
+  const MOVED = ["❤️", "🎉", "👍"];
+  // How far the history's view is from its end. Not `scrollTop`: the signed
+  // commit also sorts the arrivals a test hook delivered, which regroups
+  // their rows and shortens the history above a view held at the end.
+  const distanceFromEnd = (page: Page) =>
+    page.evaluate(() => {
+      const scroller = document.getElementById("chat-scroll-container")!;
+      return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    });
+  const inHistoryView = (target: Locator) =>
+    target.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      const view = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+      return box.bottom > view.top && box.top < view.bottom;
+    });
+
+  function panicsOf(page: Page): string[] {
+    const panics: string[] = [];
+    page.on("pageerror", (e) => panics.push(e.message));
+    page.on("console", (m) => {
+      if (m.type() === "error" && /panicked|unreachable|already borrowed/.test(m.text())) panics.push(m.text());
+    });
+    return panics;
+  }
+
+  // 👍 (the reader's, earliest), ❤️, 🎉, then another member's later 👍.
+  // Removing the reader's 👍 re-ranks it last. With three chips that moves
+  // the 👍 itself; a two-chip swap moves the other one.
+  async function movableChip(page: Page) {
+    const row = await openRoomWithTarget(page);
+    await pick(page, row, "👍");
+    for (const emoji of ["❤️", "🎉", "👍"]) await callRiverTest(page, "memberReactsToNewest", emoji);
+    await expect.poll(() => order(row), { message: "premise: the reader's 👍 stands first" }).toEqual(["👍", "❤️", "🎉"]);
+    await expect(count(chip(row, "👍")), "premise: another member holds 👍 too").toHaveText("2");
+    return { row, thumb: chip(row, "👍") };
+  }
+
+  // The reader removes their 👍 from its list, from the keyboard, with
+  // signing held: the remove is pending, and a pending remove of an emoji
+  // someone else holds moves nothing. The order changes when the caller
+  // releases the signature.
+  async function removeWithSigningHeld(page: Page, row: Locator, thumb: Locator) {
+    await callRiverTest(page, "holdMessageSigning");
+    await thumb.press("Enter");
+    await owners(page).getByTestId("reaction-remove").press("Enter");
+    await expect(owners(page), "premise: Remove closed the list").toHaveCount(0);
+    await expect(thumb, "premise: the remove is showing").toHaveAttribute("data-own-reaction", "false");
+    await expect(count(thumb), "premise: the other member's 👍 stands").toHaveText("1");
+    await expect(thumb, "premise: focus is back on the chip").toBeFocused();
+    expect(await order(row), "premise: a pending remove moves nothing").toEqual(["👍", "❤️", "🎉"]);
+  }
+
+  // Open the 👍 list again, still with signing held, and mark its node.
+  async function openListWithSigningHeld(page: Page, row: Locator, thumb: Locator) {
+    await thumb.press("Enter");
+    await expect(owners(page), "premise: one list is open").toHaveCount(1);
+    await expect(owners(page), "premise: the list has focus").toBeFocused();
+    await expect(owners(page).getByTestId("reaction-apply"), "premise: the 👍 list").toHaveText("React with 👍");
+    expect(await order(row), "premise: opening the list moves nothing").toEqual(["👍", "❤️", "🎉"]);
+    await owners(page).evaluate((el) => {
+      (el as unknown as { __sameList?: boolean }).__sameList = true;
+    });
+  }
+
+  const sameList = (page: Page) => owners(page).evaluate((el) => (el as unknown as { __sameList?: boolean }).__sameList === true);
+
+  test("a focused chip the order moves keeps focus, and the history stays put", async ({ page }) => {
+    const panics = panicsOf(page);
+    const { row, thumb } = await movableChip(page);
+    await removeWithSigningHeld(page, row, thumb);
+    // Arrivals the history follows park the chip above the view, so a focus
+    // that scrolled to it would show.
+    await callRiverTest(page, "appendMessages", 20);
+    await expect(page.getByText("batched arrival 19")).toHaveCount(1, { timeout: 5_000 });
+    await settle(page);
+    expect(await inHistoryView(thumb), "premise: the chip is out of view").toBe(false);
+    expect(await distanceFromEnd(page), "premise: the view is at the history's end").toBeLessThanOrEqual(1);
+    await expect(thumb, "premise: the chip still has focus").toBeFocused();
+
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect.poll(() => order(row), { message: "premise: the signed remove moved 👍 last" }).toEqual(MOVED);
+    await expect(thumb, "focus stays on the chip the order moved").toBeFocused();
+    await settle(page);
+    expect(await distanceFromEnd(page), "the history did not move").toBeLessThanOrEqual(1);
+    expect(await inHistoryView(thumb), "the chip is still out of view").toBe(false);
+    expect(panics, "nothing panicked").toEqual([]);
+    // What the two checks above rule out: a focus that scrolls brings the
+    // parked chip into view, in every engine.
+    await thumb.evaluate((el) => {
+      (el as HTMLElement).blur();
+      (el as HTMLElement).focus();
+    });
+    await settle(page);
+    expect(await inHistoryView(thumb), "premise: a focus that scrolls would have shown the chip").toBe(true);
+  });
+
+  test("an open reactor list the order moves keeps focus, and Escape closes it", async ({ page }) => {
+    const panics = panicsOf(page);
+    const { row, thumb } = await movableChip(page);
+    await removeWithSigningHeld(page, row, thumb);
+    await openListWithSigningHeld(page, row, thumb);
+
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect.poll(() => order(row), { message: "premise: the signed remove moved 👍 last" }).toEqual(MOVED);
+    await expect(owners(page), "premise: the list is still open").toHaveCount(1);
+    expect(await sameList(page), "premise: the same list, not one opened again").toBe(true);
+    await expect(owners(page), "focus stays in the open list").toBeFocused();
+    // From the page, as the reader's key arrives: `owners.press` would focus
+    // the list first.
+    await page.keyboard.press("Escape");
+    await expect(owners(page), "Escape closes the list").toHaveCount(0);
+    await expect(thumb, "and focus returns to its chip").toBeFocused();
+    expect(panics, "nothing panicked").toEqual([]);
+  });
+
+  test("the list's action the order moves keeps focus, and Enter still acts", async ({ page }) => {
+    const panics = panicsOf(page);
+    const { row, thumb } = await movableChip(page);
+    await removeWithSigningHeld(page, row, thumb);
+    await openListWithSigningHeld(page, row, thumb);
+    const action = owners(page).getByTestId("reaction-apply");
+    await action.focus();
+    await expect(action, "premise: focus is on the list's action").toBeFocused();
+
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect.poll(() => order(row), { message: "premise: the signed remove moved 👍 last" }).toEqual(MOVED);
+    expect(await sameList(page), "premise: the same list, not one opened again").toBe(true);
+    await expect(action, "focus stays on the list's action").toBeFocused();
+    // From the page: on the list itself Enter would do nothing.
+    await page.keyboard.press("Enter");
+    await expect(owners(page), "Enter reaches the action").toHaveCount(0);
+    await expect(thumb, "and it reacts").toHaveAttribute("data-own-reaction", "true");
+    expect(panics, "nothing panicked").toEqual([]);
+  });
+
+  // In the gateway's frame the chip stays the frame's active element while
+  // the reader is in the shell. Another member's reaction must not pull the
+  // keyboard back into River.
+  test("no focus is taken while the reader is outside the document", async ({ page }) => {
+    const panics = panicsOf(page);
+    const { row, thumb } = await movableChip(page);
+    await removeWithSigningHeld(page, row, thumb);
+    // As a browser reports a frame or window the reader has left.
+    await page.evaluate(() => Object.defineProperty(document, "hasFocus", { configurable: true, value: () => false }));
+
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect.poll(() => order(row), { message: "premise: the signed remove moved 👍 last" }).toEqual(MOVED);
+    await settle(page);
+    expect(
+      await page.evaluate(() => document.activeElement === document.body),
+      "the moved chip is not focused again",
+    ).toBe(true);
+    expect(panics, "nothing panicked").toEqual([]);
+  });
+
+  test("focus the reader moved elsewhere is left alone", async ({ page }) => {
+    const panics = panicsOf(page);
+    const { row, thumb } = await movableChip(page);
+    await removeWithSigningHeld(page, row, thumb);
+    await openListWithSigningHeld(page, row, thumb);
+    const composer = page.getByTestId("message-input");
+    await composer.focus();
+    await expect(composer, "premise: the reader moved focus to the composer").toBeFocused();
+    await expect(owners(page), "premise: the list stayed open").toHaveCount(1);
+
+    await callRiverTest(page, "releaseMessageSigning");
+    await expect.poll(() => order(row), { message: "premise: the signed remove moved 👍 last" }).toEqual(MOVED);
+    await settle(page);
+    await expect(composer, "the composer keeps the focus the reader gave it").toBeFocused();
+    await expect(owners(page), "the list stays open").toHaveCount(1);
+    expect(await sameList(page), "the same list, not one opened again").toBe(true);
+    expect(panics, "nothing panicked").toEqual([]);
+  });
+});
+
 // A received row's dense footer. An own row's is "Footer at 320px" in
 // message-action-buttons.spec.ts, held to the same shared geometry checks.
 test("dense received chips wrap inside a 320px footer, and React reaches the row's actions", async ({ page }) => {

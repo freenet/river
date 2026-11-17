@@ -128,7 +128,11 @@ Current behavior:
   48rem and wider a finger or pen held on a chip opens its list without
   waiting for the lift. Opening or closing a reactor list, and focus moving
   along a message's reaction line when a chip is removed, never scroll the
-  history. While the sheet is open the reader's
+  history. A chip that moves in the standing order while it, or its open
+  list, holds focus keeps that focus, again without scrolling
+  (`conversation/reaction_focus.rs`); focus the reader has put elsewhere
+  stays there, and none is taken while the reader is outside River's
+  document. While the sheet is open the reader's
   wheel and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and the emoji row in its panel still scrolls sideways;
   a zoom (Ctrl+wheel, a pinch) is not held, nothing outside the dialog is captured, and every close path

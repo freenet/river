@@ -53,6 +53,7 @@ mod mobile_surface;
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 mod pending_effects;
 mod pending_sends;
+mod reaction_focus;
 mod reaction_order;
 mod reaction_picker;
 mod reply_highlight;
@@ -4330,6 +4331,9 @@ fn MessageGroupComponent(
             }
         });
     }
+    // A chip the standing order moves, or its open list, keeps the focus it
+    // had: measured here, before this render's edits reach the DOM.
+    reaction_focus::keep_across_patch(group.messages.iter().map(|msg| msg.id.as_str()));
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
