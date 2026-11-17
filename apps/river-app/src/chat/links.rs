@@ -99,7 +99,8 @@ fn link_dests(md: &str) -> Vec<String> {
 }
 
 /// Whether `md` has a link reference definition (`[label]: dest`), which can turn any
-/// bracketed text, ours included, into a link elsewhere.
+/// bracketed text, ours included, into a link elsewhere. (A footnote-style `[^x]:` line is not
+/// one here, since footnotes are off.)
 fn has_definitions(md: &str) -> bool {
     Parser::new_ext(md, options())
         .reference_definitions()
@@ -262,6 +263,17 @@ fn rewrites(src: &str) -> Option<(Vec<Edit>, Vec<String>)> {
             }) => link = Some(Link::new(range, link_type, dest_url, title)),
             Event::Start(Tag::Image { .. }) => in_image += 1,
             Event::End(TagEnd::Image) => in_image = in_image.saturating_sub(1),
+            // The widget parses a paragraph that starts with `|` again, as a table, with its
+            // own code (splitting at `|` even inside a code span). Whatever it would find
+            // there, we have not checked: such a paragraph (pulldown did not make it a
+            // table, or it would not be a paragraph) is plain text.
+            Event::Start(Tag::Paragraph)
+                if src[range.clone()]
+                    .lines()
+                    .any(|l| l.trim_start_matches([' ', '\t', '>']).starts_with('|')) =>
+            {
+                return None;
+            }
             Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
             Event::End(TagEnd::CodeBlock) => in_code_block = false,
             // A backslash escape leaves the backslash itself between two text events, so a
@@ -315,6 +327,14 @@ fn rewrite_link(l: &Link, src: &str) -> Option<String> {
     {
         return Some(link_md(&label_md(), &node_url(&target.local_path())));
     }
+    // A destination a browser may read differently from how it is written (`\` is `/`), or
+    // that no link can have: never linked, so host and contract checks below can trust it.
+    if l.dest
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return Some(unlinked_md(label));
+    }
     // keep in sync with `finalize_anchors` (the node-destination step).
     let title = (!l.title.is_empty()).then_some(l.title.as_str());
     if let Some(dest_id) = node_destination(Some(&l.dest)) {
@@ -362,31 +382,38 @@ fn rewrite_link(l: &Link, src: &str) -> Option<String> {
     Some(link_md(&new_label.unwrap_or_else(label_md), dest))
 }
 
-/// Whether a word of `label` is a URL (`http(s)://…` or `www.…`) whose host is not the host of
-/// `dest`: `[https://paypal.com/login](https://evil.example/)`. Stricter than the web UI, which
-/// leaves such a link live. Only for a destination that is not on the node (the caller has
-/// checked).
+/// Whether `label` names a host other than the host of `dest`, anywhere in its text:
+/// `https://…` or `www.…` (even glued to other text: `go:https://paypal.com`, `→https://…`),
+/// or a `host.tld/path` word (`paypal.com/login`). `[https://paypal.com/login](https://evil.example/)`
+/// is the case. Stricter than the web UI, which leaves such a link live. Only for a destination
+/// that is not on the node (the caller has checked). A word with no path and no scheme
+/// (`Node.js`, `v1.2`) names nothing.
 fn label_names_another_host(label: &str, dest: &str) -> bool {
     let dest_host = host_of(dest);
-    label
-        .split(|c: char| c.is_whitespace() || is_display_hidden(c))
-        .filter(|w| {
-            starts_with_ci(w, "http://")
-                || starts_with_ci(w, "https://")
-                || starts_with_ci(w, "www.")
-        })
-        .any(|w| {
-            let w = w.trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '/');
-            let host = host_of(w);
-            // Userinfo (`https://paypal.com@evil.example/`) reads as another host.
-            let userinfo = w
-                .split_once("://")
-                .map_or(w, |(_, r)| r)
-                .split(['/', '?', '#'])
-                .next()
-                .is_some_and(|a| a.contains('@'));
-            userinfo || host.is_none() || host != dest_host
-        })
+    let word_char = |c: char| c.is_ascii_alphanumeric() || ".-_/:@%?#=&~+".contains(c);
+    label.split(|c: char| !word_char(c)).any(|w| {
+        let w = w.trim_end_matches(['.', ',', ':', ';', '?', '!', '/']);
+        let has_scheme = w.contains("://");
+        let host = host_of(w);
+        let host_like = host
+            .as_deref()
+            .and_then(|h| h.rsplit_once('.'))
+            .is_some_and(|(_, tld)| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()));
+        let named = has_scheme
+            || starts_with_ci(w, "www.")
+            || (w.contains('/') && !w.starts_with('/') && host_like);
+        if !named {
+            return false;
+        }
+        // Userinfo (`https://paypal.com@evil.example/`) reads as another host.
+        let userinfo = w
+            .split_once("://")
+            .map_or(w, |(_, r)| r)
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|a| a.contains('@'));
+        userinfo || host.is_none() || host != dest_host
+    })
 }
 
 /// The host of an `http(s)://host…` or `www.host…` URL, lowercase, without userinfo, port or
@@ -405,8 +432,8 @@ fn host_of(url: &str) -> Option<String> {
 }
 
 /// The destination a URL in plain text (the fallback for markdown that cannot be made safe)
-/// should open, `None` when it must not be a link. A gateway URL opens on the reader's node;
-/// anything the markdown path refuses (userinfo, a dot segment, a backslash, hidden or
+/// should open, `None` when it must not be a link. A gateway URL is not linked at all (the text
+/// shown would differ from where it opens); anything the markdown path refuses (userinfo, a dot segment, a backslash, hidden or
 /// control characters, a scheme other than http(s)) is refused here too.
 pub fn plain_link_target(url: &str) -> Option<String> {
     let url = url.trim();
@@ -422,10 +449,10 @@ pub fn plain_link_target(url: &str) -> Option<String> {
     {
         return None;
     }
+    // A gateway URL is not linked here: the text shown would not be where it opens.
     match node_destination(Some(url)) {
-        Some(Some(_)) => rewrite_dest(url),
-        Some(None) if !plain_absolute_url(url) => None,
-        _ => Some(url.to_owned()),
+        Some(_) => None,
+        None => Some(url.to_owned()),
     }
 }
 
@@ -2081,6 +2108,54 @@ mod tests {
     }
 
     #[test]
+    fn a_paragraph_the_widget_would_read_as_a_table_is_plain_text() {
+        for md in [
+            "| `a | [https://paypal.com](https://evil.example/)` |",
+            "|- [https://paypal.com](https://evil.example/) | x",
+            "text\n| a | [x](https://evil.example/) | b |",
+            "> | `a | [https://paypal.com](https://evil.example/)` |",
+        ] {
+            assert_eq!(super::prepare(md), None, "{md:?}");
+        }
+        // A table pulldown itself parses is fine.
+        let out = prepare(&format!("|a|b|\n|-|-|\n|freenet:{RIVER_ID}|y|"));
+        assert_eq!(opens(&out).len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_destination_a_browser_reads_differently_is_unlinked() {
+        for md in [
+            "[https://good.com](https://evil.example\\good.com/)",
+            "[x](<https://evil.example/a b>)",
+            "[x](<https://evil.example/\u{7}>)",
+        ] {
+            no_link(md);
+        }
+    }
+
+    #[test]
+    fn a_host_named_anywhere_in_a_label_is_checked() {
+        for md in [
+            "[Log in (https://paypal.com)](https://evil.example/)",
+            "[go:https://paypal.com](https://evil.example/)",
+            "[\u{2192}https://paypal.com](https://evil.example/)",
+            "[paypal.com/login](https://evil.example/)",
+            "[Sign in: www.paypal.com.](https://evil.example/)",
+        ] {
+            no_link(md);
+        }
+        for md in [
+            "[River update](https://example.com/)",
+            "[v1.2](https://example.com/)",
+            "[Node.js docs](https://nodejs.org/)",
+            "[see example.com/a](https://example.com/b)",
+            "[(https://example.com)](https://www.example.com/x)",
+        ] {
+            assert_eq!(opens(&prepare(md)).len(), 1, "{md}");
+        }
+    }
+
+    #[test]
     fn hidden_characters_in_a_url_make_it_code() {
         for ch in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{FEFF}'] {
             let out = prepare(&format!("see http://exa{ch}mple.com/x ok"));
@@ -2099,9 +2174,10 @@ mod tests {
             ok("https://example.com/a?b=c"),
             Some("https://example.com/a?b=c".into())
         );
+        // A gateway URL is not linked in plain text.
         assert_eq!(
             ok(&format!("http://gw.example/v1/contract/web/{b}/x")),
-            Some(local(&format!("/v1/contract/web/{b}/x")))
+            None
         );
         for bad in [
             format!("http://freenet:{a}@evil.example/"),
