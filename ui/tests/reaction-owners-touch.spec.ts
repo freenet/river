@@ -156,7 +156,7 @@ function historyScrollTop(page: Page): Promise<number> {
 }
 
 async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
-  const selector = own ? OWN_CHIP : '[data-testid="reaction-chip"][aria-pressed="false"]';
+  const selector = own ? OWN_CHIP : '[data-testid="reaction-chip"][data-own-reaction="false"]';
   const chip = page.locator(selector).first();
   await chip.scrollIntoViewIfNeeded();
   await expect(chip).toBeVisible();
@@ -239,14 +239,14 @@ test.describe("Reaction owner list (#714)", () => {
       await crab.tap();
       await expect(owners).toBeVisible();
       await expect(owners.getByTestId("reaction-apply")).toHaveText("React with 🦀");
-      await expect(crab).toHaveAttribute("aria-pressed", "false");
+      await expect(crab).toHaveAttribute("data-own-reaction", "false");
       await expect(crab.getByTestId("reaction-chip-count")).toHaveText("1");
       await owners.press("Escape");
       await expect(owners).toHaveCount(0);
       // Past CHIP_HOLD_MS (500).
       await page.waitForTimeout(700);
       await expect(owners, "a short tap is not a hold").toHaveCount(0);
-      await expect(crab).toHaveAttribute("aria-pressed", "false");
+      await expect(crab).toHaveAttribute("data-own-reaction", "false");
     }
   });
 
@@ -583,14 +583,14 @@ test.describe("Reaction chip below 48rem", () => {
     if (hasTouch()) await party.tap();
     else await party.press("Enter");
     await expect(owners).toBeVisible();
-    await expect(party).toHaveAttribute("aria-pressed", "false");
+    await expect(party).toHaveAttribute("data-own-reaction", "false");
     await expect(sheet(page), "a chip never opens the sheet").toBeHidden();
     await expect(owners.getByTestId("reaction-apply")).toHaveText("React with 🎉");
     await owners.getByTestId("reaction-apply").click();
     await expect(party.getByTestId("reaction-chip-count")).toHaveText("2");
-    await expect(party).toHaveAttribute("aria-pressed", "true");
+    await expect(party).toHaveAttribute("data-own-reaction", "true");
     await removeFromList(page, party);
-    await expect(party, "the shared chip stays").toHaveAttribute("aria-pressed", "false");
+    await expect(party, "the shared chip stays").toHaveAttribute("data-own-reaction", "false");
     await expect(party.getByTestId("reaction-chip-count")).toHaveText("1");
 
     // React with a different emoji through the production picker, then the
@@ -602,7 +602,7 @@ test.describe("Reaction chip below 48rem", () => {
     await expect(owners.getByTestId("reaction-apply")).toHaveText("Switch to 🎉");
     await owners.getByTestId("reaction-apply").click();
     await expect(chips(row), "the 👍 left with the switch").toHaveCount(1);
-    await expect(party).toHaveAttribute("aria-pressed", "true");
+    await expect(party).toHaveAttribute("data-own-reaction", "true");
     await expect(sheet(page)).toBeHidden();
   });
 

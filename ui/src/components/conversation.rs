@@ -3633,10 +3633,12 @@ fn fine_pointer_now() -> bool {
     crate::util::media_matches("(pointer: fine)").unwrap_or(false)
 }
 
-/// What a screen reader calls a chip: its emoji and how many reacted with it.
-fn reaction_chip_label(emoji: &str, count: usize) -> String {
+/// What a screen reader calls a chip: its emoji, how many reacted with it,
+/// and whether the reader did.
+fn reaction_chip_label(emoji: &str, count: usize, mine: bool) -> String {
     let noun = if count == 1 { "reaction" } else { "reactions" };
-    format!("{emoji}, {count} {noun}")
+    let you = if mine { ", you reacted" } else { "" };
+    format!("{emoji}, {count} {noun}{you}")
 }
 
 /// A finger or pen held on a reaction chip, at 48rem and wider, opens its
@@ -4945,7 +4947,7 @@ fn MessageGroupComponent(
                                                         let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
                                                         // The list's action is worded only while it is open.
                                                         let reader_has_reacted = user_reaction.is_some();
-                                                        let chip_label = reaction_chip_label(emoji, count);
+                                                        let chip_label = reaction_chip_label(emoji, count, is_user_reaction);
 
                                                         rsx! {
                                                             div {
@@ -5034,11 +5036,11 @@ fn MessageGroupComponent(
                                                                     id: "{chip_id}",
                                                                     "data-testid": "reaction-chip",
                                                                     "data-emoji": "{emoji}",
+                                                                    "data-own-reaction": "{is_user_reaction}",
                                                                     "aria-label": "{chip_label}",
                                                                     "aria-haspopup": "dialog",
-                                                                    "aria-controls": "{owners_dialog_id}",
-                                                                    // Pressed is selection; expanded is inspection.
-                                                                    "aria-pressed": if is_user_reaction { "true" } else { "false" },
+                                                                    // Only while the list it names exists.
+                                                                    "aria-controls": owners_open.then(|| owners_dialog_id.clone()),
                                                                     // Always present, "true" only while its list is
                                                                     // open: the row's band matches the value
                                                                     // `[aria-expanded="true"]`, not the attribute
@@ -5261,6 +5263,15 @@ mod tests {
         hold.press("a", "mouse", false);
         hold.keyboard();
         assert!(!hold.take_direct_press("a", true, 1.0));
+    }
+
+    #[test]
+    fn chip_label_says_when_the_reader_reacted() {
+        assert_eq!(reaction_chip_label("🦀", 1, false), "🦀, 1 reaction");
+        assert_eq!(
+            reaction_chip_label("🦀", 2, true),
+            "🦀, 2 reactions, you reacted"
+        );
     }
 
     #[test]

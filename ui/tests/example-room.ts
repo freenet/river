@@ -515,8 +515,8 @@ export function chips(row: Locator): Locator {
   return row.getByTestId("reaction-chip");
 }
 
-/// The reader's own chips, as a selector: `aria-pressed` is the selection.
-export const OWN_CHIP = '[data-testid="reaction-chip"][aria-pressed="true"]';
+/// The reader's own chips, as a selector.
+export const OWN_CHIP = '[data-testid="reaction-chip"][data-own-reaction="true"]';
 
 /// `row`'s chip for `emoji`.
 export function chipFor(row: Locator, emoji: string): Locator {
