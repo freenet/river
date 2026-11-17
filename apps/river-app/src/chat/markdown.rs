@@ -197,6 +197,16 @@ pub fn render(
             }
         })
         .link_help(|url| openable(url).then(|| format!("Opens {url}")))
+        // Right-click a link for Open and Copy link, as in a browser.
+        .on_link_secondary(
+            |s: &mut RiverApp, url: &str, press: rune::PointerPress, _: &mut rune::Tx| {
+                if openable(url) {
+                    s.chat.link_menu = Some((url.to_owned(), press));
+                }
+            },
+        )
+        // Text can be selected and copied, within a message.
+        .selectable(true)
         .render(&style(p, k, font, color))
         .key(key)
 }

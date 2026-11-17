@@ -172,6 +172,9 @@ pub struct Chat {
     /// Whether a narrow window shows the members panel over the conversation. Separate from
     /// `members_open`, so a narrow window opens on the conversation however the wide one was left.
     pub members_overlay: bool,
+    /// The link a right-click landed on, and where: the link menu (Open, Copy link) is open
+    /// there. Cleared when the menu closes.
+    pub link_menu: Option<(String, rune::PointerPress)>,
     /// Today's day number in message time (whose day 0 is `day_zero`).
     pub today: u32,
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
@@ -218,6 +221,7 @@ impl Chat {
             drafts: HashMap::new(),
             members_open: true,
             members_overlay: false,
+            link_menu: None,
             today,
             day_zero,
             now,

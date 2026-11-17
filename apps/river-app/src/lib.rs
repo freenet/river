@@ -1103,6 +1103,29 @@ mod tests {
     }
 
     #[test]
+    fn the_link_menu_opens_or_copies_the_link() {
+        let url = "https://freenet.org/";
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        assert!(rt.find("link-menu-item0").is_none());
+        rt.update(move |s, _| {
+            s.chat.link_menu = Some((url.to_owned(), rune::PointerPress { x: 400.0, y: 300.0 }));
+        });
+        settle(&mut rt);
+        press(&mut rt, "link-menu-item1");
+        assert_eq!(board.text().as_deref().map(String::as_str), Some(url));
+        assert!(rt.state.chat.link_menu.is_none(), "the menu closes");
+        assert!(rt.take_url_requests().is_empty(), "copying opens nothing");
+        rt.update(move |s, _| {
+            s.chat.link_menu = Some((url.to_owned(), rune::PointerPress { x: 400.0, y: 300.0 }));
+        });
+        settle(&mut rt);
+        press(&mut rt, "link-menu-item0");
+        assert_eq!(rt.take_url_requests(), [url]);
+        assert!(rt.state.chat.link_menu.is_none());
+    }
+
+    #[test]
     fn the_create_dialog_says_what_is_wrong_and_sends_what_is_right() {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
