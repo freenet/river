@@ -280,6 +280,7 @@ mod tests {
         );
         assert!(shown == before);
     }
+
     #[test]
     fn pending_new_emojis_append_and_removed_then_readded_emojis_restart_at_the_end() {
         let mut m = message(1, "one");

@@ -716,7 +716,7 @@ fn group_messages(
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
-    let reaction_ranks = reaction_order::reaction_order_for(messages_state, secrets);
+    let reaction_ranks = reaction_order::reaction_ranks_for(messages_state, secrets);
 
     // Inputs to the per-message HTML cache (see MESSAGE_HTML_CACHE). The member
     // fingerprint is computed once per render, not per message.

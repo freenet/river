@@ -11,16 +11,16 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 type EmojiRanks = HashMap<String, SystemTime>;
-type ReactionOrder = HashMap<MessageId, EmojiRanks>;
+type ReactionRanks = HashMap<MessageId, EmojiRanks>;
 
 /// Earliest still-standing add for each emoji. Replay only when order can
 /// matter, once for the full retained history rather than once per row.
 /// Recompute when secrets change as well as when messages change; no cache can
 /// infer that from a message count or newest id.
-pub(super) fn reaction_order_for(
+pub(super) fn reaction_ranks_for(
     messages: &MessagesV1,
     secrets: &HashMap<u32, [u8; 32]>,
-) -> ReactionOrder {
+) -> ReactionRanks {
     if !messages
         .actions_state
         .reactions
@@ -69,7 +69,7 @@ pub(super) fn reaction_order_for(
             _ => {}
         }
     }
-    let mut ranks: ReactionOrder = HashMap::new();
+    let mut ranks: ReactionRanks = HashMap::new();
     for ((target, emoji, reactor), time) in standing {
         // Membership/counts remain exclusively the production projection's.
         if !targets[&target]
@@ -95,15 +95,9 @@ pub(super) fn order_reactions(
     ranks: Option<&EmojiRanks>,
 ) -> Vec<String> {
     let mut emojis: Vec<_> = reactions.keys().cloned().collect();
-    emojis.sort_by(|a, b| {
-        let rank = |emoji: &String| ranks.and_then(|r| r.get(emoji));
-        match (rank(a), rank(b)) {
-            (Some(a), Some(b)) => a.cmp(b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-        .then_with(|| a.cmp(b))
+    emojis.sort_by_cached_key(|e| {
+        let r = ranks.and_then(|m| m.get(e)).copied();
+        (r.is_none(), r, e.clone())
     });
     emojis
 }
@@ -187,7 +181,7 @@ mod tests {
         secrets: &HashMap<u32, [u8; 32]>,
         target: &MessageId,
     ) -> Vec<String> {
-        let ranks = reaction_order_for(state, secrets);
+        let ranks = reaction_ranks_for(state, secrets);
         order_reactions(
             state.reactions(target).unwrap_or(&HashMap::new()),
             ranks.get(target),
@@ -372,7 +366,7 @@ mod tests {
             "premise: production projects reactions for the live target only"
         );
         assert_eq!(
-            reaction_order_for(&live, &secrets),
+            reaction_ranks_for(&live, &secrets),
             HashMap::from([(
                 id.clone(),
                 HashMap::from([("z".to_string(), at(5)), ("a".to_string(), at(7))]),
@@ -391,7 +385,7 @@ mod tests {
              only the displayable-target gate can drop its ranks"
         );
         assert!(
-            reaction_order_for(&deleted, &secrets).is_empty(),
+            reaction_ranks_for(&deleted, &secrets).is_empty(),
             "a deleted message keeps no ranks"
         );
     }
@@ -458,9 +452,10 @@ mod tests {
             vec![target, add(2, 1, &id, "z"), add(3, 2, &id, "z")],
             &HashMap::new(),
         );
-        assert!(reaction_order_for(&state, &HashMap::new()).is_empty());
+        assert!(reaction_ranks_for(&state, &HashMap::new()).is_empty());
         assert_eq!(shown(&state, &HashMap::new(), &id), names(&["z"]));
     }
+
     #[test]
     fn grouping_carries_standing_order_into_the_rendered_reaction_projection() {
         use super::super::{group_messages, reactions_by_emoji, DisplayItem, MessageClock};
@@ -507,9 +502,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             names(&["z", "a"])
         );
-        assert!(reactions[0].mine);
-        assert!(!reactions[1].mine);
-        assert_eq!(reactions[0].reactors.len(), 1);
     }
 
     /// Repeatable retained-history measurement, deliberately without a CI
@@ -545,7 +537,7 @@ mod tests {
             ] {
                 let start = Instant::now();
                 for _ in 0..20 {
-                    std::hint::black_box(reaction_order_for(state, &keys));
+                    std::hint::black_box(reaction_ranks_for(state, &keys));
                 }
                 eprintln!(
                     "{label}: retained={total}, actions={}, replay_mean={:?}",

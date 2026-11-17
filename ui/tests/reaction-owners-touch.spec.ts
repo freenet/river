@@ -22,6 +22,7 @@ import {
   waitForApp,
   withFingers,
 } from "./example-room";
+import { inHistoryView } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -152,12 +153,7 @@ async function scrollChipOutOfView(page: Page, chip: Locator): Promise<void> {
   });
   expect(plan.target, `premise: the history has room to move the chip out of view ${JSON.stringify(plan)}`).toBeLessThanOrEqual(plan.max);
   await settle(page);
-  const inView = await chip.evaluate((el) => {
-    const r = el.getBoundingClientRect();
-    const v = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
-    return r.bottom > v.top && r.top < v.bottom;
-  });
-  expect(inView, `premise: the chip is scrolled out of view ${JSON.stringify(plan)}`).toBe(false);
+  expect(await inHistoryView(chip), `premise: the chip is scrolled out of view ${JSON.stringify(plan)}`).toBe(false);
 }
 
 function historyScrollTop(page: Page): Promise<number> {

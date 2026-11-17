@@ -519,12 +519,10 @@ export function chips(row: Locator): Locator {
   return row.getByTestId("reaction-chip");
 }
 
-/// `row`'s chip for `emoji`, by its `data-emoji`. The emoji is escaped as a
-/// CSS string (quote, backslash, control characters): a peer chooses it.
+/// `row`'s chip for `emoji`, by its `data-emoji`. Only a quote and a
+/// backslash are escaped: every caller passes a literal emoji.
 export function chipFor(row: Locator, emoji: string): Locator {
-  const quoted = emoji
-    .replace(/["\\]/g, "\\$&")
-    .replace(/[\u0000-\u001f\u007f]/g, (c) => `\\${c.charCodeAt(0).toString(16)} `);
+  const quoted = emoji.replace(/["\\]/g, "\\$&");
   return row.locator(`[data-testid="reaction-chip"][data-emoji="${quoted}"]`);
 }
 

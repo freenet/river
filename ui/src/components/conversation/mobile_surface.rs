@@ -411,7 +411,7 @@ pub(super) mod dom {
 
     /// Focus, without scrolling, the control in `row` matching `selector`,
     /// if it is still there.
-    pub(in super::super) fn focus_control(row: &str, selector: &str) {
+    pub(super) fn focus_control(row: &str, selector: &str) {
         if let Some(control) = row_control(row, selector) {
             focus_without_scrolling(&control);
         }
@@ -636,7 +636,7 @@ pub(super) mod dom {
     pub(in super::super) fn row_control(_row: &str, _selector: &str) -> Option<()> {
         Some(())
     }
-    pub(in super::super) fn focus_control(_row: &str, _selector: &str) {}
+    pub(super) fn focus_control(_row: &str, _selector: &str) {}
     pub(super) fn close_dialog() {}
     pub(in super::super) fn show_dialog() -> bool {
         false

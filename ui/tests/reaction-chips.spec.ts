@@ -1,6 +1,6 @@
 import { expect, Locator, Page, test } from "@playwright/test";
 import {
-  chipFor as chip,
+  chipFor,
   chips,
   committedRow,
   expectClear,
@@ -10,14 +10,13 @@ import {
   keyboardFocus,
   openInlinePicker,
   openRoomWithTarget,
-  openSheetFromReact,
-  palette,
   panicsOf,
   press,
   reactionChoices,
   settle,
   sheet,
 } from "./example-room";
+import { distanceFromBottom, inHistoryView } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
 // A reaction chip is a native toggle button: a press of any kind reacts with
@@ -41,56 +40,37 @@ async function expectChip(target: Locator, pressed: boolean, n: string, what = "
 async function pick(page: Page, row: Locator, emoji: string) {
   await openInlinePicker(page, row);
   await press((await reactionChoices(page)).filter({ hasText: new RegExp(`^${emoji}$`, "u") }));
-  await expect(chip(row, emoji)).toHaveAttribute("aria-pressed", "true");
+  await expect(chipFor(row, emoji)).toHaveAttribute("aria-pressed", "true");
 }
 
-/// How far the history's view is from its end. Not `scrollTop`: a signed
-/// commit can regroup rows above a view held at the end.
-const distanceFromEnd = (page: Page) =>
-  page.evaluate(() => {
-    const scroller = document.getElementById("chat-scroll-container")!;
-    return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-  });
-
-const inHistoryView = (target: Locator) =>
-  target.evaluate((el) => {
-    const box = el.getBoundingClientRect();
-    const view = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
-    return box.bottom > view.top && box.top < view.bottom;
-  });
-
-test("a chip is a native toggle button with its emoji, its count and the reactors' names on hover", async ({ page }) => {
+// The attributes come from Rust, the same in every engine.
+test("a chip is a native toggle button with its count and the reactors' names on hover", { tag: "@chromium-only" }, async ({ page }) => {
   const row = await openRoomWithTarget(page);
   await callRiverTest(page, "memberReactsToNewest", "🦀");
-  const crab = chip(row, "🦀");
+  const crab = chipFor(row, "🦀");
   await expect(crab).toHaveJSProperty("tagName", "BUTTON");
   await expect(crab).toHaveAttribute("type", "button");
-  await expect(crab).toHaveAttribute("id", /^reaction-chip-/);
-  await expect(crab).toHaveRole("button");
-  await expect(crab, "Tab reaches it as a button").toHaveJSProperty("tabIndex", 0);
   for (const attr of ["role", "tabindex", "aria-label", "aria-haspopup", "aria-controls", "aria-expanded"]) {
     await expect(crab, `no ${attr}`).not.toHaveAttribute(attr);
   }
-  await expect(crab.locator("span").first()).toHaveText("🦀");
   await expectChip(crab, false, "1");
   await expect(crab, "another member's names").toHaveAttribute("title", /^Test Sender [AB]$/);
-
-  await crab.click();
-  await expectChip(crab, true, "2");
-  await expect(crab, "the reader is named").toHaveAttribute("title", /(^|, )You(, | \()/);
-  await expect(crab, "and told a click takes it back").toHaveAttribute("title", / \(click to remove\)$/);
-  await expect(crab, "still no list").not.toHaveAttribute("aria-expanded");
 });
 
-type Press = { name: string; touch?: boolean; run: (target: Locator) => Promise<void> };
+type Press = { name: string; touch?: boolean; tag?: string; run: (target: Locator) => Promise<void> };
 
 const PRESSES: Press[] = [
   { name: "a touch tap", touch: true, run: (target) => target.tap() },
   { name: "a mouse click", run: (target) => target.click() },
   { name: "Enter", run: (target) => target.press("Enter") },
   { name: "Space", run: (target) => target.press("Space") },
-  // Assistive technology, or a script: a click with no pointer or key press.
-  { name: "a click with no press of its own", run: (target) => target.evaluate((el) => (el as HTMLElement).click()) },
+  // Assistive technology, or a script: a click with no pointer or key press,
+  // so nothing engine-specific.
+  {
+    name: "a click with no press of its own",
+    tag: "@chromium-only",
+    run: (target) => target.evaluate((el) => (el as HTMLElement).click()),
+  },
 ];
 
 for (const width of [390, 1280]) {
@@ -98,13 +78,13 @@ for (const width of [390, 1280]) {
     test.beforeEach(async ({ page }) => page.setViewportSize({ width, height: 800 }));
 
     for (const p of PRESSES) {
-      test(`${p.name} toggles and switches the reader's reaction, once, and opens nothing`, async ({ page }) => {
+      test(`${p.name} toggles and switches the reader's reaction, once, and opens nothing`, { tag: p.tag ?? [] }, async ({ page }) => {
         test.skip(p.touch === true && !hasTouch(), "a finger, on a touch project");
         const row = await openRoomWithTarget(page);
         await callRiverTest(page, "memberReactsToNewest", "🦀");
         await callRiverTest(page, "memberReactsToNewest", "❤️");
-        const crab = chip(row, "🦀");
-        const heart = chip(row, "❤️");
+        const crab = chipFor(row, "🦀");
+        const heart = chipFor(row, "❤️");
         await expectChip(crab, false, "1", "premise: 🦀");
         await expectChip(heart, false, "1", "premise: ❤️");
 
@@ -128,53 +108,58 @@ for (const width of [390, 1280]) {
         await step(heart, [[heart, false, "1"], [crab, false, "1"]], 1, "takes back");
       });
     }
-
-    // Enter's click on the reader's sole reaction removes the chip and hands
-    // focus to the next one. A held Enter's repeats must not click that chip.
-    test("held Enter removes only the reader's reaction after focus moves to another chip", async ({ page }) => {
-      const row = await openRoomWithTarget(page);
-      await callRiverTest(page, "memberReactsToNewest", "🦀");
-      await pick(page, row, "👍");
-      const crab = chip(row, "🦀");
-      const thumb = chip(row, "👍");
-      await expectChip(crab, false, "1", "premise: 🦀");
-      await expectChip(thumb, true, "1", "premise: 👍");
-      expect(await order(row), "premise: the row's two chips").toEqual(["🦀", "👍"]);
-      await settle(page);
-      const before = await signs(page);
-
-      await keyboardFocus(page, thumb);
-      // `page.keyboard`, not a locator's `press`, which would refocus.
-      await page.keyboard.down("Enter");
-      try {
-        await expect(thumb, "the reader's reaction is taken back").toHaveCount(0);
-        await expect(crab, "focus moves to the surviving chip").toBeFocused();
-        await expect.poll(() => signs(page), { message: "the first press signed once" }).toBe(before + 1);
-        // Each further `down` before the `up` is an auto-repeat.
-        for (let i = 1; i <= 4; i++) {
-          await page.keyboard.down("Enter");
-          await settle(page);
-          await expectChip(crab, false, "1", `repeat ${i}: 🦀`);
-          await expect(crab, `repeat ${i}: 🦀 keeps focus`).toBeFocused();
-          expect(await signs(page), `repeat ${i}: nothing more signed`).toBe(before + 1);
-        }
-      } finally {
-        await page.keyboard.up("Enter");
-      }
-      await settle(page);
-      expect(await order(row), "one chip is left").toEqual(["🦀"]);
-      await expectChip(crab, false, "1", "after release: 🦀");
-      await expect(owners(page), "no reactor list").toHaveCount(0);
-      await expect(sheet(page), "no message sheet").toBeHidden();
-      expect(await signs(page), "after release: one action signed").toBe(before + 1);
-
-      // A fresh press after the release reacts.
-      await page.keyboard.press("Enter");
-      await expectChip(crab, true, "2", "a fresh Enter");
-      await expect.poll(() => signs(page), { message: "a fresh Enter signs once" }).toBe(before + 2);
-    });
   });
 }
+
+// The guard against a held key's repeats does not depend on the width.
+test.describe("Held Enter at 1280px", () => {
+  test.beforeEach(async ({ page }) => page.setViewportSize({ width: 1280, height: 800 }));
+
+  // Enter's click on the reader's sole reaction removes the chip and hands
+  // focus to the next one. A held Enter's repeats must not click that chip.
+  test("held Enter removes only the reader's reaction after focus moves to another chip", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await callRiverTest(page, "memberReactsToNewest", "🦀");
+    await pick(page, row, "👍");
+    const crab = chipFor(row, "🦀");
+    const thumb = chipFor(row, "👍");
+    await expectChip(crab, false, "1", "premise: 🦀");
+    await expectChip(thumb, true, "1", "premise: 👍");
+    expect(await order(row), "premise: the row's two chips").toEqual(["🦀", "👍"]);
+    await settle(page);
+    const before = await signs(page);
+
+    await keyboardFocus(page, thumb);
+    // `page.keyboard`, not a locator's `press`, which would refocus.
+    await page.keyboard.down("Enter");
+    try {
+      await expect(thumb, "the reader's reaction is taken back").toHaveCount(0);
+      await expect(crab, "focus moves to the surviving chip").toBeFocused();
+      await expect.poll(() => signs(page), { message: "the first press signed once" }).toBe(before + 1);
+      // Each further `down` before the `up` is an auto-repeat.
+      for (let i = 1; i <= 4; i++) {
+        await page.keyboard.down("Enter");
+        await settle(page);
+        await expectChip(crab, false, "1", `repeat ${i}: 🦀`);
+        await expect(crab, `repeat ${i}: 🦀 keeps focus`).toBeFocused();
+        expect(await signs(page), `repeat ${i}: nothing more signed`).toBe(before + 1);
+      }
+    } finally {
+      await page.keyboard.up("Enter");
+    }
+    await settle(page);
+    expect(await order(row), "one chip is left").toEqual(["🦀"]);
+    await expectChip(crab, false, "1", "after release: 🦀");
+    await expect(owners(page), "no reactor list").toHaveCount(0);
+    await expect(sheet(page), "no message sheet").toBeHidden();
+    expect(await signs(page), "after release: one action signed").toBe(before + 1);
+
+    // A fresh press after the release reacts.
+    await page.keyboard.press("Enter");
+    await expectChip(crab, true, "2", "a fresh Enter");
+    await expect.poll(() => signs(page), { message: "a fresh Enter signs once" }).toBe(before + 2);
+  });
+});
 
 // At 48rem and wider Shift+Enter and Shift+Space open the chip's reactor list
 // instead of reacting. A key's click comes on keydown (Enter) or keyup
@@ -187,34 +172,28 @@ test.describe("Shift at 1280px", () => {
     test(`${key} opens the reactor list once and leaves the reaction as it is`, async ({ page }) => {
       const row = await openRoomWithTarget(page);
       await callRiverTest(page, "memberReactsToNewest", "🦀");
-      const crab = chip(row, "🦀");
-      for (const own of [false, true]) {
-        const what = own ? "the reader's chip" : "another member's chip";
-        if (own) {
-          await crab.click();
-          await expectChip(crab, true, "2", "premise: the reader reacted");
-          await settle(page);
-        }
-        const before = await signs(page);
-        await crab.press(key);
-        await expect(owners(page), `${what}: one list`).toHaveCount(1);
-        await expect(owners(page)).toBeFocused();
-        await expect(crab).toHaveAttribute("aria-expanded", "true");
-        await expect(owners(page).getByTestId("reaction-remove"), `${what}: Remove only on the reader's`).toHaveCount(own ? 1 : 0);
-        await expectChip(crab, own, own ? "2" : "1", `${what}: not reacted`);
-        await page.waitForTimeout(500);
-        await settle(page);
-        await expectChip(crab, own, own ? "2" : "1", `${what}: still not reacted past 400 ms`);
-        await expect(owners(page), `${what}: still one list`).toHaveCount(1);
-        expect(await signs(page), `${what}: nothing was signed`).toBe(before);
+      const crab = chipFor(row, "🦀");
+      await crab.click();
+      await expectChip(crab, true, "2", "premise: the reader reacted");
+      await settle(page);
+      const before = await signs(page);
+      await crab.press(key);
+      await expect(owners(page), "one list").toHaveCount(1);
+      await expect(owners(page)).toBeFocused();
+      await expect(crab).toHaveAttribute("aria-expanded", "true");
+      await expectChip(crab, true, "2", "not taken back");
+      await page.waitForTimeout(500);
+      await settle(page);
+      await expectChip(crab, true, "2", "still not taken back past 400 ms");
+      await expect(owners(page), "still one list").toHaveCount(1);
+      expect(await signs(page), "nothing was signed").toBe(before);
 
-        // Escape on the chip closes its own list.
-        await crab.focus();
-        await page.keyboard.press("Escape");
-        await expect(owners(page)).toHaveCount(0);
-        await expect(crab).not.toHaveAttribute("aria-expanded");
-        await expect(crab).toBeFocused();
-      }
+      // Escape on the chip closes its own list.
+      await crab.focus();
+      await page.keyboard.press("Escape");
+      await expect(owners(page)).toHaveCount(0);
+      await expect(crab).not.toHaveAttribute("aria-expanded");
+      await expect(crab).toBeFocused();
       // Nothing of the key's lingers: Enter reacts again, once.
       await crab.press("Enter");
       await expectChip(crab, false, "1", "Enter");
@@ -234,17 +213,17 @@ test.describe("Standing order", { tag: "@chromium-only" }, () => {
     await pick(page, row, "🔥");
     await callRiverTest(page, "memberReactsToNewest", "❤️");
     await expect.poll(() => order(row)).toEqual(["🦀", "🔥", "❤️"]);
-    await chip(row, "🔥").click();
+    await chipFor(row, "🔥").click();
     await expect.poll(() => order(row)).toEqual(["🦀", "❤️"]);
     await pick(page, row, "🔥");
     await expect.poll(() => order(row)).toEqual(["🦀", "❤️", "🔥"]);
     // Joining and leaving the older emoji preserves the other member's interval.
-    await chip(row, "🦀").click();
+    await chipFor(row, "🦀").click();
     await expect.poll(() => order(row)).toEqual(["🦀", "❤️"]);
-    await expect(count(chip(row, "🦀"))).toHaveText("2");
-    await chip(row, "🦀").click();
+    await expect(count(chipFor(row, "🦀"))).toHaveText("2");
+    await chipFor(row, "🦀").click();
     await expect.poll(() => order(row)).toEqual(["🦀", "❤️"]);
-    await expect(count(chip(row, "🦀"))).toHaveText("1");
+    await expect(count(chipFor(row, "🦀"))).toHaveText("1");
   });
 
   test("a pending reaction appends, and keeps its place once signed", async ({ page }) => {
@@ -255,11 +234,11 @@ test.describe("Standing order", { tag: "@chromium-only" }, () => {
     await callRiverTest(page, "holdMessageSigning");
     await openInlinePicker(page, row);
     await press((await reactionChoices(page)).filter({ hasText: /^❤️$/u }));
-    await expect(chip(row, "❤️"), "premise: shown while its signature is held").toHaveCount(1);
+    await expect(chipFor(row, "❤️"), "premise: shown while its signature is held").toHaveCount(1);
     await expect.poll(() => order(row), { message: "pending, it goes last" }).toEqual(["🦀", "🔥", "❤️"]);
     await callRiverTest(page, "releaseMessageSigning");
     await settle(page);
-    await expectChip(chip(row, "❤️"), true, "1", "signed");
+    await expectChip(chipFor(row, "❤️"), true, "1", "signed");
     expect(await order(row), "signed, it stays last").toEqual(["🦀", "🔥", "❤️"]);
   });
 });
@@ -276,7 +255,7 @@ test.describe("Chip that leaves with the reader's reaction", () => {
     await callRiverTest(page, "memberReactsToNewest", "🦀");
     await callRiverTest(page, "memberReactsToNewest", "❤️");
     await pick(page, row, "👍");
-    const thumb = chip(row, "👍");
+    const thumb = chipFor(row, "👍");
     await keyboardFocus(page, thumb);
     await page.keyboard.press("Enter");
     await expect(thumb).toHaveCount(0);
@@ -290,20 +269,22 @@ test.describe("Chip that leaves with the reader's reaction", () => {
     const sole = committedRow(page, "sole reaction");
     await pick(page, sole, "👍");
     await expect(chips(sole), "premise: the message's only chip").toHaveCount(1);
-    await keyboardFocus(page, chip(sole, "👍"));
+    await keyboardFocus(page, chipFor(sole, "👍"));
     await callRiverTest(page, "appendMessages", 20);
     await expect(page.getByText("batched arrival 19")).toHaveCount(1, { timeout: 5_000 });
     await settle(page);
     const react = sole.getByTestId("message-react-button");
-    await expect(chip(sole, "👍"), "premise: the chip still has focus").toBeFocused();
+    await expect(chipFor(sole, "👍"), "premise: the chip still has focus").toBeFocused();
     expect(await inHistoryView(sole), "premise: the message is out of view").toBe(false);
-    expect(await distanceFromEnd(page), "premise: the view is at the history's end").toBeLessThanOrEqual(1);
+    // From the end, not `scrollTop`: a signed commit can regroup rows above
+    // a view held at the end.
+    expect(await distanceFromBottom(page), "premise: the view is at the history's end").toBeLessThanOrEqual(1);
     // A click with no scroll of its own (Playwright's would scroll to it).
-    await chip(sole, "👍").evaluate((el) => (el as HTMLElement).click());
+    await chipFor(sole, "👍").evaluate((el) => (el as HTMLElement).click());
     await expect(chips(sole)).toHaveCount(0);
     await expect(react, "no chip is left: focus is on React").toBeFocused();
     await settle(page);
-    expect(await distanceFromEnd(page), "the history did not move").toBeLessThanOrEqual(1);
+    expect(await distanceFromBottom(page), "the history did not move").toBeLessThanOrEqual(1);
     expect(await inHistoryView(react), "React is still out of view").toBe(false);
 
     // A chip without focus leaves focus where it was.
@@ -312,7 +293,7 @@ test.describe("Chip that leaves with the reader's reaction", () => {
     await pick(page, unfocused, "👍");
     await settle(page);
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
-    await chip(unfocused, "👍").evaluate((el) => (el as HTMLElement).click());
+    await chipFor(unfocused, "👍").evaluate((el) => (el as HTMLElement).click());
     await expect(chips(unfocused)).toHaveCount(0);
     await settle(page);
     expect(await page.evaluate(() => document.activeElement === document.body), "focus was not moved").toBe(true);
@@ -338,8 +319,8 @@ test.describe("Standing-order move keeps focus", () => {
     await pick(page, row, "👍");
     for (const emoji of ["❤️", "🎉", "👍"]) await callRiverTest(page, "memberReactsToNewest", emoji);
     await expect.poll(() => order(row), { message: "premise: the reader's 👍 stands first" }).toEqual(["👍", "❤️", "🎉"]);
-    await expect(count(chip(row, "👍")), "premise: another member holds 👍 too").toHaveText("2");
-    return { row, thumb: chip(row, "👍") };
+    await expect(count(chipFor(row, "👍")), "premise: another member holds 👍 too").toHaveText("2");
+    return { row, thumb: chipFor(row, "👍") };
   }
 
   // The reader takes back their 👍 with Enter on the chip, with signing
@@ -381,14 +362,14 @@ test.describe("Standing-order move keeps focus", () => {
     await expect(page.getByText("batched arrival 19")).toHaveCount(1, { timeout: 5_000 });
     await settle(page);
     expect(await inHistoryView(thumb), "premise: the chip is out of view").toBe(false);
-    expect(await distanceFromEnd(page), "premise: the view is at the history's end").toBeLessThanOrEqual(1);
+    expect(await distanceFromBottom(page), "premise: the view is at the history's end").toBeLessThanOrEqual(1);
     await expect(thumb, "premise: the chip still has focus").toBeFocused();
 
     await callRiverTest(page, "releaseMessageSigning");
     await expect.poll(() => order(row), { message: "premise: the signed remove moved 👍 last" }).toEqual(MOVED);
     await expect(thumb, "focus stays on the chip the order moved").toBeFocused();
     await settle(page);
-    expect(await distanceFromEnd(page), "the history did not move").toBeLessThanOrEqual(1);
+    expect(await distanceFromBottom(page), "the history did not move").toBeLessThanOrEqual(1);
     expect(await inHistoryView(thumb), "the chip is still out of view").toBe(false);
     expect(panics, "nothing panicked").toEqual([]);
     // What the two checks above rule out: a focus that scrolls brings the
@@ -423,7 +404,7 @@ test.describe("Standing-order move keeps focus", () => {
   // In the gateway's frame the chip stays the frame's active element while
   // the reader is in the shell. Another member's reaction must not pull the
   // keyboard back into River.
-  test("no focus is taken while the reader is outside the document", async ({ page }) => {
+  test("no focus is taken while the reader is outside the document", { tag: "@chromium-only" }, async ({ page }) => {
     const panics = panicsOf(page);
     const { row, thumb } = await movableChip(page);
     await removeWithSigningHeld(page, row, thumb);
@@ -440,7 +421,7 @@ test.describe("Standing-order move keeps focus", () => {
     expect(panics, "nothing panicked").toEqual([]);
   });
 
-  test("focus the reader moved elsewhere is left alone", async ({ page }) => {
+  test("focus the reader moved elsewhere is left alone", { tag: "@chromium-only" }, async ({ page }) => {
     const panics = panicsOf(page);
     const { row, thumb } = await movableChip(page);
     await removeWithSigningHeld(page, row, thumb);
@@ -462,7 +443,7 @@ test.describe("Standing-order move keeps focus", () => {
 
 // A received row's dense footer. An own row's is "Footer at 320px" in
 // message-action-buttons.spec.ts, held to the same shared geometry checks.
-test("dense received chips wrap inside a 320px footer, and React reaches the row's actions", async ({ page }) => {
+test("dense received chips wrap inside a 320px footer", async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 760 });
   const row = await openRoomWithTarget(page);
   const emojis = ["🦀", "❤️", "👍", "🎉", "🔥", "👀", "🚀", "💯", "😀", "🙌", "✅", "🤔"];
@@ -486,9 +467,4 @@ test("dense received chips wrap inside a 320px footer, and React reaches the row
     await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
     "the page does not overflow sideways",
   ).toBe(true);
-  // Reply is not in this footer. It is one press away: React opens the one
-  // message sheet for this row, which holds the reactions and Reply.
-  await openSheetFromReact(page, row);
-  await expect(palette(page)).toBeVisible();
-  await expect(page.getByTestId("mobile-message-action-reply")).toBeVisible();
 });

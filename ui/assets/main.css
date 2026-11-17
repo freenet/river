@@ -164,7 +164,7 @@
     min-width: 0;
 }
 
-/* Native reaction buttons retain the existing pill's dimensions. */
+/* A button would shrink in the flex row and take preflight's line-height. */
 .reaction-chip {
     flex: none;
     line-height: normal;
