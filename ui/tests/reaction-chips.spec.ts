@@ -163,8 +163,7 @@ test.describe("Held Enter at 1280px", () => {
 
 // At 48rem and wider Shift+Enter and Shift+Space open the chip's reactor list
 // instead of reacting. A key's click comes on keydown (Enter) or keyup
-// (Space); either way it must not react as well, now or once the window in
-// which the app swallows it (400 ms) has passed.
+// (Space); either way it must not react as well, now or once it settles.
 test.describe("Shift at 1280px", () => {
   test.beforeEach(async ({ page }) => page.setViewportSize({ width: 1280, height: 800 }));
 
@@ -182,9 +181,8 @@ test.describe("Shift at 1280px", () => {
       await expect(owners(page)).toBeFocused();
       await expect(crab).toHaveAttribute("aria-expanded", "true");
       await expectChip(crab, true, "2", "not taken back");
-      await page.waitForTimeout(500);
       await settle(page);
-      await expectChip(crab, true, "2", "still not taken back past 400 ms");
+      await expectChip(crab, true, "2", "still not taken back once settled");
       await expect(owners(page), "still one list").toHaveCount(1);
       expect(await signs(page), "nothing was signed").toBe(before);
 

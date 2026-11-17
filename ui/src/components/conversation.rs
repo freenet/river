@@ -3698,55 +3698,36 @@ impl ChipHold {
     }
 }
 
-/// How long after Shift+Enter or Shift+Space opened a chip's list, or after
-/// that key came up, a click on the chip is still that key press's own.
-const CHIP_LIST_KEY_CLICK_MS: f64 = 400.0;
-
 /// Shift+Enter or Shift+Space on a reaction chip, at 48rem and wider, opens
 /// its reactor list and does not react. The chip is a button, which answers
 /// Enter and Space with a click, so that key press must send none. Its
-/// keydown is prevented, which stops Enter's click in every engine. Space's
-/// click comes on the keyup, and an engine may send it even so: the keyup is
-/// prevented as well, when it reaches the chip (focus has usually moved to
-/// the list by then), and a click that arrives anyway is not a press. Not a
+/// keydown is prevented, which is enough in Chromium, Firefox and WebKit: a
+/// Shift+Space keyup that lands on the chip sends no click in any of them
+/// (measured 2026-11-17). The keyup is prevented too, when it reaches the
+/// chip, for an engine that clicks Space on its keyup regardless. Not a
 /// signal: nothing renders from it.
 #[derive(Default)]
 struct ChipListKey {
-    /// The chip whose list the key opened, and when it went down or came up
-    /// (ms).
-    opened: Option<(String, f64)>,
+    /// The chip whose list the key opened.
+    opened: Option<String>,
 }
 
 impl ChipListKey {
     /// Shift+Enter or Shift+Space went down on `key` and opened its list.
-    fn open(&mut self, key: &str, now: f64) {
-        self.opened = Some((key.to_string(), now));
+    fn open(&mut self, key: &str) {
+        self.opened = Some(key.to_string());
     }
 
-    /// A press of another kind began on a chip (a pointer, plain Enter or
-    /// Space): the click it sends is its own.
+    /// Plain Enter or Space went down on a chip: the click its keyup sends
+    /// is its own.
     fn forget(&mut self) {
         self.opened = None;
     }
 
     /// Enter or Space came up on `key`: whether it is the key that opened
     /// that chip's list, whose keyup must send no click.
-    fn lift(&mut self, key: &str, now: f64) -> bool {
-        match &mut self.opened {
-            Some((opened, at)) if opened == key => {
-                *at = now;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// A click on `key`: whether it belongs to the key press that opened
-    /// that chip's list. Any click ends the key press.
-    fn take_click(&mut self, key: &str, now: f64) -> bool {
-        self.opened.take().is_some_and(|(opened, at)| {
-            opened == key && (0.0..=CHIP_LIST_KEY_CLICK_MS).contains(&(now - at))
-        })
+    fn lift(&self, key: &str) -> bool {
+        self.opened.as_deref() == Some(key)
     }
 }
 
@@ -4840,8 +4821,6 @@ fn MessageGroupComponent(
                                                         let chip_hold_cancel = chip_hold.clone();
                                                         let chip_hold_click = chip_hold.clone();
                                                         let chip_hold_backdrop = chip_hold.clone();
-                                                        let list_key_press = chip_list_key.clone();
-                                                        let list_key_click = chip_list_key.clone();
                                                         let list_key_down = chip_list_key.clone();
                                                         let list_key_up = chip_list_key.clone();
                                                         let owners_key_for_backdrop = owners_key.clone();
@@ -4938,8 +4917,6 @@ fn MessageGroupComponent(
                                                                     ),
                                                                     title: "{tooltip}",
                                                                     onpointerdown: move |e: PointerEvent| {
-                                                                        // A pointer's click is a press of its own.
-                                                                        list_key_press.borrow_mut().forget();
                                                                         let pointer_type = e.data().pointer_type();
                                                                         let started = chip_hold_down.borrow_mut().press(
                                                                             &owners_key_for_press,
@@ -4995,11 +4972,6 @@ fn MessageGroupComponent(
                                                                         if chip_hold_click.borrow_mut().take_release(&owners_key_for_click) {
                                                                             return;
                                                                         }
-                                                                        // Nor is a click sent for the key press that
-                                                                        // opened it.
-                                                                        if list_key_click.borrow_mut().take_click(&owners_key_for_click, now_ms()) {
-                                                                            return;
-                                                                        }
                                                                         // The reader's chip with no one else on it
                                                                         // leaves with the reaction. Focus it holds stays
                                                                         // on the message's reaction line.
@@ -5045,7 +5017,7 @@ fn MessageGroupComponent(
                                                                         // No click for this key press: it does not
                                                                         // react as well.
                                                                         e.prevent_default();
-                                                                        list_key_down.borrow_mut().open(&owners_key_for_key, now_ms());
+                                                                        list_key_down.borrow_mut().open(&owners_key_for_key);
                                                                         let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
                                                                         let popover = reaction_owners_popover_at(
                                                                             owners_key_for_key.clone(),
@@ -5058,12 +5030,12 @@ fn MessageGroupComponent(
                                                                         });
                                                                     },
                                                                     onkeyup: move |e: KeyboardEvent| {
-                                                                        // Space's click comes on its keyup, and an engine
-                                                                        // may send it though the keydown was prevented.
+                                                                        // In case an engine clicks Space on its keyup
+                                                                        // though the keydown was prevented.
                                                                         let key = e.key();
                                                                         let space = matches!(&key, Key::Character(c) if c == " ");
                                                                         if (key == Key::Enter || space)
-                                                                            && list_key_up.borrow_mut().lift(&owners_key_for_keyup, now_ms())
+                                                                            && list_key_up.borrow().lift(&owners_key_for_keyup)
                                                                         {
                                                                             e.prevent_default();
                                                                         }
@@ -5174,39 +5146,25 @@ mod tests {
     }
 
     /// Shift+Enter or Shift+Space opened a chip's list: its keyup on that
-    /// chip, and a click that comes for it anyway, are that key press's.
+    /// chip is that key press's, and sends no click.
     #[test]
     fn the_key_that_lists_reactors_sends_no_press() {
         let mut list_key = ChipListKey::default();
-        assert!(!list_key.lift("a", 0.0), "a plain key's keyup is its own");
-        assert!(!list_key.take_click("a", 0.0), "and so is its click");
+        assert!(!list_key.lift("a"), "a plain key's keyup is its own");
 
-        list_key.open("a", 0.0);
-        assert!(!list_key.lift("b", 10.0), "another chip's keyup");
-        assert!(list_key.lift("a", 2000.0), "however long the key was held");
-        assert!(list_key.take_click("a", 2001.0), "the click of that keyup");
-        assert!(!list_key.take_click("a", 2002.0), "one click only");
+        list_key.open("a");
+        assert!(!list_key.lift("b"), "another chip's keyup");
+        assert!(list_key.lift("a"), "that key's keyup");
     }
 
-    /// The keyup usually lands on the list, which has focus by then, and no
-    /// click follows. What the reader does next on the chip is a press.
+    /// The keyup usually lands on the list, which has focus by then. A plain
+    /// Enter or Space the reader presses next on the chip is a press.
     #[test]
     fn a_press_after_the_key_that_lists_reactors_is_its_own() {
         let mut list_key = ChipListKey::default();
-        list_key.open("a", 0.0);
-        assert!(
-            !list_key.take_click("a", CHIP_LIST_KEY_CLICK_MS + 1.0),
-            "a click with no press of its own, later"
-        );
-
-        list_key.open("a", 0.0);
+        list_key.open("a");
         list_key.forget();
-        assert!(!list_key.lift("a", 1.0), "plain Space: its keyup clicks");
-        assert!(!list_key.take_click("a", 1.0), "a pointer's click");
-
-        list_key.open("a", 0.0);
-        assert!(!list_key.take_click("b", 1.0), "another chip's click");
-        assert!(!list_key.take_click("a", 1.0), "which ended the key press");
+        assert!(!list_key.lift("a"), "plain Space: its keyup clicks");
     }
 
     #[test]
