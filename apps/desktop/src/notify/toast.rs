@@ -5,8 +5,7 @@
 //! `HKCU` at startup and sets it as the process's own.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use river_app::RiverApp;
 use river_app::notify::Notification;
@@ -18,7 +17,7 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
-use super::{MAX_WAITING, is_click, open_room};
+use super::Waiters;
 
 /// River's AppUserModelID.
 const APP_ID: &str = "org.freenet.River";
@@ -105,13 +104,16 @@ pub fn register_identity() {
 }
 
 pub struct Backend {
-    waiting: Arc<AtomicUsize>,
+    waiters: Waiters,
+    /// A number for each toast: they stack, so each has its own waiter.
+    next: AtomicU64,
 }
 
 impl Backend {
     pub fn new() -> Self {
         Backend {
-            waiting: Arc::new(AtomicUsize::new(0)),
+            waiters: Waiters::default(),
+            next: AtomicU64::new(0),
         }
     }
 
@@ -130,24 +132,10 @@ impl Backend {
                 return;
             }
         };
-        if self.waiting.fetch_add(1, Ordering::AcqRel) >= MAX_WAITING {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-            return;
-        }
-        let (waiting, handle, room) = (self.waiting.clone(), handle.clone(), n.room_key.clone());
-        let spawned = std::thread::Builder::new()
-            .name("river-notify-click".into())
-            .spawn(move || {
-                let _ = shown.wait_for_response(|response: &notify_rust::NotificationResponse| {
-                    if is_click(response) {
-                        open_room(&handle, room);
-                    }
-                });
-                waiting.fetch_sub(1, Ordering::AcqRel);
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.waiters
+            .spawn(n.room_key.clone(), id, handle.clone(), move |on| {
+                let _ = shown.wait_for_response(on);
             });
-        if let Err(e) = spawned {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-            eprintln!("river: clicking a notification will not open its room: {e}");
-        }
     }
 }

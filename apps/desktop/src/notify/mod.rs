@@ -11,8 +11,10 @@
 //! signed `.app` bundle (`macos`). The unread count is shown in the window title by the UI on
 //! every platform; a dock badge or taskbar overlay is not done.
 
+use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use notify_rust::NotificationResponse;
 use river_app::RiverApp;
@@ -40,14 +42,97 @@ pub use toast::register_identity;
 /// server that never reports a notification closing would otherwise grow this without end.
 const MAX_WAITING: usize = 32;
 
+/// How many notifications may queue for the worker. The UI never waits for it: past this, new
+/// ones are dropped (the unread count in the title still shows them).
+const QUEUE: usize = 16;
+
+/// The notifications waiting for a click, each identified by its room and the platform's id
+/// for it, so a notification that replaced another (same id) shares its waiter.
+#[derive(Clone, Default)]
+pub(super) struct Waiters {
+    active: Arc<Mutex<HashSet<(String, u64)>>>,
+    capped: Arc<AtomicBool>,
+}
+
+/// A place among the waiters, given back when dropped: on return, panic or a thread that
+/// never started.
+struct Slot {
+    active: Arc<Mutex<HashSet<(String, u64)>>>,
+    key: (String, u64),
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.active.lock() {
+            set.remove(&self.key);
+        }
+    }
+}
+
+impl Waiters {
+    /// Wait on a thread of its own for `wait` to report a click, then open `room`. `wait` gets
+    /// the handler to give the platform. `id` is the platform's id for the notification; pass
+    /// a number that is never reused where notifications are not replaced in place, so each
+    /// gets its own waiter.
+    pub(super) fn spawn(
+        &self,
+        room: String,
+        id: u64,
+        handle: AppHandle<RiverApp>,
+        wait: impl FnOnce(Box<dyn FnOnce(&NotificationResponse)>) + Send + 'static,
+    ) {
+        let key = (room.clone(), id);
+        let mut set = match self.active.lock() {
+            Ok(set) => set,
+            Err(_) => return,
+        };
+        if set.contains(&key) {
+            // The earlier waiter is on this very notification and will hear the click.
+            return;
+        }
+        if set.len() >= MAX_WAITING {
+            // Said once: a click on later notifications will not open their room until some
+            // of these are dismissed.
+            if !self.capped.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "river: too many notifications waiting; clicks on new ones will not open their room until old ones are dismissed"
+                );
+            }
+            return;
+        }
+        set.insert(key.clone());
+        drop(set);
+        let slot = Slot {
+            active: self.active.clone(),
+            key,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("river-notify-click".into())
+            .spawn(move || {
+                let _slot = slot;
+                let open = move |response: &NotificationResponse| {
+                    if is_click(response) {
+                        open_room(&handle, room);
+                    }
+                };
+                wait(Box::new(open));
+            });
+        if let Err(e) = spawned {
+            // The closure, and the slot in it, are dropped: the slot is free again.
+            eprintln!("river: clicking a notification will not open its room: {e}");
+        }
+    }
+}
+
 /// Shows notifications through a worker thread.
 pub struct DesktopNotifier {
-    jobs: mpsc::Sender<Notification>,
+    jobs: mpsc::SyncSender<Notification>,
+    dropped: AtomicBool,
 }
 
 impl DesktopNotifier {
     pub fn new(handle: AppHandle<RiverApp>) -> Self {
-        let (jobs, rx) = mpsc::channel();
+        let (jobs, rx) = mpsc::sync_channel(QUEUE);
         let spawned = std::thread::Builder::new()
             .name("river-notify".into())
             .spawn(move || worker(rx, handle));
@@ -55,14 +140,21 @@ impl DesktopNotifier {
             // The sender then has no receiver and every notification is dropped.
             eprintln!("river: notifications are off, could not start their thread: {e}");
         }
-        DesktopNotifier { jobs }
+        DesktopNotifier {
+            jobs,
+            dropped: AtomicBool::new(false),
+        }
     }
 }
 
 impl Notifier for DesktopNotifier {
     fn notify(&self, notification: Notification) {
-        // Dropped without a word if the worker is gone: it said why when it went.
-        let _ = self.jobs.send(notification);
+        // Never waits. Dropped if the worker is gone (it said why when it went) or far behind.
+        if let Err(mpsc::TrySendError::Full(_)) = self.jobs.try_send(notification)
+            && !self.dropped.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("river: notifications are backed up; dropping some");
+        }
     }
 
     /// The count is in the window title. A dock badge or taskbar overlay needs main-thread

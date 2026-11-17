@@ -207,6 +207,9 @@ pub struct Chat {
     open_when_shown: Option<String>,
     /// The invitation asked for, by the room it was asked for in.
     pub invite: Option<(String, InviteState)>,
+    /// Whether the last status was not live, so the next live update is catch-up rather than
+    /// news (see [`Chat::show_node_rooms`]).
+    catching_up: bool,
     /// Whether new messages produce notifications: the switch in the room list's footer. The
     /// app keeps it across runs.
     pub notifications: bool,
@@ -248,6 +251,7 @@ impl Chat {
             opened: HashSet::new(),
             open_when_shown: None,
             invite: None,
+            catching_up: true,
             notifications: true,
         };
         chat.set_rooms(rooms);
@@ -319,15 +323,16 @@ impl Chat {
     ) -> Vec<crate::notify::Arrival> {
         // Only an update that follows a live one can carry news. The first rooms, the catch-up
         // that ends "Catching up", and what arrives after a reconnect are history, not messages
-        // to interrupt the person with.
-        let arrived = if matches!(self.source, Source::Node(LinkStatus::Live))
-            && status == LinkStatus::Live
-            && self.node_rooms_shown
-        {
+        // to interrupt the person with. So the first live update after any not-live one is
+        // swallowed: a genuine message that lands in exactly that update is not notified (the
+        // unread count and the title still show it). That is accepted: the alternative is a
+        // burst of old messages after every reconnect.
+        let arrived = if status == LinkStatus::Live && !self.catching_up && self.node_rooms_shown {
             crate::notify::arrivals(&self.rooms, &rooms)
         } else {
             Vec::new()
         };
+        self.catching_up = status != LinkStatus::Live;
         self.source = Source::Node(status);
         // The menu belongs to what was on screen; a new list may have removed it.
         self.link_menu = None;
@@ -361,6 +366,15 @@ impl Chat {
             self.read.insert(room.key.clone(), mark);
         }
         arrived
+    }
+
+    /// The connection's status changed without new rooms. Anything but live makes the next live
+    /// update catch-up.
+    pub fn note_status(&mut self, status: LinkStatus) {
+        if let Source::Node(_) = self.source {
+            self.source = Source::Node(status);
+            self.catching_up |= status != LinkStatus::Live;
+        }
     }
 
     /// Unread messages across all rooms.

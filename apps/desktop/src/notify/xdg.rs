@@ -2,23 +2,21 @@
 //! zbus, so no libdbus).
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use notify_rust::{Hint, Timeout};
 use river_app::RiverApp;
 use river_app::notify::Notification;
 use rune::AppHandle;
 
-use super::{MAX_WAITING, escape_markup, is_click, open_room};
+use super::{Waiters, escape_markup};
 
 pub struct Backend {
     /// The server's id for each room's latest notification, so the next one replaces it
     /// instead of stacking.
     ids: HashMap<String, u32>,
-    /// Whether the server reads the body as markup, asked once on the first notification.
+    /// Whether the server reads the text as markup, asked until it answers.
     markup: Option<bool>,
-    waiting: Arc<AtomicUsize>,
+    waiters: Waiters,
 }
 
 impl Backend {
@@ -26,24 +24,32 @@ impl Backend {
         Backend {
             ids: HashMap::new(),
             markup: None,
-            waiting: Arc::new(AtomicUsize::new(0)),
+            waiters: Waiters::default(),
         }
     }
 
     pub fn show(&mut self, n: &Notification, handle: &AppHandle<RiverApp>) {
-        let markup = *self.markup.get_or_insert_with(|| {
-            notify_rust::get_capabilities()
-                .map(|caps| caps.iter().any(|c| c == "body-markup"))
-                .unwrap_or(false)
-        });
-        let body = if markup {
-            escape_markup(&n.body)
+        // Fail closed: when the server cannot be asked, escape, and ask again next time. A
+        // server that reads markup would otherwise render tags from a message.
+        let markup = match self.markup {
+            Some(m) => m,
+            None => match notify_rust::get_capabilities() {
+                Ok(caps) => {
+                    let m = caps.iter().any(|c| c == "body-markup");
+                    self.markup = Some(m);
+                    m
+                }
+                Err(_) => true,
+            },
+        };
+        let (title, body) = if markup {
+            (escape_markup(&n.title), escape_markup(&n.body))
         } else {
-            n.body.clone()
+            (n.title.clone(), n.body.clone())
         };
         let mut note = notify_rust::Notification::new();
         note.appname("River")
-            .summary(&n.title)
+            .summary(&title)
             .body(&body)
             // The icon theme's name for it, which the .desktop file's `Icon=river` installs.
             .icon("river")
@@ -67,25 +73,16 @@ impl Backend {
                 return;
             }
         };
-        self.ids.insert(n.room_key.clone(), shown.id());
-        if self.waiting.fetch_add(1, Ordering::AcqRel) >= MAX_WAITING {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-            return;
-        }
-        let (waiting, handle, room) = (self.waiting.clone(), handle.clone(), n.room_key.clone());
-        let spawned = std::thread::Builder::new()
-            .name("river-notify-click".into())
-            .spawn(move || {
-                let _ = shown.wait_for_response(|response: &notify_rust::NotificationResponse| {
-                    if is_click(response) {
-                        open_room(&handle, room);
-                    }
-                });
-                waiting.fetch_sub(1, Ordering::AcqRel);
-            });
-        if let Err(e) = spawned {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-            eprintln!("river: clicking a notification will not open its room: {e}");
-        }
+        // A notification that replaced another has the same id, and the earlier waiter is on it.
+        let id = shown.id();
+        self.ids.insert(n.room_key.clone(), id);
+        self.waiters.spawn(
+            n.room_key.clone(),
+            u64::from(id),
+            handle.clone(),
+            move |on| {
+                let _ = shown.wait_for_response(on);
+            },
+        );
     }
 }

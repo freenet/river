@@ -41,6 +41,11 @@ pub struct RiverApp {
     /// Messages that arrived in the open room while the window was not focused. The room counts
     /// them as read the moment they land, so the title adds them back until the person returns.
     missed: (String, usize),
+    /// What holds notifications back: cooldowns, the per-minute cap, rooms still filling.
+    limiter: notify::Limiter,
+    /// Whether a private room's notification may show the message text. Off unless the
+    /// `notification_previews` preference is set (there is no switch for it yet).
+    private_previews: bool,
     /// The unread count last given to the notifier, so it hears only changes.
     reported_unread: Option<usize>,
     prefs: rune::prefs::Prefs,
@@ -96,6 +101,8 @@ impl RiverApp {
             focused: false,
             missed: Default::default(),
             reported_unread: None,
+            limiter: Default::default(),
+            private_previews: false,
             prefs: rune::prefs::Prefs::memory(),
         }
     }
@@ -127,6 +134,8 @@ impl RiverApp {
             focused: false,
             missed: Default::default(),
             reported_unread: None,
+            limiter: Default::default(),
+            private_previews: prefs.get("notification_previews").unwrap_or(false),
             prefs,
         }
     }
@@ -164,7 +173,8 @@ impl RiverApp {
     }
 
     /// Notify about `arrived`, unless the person is looking at that room right now.
-    fn notify_arrivals(&mut self, arrived: Vec<notify::Arrival>) {
+    fn notify_arrivals(&mut self, arrived: Vec<notify::Arrival>, now: std::time::Instant) {
+        self.limiter.observe(self.chat.rooms(), now);
         let open = self.chat.room().map(|r| r.key.clone());
         let mut shown = Vec::new();
         for a in arrived {
@@ -183,7 +193,8 @@ impl RiverApp {
         if !self.chat.notifications {
             return;
         }
-        for n in notify::compose(shown) {
+        let shown = self.limiter.admit(shown, now);
+        for n in notify::compose(shown, self.private_previews) {
             self.notifier.notify(n);
         }
     }
@@ -232,12 +243,13 @@ impl RiverApp {
                     .chat
                     .show_node_rooms(rooms, open.as_deref(), status, now);
                 self.chat.show_work(work);
-                self.notify_arrivals(arrived);
+                self.notify_arrivals(arrived, std::time::Instant::now());
+                // Also here: `poll` is not run for an update that arrives while the window is
+                // hidden, and the title and count must still follow.
+                self.sync_unread(tx);
             }
             RoomsUpdate::Status(status) => {
-                if let chat::Source::Node(_) = self.chat.source {
-                    self.chat.source = chat::Source::Node(status);
-                }
+                self.chat.note_status(status);
             }
             // The link is copied as the web UI's invite dialog copies it: to the clipboard as
             // it is. It is a bearer credential, which the members panel says.

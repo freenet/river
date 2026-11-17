@@ -585,7 +585,7 @@ impl Ids {
 /// Characters that draw nothing or reorder text, which a name could use to look like someone
 /// else's. A short list next to the web UI's `sanitize_display_name`
 /// (`ui/src/util/display_name.rs`), which also folds confusable characters.
-pub(super) fn is_hidden(c: char) -> bool {
+pub(crate) fn is_hidden(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
