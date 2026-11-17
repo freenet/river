@@ -112,16 +112,12 @@ impl RiverApp {
         }
     }
 
-    /// Take an update from the rooms link. The approval page opens when the wait for it
-    /// starts.
+    /// Take an update from the rooms link. The approval page is NOT opened here: the person
+    /// presses a button for it, so they are looking at the app when the browser window
+    /// appears (an automatic open can land on another workspace or fail unseen).
     pub fn apply_rooms(&mut self, update: RoomsUpdate, tx: &mut Tx) {
         match update {
             RoomsUpdate::Access(access) => {
-                if let Access::WaitingForApproval { approve_url } = &access
-                    && self.access != access
-                {
-                    let _ = tx.open_url(approve_url);
-                }
                 self.access = access;
             }
             RoomsUpdate::Rooms {
@@ -450,12 +446,13 @@ fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
             panel(
                 t,
                 "Allow River to open your rooms",
-                "Freenet keeps your rooms for River in your browser. A Freenet page has opened \
-                 in your browser asking whether this app may use them too. Choose Allow there.",
+                "Freenet keeps your rooms for River in your browser. Press the button to open \
+                 a Freenet page in your browser that asks whether this app may use them too, \
+                 then choose Allow there.",
                 None,
                 vec![
-                    Button::new("Open the page again")
-                        .variant(ButtonVariant::Ghost)
+                    Button::new("Open Freenet's approval page")
+                        .variant(ButtonVariant::Contrast)
                         .on_press_tx(move |_: &mut RiverApp, tx: &mut Tx| {
                             let _ = tx.open_url(&url);
                         })
@@ -965,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn the_approval_page_opens_once_and_again_on_request() {
+    fn the_approval_page_opens_only_when_the_button_is_pressed() {
         let url = "http://127.0.0.1:7509/v1/app-grants/approve/x".to_owned();
         let mut rt = render_access(Access::Connecting);
         let waiting = Access::WaitingForApproval {
@@ -974,11 +971,11 @@ mod tests {
         let w = waiting.clone();
         rt.update(move |s, tx| s.apply_rooms(RoomsUpdate::Access(w), tx));
         rt.frame(1.0 / 60.0);
-        // The same state again (a repeated report) does not open a second tab.
         rt.update(move |s, tx| s.apply_rooms(RoomsUpdate::Access(waiting), tx));
         rt.frame(2.0 / 60.0);
-        assert_eq!(rt.take_url_requests(), std::slice::from_ref(&url));
-        let (x, y) = rt.find("approve").expect("the open-again button");
+        // Reaching the waiting state opens nothing by itself.
+        assert!(rt.take_url_requests().is_empty());
+        let (x, y) = rt.find("approve").expect("the open button");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(3.0 / 60.0);
