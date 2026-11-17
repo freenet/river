@@ -197,6 +197,15 @@ pub fn render(
             }
         })
         .link_help(|url| openable(url).then(|| format!("Opens {url}")))
+        // Right-click a link for Open and Copy link, as in a browser. This takes the press from
+        // every link, so a mention chip or a non-web link shows no menu at all.
+        .on_link_secondary(
+            |s: &mut RiverApp, url: &str, press: rune::PointerPress, _: &mut rune::Tx| {
+                s.chat.open_link_menu(url, press);
+            },
+        )
+        // Text can be selected and copied, within a message.
+        .selectable(true)
         .render(&style(p, k, font, color))
         .key(key)
 }

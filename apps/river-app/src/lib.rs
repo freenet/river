@@ -1103,6 +1103,45 @@ mod tests {
     }
 
     #[test]
+    fn only_a_web_link_gets_a_menu_and_its_address_is_trimmed() {
+        let press = rune::PointerPress { x: 1.0, y: 2.0 };
+        let mut chat = chat::Chat::new(chat::Source::Example, Vec::new(), 0, 0, 0);
+        for no in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            &format!("{}:member", chat::model::mention_scheme()),
+        ] {
+            chat.open_link_menu(no, press);
+            assert!(chat.link_menu.is_none(), "{no}");
+        }
+        chat.open_link_menu(" https://freenet.org/ ", press);
+        assert_eq!(chat.link_menu.as_ref().unwrap().0, "https://freenet.org/");
+    }
+
+    #[test]
+    fn the_link_menu_opens_or_copies_the_link() {
+        let url = "https://freenet.org/";
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        assert!(rt.find("link-menu-item0").is_none());
+        rt.update(move |s, _| {
+            s.chat.link_menu = Some((url.to_owned(), rune::PointerPress { x: 400.0, y: 300.0 }));
+        });
+        settle(&mut rt);
+        press(&mut rt, "link-menu-item1");
+        assert_eq!(board.text().as_deref().map(String::as_str), Some(url));
+        assert!(rt.state.chat.link_menu.is_none(), "the menu closes");
+        assert!(rt.take_url_requests().is_empty(), "copying opens nothing");
+        rt.update(move |s, _| {
+            s.chat.link_menu = Some((url.to_owned(), rune::PointerPress { x: 400.0, y: 300.0 }));
+        });
+        settle(&mut rt);
+        press(&mut rt, "link-menu-item0");
+        assert_eq!(rt.take_url_requests(), [url]);
+        assert!(rt.state.chat.link_menu.is_none());
+    }
+
+    #[test]
     fn the_create_dialog_says_what_is_wrong_and_sends_what_is_right() {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);

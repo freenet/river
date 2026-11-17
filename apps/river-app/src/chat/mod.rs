@@ -172,6 +172,9 @@ pub struct Chat {
     /// Whether a narrow window shows the members panel over the conversation. Separate from
     /// `members_open`, so a narrow window opens on the conversation however the wide one was left.
     pub members_overlay: bool,
+    /// The link a right-click landed on, and where: the link menu (Open, Copy link) is open
+    /// there. Cleared when the menu closes.
+    pub link_menu: Option<(String, rune::PointerPress)>,
     /// Today's day number in message time (whose day 0 is `day_zero`).
     pub today: u32,
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
@@ -207,6 +210,14 @@ pub struct Chat {
 }
 
 impl Chat {
+    /// Open the link menu for `url` at `press`: only for a web link, and with the address
+    /// trimmed so Copy and Open act on the same text.
+    pub fn open_link_menu(&mut self, url: &str, press: rune::PointerPress) {
+        if markdown::openable(url) {
+            self.link_menu = Some((url.trim().to_owned(), press));
+        }
+    }
+
     /// A chat screen showing `rooms`, with the first one open.
     pub fn new(source: Source, rooms: Vec<Room>, today: u32, day_zero: i64, now: u32) -> Self {
         let mut chat = Chat {
@@ -218,6 +229,7 @@ impl Chat {
             drafts: HashMap::new(),
             members_open: true,
             members_overlay: false,
+            link_menu: None,
             today,
             day_zero,
             now,
@@ -302,6 +314,8 @@ impl Chat {
         now: u32,
     ) {
         self.source = Source::Node(status);
+        // The menu belongs to what was on screen; a new list may have removed it.
+        self.link_menu = None;
         self.now = now;
         self.day_zero = 0;
         self.today = now / model::MINUTES_PER_DAY;

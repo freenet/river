@@ -49,6 +49,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         .child(rooms(chat, logo, narrow, &p, &k));
     let mut layer = Vec::new();
     dialogs(chat, &k, &mut layer);
+    screen = screen.child(link_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
@@ -76,6 +77,35 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         });
     }
     rune_kit::root(screen, layer)
+}
+
+/// The menu a right-click on a link opens: Open it, or copy its address. The returned element
+/// is the zero-size trigger the menu hangs from.
+fn link_menu(chat: &Chat, k: &Kit, layer: &mut Vec<El>) -> El {
+    let (url, press) = match &chat.link_menu {
+        Some((url, press)) => (url.clone(), Some(*press)),
+        None => (String::new(), None),
+    };
+    let (open_url, copy_url) = (url.clone(), url);
+    rune_kit::context_menu(
+        "link-menu",
+        el().key("link-menu-anchor").size(0.0, 0.0),
+        press,
+    )
+    .item(rune_kit::MenuItem::new("Open link").on_select_tx(
+        move |s: &mut RiverApp, tx: &mut rune::Tx| {
+            let _ = tx.open_url(&open_url);
+            s.chat.link_menu = None;
+        },
+    ))
+    .item(rune_kit::MenuItem::new("Copy link address").on_select_tx(
+        move |s: &mut RiverApp, tx: &mut rune::Tx| {
+            tx.copy(copy_url.clone());
+            s.chat.link_menu = None;
+        },
+    ))
+    .on_close(|s: &mut RiverApp| s.chat.link_menu = None)
+    .build(k, layer)
 }
 
 type Get = fn(&mut RiverApp) -> &mut rune::TextEdit;
