@@ -1107,7 +1107,8 @@ fn a_mention_becomes_a_chip_link_with_a_safe_name() {
     // as written (and so is not a chip: it does not carry this process's scheme).
     assert!(m.md.starts_with("hi [@"), "{}", m.md);
     assert!(m.md.ends_with("[x](rvm-guess:self)"), "{}", m.md);
-    assert!(!m.md.contains("rv:"), "{}", m.md);
+    assert!(!m.md.contains("(rv:"), "{}", m.md);
+    assert!(!m.md.contains(known.as_str()), "{}", m.md);
 }
 
 #[test]

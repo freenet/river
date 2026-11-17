@@ -14,6 +14,9 @@ use crate::RiverApp;
 const MAX_SOURCE_BYTES: usize = 4096;
 /// Most block containers (`>`, `-`, `1.`) opened at the start of one line.
 const MAX_LINE_NESTING: usize = 16;
+/// Most `[` in one text: a reference definition used many times expands a short text into
+/// many link records (the web UI bounds its HTML size instead).
+const MAX_BRACKETS: usize = 100;
 /// Most `|` on one line, which bounds the columns of a table.
 const MAX_LINE_PIPES: usize = 32;
 
@@ -21,7 +24,7 @@ const MAX_LINE_PIPES: usize = 32;
 /// linearly with nesting depth and a table's size with columns times rows, so text past these
 /// limits is shown as plain text, as in the web UI.
 pub fn is_cheap(text: &str) -> bool {
-    if text.len() > MAX_SOURCE_BYTES {
+    if text.len() > MAX_SOURCE_BYTES || text.bytes().filter(|&b| b == b'[').count() > MAX_BRACKETS {
         return false;
     }
     // A byte order mark is skipped by the parser but would hide a marker from the count.
@@ -93,7 +96,9 @@ pub fn strip(text: &str) -> String {
     };
     for ev in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES) {
         match ev {
-            Event::Text(t) | Event::Code(t) => out.push_str(&t),
+            Event::Text(t) | Event::Code(t) | Event::Html(t) | Event::InlineHtml(t) => {
+                out.push_str(&t)
+            }
             Event::SoftBreak | Event::HardBreak => gap(&mut out),
             Event::End(
                 TagEnd::Paragraph
@@ -113,7 +118,9 @@ pub fn strip(text: &str) -> String {
 /// Text with each line break kept, as chat messages are written (two spaces before a newline
 /// is markdown's hard break). Descriptions are not given this, as in the web UI.
 fn keep_line_breaks(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\n', "  \n")
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "  \n")
 }
 
 /// Whether a link may be opened from the app: only web pages. A markdown link can name any
@@ -143,6 +150,16 @@ fn style(p: &Palette, k: &Kit, font: rune::tok::TextStyle, color: Color) -> Mark
         .body_font(font)
 }
 
+/// Whether a description is one plain paragraph, which is what fits the header's one line as
+/// markdown. Anything that opens a block (heading, list, quote, fence, table, several lines)
+/// is shown as one line of its words instead.
+pub fn is_one_line(text: &str) -> bool {
+    let t = text.trim_start();
+    !t.contains(['\n', '\r'])
+        && !t.starts_with(['#', '-', '*', '+', '>', '|', '`', '~', '<', '[', '!'])
+        && !t.starts_with(|c: char| c.is_ascii_digit())
+}
+
 /// Markdown for `src` under `key`. `keep_breaks` is true for messages.
 pub fn render(
     src: &str,
@@ -162,7 +179,7 @@ pub fn render(
     Markdown::new(src)
         .on_link_tx(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
             if openable(url) {
-                let _ = tx.open_url(url);
+                let _ = tx.open_url(url.trim());
             }
         })
         .link_style(move |url| {
@@ -254,7 +271,24 @@ mod tests {
     }
 
     #[test]
+    fn many_brackets_are_not_parsed() {
+        assert!(is_cheap(&"[a] ".repeat(MAX_BRACKETS)));
+        assert!(!is_cheap(&"[a] ".repeat(MAX_BRACKETS + 1)));
+    }
+
+    #[test]
+    fn only_a_plain_line_is_a_header_description() {
+        assert!(is_one_line("The **public** room, see [x](https://a.b)"));
+        for no in [
+            "# Title", "- a", "> q", "```\nx", "a\nb", "1. a", "| a |", "[r]: x",
+        ] {
+            assert!(!is_one_line(no), "{no:?}");
+        }
+        assert_eq!(strip("a <b>html</b> c"), "a <b>html</b> c");
+    }
+
+    #[test]
     fn messages_keep_their_line_breaks() {
-        assert_eq!(keep_line_breaks("a\nb\r\nc"), "a  \nb  \nc");
+        assert_eq!(keep_line_breaks("a\nb\r\nc\rd"), "a  \nb  \nc  \nd");
     }
 }

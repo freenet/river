@@ -639,3 +639,31 @@ pub fn local_minutes(t: SystemTime) -> u32 {
         .div_euclid(60)
         .clamp(0, i64::from(u32::MAX)) as u32
 }
+
+#[cfg(test)]
+mod md_tests {
+    use super::escape_markdown;
+
+    #[test]
+    fn a_hostile_name_is_literal_markdown() {
+        let name = r"a](file:///x) [b\ <i>&*_`";
+        let md = format!("[@{}](dest:member)", escape_markdown(name));
+        // Parsed as markdown, the only link is the one we built, and the name is its text.
+        let mut dests = Vec::new();
+        let mut text = String::new();
+        for ev in pulldown_cmark::Parser::new(&md) {
+            match ev {
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. }) => {
+                    dests.push(dest_url.to_string())
+                }
+                pulldown_cmark::Event::Text(t) => text.push_str(&t),
+                pulldown_cmark::Event::Html(_) | pulldown_cmark::Event::InlineHtml(_) => {
+                    panic!("html")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(dests, ["dest:member"]);
+        assert_eq!(text, format!("@{name}"));
+    }
+}

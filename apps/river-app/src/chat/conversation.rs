@@ -62,21 +62,23 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
     let mut info = col().grow(1.0).min_w(0.0).gap(2.0).child(title);
     if !room.description.is_empty() {
         // One line of the description, drawn as markdown; what does not fit is cut off.
-        info = info.child(if markdown::is_cheap(&room.description) {
-            markdown::render(
-                &room.description,
-                false,
-                st::SMALL,
-                p.text_muted,
-                "description-md".into(),
-                p,
-                k,
-            )
-            .max_h(18.0)
-            .clip_soft(0.0)
-        } else {
-            label(room.description.clone(), st::SMALL, p.text_muted).truncate()
-        });
+        info = info.child(
+            if markdown::is_one_line(&room.description) && markdown::is_cheap(&room.description) {
+                markdown::render(
+                    &room.description,
+                    false,
+                    st::SMALL,
+                    p.text_muted,
+                    format!("description-{}", room.key),
+                    p,
+                    k,
+                )
+                .max_h(18.0)
+                .clip_soft(0.0)
+            } else {
+                label(markdown::strip(&room.description), st::SMALL, p.text_muted).truncate()
+            },
+        );
     }
     let open = chat.members_shown(narrow);
     let toggle = row()
