@@ -69,7 +69,7 @@ fn options() -> Options {
 /// never as the unprepared markdown.
 pub fn prepare(src: &str) -> Option<String> {
     let (edits, kept) = rewrites(src)?;
-    if edits.is_empty() {
+    if edits.is_empty() && !src.contains('|') {
         return Some(src.to_owned());
     }
     // What the links in the output must be: the ones kept as written, and the ones the edits
@@ -228,6 +228,7 @@ fn rewrites(src: &str) -> Option<(Vec<Edit>, Vec<String>)> {
     // the outer link ends at its own closing event, not at theirs.
     let mut inner_links = 0usize;
     let (mut in_image, mut in_code_block) = (0usize, false);
+    let (mut containers, mut last_root_para) = (0usize, None::<std::ops::Range<usize>>);
     for (ev, range) in Parser::new_ext(src, options()).into_offset_iter() {
         if let Some(l) = link.as_mut() {
             if matches!(ev, Event::Start(Tag::Link { .. })) {
@@ -267,12 +268,17 @@ fn rewrites(src: &str) -> Option<(Vec<Edit>, Vec<String>)> {
             // own code (splitting at `|` even inside a code span). Whatever it would find
             // there, we have not checked: such a paragraph (pulldown did not make it a
             // table, or it would not be a paragraph) is plain text.
-            Event::Start(Tag::Paragraph)
-                if src[range.clone()]
-                    .lines()
-                    .any(|l| l.trim_start_matches([' ', '\t', '>']).starts_with('|')) =>
-            {
-                return None;
+            Event::Start(Tag::Paragraph) => {
+                if src[range.clone()].lines().any(starts_like_table_row) {
+                    return None;
+                }
+                if containers == 0 {
+                    last_root_para = Some(range.clone());
+                }
+            }
+            Event::Start(Tag::BlockQuote(_) | Tag::List(_) | Tag::Item) => containers += 1,
+            Event::End(TagEnd::BlockQuote(_) | TagEnd::List(_) | TagEnd::Item) => {
+                containers = containers.saturating_sub(1)
             }
             Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
             Event::End(TagEnd::CodeBlock) => in_code_block = false,
@@ -293,8 +299,33 @@ fn rewrites(src: &str) -> Option<(Vec<Edit>, Vec<String>)> {
             return None;
         }
     }
+    // The widget parses the LAST root-level paragraph again as a table when it starts with `|`
+    // and splits into cells, whatever pulldown made of it. Belt and braces for the line test
+    // above: a pipe anywhere in it together with anything link- or code-like is plain text.
+    // (So an ordinary `a | b` message that also holds a link, code or `<` is shown as plain
+    // text: a trade accepted for the certainty.)
+    if let Some(r) = last_root_para
+        && src[r.clone()].contains('|')
+        && (src[r.clone()].contains(['[', '<', '`']) || src_has_url_word(&src[r]))
+    {
+        return None;
+    }
     bare_links(src, &prose, ticks, &mut edits);
     (edits.len() <= MAX_REWRITES).then_some((edits, kept))
+}
+
+/// Whether a line is one the widget's table parser would take as a row: after trimming
+/// whitespace (Unicode: NBSP, U+3000, U+0085, VT, FF …) and block-quote markers it starts with
+/// `|`. Mirrors rune-kit `markdown/parser.rs` (`pending_table`, which uses `trim_start`/`trim`);
+/// keep the two the same.
+fn starts_like_table_row(line: &str) -> bool {
+    line.trim_start_matches(|c: char| c.is_whitespace() || c == '>')
+        .starts_with('|')
+}
+
+fn src_has_url_word(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("://") || lower.contains("www.")
 }
 
 /// What the whole link `[label](dest)` becomes, `None` to leave it as it is.
@@ -1999,8 +2030,11 @@ mod tests {
             "the URL is code, not prose: {out:?}"
         );
         // `|` does not end a URL outside a table: the dot segment after it is read.
-        let out = prepare(&format!("http://h.example/v1/contract/web/{b}/a|/../b"));
-        assert!(opens(&out).is_empty(), "{out:?}");
+        // (A `|` with a URL in the last paragraph is plain text: see `rewrites`.)
+        assert_eq!(
+            super::prepare(&format!("http://h.example/v1/contract/web/{b}/a|/../b")),
+            None
+        );
         // In a table cell it does end at the cell.
         let out = prepare(&format!(
             "|a|b|\n|-|-|\n|http://h.example/v1/contract/web/{b}/x|y|"
@@ -2118,6 +2152,30 @@ mod tests {
             assert_eq!(super::prepare(md), None, "{md:?}");
         }
         // A table pulldown itself parses is fine.
+        let out = prepare(&format!("|a|b|\n|-|-|\n|freenet:{RIVER_ID}|y|"));
+        assert_eq!(opens(&out).len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn unicode_whitespace_before_a_pipe_does_not_hide_a_table_paragraph() {
+        for ws in [
+            '\u{a0}', '\u{3000}', '\u{85}', '\u{2003}', '\u{2009}', '\u{b}', '\u{c}',
+        ] {
+            let md = format!("{ws}| `a | [https://paypal.com](https://evil.example/)` |");
+            assert_eq!(super::prepare(&md), None, "{ws:?}");
+        }
+        // Wherever the pipe is, in the last paragraph, with a link or code in it.
+        for md in [
+            "x `a | b` [https://paypal.com](https://evil.example/)",
+            "first\n\nsee | http://example.com/x",
+            "a | b <https://example.com/>",
+        ] {
+            assert_eq!(super::prepare(md), None, "{md:?}");
+        }
+        // A pipe alone, or links with no pipe in the last paragraph, are fine; a link in an
+        // earlier paragraph does not matter.
+        assert_eq!(super::prepare("a | b").as_deref(), Some("a | b"));
+        assert!(super::prepare("[a](https://example.com/)\n\nx | y").is_some());
         let out = prepare(&format!("|a|b|\n|-|-|\n|freenet:{RIVER_ID}|y|"));
         assert_eq!(opens(&out).len(), 1, "{out:?}");
     }
