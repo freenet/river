@@ -1030,7 +1030,10 @@ mod tests {
                 include_str!("../../../../ui/src/util/display_name.rs"),
             ),
         ];
-        let mine = include_str!("visual_fold.rs");
+        // A Windows checkout may turn every newline into CRLF; compare line content only.
+        let unix = |s: &str| s.replace("\r\n", "\n");
+        let sources = sources.map(|(f, s)| (f, unix(s)));
+        let mine = unix(include_str!("visual_fold.rs"));
         let body = mine.split("\n#[cfg(test)]\nmod tests").next().unwrap();
         let mut checked = 0;
         for chunk in body.split("//@@ ").skip(1) {
@@ -1040,7 +1043,8 @@ mod tests {
                 .iter()
                 .find(|(f, _)| *f == file.trim())
                 .unwrap_or_else(|| panic!("unknown source {file}"))
-                .1;
+                .1
+                .as_str();
             assert!(
                 web.contains(item),
                 "the copy of an item from {file} no longer matches the web UI:\n{}",
