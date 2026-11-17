@@ -3,6 +3,7 @@ import {
   asTouchTablet,
   centreOf,
   chipFor,
+  chipPointer,
   chips,
   coarsePointer,
   committedRow,
@@ -247,6 +248,25 @@ test.describe("Reaction owner list (#714)", () => {
       await expect(crab).toHaveAttribute("aria-pressed", "false");
     }
   });
+
+  test("a hold that ends without a lift does not swallow the next press outside", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+    const chip = await signedChip(page);
+    const owners = page.getByTestId("reaction-owners");
+    for (const ending of ["pointercancel", "pointerleave"] as const) {
+      // Down and held; the lift is never sent.
+      await holdChip(page, chip);
+      await expect(owners).toBeVisible();
+      await chipPointer(chip, ending, ending === "pointercancel");
+      // In the history, well above the chip and its list.
+      const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+      await page.mouse.click(view.x + view.width / 2, view.y + 40);
+      await expect(owners, `${ending}: one press outside closes the list`).toHaveCount(0);
+    }
+  });
 });
 
 // Removing your reaction from the list while another member's chip remains
@@ -394,6 +414,28 @@ test.describe("Reaction chip under a real finger (#714)", { tag: "@chromium-only
     await settle(page);
     await expect(owners, "the lift does not close it").toBeVisible();
     await expect(held, "nor remove the reaction").toHaveCount(1);
+  });
+
+  test("a held finger that drags away is cancelled, and one tap outside then closes the list", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Your Private Room");
+    await waitSettledAtBottom(page);
+    const owners = page.getByTestId("reaction-owners");
+    const held = await addOwnReaction(page);
+    const [x, y] = await centreOf(held);
+    await withFingers(page, async (fingers) => {
+      await fingers.press([1, x, y]);
+      await expect(owners).toBeVisible();
+      // The browser takes the drag for a scroll: pointercancel, and no click.
+      await fingers.move({ 1: -60 });
+      await fingers.lift();
+    });
+    await settle(page);
+    await expect(owners, "premise: the cancelled hold left the list open").toBeVisible();
+    const view = (await page.locator("#chat-scroll-container").boundingBox())!;
+    await page.touchscreen.tap(view.x + view.width / 2, view.y + 40);
+    await expect(owners, "one tap outside closes it").toHaveCount(0);
   });
 });
 

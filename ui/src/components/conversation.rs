@@ -3655,7 +3655,13 @@ struct ChipHold {
     /// The chip whose hold opened the list. The click its lift sends is not
     /// a press, wherever it lands: on the chip, or on the list's backdrop,
     /// which by then covers the chip.
-    held: Option<String>,
+    held: Option<HeldChip>,
+}
+
+/// The chip whose hold opened the list, and whether that press has lifted.
+struct HeldChip {
+    key: String,
+    lifted: bool,
 }
 
 impl ChipHold {
@@ -3673,10 +3679,16 @@ impl ChipHold {
         Some(self.generation)
     }
 
-    /// The press lifted, left the chip or was cancelled (a scroll) first.
+    /// The press left the chip or was cancelled (a scroll). Before its lift
+    /// that ends a hold too: no click of that press follows. After its lift
+    /// the release stands: a touch's `pointerleave` comes between its
+    /// `pointerup` and its click.
     fn cancel(&mut self) {
         self.pending = None;
         self.pressed = None;
+        if self.held.as_ref().is_some_and(|held| !held.lifted) {
+            self.held = None;
+        }
     }
 
     /// A click on `key`: whether it reacts directly, as the click of that
@@ -3709,7 +3721,10 @@ impl ChipHold {
         if narrow {
             return None;
         }
-        self.held = Some(key.clone());
+        self.held = Some(HeldChip {
+            key: key.clone(),
+            lifted: false,
+        });
         Some(key)
     }
 
@@ -3717,7 +3732,9 @@ impl ChipHold {
     /// [`expire`](Self::expire) should no click follow.
     fn lift(&mut self) -> Option<u32> {
         self.pending = None;
-        self.held.as_ref().map(|_| self.generation)
+        let held = self.held.as_mut()?;
+        held.lifted = true;
+        Some(self.generation)
     }
 
     /// No click followed the lift of `generation`'s hold.
@@ -3731,7 +3748,7 @@ impl ChipHold {
     /// of the hold that opened that chip's list.
     fn take_release(&mut self, key: &str) -> bool {
         self.pending = None;
-        let released = self.held.take().is_some_and(|held| held == key);
+        let released = self.held.take().is_some_and(|held| held.key == key);
         if released {
             self.pressed = None;
         }
@@ -5255,6 +5272,39 @@ mod tests {
         hold.cancel();
         assert_eq!(hold.fire(generation, false), None);
         assert!(!hold.take_release("a"), "its click is a press");
+    }
+
+    #[test]
+    fn chip_hold_cancelled_while_down_forgets_its_release() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.fire(generation, false);
+        hold.cancel();
+        assert!(!hold.take_release("a"), "no lift follows a cancelled press");
+    }
+
+    /// A touch's `pointerleave` comes between its `pointerup` and its click.
+    #[test]
+    fn chip_hold_leave_after_its_lift_keeps_the_release() {
+        let mut hold = ChipHold::default();
+        let generation = hold.press("a", "touch", false).unwrap();
+        hold.fire(generation, false);
+        hold.lift();
+        hold.cancel();
+        assert!(hold.take_release("a"));
+    }
+
+    #[test]
+    fn chip_hold_lift_of_an_earlier_hold_does_not_protect_a_later_one() {
+        let mut hold = ChipHold::default();
+        let first = hold.press("a", "touch", false).unwrap();
+        hold.fire(first, false);
+        hold.lift();
+        assert!(hold.take_release("a"));
+        let second = hold.press("a", "touch", false).unwrap();
+        hold.fire(second, false);
+        hold.cancel();
+        assert!(!hold.take_release("a"));
     }
 
     #[test]

@@ -446,18 +446,14 @@ export async function pressAt(page: Page, { x, y }: { x: number; y: number }) {
   else await page.mouse.click(x, y);
 }
 
-/// A pointer down on `chip`, held past the app's hold time (CHIP_HOLD_MS,
-/// 500). Returns the lift, which also sends the click a browser sends when
-/// the pointer lifts. Dispatched events: outside Chromium's input protocol
-/// Playwright has no touch hold, and the app decides a hold on the
-/// `pointerdown`'s type and a timer alone.
-export async function holdChip(page: Page, chip: Locator): Promise<() => Promise<void>> {
-  const fire = (type: string) =>
-    chip.evaluate((el, type) => {
+/// Dispatch a touch pointer event at `chip`'s centre.
+export function chipPointer(chip: Locator, type: string, bubbles = true): Promise<void> {
+  return chip.evaluate(
+    (el, { type, bubbles }) => {
       const r = el.getBoundingClientRect();
       el.dispatchEvent(
         new PointerEvent(type, {
-          bubbles: true,
+          bubbles,
           cancelable: true,
           composed: true,
           pointerId: 7,
@@ -467,12 +463,24 @@ export async function holdChip(page: Page, chip: Locator): Promise<() => Promise
           clientY: r.top + r.height / 2,
         }),
       );
-    }, type);
+    },
+    { type, bubbles },
+  );
+}
+
+/// A pointer down on `chip`, held past the app's hold time (CHIP_HOLD_MS,
+/// 500). Returns the lift, which also sends the click a browser sends when
+/// the pointer lifts. The lift sends `pointerleave` between `pointerup` and
+/// the click, as Chromium does for a real finger. Dispatched events: outside
+/// Chromium's input protocol Playwright has no touch hold, and the app
+/// decides a hold on the `pointerdown`'s type and a timer alone.
+export async function holdChip(page: Page, chip: Locator): Promise<() => Promise<void>> {
   await chip.scrollIntoViewIfNeeded();
-  await fire("pointerdown");
+  await chipPointer(chip, "pointerdown");
   await page.waitForTimeout(700);
   return async () => {
-    await fire("pointerup");
+    await chipPointer(chip, "pointerup");
+    await chipPointer(chip, "pointerleave", false);
     await chip.evaluate((el) => (el as HTMLElement).click());
   };
 }
