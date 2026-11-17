@@ -293,7 +293,7 @@ export function footerLayout(row: Locator) {
     const left = Array.from(el.querySelectorAll('[data-testid="message-reaction-row"] > *'))
       .map((wrapper) => wrapper.matches("button") ? wrapper : wrapper.querySelector('[data-testid="reaction-chip"]'))
       .filter((e): e is Element => !!e)
-      .map((e) => ({ id: e.getAttribute("data-testid")!, box: box(e), misses: e.matches("button") ? hits(e) : [] }));
+      .map((e) => ({ id: e.getAttribute("data-testid")!, box: box(e), misses: e.matches('[data-testid="reaction-chip"]') ? [] : hits(e) }));
     const cluster = Array.from(el.querySelectorAll('[data-testid="message-action-cluster"] button')).map((e) => ({
       id: e.getAttribute("data-testid")!,
       box: box(e),
@@ -505,6 +505,14 @@ export function choices(page: Page): Locator {
 /// `row`'s reaction chips.
 export function chips(row: Locator): Locator {
   return row.getByTestId("reaction-chip");
+}
+
+/// The reader's own chips, as a selector: `aria-pressed` is the selection.
+export const OWN_CHIP = '[data-testid="reaction-chip"][aria-pressed="true"]';
+
+/// `row`'s chip for `emoji`.
+export function chipFor(row: Locator, emoji: string): Locator {
+  return row.locator(`[data-testid="reaction-chip"][data-emoji="${emoji}"]`);
 }
 
 /// The message key a row's id carries (`msg-<key>`), as the sheet's

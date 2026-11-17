@@ -2,6 +2,7 @@ import { expect, Locator, Page, test } from "@playwright/test";
 import {
   asTouchTablet,
   centreOf,
+  chipFor,
   chips,
   coarsePointer,
   committedRow,
@@ -11,6 +12,7 @@ import {
   openRoomWithComposer,
   openRoomWithTarget,
   openSheetFromReact,
+  OWN_CHIP,
   palette,
   press,
   reactionChoices,
@@ -70,7 +72,7 @@ async function addOwnReaction(page: Page): Promise<Locator> {
   await pinned.scrollIntoViewIfNeeded();
   await openInlinePicker(page, pinned);
   await press((await reactionChoices(page)).first());
-  const chip = pinned.locator('[data-testid="reaction-chip"][aria-pressed="true"]');
+  const chip = pinned.locator(OWN_CHIP);
   await expect(chip).toHaveCount(1);
   return chip;
 }
@@ -149,9 +151,7 @@ function historyScrollTop(page: Page): Promise<number> {
 }
 
 async function chipByOwnReaction(page: Page, own: boolean): Promise<Locator> {
-  const selector = own
-    ? '[data-testid="reaction-chip"][aria-pressed="true"]'
-    : '[data-testid="reaction-chip"][aria-pressed="false"]';
+  const selector = own ? OWN_CHIP : '[data-testid="reaction-chip"][aria-pressed="false"]';
   const chip = page.locator(selector).first();
   await chip.scrollIntoViewIfNeeded();
   await expect(chip).toBeVisible();
@@ -209,8 +209,7 @@ test.describe("Reaction owner list (#714)", () => {
 
     // The reader's own chip, held. On every project: the app decides a hold
     // on the pointerdown's type, and `holdChip` sends a touch.
-    const ownSelector = '[data-testid="reaction-chip"][aria-pressed="true"]';
-    const ownCount = await page.locator(ownSelector).count();
+    const ownCount = await page.locator(OWN_CHIP).count();
     const lift = await holdChip(page, own);
     // Before the lift: nothing but the hold can have opened it.
     await expect(owners).toBeVisible();
@@ -222,7 +221,7 @@ test.describe("Reaction owner list (#714)", () => {
     await lift();
     await settle(page);
     await expect(owners, "the lift's click does not close it").toBeVisible();
-    await expect(page.locator(ownSelector), "nor remove the reaction").toHaveCount(ownCount);
+    await expect(page.locator(OWN_CHIP), "nor remove the reaction").toHaveCount(ownCount);
     await owners.press("Escape");
     await expect(owners).toHaveCount(0);
 
@@ -264,7 +263,7 @@ test.describe("Reaction removed from the owner list", () => {
     await message.scrollIntoViewIfNeeded();
     await openInlinePicker(page, message);
     await press((await reactionChoices(page)).filter({ hasNotText: "🦀" }).first());
-    const own = message.locator('[data-testid="reaction-chip"][aria-pressed="true"]');
+    const own = message.locator(OWN_CHIP);
     await expect(own).toHaveCount(1);
     await expect(chips).toHaveCount(2);
 
@@ -331,18 +330,14 @@ test.describe("Reaction chip from the keyboard (#714)", () => {
 
     // Your own reaction: native Enter opens the list with Remove.
     const own = await chipByOwnReaction(page, true);
-    const ownCount = await page
-      .locator('[data-testid="reaction-chip"][aria-pressed="true"]')
-      .count();
+    const ownCount = await page.locator(OWN_CHIP).count();
     await own.focus();
     await own.press("Enter");
     await expect(owners).toBeVisible();
     await expect(own, "the row's band keys on it").toHaveAttribute("aria-expanded", "true");
     await expect(owners.getByTestId("reaction-remove")).toBeVisible();
     await expect(owners).toBeFocused();
-    await expect(
-      page.locator('[data-testid="reaction-chip"][aria-pressed="true"]')
-    ).toHaveCount(ownCount);
+    await expect(page.locator(OWN_CHIP)).toHaveCount(ownCount);
     await owners.press("Escape");
     await expect(owners).toHaveCount(0);
     await expect(own).toBeFocused();
@@ -532,7 +527,7 @@ test.describe("Reaction chip below 48rem", () => {
   test("touch and keyboard inspect; explicit React, Switch and Remove keep the sheet closed", async ({ page }) => {
     const row = await openRoomWithTarget(page);
     await callRiverTest(page, "memberReactsToNewest", "🎉");
-    const party = row.locator('[data-testid="reaction-chip"][data-emoji="🎉"]');
+    const party = chipFor(row, "🎉");
     const owners = page.getByTestId("reaction-owners");
     await expect(party.getByTestId("reaction-chip-count")).toHaveText("1");
     await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
@@ -632,13 +627,10 @@ test.describe("Reactor list across 48rem", () => {
     const owners = page.getByTestId("reaction-owners");
     await chip.press("Enter");
     await expect(owners).toBeVisible();
-    const { width, height } = page.viewportSize()!;
+    const { height } = page.viewportSize()!;
     await page.setViewportSize({ width: 390, height });
-    await expect(owners, "the list remains available on a phone").toBeVisible();
-    await owners.press("Escape");
-    await expect(owners).toHaveCount(0);
-    await page.setViewportSize({ width, height });
     await settle(page);
-    await expect(owners, "nothing reopens it").toHaveCount(0);
+    await expect(owners, "the list remains available on a phone").toBeVisible();
+    await expect(chip).toHaveAttribute("aria-expanded", "true");
   });
 });

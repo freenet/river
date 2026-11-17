@@ -183,8 +183,8 @@ impl ReactionSurfaces {
     }
 
     /// Close the picker if what it is for has gone: another room or showing,
-    /// or its message is no longer in the history. From a deferred callback
-    /// only.
+    /// or its message is no longer in the history. A reactor list from an
+    /// earlier showing closes too. From a deferred callback only.
     pub(super) fn close_if_stale(self) {
         self.close_mobile_if_stale();
         let owners_stale = self
@@ -549,7 +549,7 @@ pub(super) fn ReactionPicker(
         }
     }
     // The window crossing below 48rem turns every React into the mobile
-    // popup's: close an open desktop picker and release its hold/anchor.
+    // sheet's: close an open desktop picker and release its hold/anchor.
     // Chip inspection is available at every width; its list stays open.
     let narrow = narrow_for_render();
     let was_narrow = use_hook(|| Rc::new(Cell::new(narrow)));

@@ -1,6 +1,7 @@
 import { expect, Locator, Page, test } from "@playwright/test";
 import {
   asTouchTablet,
+  chipFor as chip,
   chips,
   committedRow,
   expectClear,
@@ -15,10 +16,6 @@ import {
   settle,
 } from "./example-room";
 import { callRiverTest } from "./river-test";
-
-function chip(row: Locator, emoji: string): Locator {
-  return row.locator(`[data-testid="reaction-chip"][data-emoji="${emoji}"]`);
-}
 
 const owners = (page: Page) => page.getByTestId("reaction-owners");
 const count = (target: Locator) => target.getByTestId("reaction-chip-count");
@@ -247,14 +244,13 @@ test.describe("Native reaction chip actions", () => {
         await crab.click();
         await expect(crab).toHaveAttribute("aria-pressed", "true");
       }
-      if (action === "apply" || action === "remove") {
+      const fromList = action === "apply" || action === "remove";
+      if (fromList) {
         await crab.press("Enter");
         await expect(owners(page)).toBeFocused();
       }
       const selected = action === "remove";
-      const selector = action === "apply" || selected
-        ? `[data-testid="reaction-${selected ? "remove" : "apply"}"]`
-        : `[id="${await crab.getAttribute("id")}"]`;
+      const selector = fromList ? `[data-testid="reaction-${action}"]` : `[id="${await crab.getAttribute("id")}"]`;
       const signs = await callRiverTest(page, "messageSignsRecorded");
       await page.evaluate(({ selector, action, back }) => {
         const hooks = (window as unknown as { __riverTest: { switchRoom(name: string): void } }).__riverTest;

@@ -3641,14 +3641,16 @@ fn reaction_chip_label(emoji: &str, count: usize) -> String {
 
 /// A finger or pen held on a reaction chip, at 48rem and wider, opens its
 /// reactor list (#714), without waiting for the inspecting tap on release.
-/// Not a signal: nothing renders from it.
+/// It also records each press, so a click reacts only for its own fresh
+/// mouse or fine-pen press; a touch tap, the keyboard and assistive
+/// activation inspect. Not a signal: nothing renders from it.
 #[derive(Default)]
 struct ChipHold {
     /// The chip of the press being timed.
     pending: Option<String>,
     /// Key, pointer type and monotonic time of this chip's own press.
     pressed: Option<(String, String, f64)>,
-    /// That press, which a later press outdates.
+    /// The timed press in `pending`, which a later press outdates.
     generation: u32,
     /// The chip whose hold opened the list. The click its lift sends is not
     /// a press, wherever it lands: on the chip, or on the list's backdrop,
@@ -3677,6 +3679,8 @@ impl ChipHold {
         self.pressed = None;
     }
 
+    /// A click on `key`: whether it reacts directly, as the click of that
+    /// chip's own fresh mouse or fine-pen press. The press is consumed.
     fn take_direct_press(&mut self, key: &str, fine: bool, now: f64) -> bool {
         self.pressed
             .take()
@@ -3687,6 +3691,8 @@ impl ChipHold {
             })
     }
 
+    /// Enter or Space on a chip: no pointer press or hold stands, so the
+    /// click the button sends inspects.
     fn keyboard(&mut self) {
         self.cancel();
         self.held = None;
@@ -4075,8 +4081,9 @@ fn reaction_owner_marks(
     )
 }
 
-/// A message's reactions in standing-history order, each with who made it ("You" for the reader, never checked for
-/// impersonation; everyone else with the same ⚠ / 🛡 as the author line).
+/// A message's reactions in standing-history order, each with who made it
+/// ("You" for the reader, never checked for impersonation; everyone else
+/// with the same ⚠ / 🛡 as the author line).
 fn reactions_by_emoji(
     reactions: &HashMap<String, Vec<MemberId>>,
     order: &[String],
@@ -4258,10 +4265,11 @@ fn MessageGroupComponent(
                     let Some((key, message_id)) = previous else {
                         return;
                     };
-                    // Closed because the picker or the mobile sheet opened
-                    // (React from the keyboard, a tap below 48rem): focus
-                    // stays where the reader put it, never pulled out of
-                    // either.
+                    // Closed because the picker, the mobile sheet or another
+                    // group's reactor list opened (React from the keyboard, a
+                    // tap below 48rem, another group's chip): focus stays
+                    // where the reader put it, never pulled out of any of
+                    // them.
                     if reaction_picker_is_open()
                         || mobile_surface_is_open()
                         || reactions.owner_list_is_open()
