@@ -359,7 +359,11 @@ impl Chat {
             self.open_when_shown = None;
             self.select(&key);
         }
-        // The open room is being read.
+        // The open room is being read, so nothing in it is unread (a window that is away
+        // counts what it missed itself, see `RiverApp::unread`).
+        if let Some(room) = self.room_mut() {
+            room.unread = 0;
+        }
         if let Some(room) = self.room()
             && let Some(mark) = ReadMark::of(room)
         {

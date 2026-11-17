@@ -42,14 +42,15 @@ impl Backend {
                 Err(_) => true,
             },
         };
-        let (title, body) = if markup {
-            (escape_markup(&n.title), escape_markup(&n.body))
+        // Only the body is markup; the summary is plain text by the specification.
+        let body = if markup {
+            escape_markup(&n.body)
         } else {
-            (n.title.clone(), n.body.clone())
+            n.body.clone()
         };
         let mut note = notify_rust::Notification::new();
         note.appname("River")
-            .summary(&title)
+            .summary(&n.title)
             .body(&body)
             // The icon theme's name for it, which the .desktop file's `Icon=river` installs.
             .icon("river")
@@ -73,7 +74,9 @@ impl Backend {
                 return;
             }
         };
-        // A notification that replaced another has the same id, and the earlier waiter is on it.
+        // A notification that replaced another has the same id. It gets a waiter of its own, so
+        // its handle (and D-Bus connection) outlives the replaced one's; the older waiters end
+        // when the server reports the id closed.
         let id = shown.id();
         self.ids.insert(n.room_key.clone(), id);
         self.waiters.spawn(

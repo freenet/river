@@ -85,7 +85,14 @@ impl Backend {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.waiters
             .spawn(n.room_key.clone(), id, handle.clone(), move |on| {
-                let _ = shown.wait_for_response(on);
+                if let Err(e) = shown.wait_for_response(on) {
+                    // Said once: a click on this notification will not be heard.
+                    static SAID: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, Ordering::Relaxed) {
+                        eprintln!("river: lost track of a notification, so a click on it will not open its room: {e}");
+                    }
+                }
             });
     }
 }

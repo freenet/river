@@ -151,6 +151,7 @@ impl RiverApp {
         self.focused = focused;
         if focused {
             self.missed = Default::default();
+            self.drop_read_held();
         }
     }
 
@@ -165,6 +166,42 @@ impl RiverApp {
     /// Open the room a notification was about. The shell calls this when it is clicked.
     pub fn open_room(&mut self, key: &str) {
         self.chat.open_room(key);
+        self.limiter.retain_held(|k| k != key);
+    }
+
+    /// Forget held-back notifications for what has been read since: the open room while the
+    /// window is focused, or any other room with nothing unread.
+    fn drop_read_held(&mut self) {
+        let (chat, focused) = (&self.chat, self.focused);
+        let open = chat.room().map(|r| r.key.as_str());
+        self.limiter.retain_held(|k| {
+            if open == Some(k) {
+                !focused
+            } else {
+                chat.rooms().iter().any(|r| r.key == k && r.unread > 0)
+            }
+        });
+    }
+
+    /// Show what the limits let through.
+    fn show(&mut self, admitted: Vec<notify::Arrival>) {
+        for n in notify::compose(admitted, self.private_previews) {
+            let room = n.room_key.clone();
+            if !self.notifier.notify(n) {
+                self.limiter.refund(&room);
+            }
+        }
+    }
+
+    /// Show held-back notifications whose cooldown has ended, for a room that went quiet.
+    pub(crate) fn flush_held(&mut self, now: std::time::Instant) {
+        self.drop_read_held();
+        if !self.chat.notifications {
+            self.limiter.retain_held(|_| false);
+            return;
+        }
+        let due = self.limiter.admit(Vec::new(), now);
+        self.show(due);
     }
 
     /// Unread messages across all rooms, counting the open room's while the window was away.
@@ -193,10 +230,9 @@ impl RiverApp {
         if !self.chat.notifications {
             return;
         }
-        let shown = self.limiter.admit(shown, now);
-        for n in notify::compose(shown, self.private_previews) {
-            self.notifier.notify(n);
-        }
+        self.drop_read_held();
+        let admitted = self.limiter.admit(shown, now);
+        self.show(admitted);
     }
 
     /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
@@ -204,6 +240,11 @@ impl RiverApp {
     fn sync_unread(&mut self, tx: &mut Tx) {
         if !matches!(self.chat.source, chat::Source::Node(_)) {
             return;
+        }
+        let now = std::time::Instant::now();
+        self.flush_held(now);
+        if let Some(wait) = self.limiter.next_due(now) {
+            tx.wake_after(wait);
         }
         let unread = self.unread();
         tx.set_title(notify::window_title(unread));

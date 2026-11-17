@@ -120,6 +120,12 @@ impl Backend {
     pub fn show(&mut self, n: &Notification, handle: &AppHandle<RiverApp>) {
         // Windows toasts here cannot be replaced per room (the toast crate sets no tag), so
         // they stack; Windows shows the newest few.
+        //
+        // A click is heard only while the toast is on screen or its process-local handler is
+        // alive. After the toast times out (about 5 seconds) it sits in the Action Center, and
+        // a click there most likely does not reach this process: that needs an activator
+        // registered by an installer (a Start Menu shortcut with this app id and a COM
+        // server). Untested.
         let mut note = notify_rust::Notification::new();
         note.appname("River")
             .app_id(APP_ID)

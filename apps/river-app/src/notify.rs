@@ -52,8 +52,9 @@ pub struct Notification {
 /// implementation must not block, so it hands the work to a thread of its own.
 pub trait Notifier {
     /// Show `notification`, replacing the one before it for the same room where the platform
-    /// can. A failure is the implementation's to log; it never reaches the app.
-    fn notify(&self, notification: Notification);
+    /// can. A failure is the implementation's to log; it never reaches the app. False if it
+    /// could not even be queued, so the app gives back what it counted.
+    fn notify(&self, notification: Notification) -> bool;
     /// The number of unread messages across all rooms, for a dock badge or taskbar overlay.
     /// Called when the number changes, with 0 when everything is read.
     fn set_unread(&self, total: usize);
@@ -63,7 +64,9 @@ pub trait Notifier {
 pub struct Silent;
 
 impl Notifier for Silent {
-    fn notify(&self, _: Notification) {}
+    fn notify(&self, _: Notification) -> bool {
+        true
+    }
     fn set_unread(&self, _: usize) {}
 }
 
@@ -101,10 +104,10 @@ fn tidy(text: &str, max: usize) -> String {
 
 /// The messages in `new` that were not in `old`, one [`Arrival`] per room.
 ///
-/// A message counts when its key is new in a room that already had messages, it is not yours
-/// and not still on its way (`pending`). Edits and reactions keep a message's key, so they
-/// give nothing. A room that was not in `old`, or had no messages, gives nothing: it is
-/// being joined or loaded, and what fills it is history.
+/// A message counts when its key is new in a room that was in `old`, it is not yours and not
+/// still on its way (`pending`). Edits and reactions keep a message's key, so they give
+/// nothing. A room that was not in `old` gives nothing, and the [`Limiter`] drops what fills a
+/// room that just appeared or was empty: that is history.
 ///
 /// Message times are NOT used. They are whatever their author's clock said (one far in the
 /// future, or a skewed member, would otherwise silence a room), and a message that reaches
@@ -116,9 +119,6 @@ pub fn arrivals(old: &[Room], new: &[Room]) -> Vec<Arrival> {
         let Some(before) = old.iter().find(|r| r.key == room.key) else {
             continue;
         };
-        if before.messages.is_empty() {
-            continue;
-        }
         let fresh: Vec<&Message> = room
             .messages
             .iter()
@@ -150,11 +150,14 @@ pub fn arrivals(old: &[Room], new: &[Room]) -> Vec<Arrival> {
 /// What the limits remember about one room.
 #[derive(Default)]
 struct RoomClock {
-    /// When a notification for it was last let through.
+    /// When a notification for it was last let through, and the time before that (to give back
+    /// if the notification could not be queued).
     last: Option<Instant>,
-    /// Messages held back since, counted into the next notification.
-    held: usize,
-    /// When it first appeared after the first show, while it may still be filling.
+    prev_last: Option<Instant>,
+    /// What was held back since: one arrival standing for all of it (counted, mention kept),
+    /// shown by the next notification or, if the room goes quiet, when the cooldown ends.
+    held: Option<Arrival>,
+    /// When it first appeared (or was first seen empty), while it may still be filling.
     joined: Option<Instant>,
 }
 
@@ -164,7 +167,8 @@ pub struct Limiter {
     rooms: HashMap<String, RoomClock>,
     tokens: f64,
     refilled: Option<Instant>,
-    /// Whether the first show of the rooms has been seen: rooms in it are settled.
+    /// Whether the first show of the rooms (empty or not) has been seen: a room first seen
+    /// after it was joined or created, and may still be filling.
     started: bool,
 }
 
@@ -179,39 +183,61 @@ impl Default for Limiter {
     }
 }
 
+const TOKEN_RATE: f64 = PER_MINUTE / 60.0;
+
 impl Limiter {
-    /// Note the rooms now shown. A room that is new since the first show is given [`SETTLE`]
-    /// to fill with its history.
+    /// Note the rooms now shown. A room first seen after the first show, or first seen empty,
+    /// is given [`SETTLE`] to fill with its history; one that is gone is forgotten, so
+    /// leaving and rejoining settles again.
     pub fn observe(&mut self, rooms: &[Room], now: Instant) {
+        // An empty list is often a reload on its way to the full one: forget nothing then.
+        if !rooms.is_empty() {
+            self.rooms.retain(|k, _| rooms.iter().any(|r| &r.key == k));
+        }
         for room in rooms {
-            let known = self.rooms.contains_key(&room.key);
-            let clock = self.rooms.entry(room.key.clone()).or_default();
-            if !known && self.started {
-                clock.joined = Some(now);
+            if !self.rooms.contains_key(&room.key) {
+                let clock = self.rooms.entry(room.key.clone()).or_default();
+                if self.started || room.messages.is_empty() {
+                    clock.joined = Some(now);
+                }
             }
         }
-        if !rooms.is_empty() {
-            self.started = true;
-        }
+        self.started = true;
     }
 
-    /// The arrivals that may notify now. What is held back (by a cooldown, the bucket or a
-    /// room still settling) is counted into that room's next notification, except a room's
-    /// first messages while it settles, which are history.
-    pub fn admit(&mut self, arrivals: Vec<Arrival>, now: Instant) -> Vec<Arrival> {
-        let refilled = self.refilled.replace(now).unwrap_or(now);
-        let gained = now.saturating_duration_since(refilled).as_secs_f64() * PER_MINUTE / 60.0;
+    fn refill(&mut self, now: Instant) {
+        let before = self.refilled.replace(now).unwrap_or(now);
+        let gained = now.saturating_duration_since(before).as_secs_f64() * TOKEN_RATE;
         self.tokens = (self.tokens + gained).min(PER_MINUTE);
+    }
+
+    /// The arrivals that may notify now, including held-back ones whose cooldown has ended.
+    /// What is held back (by a cooldown or the bucket) is counted into that room's next
+    /// notification; a room still settling gives nothing, as what fills it is history.
+    pub fn admit(&mut self, arrivals: Vec<Arrival>, now: Instant) -> Vec<Arrival> {
+        self.refill(now);
+        let mut all = arrivals;
+        let quiet: Vec<String> = self
+            .rooms
+            .iter()
+            .filter(|(k, c)| c.held.is_some() && !all.iter().any(|a| &a.room_key == *k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in quiet {
+            if let Some(held) = self.rooms.get_mut(&key).and_then(|c| c.held.take()) {
+                all.push(held);
+            }
+        }
         // Mentions first, so they get the tokens.
-        let mut arrivals = arrivals;
-        arrivals.sort_by_key(|a| !a.mention);
+        all.sort_by_key(|a| !a.mention);
         let mut out = Vec::new();
-        for mut a in arrivals {
+        for mut a in all {
             let clock = self.rooms.entry(a.room_key.clone()).or_default();
             if clock.joined.is_some_and(|t| now.duration_since(t) < SETTLE) {
                 continue;
             }
-            let cooldown = if a.mention {
+            let mention = a.mention || clock.held.as_ref().is_some_and(|h| h.mention);
+            let cooldown = if mention {
                 MENTION_COOLDOWN
             } else {
                 ROOM_COOLDOWN
@@ -220,15 +246,72 @@ impl Limiter {
                 .last
                 .is_some_and(|t| now.saturating_duration_since(t) < cooldown);
             if cooling || self.tokens < 1.0 {
-                clock.held += a.count;
+                match clock.held.as_mut() {
+                    Some(h) => {
+                        h.count += a.count;
+                        if a.mention || !h.mention {
+                            h.text = a.text;
+                            h.author = a.author;
+                        }
+                        h.mention |= a.mention;
+                    }
+                    None => clock.held = Some(a),
+                }
                 continue;
             }
             self.tokens -= 1.0;
+            clock.prev_last = clock.last;
             clock.last = Some(now);
-            a.count += std::mem::take(&mut clock.held);
+            if let Some(h) = clock.held.take() {
+                a.count += h.count;
+                if h.mention && !a.mention {
+                    a.mention = true;
+                    a.text = h.text;
+                    a.author = h.author;
+                }
+            }
             out.push(a);
         }
         out
+    }
+
+    /// How long until something held back can be shown, if anything is held.
+    pub fn next_due(&self, now: Instant) -> Option<Duration> {
+        let since = now.saturating_duration_since(self.refilled.unwrap_or(now));
+        let tokens = (self.tokens + since.as_secs_f64() * TOKEN_RATE).min(PER_MINUTE);
+        let token_wait = Duration::from_secs_f64(((1.0 - tokens) / TOKEN_RATE).max(0.0));
+        self.rooms
+            .values()
+            .filter_map(|c| {
+                let held = c.held.as_ref()?;
+                let cooldown = if held.mention {
+                    MENTION_COOLDOWN
+                } else {
+                    ROOM_COOLDOWN
+                };
+                let ready = c.last.map_or(Duration::ZERO, |t| {
+                    cooldown.saturating_sub(now.saturating_duration_since(t))
+                });
+                Some(ready.max(token_wait) + Duration::from_millis(50))
+            })
+            .min()
+    }
+
+    /// Keep only the held-back arrivals of the rooms `keep` says are still unread.
+    pub fn retain_held(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        for (key, clock) in &mut self.rooms {
+            if clock.held.is_some() && !keep(key) {
+                clock.held = None;
+            }
+        }
+    }
+
+    /// Give back what a notification used when it could not be queued.
+    pub fn refund(&mut self, room_key: &str) {
+        self.tokens = (self.tokens + 1.0).min(PER_MINUTE);
+        if let Some(clock) = self.rooms.get_mut(room_key) {
+            clock.last = clock.prev_last;
+        }
     }
 }
 
@@ -305,11 +388,17 @@ mod tests {
     struct Recorder {
         shown: Rc<RefCell<Vec<Notification>>>,
         unread: Rc<RefCell<Vec<usize>>>,
+        /// Refuse to queue, as a backed-up shell does.
+        full: Rc<std::cell::Cell<bool>>,
     }
 
     impl Notifier for Recorder {
-        fn notify(&self, n: Notification) {
+        fn notify(&self, n: Notification) -> bool {
+            if self.full.get() {
+                return false;
+            }
             self.shown.borrow_mut().push(n);
+            true
         }
         fn set_unread(&self, total: usize) {
             self.unread.borrow_mut().push(total);
@@ -786,5 +875,161 @@ mod tests {
         rt.frame(0.1);
         rt.frame(0.2);
         assert!(!rt.state.chat.notifications);
+    }
+
+    #[test]
+    fn the_unread_count_never_counts_the_room_you_are_looking_at() {
+        let (mut s, _, rooms) = live();
+        let open = s.chat.room().unwrap().key.clone();
+        let i = rooms.iter().position(|r| r.key == open).unwrap();
+        s.chat
+            .edit_rooms(|r| r.iter_mut().for_each(|r| r.unread = 0));
+        let base = s.chat.rooms().to_vec();
+        s.focus_changed(true);
+        let one = with(&base, i, vec![from_other(&base[i], "a", "x")]);
+        deliver(&mut s, one.clone());
+        assert_eq!(s.unread(), 0, "focused in the room: nothing unread");
+        // Away: exactly one per message, however often the rooms are shown.
+        s.focus_changed(false);
+        let two = with(&one, i, vec![from_other(&base[i], "b", "y")]);
+        deliver(&mut s, two.clone());
+        assert_eq!(s.unread(), 1);
+        deliver(&mut s, two.clone());
+        assert_eq!(s.unread(), 1);
+        let three = with(&two, i, vec![from_other(&base[i], "c", "z")]);
+        deliver(&mut s, three);
+        assert_eq!(s.unread(), 2);
+        s.focus_changed(true);
+        assert_eq!(s.unread(), 0);
+    }
+
+    #[test]
+    fn a_held_mention_is_shown_when_its_cooldown_ends_even_if_the_room_goes_quiet() {
+        let (mut s, rec, rooms) = live();
+        let t0 = minute_later();
+        let first = with(&rooms, 0, vec![from_other(&rooms[0], "a", "plain")]);
+        deliver_at(&mut s, first.clone(), t0);
+        assert_eq!(shown(&rec).len(), 1);
+        let mut m = from_other(&rooms[0], "b", "hey @you");
+        m.md = format!("hey [@you]({}:self)", mention_scheme());
+        deliver_at(
+            &mut s,
+            with(&first, 0, vec![m]),
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(shown(&rec).len(), 1, "held by the mention cooldown");
+        s.flush_held(t0 + Duration::from_secs(9));
+        assert_eq!(shown(&rec).len(), 1);
+        s.flush_held(t0 + Duration::from_secs(11));
+        let n = shown(&rec);
+        assert_eq!(n.len(), 2);
+        assert!(n[1].mention && n[1].title.ends_with("mentioned you"));
+        // And it is not shown twice.
+        s.flush_held(t0 + Duration::from_secs(60));
+        assert_eq!(shown(&rec).len(), 2);
+        // The timer asks to be woken for what is held.
+        assert!(s.limiter.next_due(t0).is_none());
+    }
+
+    #[test]
+    fn held_messages_already_read_are_not_reported() {
+        let (mut s, rec, rooms) = live();
+        let open = s.chat.room().unwrap().key.clone();
+        let i = rooms.iter().position(|r| r.key == open).unwrap();
+        s.focus_changed(false);
+        let t0 = minute_later();
+        let a = with(&rooms, i, vec![from_other(&rooms[i], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        deliver_at(
+            &mut s,
+            with(&a, i, vec![from_other(&rooms[i], "b", "two")]),
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(shown(&rec).len(), 1);
+        assert!(s.limiter.next_due(t0).is_some());
+        // The person comes back to the room before the cooldown ends.
+        s.focus_changed(true);
+        s.flush_held(t0 + ROOM_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(shown(&rec).len(), 1);
+        assert!(s.limiter.next_due(t0).is_none());
+    }
+
+    #[test]
+    fn a_first_room_on_a_fresh_account_settles_before_its_history_counts() {
+        let rec = Recorder::default();
+        let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        let t0 = Instant::now();
+        let at = |s: &mut RiverApp, rooms: Vec<Room>, status, secs| {
+            let a = s.chat.show_node_rooms(rooms, None, status, 1);
+            s.notify_arrivals(a, t0 + Duration::from_secs(secs));
+        };
+        at(&mut s, vec![], LinkStatus::Loading, 0);
+        at(&mut s, vec![], LinkStatus::Live, 1);
+        let base = example::data().rooms[0].clone();
+        let mut joined = base.clone();
+        joined.messages.clear();
+        at(&mut s, vec![joined.clone()], LinkStatus::Live, 2);
+        let mut part = joined.clone();
+        part.messages = base.messages[..2].to_vec();
+        at(&mut s, vec![part], LinkStatus::Live, 3);
+        at(&mut s, vec![base.clone()], LinkStatus::Live, 4);
+        assert!(shown(&rec).is_empty());
+        // After it settles, a message is news.
+        let news = with(
+            std::slice::from_ref(&base),
+            0,
+            vec![from_other(&base, "n", "hi")],
+        );
+        at(&mut s, news, LinkStatus::Live, 40);
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
+    #[test]
+    fn a_rejoined_room_settles_again() {
+        let mut lim = Limiter::default();
+        let rooms = example::data().rooms;
+        let t0 = Instant::now();
+        lim.observe(&rooms, t0);
+        lim.observe(&rooms[1..], t0 + Duration::from_secs(100));
+        lim.observe(&rooms, t0 + Duration::from_secs(200));
+        let mut a = arrival(0, false);
+        a.room_key = rooms[0].key.clone();
+        assert!(lim.admit(vec![a], t0 + Duration::from_secs(205)).is_empty());
+    }
+
+    #[test]
+    fn a_notification_that_could_not_be_queued_gives_back_its_cooldown() {
+        let (mut s, rec, rooms) = live();
+        rec.full.set(true);
+        let t0 = minute_later();
+        let a = with(&rooms, 0, vec![from_other(&rooms[0], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        assert!(shown(&rec).is_empty());
+        rec.full.set(false);
+        deliver_at(
+            &mut s,
+            with(&a, 0, vec![from_other(&rooms[0], "b", "two")]),
+            t0 + Duration::from_secs(1),
+        );
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
+    #[test]
+    fn a_mention_joining_held_messages_keeps_its_flag() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now();
+        assert_eq!(lim.admit(vec![arrival(0, false)], t0).len(), 1);
+        assert!(
+            lim.admit(vec![arrival(0, false)], t0 + Duration::from_secs(2))
+                .is_empty()
+        );
+        assert!(
+            lim.admit(vec![arrival(0, true)], t0 + Duration::from_secs(4))
+                .is_empty()
+        );
+        let out = lim.admit(Vec::new(), t0 + MENTION_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].mention);
+        assert_eq!(out[0].count, 4);
     }
 }

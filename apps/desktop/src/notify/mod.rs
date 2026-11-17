@@ -11,7 +11,7 @@
 //! signed `.app` bundle (`macos`). The unread count is shown in the window title by the UI on
 //! every platform; a dock badge or taskbar overlay is not done.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -46,25 +46,36 @@ const MAX_WAITING: usize = 32;
 /// ones are dropped (the unread count in the title still shows them).
 const QUEUE: usize = 16;
 
-/// The notifications waiting for a click, each identified by its room and the platform's id
-/// for it, so a notification that replaced another (same id) shares its waiter.
+/// How many waiters one notification id may have. A notification that replaces another keeps
+/// its id, and each shows its own handle (its own D-Bus connection) so the newest is always
+/// alive to hear the click; the older ones end when the server reports the id closed.
+const PER_ID: usize = 4;
+
+type Active = Arc<Mutex<HashMap<(String, u64), usize>>>;
+
+/// The notifications waiting for a click, counted by room and the platform's id for it.
 #[derive(Clone, Default)]
 pub(super) struct Waiters {
-    active: Arc<Mutex<HashSet<(String, u64)>>>,
+    active: Active,
     capped: Arc<AtomicBool>,
 }
 
 /// A place among the waiters, given back when dropped: on return, panic or a thread that
 /// never started.
 struct Slot {
-    active: Arc<Mutex<HashSet<(String, u64)>>>,
+    active: Active,
     key: (String, u64),
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.active.lock() {
-            set.remove(&self.key);
+        if let Ok(mut map) = self.active.lock()
+            && let Some(n) = map.get_mut(&self.key)
+        {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.key);
+            }
         }
     }
 }
@@ -72,8 +83,7 @@ impl Drop for Slot {
 impl Waiters {
     /// Wait on a thread of its own for `wait` to report a click, then open `room`. `wait` gets
     /// the handler to give the platform. `id` is the platform's id for the notification; pass
-    /// a number that is never reused where notifications are not replaced in place, so each
-    /// gets its own waiter.
+    /// a number that is never reused where notifications are not replaced in place.
     pub(super) fn spawn(
         &self,
         room: String,
@@ -82,15 +92,15 @@ impl Waiters {
         wait: impl FnOnce(Box<dyn FnOnce(&NotificationResponse)>) + Send + 'static,
     ) {
         let key = (room.clone(), id);
-        let mut set = match self.active.lock() {
-            Ok(set) => set,
+        let mut map = match self.active.lock() {
+            Ok(map) => map,
             Err(_) => return,
         };
-        if set.contains(&key) {
-            // The earlier waiter is on this very notification and will hear the click.
+        if map.get(&key).is_some_and(|n| *n >= PER_ID) {
+            // Enough already wait on this very notification; they hear the click.
             return;
         }
-        if set.len() >= MAX_WAITING {
+        if map.values().sum::<usize>() >= MAX_WAITING {
             // Said once: a click on later notifications will not open their room until some
             // of these are dismissed.
             if !self.capped.swap(true, Ordering::Relaxed) {
@@ -100,8 +110,8 @@ impl Waiters {
             }
             return;
         }
-        set.insert(key.clone());
-        drop(set);
+        *map.entry(key.clone()).or_default() += 1;
+        drop(map);
         let slot = Slot {
             active: self.active.clone(),
             key,
@@ -148,12 +158,18 @@ impl DesktopNotifier {
 }
 
 impl Notifier for DesktopNotifier {
-    fn notify(&self, notification: Notification) {
+    fn notify(&self, notification: Notification) -> bool {
         // Never waits. Dropped if the worker is gone (it said why when it went) or far behind.
-        if let Err(mpsc::TrySendError::Full(_)) = self.jobs.try_send(notification)
-            && !self.dropped.swap(true, Ordering::Relaxed)
-        {
-            eprintln!("river: notifications are backed up; dropping some");
+        match self.jobs.try_send(notification) {
+            Ok(()) => true,
+            Err(e) => {
+                if matches!(e, mpsc::TrySendError::Full(_))
+                    && !self.dropped.swap(true, Ordering::Relaxed)
+                {
+                    eprintln!("river: notifications are backed up; dropping some");
+                }
+                false
+            }
         }
     }
 
