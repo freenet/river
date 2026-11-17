@@ -210,6 +210,14 @@ pub struct Chat {
 }
 
 impl Chat {
+    /// Open the link menu for `url` at `press`: only for a web link, and with the address
+    /// trimmed so Copy and Open act on the same text.
+    pub fn open_link_menu(&mut self, url: &str, press: rune::PointerPress) {
+        if markdown::openable(url) {
+            self.link_menu = Some((url.trim().to_owned(), press));
+        }
+    }
+
     /// A chat screen showing `rooms`, with the first one open.
     pub fn new(source: Source, rooms: Vec<Room>, today: u32, day_zero: i64, now: u32) -> Self {
         let mut chat = Chat {
@@ -306,6 +314,8 @@ impl Chat {
         now: u32,
     ) {
         self.source = Source::Node(status);
+        // The menu belongs to what was on screen; a new list may have removed it.
+        self.link_menu = None;
         self.now = now;
         self.day_zero = 0;
         self.today = now / model::MINUTES_PER_DAY;

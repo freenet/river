@@ -1103,6 +1103,22 @@ mod tests {
     }
 
     #[test]
+    fn only_a_web_link_gets_a_menu_and_its_address_is_trimmed() {
+        let press = rune::PointerPress { x: 1.0, y: 2.0 };
+        let mut chat = chat::Chat::new(chat::Source::Example, Vec::new(), 0, 0, 0);
+        for no in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            &format!("{}:member", chat::model::mention_scheme()),
+        ] {
+            chat.open_link_menu(no, press);
+            assert!(chat.link_menu.is_none(), "{no}");
+        }
+        chat.open_link_menu(" https://freenet.org/ ", press);
+        assert_eq!(chat.link_menu.as_ref().unwrap().0, "https://freenet.org/");
+    }
+
+    #[test]
     fn the_link_menu_opens_or_copies_the_link() {
         let url = "https://freenet.org/";
         let board = rune::clipboard::memory();
