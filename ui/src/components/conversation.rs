@@ -3561,8 +3561,6 @@ pub fn Conversation() -> Element {
 #[derive(Clone, PartialEq)]
 struct ReactionOwnersPopover {
     key: String,
-    /// The room and showing this inspection belongs to.
-    showing: reaction_picker::Showing,
     /// The row's `msg-{id}` suffix, for a focus fallback when the chip is gone.
     message_id: String,
     above: bool,
@@ -3622,49 +3620,26 @@ const CHIP_HOLD_MS: u64 = 500;
 /// lift sent none, and the next click is a press of its own.
 const CHIP_HOLD_RELEASE_MS: u64 = 400;
 
-/// Only a chip's own fresh mouse press, or a pen on a fine-pointer screen,
-/// changes a reaction. Keyboard, assistive activation and touch inspect.
-fn chip_press_applies(pointer: &str, fine: bool) -> bool {
-    pointer == "mouse" || pointer == "pen" && fine
-}
-
-/// Whether the primary pointer is fine, asked when a chip is clicked. A
-/// query that cannot be answered reads as coarse, so a pen inspects.
-fn fine_pointer_now() -> bool {
-    crate::util::media_matches("(pointer: fine)").unwrap_or(false)
-}
-
-/// What a screen reader calls a chip: its emoji, how many reacted with it,
-/// and whether the reader did.
-fn reaction_chip_label(emoji: &str, count: usize, mine: bool) -> String {
-    let noun = if count == 1 { "reaction" } else { "reactions" };
-    let you = if mine { ", you reacted" } else { "" };
-    format!("{emoji}, {count} {noun}{you}")
+/// Whether Enter or Space on a reaction chip opens its reactor list instead
+/// of reacting, as a press does: with Shift, at 48rem and wider. Below 48rem
+/// there is no list.
+fn shift_lists_reactors(narrow: bool, shift: bool) -> bool {
+    shift && !narrow
 }
 
 /// A finger or pen held on a reaction chip, at 48rem and wider, opens its
-/// reactor list (#714), without waiting for the inspecting tap on release.
-/// It also records each press, so a click reacts only for its own fresh
-/// mouse or fine-pen press; a touch tap, the keyboard and assistive
-/// activation inspect. Not a signal: nothing renders from it.
+/// reactor list (#714): a press reacts, and touch has no hover `title`.
+/// Not a signal: nothing renders from it.
 #[derive(Default)]
 struct ChipHold {
     /// The chip of the press being timed.
     pending: Option<String>,
-    /// Key, pointer type and monotonic time of this chip's own press.
-    pressed: Option<(String, String, f64)>,
-    /// The timed press in `pending`, which a later press outdates.
+    /// That press, which a later press outdates.
     generation: u32,
     /// The chip whose hold opened the list. The click its lift sends is not
     /// a press, wherever it lands: on the chip, or on the list's backdrop,
     /// which by then covers the chip.
-    held: Option<HeldChip>,
-}
-
-/// The chip whose hold opened the list, and whether that press has lifted.
-struct HeldChip {
-    key: String,
-    lifted: bool,
+    held: Option<String>,
 }
 
 impl ChipHold {
@@ -3673,7 +3648,6 @@ impl ChipHold {
     fn press(&mut self, key: &str, pointer_type: &str, narrow: bool) -> Option<u32> {
         self.held = None;
         self.pending = None;
-        self.pressed = Some((key.to_string(), pointer_type.to_string(), now_ms()));
         self.generation = self.generation.wrapping_add(1);
         if narrow || !matches!(pointer_type, "touch" | "pen") {
             return None;
@@ -3682,35 +3656,9 @@ impl ChipHold {
         Some(self.generation)
     }
 
-    /// The press left the chip or was cancelled (a scroll). Before its lift
-    /// that ends a hold too: no click of that press follows. After its lift
-    /// the release stands: a touch's `pointerleave` comes between its
-    /// `pointerup` and its click.
+    /// The press lifted, left the chip or was cancelled (a scroll) first.
     fn cancel(&mut self) {
         self.pending = None;
-        self.pressed = None;
-        if self.held.as_ref().is_some_and(|held| !held.lifted) {
-            self.held = None;
-        }
-    }
-
-    /// A click on `key`: whether it reacts directly, as the click of that
-    /// chip's own fresh mouse or fine-pen press. The press is consumed.
-    fn take_direct_press(&mut self, key: &str, fine: bool, now: f64) -> bool {
-        self.pressed
-            .take()
-            .is_some_and(|(pressed_key, pointer, at)| {
-                pressed_key == key
-                    && (0.0..=PRESS_FRESH_MS).contains(&(now - at))
-                    && chip_press_applies(&pointer, fine)
-            })
-    }
-
-    /// Enter or Space on a chip: no pointer press or hold stands, so the
-    /// click the button sends inspects.
-    fn keyboard(&mut self) {
-        self.cancel();
-        self.held = None;
     }
 
     /// The timer for `generation` ran out, the window `narrow` or not by
@@ -3724,10 +3672,7 @@ impl ChipHold {
         if narrow {
             return None;
         }
-        self.held = Some(HeldChip {
-            key: key.clone(),
-            lifted: false,
-        });
+        self.held = Some(key.clone());
         Some(key)
     }
 
@@ -3735,9 +3680,7 @@ impl ChipHold {
     /// [`expire`](Self::expire) should no click follow.
     fn lift(&mut self) -> Option<u32> {
         self.pending = None;
-        let held = self.held.as_mut()?;
-        held.lifted = true;
-        Some(self.generation)
+        self.held.as_ref().map(|_| self.generation)
     }
 
     /// No click followed the lift of `generation`'s hold.
@@ -3751,79 +3694,87 @@ impl ChipHold {
     /// of the hold that opened that chip's list.
     fn take_release(&mut self, key: &str) -> bool {
         self.pending = None;
-        let released = self.held.take().is_some_and(|held| held.key == key);
-        if released {
-            self.pressed = None;
+        self.held.take().is_some_and(|held| held == key)
+    }
+}
+
+/// How long after Shift+Enter or Shift+Space opened a chip's list, or after
+/// that key came up, a click on the chip is still that key press's own.
+const CHIP_LIST_KEY_CLICK_MS: f64 = 400.0;
+
+/// Shift+Enter or Shift+Space on a reaction chip, at 48rem and wider, opens
+/// its reactor list and does not react. The chip is a button, which answers
+/// Enter and Space with a click, so that key press must send none. Its
+/// keydown is prevented, which stops Enter's click in every engine. Space's
+/// click comes on the keyup, and an engine may send it even so: the keyup is
+/// prevented as well, when it reaches the chip (focus has usually moved to
+/// the list by then), and a click that arrives anyway is not a press. Not a
+/// signal: nothing renders from it.
+#[derive(Default)]
+struct ChipListKey {
+    /// The chip whose list the key opened, and when it went down or came up
+    /// (ms).
+    opened: Option<(String, f64)>,
+}
+
+impl ChipListKey {
+    /// Shift+Enter or Shift+Space went down on `key` and opened its list.
+    fn open(&mut self, key: &str, now: f64) {
+        self.opened = Some((key.to_string(), now));
+    }
+
+    /// A press of another kind began on a chip (a pointer, plain Enter or
+    /// Space): the click it sends is its own.
+    fn forget(&mut self) {
+        self.opened = None;
+    }
+
+    /// Enter or Space came up on `key`: whether it is the key that opened
+    /// that chip's list, whose keyup must send no click.
+    fn lift(&mut self, key: &str, now: f64) -> bool {
+        match &mut self.opened {
+            Some((opened, at)) if opened == key => {
+                *at = now;
+                true
+            }
+            _ => false,
         }
-        released
+    }
+
+    /// A click on `key`: whether it belongs to the key press that opened
+    /// that chip's list. Any click ends the key press.
+    fn take_click(&mut self, key: &str, now: f64) -> bool {
+        self.opened.take().is_some_and(|(opened, at)| {
+            opened == key && (0.0..=CHIP_LIST_KEY_CLICK_MS).contains(&(now - at))
+        })
     }
 }
 
 /// Where the reactor list for a chip opens, from a point on the chip (its
-/// centre, however it was opened): below unless there is more room above,
-/// and toward whichever side of the window has more room.
+/// centre, for a held finger and for Shift+Enter): below unless there is
+/// more room above, and toward whichever side of the window has more room.
 fn reaction_owners_popover_at(
     key: String,
     message_id: String,
     x: f64,
     y: f64,
 ) -> ReactionOwnersPopover {
-    ReactionOwnersPopover {
-        key,
-        showing: reaction_picker::shown_room(),
-        message_id,
-        above: false,
-        align_right: false,
-        max_h: 0.0,
-        max_w: 0.0,
-    }
-    .placed_at(x, y)
-}
-
-/// Which side of its chip a reactor list hangs toward (`true`: its right
-/// edge on the chip's), and its max width: the roomier side of a window
-/// `win_w` wide from the chip's centre `x`, less 8px, never under 8rem.
-fn horizontal_placement(x: f64, win_w: f64) -> (bool, f64) {
+    let (above, max_h) = vertical_placement(y, REACTION_OWNERS_POPOVER_HEIGHT_PX);
+    let win_w = web_sys::window()
+        .and_then(|w| w.inner_width().ok())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(400.0);
     let space_right = (win_w - x - 8.0).max(128.0);
     let space_left = (x - 8.0).max(128.0);
     let align_right = space_left > space_right;
-    (
+    let max_w = if align_right { space_left } else { space_right };
+    ReactionOwnersPopover {
+        key,
+        message_id,
+        above,
         align_right,
-        if align_right { space_left } else { space_right },
-    )
-}
-
-impl ReactionOwnersPopover {
-    /// This list, placed for its chip's centre in the window as it is now.
-    fn placed_at(self, x: f64, y: f64) -> Self {
-        let (above, max_h) = vertical_placement(y, REACTION_OWNERS_POPOVER_HEIGHT_PX);
-        let win_w = web_sys::window()
-            .and_then(|w| w.inner_width().ok())
-            .and_then(|v| v.as_f64())
-            .unwrap_or(400.0);
-        let (align_right, max_w) = horizontal_placement(x, win_w);
-        Self {
-            above,
-            align_right,
-            max_h,
-            max_w,
-            ..self
-        }
-    }
-}
-
-/// Close a group's own reactor list, if it is open. Fallibly both ways: the
-/// group may have unmounted by the time a queued close runs. A list already
-/// closed is left alone, since a write notifies its subscribers even when it
-/// changes nothing. From a deferred callback only.
-///
-/// This closes the list it is given.
-/// [`ReactionSurfaces::close_owner_list_now`] instead closes whichever
-/// group's list holds the conversation's slot when it runs.
-fn close_reaction_owners(mut list: Signal<Option<ReactionOwnersPopover>>) {
-    if list.try_peek().is_ok_and(|open| open.is_some()) {
-        // A statement, so the write guard drops before `list` does.
-        let _ = list.try_write().map(|mut open| *open = None);
+        max_h,
+        max_w,
     }
 }
 
@@ -3864,6 +3815,22 @@ fn focus_without_scrolling(element: &web_sys::Element) -> bool {
     let options = web_sys::FocusOptions::new();
     options.set_prevent_scroll(true);
     element.focus_with_options(&options).is_ok()
+}
+
+/// Whether the element with this id holds the document's focus.
+fn element_has_focus(id: &str) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| active.id() == id)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = id;
+        false
+    }
 }
 
 /// Move focus onto the reaction line of the message in row `row_id`: the
@@ -4228,12 +4195,11 @@ fn MessageGroupComponent(
     crate::test_hooks::note_message_group_render();
     let header_time = header_time_labels(&group);
     let is_self = group.is_self;
-    let showing = reaction_picker::shown_room();
 
     // This group's open reactor list. At most one list or picker is open in
     // the conversation: opening a list closes the picker and is recorded in
     // `reactions`, so that opening the picker closes the list.
-    let open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
+    let mut open_reaction_owners: Signal<Option<ReactionOwnersPopover>> = use_signal(|| None);
     {
         let live_owner_keys: HashSet<String> = group
             .messages
@@ -4250,22 +4216,26 @@ fn MessageGroupComponent(
             .as_ref()
             .is_some_and(|popup| !live_owner_keys.contains(&popup.key));
         if owners_stale {
+            let mut open_reaction_owners = open_reaction_owners;
             crate::util::defer(move || {
-                let still = open_reaction_owners.try_peek().is_ok_and(|open| {
-                    open.as_ref()
-                        .is_some_and(|popup| !live_owner_keys.contains(&popup.key))
-                });
+                let still = open_reaction_owners
+                    .peek()
+                    .as_ref()
+                    .is_some_and(|popup| !live_owner_keys.contains(&popup.key));
                 if still {
-                    close_reaction_owners(open_reaction_owners);
+                    open_reaction_owners.set(None);
                 }
             });
         }
     }
     // A finger resting on a reaction chip in this group; see `ChipHold`.
     let chip_hold = use_hook(|| Rc::new(std::cell::RefCell::new(ChipHold::default())));
+    // Shift+Enter or Shift+Space on one of its chips; see `ChipListKey`.
+    let chip_list_key = use_hook(|| Rc::new(std::cell::RefCell::new(ChipListKey::default())));
     {
         // (key, message id) of the list that was open on the last run.
         let owners_focus = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
+        let open_reaction_owners = open_reaction_owners;
         use_effect(move || {
             // An infallible read, deliberately. `open_reaction_owners` is this
             // component's own `use_signal`, written only from `defer()`
@@ -4284,16 +4254,6 @@ fn MessageGroupComponent(
             #[cfg(target_arch = "wasm32")]
             if current != previous {
                 crate::util::defer(move || {
-                    // A close/reopen or room unmount can overtake queued focus.
-                    let still_current = open_reaction_owners
-                        .try_peek()
-                        .ok()
-                        .map(|open| open.as_ref().map(|p| (p.key.clone(), p.message_id.clone())));
-                    if still_current.as_ref() != Some(&current)
-                        || !reaction_picker::showing_is_current(showing)
-                    {
-                        return;
-                    }
                     let Some(document) = web_sys::window().and_then(|window| window.document())
                     else {
                         return;
@@ -4309,15 +4269,11 @@ fn MessageGroupComponent(
                     let Some((key, message_id)) = previous else {
                         return;
                     };
-                    // Closed because the picker, the mobile sheet or another
-                    // group's reactor list opened (React from the keyboard, a
-                    // tap below 48rem, another group's chip): focus stays
-                    // where the reader put it, never pulled out of any of
-                    // them.
-                    if reaction_picker_is_open()
-                        || mobile_surface_is_open()
-                        || reactions.owner_list_is_open()
-                    {
+                    // Closed because the picker or the mobile sheet opened
+                    // (React from the keyboard, a tap below 48rem): focus
+                    // stays where the reader put it, never pulled out of
+                    // either.
+                    if reaction_picker_is_open() || mobile_surface_is_open() {
                         return;
                     }
                     if let Some(chip) = document.get_element_by_id(&reaction_chip_id(&key)) {
@@ -4888,7 +4844,7 @@ fn MessageGroupComponent(
                                                 class: "msg-footer",
                                             div {
                                                 "data-testid": "message-reaction-row",
-                                                // The chips (direct mouse actions, otherwise inspect), then
+                                                // The chips, which react with their emoji, then
                                                 // React: the message's one way into the picker
                                                 // or the sheet. Taps here (a chip, its reactor
                                                 // list and that list's backdrop, React) never
@@ -4909,9 +4865,9 @@ fn MessageGroupComponent(
                                                             .collect::<Vec<_>>()
                                                             .join(", ");
                                                         let tooltip = if is_user_reaction {
-                                                            format!("{names_str}. Click to remove; tap or use the keyboard for details.")
+                                                            format!("{names_str} (click to remove)")
                                                         } else {
-                                                            format!("{names_str}. Click to react; tap or use the keyboard for details.")
+                                                            names_str
                                                         };
                                                         let owners_key = format!("{row_id_for_chips}:{emoji}");
                                                         let (
@@ -4931,13 +4887,17 @@ fn MessageGroupComponent(
                                                                 mine.map(|popup| popup.max_w).unwrap_or(240.0),
                                                             )
                                                         };
-                                                        let msg_id_for_list_action = msg_id_for_click.clone();
-                                                        let emoji_for_list_action = emoji_for_click.clone();
+                                                        let msg_id_for_remove = msg_id_for_click.clone();
+                                                        let emoji_for_remove = emoji_for_click.clone();
                                                         let owners_key_for_click = owners_key.clone();
+                                                        let owners_key_for_key = owners_key.clone();
+                                                        let owners_key_for_keyup = owners_key.clone();
                                                         let owners_key_for_press = owners_key.clone();
                                                         let row_id_for_click = row_id_for_chips.clone();
+                                                        let row_id_for_owners_key = row_id_for_chips.clone();
                                                         let chip_id = reaction_chip_id(&owners_key);
                                                         let chip_id_for_click = chip_id.clone();
+                                                        let chip_id_for_key = chip_id.clone();
                                                         let chip_id_for_hold = chip_id.clone();
                                                         let row_id_for_hold = row_id_for_chips.clone();
                                                         let chip_hold_down = chip_hold.clone();
@@ -4945,13 +4905,13 @@ fn MessageGroupComponent(
                                                         let chip_hold_leave = chip_hold.clone();
                                                         let chip_hold_cancel = chip_hold.clone();
                                                         let chip_hold_click = chip_hold.clone();
-                                                        let chip_hold_key = chip_hold.clone();
                                                         let chip_hold_backdrop = chip_hold.clone();
+                                                        let list_key_press = chip_list_key.clone();
+                                                        let list_key_click = chip_list_key.clone();
+                                                        let list_key_down = chip_list_key.clone();
+                                                        let list_key_up = chip_list_key.clone();
                                                         let owners_key_for_backdrop = owners_key.clone();
                                                         let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
-                                                        // The list's action is worded only while it is open.
-                                                        let reader_has_reacted = user_reaction.is_some();
-                                                        let chip_label = reaction_chip_label(emoji, count, is_user_reaction);
 
                                                         rsx! {
                                                             div {
@@ -4961,10 +4921,7 @@ fn MessageGroupComponent(
                                                                     if owners_open { "z-[60]" } else { "" }
                                                                 ),
                                                                 if owners_open {
-                                                                    // Marked itself, not only through the reaction line it is inside.
                                                                     div {
-                                                                        "data-testid": "reaction-owners-backdrop",
-                                                                        "data-row-actions": "exclude",
                                                                         class: "fixed inset-0 z-40",
                                                                         onclick: move |_| {
                                                                             // The finger whose hold opened the list
@@ -4972,7 +4929,7 @@ fn MessageGroupComponent(
                                                                             if chip_hold_backdrop.borrow_mut().take_release(&owners_key_for_backdrop) {
                                                                                 return;
                                                                             }
-                                                                            crate::util::defer(move || close_reaction_owners(open_reaction_owners));
+                                                                            crate::util::defer(move || open_reaction_owners.set(None));
                                                                         },
                                                                     }
                                                                     div {
@@ -4991,32 +4948,22 @@ fn MessageGroupComponent(
                                                                         onkeydown: move |e: KeyboardEvent| {
                                                                             if e.key() == Key::Escape {
                                                                                 e.prevent_default();
-                                                                                crate::util::defer(move || close_reaction_owners(open_reaction_owners));
+                                                                                crate::util::defer(move || open_reaction_owners.set(None));
                                                                             }
                                                                         },
-                                                                        button {
-                                                                            r#type: "button",
-                                                                            "data-testid": if is_user_reaction { "reaction-remove" } else { "reaction-apply" },
-                                                                            class: if is_user_reaction {
-                                                                                "px-3 py-2 text-sm text-left text-danger hover:bg-error-bg"
-                                                                            } else {
-                                                                                "px-3 py-2 text-sm text-left text-text hover:bg-surface"
-                                                                            },
-                                                                            onclick: move |_| {
-                                                                                let id = msg_id_for_list_action.clone();
-                                                                                let emoji = emoji_for_list_action.clone();
-                                                                                crate::util::defer(move || {
-                                                                                    if !reaction_picker::showing_is_current(showing) { return; }
-                                                                                    on_react.call((id, emoji));
-                                                                                    close_reaction_owners(open_reaction_owners);
-                                                                                });
-                                                                            },
-                                                                            if is_user_reaction {
+                                                                        if is_user_reaction {
+                                                                            button {
+                                                                                "data-testid": "reaction-remove",
+                                                                                class: "px-3 py-2 text-sm text-left text-danger hover:bg-error-bg",
+                                                                                onclick: move |_| {
+                                                                                    let id = msg_id_for_remove.clone();
+                                                                                    let emoji = emoji_for_remove.clone();
+                                                                                    crate::util::defer(move || {
+                                                                                        on_react.call((id, emoji));
+                                                                                        open_reaction_owners.set(None);
+                                                                                    });
+                                                                                },
                                                                                 "Remove"
-                                                                            } else if reader_has_reacted {
-                                                                                "Switch to {emoji}"
-                                                                            } else {
-                                                                                "React with {emoji}"
                                                                             }
                                                                         }
                                                                         {reaction.reactors.iter().enumerate().map(|(index, reactor)| {
@@ -5040,16 +4987,11 @@ fn MessageGroupComponent(
                                                                     id: "{chip_id}",
                                                                     "data-testid": "reaction-chip",
                                                                     "data-emoji": "{emoji}",
-                                                                    "data-own-reaction": "{is_user_reaction}",
-                                                                    "aria-label": "{chip_label}",
-                                                                    "aria-haspopup": "dialog",
-                                                                    // Only while the list it names exists.
-                                                                    "aria-controls": owners_open.then(|| owners_dialog_id.clone()),
-                                                                    // Always present, "true" only while its list is
-                                                                    // open: the row's band matches the value
-                                                                    // `[aria-expanded="true"]`, not the attribute
-                                                                    // (main.css).
-                                                                    "aria-expanded": if owners_open { "true" } else { "false" },
+                                                                    // A toggle: a press reacts with this emoji.
+                                                                    "aria-pressed": if is_user_reaction { "true" } else { "false" },
+                                                                    // Only while its list is open: the row's band
+                                                                    // keys on it (main.css).
+                                                                    "aria-expanded": owners_open.then_some("true"),
                                                                     // A pill; your own reaction is the link
                                                                     // colour on the soft accent, like a mention.
                                                                     class: format!(
@@ -5062,6 +5004,8 @@ fn MessageGroupComponent(
                                                                     ),
                                                                     title: "{tooltip}",
                                                                     onpointerdown: move |e: PointerEvent| {
+                                                                        // A pointer's click is a press of its own.
+                                                                        list_key_press.borrow_mut().forget();
                                                                         let pointer_type = e.data().pointer_type();
                                                                         let started = chip_hold_down.borrow_mut().press(
                                                                             &owners_key_for_press,
@@ -5112,41 +5056,75 @@ fn MessageGroupComponent(
                                                                         chip_hold_cancel.borrow_mut().cancel();
                                                                     },
                                                                     onclick: move |_| {
+                                                                        // The lift of the hold that opened the list is
+                                                                        // not a press.
                                                                         if chip_hold_click.borrow_mut().take_release(&owners_key_for_click) {
                                                                             return;
                                                                         }
-                                                                        let applies = chip_hold_click.borrow_mut().take_direct_press(
-                                                                            &owners_key_for_click, fine_pointer_now(), now_ms(),
-                                                                        );
-                                                                        if applies {
-                                                                            // A selected chip may disappear. Keep focus on
-                                                                            // another live chip or the persistent React,
-                                                                            // whether or not this chip had it.
-                                                                            if is_user_reaction && count == 1 {
-                                                                                focus_reaction_line(&row_id_for_click, Some(chip_id_for_click.as_str()));
-                                                                            }
-                                                                            let id = msg_id_for_click.clone();
-                                                                            let emoji = emoji_for_click.clone();
-                                                                            crate::util::defer(move || {
-                                                                                if reaction_picker::showing_is_current(showing) { on_react.call((id, emoji)); }
-                                                                            });
-                                                                        } else {
-                                                                            let (x, y) = element_centre(&chip_id_for_click).unwrap_or((0.0, 0.0));
-                                                                            let popover = reaction_owners_popover_at(
-                                                                                owners_key_for_click.clone(), row_id_for_click.clone(), x, y,
-                                                                            );
-                                                                            crate::util::defer(move || reactions.open_owner_list(open_reaction_owners, popover));
+                                                                        // Nor is a click sent for the key press that
+                                                                        // opened it.
+                                                                        if list_key_click.borrow_mut().take_click(&owners_key_for_click, now_ms()) {
+                                                                            return;
                                                                         }
+                                                                        // The reader's chip with no one else on it
+                                                                        // leaves with the reaction. Focus it holds stays
+                                                                        // on the message's reaction line.
+                                                                        if is_user_reaction && count == 1 && element_has_focus(&chip_id_for_click) {
+                                                                            focus_reaction_line(&row_id_for_click, Some(chip_id_for_click.as_str()));
+                                                                        }
+                                                                        let id = msg_id_for_click.clone();
+                                                                        let emoji = emoji_for_click.clone();
+                                                                        crate::util::defer(move || on_react.call((id, emoji)));
                                                                     },
                                                                     onkeydown: move |e: KeyboardEvent| {
-                                                                        if e.key() == Key::Escape && owners_open {
-                                                                            e.prevent_default();
-                                                                            crate::util::defer(move || close_reaction_owners(open_reaction_owners));
+                                                                        let key = e.key();
+                                                                        if key == Key::Escape {
+                                                                            // Only this chip's own list: an Escape
+                                                                            // with none open is left to close the
+                                                                            // reaction picker.
+                                                                            if owners_open {
+                                                                                e.prevent_default();
+                                                                                crate::util::defer(move || open_reaction_owners.set(None));
+                                                                            }
+                                                                            return;
                                                                         }
-                                                                        if e.key() == Key::Enter || matches!(e.key(), Key::Character(c) if c == " ") {
-                                                                            // Let the native button generate exactly one
-                                                                            // click, which inspects without a pointer.
-                                                                            chip_hold_key.borrow_mut().keyboard();
+                                                                        // A button answers Enter and Space with a click,
+                                                                        // which reacts, as a press does: neither is
+                                                                        // handled here. With Shift, at 48rem and wider,
+                                                                        // they open the list instead: a key press has no
+                                                                        // hover title to say who reacted.
+                                                                        let space = matches!(&key, Key::Character(c) if c == " ");
+                                                                        if key != Key::Enter && !space {
+                                                                            return;
+                                                                        }
+                                                                        if !shift_lists_reactors(mobile_surface::narrow_now(), e.modifiers().shift()) {
+                                                                            list_key_down.borrow_mut().forget();
+                                                                            return;
+                                                                        }
+                                                                        // No click for this key press: it does not
+                                                                        // react as well.
+                                                                        e.prevent_default();
+                                                                        list_key_down.borrow_mut().open(&owners_key_for_key, now_ms());
+                                                                        let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
+                                                                        let popover = reaction_owners_popover_at(
+                                                                            owners_key_for_key.clone(),
+                                                                            row_id_for_owners_key.clone(),
+                                                                            x,
+                                                                            y,
+                                                                        );
+                                                                        crate::util::defer(move || {
+                                                                            reactions.open_owner_list(open_reaction_owners, popover)
+                                                                        });
+                                                                    },
+                                                                    onkeyup: move |e: KeyboardEvent| {
+                                                                        // Space's click comes on its keyup, and an engine
+                                                                        // may send it though the keydown was prevented.
+                                                                        let key = e.key();
+                                                                        let space = matches!(&key, Key::Character(c) if c == " ");
+                                                                        if (key == Key::Enter || space)
+                                                                            && list_key_up.borrow_mut().lift(&owners_key_for_keyup, now_ms())
+                                                                        {
+                                                                            e.prevent_default();
                                                                         }
                                                                     },
                                                                     span { class: "text-[15px] leading-none", "{emoji}" }
@@ -5244,38 +5222,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_fresh_eligible_press_on_this_chip_applies() {
-        let mut hold = ChipHold::default();
-        for (pointer, fine, applies) in [
-            ("mouse", false, true),
-            ("pen", true, true),
-            ("pen", false, false),
-            ("touch", true, false),
-            ("", true, false),
-        ] {
-            hold.press("a", pointer, false);
-            assert_eq!(hold.take_direct_press("a", fine, 1.0), applies);
-            assert!(!hold.take_direct_press("a", fine, 1.0), "consumed once");
-        }
-        hold.press("a", "mouse", false);
-        assert!(!hold.take_direct_press("b", true, 1.0));
-        hold.press("a", "mouse", false);
-        assert!(!hold.take_direct_press("a", true, PRESS_FRESH_MS + 1.0));
-        hold.press("a", "mouse", false);
-        hold.cancel();
-        assert!(!hold.take_direct_press("a", true, 1.0));
-        hold.press("a", "mouse", false);
-        hold.keyboard();
-        assert!(!hold.take_direct_press("a", true, 1.0));
+    fn a_chip_key_reacts_except_shift_at_48rem_and_wider() {
+        assert!(!shift_lists_reactors(false, false));
+        assert!(
+            shift_lists_reactors(false, true),
+            "Shift, at 48rem and wider"
+        );
+        assert!(!shift_lists_reactors(true, false));
+        assert!(!shift_lists_reactors(true, true), "below 48rem: no list");
     }
 
+    /// Shift+Enter or Shift+Space opened a chip's list: its keyup on that
+    /// chip, and a click that comes for it anyway, are that key press's.
     #[test]
-    fn chip_label_says_when_the_reader_reacted() {
-        assert_eq!(reaction_chip_label("🦀", 1, false), "🦀, 1 reaction");
-        assert_eq!(
-            reaction_chip_label("🦀", 2, true),
-            "🦀, 2 reactions, you reacted"
+    fn the_key_that_lists_reactors_sends_no_press() {
+        let mut list_key = ChipListKey::default();
+        assert!(!list_key.lift("a", 0.0), "a plain key's keyup is its own");
+        assert!(!list_key.take_click("a", 0.0), "and so is its click");
+
+        list_key.open("a", 0.0);
+        assert!(!list_key.lift("b", 10.0), "another chip's keyup");
+        assert!(list_key.lift("a", 2000.0), "however long the key was held");
+        assert!(list_key.take_click("a", 2001.0), "the click of that keyup");
+        assert!(!list_key.take_click("a", 2002.0), "one click only");
+    }
+
+    /// The keyup usually lands on the list, which has focus by then, and no
+    /// click follows. What the reader does next on the chip is a press.
+    #[test]
+    fn a_press_after_the_key_that_lists_reactors_is_its_own() {
+        let mut list_key = ChipListKey::default();
+        list_key.open("a", 0.0);
+        assert!(
+            !list_key.take_click("a", CHIP_LIST_KEY_CLICK_MS + 1.0),
+            "a click with no press of its own, later"
         );
+
+        list_key.open("a", 0.0);
+        list_key.forget();
+        assert!(!list_key.lift("a", 1.0), "plain Space: its keyup clicks");
+        assert!(!list_key.take_click("a", 1.0), "a pointer's click");
+
+        list_key.open("a", 0.0);
+        assert!(!list_key.take_click("b", 1.0), "another chip's click");
+        assert!(!list_key.take_click("a", 1.0), "which ended the key press");
     }
 
     #[test]
@@ -5311,39 +5301,6 @@ mod tests {
         hold.cancel();
         assert_eq!(hold.fire(generation, false), None);
         assert!(!hold.take_release("a"), "its click is a press");
-    }
-
-    #[test]
-    fn chip_hold_cancelled_while_down_forgets_its_release() {
-        let mut hold = ChipHold::default();
-        let generation = hold.press("a", "touch", false).unwrap();
-        hold.fire(generation, false);
-        hold.cancel();
-        assert!(!hold.take_release("a"), "no lift follows a cancelled press");
-    }
-
-    /// A touch's `pointerleave` comes between its `pointerup` and its click.
-    #[test]
-    fn chip_hold_leave_after_its_lift_keeps_the_release() {
-        let mut hold = ChipHold::default();
-        let generation = hold.press("a", "touch", false).unwrap();
-        hold.fire(generation, false);
-        hold.lift();
-        hold.cancel();
-        assert!(hold.take_release("a"));
-    }
-
-    #[test]
-    fn chip_hold_lift_of_an_earlier_hold_does_not_protect_a_later_one() {
-        let mut hold = ChipHold::default();
-        let first = hold.press("a", "touch", false).unwrap();
-        hold.fire(first, false);
-        hold.lift();
-        assert!(hold.take_release("a"));
-        let second = hold.press("a", "touch", false).unwrap();
-        hold.fire(second, false);
-        hold.cancel();
-        assert!(!hold.take_release("a"));
     }
 
     #[test]
@@ -5432,19 +5389,6 @@ mod tests {
         assert_eq!(reveal_shift(400.0, 1400.0, 100.0, 700.0, 8.0), 292);
         // Above the view: up, to show the top.
         assert_eq!(reveal_shift(40.0, 180.0, 100.0, 700.0, 8.0), -68);
-    }
-
-    /// The reactor list hangs toward the roomier side, capped to the window.
-    #[test]
-    fn owners_list_side_and_width_follow_the_window() {
-        assert_eq!(horizontal_placement(355.0, 1280.0), (false, 917.0));
-        assert_eq!(horizontal_placement(76.0, 390.0), (false, 306.0));
-        assert_eq!(horizontal_placement(900.0, 1280.0), (true, 892.0));
-        assert_eq!(
-            horizontal_placement(60.0, 100.0),
-            (false, 128.0),
-            "never under 8rem"
-        );
     }
 
     /// The popover side rule at its edges: a scrollport from 100 to 700,

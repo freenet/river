@@ -41,9 +41,9 @@ import { callRiverTest, rekeyThenClick } from "./river-test";
 // same sheet. On top, the 16 choices the desktop picker has, in one row that
 // scrolls sideways: a tap on one reacts and closes it. Then those actions.
 // It has no field, so it never asks for the software keyboard; a tap outside
-// dismisses it. A reaction chip never opens the sheet: it has its own reactor
-// list (reaction-owners-touch.spec.ts, reaction-chips.spec.ts); the sheet's
-// drags are in mobile-message-sheet-gestures.spec.ts.
+// dismisses it. A reaction chip opens nothing: a press on it reacts with its
+// emoji (reaction-owners-touch.spec.ts); the sheet's drags are in
+// mobile-message-sheet-gestures.spec.ts.
 // Width alone decides: a narrow mouse window is mobile, a wide touch screen
 // keeps the desktop footer. These run on every project at the widths they
 // set, so the desktop projects are narrow mouse windows here.

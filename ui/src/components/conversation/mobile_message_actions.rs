@@ -1,28 +1,26 @@
 //! How a row opens the mobile message sheet (`mobile_message_sheet.rs`):
 //! below 48rem, a tap on a signed message, or its keyboard entry, opens the
 //! sheet for that exact message. Its + opens the same sheet
-//! (`reaction_picker.rs`); its chips have their own reactor list and actions
-//! (`conversation.rs`). `mobile_surface.rs` has the sheet's state and
-//! lifecycle.
+//! (`reaction_picker.rs`); its chips react (`conversation.rs`).
+//! `mobile_surface.rs` has the sheet's state and lifecycle.
 //!
 //! Row taps ([`row_tap`], [`row_clicked`]). One ordinary tap on a message's
 //! non-interactive content or background opens it. Anything with a behaviour
 //! of its own keeps it and opens nothing: links, mentions and share links in
-//! the raw message HTML, buttons (author name, reply strip, React), the
-//! reaction line (its chips, their reactor lists, and a list's dismiss
-//! backdrop, which covers the screen but is inside that line), fields and the
-//! edit form, media and disclosure controls, and anything marked
-//! `data-row-actions="exclude"` (the avatar). The click's actual DOM target is
-//! checked, ancestors up to the row, because the message body is raw HTML
-//! whose delegated handlers Dioxus does not see. A drag or scroll (a press
-//! that moved, or one the browser cancelled), a second finger, a press too old
-//! to be this click, and a tap that completes a text selection open nothing;
-//! touch scrolling and text selection themselves are left alone. A tap or
-//! click opens at once, whatever the pointer: the first click of a
-//! double-click opens the sheet, and the second does nothing, on the row or in
-//! the sheet it opened (`mobile_sheet_drag.rs`). Rows take no double-tap zoom
-//! below 48rem (`touch-action: manipulation`, `main.css`), so iOS Safari does
-//! not hold the click back waiting for a second tap.
+//! the raw message HTML, buttons (author name, reply strip, React), reaction
+//! chips and their reactor lists, fields and the edit form, media and
+//! disclosure controls, and anything marked `data-row-actions="exclude"` (the
+//! avatar). The click's actual DOM target is checked, ancestors up to the row,
+//! because the message body is raw HTML whose delegated handlers Dioxus does
+//! not see. A drag or scroll (a press that moved, or one the browser
+//! cancelled), a second finger, a press too old to be this click, and a tap
+//! that completes a text selection open nothing; touch scrolling and text
+//! selection themselves are left alone. A tap or click opens at once, whatever
+//! the pointer: the first click of a double-click opens the sheet, and the
+//! second does nothing, on the row or in the sheet it opened
+//! (`mobile_sheet_drag.rs`). Rows take no double-tap zoom below 48rem
+//! (`touch-action: manipulation`, `main.css`), so iOS Safari does not hold the
+//! click back waiting for a second tap.
 //!
 //! Keyboard. Each row has one visually hidden native button
 //! ([`MobileActionsEntry`]), shown on keyboard focus, which opens the same

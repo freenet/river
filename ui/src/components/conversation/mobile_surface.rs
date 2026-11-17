@@ -5,9 +5,9 @@
 //! Delete are hidden. A tap on the row or on its reaction +, or its keyboard
 //! entry, opens the one **message sheet** (`mobile_message_sheet.rs`): the 16
 //! emoji in a row that scrolls sideways, then Reply, and Edit and Delete on
-//! your own. Reaction chips have their own inspection and actions at every
-//! width (`conversation.rs`). Row taps and the entry are
-//! `mobile_message_actions.rs`. At 48rem and wider the
+//! your own. A press on a reaction chip opens nothing: it
+//! reacts with the chip's emoji, at every width (`conversation.rs`). Row taps
+//! and the entry are `mobile_message_actions.rs`. At 48rem and wider the
 //! sheet does not exist: the footer, the anchored reaction picker
 //! (`reaction_picker.rs`) and the chips' reactor lists are as before.
 //!
@@ -411,7 +411,7 @@ pub(super) mod dom {
 
     /// Focus, without scrolling, the control in `row` matching `selector`,
     /// if it is still there.
-    pub(super) fn focus_control(row: &str, selector: &str) {
+    pub(in super::super) fn focus_control(row: &str, selector: &str) {
         if let Some(control) = row_control(row, selector) {
             focus_without_scrolling(&control);
         }
@@ -636,7 +636,7 @@ pub(super) mod dom {
     pub(in super::super) fn row_control(_row: &str, _selector: &str) -> Option<()> {
         Some(())
     }
-    pub(super) fn focus_control(_row: &str, _selector: &str) {}
+    pub(in super::super) fn focus_control(_row: &str, _selector: &str) {}
     pub(super) fn close_dialog() {}
     pub(in super::super) fn show_dialog() -> bool {
         false

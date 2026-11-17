@@ -346,15 +346,12 @@ pub fn install_test_hooks() {
     // A signed reaction from a test member to the newest message (not an
     // action or event), so it survives the rebuild every toggle does, as the
     // chips `addReactionsToNewest` writes straight into state do not. Public
-    // rooms only: a private room does not admit a public action. Given a
-    // nickname, the reaction is from a member of that name.
+    // rooms only: a private room does not admit a public action.
     set_hook(
         "memberReactsToNewest",
-        Closure::<dyn FnMut(String, Option<String>)>::new(
-            move |emoji: String, nickname: Option<String>| {
-                crate::util::defer(move || member_reacts_to_newest(emoji, nickname));
-            },
-        )
+        Closure::<dyn FnMut(String)>::new(move |emoji: String| {
+            crate::util::defer(move || member_reacts_to_newest(emoji));
+        })
         .into_js_value(),
     );
 
@@ -1185,7 +1182,7 @@ fn add_reactions_to_newest(emojis: Vec<String>) {
     });
 }
 
-fn member_reacts_to_newest(emoji: String, nickname: Option<String>) {
+fn member_reacts_to_newest(emoji: String) {
     with_current_room_mut(|room, room_key| {
         let Some(target) = room
             .room_state
@@ -1199,18 +1196,12 @@ fn member_reacts_to_newest(emoji: String, nickname: Option<String>) {
             web_sys::console::error_1(&"__riverTest.memberReactsToNewest: no messages".into());
             return;
         };
-        let body = RoomMessageBody::reaction(target, emoji);
-        match nickname {
-            None => push_test_body(room, room_key, body, Delivery::Append),
-            // A member of its own, so the name is the caller's.
-            Some(nickname) => {
-                let sk = SigningKey::from_bytes(&[0x8D; 32]);
-                admit_with_nickname(room, room_key, &sk, &nickname);
-                let now = crate::util::get_current_system_time();
-                let message = signed_message(room_key, &sk, body, now);
-                room.room_state.recent_messages.messages.push(message);
-            }
-        }
+        push_test_body(
+            room,
+            room_key,
+            RoomMessageBody::reaction(target, emoji),
+            Delivery::Append,
+        );
         room.room_state.recent_messages.rebuild_actions_state();
     });
 }

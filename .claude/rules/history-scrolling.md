@@ -118,22 +118,15 @@ Current behavior:
 - Below 48rem a row tap, the + or the row's keyboard entry opens the one
   mobile message sheet, a native modal `<dialog>`
   (`conversation/mobile_message_sheet.rs`; its state and input hold are in
-  `conversation/mobile_surface.rs`). A reaction chip never opens the sheet.
-  At every width a touch tap or the keyboard (Enter or Space; no modifier is
-  needed) inspects: it opens the chip's reactor list, which holds the
-  action. A press outside an open list only closes it, at every width; below
-  48rem it does not open the sheet. An open list stays open when the window
-  crosses 48rem, and is placed again for the new width. A mouse press, or a
-  pen on a fine-pointer screen, reacts with the chip's emoji directly. At
-  48rem and wider a finger or pen held on a chip opens its list without
-  waiting for the lift. Opening or closing a reactor list, and focus moving
-  along a message's reaction line when a chip is removed, never scroll the
-  history. A chip that moves in the standing order while it, or its open
-  list, holds focus keeps that focus, again without scrolling
-  (`conversation/reaction_focus.rs`); focus the reader has put elsewhere
-  stays there, and none is taken while the reader is outside River's
-  document. While the sheet is open the reader's
-  wheel and one-finger touch scrolling outside its panel are held off, as the
+  `conversation/mobile_surface.rs`). A reaction chip opens nothing: a
+  press on it reacts with its emoji, at every width. At 48rem and wider a
+  finger held on a chip, or Shift+Enter, opens its reactor list. A chip
+  that moves in the standing order while it, or its open list, holds focus
+  keeps that focus without scrolling (`conversation/reaction_focus.rs`);
+  focus the reader has put elsewhere stays there, and none is taken while
+  the reader is outside River's document. While the
+  sheet is open the reader's wheel
+  and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and the emoji row in its panel still scrolls sideways;
   a zoom (Ctrl+wheel, a pinch) is not held, nothing outside the dialog is captured, and every close path
   removes the listeners. It can be dragged down from anywhere on the screen

@@ -29,6 +29,9 @@ export async function settle(page: Page) {
   await page.waitForTimeout(300);
 }
 
+/// Collect uncaught page errors and console panics (a Rust panic, a WASM
+/// trap, a RefCell borrow failure) from now on. The caller asserts the
+/// returned array is still empty at the end.
 // Force the tab's visibility state: override the `document.hidden` and
 // `document.visibilityState` getters and dispatch `visibilitychange`, the way
 // Chromium, WebKit and Firefox do when the tab goes to the background or back.
@@ -446,14 +449,18 @@ export async function pressAt(page: Page, { x, y }: { x: number; y: number }) {
   else await page.mouse.click(x, y);
 }
 
-/// Dispatch a touch pointer event at `chip`'s centre.
-export function chipPointer(chip: Locator, type: string, bubbles = true): Promise<void> {
-  return chip.evaluate(
-    (el, { type, bubbles }) => {
+/// A pointer down on `chip`, held past the app's hold time (CHIP_HOLD_MS,
+/// 500). Returns the lift, which also sends the click a browser sends when
+/// the pointer lifts. Dispatched events: outside Chromium's input protocol
+/// Playwright has no touch hold, and the app decides a hold on the
+/// `pointerdown`'s type and a timer alone.
+export async function holdChip(page: Page, chip: Locator): Promise<() => Promise<void>> {
+  const fire = (type: string) =>
+    chip.evaluate((el, type) => {
       const r = el.getBoundingClientRect();
       el.dispatchEvent(
         new PointerEvent(type, {
-          bubbles,
+          bubbles: true,
           cancelable: true,
           composed: true,
           pointerId: 7,
@@ -463,24 +470,12 @@ export function chipPointer(chip: Locator, type: string, bubbles = true): Promis
           clientY: r.top + r.height / 2,
         }),
       );
-    },
-    { type, bubbles },
-  );
-}
-
-/// A pointer down on `chip`, held past the app's hold time (CHIP_HOLD_MS,
-/// 500). Returns the lift, which also sends the click a browser sends when
-/// the pointer lifts. The lift sends `pointerleave` between `pointerup` and
-/// the click, as Chromium does for a real finger. Dispatched events: outside
-/// Chromium's input protocol Playwright has no touch hold, and the app
-/// decides a hold on the `pointerdown`'s type and a timer alone.
-export async function holdChip(page: Page, chip: Locator): Promise<() => Promise<void>> {
+    }, type);
   await chip.scrollIntoViewIfNeeded();
-  await chipPointer(chip, "pointerdown");
+  await fire("pointerdown");
   await page.waitForTimeout(700);
   return async () => {
-    await chipPointer(chip, "pointerup");
-    await chipPointer(chip, "pointerleave", false);
+    await fire("pointerup");
     await chip.evaluate((el) => (el as HTMLElement).click());
   };
 }
@@ -515,12 +510,13 @@ export function chips(row: Locator): Locator {
   return row.getByTestId("reaction-chip");
 }
 
-/// The reader's own chips, as a selector.
-export const OWN_CHIP = '[data-testid="reaction-chip"][data-own-reaction="true"]';
-
-/// `row`'s chip for `emoji`.
+/// `row`'s chip for `emoji`, by its `data-emoji`. The emoji is escaped as a
+/// CSS string (quote, backslash, control characters): a peer chooses it.
 export function chipFor(row: Locator, emoji: string): Locator {
-  return row.locator(`[data-testid="reaction-chip"][data-emoji="${emoji}"]`);
+  const quoted = emoji
+    .replace(/["\\]/g, "\\$&")
+    .replace(/[\u0000-\u001f\u007f]/g, (c) => `\\${c.charCodeAt(0).toString(16)} `);
+  return row.locator(`[data-testid="reaction-chip"][data-emoji="${quoted}"]`);
 }
 
 /// The message key a row's id carries (`msg-<key>`), as the sheet's
