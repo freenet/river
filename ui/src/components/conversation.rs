@@ -3765,23 +3765,47 @@ fn reaction_owners_popover_at(
     x: f64,
     y: f64,
 ) -> ReactionOwnersPopover {
-    let (above, max_h) = vertical_placement(y, REACTION_OWNERS_POPOVER_HEIGHT_PX);
-    let win_w = web_sys::window()
-        .and_then(|w| w.inner_width().ok())
-        .and_then(|v| v.as_f64())
-        .unwrap_or(400.0);
-    let space_right = (win_w - x - 8.0).max(128.0);
-    let space_left = (x - 8.0).max(128.0);
-    let align_right = space_left > space_right;
-    let max_w = if align_right { space_left } else { space_right };
     ReactionOwnersPopover {
         key,
         showing: reaction_picker::shown_room(),
         message_id,
-        above,
+        above: false,
+        align_right: false,
+        max_h: 0.0,
+        max_w: 0.0,
+    }
+    .placed_at(x, y)
+}
+
+/// Which side of its chip a reactor list hangs toward (`true`: its right
+/// edge on the chip's), and its max width: the roomier side of a window
+/// `win_w` wide from the chip's centre `x`, less 8px, never under 8rem.
+fn horizontal_placement(x: f64, win_w: f64) -> (bool, f64) {
+    let space_right = (win_w - x - 8.0).max(128.0);
+    let space_left = (x - 8.0).max(128.0);
+    let align_right = space_left > space_right;
+    (
         align_right,
-        max_h,
-        max_w,
+        if align_right { space_left } else { space_right },
+    )
+}
+
+impl ReactionOwnersPopover {
+    /// This list, placed for its chip's centre in the window as it is now.
+    fn placed_at(self, x: f64, y: f64) -> Self {
+        let (above, max_h) = vertical_placement(y, REACTION_OWNERS_POPOVER_HEIGHT_PX);
+        let win_w = web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(400.0);
+        let (align_right, max_w) = horizontal_placement(x, win_w);
+        Self {
+            above,
+            align_right,
+            max_h,
+            max_w,
+            ..self
+        }
     }
 }
 
@@ -5393,6 +5417,19 @@ mod tests {
         assert_eq!(reveal_shift(400.0, 1400.0, 100.0, 700.0, 8.0), 292);
         // Above the view: up, to show the top.
         assert_eq!(reveal_shift(40.0, 180.0, 100.0, 700.0, 8.0), -68);
+    }
+
+    /// The reactor list hangs toward the roomier side, capped to the window.
+    #[test]
+    fn owners_list_side_and_width_follow_the_window() {
+        assert_eq!(horizontal_placement(355.0, 1280.0), (false, 917.0));
+        assert_eq!(horizontal_placement(76.0, 390.0), (false, 306.0));
+        assert_eq!(horizontal_placement(900.0, 1280.0), (true, 892.0));
+        assert_eq!(
+            horizontal_placement(60.0, 100.0),
+            (false, 128.0),
+            "never under 8rem"
+        );
     }
 
     /// The popover side rule at its edges: a scrollport from 100 to 700,

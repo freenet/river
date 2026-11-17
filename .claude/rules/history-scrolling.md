@@ -122,12 +122,13 @@ Current behavior:
   At every width a touch tap or the keyboard (Enter or Space; no modifier is
   needed) inspects: it opens the chip's reactor list, which holds the
   action. A press outside an open list only closes it, at every width; below
-  48rem it does not open the sheet. A mouse press, or a pen on a fine-pointer
-  screen, reacts with the chip's emoji directly. At 48rem and wider a finger
-  or pen held on a chip opens its list without waiting for the lift. Opening
-  or closing a reactor list, and focus moving along a message's reaction line
-  when a chip is removed, never scroll the history. While the sheet is open
-  the reader's
+  48rem it does not open the sheet. An open list stays open when the window
+  crosses 48rem, and is placed again for the new width. A mouse press, or a
+  pen on a fine-pointer screen, reacts with the chip's emoji directly. At
+  48rem and wider a finger or pen held on a chip opens its list without
+  waiting for the lift. Opening or closing a reactor list, and focus moving
+  along a message's reaction line when a chip is removed, never scroll the
+  history. While the sheet is open the reader's
   wheel and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and the emoji row in its panel still scrolls sideways;
   a zoom (Ctrl+wheel, a pinch) is not held, nothing outside the dialog is captured, and every close path

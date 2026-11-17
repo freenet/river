@@ -102,8 +102,9 @@ async function removeFromList(page: Page, chip: Locator) {
 }
 
 /// A known reactor on the newest message, signed through the action path.
-async function signedChip(page: Page): Promise<Locator> {
-  await callRiverTest(page, "memberReactsToNewest", "🦀");
+async function signedChip(page: Page, nickname?: string): Promise<Locator> {
+  if (nickname === undefined) await callRiverTest(page, "memberReactsToNewest", "🦀");
+  else await callRiverTest(page, "memberReactsToNewest", "🦀", nickname);
   const row = page
     .locator('[id^="msg-"]')
     .filter({ has: page.getByTestId("reaction-chip").filter({ hasText: "🦀" }) })
@@ -691,19 +692,25 @@ test.describe("Reaction chip held while its group remounts", { tag: "@chromium-o
 });
 
 test.describe("Reactor list across 48rem", () => {
-  test("inspection remains available when narrowing below 48rem", async ({ page }) => {
+  // 50 bytes: the default nickname cap.
+  const LONG_NAME = "Bartholomew Featherstonehaugh-Cholmondeley of Bath";
+
+  test("the list stays open and on screen when narrowing below 48rem", async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
     await selectRoom(page, "Your Private Room");
     await waitSettledAtBottom(page);
-    const chip = await signedChip(page);
+    const chip = await signedChip(page, LONG_NAME);
     const owners = page.getByTestId("reaction-owners");
     await chip.press("Enter");
-    await expect(owners).toBeVisible();
+    await expect(owners.getByTestId("reaction-owner")).toHaveText(LONG_NAME);
+    expect((await owners.boundingBox())!.width, "premise: wider than a phone has beside the chip").toBeGreaterThan(320);
     const { height } = page.viewportSize()!;
     await page.setViewportSize({ width: 390, height });
     await settle(page);
     await expect(owners, "the list remains available on a phone").toBeVisible();
     await expect(chip).toHaveAttribute("aria-expanded", "true");
+    await expect(owners, "focus stays in the list").toBeFocused();
+    await expectOnScreen(page, owners);
   });
 });

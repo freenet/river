@@ -252,6 +252,26 @@ impl ReactionSurfaces {
             close_reaction_owners(list);
         }
     }
+
+    /// Place the open reactor list again, from where its chip is now: the
+    /// window crossed 48rem under it. Its showing is kept. Nothing if no list
+    /// is open, or its chip or group has gone. From a deferred callback only.
+    pub(super) fn place_owner_list_again(self) {
+        let Some(mut list) = self.open_owner_list.try_peek().ok().and_then(|slot| *slot) else {
+            return;
+        };
+        let Some(open) = list.try_peek().ok().and_then(|open| (*open).clone()) else {
+            return;
+        };
+        let Some((x, y)) = super::element_centre(&super::reaction_chip_id(&open.key)) else {
+            return;
+        };
+        let placed = open.clone().placed_at(x, y);
+        if placed != open {
+            // A statement, so the write guard drops before `list` does.
+            let _ = list.try_write().map(|mut slot| *slot = Some(placed));
+        }
+    }
 }
 
 thread_local! {
@@ -550,12 +570,16 @@ pub(super) fn ReactionPicker(
     }
     // The window crossing below 48rem turns every React into the mobile
     // sheet's: close an open desktop picker and release its hold/anchor.
-    // Chip inspection is available at every width; its list stays open.
+    // A chip's reactor list stays open at every width; crossing either way,
+    // it is placed again for the new layout.
     let narrow = narrow_for_render();
     let was_narrow = use_hook(|| Rc::new(Cell::new(narrow)));
-    if was_narrow.replace(narrow) != narrow && narrow {
+    if was_narrow.replace(narrow) != narrow {
         crate::util::defer(move || {
-            surfaces.close();
+            if narrow {
+                surfaces.close();
+            }
+            surfaces.place_owner_list_again();
         });
     }
     // Unmounted open: nothing held or captured outlives it.
