@@ -160,7 +160,8 @@ pub fn is_one_line(text: &str) -> bool {
         && !t.starts_with(|c: char| c.is_ascii_digit())
 }
 
-/// Markdown for `src` under `key`. `keep_breaks` is true for messages.
+/// Markdown for `src` under `key`. `keep_breaks` is true for messages. `None` when the text
+/// cannot be made safe to draw as markdown (see `links::prepare`): show it as plain text.
 pub fn render(
     src: &str,
     keep_breaks: bool,
@@ -169,7 +170,7 @@ pub fn render(
     key: String,
     p: &Palette,
     k: &Kit,
-) -> El {
+) -> Option<El> {
     let src = if keep_breaks {
         keep_line_breaks(src)
     } else {
@@ -177,43 +178,45 @@ pub fn render(
     };
     // Links to Freenet apps behave as in the web UI (see `links`).
     let src = if is_cheap(&src) {
-        super::links::prepare(&src)
+        super::links::prepare(&src)?
     } else {
         src
     };
     let (accent, soft, line, muted) = (p.accent, p.accent_soft, p.accent_line, p.text_muted);
-    Markdown::new(src)
-        .on_link_tx(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
-            if openable(url) {
-                let _ = tx.open_url(url.trim());
-            }
-        })
-        .link_style(move |url| {
-            let chip = |bg: Color, fg: Color| {
-                (
-                    Span::new(0, 0).bold().color(fg).bg(bg, 2.0),
-                    rune::LinkPaint::new().bg(line),
-                )
-            };
-            match mention_kind(url)? {
-                // A mention of you stands out, as the web UI's self chip does.
-                "self" => Some(chip(line, accent)),
-                "member" => Some(chip(soft, accent)),
-                _ => Some(chip(soft, muted)),
-            }
-        })
-        .link_help(|url| openable(url).then(|| format!("Opens {url}")))
-        // Right-click a link for Open and Copy link, as in a browser. This takes the press from
-        // every link, so a mention chip or a non-web link shows no menu at all.
-        .on_link_secondary(
-            |s: &mut RiverApp, url: &str, press: rune::PointerPress, _: &mut rune::Tx| {
-                s.chat.open_link_menu(url, press);
-            },
-        )
-        // Text can be selected and copied, within a message.
-        .selectable(true)
-        .render(&style(p, k, font, color))
-        .key(key)
+    Some(
+        Markdown::new(src)
+            .on_link_tx(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
+                if openable(url) {
+                    let _ = tx.open_url(url.trim());
+                }
+            })
+            .link_style(move |url| {
+                let chip = |bg: Color, fg: Color| {
+                    (
+                        Span::new(0, 0).bold().color(fg).bg(bg, 2.0),
+                        rune::LinkPaint::new().bg(line),
+                    )
+                };
+                match mention_kind(url)? {
+                    // A mention of you stands out, as the web UI's self chip does.
+                    "self" => Some(chip(line, accent)),
+                    "member" => Some(chip(soft, accent)),
+                    _ => Some(chip(soft, muted)),
+                }
+            })
+            .link_help(|url| openable(url).then(|| format!("Opens {url}")))
+            // Right-click a link for Open and Copy link, as in a browser. This takes the press from
+            // every link, so a mention chip or a non-web link shows no menu at all.
+            .on_link_secondary(
+                |s: &mut RiverApp, url: &str, press: rune::PointerPress, _: &mut rune::Tx| {
+                    s.chat.open_link_menu(url, press);
+                },
+            )
+            // Text can be selected and copied, within a message.
+            .selectable(true)
+            .render(&style(p, k, font, color))
+            .key(key),
+    )
 }
 
 #[cfg(test)]
@@ -300,6 +303,27 @@ mod tests {
             assert!(!is_one_line(no), "{no:?}");
         }
         assert_eq!(strip("a <b>html</b> c"), "a <b>html</b> c");
+    }
+
+    #[test]
+    fn markdown_that_cannot_be_made_safe_is_not_rendered() {
+        let p = super::super::style::palette();
+        let k = Kit::neutral(true);
+        let draw = |src: &str| {
+            render(
+                src,
+                true,
+                super::super::style::MESSAGE,
+                p.text,
+                "k".into(),
+                &p,
+                &k,
+            )
+        };
+        assert!(draw("hello [a](https://example.com/)").is_some());
+        let over = "<ab:c> ".repeat(60);
+        assert!(is_cheap(&keep_line_breaks(&over)));
+        assert!(draw(&over).is_none());
     }
 
     #[test]

@@ -62,7 +62,7 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
     let mut info = col().grow(1.0).min_w(0.0).gap(2.0).child(title);
     if !room.description.is_empty() {
         // One line of the description, drawn as markdown; what does not fit is cut off.
-        info = info.child(
+        let rendered =
             if markdown::is_one_line(&room.description) && markdown::is_cheap(&room.description) {
                 markdown::render(
                     &room.description,
@@ -73,12 +73,13 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
                     p,
                     k,
                 )
-                .max_h(18.0)
-                .clip_soft(0.0)
             } else {
-                label(markdown::strip(&room.description), st::SMALL, p.text_muted).truncate()
-            },
-        );
+                None
+            };
+        info = info.child(match rendered {
+            Some(md) => md.max_h(18.0).clip_soft(0.0),
+            None => label(markdown::strip(&room.description), st::SMALL, p.text_muted).truncate(),
+        });
     }
     let open = chat.members_shown(narrow);
     let toggle = row()
@@ -555,8 +556,12 @@ fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette, k: &Kit) -> El
 
 /// A message's text, with any web links in it styled and pressable.
 fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
-    if !m.md.is_empty() && markdown::is_cheap(&m.md) {
-        return markdown_body(m, p, k);
+    // Markdown that cannot be made safe to draw (`None`) falls back to the plain text.
+    if !m.md.is_empty()
+        && markdown::is_cheap(&m.md)
+        && let Some(body) = markdown_body(m, p, k)
+    {
+        return body;
     }
     let mut content = m.text.clone();
     let links = model::links(&m.text);
@@ -593,8 +598,8 @@ fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
 }
 
 /// A message as markdown, then the `(edited)` mark under it.
-fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> El {
-    let mut body = col().w_full().max_w(BODY_MAX_W).child(markdown::render(
+fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> Option<El> {
+    let rendered = markdown::render(
         &m.md,
         true,
         st::MESSAGE,
@@ -602,11 +607,12 @@ fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> El {
         format!("md-{}", m.key),
         p,
         k,
-    ));
+    )?;
+    let mut body = col().w_full().max_w(BODY_MAX_W).child(rendered);
     if m.edited {
         body = body.child(label("(edited)", st::SMALL, p.text_muted));
     }
-    body
+    Some(body)
 }
 
 fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {

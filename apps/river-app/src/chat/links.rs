@@ -36,9 +36,13 @@ use super::model;
 use super::share_link::{self, parse_share_link};
 use crate::rooms::NODE_AUTHORITY;
 
-/// Most rewrites made to one text; past it the source is returned unchanged (the widget then
-/// shows the text's own links, as it would without this pass).
+/// Most rewrites made to one text. Past it [`prepare`] gives up (`None`) and the caller shows
+/// the text as plain text: handing the widget the unchanged source would switch every
+/// protection here off.
 const MAX_REWRITES: usize = 50;
+/// Longest prepared text (twice `markdown::MAX_SOURCE_BYTES`). A reference definition used many
+/// times expands a short text into many long links; past this [`prepare`] gives up.
+const MAX_OUTPUT_BYTES: usize = 8192;
 /// Longest whitespace-free run examined as a bare link candidate (the web UI's
 /// `MAX_BARE_LINK_CANDIDATE_LEN`).
 const MAX_CANDIDATE_LEN: usize = share_link::MAX_SHARE_LINK_LEN + 128;
@@ -52,10 +56,14 @@ fn options() -> Options {
 /// `src` rewritten so its links to Freenet apps behave as in the web UI (see the module docs).
 /// Cheap, and `src` is returned as it is when nothing needs changing. Call it only on text
 /// that passed `markdown::is_cheap`.
-pub fn prepare(src: &str) -> String {
-    match rewrites(src) {
-        Some(edits) if !edits.is_empty() => apply(src, edits),
-        _ => src.to_owned(),
+///
+/// `None` means the text is too complex to make safe (more than [`MAX_REWRITES`] rewrites, a
+/// result past [`MAX_OUTPUT_BYTES`], overlapping edits): the caller must show it as plain text,
+/// never as the unprepared markdown.
+pub fn prepare(src: &str) -> Option<String> {
+    match rewrites(src)? {
+        edits if edits.is_empty() => Some(src.to_owned()),
+        edits => apply(src, edits),
     }
 }
 
@@ -66,21 +74,24 @@ struct Edit {
     text: String,
 }
 
-fn apply(src: &str, mut edits: Vec<Edit>) -> String {
+fn apply(src: &str, mut edits: Vec<Edit>) -> Option<String> {
     edits.sort_by_key(|e| e.start);
     let mut out = String::with_capacity(src.len() + edits.len() * 64);
     let mut cursor = 0;
     for e in edits {
         if e.start < cursor || e.end < e.start || e.end > src.len() {
             // Overlapping edits cannot happen by construction; never guess if they do.
-            return src.to_owned();
+            return None;
         }
         out.push_str(&src[cursor..e.start]);
         out.push_str(&e.text);
         cursor = e.end;
+        if out.len() > MAX_OUTPUT_BYTES {
+            return None;
+        }
     }
     out.push_str(&src[cursor..]);
-    out
+    (out.len() <= MAX_OUTPUT_BYTES).then_some(out)
 }
 
 /// A link found in the source, collected from its parser events.
@@ -98,6 +109,8 @@ struct Link {
     label_end: usize,
     /// Tooltips of images inside the label.
     img_titles: Vec<String>,
+    /// Whether another link (an autolink) sits inside the label.
+    nested: bool,
 }
 
 impl Link {
@@ -112,6 +125,7 @@ impl Link {
             label_start: None,
             label_end: 0,
             img_titles: Vec::new(),
+            nested: false,
         }
     }
 
@@ -126,6 +140,10 @@ impl Link {
             }
             Event::SoftBreak | Event::HardBreak => {
                 self.text.push('\n');
+                self.plain_only = false;
+            }
+            Event::Start(Tag::Link { .. }) => {
+                self.nested = true;
                 self.plain_only = false;
             }
             Event::Start(Tag::Image { title, .. }) => {
@@ -149,10 +167,19 @@ fn rewrites(src: &str) -> Option<Vec<Edit>> {
     // Source ranges of text rendered as plain prose: not code, not inside a link or an image.
     let mut prose: Vec<(usize, usize)> = Vec::new();
     let mut link: Option<Link> = None;
+    // Links opened inside `link` (an autolink in a label): the label goes on across them, and
+    // the outer link ends at its own closing event, not at theirs.
+    let mut inner_links = 0usize;
     let (mut in_image, mut in_code_block) = (0usize, false);
     for (ev, range) in Parser::new_ext(src, options()).into_offset_iter() {
         if let Some(l) = link.as_mut() {
-            if matches!(ev, Event::End(TagEnd::Link)) {
+            if matches!(ev, Event::Start(Tag::Link { .. })) {
+                inner_links += 1;
+                l.child(&ev, &range);
+            } else if matches!(ev, Event::End(TagEnd::Link)) && inner_links > 0 {
+                inner_links -= 1;
+                l.child(&ev, &range);
+            } else if matches!(ev, Event::End(TagEnd::Link)) {
                 let done = link.take().expect("checked above");
                 if let Some(text) = rewrite_link(&done, src) {
                     edits.push(Edit {
@@ -208,7 +235,7 @@ fn rewrite_link(l: &Link, src: &str) -> Option<String> {
     // The label's markdown: its own source when that is safe to move (no backslash escapes to
     // misread), else its text escaped.
     let label_md = || match l.label_start {
-        Some(a) if l.kind != LinkType::Autolink => src
+        Some(a) if l.kind != LinkType::Autolink && !l.nested => src
             .get(a..l.label_end)
             .filter(|s| !s.contains('\\') && !s.is_empty())
             .map_or_else(|| escape_md(label), str::to_owned),
@@ -238,6 +265,15 @@ fn rewrite_link(l: &Link, src: &str) -> Option<String> {
         if unlink {
             return Some(unlinked_md(label));
         }
+    } else if !(l.dest == label && has_scheme_and_authority(label))
+        && label_contradicts_destination(label, title, &l.img_titles, None)
+    {
+        // Stricter than the web UI, which leaves such a link live: a label that names a
+        // contract (or a `freenet:` id) and a destination that is not on the node, as
+        // `[freenet:<A>](https://evil.example/)` with the id mangled, or a node URL as the
+        // label of an external page. Nothing here opens it on the node, so the label is a
+        // claim nothing backs: show it as text.
+        return Some(unlinked_md(label));
     }
     let new_dest = rewrite_dest(&l.dest);
     let new_label = if l.dest == label {
@@ -251,7 +287,9 @@ fn rewrite_link(l: &Link, src: &str) -> Option<String> {
         return Some(unlinked_md(label));
     }
     if new_dest.is_none() && new_label.is_none() {
-        return None;
+        // A link with another link in its label is flattened to one, so the inner one (any
+        // scheme) does not survive.
+        return l.nested.then(|| link_md(&escape_md(label), dest));
     }
     Some(link_md(&new_label.unwrap_or_else(label_md), dest))
 }
@@ -294,10 +332,9 @@ fn bare_links(src: &str, prose: &[(usize, usize)], edits: &mut Vec<Edit>) {
     let lower = src.to_ascii_lowercase();
     let mut starts: Vec<usize> = Vec::new();
     for scheme in ["freenet:", "http://", "https://"] {
+        // All of them: a text is at most a few KB, and stopping early would leave later
+        // candidates (a URL naming another contract before its path) to the widget.
         starts.extend(lower.match_indices(scheme).map(|(i, _)| i));
-        if starts.len() > 4 * MAX_REWRITES {
-            break;
-        }
     }
     starts.sort_unstable();
     let in_prose = |s: usize, e: usize| {
@@ -917,6 +954,11 @@ fn beautify_freenet_label(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `prepare` for text it can handle.
+    fn prepare(md: &str) -> String {
+        super::prepare(md).expect("prepared")
+    }
 
     const SAMPLE_ID: &str = "UDzGbcWrKN748tYbhvbPCCCQrZc9r9xkN3tUuun5Rts";
     const SAMPLE_ID_2: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
@@ -1611,20 +1653,107 @@ mod tests {
     }
 
     #[test]
-    fn more_than_the_cap_of_rewrites_falls_back_to_the_source() {
+    fn more_than_the_cap_of_rewrites_gives_up_so_the_caller_shows_plain_text() {
         let one = format!("[freenet:{RIVER_ID}](https://evil.example)\n\n");
-        let at_cap = one.repeat(MAX_REWRITES);
-        let out = prepare(&at_cap);
-        assert_ne!(out, at_cap);
+        let out = super::prepare(&one.repeat(MAX_REWRITES)).expect("at the cap");
         assert!(
             opens(&out)
                 .iter()
                 .all(|(d, _)| d.starts_with("http://127.0.0.1:7509/"))
         );
-        let over = one.repeat(MAX_REWRITES + 1);
-        assert_eq!(prepare(&over), over);
+        assert_eq!(super::prepare(&one.repeat(MAX_REWRITES + 1)), None);
         let bare = format!("freenet:{RIVER_ID}\n\n").repeat(MAX_REWRITES + 1);
-        assert_eq!(prepare(&bare), bare);
+        assert_eq!(super::prepare(&bare), None);
+        // The spoof that used to hide behind the cap: many autolinks, then a false label.
+        let spoof = format!(
+            "{}[freenet:{RIVER_ID}/ x](https://evil.example/)",
+            "<ab:c> ".repeat(MAX_REWRITES + 1)
+        );
+        assert_eq!(super::prepare(&spoof), None);
+    }
+
+    #[test]
+    fn the_candidate_cap_counts_all_schemes() {
+        // Plenty of `freenet:` words first must not stop the URLs after them being checked.
+        let url = format!("http://freenet:{RIVER_ID}@evil.example/v1/contract/web/{SAMPLE_ID}/");
+        let few = format!("{} {url}", "freenet:x ".repeat(300));
+        let out = prepare(&few);
+        assert!(opens(&out).is_empty(), "{out:?}");
+        // Over the cap of ACCEPTED candidates: give up.
+        let many = format!("freenet:{RIVER_ID} ").repeat(MAX_REWRITES + 1);
+        assert_eq!(super::prepare(&many), None);
+    }
+
+    #[test]
+    fn a_nested_autolink_in_a_label_does_not_truncate_it() {
+        let (a, b) = (RIVER_ID, SAMPLE_ID);
+        // The spoof is still caught, and no text is deleted.
+        let md = format!("[<ab:c> freenet:{a}](http://evil.example/v1/contract/web/{b}/) tail");
+        let out = prepare(&md);
+        assert!(opens(&out).is_empty(), "{out:?}");
+        let shown = plain(&out);
+        assert!(
+            shown.contains("ab:c") && shown.contains(&format!("freenet:{a}")),
+            "{out:?}"
+        );
+        assert!(shown.ends_with(" tail"), "{out:?}");
+        // An honest label with a nested autolink: one link, flattened, text kept.
+        let md = format!("[see <ab:c> app](http://evil.example/v1/contract/web/{b}/) tail");
+        let out = prepare(&md);
+        let found = opens(&out);
+        assert_eq!(found.len(), 1, "{out:?}");
+        assert_eq!(found[0].0, local(&format!("/v1/contract/web/{b}/")));
+        assert!(
+            found[0].1.contains("ab:c") && plain(&out).ends_with(" tail"),
+            "{out:?}"
+        );
+        // Not rewritten, still flattened: no inner link of another scheme survives.
+        let out = prepare("[x <ab:c> y](https://example.com/) z");
+        assert_eq!(
+            opens(&out),
+            vec![("https://example.com/".to_owned(), "x ab:c y".to_owned())]
+        );
+        // Many nested ones, and a nested one in a nested one's neighbour: no panic, no overlap.
+        let _ = super::prepare(&format!(
+            "[{}](https://e.example/) <ab:c>",
+            "<ab:c>".repeat(20)
+        ));
+    }
+
+    #[test]
+    fn a_label_claiming_a_contract_for_an_external_destination_is_unlinked() {
+        // Stricter than the web UI, which leaves these live: nothing backs the claim.
+        let (a, b) = (RIVER_ID, SAMPLE_ID);
+        for md in [
+            format!("[*freenet:{a}/ app*](https://evil.example/)"),
+            format!("[freenet:{} app](https://evil.example/)", &a[..12]),
+            format!("[http://127.0.0.1:7509/v1/contract/web/{a}](https://evil.example/)"),
+            format!("[open {b}](https://evil.example/)"),
+            format!("[![x](y.png \"freenet:{a}\")](https://evil.example/)"),
+        ] {
+            no_link(&md);
+        }
+        // An ordinary label, and a pasted external URL, stay links.
+        one_link(
+            "[River docs](https://example.com/)",
+            "https://example.com/",
+            "River docs",
+        );
+        let long = format!("https://example.com/{}", "aB".repeat(20));
+        one_link(&format!("[{long}]({long})"), &long, &long);
+    }
+
+    #[test]
+    fn output_is_capped() {
+        // One definition used by many references: each becomes a long link.
+        let dest = format!(
+            "http://h.example/v1/contract/web/{SAMPLE_ID}/{}",
+            "a".repeat(1500)
+        );
+        let md = format!("{}\n\n[r]: {dest}", "[x][r] ".repeat(40));
+        assert_eq!(super::prepare(&md), None);
+        // A few are fine.
+        assert!(super::prepare(&format!("[x][r]\n\n[r]: {dest}")).is_some());
     }
 
     #[test]
@@ -1693,7 +1822,7 @@ mod tests {
             "![](freenet:)\u{0}\u{feff}\r\n".repeat(100),
             "\\".repeat(2000),
         ] {
-            let _ = prepare(&md);
+            let _ = super::prepare(&md);
         }
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }

@@ -885,3 +885,29 @@ fn an_empty_list_says_why_when_the_store_is_missing() {
     );
     assert!(rt.find("no-rooms-hint").is_some());
 }
+
+/// Markdown that `links::prepare` gives up on is shown as the plain text, end to end: the
+/// message's own words, `[label](url)` brackets and all, not the unprepared markdown.
+#[test]
+fn a_message_that_cannot_be_made_safe_is_shown_as_plain_text() {
+    let id = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+    // More than the rewrite cap of links, then a spoofed one.
+    let text = format!(
+        "{}[freenet:{id}](https://evil.example/)",
+        "<ab:c> ".repeat(60)
+    );
+    let rt = node_rooms(|rooms| {
+        let m = rooms[0].messages.last_mut().unwrap();
+        m.text = text.clone();
+        m.md = text.clone();
+    });
+    assert!(shows(&rt, "](https://evil.example/)"), "{:?}", texts(&rt));
+    // The same text, within the cap, is drawn as markdown: the label only, no brackets.
+    let ok = format!("see [freenet:{id}](https://evil.example/)");
+    let rt = node_rooms(|rooms| {
+        let m = rooms[0].messages.last_mut().unwrap();
+        m.text = ok.clone();
+        m.md = ok.clone();
+    });
+    assert!(!shows(&rt, "](https://evil.example/)"), "{:?}", texts(&rt));
+}
