@@ -23,6 +23,11 @@
 //! label check is copied verbatim (`visual_fold.rs`, with a drift test). A change to a rule
 //! belongs in the web file and here in the same commit.
 //!
+//! Deliberately STRICTER than the web UI (which leaves these links live): a label that names a
+//! contract, a `freenet:` id, or a URL on another host than its destination, for a destination
+//! that is not on the node, is unlinked; a text with any link reference definition, or whose
+//! output reads back as different links than `prepare` wrote, is shown as plain text.
+//!
 //! What differs from the web UI because this renders markdown with another engine: the web
 //! rewrites the HTML it generated, this rewrites the markdown source (found with the parser's
 //! source offsets) and the widget draws the result, with its own autolinking turned off: a bare
@@ -35,6 +40,7 @@ use pulldown_cmark::{CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use super::model;
 use super::share_link::{self, parse_share_link};
+use super::visual_fold::is_display_hidden;
 use crate::rooms::NODE_AUTHORITY;
 
 /// Most rewrites made to one text. Past it [`prepare`] gives up (`None`) and the caller shows
@@ -62,10 +68,44 @@ fn options() -> Options {
 /// result past [`MAX_OUTPUT_BYTES`], overlapping edits): the caller must show it as plain text,
 /// never as the unprepared markdown.
 pub fn prepare(src: &str) -> Option<String> {
-    match rewrites(src)? {
-        edits if edits.is_empty() => Some(src.to_owned()),
-        edits => apply(src, edits),
+    let (edits, kept) = rewrites(src)?;
+    if edits.is_empty() {
+        return Some(src.to_owned());
     }
+    // What the links in the output must be: the ones kept as written, and the ones the edits
+    // wrote (each edit parsed on its own).
+    let mut expected = kept;
+    for e in &edits {
+        expected.extend(link_dests(&e.text));
+    }
+    expected.sort();
+    let out = apply(src, edits)?;
+    // The output is parsed again, as the widget will. Text that reads differently next to what
+    // we wrote around it (a `[label](<dest>)` right after a `]` becoming a reference link, a
+    // definition turning a shortcut into a link) shows up as a link we did not write.
+    let mut got = link_dests(&out);
+    got.sort();
+    (got == expected && !has_definitions(&out)).then_some(out)
+}
+
+/// The destination of every link in `md`.
+fn link_dests(md: &str) -> Vec<String> {
+    Parser::new_ext(md, options())
+        .filter_map(|ev| match ev {
+            Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url.into_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `md` has a link reference definition (`[label]: dest`), which can turn any
+/// bracketed text, ours included, into a link elsewhere.
+fn has_definitions(md: &str) -> bool {
+    Parser::new_ext(md, options())
+        .reference_definitions()
+        .iter()
+        .next()
+        .is_some()
 }
 
 /// One replacement of `src[start..end]`.
@@ -112,6 +152,8 @@ struct Link {
     img_titles: Vec<String>,
     /// Whether another link (an autolink) sits inside the label.
     nested: bool,
+    /// Destinations of the links inside the label.
+    inner_dests: Vec<String>,
 }
 
 impl Link {
@@ -127,6 +169,7 @@ impl Link {
             label_end: 0,
             img_titles: Vec::new(),
             nested: false,
+            inner_dests: Vec::new(),
         }
     }
 
@@ -143,7 +186,8 @@ impl Link {
                 self.text.push('\n');
                 self.plain_only = false;
             }
-            Event::Start(Tag::Link { .. }) => {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                self.inner_dests.push(dest_url.to_string());
                 self.nested = true;
                 self.plain_only = false;
             }
@@ -158,17 +202,23 @@ impl Link {
     }
 }
 
-/// The edits `prepare` makes, `None` when there are more than [`MAX_REWRITES`].
-fn rewrites(src: &str) -> Option<Vec<Edit>> {
+/// The edits `prepare` makes and the destinations of the links it leaves as written, `None`
+/// when there are more than [`MAX_REWRITES`] edits or the text has a reference definition
+/// (chat messages have none in practice, and one can redirect any `[bracketed]` text).
+fn rewrites(src: &str) -> Option<(Vec<Edit>, Vec<String>)> {
     let lower = src.to_ascii_lowercase();
     if !src.contains(['[', '<'])
         && !lower.contains("freenet:")
         && !lower.contains("://")
         && !lower.contains("www.")
     {
-        return Some(Vec::new());
+        return Some((Vec::new(), Vec::new()));
+    }
+    if has_definitions(src) {
+        return None;
     }
     let mut edits = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let ticks = longest_backtick_run(src);
     // Source ranges of text rendered as plain prose: not code, not inside a link or an image.
     let mut prose: Vec<(usize, usize)> = Vec::new();
@@ -187,12 +237,16 @@ fn rewrites(src: &str) -> Option<Vec<Edit>> {
                 l.child(&ev, &range);
             } else if matches!(ev, Event::End(TagEnd::Link)) {
                 let done = link.take().expect("checked above");
-                if let Some(text) = rewrite_link(&done, src) {
-                    edits.push(Edit {
+                match rewrite_link(&done, src) {
+                    Some(text) => edits.push(Edit {
                         start: done.range.start,
                         end: done.range.end,
                         text,
-                    });
+                    }),
+                    None => {
+                        kept.push(done.dest.clone());
+                        kept.extend(done.inner_dests.iter().cloned());
+                    }
                 }
             } else {
                 l.child(&ev, &range);
@@ -228,7 +282,7 @@ fn rewrites(src: &str) -> Option<Vec<Edit>> {
         }
     }
     bare_links(src, &prose, ticks, &mut edits);
-    (edits.len() <= MAX_REWRITES).then_some(edits)
+    (edits.len() <= MAX_REWRITES).then_some((edits, kept))
 }
 
 /// What the whole link `[label](dest)` becomes, `None` to leave it as it is.
@@ -279,7 +333,8 @@ fn rewrite_link(l: &Link, src: &str) -> Option<String> {
             return Some(unlinked_md(label));
         }
     } else if !(l.dest == label && has_scheme_and_authority(label))
-        && label_contradicts_destination(label, title, &l.img_titles, None)
+        && (label_contradicts_destination(label, title, &l.img_titles, None)
+            || label_names_another_host(label, &l.dest))
     {
         // Stricter than the web UI, which leaves such a link live: a label that names a
         // contract (or a `freenet:` id) and a destination that is not on the node, as
@@ -305,6 +360,73 @@ fn rewrite_link(l: &Link, src: &str) -> Option<String> {
         return l.nested.then(|| link_md(&escape_md(label), dest));
     }
     Some(link_md(&new_label.unwrap_or_else(label_md), dest))
+}
+
+/// Whether a word of `label` is a URL (`http(s)://…` or `www.…`) whose host is not the host of
+/// `dest`: `[https://paypal.com/login](https://evil.example/)`. Stricter than the web UI, which
+/// leaves such a link live. Only for a destination that is not on the node (the caller has
+/// checked).
+fn label_names_another_host(label: &str, dest: &str) -> bool {
+    let dest_host = host_of(dest);
+    label
+        .split(|c: char| c.is_whitespace() || is_display_hidden(c))
+        .filter(|w| {
+            starts_with_ci(w, "http://")
+                || starts_with_ci(w, "https://")
+                || starts_with_ci(w, "www.")
+        })
+        .any(|w| {
+            let w = w.trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '/');
+            let host = host_of(w);
+            // Userinfo (`https://paypal.com@evil.example/`) reads as another host.
+            let userinfo = w
+                .split_once("://")
+                .map_or(w, |(_, r)| r)
+                .split(['/', '?', '#'])
+                .next()
+                .is_some_and(|a| a.contains('@'));
+            userinfo || host.is_none() || host != dest_host
+        })
+}
+
+/// The host of an `http(s)://host…` or `www.host…` URL, lowercase, without userinfo, port or
+/// a leading `www.`.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    let host = host
+        .rsplit_once(':')
+        .filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(host, |(h, _)| h);
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// The destination a URL in plain text (the fallback for markdown that cannot be made safe)
+/// should open, `None` when it must not be a link. A gateway URL opens on the reader's node;
+/// anything the markdown path refuses (userinfo, a dot segment, a backslash, hidden or
+/// control characters, a scheme other than http(s)) is refused here too.
+pub fn plain_link_target(url: &str) -> Option<String> {
+    let url = url.trim();
+    if !(starts_with_ci(url, "http://") || starts_with_ci(url, "https://"))
+        || !url
+            .split_once("://")
+            .is_some_and(|(_, r)| r.starts_with(|c: char| c.is_ascii_alphanumeric()))
+        || url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || is_display_hidden(c))
+        || url.contains('\\')
+        || pasted_url_poses_before_its_path(url)
+    {
+        return None;
+    }
+    match node_destination(Some(url)) {
+        Some(Some(_)) => rewrite_dest(url),
+        Some(None) if !plain_absolute_url(url) => None,
+        _ => Some(url.to_owned()),
+    }
 }
 
 /// A destination rewritten to the reader's node, if it names a Freenet web contract on any
@@ -396,7 +518,9 @@ fn bare_links(src: &str, prose: &[(usize, usize)], ticks: usize, edits: &mut Vec
             let token = trim_candidate(&src[start..run_end]);
             let end = start + token.len();
             // A `!` before `[` would make an image: only code is safe there.
-            let after_bang = src[..start].ends_with('!');
+            // A `!` or `]` before `[` would make an image or a reference link: only code (or,
+            // for a share link, nothing) is safe there.
+            let after_bang = src[..start].ends_with(['!', ']']);
             let text = if !is_url {
                 match parse_share_link(token) {
                     Some(target) if !after_bang => {
@@ -436,7 +560,7 @@ fn url_md(token: &str, as_code: bool, ticks: usize) -> Option<String> {
         return None;
     }
     // Cannot be fully read: a backslash is `/` to a browser.
-    if as_code || token.contains('\\') {
+    if as_code || token.contains('\\') || token.chars().any(is_display_hidden) {
         return Some(code_span(token, ticks));
     }
     // A pasted URL's text before its path must not read as another destination, whatever the
@@ -1217,7 +1341,6 @@ mod tests {
             format!("```\nfreenet:{RIVER_ID}\n```"),
             format!("    freenet:{RIVER_ID}"),
             format!("`x` `https://evil.example/v1/contract/web/{RIVER_ID}/`"),
-            format!("[ref]: freenet:{RIVER_ID}"),
         ] {
             assert_eq!(prepare(&md), md, "{md:?}");
         }
@@ -1897,6 +2020,106 @@ mod tests {
         );
     }
 
+    /// Text that reads differently once our rewrite sits next to it must not become a link we
+    /// did not write.
+    #[test]
+    fn a_rewrite_cannot_join_the_text_around_it_into_another_link() {
+        let (a, b) = (RIVER_ID, SAMPLE_ID);
+        // The reviewer's input: a bare URL right after `]`, and a definition for its label.
+        let md =
+            format!("[freenet:{b}]http://x.co\n\n[http\\:\\/\\/x\\.co]: https://evil.example/");
+        assert_eq!(super::prepare(&md), None);
+        // Without the definition the URL right after `]` is code, not a link.
+        let out = prepare(&format!("[freenet:{b}]http://x.co"));
+        assert!(opens(&out).is_empty(), "{out:?}");
+        // A shortcut link redirected by a definition; images likewise.
+        for md in [
+            format!("[foo] freenet:{a}\n\n[foo]: https://evil.example/"),
+            format!("[freenet:{a}](https://e.example/) [foo]\n\n[foo]: https://evil.example/"),
+            "![x]http://x.co\n\n[x]: https://evil.example/i.png".to_string(),
+            "![x] [x]\n\n[x]: https://evil.example/".to_string(),
+        ] {
+            assert_eq!(super::prepare(&md), None, "{md:?}");
+        }
+        // `!` and `]` before a share link: left alone.
+        for md in [
+            format!("]freenet:{a}"),
+            format!("!freenet:{a}"),
+            format!("[x]freenet:{a}"),
+        ] {
+            let out = prepare(&md);
+            assert!(opens(&out).is_empty(), "{md:?} -> {out:?}");
+        }
+        // The check on the output: the links read back are exactly the ones written.
+        let out = prepare(&format!(
+            "[Atlas](http://h.example/v1/contract/web/{b}/) freenet:{a}"
+        ));
+        assert_eq!(opens(&out).len(), 2);
+    }
+
+    #[test]
+    fn a_label_naming_another_host_is_unlinked() {
+        for md in [
+            "[https://paypal.com/login](https://evil.example/)",
+            "[Sign in at www.bank.com](https://evil.example/)",
+            "[www.bank.com](https://evil)",
+            "[![https://paypal.com](x.png)](https://evil.example/)",
+            "[HTTPS://PayPal.com](https://evil.example/)",
+            "[https://paypal.com@evil.example/](https://evil.example/)",
+        ] {
+            no_link(md);
+        }
+        // The same host (any path, port, case, `www.`) links.
+        for md in [
+            "[https://freenet.org](https://freenet.org/x)",
+            "[www.freenet.org/a](https://freenet.org:8080/x)",
+            "[see HTTPS://Freenet.ORG/a.](https://www.freenet.org/)",
+            "[River](https://freenet.org/)",
+        ] {
+            assert_eq!(opens(&prepare(md)).len(), 1, "{md}");
+        }
+    }
+
+    #[test]
+    fn hidden_characters_in_a_url_make_it_code() {
+        for ch in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{FEFF}'] {
+            let out = prepare(&format!("see http://exa{ch}mple.com/x ok"));
+            assert!(
+                opens(&out).is_empty() && out.contains('`'),
+                "{ch:?}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plain_text_fallback_links_only_what_the_markdown_path_would() {
+        let (a, b) = (RIVER_ID, SAMPLE_ID);
+        let ok = |u: &str| plain_link_target(u);
+        assert_eq!(
+            ok("https://example.com/a?b=c"),
+            Some("https://example.com/a?b=c".into())
+        );
+        assert_eq!(
+            ok(&format!("http://gw.example/v1/contract/web/{b}/x")),
+            Some(local(&format!("/v1/contract/web/{b}/x")))
+        );
+        for bad in [
+            format!("http://freenet:{a}@evil.example/"),
+            "http://user@evil.example/".to_owned(),
+            format!("http://h.example/v1/contract/web/{b}/../x"),
+            format!("http://h.example/v1/contract/web/{b}/%2e%2e/x"),
+            "http://h.example/a\\b".to_owned(),
+            "http://h.example/a\u{202E}b".to_owned(),
+            "http://h.example/a\u{200B}b".to_owned(),
+            "http://h.exa\nmple/".to_owned(),
+            "javascript:alert(1)".to_owned(),
+            "ftp://h.example/".to_owned(),
+            "http://".to_owned(),
+        ] {
+            assert_eq!(ok(&bad), None, "{bad:?}");
+        }
+    }
+
     #[test]
     fn output_is_capped() {
         // One definition used by many references: each becomes a long link.
@@ -1906,8 +2129,8 @@ mod tests {
         );
         let md = format!("{}\n\n[r]: {dest}", "[x][r] ".repeat(40));
         assert_eq!(super::prepare(&md), None);
-        // A few are fine.
-        assert!(super::prepare(&format!("[x][r]\n\n[r]: {dest}")).is_some());
+        // Any definition at all: plain text.
+        assert_eq!(super::prepare(&format!("[x][r]\n\n[r]: {dest}")), None);
     }
 
     #[test]
@@ -1942,7 +2165,6 @@ mod tests {
                 "[x](javascript:alert(1)) [y](file:///etc/passwd) [z](freenet:{a}) [w](//evil.example/)"
             ),
             format!("[a](<> ) [b]() [c](#frag) [d](mailto:a@b.c) <a@b.c> <freenet:{a}>"),
-            format!("[ref][r] [r2]\n\n[r]: javascript:alert(1)\n[r2]: /v1/contract/web/{b}/"),
             format!("[@x]({chip}) [@y](rvm-1:self)"),
             format!("[{a}](/v1/contract/web/{b}/) [freenet:{b}](ftp://x/)"),
         ] {

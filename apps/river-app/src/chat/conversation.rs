@@ -5,6 +5,7 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::{Kit, TextInput};
 
 use super::icons;
+use super::links;
 use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
@@ -564,10 +565,15 @@ fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
         return body;
     }
     let mut content = m.text.clone();
-    let links = model::links(&m.text);
+    // Only URLs that pass the same checks as the markdown path, each to where it is safe to go
+    // (a gateway URL opens on this node).
+    let links: Vec<(std::ops::Range<usize>, String)> = model::links(&m.text)
+        .into_iter()
+        .filter_map(|r| links::plain_link_target(&m.text[r.clone()]).map(|u| (r, u)))
+        .collect();
     let mut spans: Vec<rune::Span> = links
         .iter()
-        .map(|r| {
+        .map(|(r, _)| {
             rune::Span::new(r.start, r.end)
                 .color(p.accent)
                 .underline(p.accent_line)
@@ -588,12 +594,13 @@ fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
         .w_full()
         .max_w(BODY_MAX_W)
         .selectable(true);
-    for r in links {
-        let url = m.text[r.clone()].to_owned();
+    for (r, url) in links {
         body = body.link(rune::Link::new(r, url).hover(rune::LinkPaint::new().underline(p.accent)));
     }
     body.on_link(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
-        let _ = tx.open_url(url);
+        if markdown::openable(url) {
+            let _ = tx.open_url(url.trim());
+        }
     })
 }
 
