@@ -61,10 +61,12 @@ test.describe("Native reaction chip actions", () => {
     await expect(crab).toHaveAttribute("data-own-reaction", "true");
     await expect(count(crab)).toHaveText("2");
     await expect(crab).toHaveAccessibleName("🦀, 2 reactions, you reacted");
+    await expect(crab, "the reader's own chip is not a toggle either").not.toHaveAttribute("aria-pressed");
     await expect(owners(page)).toHaveCount(0);
     await heart.click();
     await expect(heart).toHaveAttribute("data-own-reaction", "true");
     await expect(count(heart)).toHaveText("2");
+    await expect(heart, "nor the chip a switch made the reader's").not.toHaveAttribute("aria-pressed");
     await expect(crab).toHaveAttribute("data-own-reaction", "false");
     await expect(count(crab)).toHaveText("1");
     await heart.click();
@@ -127,8 +129,16 @@ test.describe("Native reaction chip actions", () => {
     await expect(owners(page)).toHaveCount(0);
     await expect(crab).toBeFocused();
     await expect(count(crab)).toHaveText("2");
+    // The reader's through the list's React: still named for its state, and
+    // still not a toggle, closed or with its list open.
+    await expect(crab).toHaveAttribute("data-own-reaction", "true");
+    await expect(crab).toHaveAccessibleName("🦀, 2 reactions, you reacted");
+    await expect(crab, "the list's React does not make it a toggle").not.toHaveAttribute("aria-pressed");
     await crab.press("Enter");
     await expect(owners(page).getByTestId("reaction-remove")).toBeVisible();
+    await expect(crab).toHaveAttribute("aria-expanded", "true");
+    await expect(crab).toHaveAccessibleName("🦀, 2 reactions, you reacted");
+    await expect(crab, "nor while its list offers Remove").not.toHaveAttribute("aria-pressed");
     await expect(owners(page).getByTestId("reaction-owner")).toHaveText(["Test Sender B", "You"]);
     await owners(page).getByTestId("reaction-remove").click();
     await expect(count(crab)).toHaveText("1");
