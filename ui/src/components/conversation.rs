@@ -5012,6 +5012,13 @@ fn MessageGroupComponent(
                                                                     },
                                                                     onkeydown: move |e: KeyboardEvent| {
                                                                         let key = e.key();
+                                                                        // A held Enter repeats, and each repeat would
+                                                                        // click the chip that took focus when the reader's
+                                                                        // own chip left with its reaction: no click.
+                                                                        if key == Key::Enter && e.is_auto_repeating() {
+                                                                            e.prevent_default();
+                                                                            return;
+                                                                        }
                                                                         if key == Key::Escape {
                                                                             // Only this chip's own list: an Escape
                                                                             // with none open is left to close the

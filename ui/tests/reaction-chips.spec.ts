@@ -128,6 +128,51 @@ for (const width of [390, 1280]) {
         await step(heart, [[heart, false, "1"], [crab, false, "1"]], 1, "takes back");
       });
     }
+
+    // Enter's click on the reader's sole reaction removes the chip and hands
+    // focus to the next one. A held Enter's repeats must not click that chip.
+    test("held Enter removes only the reader's reaction after focus moves to another chip", async ({ page }) => {
+      const row = await openRoomWithTarget(page);
+      await callRiverTest(page, "memberReactsToNewest", "🦀");
+      await pick(page, row, "👍");
+      const crab = chip(row, "🦀");
+      const thumb = chip(row, "👍");
+      await expectChip(crab, false, "1", "premise: 🦀");
+      await expectChip(thumb, true, "1", "premise: 👍");
+      expect(await order(row), "premise: the row's two chips").toEqual(["🦀", "👍"]);
+      await settle(page);
+      const before = await signs(page);
+
+      await keyboardFocus(page, thumb);
+      // `page.keyboard`, not a locator's `press`, which would refocus.
+      await page.keyboard.down("Enter");
+      try {
+        await expect(thumb, "the reader's reaction is taken back").toHaveCount(0);
+        await expect(crab, "focus moves to the surviving chip").toBeFocused();
+        await expect.poll(() => signs(page), { message: "the first press signed once" }).toBe(before + 1);
+        // Each further `down` before the `up` is an auto-repeat.
+        for (let i = 1; i <= 4; i++) {
+          await page.keyboard.down("Enter");
+          await settle(page);
+          await expectChip(crab, false, "1", `repeat ${i}: 🦀`);
+          await expect(crab, `repeat ${i}: 🦀 keeps focus`).toBeFocused();
+          expect(await signs(page), `repeat ${i}: nothing more signed`).toBe(before + 1);
+        }
+      } finally {
+        await page.keyboard.up("Enter");
+      }
+      await settle(page);
+      expect(await order(row), "one chip is left").toEqual(["🦀"]);
+      await expectChip(crab, false, "1", "after release: 🦀");
+      await expect(owners(page), "no reactor list").toHaveCount(0);
+      await expect(sheet(page), "no message sheet").toBeHidden();
+      expect(await signs(page), "after release: one action signed").toBe(before + 1);
+
+      // A fresh press after the release reacts.
+      await page.keyboard.press("Enter");
+      await expectChip(crab, true, "2", "a fresh Enter");
+      await expect.poll(() => signs(page), { message: "a fresh Enter signs once" }).toBe(before + 2);
+    });
   });
 }
 
