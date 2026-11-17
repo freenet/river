@@ -3698,39 +3698,6 @@ impl ChipHold {
     }
 }
 
-/// Shift+Enter or Shift+Space on a reaction chip, at 48rem and wider, opens
-/// its reactor list and does not react. The chip is a button, which answers
-/// Enter and Space with a click, so that key press must send none. Its
-/// keydown is prevented, which is enough in Chromium, Firefox and WebKit: a
-/// Shift+Space keyup that lands on the chip sends no click in any of them
-/// (measured 2026-11-17). The keyup is prevented too, when it reaches the
-/// chip, for an engine that clicks Space on its keyup regardless. Not a
-/// signal: nothing renders from it.
-#[derive(Default)]
-struct ChipListKey {
-    /// The chip whose list the key opened.
-    opened: Option<String>,
-}
-
-impl ChipListKey {
-    /// Shift+Enter or Shift+Space went down on `key` and opened its list.
-    fn open(&mut self, key: &str) {
-        self.opened = Some(key.to_string());
-    }
-
-    /// Plain Enter or Space went down on a chip: the click its keyup sends
-    /// is its own.
-    fn forget(&mut self) {
-        self.opened = None;
-    }
-
-    /// Enter or Space came up on `key`: whether it is the key that opened
-    /// that chip's list, whose keyup must send no click.
-    fn lift(&self, key: &str) -> bool {
-        self.opened.as_deref() == Some(key)
-    }
-}
-
 /// Where the reactor list for a chip opens, from a point on the chip (its
 /// centre, for a held finger and for Shift+Enter): below unless there is
 /// more room above, and toward whichever side of the window has more room.
@@ -4145,8 +4112,6 @@ fn MessageGroupComponent(
     }
     // A finger resting on a reaction chip in this group; see `ChipHold`.
     let chip_hold = use_hook(|| Rc::new(std::cell::RefCell::new(ChipHold::default())));
-    // Shift+Enter or Shift+Space on one of its chips; see `ChipListKey`.
-    let chip_list_key = use_hook(|| Rc::new(std::cell::RefCell::new(ChipListKey::default())));
     {
         // (key, message id) of the list that was open on the last run.
         let owners_focus = use_hook(|| Rc::new(std::cell::RefCell::new(None::<(String, String)>)));
@@ -4806,7 +4771,6 @@ fn MessageGroupComponent(
                                                         let emoji_for_remove = emoji_for_click.clone();
                                                         let owners_key_for_click = owners_key.clone();
                                                         let owners_key_for_key = owners_key.clone();
-                                                        let owners_key_for_keyup = owners_key.clone();
                                                         let owners_key_for_press = owners_key.clone();
                                                         let row_id_for_click = row_id_for_chips.clone();
                                                         let row_id_for_owners_key = row_id_for_chips.clone();
@@ -4821,8 +4785,6 @@ fn MessageGroupComponent(
                                                         let chip_hold_cancel = chip_hold.clone();
                                                         let chip_hold_click = chip_hold.clone();
                                                         let chip_hold_backdrop = chip_hold.clone();
-                                                        let list_key_down = chip_list_key.clone();
-                                                        let list_key_up = chip_list_key.clone();
                                                         let owners_key_for_backdrop = owners_key.clone();
                                                         let owners_dialog_id = reaction_owners_dialog_id(&owners_key);
 
@@ -5011,13 +4973,14 @@ fn MessageGroupComponent(
                                                                             return;
                                                                         }
                                                                         if !shift_lists_reactors(mobile_surface::narrow_now(), e.modifiers().shift()) {
-                                                                            list_key_down.borrow_mut().forget();
                                                                             return;
                                                                         }
-                                                                        // No click for this key press: it does not
-                                                                        // react as well.
+                                                                        // No click for this key press, so it does not
+                                                                        // react as well: a button clicks for Enter or
+                                                                        // Space only when their keydown is not
+                                                                        // prevented (Chromium, Firefox and WebKit,
+                                                                        // checked 2026-11-17).
                                                                         e.prevent_default();
-                                                                        list_key_down.borrow_mut().open(&owners_key_for_key);
                                                                         let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
                                                                         let popover = reaction_owners_popover_at(
                                                                             owners_key_for_key.clone(),
@@ -5028,17 +4991,6 @@ fn MessageGroupComponent(
                                                                         crate::util::defer(move || {
                                                                             reactions.open_owner_list(open_reaction_owners, popover)
                                                                         });
-                                                                    },
-                                                                    onkeyup: move |e: KeyboardEvent| {
-                                                                        // In case an engine clicks Space on its keyup
-                                                                        // though the keydown was prevented.
-                                                                        let key = e.key();
-                                                                        let space = matches!(&key, Key::Character(c) if c == " ");
-                                                                        if (key == Key::Enter || space)
-                                                                            && list_key_up.borrow().lift(&owners_key_for_keyup)
-                                                                        {
-                                                                            e.prevent_default();
-                                                                        }
                                                                     },
                                                                     span { class: "text-[15px] leading-none", "{emoji}" }
                                                                     span { "data-testid": "reaction-chip-count", class: "tabular-nums", "{count}" }
@@ -5143,28 +5095,6 @@ mod tests {
         );
         assert!(!shift_lists_reactors(true, false));
         assert!(!shift_lists_reactors(true, true), "below 48rem: no list");
-    }
-
-    /// Shift+Enter or Shift+Space opened a chip's list: its keyup on that
-    /// chip is that key press's, and sends no click.
-    #[test]
-    fn the_key_that_lists_reactors_sends_no_press() {
-        let mut list_key = ChipListKey::default();
-        assert!(!list_key.lift("a"), "a plain key's keyup is its own");
-
-        list_key.open("a");
-        assert!(!list_key.lift("b"), "another chip's keyup");
-        assert!(list_key.lift("a"), "that key's keyup");
-    }
-
-    /// The keyup usually lands on the list, which has focus by then. A plain
-    /// Enter or Space the reader presses next on the chip is a press.
-    #[test]
-    fn a_press_after_the_key_that_lists_reactors_is_its_own() {
-        let mut list_key = ChipListKey::default();
-        list_key.open("a");
-        list_key.forget();
-        assert!(!list_key.lift("a"), "plain Space: its keyup clicks");
     }
 
     #[test]
