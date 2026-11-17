@@ -25,10 +25,11 @@
 //!
 //! What differs from the web UI because this renders markdown with another engine: the web
 //! rewrites the HTML it generated, this rewrites the markdown source (found with the parser's
-//! source offsets) and the widget draws the result. An unlinked label is its visible text with
+//! source offsets) and the widget draws the result, with its own autolinking turned off: a bare
+//! URL is a link only where `prepare` wrote one. An unlinked label is its visible text with
 //! punctuation escaped (emphasis inside it is dropped), a pasted URL that must not be a link is
-//! shown as inline code (the widget would link plain text itself), and a `\` in a gateway URL
-//! after the contract id is refused (a browser reads it as `/`).
+//! shown as inline code (fenced longer than any backtick run in the message), and a `\` in a
+//! URL is refused (a browser reads it as `/`).
 
 use pulldown_cmark::{CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 
@@ -160,10 +161,15 @@ impl Link {
 /// The edits `prepare` makes, `None` when there are more than [`MAX_REWRITES`].
 fn rewrites(src: &str) -> Option<Vec<Edit>> {
     let lower = src.to_ascii_lowercase();
-    if !src.contains(['[', '<']) && !lower.contains("freenet:") && !lower.contains("://") {
+    if !src.contains(['[', '<'])
+        && !lower.contains("freenet:")
+        && !lower.contains("://")
+        && !lower.contains("www.")
+    {
         return Some(Vec::new());
     }
     let mut edits = Vec::new();
+    let ticks = longest_backtick_run(src);
     // Source ranges of text rendered as plain prose: not code, not inside a link or an image.
     let mut prose: Vec<(usize, usize)> = Vec::new();
     let mut link: Option<Link> = None;
@@ -221,9 +227,7 @@ fn rewrites(src: &str) -> Option<Vec<Edit>> {
             return None;
         }
     }
-    if !bare_links(src, &prose, &mut edits) {
-        return None;
-    }
+    bare_links(src, &prose, ticks, &mut edits);
     (edits.len() <= MAX_REWRITES).then_some(edits)
 }
 
@@ -333,32 +337,25 @@ fn rewrite_dest(dest: &str) -> Option<String> {
     None
 }
 
-/// Bare share links and bare gateway URLs in prose, each as an edit.
+/// Every bare `freenet:` share link and `http://`, `https://` or `www.` URL in prose, each as an
+/// edit: a checked `[label](dest)`, or an inline code span (shown, not clickable). The widget
+/// is told not to link anything bare (`Markdown::autolink(false)`), so a token left alone is
+/// plain text and harmless; nothing it would have linked is left unchecked.
 ///
-/// keep in sync with `extract_bare_freenet_links` (the scan and its trimming) and with the
-/// GFM autolinks the web UI's markdown crate makes of a pasted URL.
+/// Both label and destination are made from the token's own source text, so what is shown and
+/// where it goes cannot differ (an entity such as `&#114;` stays the literal text it is). A
+/// token the checks cannot fully read (a backslash, too long) is shown as code.
 ///
-/// Returns `false` when a pasted URL cannot be classified (it runs across markup the scan does
-/// not understand): the caller then shows the whole text as plain text, since the widget would
-/// link that URL by itself unchecked.
-fn bare_links(src: &str, prose: &[(usize, usize)], edits: &mut Vec<Edit>) -> bool {
+/// keep in sync with `extract_bare_freenet_links` (the scan and its trimming) and with the GFM
+/// autolinks the web UI's markdown crate makes of a pasted URL.
+fn bare_links(src: &str, prose: &[(usize, usize)], ticks: usize, edits: &mut Vec<Edit>) {
     let lower = src.to_ascii_lowercase();
     let mut starts: Vec<usize> = Vec::new();
-    for scheme in ["freenet:", "http://", "https://"] {
-        // All of them: a text is at most a few KB, and stopping early would leave later
-        // candidates (a URL naming another contract before its path) to the widget.
+    // All of them: a text is at most a few KB.
+    for scheme in ["freenet:", "http://", "https://", "www."] {
         starts.extend(lower.match_indices(scheme).map(|(i, _)| i));
     }
     starts.sort_unstable();
-    let in_prose = |s: usize, e: usize| {
-        let i = prose.partition_point(|&(_, pe)| pe < e);
-        prose.get(i).is_some_and(|&(ps, pe)| ps <= s && e <= pe)
-    };
-    // Whether the byte at `s` is prose at all (not code, a link, an image).
-    let starts_in_prose = |s: usize| {
-        let i = prose.partition_point(|&(_, pe)| pe <= s);
-        prose.get(i).is_some_and(|&(ps, _)| ps <= s)
-    };
     // End of the last candidate taken; a later one that starts inside it is part of it.
     let mut claimed_until = 0;
     for start in starts {
@@ -370,78 +367,102 @@ fn bare_links(src: &str, prose: &[(usize, usize)], edits: &mut Vec<Edit>) -> boo
         {
             continue;
         }
-        // The widget's autolink ends at whitespace, a control character, `<` or `>`; a table
-        // cell also ends at `|`.
-        let run_end = src[start..]
-            .find(|c: char| c.is_whitespace() || c.is_control() || matches!(c, '|' | '<' | '>'))
-            .map_or(src.len(), |p| start + p);
-        let is_url = starts_with_ci(&src[start..], "http");
-        if run_end - start > MAX_CANDIDATE_LEN {
-            // Too long to be checked, and the widget would link it: show it as code.
-            if is_url && starts_in_prose(start) {
-                claimed_until = run_end;
+        // The run of prose it sits in (code, links and images are none of ours); a token never
+        // runs past it, which is also where a table cell ends.
+        let i = prose.partition_point(|&(_, pe)| pe <= start);
+        let Some(&(ps, pe)) = prose.get(i) else {
+            continue;
+        };
+        if ps > start {
+            continue;
+        }
+        // The widget's own rule for the end of a URL: whitespace, a control character, `<`, `>`.
+        let run_end = src[start..pe]
+            .find(|c: char| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>'))
+            .map_or(pe, |p| start + p);
+        let is_url = !starts_with_ci(&src[start..], "freenet:");
+        let (end, text) = if run_end - start > MAX_CANDIDATE_LEN {
+            // Too long to be checked.
+            claimed_until = run_end;
+            if is_url {
                 edits.push(Edit {
                     start,
                     end: run_end,
-                    text: code_span(&src[start..run_end]),
+                    text: code_span(&src[start..run_end], ticks),
                 });
             }
             continue;
-        }
-        let token = trim_candidate(&src[start..run_end]);
-        let end = start + token.len();
-        if !in_prose(start, end) {
-            // Not prose (code, a link, an image): none of ours. But a URL that starts in prose
-            // and runs on into markup is one the widget links and we cannot read.
-            if is_url && starts_in_prose(start) {
-                return false;
-            }
-            continue;
-        }
-        // A link or image sign here would join `[label](dest)` into an image.
-        let after_bang = src[..start].ends_with('!');
-        if after_bang && !is_url {
-            continue;
-        }
-        let text = if after_bang {
-            // Only code is safe next to a `!`; a URL the widget would link is shown as code.
-            bare_gateway_url(token).map(|_| code_span(token))
-        } else if let Some(target) = parse_share_link(token) {
-            // keep in sync with the share-link step of `finalize_anchors`.
-            Some(link_md(&escape_md(token), &node_url(&target.local_path())))
-        } else if starts_with_ci(token, "http") {
-            bare_gateway_url(token)
         } else {
-            continue;
+            let token = trim_candidate(&src[start..run_end]);
+            let end = start + token.len();
+            // A `!` before `[` would make an image: only code is safe there.
+            let after_bang = src[..start].ends_with('!');
+            let text = if !is_url {
+                match parse_share_link(token) {
+                    Some(target) if !after_bang => {
+                        // keep in sync with the share-link step of `finalize_anchors`.
+                        link_md(&escape_md(token), &node_url(&target.local_path()))
+                    }
+                    _ => continue,
+                }
+            } else {
+                match url_md(token, after_bang, ticks) {
+                    Some(text) => text,
+                    None => continue,
+                }
+            };
+            (end, text)
         };
         // Whatever it is, a URL is one unit: nothing inside it is a link of its own.
         claimed_until = end;
-        if let Some(text) = text {
-            edits.push(Edit { start, end, text });
-        }
+        edits.push(Edit { start, end, text });
     }
-    true
 }
 
-/// What a pasted `http(s)://` URL in prose becomes: a link to the reader's node when it is a
-/// gateway URL, inline code when it must not be a link (the widget would link plain text),
-/// `None` when it is some other URL.
+/// What a pasted `http://`, `https://` or `www.` URL in prose becomes: a link to the reader's
+/// node for a share or gateway URL, a link to what it shows for any other URL, inline code when
+/// it must not be a link; `None` when it is not a URL at all.
 ///
 /// keep in sync with `finalize_anchors` (the node-destination step, bare branch).
-fn bare_gateway_url(url: &str) -> Option<String> {
-    match node_destination(Some(url))? {
-        Some(_) if pasted_url_poses_before_its_path(url) => Some(code_span(url)),
-        Some(_) => {
-            let path = rewrite_freenet_href(url)?;
-            let label = beautify_freenet_label(url).unwrap_or_else(|| url.to_owned());
-            Some(link_md(&escape_md(&label), &node_url(&path)))
-        }
-        // An unknown destination (a dot segment, a refused `\`) still must not pose as another.
-        None if !plain_absolute_url(url) || pasted_url_poses_before_its_path(url) => {
-            Some(code_span(url))
-        }
-        None => None,
+fn url_md(token: &str, as_code: bool, ticks: usize) -> Option<String> {
+    let url = if starts_with_ci(token, "www.") {
+        format!("http://{token}")
+    } else {
+        token.to_owned()
+    };
+    // Something to open: a host after the scheme.
+    let after_scheme = url.split_once("://")?.1;
+    if !after_scheme.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
     }
+    // Cannot be fully read: a backslash is `/` to a browser.
+    if as_code || token.contains('\\') {
+        return Some(code_span(token, ticks));
+    }
+    // A pasted URL's text before its path must not read as another destination, whatever the
+    // destination is (userinfo, or a contract id in the host).
+    let poses = pasted_url_poses_before_its_path(&url);
+    let ordinary = || link_md(&escape_md(token), &url);
+    if let Some(target) = parse_share_link(&url) {
+        return Some(if poses {
+            code_span(token, ticks)
+        } else {
+            link_md(&escape_md(token), &node_url(&target.local_path()))
+        });
+    }
+    Some(match node_destination(Some(&url)) {
+        Some(Some(_)) if poses => code_span(token, ticks),
+        Some(Some(_)) => {
+            let path = rewrite_freenet_href(&url)?;
+            let label = beautify_freenet_label(&url).unwrap_or_else(|| token.to_owned());
+            link_md(&escape_md(&label), &node_url(&path))
+        }
+        // An unknown destination (a dot segment, a refused `\`) must not pose as another.
+        Some(None) if !plain_absolute_url(&url) || poses => code_span(token, ticks),
+        Some(None) => ordinary(),
+        None if poses => code_span(token, ticks),
+        None => ordinary(),
+    })
 }
 
 /// `token` without the trailing punctuation the markdown autolink leaves out of a link
@@ -519,22 +540,24 @@ fn escape_md(text: &str) -> String {
     out
 }
 
-/// An unlinked label: its text, which the widget must not turn back into a link. Escaping
-/// stops `freenet:<id>` being read as a share link again; a URL is shown as code instead,
-/// because the widget links a plain `https://…` by itself.
+/// An unlinked label: its text with every punctuation character escaped, so `freenet:<id>` in
+/// it is not read as a share link by a second pass. Nothing links bare text (the widget's own
+/// autolinking is off), so a URL in it is only shown.
 fn unlinked_md(label: &str) -> String {
-    let lower = label.to_ascii_lowercase();
-    if lower.contains("://") || lower.contains("www.") {
-        code_span(label)
-    } else {
-        escape_md(label)
-    }
+    escape_md(label)
 }
 
-fn code_span(text: &str) -> String {
+/// The longest run of backticks in `src`.
+fn longest_backtick_run(src: &str) -> usize {
+    src.split(|c| c != '`').map(str::len).max().unwrap_or(0)
+}
+
+/// `text` as an inline code span. Its fence is longer than any backtick run in the whole
+/// SOURCE (`ticks`), not just in `text`, so no stray backtick earlier in the message can pair
+/// with it and turn the text back into prose.
+fn code_span(text: &str, ticks: usize) -> String {
     let text = text.replace(['\n', '\r'], " ");
-    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest + 1);
+    let fence = "`".repeat(ticks.max(longest_backtick_run(&text)) + 1);
     let pad = if text.starts_with('`') || text.ends_with('`') {
         " "
     } else {
@@ -1012,32 +1035,19 @@ mod tests {
         format!("http://127.0.0.1:7509{path}")
     }
 
-    /// What the widget would draw as links after `prepare`: each explicit link as
-    /// (destination, label text), and each bare `http(s)://` word in plain text, which the
-    /// widget links by itself (as (word, word)).
+    /// What the widget draws as links after `prepare` (it links nothing bare itself): each
+    /// explicit link as (destination, label text).
     fn opens(md: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let mut label: Option<(String, String)> = None;
-        let (mut in_code_block, mut in_image) = (false, 0);
         for ev in Parser::new_ext(md, options()) {
             match ev {
                 Event::Start(Tag::Link { dest_url, .. }) => {
                     label = Some((dest_url.to_string(), String::new()))
                 }
                 Event::End(TagEnd::Link) => out.extend(label.take()),
-                Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
-                Event::End(TagEnd::CodeBlock) => in_code_block = false,
-                Event::Start(Tag::Image { .. }) => in_image += 1,
-                Event::End(TagEnd::Image) => in_image -= 1,
                 Event::Text(t) | Event::Code(t) if label.is_some() => {
                     label.as_mut().unwrap().1.push_str(&t)
-                }
-                Event::Text(t) if !in_code_block && in_image == 0 => {
-                    for w in t.split_whitespace() {
-                        if starts_with_ci(w, "http://") || starts_with_ci(w, "https://") {
-                            out.push((w.to_owned(), w.to_owned()));
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -1317,8 +1327,9 @@ mod tests {
     #[test]
     fn a_backslash_after_the_id_is_not_rewritten() {
         // A browser reads `\` as `/`, so this would be a dot-segment path.
-        let md = format!("see http://h.example/v1/contract/web/{SAMPLE_ID}/a\\..\\x ok");
-        assert_eq!(prepare(&md), md);
+        let url = format!("http://h.example/v1/contract/web/{SAMPLE_ID}/a\\..\\x");
+        let out = prepare(&format!("see {url} ok"));
+        assert_eq!(out, format!("see `{url}` ok"));
         assert!(
             parse_freenet_web_url(&format!(
                 "http://h.example/v1/contract/web/{SAMPLE_ID}/a\\..\\x"
@@ -1329,9 +1340,11 @@ mod tests {
 
     #[test]
     fn non_gateway_urls_and_other_schemes_are_left_alone() {
-        assert_eq!(
-            prepare("see https://example.com/page now"),
-            "see https://example.com/page now"
+        // An ordinary URL is linked by `prepare` (the widget links nothing bare), to what it shows.
+        one_link(
+            "see https://example.com/page now",
+            "https://example.com/page",
+            "https://example.com/page",
         );
         assert_eq!(
             prepare("[a](https://example.com/)"),
@@ -1402,7 +1415,7 @@ mod tests {
         ] {
             for md in [url.clone(), format!("<{url}>"), format!("[{url}]({url})")] {
                 no_link(&md);
-                assert!(prepare(&md).contains(&url), "{md:?}: text kept");
+                assert!(plain(&prepare(&md)).contains(&url), "{md:?}: text kept");
             }
         }
         // Its tooltip is label text too.
@@ -1803,11 +1816,9 @@ mod tests {
             opens(&out).is_empty() && out.contains(&format!("`{long}`")),
             "{out:?}"
         );
-        // A URL that runs into markup the scan cannot read: give up, plain text.
-        assert_eq!(
-            super::prepare(&format!("http://freenet:{a}@evil.example/x*y*z")),
-            None
-        );
+        // A URL that runs into emphasis markup: the part in prose is checked.
+        let out = prepare(&format!("http://freenet:{a}@evil.example/x*y*z"));
+        assert!(opens(&out).is_empty(), "{out:?}");
         // `>` ends the URL, as in the widget (`<` and whitespace already did).
         let out = prepare(&format!("a http://h.example/v1/contract/web/{b}/x>y"));
         assert_eq!(opens(&out).len(), 1, "{out:?}");
@@ -1815,6 +1826,75 @@ mod tests {
         // Next to a `!` a gateway URL is code, never an image.
         let out = prepare(&format!("!http://h.example/v1/contract/web/{b}/"));
         assert!(opens(&out).is_empty() && !out.contains("!["), "{out:?}");
+    }
+
+    /// The widget links nothing bare (`.autolink(false)`), so every bare URL that could have
+    /// been linked is either a link `prepare` wrote and checked, or text. These are the inputs a
+    /// scan that trusted its own reading let through.
+    #[test]
+    fn no_bare_url_is_left_for_the_widget_to_link() {
+        let (a, b) = (RIVER_ID, SAMPLE_ID);
+        // A stray backtick earlier in the message cannot pair with a code span of ours.
+        let md = format!("a ` b http://freenet:{a}@evil.example/v1/contract/web/{b}/ c ` d");
+        let out = prepare(&md);
+        assert!(opens(&out).is_empty(), "{out:?}");
+        let code: Vec<_> = Parser::new_ext(&out, options())
+            .filter_map(|e| match e {
+                Event::Code(c) => Some(c.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            code.iter().any(|c| c.contains("evil.example")),
+            "the URL is code, not prose: {out:?}"
+        );
+        // `|` does not end a URL outside a table: the dot segment after it is read.
+        let out = prepare(&format!("http://h.example/v1/contract/web/{b}/a|/../b"));
+        assert!(opens(&out).is_empty(), "{out:?}");
+        // In a table cell it does end at the cell.
+        let out = prepare(&format!(
+            "|a|b|\n|-|-|\n|http://h.example/v1/contract/web/{b}/x|y|"
+        ));
+        assert_eq!(opens(&out).len(), 1, "{out:?}");
+        // `www.` is checked and linked as http://www.
+        one_link(
+            "go www.example.com/x now",
+            "http://www.example.com/x",
+            "www.example.com/x",
+        );
+        let out = prepare(&format!("www.h.example/v1/contract/web/{b}/"));
+        assert_eq!(opens(&out).len(), 1, "{out:?}");
+        assert!(
+            opens(&out)[0]
+                .0
+                .starts_with("http://127.0.0.1:7509/v1/contract/web/"),
+            "{out:?}"
+        );
+        let out = prepare(&format!("www.freenet:{a}@evil.example/"));
+        assert!(opens(&out).is_empty(), "{out:?}");
+        // An entity in a URL is shown as written and is what the link goes to: no decoding.
+        let out = prepare("http://h.example/?q=&#114;x");
+        let found = opens(&out);
+        assert_eq!(found.len(), 1, "{out:?}");
+        assert!(
+            found[0].0.contains("&#114;") && found[0].1.contains("&#114;"),
+            "{found:?}"
+        );
+        let out = prepare(&format!("http://&#102;reenet:{a}@evil.example/"));
+        assert!(opens(&out).is_empty(), "{out:?}");
+        // The code fence is longer than any backtick run in the message.
+        assert!(code_span("u", 3).starts_with("````"));
+    }
+
+    #[test]
+    fn the_widget_is_told_not_to_autolink() {
+        // Everything above depends on it; `markdown::render` must keep calling it.
+        assert!(
+            include_str!("markdown.rs")
+                .matches(concat!(".autoli", "nk(false)"))
+                .count()
+                >= 1
+        );
     }
 
     #[test]
@@ -1988,7 +2068,7 @@ mod tests {
     #[test]
     fn a_code_span_shows_the_text_whatever_it_holds() {
         for t in ["http://x/", "a`b", "`a", "a``b``c", " x "] {
-            let md = code_span(t);
+            let md = code_span(t, 0);
             let got: Vec<_> = Parser::new_ext(&md, options())
                 .filter_map(|e| match e {
                     Event::Code(c) => Some(c.to_string()),

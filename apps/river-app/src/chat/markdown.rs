@@ -186,6 +186,9 @@ pub fn render(
     let (accent, soft, line, muted) = (p.accent, p.accent_soft, p.accent_line, p.text_muted);
     Some(
         Markdown::new(src)
+            // Nothing is linked unless `links::prepare` wrote it as a link, so a bare URL
+            // it has not checked is only text.
+            .autolink(false)
             .on_link_tx(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
                 if openable(url) {
                     let _ = tx.open_url(url.trim());
