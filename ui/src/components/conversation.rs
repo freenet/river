@@ -4915,6 +4915,7 @@ fn MessageGroupComponent(
                                                                 ),
                                                                 if owners_open {
                                                                     div {
+                                                                        "data-testid": "reaction-owners-backdrop",
                                                                         class: "fixed inset-0 z-40",
                                                                         onclick: move |_| {
                                                                             // The finger whose hold opened the list

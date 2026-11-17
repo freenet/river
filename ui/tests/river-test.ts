@@ -16,7 +16,8 @@ type RiverTestHooks = {
   // Each emoji as a reaction on the newest message, all held by one test author.
   addReactionsToNewest(emojis: string[]): void;
   // A signed reaction from a test member to the newest message; public rooms only.
-  memberReactsToNewest(emoji: string): void;
+  // Given a nickname, from a member of that name.
+  memberReactsToNewest(emoji: string, nickname?: string): void;
   // The current room's avatar salt: 32 bytes of `fill`, or none (neutral avatars).
   setAvatarSalt(fill: number | null): void;
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
