@@ -202,8 +202,8 @@ fn each_room_opens_at_its_newest_message() {
     copy.name = "Town Square copy".into();
     state.chat.edit_rooms(|rooms| rooms.push(copy));
     let town = &state.chat.rooms()[0];
-    let first = format!("msg-{}", town.messages[0].id);
-    let last = format!("msg-{}", town.last_message().unwrap().id);
+    let first = format!("msg-{}", town.messages[0].key);
+    let last = format!("msg-{}", town.last_message().unwrap().key);
     let mut rt = render(state, WINDOW_SIZE);
     assert!(visible(&rt, &last) && !visible(&rt, &first));
     // Scroll Town Square to its top.
@@ -781,6 +781,7 @@ fn a_room_read_here_counts_unread_from_where_it_was_read() {
             time,
             text: "new".into(),
             source: "new".into(),
+            md: String::new(),
             reply_to: None,
             reactions: vec![],
             edited: false,
@@ -795,6 +796,7 @@ fn a_room_read_here_counts_unread_from_where_it_was_read() {
         time: last.time + 2,
         text: "mine".into(),
         source: "mine".into(),
+        md: String::new(),
         reply_to: None,
         reactions: vec![],
         edited: false,

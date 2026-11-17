@@ -302,6 +302,35 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.access = Access::PermissionRemoved;
     }),
+    // Markdown in a room's description and messages, with mention chips.
+    ("chat-markdown", |s| {
+        connect(s);
+        s.chat.edit_rooms(|rooms| {
+            let room = &mut rooms[0];
+            room.description =
+                "The **public** room for everyone using [Freenet](https://freenet.org). Be kind."
+                    .into();
+            let scheme = chat::model::mention_scheme();
+            let last = room.messages.last().map_or(1, |m| m.id + 1);
+            let samples = [
+                format!(
+                    "# Release notes\n\n**Bold**, *italic*, ~~struck~~ and `inline code`.\n\n- one\n- two\n\n> quoted\nnext line\n\nhello [@Maya Chen]({scheme}:member) and [@Sam Rivers]({scheme}:self), see https://freenet.org/ or [a link](https://freenet.org)"
+                ),
+                "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |".into(),
+            ];
+            for (i, md) in samples.into_iter().enumerate() {
+                let mut m = room.messages.last().cloned().expect("example messages");
+                m.id = last + i as u32;
+                m.key = format!("md-sample-{i}");
+                m.text = md.clone();
+                m.source = md.clone();
+                m.md = md;
+                m.reactions.clear();
+                m.reply_to = None;
+                room.messages.push(m);
+            }
+        });
+    }),
     // The node has no chat delegate under the key this build carries, though River registered
     // it.
     ("chat-no-store", |s| {

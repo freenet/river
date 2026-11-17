@@ -9,7 +9,8 @@ publish = false
 
 [dependencies]
 rune.workspace = true
-rune-kit.workspace = true
+rune-kit = { workspace = true, features = ["markdown"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Reading the user's rooms from the local node (src/rooms/). River's own types, with the
 # client-only features the room-contract and chat-delegate WASM builds never enable.

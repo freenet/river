@@ -105,6 +105,50 @@ impl LiveRoom {
         river_core::mention::render_plaintext_transformed(raw, resolve_mention, |name| clean(&name))
     }
 
+    /// Text as written as markdown for display: each mention a link to
+    /// [`model::mention_scheme`] carrying the member's current nickname.
+    fn render_md(&self, raw: &str) -> String {
+        use river_core::mention::{MentionSegment, parse_segments};
+        let state = &self.stored.room_state;
+        let owner = RiverMemberId::from(&self.stored.owner_vk);
+        let me = self
+            .stored
+            .self_verifying_key()
+            .map(|vk| RiverMemberId::from(&vk));
+        let mut out = String::with_capacity(raw.len());
+        for seg in parse_segments(raw) {
+            match seg {
+                MentionSegment::Text(t) => out.push_str(&t),
+                MentionSegment::Mention(m) => {
+                    let id = std::iter::once(owner)
+                        .chain(state.members.members.iter().map(|x| x.member.id()))
+                        .find(|id| m.member_ref.matches(*id));
+                    let name = match id {
+                        Some(id) => self.nickname(id, me),
+                        None => m.display_name,
+                    };
+                    let name = clean(&name);
+                    let name = if name.is_empty() {
+                        "Member".to_owned()
+                    } else {
+                        name
+                    };
+                    let kind = match id {
+                        Some(id) if Some(id) == me => "self",
+                        Some(_) => "member",
+                        None => "unknown",
+                    };
+                    out.push_str(&format!(
+                        "[@{}]({}:{kind})",
+                        escape_markdown(&name),
+                        model::mention_scheme()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// A message's text as written: edited and decrypted, with mention tokens kept, so an edit
     /// of it keeps its mentions. `None` for a private body this computer cannot decrypt, whose
     /// placeholder must never be offered for editing.
@@ -391,6 +435,10 @@ impl LiveRoom {
                 time: minutes(m.message.time),
                 text: texts[i].clone(),
                 source: written[i].clone().unwrap_or_default(),
+                md: written[i]
+                    .as_deref()
+                    .map(|w| self.render_md(w))
+                    .unwrap_or_default(),
                 reply_to,
                 reactions,
                 edited: state.recent_messages.is_edited(&m.id()),
@@ -485,6 +533,19 @@ fn plain_text(content_type: u32, plain: &[u8]) -> String {
         return r.text;
     }
     String::from_utf8_lossy(plain).into_owned()
+}
+
+/// `s` with every ASCII punctuation character backslash-escaped, so it is literal text in
+/// markdown (a name like `a]b(c)` cannot end its own link early).
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The stable key of a River message on screen: its id (a hash of its signature) in decimal.

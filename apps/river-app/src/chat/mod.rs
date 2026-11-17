@@ -12,6 +12,7 @@
 mod conversation;
 pub mod example;
 mod icons;
+mod markdown;
 pub mod model;
 pub(crate) mod style;
 #[cfg(test)]

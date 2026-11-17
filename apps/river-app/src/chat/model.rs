@@ -10,6 +10,19 @@ pub type MemberId = u32;
 /// A message's id within a room.
 pub type MessageId = u32;
 
+/// The link scheme that marks a mention chip in a message's markdown. Random per process and
+/// never shown, so message text cannot forge a chip by writing a link with it.
+pub fn mention_scheme() -> &'static str {
+    use std::hash::{BuildHasher, Hasher};
+    static SCHEME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCHEME.get_or_init(|| {
+        let n = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        format!("rvm-{n:016x}")
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub id: MemberId,
@@ -73,6 +86,10 @@ pub struct Message {
     /// they are stored, where `text` shows names. Empty when this computer can't read the
     /// message, which then can't be edited.
     pub source: String,
+    /// `source` as markdown for display: each mention token a link to `mention_scheme()`
+    /// (`[@name](<scheme>:self|member|unknown)`). Empty when this computer can't read the
+    /// message, whose `text` is then shown as plain text.
+    pub md: String,
     pub reply_to: Option<ReplyTo>,
     pub reactions: Vec<Reaction>,
     pub edited: bool,
@@ -132,6 +149,7 @@ impl Room {
             time,
             text: text.to_owned(),
             source: text.to_owned(),
+            md: text.to_owned(),
             reply_to: None,
             reactions: Vec::new(),
             edited: false,
@@ -337,7 +355,8 @@ pub fn day_label(day: i64, today: i64) -> String {
 /// become one space, and past `max_chars` it is cut at a word boundary, with trailing
 /// punctuation dropped before the "…" so a cut never reads as "up.…".
 pub fn preview(text: &str, max_chars: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stripped = super::markdown::strip(text);
+    let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max_chars {
         return flat;
     }
@@ -407,6 +426,7 @@ mod tests {
             time,
             text: String::new(),
             source: String::new(),
+            md: String::new(),
             reply_to: None,
             reactions: vec![],
             edited: false,
