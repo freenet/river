@@ -6,6 +6,7 @@ import {
   chips,
   coarsePointer,
   committedRow,
+  expectSheetOpenFor,
   hasTouch,
   holdChip,
   openInlinePicker,
@@ -14,7 +15,9 @@ import {
   openSheetFromReact,
   OWN_CHIP,
   palette,
+  plainPointOf,
   press,
+  pressAt,
   reactionChoices,
   selectRoom,
   settle,
@@ -558,6 +561,34 @@ test.describe("Reaction chip below 48rem", () => {
     await expect(chips(row), "the 👍 left with the switch").toHaveCount(1);
     await expect(party).toHaveAttribute("aria-pressed", "true");
     await expect(sheet(page)).toBeHidden();
+  });
+
+  test("a press outside the list only closes it, and the sheet stays closed", async ({ page }) => {
+    const row = await openRoomWithTarget(page);
+    await callRiverTest(page, "memberReactsToNewest", "🎉");
+    const party = chipFor(row, "🎉");
+    const owners = page.getByTestId("reaction-owners");
+    await row.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    // Measured before the list opens: its backdrop then covers the row.
+    const onRow = await plainPointOf(row);
+    const hit = (p: { x: number; y: number }) =>
+      page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute("data-testid"), p);
+    for (const [where, point] of [
+      ["on its own message", onRow],
+      ["far from it", { x: 195, y: 120 }],
+    ] as const) {
+      if (hasTouch()) await party.tap();
+      else await party.press("Enter");
+      await expect(owners).toBeVisible();
+      expect(await hit(point), `premise, ${where}: the press lands on the backdrop`).toBe("reaction-owners-backdrop");
+      await pressAt(page, point);
+      await expect(owners, `${where}: the list closes`).toHaveCount(0);
+      await settle(page);
+      await expect(sheet(page), `${where}: the sheet stays closed`).toBeHidden();
+    }
+    // The same point opens the sheet once no list covers it.
+    await pressAt(page, onRow);
+    await expectSheetOpenFor(page, row);
   });
 });
 

@@ -4914,8 +4914,10 @@ fn MessageGroupComponent(
                                                                     if owners_open { "z-[60]" } else { "" }
                                                                 ),
                                                                 if owners_open {
+                                                                    // Marked itself, not only through the reaction line it is inside.
                                                                     div {
                                                                         "data-testid": "reaction-owners-backdrop",
+                                                                        "data-row-actions": "exclude",
                                                                         class: "fixed inset-0 z-40",
                                                                         onclick: move |_| {
                                                                             // The finger whose hold opened the list
