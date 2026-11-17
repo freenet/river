@@ -5,6 +5,7 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::{Kit, TextInput};
 
 use super::icons;
+use super::links;
 use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
@@ -62,7 +63,7 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
     let mut info = col().grow(1.0).min_w(0.0).gap(2.0).child(title);
     if !room.description.is_empty() {
         // One line of the description, drawn as markdown; what does not fit is cut off.
-        info = info.child(
+        let rendered =
             if markdown::is_one_line(&room.description) && markdown::is_cheap(&room.description) {
                 markdown::render(
                     &room.description,
@@ -73,12 +74,13 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
                     p,
                     k,
                 )
-                .max_h(18.0)
-                .clip_soft(0.0)
             } else {
-                label(markdown::strip(&room.description), st::SMALL, p.text_muted).truncate()
-            },
-        );
+                None
+            };
+        info = info.child(match rendered {
+            Some(md) => md.max_h(18.0).clip_soft(0.0),
+            None => label(markdown::strip(&room.description), st::SMALL, p.text_muted).truncate(),
+        });
     }
     let open = chat.members_shown(narrow);
     let toggle = row()
@@ -555,14 +557,23 @@ fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette, k: &Kit) -> El
 
 /// A message's text, with any web links in it styled and pressable.
 fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
-    if !m.md.is_empty() && markdown::is_cheap(&m.md) {
-        return markdown_body(m, p, k);
+    // Markdown that cannot be made safe to draw (`None`) falls back to the plain text.
+    if !m.md.is_empty()
+        && markdown::is_cheap(&m.md)
+        && let Some(body) = markdown_body(m, p, k)
+    {
+        return body;
     }
     let mut content = m.text.clone();
-    let links = model::links(&m.text);
+    // Only URLs that pass the same checks as the markdown path, each to where it is safe to go
+    // (a gateway URL opens on this node).
+    let links: Vec<(std::ops::Range<usize>, String)> = model::links(&m.text)
+        .into_iter()
+        .filter_map(|r| links::plain_link_target(&m.text[r.clone()]).map(|u| (r, u)))
+        .collect();
     let mut spans: Vec<rune::Span> = links
         .iter()
-        .map(|r| {
+        .map(|(r, _)| {
             rune::Span::new(r.start, r.end)
                 .color(p.accent)
                 .underline(p.accent_line)
@@ -583,18 +594,19 @@ fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
         .w_full()
         .max_w(BODY_MAX_W)
         .selectable(true);
-    for r in links {
-        let url = m.text[r.clone()].to_owned();
+    for (r, url) in links {
         body = body.link(rune::Link::new(r, url).hover(rune::LinkPaint::new().underline(p.accent)));
     }
     body.on_link(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
-        let _ = tx.open_url(url);
+        if markdown::openable(url) {
+            let _ = tx.open_url(url.trim());
+        }
     })
 }
 
 /// A message as markdown, then the `(edited)` mark under it.
-fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> El {
-    let mut body = col().w_full().max_w(BODY_MAX_W).child(markdown::render(
+fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> Option<El> {
+    let rendered = markdown::render(
         &m.md,
         true,
         st::MESSAGE,
@@ -602,11 +614,12 @@ fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> El {
         format!("md-{}", m.key),
         p,
         k,
-    ));
+    )?;
+    let mut body = col().w_full().max_w(BODY_MAX_W).child(rendered);
     if m.edited {
         body = body.child(label("(edited)", st::SMALL, p.text_muted));
     }
-    body
+    Some(body)
 }
 
 fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {

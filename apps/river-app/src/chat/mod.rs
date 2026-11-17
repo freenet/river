@@ -12,12 +12,19 @@
 mod conversation;
 pub mod example;
 mod icons;
+mod links;
 mod markdown;
 pub mod model;
+/// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
+/// what a share link is (its tests, and the shared vector file, run here too).
+#[path = "../../../../ui/src/util/share_link.rs"]
+#[allow(dead_code)]
+mod share_link;
 pub(crate) mod style;
 #[cfg(test)]
 mod tests;
 mod view;
+mod visual_fold;
 
 use std::collections::{HashMap, HashSet};
 
