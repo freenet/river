@@ -5,6 +5,7 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::{Kit, TextInput};
 
 use super::icons;
+use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label, not_yet};
@@ -30,15 +31,15 @@ pub(super) fn conversation(chat: &Chat, room: &Room, narrow: bool, p: &Palette, 
         .grow(1.0)
         .min_w(0.0)
         .h_full()
-        .child(header(chat, room, narrow, p))
+        .child(header(chat, room, narrow, p, k))
         .child(hline(p))
-        .child(history(chat, room, p))
+        .child(history(chat, room, p, k))
         .child(composer(chat, room, p, k))
 }
 
 /// The room's name and description, and the members toggle. Like the web UI's header it spans
 /// the whole conversation pane, left-aligned, rather than the centred message column.
-fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette) -> El {
+fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
     let mut title = row().gap(8.0).center_y().min_w(0.0).child(
         label(room.name.clone(), st::HEADER, p.text)
             .truncate()
@@ -60,7 +61,24 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette) -> El {
     }
     let mut info = col().grow(1.0).min_w(0.0).gap(2.0).child(title);
     if !room.description.is_empty() {
-        info = info.child(label(room.description.clone(), st::SMALL, p.text_muted).truncate());
+        // One line of the description, drawn as markdown; what does not fit is cut off.
+        info = info.child(
+            if markdown::is_one_line(&room.description) && markdown::is_cheap(&room.description) {
+                markdown::render(
+                    &room.description,
+                    false,
+                    st::SMALL,
+                    p.text_muted,
+                    format!("description-{}", room.key),
+                    p,
+                    k,
+                )
+                .max_h(18.0)
+                .clip_soft(0.0)
+            } else {
+                label(markdown::strip(&room.description), st::SMALL, p.text_muted).truncate()
+            },
+        );
     }
     let open = chat.members_shown(narrow);
     let toggle = row()
@@ -95,7 +113,7 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette) -> El {
         .child(toggle)
 }
 
-fn history(chat: &Chat, room: &Room, p: &Palette) -> El {
+fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     if room.messages.is_empty() {
         return col()
             .key("history-empty")
@@ -138,7 +156,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette) -> El {
             );
             items = items.child(day_divider(d, label, p));
         }
-        items = items.child(group_el(chat, room, &group, p));
+        items = items.child(group_el(chat, room, &group, p, k));
     }
     // Keyed by room, so each room's viewport is its own: a room opens at its newest message
     // instead of at the offset the previous room was scrolled to.
@@ -194,7 +212,7 @@ fn tag(s: &str, p: &Palette) -> El {
 /// One author's run of messages. Each message is its own row, as in the web UI: the first
 /// carries the avatar and the name line, and the others show their time in the gutter while
 /// the pointer is over them.
-fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette) -> El {
+fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El {
     let first = &group.messages[0];
     let author = room.member(group.author);
     let mine = group.author == room.me;
@@ -221,7 +239,7 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette) -> El {
     // Both go in the first row only.
     let (mut face, mut name_row) = (Some(face), Some(name_row));
     let mut rows = col()
-        .key(format!("group-{}", first.id))
+        .key(format!("group-{}", first.key))
         .w_full()
         .radius(8.0);
     if mine {
@@ -240,7 +258,7 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette) -> El {
                     .min_w(0.0)
                     .gap(4.0)
                     .child(name_row.take().unwrap_or_else(row))
-                    .child(message_el(chat, room, m, p)),
+                    .child(message_el(chat, room, m, p, k)),
             )
         } else {
             (
@@ -251,11 +269,11 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette) -> El {
                 col()
                     .grow(1.0)
                     .min_w(0.0)
-                    .child(message_el(chat, room, m, p)),
+                    .child(message_el(chat, room, m, p, k)),
             )
         };
         let mut line = row()
-            .key(format!("row-{}", m.id))
+            .key(format!("row-{}", m.key))
             .w_full()
             .pt(if i == 0 { 6.0 } else { 3.0 })
             .pb(3.0)
@@ -458,8 +476,8 @@ fn text_button(
         .child(label(name, st::SMALL_STRONG, color))
 }
 
-fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette) -> El {
-    let mut c = col().key(format!("msg-{}", m.id)).w_full().gap(5.0);
+fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
+    let mut c = col().key(format!("msg-{}", m.key)).w_full().gap(5.0);
     if let Some(reply) = &m.reply_to {
         let author = room.nickname(reply.author).to_owned();
         let line = format!("{author}  {}", reply.preview);
@@ -487,7 +505,7 @@ fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette) -> El {
                 ),
         );
     }
-    c = c.child(message_body(m, p));
+    c = c.child(message_body(m, p, k));
     if let Some(pending) = &m.pending {
         c = c.child(delivery(pending, p));
     }
@@ -536,7 +554,10 @@ fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette) -> El {
 }
 
 /// A message's text, with any web links in it styled and pressable.
-fn message_body(m: &Message, p: &Palette) -> El {
+fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
+    if !m.md.is_empty() && markdown::is_cheap(&m.md) {
+        return markdown_body(m, p, k);
+    }
     let mut content = m.text.clone();
     let links = model::links(&m.text);
     let mut spans: Vec<rune::Span> = links
@@ -569,6 +590,23 @@ fn message_body(m: &Message, p: &Palette) -> El {
     body.on_link(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
         let _ = tx.open_url(url);
     })
+}
+
+/// A message as markdown, then the `(edited)` mark under it.
+fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> El {
+    let mut body = col().w_full().max_w(BODY_MAX_W).child(markdown::render(
+        &m.md,
+        true,
+        st::MESSAGE,
+        p.text,
+        format!("md-{}", m.key),
+        p,
+        k,
+    ));
+    if m.edited {
+        body = body.child(label("(edited)", st::SMALL, p.text_muted));
+    }
+    body
 }
 
 fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {

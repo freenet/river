@@ -105,6 +105,50 @@ impl LiveRoom {
         river_core::mention::render_plaintext_transformed(raw, resolve_mention, |name| clean(&name))
     }
 
+    /// Text as written as markdown for display: each mention a link to
+    /// [`model::mention_scheme`] carrying the member's current nickname.
+    fn render_md(&self, raw: &str) -> String {
+        use river_core::mention::{MentionSegment, parse_segments};
+        let state = &self.stored.room_state;
+        let owner = RiverMemberId::from(&self.stored.owner_vk);
+        let me = self
+            .stored
+            .self_verifying_key()
+            .map(|vk| RiverMemberId::from(&vk));
+        let mut out = String::with_capacity(raw.len());
+        for seg in parse_segments(raw) {
+            match seg {
+                MentionSegment::Text(t) => out.push_str(&t),
+                MentionSegment::Mention(m) => {
+                    let id = std::iter::once(owner)
+                        .chain(state.members.members.iter().map(|x| x.member.id()))
+                        .find(|id| m.member_ref.matches(*id));
+                    let name = match id {
+                        Some(id) => self.nickname(id, me),
+                        None => m.display_name,
+                    };
+                    let name = clean(&name);
+                    let name = if name.is_empty() {
+                        "Member".to_owned()
+                    } else {
+                        name
+                    };
+                    let kind = match id {
+                        Some(id) if Some(id) == me => "self",
+                        Some(_) => "member",
+                        None => "unknown",
+                    };
+                    out.push_str(&format!(
+                        "[@{}]({}:{kind})",
+                        escape_markdown(&name),
+                        model::mention_scheme()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// A message's text as written: edited and decrypted, with mention tokens kept, so an edit
     /// of it keeps its mentions. `None` for a private body this computer cannot decrypt, whose
     /// placeholder must never be offered for editing.
@@ -391,6 +435,10 @@ impl LiveRoom {
                 time: minutes(m.message.time),
                 text: texts[i].clone(),
                 source: written[i].clone().unwrap_or_default(),
+                md: written[i]
+                    .as_deref()
+                    .map(|w| self.render_md(w))
+                    .unwrap_or_default(),
                 reply_to,
                 reactions,
                 edited: state.recent_messages.is_edited(&m.id()),
@@ -487,6 +535,19 @@ fn plain_text(content_type: u32, plain: &[u8]) -> String {
     String::from_utf8_lossy(plain).into_owned()
 }
 
+/// `s` with every ASCII punctuation character backslash-escaped, so it is literal text in
+/// markdown (a name like `a]b(c)` cannot end its own link early).
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The stable key of a River message on screen: its id (a hash of its signature) in decimal.
 pub fn message_key(id: &RiverMessageId) -> String {
     id.0.0.to_string()
@@ -577,4 +638,32 @@ pub fn local_minutes(t: SystemTime) -> u32 {
     (secs + i64::from(offset))
         .div_euclid(60)
         .clamp(0, i64::from(u32::MAX)) as u32
+}
+
+#[cfg(test)]
+mod md_tests {
+    use super::escape_markdown;
+
+    #[test]
+    fn a_hostile_name_is_literal_markdown() {
+        let name = r"a](file:///x) [b\ <i>&*_`";
+        let md = format!("[@{}](dest:member)", escape_markdown(name));
+        // Parsed as markdown, the only link is the one we built, and the name is its text.
+        let mut dests = Vec::new();
+        let mut text = String::new();
+        for ev in pulldown_cmark::Parser::new(&md) {
+            match ev {
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. }) => {
+                    dests.push(dest_url.to_string())
+                }
+                pulldown_cmark::Event::Text(t) => text.push_str(&t),
+                pulldown_cmark::Event::Html(_) | pulldown_cmark::Event::InlineHtml(_) => {
+                    panic!("html")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(dests, ["dest:member"]);
+        assert_eq!(text, format!("@{name}"));
+    }
 }

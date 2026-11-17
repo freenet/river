@@ -1089,6 +1089,29 @@ fn the_view_keeps_mention_tokens_for_editing() {
 }
 
 #[test]
+fn a_mention_becomes_a_chip_link_with_a_safe_name() {
+    let f = Fixture::new();
+    let mut state = public_state(&f);
+    let known = river_core::mention::encode_mention(f.owner_id(), "Olive");
+    state.recent_messages.messages.push(f.message(
+        &f.me,
+        BASE - 5,
+        RoomMessageBody::public(format!("hi {known} [x](rvm-guess:self)")),
+    ));
+    let room = LiveRoom::new(f.stored(state));
+    let view = Outbox::default().view(&room, &minutes);
+    let m = view.messages.last().unwrap();
+    let scheme = crate::chat::model::mention_scheme();
+    assert!(m.md.contains(&format!("]({scheme}:")), "{}", m.md);
+    // The name is escaped so it cannot end its own link, and a link the author wrote is kept
+    // as written (and so is not a chip: it does not carry this process's scheme).
+    assert!(m.md.starts_with("hi [@"), "{}", m.md);
+    assert!(m.md.ends_with("[x](rvm-guess:self)"), "{}", m.md);
+    assert!(!m.md.contains("(rv:"), "{}", m.md);
+    assert!(!m.md.contains(known.as_str()), "{}", m.md);
+}
+
+#[test]
 fn message_ids_are_stable_keys() {
     let id = MessageId(freenet_scaffold::util::FastHash(-42));
     assert_eq!(message_key(&id), "-42");
