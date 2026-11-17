@@ -10,6 +10,7 @@
 
 mod host;
 mod install;
+mod notify;
 mod release;
 
 use std::sync::Arc;
@@ -29,13 +30,16 @@ fn main() {
         rune::run(river_app::spec());
         return;
     }
+    #[cfg(windows)]
+    notify::register_identity();
     let host = Arc::new(host::DesktopHost::new());
     river_app::app(move |handle| {
+        let notifier = notify::DesktopNotifier::new(handle.clone());
         let rooms = handle.clone();
         let link = river_app::rooms::Link::new(host.config_dir(), move |update| {
             rooms.update(move |s, tx| s.apply_rooms(update, tx))
         });
-        RiverApp::attached(Controller::new(host, handle), link)
+        RiverApp::attached(Controller::new(host, handle), link).with_notifier(Box::new(notifier))
     })
     .run();
 }

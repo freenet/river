@@ -207,6 +207,15 @@ pub struct Chat {
     open_when_shown: Option<String>,
     /// The invitation asked for, by the room it was asked for in.
     pub invite: Option<(String, InviteState)>,
+    /// Whether the last status was not live, so the next live update is catch-up rather than
+    /// news (see [`Chat::show_node_rooms`]).
+    catching_up: bool,
+    /// Whether the last rooms shown were live and not a catch-up: the whole list, not a partial
+    /// one while reconnecting.
+    full_list: bool,
+    /// Whether new messages produce notifications: the switch in the room list's footer. The
+    /// app keeps it across runs.
+    pub notifications: bool,
 }
 
 impl Chat {
@@ -245,6 +254,9 @@ impl Chat {
             opened: HashSet::new(),
             open_when_shown: None,
             invite: None,
+            catching_up: true,
+            full_list: false,
+            notifications: true,
         };
         chat.set_rooms(rooms);
         chat
@@ -312,7 +324,26 @@ impl Chat {
         open: Option<&str>,
         status: LinkStatus,
         now: u32,
-    ) {
+    ) -> Vec<crate::notify::Arrival> {
+        // Only an update that follows a live one can carry news. The first rooms, the catch-up
+        // that ends "Catching up", and what arrives after a reconnect are history, not messages
+        // to interrupt the person with. So the first live update after any not-live one is
+        // swallowed: a genuine message that lands in exactly that update is not notified (the
+        // unread count and the title still show it). That is accepted: the alternative is a
+        // burst of old messages after every reconnect.
+        //
+        // That swallowed update's arrivals are still returned, marked `quiet`: they count as
+        // unread while the window is away, they just are not shown as notifications.
+        let arrived = if status == LinkStatus::Live && self.node_rooms_shown {
+            let quiet = self.catching_up;
+            let mut arrived = crate::notify::arrivals(&self.rooms, &rooms);
+            arrived.iter_mut().for_each(|a| a.quiet = quiet);
+            arrived
+        } else {
+            Vec::new()
+        };
+        self.full_list = status == LinkStatus::Live && !self.catching_up;
+        self.catching_up = status != LinkStatus::Live;
         self.source = Source::Node(status);
         // The menu belongs to what was on screen; a new list may have removed it.
         self.link_menu = None;
@@ -339,12 +370,48 @@ impl Chat {
             self.open_when_shown = None;
             self.select(&key);
         }
-        // The open room is being read.
+        // The open room is being read, so nothing in it is unread (a window that is away
+        // counts what it missed itself, see `RiverApp::unread`).
+        if let Some(room) = self.room_mut() {
+            room.unread = 0;
+        }
         if let Some(room) = self.room()
             && let Some(mark) = ReadMark::of(room)
         {
             self.read.insert(room.key.clone(), mark);
         }
+        arrived
+    }
+
+    /// The connection's status changed without new rooms. Anything but live makes the next live
+    /// update catch-up.
+    pub fn note_status(&mut self, status: LinkStatus) {
+        if let Source::Node(_) = self.source {
+            self.source = Source::Node(status);
+            self.catching_up |= status != LinkStatus::Live;
+        }
+    }
+
+    /// Whether the rooms last shown are the whole list (live, not catching up).
+    pub fn list_is_full(&self) -> bool {
+        self.full_list
+    }
+
+    /// Unread messages across all rooms.
+    pub fn unread_total(&self) -> usize {
+        self.rooms.iter().map(|r| r.unread).sum()
+    }
+
+    /// Bring the room keyed `key` to the front, as a click on its notification does: open it,
+    /// and show the conversation rather than the members panel on a narrow window. False if
+    /// there is no such room.
+    pub fn open_room(&mut self, key: &str) -> bool {
+        if !self.rooms.iter().any(|r| r.key == key) {
+            return false;
+        }
+        self.select(key);
+        self.members_overlay = false;
+        true
     }
 
     /// Change the rooms in place, then settle the open room as [`Chat::set_rooms`] does.

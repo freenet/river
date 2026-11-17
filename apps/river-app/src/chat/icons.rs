@@ -67,3 +67,9 @@ pub static TRASH: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M2.5 4.5h11M6.5 4.5V3h3v1.5M4 4.5l.7 9h6.6l.7-9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+
+pub static BELL: Icon = Icon {
+    name: "river-bell",
+    view: 16.0,
+    body: r#"<path d="M4 11V7a4 4 0 0 1 8 0v4l1.2 1.5H2.8L4 11Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M6.5 14a1.7 1.7 0 0 0 3 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#,
+};

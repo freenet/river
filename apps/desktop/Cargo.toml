@@ -25,6 +25,21 @@ tar = "0.4"
 tempfile = "3"
 directories = "6"
 
+# OS notifications (src/notify/). MIT OR Apache-2.0. Linux speaks D-Bus through zbus (the `z`
+# feature, no libdbus); the notification images feature is off.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = { version = "4.19", default-features = false, features = ["z"] }
+
+# macOS uses UNUserNotificationCenter (the default NSUserNotification backend is deprecated).
+[target.'cfg(target_os = "macos")'.dependencies]
+notify-rust = { version = "4.19", default-features = false, features = ["preview-macos-un"] }
+
+# Windows toasts, and the registry and shell calls that give them River's name and icon. The
+# same windows-sys version rune already uses.
+[target.'cfg(windows)'.dependencies]
+notify-rust = { version = "4.19", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_UI_Shell"] }
+
 # Icon and version resource for river.exe (build.rs). Windows only, so Linux and macOS builds
 # never compile it.
 [target.'cfg(windows)'.build-dependencies]
