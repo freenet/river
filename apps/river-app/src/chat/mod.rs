@@ -210,6 +210,9 @@ pub struct Chat {
     /// Whether the last status was not live, so the next live update is catch-up rather than
     /// news (see [`Chat::show_node_rooms`]).
     catching_up: bool,
+    /// Whether the last rooms shown were live and not a catch-up: the whole list, not a partial
+    /// one while reconnecting.
+    full_list: bool,
     /// Whether new messages produce notifications: the switch in the room list's footer. The
     /// app keeps it across runs.
     pub notifications: bool,
@@ -252,6 +255,7 @@ impl Chat {
             open_when_shown: None,
             invite: None,
             catching_up: true,
+            full_list: false,
             notifications: true,
         };
         chat.set_rooms(rooms);
@@ -327,11 +331,18 @@ impl Chat {
         // swallowed: a genuine message that lands in exactly that update is not notified (the
         // unread count and the title still show it). That is accepted: the alternative is a
         // burst of old messages after every reconnect.
-        let arrived = if status == LinkStatus::Live && !self.catching_up && self.node_rooms_shown {
-            crate::notify::arrivals(&self.rooms, &rooms)
+        //
+        // That swallowed update's arrivals are still returned, marked `quiet`: they count as
+        // unread while the window is away, they just are not shown as notifications.
+        let arrived = if status == LinkStatus::Live && self.node_rooms_shown {
+            let quiet = self.catching_up;
+            let mut arrived = crate::notify::arrivals(&self.rooms, &rooms);
+            arrived.iter_mut().for_each(|a| a.quiet = quiet);
+            arrived
         } else {
             Vec::new()
         };
+        self.full_list = status == LinkStatus::Live && !self.catching_up;
         self.catching_up = status != LinkStatus::Live;
         self.source = Source::Node(status);
         // The menu belongs to what was on screen; a new list may have removed it.
@@ -379,6 +390,11 @@ impl Chat {
             self.source = Source::Node(status);
             self.catching_up |= status != LinkStatus::Live;
         }
+    }
+
+    /// Whether the rooms last shown are the whole list (live, not catching up).
+    pub fn list_is_full(&self) -> bool {
+        self.full_list
     }
 
     /// Unread messages across all rooms.

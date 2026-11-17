@@ -42,15 +42,16 @@ impl Backend {
                 Err(_) => true,
             },
         };
-        // Only the body is markup; the summary is plain text by the specification.
-        let body = if markup {
-            escape_markup(&n.body)
+        // Some servers (dunst) read markup in the summary too, and the room name is chosen by
+        // the room's owner: escape both exactly when the server reads markup.
+        let (title, body) = if markup {
+            (escape_markup(&n.title), escape_markup(&n.body))
         } else {
-            n.body.clone()
+            (n.title.clone(), n.body.clone())
         };
         let mut note = notify_rust::Notification::new();
         note.appname("River")
-            .summary(&n.title)
+            .summary(&title)
             .body(&body)
             // The icon theme's name for it, which the .desktop file's `Icon=river` installs.
             .icon("river")

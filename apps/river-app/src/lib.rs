@@ -184,11 +184,10 @@ impl RiverApp {
     }
 
     /// Show what the limits let through.
-    fn show(&mut self, admitted: Vec<notify::Arrival>) {
-        for n in notify::compose(admitted, self.private_previews) {
-            let room = n.room_key.clone();
+    fn show(&mut self, admitted: Vec<notify::Arrival>, now: std::time::Instant) {
+        for (n, from) in notify::compose_from(admitted, self.private_previews) {
             if !self.notifier.notify(n) {
-                self.limiter.refund(&room);
+                self.limiter.refund(from, now);
             }
         }
     }
@@ -201,7 +200,7 @@ impl RiverApp {
             return;
         }
         let due = self.limiter.admit(Vec::new(), now);
-        self.show(due);
+        self.show(due, now);
     }
 
     /// Unread messages across all rooms, counting the open room's while the window was away.
@@ -211,28 +210,35 @@ impl RiverApp {
 
     /// Notify about `arrived`, unless the person is looking at that room right now.
     fn notify_arrivals(&mut self, arrived: Vec<notify::Arrival>, now: std::time::Instant) {
-        self.limiter.observe(self.chat.rooms(), now);
+        self.limiter
+            .observe(self.chat.rooms(), now, self.chat.list_is_full());
         let open = self.chat.room().map(|r| r.key.clone());
         let mut shown = Vec::new();
         for a in arrived {
-            let in_front = self.focused && open.as_deref() == Some(a.room_key.as_str());
-            if in_front {
+            // What fills a room that just appeared is history: not news, not unread.
+            if self.limiter.settling(&a.room_key, now) {
                 continue;
             }
-            if open.as_deref() == Some(a.room_key.as_str()) {
+            let is_open = open.as_deref() == Some(a.room_key.as_str());
+            if self.focused && is_open {
+                continue;
+            }
+            if is_open {
                 if self.missed.0 != a.room_key {
                     self.missed = (a.room_key.clone(), 0);
                 }
                 self.missed.1 += a.count;
             }
-            shown.push(a);
+            if !a.quiet {
+                shown.push(a);
+            }
         }
         if !self.chat.notifications {
             return;
         }
         self.drop_read_held();
         let admitted = self.limiter.admit(shown, now);
-        self.show(admitted);
+        self.show(admitted, now);
     }
 
     /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
