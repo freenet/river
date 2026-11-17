@@ -11,8 +11,8 @@
 //! which of its chips or lists holds focus. Once that render's edits are in
 //! the DOM, focus goes back to the same element if the edits dropped it.
 //! Focus the reader has put anywhere else is left where it is. An element
-//! these edits removed gets nothing from here: where focus goes after the
-//! reader's own removal is `focus_reaction_line`'s.
+//! these edits removed gets nothing from `keep_across_patch`: where focus
+//! goes after the reader's own removal is `focus_reaction_line`'s, below.
 //!
 //! Nothing is noted while the document itself is unfocused (the reader is in
 //! the gateway's shell, or another window): putting focus back then could
@@ -31,7 +31,7 @@
 /// are the ids of the group's messages, read only for an id on some
 /// reaction line.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub(super) fn held_focus_id<'a>(
+fn held_focus_id<'a>(
     active_id: &str,
     enclosing_list_id: Option<&str>,
     row_ids: impl IntoIterator<Item = &'a str>,
@@ -97,6 +97,76 @@ pub(super) fn keep_across_patch<'a>(row_ids: impl IntoIterator<Item = &'a str>) 
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn keep_across_patch<'a>(_row_ids: impl IntoIterator<Item = &'a str>) {}
+
+/// Whether the element with this id holds the document's focus.
+pub(super) fn element_has_focus(id: &str) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| active.id() == id)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = id;
+        false
+    }
+}
+
+/// Move focus onto the reaction line of the message in row `row_id`: the
+/// first chip that takes it, leaving out the chip with id `except_chip_id`
+/// (one about to be removed), else the message's footer React, which every
+/// message has. Each control is tried until one actually holds focus (a row
+/// being edited has no React). If none does, or the row is gone, focus stays
+/// where the browser put it. Never scrolling: only an arrival moves the
+/// history (history-scrolling.md).
+///
+/// Chips are told apart by their `id` attribute, compared as a string: an
+/// emoji is peer-supplied and never goes into a selector. Whether focus
+/// should move at all is the caller's to decide.
+pub(super) fn focus_reaction_line(row_id: &str, except_chip_id: Option<&str>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        let Some(row) = document.get_element_by_id(&format!("msg-{row_id}")) else {
+            return;
+        };
+        for selector in [
+            REACTION_CHIP_SELECTOR,
+            super::mobile_surface::REACT_SELECTOR,
+        ] {
+            let Ok(controls) = row.query_selector_all(selector) else {
+                continue;
+            };
+            for index in 0..controls.length() {
+                let Some(control) = controls
+                    .item(index)
+                    .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+                else {
+                    continue;
+                };
+                if except_chip_id.is_some_and(|id| control.id() == id) {
+                    continue;
+                }
+                if super::focus_without_scrolling(&control)
+                    && document.active_element().as_ref() == Some(&control)
+                {
+                    return;
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (row_id, except_chip_id);
+}
+
+/// Every reaction chip.
+#[cfg(target_arch = "wasm32")]
+const REACTION_CHIP_SELECTOR: &str = "[data-testid=\"reaction-chip\"]";
 
 /// Every open reactor list.
 #[cfg(target_arch = "wasm32")]

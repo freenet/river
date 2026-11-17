@@ -3801,10 +3801,6 @@ fn reaction_chip_id(key: &str) -> String {
     format!("reaction-chip-{key}")
 }
 
-/// Every reaction chip.
-#[cfg(target_arch = "wasm32")]
-const REACTION_CHIP_SELECTOR: &str = "[data-testid=\"reaction-chip\"]";
-
 /// Focus without scrolling. Moving focus between a chip and its list must not
 /// move the history: only an arrival does (history-scrolling.md).
 #[cfg(target_arch = "wasm32")]
@@ -3815,68 +3811,6 @@ fn focus_without_scrolling(element: &web_sys::Element) -> bool {
     let options = web_sys::FocusOptions::new();
     options.set_prevent_scroll(true);
     element.focus_with_options(&options).is_ok()
-}
-
-/// Whether the element with this id holds the document's focus.
-fn element_has_focus(id: &str) -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        web_sys::window()
-            .and_then(|window| window.document())
-            .and_then(|document| document.active_element())
-            .is_some_and(|active| active.id() == id)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = id;
-        false
-    }
-}
-
-/// Move focus onto the reaction line of the message in row `row_id`: the
-/// first chip that takes it, leaving out the chip with id `except_chip_id`
-/// (one about to be removed), else the message's footer React, which every
-/// message has. Each control is tried until one actually holds focus (a row
-/// being edited has no React). If none does, or the row is gone, focus stays
-/// where the browser put it. Never scrolling: only an arrival moves the
-/// history (history-scrolling.md).
-///
-/// Chips are told apart by their `id` attribute, compared as a string: an
-/// emoji is peer-supplied and never goes into a selector. Whether focus
-/// should move at all is the caller's to decide.
-fn focus_reaction_line(row_id: &str, except_chip_id: Option<&str>) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-            return;
-        };
-        let Some(row) = document.get_element_by_id(&format!("msg-{row_id}")) else {
-            return;
-        };
-        for selector in [REACTION_CHIP_SELECTOR, mobile_surface::REACT_SELECTOR] {
-            let Ok(controls) = row.query_selector_all(selector) else {
-                continue;
-            };
-            for index in 0..controls.length() {
-                let Some(control) = controls
-                    .item(index)
-                    .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
-                else {
-                    continue;
-                };
-                if except_chip_id.is_some_and(|id| control.id() == id) {
-                    continue;
-                }
-                if focus_without_scrolling(&control)
-                    && document.active_element().as_ref() == Some(&control)
-                {
-                    return;
-                }
-            }
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = (row_id, except_chip_id);
 }
 
 /// Whether a popover of `height` opened at viewport `y` goes above (only when
@@ -4282,7 +4216,7 @@ fn MessageGroupComponent(
                     }
                     // The chip is gone: Remove took the only reaction with that
                     // emoji. Focus stays on the message's reaction line.
-                    focus_reaction_line(&message_id, None);
+                    reaction_focus::focus_reaction_line(&message_id, None);
                 });
             }
         });
@@ -5069,8 +5003,8 @@ fn MessageGroupComponent(
                                                                         // The reader's chip with no one else on it
                                                                         // leaves with the reaction. Focus it holds stays
                                                                         // on the message's reaction line.
-                                                                        if is_user_reaction && count == 1 && element_has_focus(&chip_id_for_click) {
-                                                                            focus_reaction_line(&row_id_for_click, Some(chip_id_for_click.as_str()));
+                                                                        if is_user_reaction && count == 1 && reaction_focus::element_has_focus(&chip_id_for_click) {
+                                                                            reaction_focus::focus_reaction_line(&row_id_for_click, Some(chip_id_for_click.as_str()));
                                                                         }
                                                                         let id = msg_id_for_click.clone();
                                                                         let emoji = emoji_for_click.clone();

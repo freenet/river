@@ -13,6 +13,7 @@ import {
   openRoomWithTarget,
   openSheetFromReact,
   palette,
+  panicsOf,
   press,
   reactionChoices,
   selectRoom,
@@ -71,10 +72,11 @@ async function waitSettledAtBottom(page: Page) {
     .toBeLessThan(120);
 }
 
-// Fixture reactions are written into example state, not sent as signed
-// messages. The first real toggle rebuilds that state from messages and
-// drops every fixture chip, so "one fewer chip in the room" lands on 0.
-// Removal is asserted on a reaction this test adds itself.
+// A reaction of the reader's own, on a message with no other chip. When the
+// reader's chip leaves, focus goes to another chip of the message if it has
+// one (reaction-chips.spec.ts), else to its React. Picking a chip-free row
+// leaves the removed chip as the only one, so these tests reach the React
+// fallback rather than a surviving chip.
 async function addOwnReaction(page: Page): Promise<Locator> {
   const row = page
     .locator('[id^="msg-"]')
@@ -625,11 +627,7 @@ test.describe("Reaction chip below 48rem", () => {
 // group's list, or write to the old group's state.
 test.describe("Reaction chip held while its group remounts", { tag: "@chromium-only" }, () => {
   test("the hold opens nothing, nothing panics, and the chip still reacts", async ({ page }) => {
-    const panics: string[] = [];
-    page.on("pageerror", (e) => panics.push(e.message));
-    page.on("console", (m) => {
-      if (m.type() === "error" && /panicked|unreachable/.test(m.text())) panics.push(m.text());
-    });
+    const panics = panicsOf(page);
     await openRoomWithComposer(page);
     await callRiverTest(page, "deliverTimedMessages", 0, [
       { text: "hold lead", sentSecs: 1, receivedSecs: 0 },

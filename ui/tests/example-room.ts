@@ -32,6 +32,15 @@ export async function settle(page: Page) {
 /// Collect uncaught page errors and console panics (a Rust panic, a WASM
 /// trap, a RefCell borrow failure) from now on. The caller asserts the
 /// returned array is still empty at the end.
+export function panicsOf(page: Page): string[] {
+  const panics: string[] = [];
+  page.on("pageerror", (e) => panics.push(e.message));
+  page.on("console", (m) => {
+    if (m.type() === "error" && /panicked|unreachable|already borrowed/.test(m.text())) panics.push(m.text());
+  });
+  return panics;
+}
+
 // Force the tab's visibility state: override the `document.hidden` and
 // `document.visibilityState` getters and dispatch `visibilitychange`, the way
 // Chromium, WebKit and Firefox do when the tab goes to the background or back.

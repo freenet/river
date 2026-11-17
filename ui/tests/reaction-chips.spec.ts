@@ -12,6 +12,7 @@ import {
   openRoomWithTarget,
   openSheetFromReact,
   palette,
+  panicsOf,
   press,
   reactionChoices,
   settle,
@@ -30,16 +31,6 @@ const owners = (page: Page) => page.getByTestId("reaction-owners");
 const count = (target: Locator) => target.getByTestId("reaction-chip-count");
 const order = (row: Locator) => chips(row).evaluateAll((els) => els.map((el) => el.getAttribute("data-emoji")));
 const signs = (page: Page) => callRiverTest(page, "messageSignsRecorded");
-
-/// Panics and unreachable code the page reports, collected from here on.
-function panicsOf(page: Page): string[] {
-  const panics: string[] = [];
-  page.on("pageerror", (e) => panics.push(e.message));
-  page.on("console", (m) => {
-    if (m.type() === "error" && /panicked|unreachable|already borrowed/.test(m.text())) panics.push(m.text());
-  });
-  return panics;
-}
 
 async function expectChip(target: Locator, pressed: boolean, n: string, what = "") {
   await expect(target, `${what} aria-pressed`).toHaveAttribute("aria-pressed", String(pressed));
