@@ -177,11 +177,12 @@ pub fn render(
         src.to_owned()
     };
     // Links to Freenet apps behave as in the web UI (see `links`).
-    let src = if is_cheap(&src) {
-        super::links::prepare(&src)?
-    } else {
-        src
-    };
+    // The line breaks added bytes, so the text may no longer be cheap; the unprepared source
+    // must never reach the widget.
+    if !is_cheap(&src) {
+        return None;
+    }
+    let src = super::links::prepare(&src)?;
     let (accent, soft, line, muted) = (p.accent, p.accent_soft, p.accent_line, p.text_muted);
     Some(
         Markdown::new(src)

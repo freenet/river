@@ -911,3 +911,21 @@ fn a_message_that_cannot_be_made_safe_is_shown_as_plain_text() {
     });
     assert!(!shows(&rt, "](https://evil.example/)"), "{:?}", texts(&rt));
 }
+
+/// A message that is cheap as written but not once its line breaks are made hard breaks is
+/// shown as plain text, never as unprepared markdown.
+#[test]
+fn a_message_that_stops_being_cheap_after_its_line_breaks_is_plain_text() {
+    let id = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+    let text = format!(
+        "{}[freenet:{id}](https://evil.example/)",
+        "a\n".repeat(1400)
+    );
+    assert!(super::markdown::is_cheap(&text));
+    let rt = node_rooms(|rooms| {
+        let m = rooms[0].messages.last_mut().unwrap();
+        m.text = text.clone();
+        m.md = text.clone();
+    });
+    assert!(shows(&rt, "](https://evil.example/)"), "{:?}", texts(&rt));
+}
