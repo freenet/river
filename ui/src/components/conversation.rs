@@ -4935,9 +4935,10 @@ fn MessageGroupComponent(
                                                                             return;
                                                                         }
                                                                         // The reader's chip with no one else on it
-                                                                        // leaves with the reaction. Focus it holds stays
-                                                                        // on the message's reaction line.
-                                                                        if is_user_reaction && count == 1 && reaction_focus::element_has_focus(&chip_id_for_click) {
+                                                                        // leaves with the reaction. Keyboard focus it
+                                                                        // holds stays on the message's reaction line;
+                                                                        // a pointer press's focus leaves with the chip.
+                                                                        if is_user_reaction && count == 1 && reaction_focus::element_has_keyboard_focus(&chip_id_for_click) {
                                                                             reaction_focus::focus_reaction_line(&row_id_for_click, Some(chip_id_for_click.as_str()));
                                                                         }
                                                                         let id = msg_id_for_click.clone();

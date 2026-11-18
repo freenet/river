@@ -317,4 +317,34 @@ mod tests {
         assert_eq!(only(&shown)[0].reaction_order, vec!["a", "z", "b"]);
         assert_eq!(only(&shown)[0].reactions["z"], vec![me()]);
     }
+
+    #[test]
+    fn pending_effects_on_an_emoji_others_hold_keep_its_place() {
+        let other = MemberId(freenet_scaffold::util::FastHash(7));
+        let mut m = message(1, "one");
+        m.reactions.insert("z".into(), vec![me(), other]);
+        m.reactions.insert("a".into(), vec![other]);
+        m.reaction_order = vec!["z".into(), "a".into()];
+        let mut shown = items(vec![m]);
+        apply_pending_effects(
+            &mut shown,
+            &[
+                // Another member still holds "z": it stays first.
+                PendingEffect::Unreact {
+                    target: id(1),
+                    emoji: "z".into(),
+                },
+                // Joining "a", which is already shown: no second entry.
+                PendingEffect::React {
+                    target: id(1),
+                    emoji: "a".into(),
+                },
+            ],
+            me(),
+            &HashMap::new(),
+        );
+        assert_eq!(only(&shown)[0].reaction_order, vec!["z", "a"]);
+        assert_eq!(only(&shown)[0].reactions["z"], vec![other]);
+        assert_eq!(only(&shown)[0].reactions["a"], vec![other, me()]);
+    }
 }

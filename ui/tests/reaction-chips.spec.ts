@@ -285,6 +285,19 @@ test.describe("Chip that leaves with the reader's reaction", () => {
     expect(await distanceFromBottom(page), "the history did not move").toBeLessThanOrEqual(1);
     expect(await inHistoryView(react), "React is still out of view").toBe(false);
 
+    // A mouse press focuses a button in Chromium and Firefox, but not as
+    // keyboard focus: that focus leaves with the chip, so no unseen focus is
+    // left on another chip for a later Enter or Space to react with.
+    await callRiverTest(page, "appendMessage", "mouse reaction");
+    const moused = committedRow(page, "mouse reaction");
+    await callRiverTest(page, "memberReactsToNewest", "🦀");
+    await pick(page, moused, "👍");
+    await expect(chips(moused), "premise: another member's chip and the reader's").toHaveCount(2);
+    await chipFor(moused, "👍").click();
+    await expect(chipFor(moused, "👍")).toHaveCount(0);
+    await settle(page);
+    await expect(moused.locator('[data-testid="reaction-chip"]:focus'), "no chip took the mouse's focus").toHaveCount(0);
+
     // A chip without focus leaves focus where it was.
     await callRiverTest(page, "appendMessage", "unfocused reaction");
     const unfocused = committedRow(page, "unfocused reaction");

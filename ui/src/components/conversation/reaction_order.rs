@@ -17,6 +17,12 @@ type ReactionRanks = HashMap<MessageId, EmojiRanks>;
 /// matter, once for the full retained history rather than once per row.
 /// Recompute when secrets change as well as when messages change; no cache can
 /// infer that from a message count or newest id.
+///
+/// Cost, measured 2026-11-18 (release native build, x86_64, every retained
+/// message a reaction on one target): about 0.27 ms public and 0.56 ms private
+/// at 200 retained messages, 1.4 / 2.7 ms at 1,000. It runs from the
+/// conversation's `message_groups` memo, so once per change to the room's
+/// data, not once per render.
 pub(super) fn reaction_ranks_for(
     messages: &MessagesV1,
     secrets: &HashMap<u32, [u8; 32]>,
@@ -502,49 +508,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             names(&["z", "a"])
         );
-    }
-
-    /// Repeatable retained-history measurement, deliberately without a CI
-    /// wall-clock assertion. Run with `cargo test -p river-ui --bins
-    /// retained_history_replay_cost -- --ignored --nocapture` and record the
-    /// compiler/profile/hardware with the output. Setup/signing is not timed.
-    /// This is an action-heavy synthetic retained history at the cap/deep
-    /// fixture sizes and beyond, not the normal text/action mix or a WASM
-    /// browser measurement. Observed 2026-11-16: rustc 1.94.1, unoptimized
-    /// native test profile, Apple M4 Pro arm64. At 1,000 messages
-    /// public/private replay averaged 2.60/35.5 ms; at 10,000, 25.9/357.7 ms
-    /// (20 repetitions). These observations are context, not performance
-    /// thresholds.
-    #[test]
-    #[ignore]
-    fn retained_history_replay_cost() {
-        use std::time::Instant;
-        for total in [164, 204, 1_000, 10_000] {
-            let target = text();
-            let id = target.id();
-            let mut history = vec![target];
-            for n in 1..total {
-                let emoji = if n % 2 == 0 { "a" } else { "z" };
-                history.push(add(2 + (n % 8) as u8, n as u64, &id, emoji));
-            }
-            let public = rebuild(history, &HashMap::new());
-            let secrets = HashMap::from([(SECRET_VERSION, SECRET)]);
-            let private = rebuild(seal_actions(&public), &secrets);
-            for (label, state, keys) in [
-                ("public", &public, HashMap::new()),
-                ("private", &private, secrets.clone()),
-                ("private-without-secret", &private, HashMap::new()),
-            ] {
-                let start = Instant::now();
-                for _ in 0..20 {
-                    std::hint::black_box(reaction_ranks_for(state, &keys));
-                }
-                eprintln!(
-                    "{label}: retained={total}, actions={}, replay_mean={:?}",
-                    total - 1,
-                    start.elapsed() / 20
-                );
-            }
-        }
     }
 }
