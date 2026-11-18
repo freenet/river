@@ -285,18 +285,48 @@ test.describe("Chip that leaves with the reader's reaction", () => {
     expect(await distanceFromBottom(page), "the history did not move").toBeLessThanOrEqual(1);
     expect(await inHistoryView(react), "React is still out of view").toBe(false);
 
-    // A mouse press focuses a button in Chromium and Firefox, but not as
-    // keyboard focus: that focus leaves with the chip, so no unseen focus is
-    // left on another chip for a later Enter or Space to react with.
+    // A mouse press focuses a button, without showing it: that focus leaves
+    // with the chip, so no unseen focus is left on another chip for a later
+    // Enter or Space to react with.
     await callRiverTest(page, "appendMessage", "mouse reaction");
     const moused = committedRow(page, "mouse reaction");
     await callRiverTest(page, "memberReactsToNewest", "🦀");
     await pick(page, moused, "👍");
     await expect(chips(moused), "premise: another member's chip and the reader's").toHaveCount(2);
-    await chipFor(moused, "👍").click();
-    await expect(chipFor(moused, "👍")).toHaveCount(0);
+    const mine = chipFor(moused, "👍");
+    await mine.scrollIntoViewIfNeeded();
+    const box = (await mine.boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    // Where a press does not focus a button (macOS Safari) there is no
+    // focus to hand on, and this case would prove nothing.
+    await expect(mine, "premise: the press focused the chip").toBeFocused();
+    await page.mouse.up();
+    await expect(mine).toHaveCount(0);
     await settle(page);
-    await expect(moused.locator('[data-testid="reaction-chip"]:focus'), "no chip took the mouse's focus").toHaveCount(0);
+    expect(await page.evaluate(() => document.activeElement === document.body), "the mouse's focus left with the chip").toBe(true);
+
+    // Focus a press left (released off the chip, so no click), then Enter:
+    // the key press removes the reaction and hands focus on, though Firefox
+    // still does not show that focus as keyboard focus.
+    await callRiverTest(page, "appendMessage", "pressed then keyed");
+    const keyed = committedRow(page, "pressed then keyed");
+    await callRiverTest(page, "memberReactsToNewest", "🦀");
+    await pick(page, keyed, "👍");
+    await expect(chips(keyed), "premise: another member's chip and the reader's").toHaveCount(2);
+    const pressed = chipFor(keyed, "👍");
+    await pressed.scrollIntoViewIfNeeded();
+    const at = (await pressed.boundingBox())!;
+    await page.mouse.move(at.x + at.width / 2, at.y + at.height / 2);
+    await page.mouse.down();
+    await expect(pressed, "premise: the press focused the chip").toBeFocused();
+    await page.mouse.move(at.x + at.width / 2, at.y - 200);
+    await page.mouse.up();
+    await expect(pressed, "premise: released off the chip, no click").toBeFocused();
+    await expect(chips(keyed)).toHaveCount(2);
+    await page.keyboard.press("Enter");
+    await expect(pressed).toHaveCount(0);
+    await expect(keyed.locator('[data-testid="reaction-chip"]:focus'), "the key press handed focus to the other chip").toHaveCount(1);
 
     // A chip without focus leaves focus where it was.
     await callRiverTest(page, "appendMessage", "unfocused reaction");

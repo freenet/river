@@ -98,24 +98,40 @@ pub(super) fn keep_across_patch<'a>(row_ids: impl IntoIterator<Item = &'a str>) 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn keep_across_patch<'a>(_row_ids: impl IntoIterator<Item = &'a str>) {}
 
-/// Whether the element with this id holds the document's focus and the
-/// browser shows it as keyboard focus (`:focus-visible`). A mouse or touch
-/// press focuses a button in Chromium and Firefox without making it
-/// focus-visible: moving that focus to another chip would leave an unseen
-/// focus there, and a later Enter or Space would react with its emoji.
-pub(super) fn element_has_keyboard_focus(id: &str) -> bool {
+/// Whether the element with this id holds the document's focus.
+pub(super) fn element_has_focus(id: &str) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
         web_sys::window()
             .and_then(|window| window.document())
             .and_then(|document| document.active_element())
-            .is_some_and(|active| {
-                active.id() == id && active.matches(":focus-visible").unwrap_or(true)
-            })
+            .is_some_and(|active| active.id() == id)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = id;
+        false
+    }
+}
+
+/// Whether a click came from a pointer press (mouse, touch, pen): its
+/// `detail`, the press count, is at least 1. A click a key press makes
+/// (Enter or Space on a button), one assistive technology sends, or one
+/// from script has `detail` 0. A pointer press focuses a button in Chromium
+/// and Firefox without showing it, so a focus it leaves must not be handed
+/// to another chip, where a later Enter or Space would react unseen.
+pub(super) fn click_is_pointer_press(
+    evt: &dioxus::prelude::Event<dioxus::prelude::MouseData>,
+) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        evt.data()
+            .downcast::<web_sys::MouseEvent>()
+            .is_some_and(|mouse| mouse.detail() >= 1)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = evt;
         false
     }
 }

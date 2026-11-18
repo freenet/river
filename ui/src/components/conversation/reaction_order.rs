@@ -21,8 +21,8 @@ type ReactionRanks = HashMap<MessageId, EmojiRanks>;
 /// Cost, measured 2026-11-18 (release native build, x86_64, every retained
 /// message a reaction on one target): about 0.27 ms public and 0.56 ms private
 /// at 200 retained messages, 1.4 / 2.7 ms at 1,000. It runs from the
-/// conversation's `message_groups` memo, so once per change to the room's
-/// data, not once per render.
+/// conversation's `message_groups` memo, so when room data or receive times
+/// change, not on every render.
 pub(super) fn reaction_ranks_for(
     messages: &MessagesV1,
     secrets: &HashMap<u32, [u8; 32]>,

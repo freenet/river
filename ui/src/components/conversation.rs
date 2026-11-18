@@ -4928,17 +4928,20 @@ fn MessageGroupComponent(
                                                                         // A scroll that starts on the chip ends here.
                                                                         chip_hold_cancel.borrow_mut().cancel();
                                                                     },
-                                                                    onclick: move |_| {
+                                                                    onclick: move |e: MouseEvent| {
                                                                         // The lift of the hold that opened the list is
                                                                         // not a press.
                                                                         if chip_hold_click.borrow_mut().take_release(&owners_key_for_click) {
                                                                             return;
                                                                         }
                                                                         // The reader's chip with no one else on it
-                                                                        // leaves with the reaction. Keyboard focus it
-                                                                        // holds stays on the message's reaction line;
-                                                                        // a pointer press's focus leaves with the chip.
-                                                                        if is_user_reaction && count == 1 && reaction_focus::element_has_keyboard_focus(&chip_id_for_click) {
+                                                                        // leaves with the reaction. Focus it holds from
+                                                                        // a key press stays on the message's reaction
+                                                                        // line; a pointer press's leaves with the chip.
+                                                                        if is_user_reaction && count == 1
+                                                                            && !reaction_focus::click_is_pointer_press(&e)
+                                                                            && reaction_focus::element_has_focus(&chip_id_for_click)
+                                                                        {
                                                                             reaction_focus::focus_reaction_line(&row_id_for_click, Some(chip_id_for_click.as_str()));
                                                                         }
                                                                         let id = msg_id_for_click.clone();
