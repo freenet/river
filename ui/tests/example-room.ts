@@ -29,6 +29,18 @@ export async function settle(page: Page) {
   await page.waitForTimeout(300);
 }
 
+/// Collect uncaught page errors and console panics (a Rust panic, a WASM
+/// trap, a RefCell borrow failure) from now on. The caller asserts the
+/// returned array is still empty at the end.
+export function panicsOf(page: Page): string[] {
+  const panics: string[] = [];
+  page.on("pageerror", (e) => panics.push(e.message));
+  page.on("console", (m) => {
+    if (m.type() === "error" && /panicked|unreachable|already borrowed/.test(m.text())) panics.push(m.text());
+  });
+  return panics;
+}
+
 // Force the tab's visibility state: override the `document.hidden` and
 // `document.visibilityState` getters and dispatch `visibilitychange`, the way
 // Chromium, WebKit and Firefox do when the tab goes to the background or back.
@@ -268,6 +280,99 @@ export function controlStates(row: Locator, ids: string[]) {
 /// A control `controlStates` found shown and taking its own hits.
 export const SHOWN = { opacity: "1", hit: true };
 
+/// Every chip and footer control of `row`, with where a hit at its centre and
+/// 1px inside each corner lands, and the boxes it must stay clear of.
+export function footerLayout(row: Locator) {
+  return row.evaluate((el) => {
+    const box = (e: Element) => {
+      const r = e.getBoundingClientRect();
+      return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+    };
+    const hits = (e: Element) => {
+      const r = e.getBoundingClientRect();
+      const points = [
+        [r.left + r.width / 2, r.top + r.height / 2],
+        [r.left + 1, r.top + 1],
+        [r.right - 1, r.top + 1],
+        [r.left + 1, r.bottom - 1],
+        [r.right - 1, r.bottom - 1],
+      ];
+      return points.filter(([x, y]) => {
+        const at = document.elementFromPoint(x, y);
+        return !(at && e.contains(at));
+      });
+    };
+    const left = Array.from(el.querySelectorAll('[data-testid="message-reaction-row"] > *'))
+      .map((wrapper) => wrapper.matches("button") ? wrapper : wrapper.querySelector('[data-testid="reaction-chip"]'))
+      .filter((e): e is Element => !!e)
+      .map((e) => ({ id: e.getAttribute("data-testid")!, box: box(e), misses: e.matches('[data-testid="reaction-chip"]') ? [] : hits(e) }));
+    const cluster = Array.from(el.querySelectorAll('[data-testid="message-action-cluster"] button')).map((e) => ({
+      id: e.getAttribute("data-testid")!,
+      box: box(e),
+      misses: hits(e),
+    }));
+    const chipCentreMisses = Array.from(el.querySelectorAll('[data-testid="reaction-chip"]')).filter((c) => {
+      const r = c.getBoundingClientRect();
+      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return !(at && c.contains(at));
+    }).length;
+    return {
+      left,
+      cluster,
+      chipCentreMisses,
+      body: box(el.querySelector('[data-testid="message-body"]')!),
+      content: box(el.querySelector('[data-testid="message-content"]')!),
+      scroller: box(document.getElementById("chat-scroll-container")!),
+      viewport: document.documentElement.clientWidth,
+    };
+  });
+}
+
+type Box = { left: number; right: number; top: number; bottom: number; width: number; height: number };
+const overlaps = (a: Box, b: Box) =>
+  Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+
+export type FooterLayout = Awaited<ReturnType<typeof footerLayout>>;
+type FooterControl = FooterLayout["left"][number];
+
+/// Targets of the footer's size, each taking every hit inside it.
+export function expectTargets(controls: FooterControl[], what: string) {
+  for (const c of controls) {
+    expect(c.box.width, `${what}: ${c.id} width`).toBeGreaterThanOrEqual(26);
+    expect(c.box.height, `${what}: ${c.id} height`).toBeGreaterThanOrEqual(26);
+    expect(c.misses, `${what}: a hit anywhere in ${c.id} reaches it`).toEqual([]);
+  }
+}
+
+/// None of `controls` overlaps another or the message, and each is inside
+/// the content column and the screen.
+export function expectClear(controls: FooterControl[], layout: FooterLayout, what: string) {
+  for (let i = 0; i < controls.length; i++) {
+    expect(overlaps(controls[i].box, layout.body), `${what}: ${controls[i].id} clear of the message`).toBe(false);
+    for (let j = i + 1; j < controls.length; j++) {
+      expect(overlaps(controls[i].box, controls[j].box), `${what}: ${controls[i].id} #${i} and ${controls[j].id} #${j} overlap`).toBe(false);
+    }
+    expect(controls[i].box.left).toBeGreaterThanOrEqual(layout.content.left - 0.5);
+    expect(controls[i].box.right).toBeLessThanOrEqual(Math.min(layout.content.right, layout.scroller.right, layout.viewport) + 0.5);
+  }
+}
+
+/// The footer's left group: React after its chips, a footer-sized target,
+/// and every chip taking a hit at its centre.
+export function expectUsableLeftGroup(layout: FooterLayout, what: string) {
+  expect(layout.left.at(-1)!.id, `${what}: React ends the left group`).toBe("message-react-button");
+  // React after its last chip: on the same line to its right, or below it.
+  const chips = layout.left.slice(0, -1);
+  const react = layout.left.at(-1)!.box;
+  if (chips.length) {
+    const last = chips.at(-1)!.box;
+    const sameLine = react.top < last.bottom && react.bottom > last.top;
+    expect(sameLine ? react.left >= last.right - 0.5 : react.top >= last.bottom - 0.5, `${what}: React follows the chips`).toBe(true);
+  }
+  expectTargets([layout.left.at(-1)!], what);
+  expect(layout.chipCentreMisses, `${what}: every chip takes a hit at its centre`).toBe(0);
+}
+
 /// Footer test ids and the sheet action that replaces each below 48rem.
 const SHEET_ACTIONS: Record<string, string> = {
   "message-reply-button": "mobile-message-action-reply",
@@ -412,6 +517,13 @@ export function choices(page: Page): Locator {
 /// `row`'s reaction chips.
 export function chips(row: Locator): Locator {
   return row.getByTestId("reaction-chip");
+}
+
+/// `row`'s chip for `emoji`, by its `data-emoji`. Only a quote and a
+/// backslash are escaped: every caller passes a literal emoji.
+export function chipFor(row: Locator, emoji: string): Locator {
+  const quoted = emoji.replace(/["\\]/g, "\\$&");
+  return row.locator(`[data-testid="reaction-chip"][data-emoji="${quoted}"]`);
 }
 
 /// The message key a row's id carries (`msg-<key>`), as the sheet's

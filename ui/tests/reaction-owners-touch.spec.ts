@@ -13,6 +13,7 @@ import {
   openRoomWithTarget,
   openSheetFromReact,
   palette,
+  panicsOf,
   press,
   reactionChoices,
   selectRoom,
@@ -21,6 +22,7 @@ import {
   waitForApp,
   withFingers,
 } from "./example-room";
+import { inHistoryView } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
 // Regression coverage for freenet/river#714.
@@ -71,15 +73,16 @@ async function waitSettledAtBottom(page: Page) {
     .toBeLessThan(120);
 }
 
-// Fixture reactions are written into example state, not sent as signed
-// messages. The first real toggle rebuilds that state from messages and
-// drops every fixture chip, so "one fewer chip in the room" lands on 0.
-// Removal is asserted on a reaction this test adds itself.
+// A reaction of the reader's own, on a message with no other chip. When the
+// reader's chip leaves, focus goes to another chip of the message if it has
+// one (reaction-chips.spec.ts), else to its React. Picking a chip-free row
+// leaves the removed chip as the only one, so these tests reach the React
+// fallback rather than a surviving chip.
 async function addOwnReaction(page: Page): Promise<Locator> {
   const row = page
     .locator('[id^="msg-"]')
     .filter({
-      hasNot: page.locator('[data-testid="reaction-chip"][title*="click to remove"]'),
+      hasNot: page.getByTestId("reaction-chip"),
     })
     .last();
   await expect(row).toBeVisible();
@@ -150,12 +153,7 @@ async function scrollChipOutOfView(page: Page, chip: Locator): Promise<void> {
   });
   expect(plan.target, `premise: the history has room to move the chip out of view ${JSON.stringify(plan)}`).toBeLessThanOrEqual(plan.max);
   await settle(page);
-  const inView = await chip.evaluate((el) => {
-    const r = el.getBoundingClientRect();
-    const v = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
-    return r.bottom > v.top && r.top < v.bottom;
-  });
-  expect(inView, `premise: the chip is scrolled out of view ${JSON.stringify(plan)}`).toBe(false);
+  expect(await inHistoryView(chip), `premise: the chip is scrolled out of view ${JSON.stringify(plan)}`).toBe(false);
 }
 
 function historyScrollTop(page: Page): Promise<number> {
@@ -625,11 +623,7 @@ test.describe("Reaction chip below 48rem", () => {
 // group's list, or write to the old group's state.
 test.describe("Reaction chip held while its group remounts", { tag: "@chromium-only" }, () => {
   test("the hold opens nothing, nothing panics, and the chip still reacts", async ({ page }) => {
-    const panics: string[] = [];
-    page.on("pageerror", (e) => panics.push(e.message));
-    page.on("console", (m) => {
-      if (m.type() === "error" && /panicked|unreachable/.test(m.text())) panics.push(m.text());
-    });
+    const panics = panicsOf(page);
     await openRoomWithComposer(page);
     await callRiverTest(page, "deliverTimedMessages", 0, [
       { text: "hold lead", sentSecs: 1, receivedSecs: 0 },

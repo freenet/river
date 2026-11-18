@@ -1,4 +1,4 @@
-import { expect, Page, Route, test } from "@playwright/test";
+import { expect, Locator, Page, Route, test } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 import { waitForApp, selectRoom, nextFrames, settle } from "./example-room";
 
@@ -92,6 +92,15 @@ export function scrollMetrics(page: Page, view: HistoryView = ROOM_VIEW) {
 /// `scrollMetrics().toEnd`, the measure most polls wait on.
 export async function distanceFromBottom(page: Page, view: HistoryView = ROOM_VIEW): Promise<number> {
   return (await scrollMetrics(page, view)).toEnd;
+}
+
+/// Whether any part of `target` overlaps the room history's visible area.
+export function inHistoryView(target: Locator): Promise<boolean> {
+  return target.evaluate((el) => {
+    const box = el.getBoundingClientRect();
+    const view = document.getElementById("chat-scroll-container")!.getBoundingClientRect();
+    return box.bottom > view.top && box.top < view.bottom;
+  });
 }
 
 /// How many newer items the rendered range is holding back, from the

@@ -53,6 +53,8 @@ mod mobile_surface;
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 mod pending_effects;
 mod pending_sends;
+mod reaction_focus;
+mod reaction_order;
 mod reaction_picker;
 mod reply_highlight;
 #[cfg(target_arch = "wasm32")]
@@ -302,6 +304,8 @@ struct GroupedMessage {
     message_id: MessageId,
     edited: bool,
     reactions: HashMap<String, Vec<MemberId>>,
+    /// Emoji order from the earliest retained, still-standing reaction.
+    reaction_order: Vec<String>,
     /// What the reply-quote strip should render, already resolved against live
     /// room state — see [`ReplyStrip`] and [`resolve_reply_strip`].
     reply_strip: ReplyStrip,
@@ -712,6 +716,7 @@ fn group_messages(
 ) -> Vec<DisplayItem> {
     let mut items: Vec<DisplayItem> = Vec::new();
     let group_threshold = Duration::from_secs(5 * 60); // 5 minutes
+    let reaction_ranks = reaction_order::reaction_ranks_for(messages_state, secrets);
 
     // Inputs to the per-message HTML cache (see MESSAGE_HTML_CACHE). The member
     // fingerprint is computed once per render, not per message.
@@ -786,6 +791,9 @@ fn group_messages(
             .cloned()
             .unwrap_or_default();
 
+        let reaction_order =
+            reaction_order::order_reactions(&reactions, reaction_ranks.get(&message_id));
+
         // Resolve the reply quote (if any) against live room state.
         let reply_strip = resolve_reply_strip(
             &message.message.content,
@@ -808,6 +816,7 @@ fn group_messages(
             message_id,
             edited,
             reactions,
+            reaction_order,
             reply_strip,
             receive_delay_secs,
         };
@@ -3965,21 +3974,21 @@ fn reaction_owner_marks(
     )
 }
 
-/// A message's reactions as its chips show them: by
-/// emoji, each with who made it ("You" for the reader, never checked for
-/// impersonation; everyone else with the same ⚠ / 🛡 as the author line).
+/// A message's reactions in standing-history order, each with who made it
+/// ("You" for the reader, never checked for impersonation; everyone else
+/// with the same ⚠ / 🛡 as the author line).
 fn reactions_by_emoji(
     reactions: &HashMap<String, Vec<MemberId>>,
+    order: &[String],
     self_member_id: Option<MemberId>,
     member_names: &HashMap<MemberId, String>,
     impersonation: &ImpersonationChecker,
     owner_id: MemberId,
     deputy_badges: &HashMap<MemberId, DeputyBadge>,
 ) -> Vec<RowReaction> {
-    let mut sorted: Vec<_> = reactions.iter().collect();
-    sorted.sort_by_key(|(emoji, _)| emoji.as_str());
-    sorted
-        .into_iter()
+    order
+        .iter()
+        .filter_map(|emoji| reactions.get_key_value(emoji))
         .map(|(emoji, reactors)| RowReaction {
             emoji: emoji.clone(),
             mine: self_member_id.is_some_and(|me| reactors.contains(&me)),
@@ -4152,33 +4161,15 @@ fn MessageGroupComponent(
                         return;
                     }
                     // The chip is gone: Remove took the only reaction with that
-                    // emoji. Focus stays on the reaction line: another chip
-                    // while one remains, else the message's footer React,
-                    // which every message has. Each is tried until one
-                    // actually holds focus (a row being edited has no React).
-                    // If the message is gone too, focus stays where the
-                    // browser put it. Never scrolling: only an arrival moves
-                    // the history.
-                    let Some(row) = document.get_element_by_id(&format!("msg-{message_id}")) else {
-                        return;
-                    };
-                    for selector in [
-                        "[data-testid=\"reaction-chip\"]",
-                        "[data-testid=\"message-react-button\"]",
-                    ] {
-                        let Some(control) = row.query_selector(selector).ok().flatten() else {
-                            continue;
-                        };
-                        if focus_without_scrolling(&control)
-                            && document.active_element().as_ref() == Some(&control)
-                        {
-                            return;
-                        }
-                    }
+                    // emoji. Focus stays on the message's reaction line.
+                    reaction_focus::focus_reaction_line(&message_id, None);
                 });
             }
         });
     }
+    // A chip the standing order moves, or its open list, keeps the focus it
+    // had: measured here, before this render's edits reach the DOM.
+    reaction_focus::keep_across_patch(group.messages.iter().map(|msg| msg.id.as_str()));
 
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
@@ -4268,6 +4259,7 @@ fn MessageGroupComponent(
                         // as the chips show them.
                         let row_reactions = reactions_by_emoji(
                             &msg.reactions,
+                            &msg.reaction_order,
                             self_member_id,
                             &member_names,
                             &impersonation,
@@ -4780,10 +4772,10 @@ fn MessageGroupComponent(
                                                         let owners_key_for_click = owners_key.clone();
                                                         let owners_key_for_key = owners_key.clone();
                                                         let owners_key_for_press = owners_key.clone();
-                                                        let msg_id_for_key = msg_id_for_click.clone();
-                                                        let emoji_for_key = emoji_for_click.clone();
+                                                        let row_id_for_click = row_id_for_chips.clone();
                                                         let row_id_for_owners_key = row_id_for_chips.clone();
                                                         let chip_id = reaction_chip_id(&owners_key);
+                                                        let chip_id_for_click = chip_id.clone();
                                                         let chip_id_for_key = chip_id.clone();
                                                         let chip_id_for_hold = chip_id.clone();
                                                         let row_id_for_hold = row_id_for_chips.clone();
@@ -4865,11 +4857,11 @@ fn MessageGroupComponent(
                                                                         })}
                                                                     }
                                                                 }
-                                                                span {
+                                                                button {
+                                                                    r#type: "button",
                                                                     id: "{chip_id}",
                                                                     "data-testid": "reaction-chip",
-                                                                    role: "button",
-                                                                    tabindex: "0",
+                                                                    "data-emoji": "{emoji}",
                                                                     // A toggle: a press reacts with this emoji.
                                                                     "aria-pressed": if is_user_reaction { "true" } else { "false" },
                                                                     // Only while its list is open: the row's band
@@ -4878,7 +4870,7 @@ fn MessageGroupComponent(
                                                                     // A pill; your own reaction is the link
                                                                     // colour on the soft accent, like a mention.
                                                                     class: format!(
-                                                                        "inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold cursor-pointer select-none [-webkit-touch-callout:none] {}",
+                                                                        "reaction-chip inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[13px] font-bold cursor-pointer select-none [-webkit-touch-callout:none] {}",
                                                                         if is_user_reaction {
                                                                             "border-[color-mix(in_srgb,var(--color-link)_50%,transparent)] bg-accent-soft text-link"
                                                                         } else {
@@ -4936,11 +4928,21 @@ fn MessageGroupComponent(
                                                                         // A scroll that starts on the chip ends here.
                                                                         chip_hold_cancel.borrow_mut().cancel();
                                                                     },
-                                                                    onclick: move |_| {
+                                                                    onclick: move |e: MouseEvent| {
                                                                         // The lift of the hold that opened the list is
                                                                         // not a press.
                                                                         if chip_hold_click.borrow_mut().take_release(&owners_key_for_click) {
                                                                             return;
+                                                                        }
+                                                                        // The reader's chip with no one else on it
+                                                                        // leaves with the reaction. Focus it holds from
+                                                                        // a key press stays on the message's reaction
+                                                                        // line; a pointer press's leaves with the chip.
+                                                                        if is_user_reaction && count == 1
+                                                                            && !reaction_focus::click_is_pointer_press(&e)
+                                                                            && reaction_focus::element_has_focus(&chip_id_for_click)
+                                                                        {
+                                                                            reaction_focus::focus_reaction_line(&row_id_for_click, Some(chip_id_for_click.as_str()));
                                                                         }
                                                                         let id = msg_id_for_click.clone();
                                                                         let emoji = emoji_for_click.clone();
@@ -4948,6 +4950,13 @@ fn MessageGroupComponent(
                                                                     },
                                                                     onkeydown: move |e: KeyboardEvent| {
                                                                         let key = e.key();
+                                                                        // A held Enter repeats, and each repeat would
+                                                                        // click the chip that took focus when the reader's
+                                                                        // own chip left with its reaction: no click.
+                                                                        if key == Key::Enter && e.is_auto_repeating() {
+                                                                            e.prevent_default();
+                                                                            return;
+                                                                        }
                                                                         if key == Key::Escape {
                                                                             // Only this chip's own list: an Escape
                                                                             // with none open is left to close the
@@ -4958,43 +4967,37 @@ fn MessageGroupComponent(
                                                                             }
                                                                             return;
                                                                         }
-                                                                        // A `role="button"` answers Enter and Space. Both
-                                                                        // react, as a press does. With Shift, at 48rem and
-                                                                        // wider, they open the list instead: a key press
-                                                                        // has no hover title to say who reacted.
+                                                                        // A button answers Enter and Space with a click,
+                                                                        // which reacts, as a press does: neither is
+                                                                        // handled here. With Shift, at 48rem and wider,
+                                                                        // they open the list instead: a key press has no
+                                                                        // hover title to say who reacted.
                                                                         let space = matches!(&key, Key::Character(c) if c == " ");
                                                                         if key != Key::Enter && !space {
                                                                             return;
                                                                         }
-                                                                        // Space would scroll the history.
-                                                                        e.prevent_default();
-                                                                        if shift_lists_reactors(mobile_surface::narrow_now(), e.modifiers().shift()) {
-                                                                            let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
-                                                                            let popover = reaction_owners_popover_at(
-                                                                                owners_key_for_key.clone(),
-                                                                                row_id_for_owners_key.clone(),
-                                                                                x,
-                                                                                y,
-                                                                            );
-                                                                            crate::util::defer(move || {
-                                                                                reactions.open_owner_list(open_reaction_owners, popover)
-                                                                            });
-                                                                        } else {
-                                                                            // The reader's chip with no one else on it
-                                                                            // leaves with the reaction.
-                                                                            if is_user_reaction && count == 1 {
-                                                                                mobile_surface::dom::focus_control(
-                                                                                    &row_id_for_owners_key,
-                                                                                    mobile_surface::REACT_SELECTOR,
-                                                                                );
-                                                                            }
-                                                                            let id = msg_id_for_key.clone();
-                                                                            let emoji = emoji_for_key.clone();
-                                                                            crate::util::defer(move || on_react.call((id, emoji)));
+                                                                        if !shift_lists_reactors(mobile_surface::narrow_now(), e.modifiers().shift()) {
+                                                                            return;
                                                                         }
+                                                                        // No click for this key press, so it does not
+                                                                        // react as well: a button clicks for Enter or
+                                                                        // Space only when their keydown is not
+                                                                        // prevented (Chromium, Firefox and WebKit,
+                                                                        // checked 2026-11-17).
+                                                                        e.prevent_default();
+                                                                        let (x, y) = element_centre(&chip_id_for_key).unwrap_or((0.0, 0.0));
+                                                                        let popover = reaction_owners_popover_at(
+                                                                            owners_key_for_key.clone(),
+                                                                            row_id_for_owners_key.clone(),
+                                                                            x,
+                                                                            y,
+                                                                        );
+                                                                        crate::util::defer(move || {
+                                                                            reactions.open_owner_list(open_reaction_owners, popover)
+                                                                        });
                                                                     },
                                                                     span { class: "text-[15px] leading-none", "{emoji}" }
-                                                                    span { class: "tabular-nums", "{count}" }
+                                                                    span { "data-testid": "reaction-chip-count", class: "tabular-nums", "{count}" }
                                                                 }
                                                             }
                                                         }

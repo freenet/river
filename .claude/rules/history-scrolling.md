@@ -131,7 +131,11 @@ Current behavior:
   (`conversation/mobile_message_sheet.rs`; its state and input hold are in
   `conversation/mobile_surface.rs`). A reaction chip opens nothing: a
   press on it reacts with its emoji, at every width. At 48rem and wider a
-  finger held on a chip, or Shift+Enter, opens its reactor list. While the
+  finger held on a chip, or Shift+Enter, opens its reactor list. A chip
+  that moves in the standing order while it, or its open list, holds focus
+  keeps that focus without scrolling (`conversation/reaction_focus.rs`);
+  focus the reader has put elsewhere stays there, and none is taken while
+  the reader is outside River's document. While the
   sheet is open the reader's wheel
   and one-finger touch scrolling outside its panel are held off, as the
   picker holds them, and the emoji row in its panel still scrolls sideways;
