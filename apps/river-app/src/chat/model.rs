@@ -122,6 +122,67 @@ pub struct Message {
     pub pending: Option<Pending>,
 }
 
+/// The room's limits, as its configuration sets them (the web UI's room details fields).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub max_members: usize,
+    pub max_recent_messages: usize,
+    /// Bytes.
+    pub max_message_size: usize,
+    pub max_user_bans: usize,
+    /// Bytes.
+    pub max_nickname_size: usize,
+    /// Bytes.
+    pub max_room_name: usize,
+    /// Bytes.
+    pub max_room_description: usize,
+}
+
+/// How much of its limits a room uses now, which lowering a limit below cuts off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Members, not counting the owner.
+    pub members: usize,
+    /// Bans the room holds.
+    pub bans: usize,
+    /// Messages (and their actions) the room holds.
+    pub messages: usize,
+}
+
+/// What the room details dialog shows beyond the name, description and privacy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Details {
+    /// The room's contract id, which the web UI shows as "Contract ID".
+    pub contract_id: String,
+    /// The owner's verifying key in base58: the web UI's "Room Public Key".
+    pub owner_key: String,
+    pub limits: Limits,
+    pub usage: Usage,
+    /// The version of the secret the room is sealed under now (0 for a public room).
+    pub secret_version: u32,
+    /// The room name as stored, which an edit starts from; empty when this computer can't
+    /// read it (a private room's secret has not arrived).
+    pub name_source: String,
+    /// The description as stored, likewise.
+    pub description_source: String,
+    /// Whether the viewer can change the room here, and for the owner who can't, why not.
+    pub editable: Editable,
+    /// An edit of the room's details that is on its way or failed.
+    pub pending: Option<Pending>,
+}
+
+/// Whether the viewer can edit the room's details.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Editable {
+    /// Not the owner: the dialog only shows.
+    #[default]
+    No,
+    /// The owner, who can.
+    Yes,
+    /// The owner, who can't from here, and why.
+    Blocked(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Room {
     /// Stable across renames; River uses the owner's verifying key.
@@ -147,6 +208,7 @@ pub struct Room {
     /// Why your nickname can't be changed now even though you can write, if it can't: the room
     /// removed you for inactivity, and only a message brings you back.
     pub nickname_block: Option<String>,
+    pub details: Details,
 }
 
 impl Room {
@@ -603,6 +665,7 @@ mod tests {
             nickname_limit: 50,
             own_nickname: None,
             nickname_block: None,
+            details: Details::default(),
         };
         let id = room.send("hi", 100);
         assert_eq!(id, 8);

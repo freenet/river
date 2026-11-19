@@ -1214,26 +1214,22 @@ fn the_emoji_button_opens_a_picker_that_types_into_the_composer() {
 }
 
 #[test]
-fn a_description_with_a_link_is_markdown_and_a_long_one_expands() {
+fn a_description_with_a_link_is_markdown_on_one_line_with_no_more_button() {
     let mut state = connected();
     state.chat.edit_rooms(|rooms| {
         rooms[0].description =
             "[Freenet](https://freenet.org) is the place.\nSecond line, with `code`.".into();
     });
-    let mut rt = render(state, WINDOW_SIZE);
+    let rt = render(state, WINDOW_SIZE);
     let key = format!("description-{}", rt.state.chat.room().unwrap().key);
     assert!(
         rt.find(&key).is_some(),
         "the first line is drawn as markdown"
     );
+    // The header never expands: the details dialog shows the whole description.
+    assert!(rt.find("description-toggle").is_none());
     assert!(rt.find("description-scroll").is_none());
-    press(&mut rt, "description-toggle");
-    assert!(
-        rt.find("description-scroll").is_some(),
-        "the whole description shows"
-    );
-    press(&mut rt, "description-toggle");
-    assert!(rt.find("description-scroll").is_none());
+    assert!(!shows(&rt, "Second line"));
 }
 
 #[test]
@@ -2270,4 +2266,507 @@ fn a_failed_or_dismissed_save_reverts_the_display_and_a_stored_one_follows_the_s
     s.chat.set_mode(&room, NotificationMode::Muted);
     s.chat.apply_modes(Default::default(), &settled);
     assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+}
+
+// The room details dialog ----------------------------------------------------------------------
+
+use super::LinkStatus;
+use super::model::Pending;
+
+/// The example rooms as rooms from the node, with `room` open.
+fn from_node(room: &str) -> RiverApp {
+    let mut state = connected();
+    let rooms = super::example::data().rooms;
+    state
+        .chat
+        .show_node_rooms(rooms, None, LinkStatus::Live, 29_000_000);
+    state.chat.select(room);
+    state
+}
+
+/// The example room the viewer owns.
+const OWNED: &str = "book-club";
+
+fn details(rt: &Runtime<RiverApp>) -> &super::details::DetailsForm {
+    rt.state.chat.details.as_ref().expect("the dialog is open")
+}
+
+/// Draw again after the test changed the state itself, as an event would have.
+fn redraw_now(rt: &mut Runtime<RiverApp>) {
+    rt.invalidate();
+    rt.frame(0.4);
+}
+
+fn type_into(rt: &mut Runtime<RiverApp>, field: &str, text: &str) {
+    press(rt, field);
+    // The field's text is replaced, as a person selects all and types.
+    if let Some(form) = rt.state.chat.details.as_mut() {
+        match field {
+            "details-name-input" => form.name.replace_text(""),
+            "details-description-input" => form.description.replace_text(""),
+            other => panic!("no field {other}"),
+        }
+    }
+    redraw_now(rt);
+    key(rt, Key::Text(text.into()));
+}
+
+/// Whether Save is drawn dimmed, as a disabled button is.
+fn save_dimmed(rt: &Runtime<RiverApp>) -> bool {
+    rt.elements()
+        .into_iter()
+        .any(|e| e.key.as_deref() == Some("details-save") && e.opacity < 0.9)
+}
+
+#[test]
+fn clicking_the_room_name_or_description_opens_the_details() {
+    for target in ["room-title", "description-open"] {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        assert!(rt.find("room-details-dialog").is_none());
+        press(&mut rt, target);
+        assert!(rt.find("room-details-dialog").is_some(), "{target}");
+        assert_eq!(details(&rt).room, rt.state.chat.room().unwrap().key);
+    }
+}
+
+#[test]
+fn the_room_name_opens_the_details_from_the_keyboard() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    // The name is the first thing Tab reaches; Space presses it, as it does any button.
+    key(&mut rt, Key::Tab);
+    assert!(
+        rt.elements()
+            .into_iter()
+            .any(|e| e.key.as_deref() == Some("room-title") && e.focused),
+        "the name takes the keyboard focus"
+    );
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(rt.find("room-details-dialog").is_some());
+}
+
+#[test]
+fn escape_and_switching_rooms_close_the_details() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("room-details-dialog").is_none());
+    assert!(rt.state.chat.details.is_none());
+    press(&mut rt, "room-title");
+    press(&mut rt, &format!("room-{PRIVATE_ROOM}"));
+    assert!(rt.state.chat.details.is_none(), "it belongs to its room");
+    assert!(rt.find("room-details-dialog").is_none());
+}
+
+#[test]
+fn a_member_sees_the_room_but_cannot_edit_it() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("room-details-dialog").is_some());
+    assert!(shows(&rt, "Town Square"));
+    // The description is markdown, shown in full.
+    let key = format!("details-description-{}", rt.state.chat.room().unwrap().key);
+    assert!(rt.find(&key).is_some() || shows(&rt, "The public room for everyone"));
+    assert!(shows(&rt, "Members"));
+    assert!(shows(&rt, "Max Message Size (bytes)"));
+    assert!(shows(&rt, "Maya Chen"), "the owner is named");
+    for edit in [
+        "details-name-input",
+        "details-description-input",
+        "details-save",
+    ] {
+        assert!(rt.find(edit).is_none(), "a member has no {edit}");
+    }
+    // Keys can be copied.
+    assert!(rt.find("details-contract-id-copy").is_some());
+    assert!(rt.find("details-owner-key-copy").is_some());
+    assert!(rt.find("details-private").is_none());
+}
+
+#[test]
+fn a_private_room_says_so() {
+    let mut rt = render(from_node(PRIVATE_ROOM), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("details-private").is_some());
+    assert!(rt.find("details-secret").is_some());
+}
+
+#[test]
+fn the_owner_name_opens_the_owners_dialog() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    press(&mut rt, "details-owner-open");
+    assert!(rt.find("room-details-dialog").is_none());
+    assert!(rt.find("member-info-dialog").is_some());
+    assert!(shows(&rt, "Room Owner"));
+}
+
+#[test]
+fn the_owner_edits_the_room_and_it_shows_everywhere() {
+    let mut state = connected();
+    state.chat.select(OWNED);
+    let mut rt = render(state, WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    for edit in [
+        "details-name-input",
+        "details-description-input",
+        "details-save",
+        "details-cancel",
+    ] {
+        assert!(rt.find(edit).is_some(), "the owner has {edit}");
+    }
+    type_into(&mut rt, "details-name-input", "Reading Circle");
+    assert_eq!(details(&rt).name.text, "Reading Circle");
+    rt.state
+        .chat
+        .details
+        .as_mut()
+        .unwrap()
+        .description
+        .replace_text("Now **reading** *Ursula*");
+    rt.state.chat.details.as_mut().unwrap().limits[0].replace_text("12");
+    redraw_now(&mut rt);
+    press(&mut rt, "details-save");
+    assert!(rt.find("room-details-dialog").is_none(), "saved, so closed");
+    let room = rt.state.chat.room().unwrap();
+    assert_eq!(room.name, "Reading Circle");
+    assert_eq!(room.description, "Now **reading** *Ursula*");
+    assert_eq!(room.details.limits.max_members, 12);
+    // The header, the room list and the composer all say the new name.
+    assert!(shows(&rt, "Reading Circle"));
+    assert!(!shows(&rt, "Book Club"));
+    assert!(
+        rt.find("room-book-club").is_some(),
+        "the room's key is stable"
+    );
+}
+
+#[test]
+fn cancel_changes_nothing() {
+    let mut state = connected();
+    state.chat.select(OWNED);
+    let mut rt = render(state, WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    type_into(&mut rt, "details-name-input", "Scratch");
+    press(&mut rt, "details-cancel");
+    assert!(rt.find("room-details-dialog").is_none());
+    assert_eq!(rt.state.chat.room().unwrap().name, "Book Club");
+}
+
+#[test]
+fn an_unchanged_dialog_saves_nothing() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    press(&mut rt, "details-save");
+    assert!(rt.find("room-details-dialog").is_none());
+    assert!(rt.state.chat.outgoing.is_empty(), "nothing was sent");
+}
+
+#[test]
+fn only_what_changed_goes_to_the_node() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    type_into(&mut rt, "details-name-input", "  Reading Circle ");
+    rt.state.chat.details.as_mut().unwrap().limits[3].replace_text("4");
+    redraw_now(&mut rt);
+    press(&mut rt, "details-save");
+    let sent = std::mem::take(&mut rt.state.chat.outgoing);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].room, OWNED);
+    let Action::SetRoomDetails { edit } = &sent[0].action else {
+        panic!("{:?}", sent[0].action);
+    };
+    assert_eq!(edit.name.as_deref(), Some("Reading Circle"));
+    assert_eq!(edit.max_user_bans, Some(4));
+    assert_eq!(edit.description, None);
+    assert_eq!(edit.max_members, None);
+    // Waiting on the node: said, and the dialog stays until the room shows it.
+    assert!(rt.find("room-details-dialog").is_some());
+}
+
+#[test]
+fn the_dialog_shows_a_change_on_its_way_and_closes_when_the_room_has_it() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    type_into(&mut rt, "details-name-input", "Reading Circle");
+    press(&mut rt, "details-save");
+    let pending = |name: &str, failed: Option<&str>| {
+        let (name, failed) = (name.to_owned(), failed.map(str::to_owned));
+        move |rooms: &mut Vec<super::model::Room>| {
+            let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+            r.name = name.clone();
+            r.details.name_source = name.clone();
+            r.details.pending = Some(Pending {
+                entry: 7,
+                failed: failed.clone(),
+                retry: true,
+            });
+        }
+    };
+    rt.state.chat.edit_rooms(pending("Reading Circle", None));
+    redraw_now(&mut rt);
+    assert!(rt.find("room-details-dialog").is_some());
+    assert!(shows(&rt, "Sending"));
+    assert!(save_dimmed(&rt), "one change at a time");
+    // The node refuses it: said with Retry and Discard, and the dialog stays.
+    rt.state.chat.edit_rooms(pending(
+        "Book Club",
+        Some("Not saved. Freenet refused it: the room is full."),
+    ));
+    redraw_now(&mut rt);
+    assert!(rt.find("room-details-dialog").is_some());
+    assert!(shows(&rt, "the room is full"));
+    assert!(rt.find("details-retry").is_some());
+    assert!(rt.find("details-discard").is_some());
+    press(&mut rt, "details-retry");
+    let sent = std::mem::take(&mut rt.state.chat.outgoing);
+    assert!(
+        sent.iter().any(|c| c.action == Action::Retry { entry: 7 }),
+        "{sent:?}"
+    );
+    press(&mut rt, "details-discard");
+    assert!(
+        rt.state
+            .chat
+            .outgoing
+            .iter()
+            .any(|c| c.action == Action::Discard { entry: 7 })
+    );
+    // Taken: the room shows the name and has nothing on its way, so the dialog is done.
+    rt.state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+        r.name = "Reading Circle".into();
+        r.details.name_source = "Reading Circle".into();
+        r.details.pending = None;
+    });
+    rt.state.chat.details.as_mut().unwrap().saving = true;
+    rt.state.chat.edit_rooms(|_| {});
+    redraw_now(&mut rt);
+    assert!(rt.find("room-details-dialog").is_none());
+}
+
+#[test]
+fn values_the_room_would_refuse_are_said_and_not_saved() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    for (typed, said) in [
+        ("", "Give the room a name."),
+        ("   ", "Give the room a name."),
+    ] {
+        rt.state
+            .chat
+            .details
+            .as_mut()
+            .unwrap()
+            .name
+            .replace_text(typed);
+        redraw_now(&mut rt);
+        assert!(shows(&rt, said), "{typed:?}");
+        press(&mut rt, "details-save");
+        assert!(rt.state.chat.outgoing.is_empty());
+        assert!(rt.find("room-details-dialog").is_some());
+    }
+    rt.state
+        .chat
+        .details
+        .as_mut()
+        .unwrap()
+        .name
+        .replace_text("Book Club");
+    for (typed, said) in [
+        ("abc", "Members must be a whole number of at least 1."),
+        ("0", "Members must be at least 1."),
+        ("-3", "Members must be a whole number of at least 1."),
+    ] {
+        rt.state.chat.details.as_mut().unwrap().limits[0].replace_text(typed);
+        redraw_now(&mut rt);
+        assert!(shows(&rt, said), "{typed:?}: {:?}", texts(&rt));
+        assert!(save_dimmed(&rt), "Save is off while the values are refused");
+        press(&mut rt, "details-save");
+        assert!(
+            rt.state.chat.outgoing.is_empty(),
+            "{typed:?} must not be sent"
+        );
+    }
+    // A name longer than the room's limit.
+    rt.state.chat.details.as_mut().unwrap().limits[0].replace_text("200");
+    rt.state
+        .chat
+        .details
+        .as_mut()
+        .unwrap()
+        .name
+        .replace_text("n".repeat(101));
+    redraw_now(&mut rt);
+    assert!(shows(&rt, "Max Room Name Size"));
+    press(&mut rt, "details-save");
+    assert!(rt.state.chat.outgoing.is_empty());
+}
+
+#[test]
+fn an_owner_who_cannot_sign_here_is_told_why() {
+    let mut state = from_node(OWNED);
+    state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+        r.details.editable =
+            super::model::Editable::Blocked(crate::rooms::room::NO_KEY_TO_EDIT.into());
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("details-blocked").is_some());
+    assert!(shows(&rt, "doesn't hold your key"));
+    assert!(rt.find("details-name-input").is_none());
+}
+
+#[test]
+fn the_details_fit_a_narrow_window() {
+    let mut state = connected();
+    state.chat.select(OWNED);
+    let mut rt = render(state, NARROW_SCENE_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("room-details-dialog").is_some());
+    assert!(rt.find("details-save").is_some());
+}
+
+#[test]
+fn return_in_the_name_field_saves() {
+    let mut state = connected();
+    state.chat.select(OWNED);
+    let mut rt = render(state, WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    type_into(&mut rt, "details-name-input", "Reading Circle");
+    key(&mut rt, Key::Enter);
+    assert!(rt.find("room-details-dialog").is_none());
+    assert_eq!(rt.state.chat.room().unwrap().name, "Reading Circle");
+}
+
+#[test]
+fn a_field_changed_elsewhere_while_the_dialog_is_open_is_not_signed_back() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    // Another device raises the member cap while the dialog is open.
+    rt.state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+        r.details.limits.max_members = 12;
+    });
+    redraw_now(&mut rt);
+    type_into(&mut rt, "details-name-input", "Reading Circle");
+    press(&mut rt, "details-save");
+    let sent = std::mem::take(&mut rt.state.chat.outgoing);
+    let Some(Action::SetRoomDetails { edit }) = sent.last().map(|c| &c.action) else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(edit.name.as_deref(), Some("Reading Circle"));
+    assert_eq!(
+        edit.max_members, None,
+        "the other device's value is left alone"
+    );
+}
+
+#[test]
+fn an_unrelated_update_does_not_close_the_dialog_and_a_second_save_does_nothing() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    type_into(&mut rt, "details-name-input", "Reading Circle");
+    // A new message arrives: the dialog stays, unsaved.
+    rt.state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+        r.send("hello", 1);
+    });
+    assert!(rt.state.chat.details.is_some());
+    // Save twice: one command only, and the dialog waits for the room to show it.
+    rt.state.chat.submit_details();
+    rt.state.chat.submit_details();
+    let sent: Vec<_> = rt
+        .state
+        .chat
+        .outgoing
+        .iter()
+        .filter(|c| matches!(c.action, Action::SetRoomDetails { .. }))
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    // An update that does not show the change yet does not close it either.
+    rt.state.chat.edit_rooms(|_| {});
+    assert!(rt.state.chat.details.is_some());
+    // Once the room shows the name, it closes.
+    rt.state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+        r.details.name_source = "Reading Circle".into();
+    });
+    assert!(rt.state.chat.details.is_none());
+}
+
+#[test]
+fn lowering_a_limit_below_what_is_used_asks_first_in_plain_words() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+        r.details.usage.members = 7;
+    });
+    press(&mut rt, "room-title");
+    rt.state.chat.details.as_mut().unwrap().limits[0].replace_text("3");
+    redraw_now(&mut rt);
+    press(&mut rt, "details-save");
+    assert!(
+        rt.state.chat.outgoing.is_empty(),
+        "not sent before it is confirmed"
+    );
+    assert!(shows(
+        &rt,
+        "Lowering Members to 3 removes 4 members, starting with the longest invite chains. This cannot be undone."
+    ));
+    // Back returns to the fields, unsent.
+    press(&mut rt, "details-back");
+    assert!(rt.find("details-confirm").is_none());
+    assert!(rt.state.chat.outgoing.is_empty());
+    press(&mut rt, "details-save");
+    press(&mut rt, "details-confirm-save");
+    let sent = std::mem::take(&mut rt.state.chat.outgoing);
+    let Some(Action::SetRoomDetails { edit }) = sent.last().map(|c| &c.action) else {
+        panic!("{sent:?}");
+    };
+    assert_eq!(edit.max_members, Some(3));
+}
+
+#[test]
+fn the_dialog_shows_how_much_of_a_limit_is_used() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == OWNED).unwrap();
+        r.details.usage.bans = 4;
+        r.details.usage.messages = 61;
+    });
+    press(&mut rt, "room-title");
+    assert!(shows(&rt, "Max Recent Messages (61 held now)"));
+    assert!(shows(&rt, "Max User Bans (4 in force now)"));
+}
+
+#[test]
+fn the_dialog_says_what_the_room_would_refuse() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    let set = |rt: &mut Runtime<RiverApp>, f: &dyn Fn(&mut super::details::DetailsForm)| {
+        f(rt.state.chat.details.as_mut().unwrap());
+        redraw_now(rt);
+    };
+    // A nickname limit over the ceiling, a limit over u32, a description over the limit, and a
+    // name over a limit lowered in the same edit.
+    set(&mut rt, &|f| f.limits[4].replace_text("1001"));
+    assert!(shows(&rt, "Max nickname size can be at most"));
+    set(&mut rt, &|f| {
+        f.limits[4].replace_text("50");
+        f.limits[2].replace_text("4294967296");
+    });
+    assert!(shows(&rt, "at most 4294967295"));
+    set(&mut rt, &|f| {
+        f.limits[2].replace_text("1000");
+        f.description.replace_text("d".repeat(501));
+    });
+    assert!(shows(&rt, "Max Room Description Size"));
+    set(&mut rt, &|f| {
+        f.description.replace_text("short");
+        f.limits[5].replace_text("3");
+    });
+    assert!(shows(&rt, "Max Room Name Size"));
+    assert!(save_dimmed(&rt));
+    assert!(rt.state.chat.outgoing.is_empty());
 }

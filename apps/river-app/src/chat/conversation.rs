@@ -28,8 +28,6 @@ const BODY_MAX_W: f32 = 604.0;
 /// The history and composer column, centred on a wide window: the web UI's
 /// `.conversation-column` (`60px + 76ch + 24px`).
 const COLUMN_MAX_W: f32 = GUTTER + BODY_MAX_W + 24.0;
-/// The tallest the header's full description grows to before it scrolls.
-const DESCRIPTION_MAX_H: f32 = 220.0;
 /// The most lines the composer grows to before it scrolls.
 const COMPOSER_MAX_LINES: usize = 8;
 
@@ -67,9 +65,18 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
                 .child(label("PRIVATE", st::TAG, p.text_secondary)),
         );
     }
+    // The name opens the room's details dialog, from the keyboard too.
+    let title = title
+        .key("room-title")
+        .role("button")
+        .label(format!("Room details: {}", room.name))
+        .help("Room details")
+        .focusable(true)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut RiverApp| s.chat.open_details());
     let mut info = col().grow(1.0).min_w(0.0).gap(2.0).child(title);
-    // The description is markdown. Collapsed it is its first line (links work there); a longer
-    // one has a More button that shows the whole of it, scrolling past a height.
+    // The description is markdown, shown as its first line (links work there); the details
+    // dialog shows all of it.
     let desc = room.description.as_str();
     // The first line that says something: a description may start with a blank line.
     let first = desc
@@ -77,68 +84,28 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    let expandable = desc.lines().filter(|l| !l.trim().is_empty()).count() > 1
-        || desc.chars().count() > 90
-        || !markdown::is_one_line(first);
-    let show_all = chat.description_open && expandable;
     if !desc.is_empty() {
         let key = format!("description-{}", room.key);
-        let source = if show_all { desc } else { first };
-        let rendered = if (show_all || markdown::is_one_line(source)) && markdown::is_cheap(source)
-        {
-            markdown::render(source, false, st::SMALL, p.text_muted, key, p, k)
+        let rendered = if markdown::is_one_line(first) && markdown::is_cheap(first) {
+            markdown::render(first, false, st::SMALL, p.text_muted, key, p, k)
         } else {
             None
         };
-        info = info.child(match (rendered, show_all) {
-            (Some(md), true) => col()
-                .key("description-scroll")
+        let line = match rendered {
+            Some(md) => md.max_h(18.0).clip_soft(0.0),
+            None => label(markdown::strip(desc), st::SMALL, p.text_muted).truncate(),
+        };
+        // A press on the text between links opens the dialog; a link keeps its own press.
+        info = info.child(
+            row()
+                .key("description-open")
                 .w_full()
-                .max_h(DESCRIPTION_MAX_H)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .child(md),
-            (Some(md), false) => md.max_h(18.0).clip_soft(0.0),
-            (None, true) => col()
-                .key("description-scroll")
-                .w_full()
-                .max_h(DESCRIPTION_MAX_H)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .child(label(desc.to_owned(), st::SMALL, p.text_muted).wrap()),
-            (None, false) => label(markdown::strip(desc), st::SMALL, p.text_muted).truncate(),
-        });
+                .min_w(0.0)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(|s: &mut RiverApp| s.chat.open_details())
+                .child(line),
+        );
     }
-    let more = expandable.then(|| {
-        let open = show_all;
-        row()
-            .key("description-toggle")
-            .role("button")
-            .label(if open {
-                "Show less of the description"
-            } else {
-                "Show the whole description"
-            })
-            .h(26.0)
-            .px(8.0)
-            .radius(6.0)
-            .center()
-            .hover(p.surface_hover)
-            .cursor(rune::Cursor::Pointer)
-            .on_press(|s: &mut RiverApp| {
-                s.chat.description_open = !s.chat.description_open;
-                if s.chat.description_open {
-                    s.chat.emoji_open = false;
-                }
-            })
-            .child(label(
-                if open { "Less" } else { "More" },
-                st::SMALL_STRONG,
-                p.accent,
-            ))
-    });
     let open = chat.members_shown(narrow);
     let toggle = row()
         .key("toggle-members")
@@ -189,15 +156,11 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
         .key("room-header")
         .w_full()
         .min_h(HEADER_H)
-        .py(if show_all { 10.0 } else { 0.0 })
         .pl(20.0)
         .pr(12.0)
         .gap(16.0)
         .center_y()
         .child(info);
-    if let Some(more) = more {
-        header = header.child(more);
-    }
     if let Some(bell) = bell {
         header = header.child(bell);
     }

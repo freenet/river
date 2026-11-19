@@ -9,7 +9,9 @@
 # it, each receives the other's message, and each changes its own nickname and the other sees
 # it. Last, the example asks each node's chat delegate for
 # the room's signing key and requires it to be that app's own member key (the app's background
-# sweep stores it). Then, on the gateway, a pointer record signed by a throwaway key names a
+# sweep stores it). Then the owner's app changes the room's name, description and a limit (a new
+# signed configuration) and the other app shows them, and the other app's member is refused when
+# it tries the same. Then, on the gateway, a pointer record signed by a throwaway key names a
 # newer chat delegate, and a third app that trusts that key must show the room read-only and
 # write nothing (the record goes to the local test node only, never to River's addresses).
 #

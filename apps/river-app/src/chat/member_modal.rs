@@ -84,7 +84,7 @@ fn chip(key: &str, text: &str, color: rune::Color, line: rune::Color) -> El {
 /// dialog's width, where the body size left a lone character on a second line.
 const KEY_TEXT: rune::tok::TextStyle = rune::tok::TextStyle::new(13.0, 400.0);
 
-fn field(
+pub(super) fn field(
     key: &str,
     name: &str,
     value: &str,

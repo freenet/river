@@ -375,6 +375,37 @@ fn nickname_scene(s: &mut RiverApp, edit: fn(&mut Chat, &mut chat::model::Room))
     });
 }
 
+/// The room details dialog open on the example room `room`, shown as a room from the node (so
+/// Save sends a command), after `edit` set the room and what is typed.
+fn details_scene(s: &mut RiverApp, room: &str, edit: fn(&mut Chat, &mut chat::model::Room)) {
+    connect(s);
+    let mut rooms = chat::example::data().rooms;
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    let i = rooms.iter().position(|r| r.key == room).unwrap_or(0);
+    let mut shown = rooms[i].clone();
+    // Edited rooms are given to the chat before the dialog opens, so the form starts from them.
+    shown.description = match room {
+        "town-square" => "The **public** room for everyone using [Freenet](https://freenet.org).\n\n- Be kind\n- Read the [rules](https://freenet.org/rules)\n\nSee `#help` for questions.".into(),
+        _ => shown.description,
+    };
+    shown.details.description_source = shown.description.clone();
+    rooms[i] = shown;
+    s.chat
+        .show_node_rooms(rooms.clone(), None, chat::LinkStatus::Live, 29_000_000);
+    s.chat.select(room);
+    s.chat.open_details();
+    let mut shown = rooms.swap_remove(i);
+    edit(&mut s.chat, &mut shown);
+    let pending = shown.details.pending.clone();
+    let editable = shown.details.editable.clone();
+    s.chat.edit_rooms(|r| {
+        if let Some(r) = r.iter_mut().find(|r| r.key == room) {
+            r.details.pending = pending;
+            r.details.editable = editable;
+        }
+    });
+}
+
 /// A named state for `--snap` and `--list-scenes`: a name and how it changes the initial state.
 pub type Scene = (&'static str, fn(&mut RiverApp));
 
@@ -604,14 +635,82 @@ pub const SCENES: &[Scene] = &[
         s.chat
             .set_mode("rust-help", rooms::modes::NotificationMode::Muted);
     }),
-    ("chat-description-open", |s| {
-        connect(s);
-        s.chat.edit_rooms(|rooms| {
-            rooms[0].description =
-                "The **public** room for [Freenet](https://freenet.org) users.\n\n- Be kind\n- Read the [rules](https://freenet.org/rules)\n\nSee `#help` for questions."
-                    .into();
+    // The room details dialog: as a member sees it (a public and a private room), as the owner
+    // edits it, with values the room would refuse, on its way to the node, after the node
+    // refused it, and for an owner whose key this computer does not hold.
+    ("chat-room-details-member", |s| {
+        details_scene(s, "town-square", |_, _| {})
+    }),
+    ("chat-room-details-private", |s| {
+        details_scene(s, "family", |_, _| {})
+    }),
+    ("chat-room-details-owner", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |_, _| {})
+    }),
+    ("chat-room-details-editing", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |chat, _| {
+            let form = chat.details.as_mut().expect("open");
+            form.name.replace_text("Reading Circle");
+            form.description
+                .replace_text("This month: **The Dispossessed**.\nSecond week: chapters 5-8.");
+            form.limits[0].replace_text("40");
+        })
+    }),
+    ("chat-room-details-error", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |chat, _| {
+            let form = chat.details.as_mut().expect("open");
+            form.name.replace_text("Reading Circle");
+            form.limits[2].replace_text("lots");
+        })
+    }),
+    ("chat-room-details-pending", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |chat, room| {
+            chat.details
+                .as_mut()
+                .expect("open")
+                .name
+                .replace_text("Reading Circle");
+            room.details.pending = Some(chat::model::Pending {
+                entry: 1,
+                failed: None,
+                retry: false,
+            });
+        })
+    }),
+    ("chat-room-details-failed", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |chat, room| {
+            chat.details
+                .as_mut()
+                .expect("open")
+                .name
+                .replace_text("Reading Circle");
+            room.details.pending = Some(chat::model::Pending {
+                entry: 1,
+                failed: Some("Not saved. Freenet refused it: the room is full.".into()),
+                retry: true,
+            });
+        })
+    }),
+    // Lowering the member cap below the members the room has: asked to confirm, in plain words.
+    ("chat-room-details-confirm", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |_, _| {});
+        s.chat.edit_rooms(|r| {
+            if let Some(r) = r.iter_mut().find(|r| r.key == chat::example::EMPTY_ROOM) {
+                r.details.usage.members = 7;
+                r.details.usage.messages = 61;
+                r.details.usage.bans = 3;
+            }
         });
-        s.chat.description_open = true;
+        let form = s.chat.details.as_mut().expect("open");
+        form.limits[0].replace_text("3");
+        form.limits[3].replace_text("1");
+        s.chat.submit_details();
+    }),
+    ("chat-room-details-no-key", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |_, room| {
+            room.details.editable =
+                chat::model::Editable::Blocked(rooms::room::NO_KEY_TO_EDIT.into());
+        })
     }),
     // Markdown in a room's description and messages, with mention chips.
     ("chat-markdown", |s| {

@@ -5,7 +5,10 @@
 //! part of the conversation view (groups, a reply, reactions, a long wrapping message, a link,
 //! an edit).
 
-use super::model::{self, Member, MemberId, Message, Reaction, ReplyTo, Role, Room};
+use super::model::{
+    self, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role, Room,
+    Usage,
+};
 
 pub struct ExampleData {
     pub rooms: Vec<Room>,
@@ -177,6 +180,7 @@ fn town_square() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        details: Details::default(),
     }
 }
 
@@ -226,6 +230,7 @@ fn design_crew() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        details: Details::default(),
     }
 }
 
@@ -265,6 +270,7 @@ fn rust_help() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        details: Details::default(),
     }
 }
 
@@ -293,6 +299,7 @@ fn family() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        details: Details::default(),
     }
 }
 
@@ -311,17 +318,55 @@ fn book_club() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        details: Details::default(),
     }
+}
+
+/// The details dialog's content for an example room: the web UI's default limits, and a key
+/// made from the room's own.
+fn with_details(mut room: Room) -> Room {
+    let owner = room
+        .members
+        .iter()
+        .any(|m| m.role == Role::Owner && m.id == room.me);
+    room.details = Details {
+        contract_id: format!("{:0<44}", room.key.replace('-', "")),
+        owner_key: format!("{:0<44}", format!("{}owner", room.key.replace('-', ""))),
+        limits: Limits {
+            max_members: 200,
+            max_recent_messages: 100,
+            max_message_size: 1000,
+            max_user_bans: 10,
+            max_nickname_size: 50,
+            max_room_name: 100,
+            max_room_description: 500,
+        },
+        usage: Usage {
+            members: room
+                .members
+                .iter()
+                .filter(|m| m.role != Role::Owner)
+                .count(),
+            bans: 0,
+            messages: room.messages.len(),
+        },
+        secret_version: 0,
+        name_source: room.name.clone(),
+        description_source: room.description.clone(),
+        editable: if owner { Editable::Yes } else { Editable::No },
+        pending: None,
+    };
+    room
 }
 
 pub fn data() -> ExampleData {
     ExampleData {
         rooms: vec![
-            town_square(),
-            design_crew(),
-            rust_help(),
-            family(),
-            book_club(),
+            with_details(town_square()),
+            with_details(design_crew()),
+            with_details(rust_help()),
+            with_details(family()),
+            with_details(book_club()),
         ],
         today: TODAY,
         day_zero: model::days_from_civil(2026, 11, 6) - TODAY as i64,

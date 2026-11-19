@@ -10,6 +10,7 @@
 //! [`Command`] too, and what became of it comes back as [`WorkView`]s and an invitation's link.
 
 mod conversation;
+mod details;
 mod emoji;
 pub mod example;
 mod icons;
@@ -190,14 +191,14 @@ pub struct Chat {
     /// The composer's emoji picker is open, and on which category.
     pub emoji_open: bool,
     pub emoji_category: usize,
-    /// The room header shows the whole description, not one line of it.
-    pub description_open: bool,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
     /// What is typed in the nickname field of your own member info dialog.
     pub nickname: TextEdit,
     /// Why the nickname typed was refused when Save was pressed with nothing in it.
     pub nickname_error: Option<String>,
+    /// The room details dialog, when open (in the open room).
+    pub details: Option<details::DetailsForm>,
     /// Today's day number in message time (whose day 0 is `day_zero`).
     pub today: u32,
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
@@ -325,10 +326,10 @@ impl Chat {
             link_menu: None,
             emoji_open: false,
             emoji_category: 0,
-            description_open: false,
             member_modal: None,
             nickname: TextEdit::new(""),
             nickname_error: None,
+            details: None,
             today,
             day_zero,
             now,
@@ -381,8 +382,8 @@ impl Chat {
         self.rooms = rooms;
         if self.rooms.is_empty() {
             self.emoji_open = false;
-            self.description_open = false;
             self.member_modal = None;
+            self.details = None;
             // An empty list is often a reload on its way to the full one: keep the open room's
             // text as its draft, remember which room it was, and open nothing.
             let mut open = std::mem::replace(&mut self.composer, TextEdit::new(""));
@@ -417,6 +418,7 @@ impl Chat {
         {
             self.notify_dialog = None;
         }
+        self.settle_details();
     }
 
     /// Show the user's rooms as read from the node, replacing what is shown. `open` is the room
@@ -554,10 +556,10 @@ impl Chat {
         // A reply, edit or deletion belongs to the room it was started in.
         self.cancel();
         self.emoji_open = false;
-        self.description_open = false;
-        // A member's dialog belongs to the room it was opened in.
+        // A member's dialog, and the details dialog, belong to the room they were opened in.
         self.member_modal = None;
         self.notify_dialog = None;
+        self.details = None;
         if self.selected.is_empty() {
             // Nothing was open, so what the composer holds belongs to no room yet: keep it,
             // unless it is empty and this room has a draft.
@@ -732,9 +734,7 @@ impl Chat {
     pub fn toggle_emoji(&mut self) {
         self.emoji_open = !self.emoji_open;
         // The expanded description and the picker together would crowd a short window.
-        if self.emoji_open {
-            self.description_open = false;
-        }
+        if self.emoji_open {}
     }
 
     /// Put `emoji` into the composer at the caret (in place of the selection) and give the
@@ -824,6 +824,7 @@ impl Chat {
         edit.focused = member.id == self.room().map_or(0, |r| r.me);
         self.nickname = edit;
         self.nickname_error = None;
+        self.details = None;
         self.member_modal = Some(uid.to_owned());
     }
 
