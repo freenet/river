@@ -595,6 +595,12 @@ pub const SCENES: &[Scene] = &[
         });
         s.chat.open_member("90");
     }),
+    // A deputy's info dialog: the Deputy tag and who appointed them. In the example room Jonas
+    // is the owner's deputy, so the author line and the members list show him too.
+    ("chat-deputy", |s| {
+        connect(s);
+        s.chat.open_member("30");
+    }),
     // Your own member info dialog, which edits your nickname: as it opens, with the new
     // nickname being typed, with one the room would refuse, on its way to the node, and after
     // the node refused it.

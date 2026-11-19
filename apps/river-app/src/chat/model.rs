@@ -38,6 +38,64 @@ pub struct Member {
     /// Whether they chose the nickname shown: false for a stand-in ("Member <id>") used when
     /// they have none this computer can read.
     pub claimed: bool,
+    /// Who made them a deputy, as this viewer sees it (the web UI's `DeputyBadge`): only the
+    /// owner, you, and the people who invited you count. Empty for anyone who is not a deputy
+    /// to you, and for the owner.
+    pub deputized_by: Vec<Appointer>,
+    /// Whether this deputy can get you removed from the room. `None` unless they are a deputy,
+    /// and for yourself.
+    pub can_ban_you: Option<bool>,
+    /// River's own ordering of member ids (the hash a `MemberId` wraps), which the web UI sorts
+    /// protected names by. `uid` is a label and does not sort the same way. 0 in example rooms.
+    pub order: i64,
+}
+
+/// One appointer behind a deputy's shield. The owner and you are kept apart from other members
+/// because the web UI words them as trusted labels and never by nickname.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Appointer {
+    Owner,
+    You,
+    Member(MemberId),
+}
+
+impl Member {
+    /// The web UI's `DeputyBadge::tooltip`: who appointed them and what that means for you,
+    /// built from fixed wording and a count, never from a nickname (a name could forge a role
+    /// label in a flat sentence). `None` for someone who is not a deputy to you.
+    pub fn deputy_tooltip(&self) -> Option<String> {
+        if self.deputized_by.is_empty() {
+            return None;
+        }
+        let has = |a: Appointer| self.deputized_by.contains(&a);
+        let others = self
+            .deputized_by
+            .iter()
+            .filter(|a| matches!(a, Appointer::Member(_)))
+            .count();
+        let mut parts: Vec<String> = Vec::new();
+        if has(Appointer::Owner) {
+            parts.push("the room owner".into());
+        }
+        if has(Appointer::You) {
+            parts.push("you".into());
+        }
+        match others {
+            0 => {}
+            1 => parts.push("another member".into()),
+            n => parts.push(format!("{n} other members")),
+        }
+        let who = match parts.len() {
+            1 => parts.remove(0),
+            2 => format!("{} and {}", parts[0], parts[1]),
+            _ => format!("{}, {} and {}", parts[0], parts[1], parts[2]),
+        };
+        Some(match self.can_ban_you {
+            Some(true) => format!("Deputy (appointed by {who}). Can ban you."),
+            Some(false) => format!("Deputy (appointed by {who}). Cannot ban you."),
+            None => format!("Deputy (appointed by {who})"),
+        })
+    }
 }
 
 impl Member {
@@ -51,6 +109,9 @@ impl Member {
             invited_by: None,
             key: String::new(),
             claimed: true,
+            deputized_by: Vec::new(),
+            can_ban_you: None,
+            order: 0,
         }
     }
 }
@@ -59,6 +120,8 @@ impl Member {
 pub enum Role {
     Owner,
     Member,
+    /// Holds a deputy grant that counts in this viewer's view (see `Member::deputized_by`).
+    Deputy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

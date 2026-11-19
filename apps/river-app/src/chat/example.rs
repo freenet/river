@@ -6,8 +6,8 @@
 //! an edit).
 
 use super::model::{
-    self, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role, Room,
-    Usage,
+    self, Appointer, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role,
+    Room, Usage,
 };
 
 pub struct ExampleData {
@@ -34,6 +34,14 @@ fn member(id: MemberId, nickname: &str, role: Role) -> Member {
 /// `m`, invited by `by`.
 fn invited(mut m: Member, by: MemberId) -> Member {
     m.invited_by = Some(by);
+    m
+}
+
+/// `m` as a deputy in the viewer's view: appointed by `by`, and able (or not) to ban the viewer.
+fn deputy(mut m: Member, by: &[Appointer], can_ban_you: bool) -> Member {
+    m.role = Role::Deputy;
+    m.deputized_by = by.to_vec();
+    m.can_ban_you = Some(can_ban_you);
     m
 }
 
@@ -165,10 +173,19 @@ fn town_square() -> Room {
         private: false,
         members: vec![
             member(MAYA, "Maya Chen", Role::Owner),
-            invited(member(JONAS, "Jonas", Role::Member), MAYA),
+            // Jonas is a deputy of the owner: he can ban Sam. Elena is Sam's own deputy.
+            deputy(
+                invited(member(JONAS, "Jonas", Role::Member), MAYA),
+                &[Appointer::Owner],
+                true,
+            ),
             invited(member(PRIYA, "Priya Raman", Role::Member), MAYA),
             invited(member(TOMAS, "Tomás", Role::Member), JONAS),
-            invited(member(ELENA, "Elena Petrova", Role::Member), PRIYA),
+            deputy(
+                invited(member(ELENA, "Elena Petrova", Role::Member), PRIYA),
+                &[Appointer::You],
+                false,
+            ),
             invited(member(KWAME, "Kwame Mensah", Role::Member), JONAS),
             invited(member(ME, "Sam Rivers", Role::Member), PRIYA),
         ],

@@ -38,6 +38,13 @@ pub static CROWN: Icon = Icon {
     body: r#"<path d="M2.5 5.5 5.5 8 8 3.5 10.5 8l3-2.5-1.2 7H3.7l-1.2-7Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>"#,
 };
 
+/// The deputy shield: the web UI's `SHIELD_ICON_PATH` (a 24 point grid).
+pub static SHIELD: Icon = Icon {
+    name: "river-shield",
+    view: 24.0,
+    body: r#"<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>"#,
+};
+
 pub static CHAT: Icon = Icon {
     name: "river-chat",
     view: 16.0,
