@@ -78,7 +78,38 @@ fn connecting_shows_the_chat_screen() {
     assert!(shows(&rt, "Town Square"));
     // Example rooms say so, and do not claim a connection.
     assert!(shows(&rt, "Example rooms, not connected to Freenet"));
-    assert!(!shows(&rt, "Connected to Freenet"));
+    assert!(!shows(&rt, "Connected"));
+    assert!(
+        rt.find("notifications").is_none(),
+        "the footer has no notifications switch"
+    );
+}
+
+#[test]
+fn the_connection_dot_follows_the_link_status() {
+    use super::view::connection_pill;
+    use super::{LinkStatus::*, Source};
+    let p = super::style::palette();
+    let words = |s| connection_pill(s, &p).text;
+    assert_eq!(words(Source::Node(Live)), "Connected");
+    assert_eq!(words(Source::Node(Loading)), "Connecting...");
+    assert_eq!(words(Source::Node(Reconnecting)), "Disconnected");
+    assert_eq!(connection_pill(Source::Node(Live), &p).dot, p.success);
+    assert_eq!(connection_pill(Source::Node(Loading), &p).dot, p.warning);
+    assert_eq!(connection_pill(Source::Node(Reconnecting), &p).dot, p.error);
+    assert_eq!(connection_pill(Source::Example, &p).dot, p.text_muted);
+    // Each state is on screen, with its dot and a tooltip.
+    for (status, text) in [
+        (Live, "Connected"),
+        (Loading, "Connecting..."),
+        (Reconnecting, "Disconnected"),
+    ] {
+        let mut s = connected();
+        s.chat.source = Source::Node(status);
+        let rt = render(s, WINDOW_SIZE);
+        assert!(shows(&rt, text), "{text}");
+        assert!(rt.find("connection-dot").is_some());
+    }
 }
 
 #[test]
@@ -2189,16 +2220,11 @@ fn the_dialog_belongs_to_its_room() {
 }
 
 #[test]
-fn the_dialog_says_when_the_master_switch_is_off() {
+fn the_dialog_has_no_master_switch_note() {
     let mut rt = render(connected(), WINDOW_SIZE);
     open_bell(&mut rt);
     assert!(rt.find("notify-master-off").is_none());
-    let mut off = connected();
-    off.chat.notifications = false;
-    let mut rt = render(off, WINDOW_SIZE);
-    open_bell(&mut rt);
-    assert!(rt.find("notify-master-off").is_some());
-    assert!(shows(&rt, "switched off for every room"));
+    assert!(!shows(&rt, "switched off for every room"));
 }
 
 #[test]

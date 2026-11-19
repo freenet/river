@@ -37,6 +37,10 @@ pub struct Palette {
     pub warning_text: Color,
     pub warning_bg: Color,
     pub warning: Color,
+    /// The connection dot: connected and failed (the web UI's `--color-success` and
+    /// `--color-error`).
+    pub success: Color,
+    pub error: Color,
 }
 
 fn hex(s: &str) -> Color {
@@ -77,6 +81,8 @@ pub fn palette() -> Palette {
         warning_text: hex("#e3a845"),
         warning_bg: hex("#422006"),
         warning: hex("#eab308"),
+        success: hex("#22c55e"),
+        error: hex("#ef4444"),
     }
 }
 

@@ -874,24 +874,6 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_turns_notifications_off() {
-        let (mut s, rec, rooms) = live();
-        s.set_notifications(false);
-        deliver(
-            &mut s,
-            with(&rooms, 0, vec![from_other(&rooms[0], "a", "x")]),
-        );
-        assert!(shown(&rec).is_empty());
-        s.set_notifications(true);
-        let next = with(&rooms, 0, vec![from_other(&rooms[0], "a", "x")]);
-        deliver(
-            &mut s,
-            with(&next, 0, vec![from_other(&rooms[0], "b", "y")]),
-        );
-        assert_eq!(shown(&rec).len(), 1);
-    }
-
-    #[test]
     fn the_title_counts_unread_and_the_notifier_hears_changes() {
         assert_eq!(window_title(0), "River");
         assert_eq!(window_title(7), "(7) River");
@@ -936,37 +918,6 @@ mod tests {
         // A room that is gone is ignored.
         s.open_room("nope");
         assert_eq!(s.chat.room().unwrap().key, target);
-    }
-
-    #[test]
-    fn the_footer_switch_turns_notifications_off() {
-        let mut s = RiverApp::detached();
-        s.setup = crate::Setup::Connected {
-            version: "0.2.155".into(),
-        };
-        s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
-        let mut rt = Runtime::new(
-            s,
-            view,
-            (1000.0, 700.0),
-            Env {
-                system_dark: true,
-                scale: 1.0,
-            },
-        );
-        rt.frame(0.0);
-        rt.frame(1.0 / 60.0);
-        assert!(rt.state.chat.notifications);
-        assert!(
-            rt.find("notifications").is_some(),
-            "the switch row is shown"
-        );
-        let (cx, cy) = rt.find("control").expect("the switch control");
-        rt.pointer_down(cx, cy);
-        rt.pointer_up(cx, cy);
-        rt.frame(0.1);
-        rt.frame(0.2);
-        assert!(!rt.state.chat.notifications);
     }
 
     #[test]
@@ -1335,15 +1286,14 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_switch_is_the_master_over_every_mode() {
+    fn an_all_room_notifies_with_no_master_switch() {
         let (mut s, rec, rooms) = live();
         set_mode(&mut s, &rooms[0], NotificationMode::All);
-        s.chat.notifications = false;
         deliver(
             &mut s,
-            with(&rooms, 0, vec![mention_of_you(&rooms[0], "m")]),
+            with(&rooms, 0, vec![from_other(&rooms[0], "a", "hello")]),
         );
-        assert!(shown(&rec).is_empty());
+        assert_eq!(shown(&rec).len(), 1);
     }
 
     /// The title's count follows the mode as the web UI's does: nothing when muted, only
