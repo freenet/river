@@ -2770,3 +2770,343 @@ fn the_dialog_says_what_the_room_would_refuse() {
     assert!(save_dimmed(&rt));
     assert!(rt.state.chat.outgoing.is_empty());
 }
+
+// ---- @mention autocomplete, and opening a member's dialog from a name, avatar or chip ----
+
+fn type_text(rt: &mut Runtime<RiverApp>, text: &str) {
+    press(rt, "composer-field");
+    key(rt, Key::Text(text.into()));
+}
+
+fn mention_names(rt: &Runtime<RiverApp>) -> Vec<String> {
+    rt.state
+        .chat
+        .mention_popup()
+        .map(|p| p.candidates.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn typing_an_at_lists_the_members_and_filters_as_you_type() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    assert!(rt.find("mention-popup-content").is_none());
+    type_text(&mut rt, "hi @");
+    assert!(rt.find("mention-popup-content").is_some());
+    let all = mention_names(&rt);
+    // Everyone with a name but you (Sam Rivers), by name.
+    assert_eq!(
+        all,
+        [
+            "Elena Petrova",
+            "Jonas",
+            "Kwame Mensah",
+            "Maya Chen",
+            "Priya Raman",
+            "Tomás"
+        ]
+    );
+    key(&mut rt, Key::Text("jo".into()));
+    assert_eq!(mention_names(&rt), ["Jonas"]);
+    // A name that only contains the query comes after those that start with it.
+    key(&mut rt, Key::Backspace);
+    key(&mut rt, Key::Backspace);
+    key(&mut rt, Key::Text("e".into()));
+    let names = mention_names(&rt);
+    assert_eq!(names, ["Elena Petrova", "Kwame Mensah", "Maya Chen"]);
+    key(&mut rt, Key::Text("zzz".into()));
+    assert!(
+        rt.find("mention-popup-content").is_none(),
+        "no match, no popup"
+    );
+}
+
+#[test]
+fn an_email_address_is_not_a_mention() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "write to ian@");
+    assert!(rt.find("mention-popup-content").is_none());
+}
+
+#[test]
+fn enter_picks_the_highlighted_member_and_writes_the_token() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let jonas = uid_of(&rt, "Jonas");
+    type_text(&mut rt, "hi @jo");
+    let before = rt.state.chat.room().unwrap().messages.len();
+    key(&mut rt, Key::Enter);
+    assert_eq!(
+        rt.state.chat.composer.text,
+        format!("hi @[Jonas](rv:{jonas}) ")
+    );
+    assert_eq!(
+        rt.state.chat.room().unwrap().messages.len(),
+        before,
+        "Enter picked, it did not send"
+    );
+    assert!(rt.find("mention-popup-content").is_none());
+}
+
+#[test]
+fn arrow_keys_move_the_highlight_and_tab_picks() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "@");
+    key(&mut rt, Key::Down);
+    key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.mention_popup().unwrap().selected, 2);
+    key(&mut rt, Key::Up);
+    assert_eq!(rt.state.chat.mention_popup().unwrap().selected, 1);
+    key(&mut rt, Key::Up);
+    key(&mut rt, Key::Up);
+    assert_eq!(
+        rt.state.chat.mention_popup().unwrap().selected,
+        5,
+        "wraps to the last"
+    );
+    key(&mut rt, Key::Down);
+    key(&mut rt, Key::Down);
+    key(&mut rt, Key::Tab);
+    let text = rt.state.chat.composer.text.clone();
+    assert!(
+        text.starts_with("@[Jonas](rv:") && text.ends_with(") "),
+        "{text}"
+    );
+    assert!(rt.find("mention-popup-content").is_none());
+}
+
+#[test]
+fn clicking_a_row_picks_that_member() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let priya = uid_of(&rt, "Priya Raman");
+    type_text(&mut rt, "cc @pr");
+    assert!(rt.find(&format!("mention-popup-option-{priya}")).is_some());
+    press(&mut rt, &format!("mention-popup-option-{priya}"));
+    assert_eq!(
+        rt.state.chat.composer.text,
+        format!("cc @[Priya Raman](rv:{priya}) ")
+    );
+    assert!(rt.find("mention-popup-content").is_none());
+    assert!(
+        rt.elements()
+            .into_iter()
+            .any(|e| e.key.as_deref() == Some("composer-field") && e.focused),
+        "the composer keeps the focus"
+    );
+}
+
+#[test]
+fn escape_closes_the_popup_until_the_caret_leaves_the_word() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "@ma");
+    assert!(rt.find("mention-popup-content").is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("mention-popup-content").is_none());
+    assert_eq!(
+        rt.state.chat.composer.text, "@ma",
+        "Escape leaves the text alone"
+    );
+    key(&mut rt, Key::Text("y".into()));
+    assert!(
+        rt.find("mention-popup-content").is_none(),
+        "still closed in the same word"
+    );
+    // A new word opens it again.
+    key(&mut rt, Key::Text(" @".into()));
+    assert!(rt.find("mention-popup-content").is_some());
+}
+
+#[test]
+fn the_popup_closes_when_the_caret_leaves_the_word() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "@ma");
+    assert!(rt.find("mention-popup-content").is_some());
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(rt.find("mention-popup-content").is_none());
+    // Moving the caret back into the word brings it back.
+    key(&mut rt, Key::Left);
+    assert!(rt.find("mention-popup-content").is_some());
+    rt.state.chat.composer.set_caret(0);
+    rt.invalidate();
+    rt.frame(1.0);
+    assert!(rt.find("mention-popup-content").is_none());
+}
+
+#[test]
+fn there_is_no_popup_in_a_room_you_cannot_write_to() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "@");
+    assert!(rt.find("mention-popup-content").is_some());
+    for r in &mut rt.state.chat.rooms {
+        r.send_block = Some("You have been banned.".into());
+    }
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(rt.find("mention-popup-content").is_none());
+    assert!(rt.state.chat.mention_popup().is_none());
+}
+
+#[test]
+fn unnamed_members_and_you_are_not_offered() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let m = rooms[0]
+            .members
+            .iter_mut()
+            .find(|m| m.nickname == "Tomás")
+            .unwrap();
+        m.claimed = false;
+    });
+    type_text(&mut rt, "@");
+    let names = mention_names(&rt);
+    assert!(!names.contains(&"Tomás".to_owned()));
+    assert!(!names.contains(&"Sam Rivers".to_owned()));
+}
+
+#[test]
+fn members_with_one_name_are_told_apart_by_their_id() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let m = rooms[0]
+            .members
+            .iter_mut()
+            .find(|m| m.nickname == "Tomás")
+            .unwrap();
+        m.nickname = "jonas".into();
+    });
+    type_text(&mut rt, "@jonas");
+    let p = rt.state.chat.mention_popup().unwrap();
+    assert_eq!(p.candidates.len(), 2);
+    assert!(p.candidates.iter().all(|c| c.duplicate));
+}
+
+#[test]
+fn the_token_is_the_one_the_web_ui_writes() {
+    use freenet_scaffold::util::FastHash;
+    use river_core::mention::{MentionSegment, encode_mention, parse_segments};
+    use river_core::room_state::member::MemberId;
+    let id = MemberId(FastHash(0x1234_5678_9abc_def0));
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let m = rooms[0]
+            .members
+            .iter_mut()
+            .find(|m| m.nickname == "Jonas")
+            .unwrap();
+        m.uid = id.to_string();
+        m.nickname = "Jo [x](y)".into();
+    });
+    type_text(&mut rt, "hey @jo");
+    key(&mut rt, Key::Tab);
+    let text = rt.state.chat.composer.text.clone();
+    let token = encode_mention(id, "Jo [x](y)");
+    assert_eq!(text, format!("hey {token} "));
+    // It reads back as a real mention of that member.
+    let segs = parse_segments(&text);
+    let mentions: Vec<_> = segs
+        .iter()
+        .filter_map(|s| match s {
+            MentionSegment::Mention(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(mentions.len(), 1);
+    assert!(mentions[0].member_ref.matches(id));
+    // And sending it sends the token as written.
+    key(&mut rt, Key::Text("there".into()));
+    key(&mut rt, Key::Enter);
+    let last = rt.state.chat.room().unwrap().last_message().unwrap();
+    assert_eq!(last.text, format!("hey {token} there"));
+}
+
+fn chat_with_chip(chip: impl Fn(&str) -> String) -> (Runtime<RiverApp>, String) {
+    let mut state = connected();
+    let jonas = {
+        let rt = render(connected(), WINDOW_SIZE);
+        uid_of(&rt, "Jonas")
+    };
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        let mid = room.messages.last().map_or(0, |m| m.id) + 1;
+        let md = chip(&jonas);
+        room.messages.push(super::model::Message {
+            id: mid,
+            key: format!("chip-{mid}"),
+            author: me,
+            time: room.messages.last().map_or(0, |m| m.time),
+            text: "@Jonas".into(),
+            source: String::new(),
+            md,
+            reply_to: None,
+            reactions: Vec::new(),
+            edited: false,
+            pending: None,
+        });
+    });
+    (render(state, WINDOW_SIZE), jonas)
+}
+
+/// Press on the chip of the last message, which is a message of nothing else.
+fn press_chip(rt: &mut Runtime<RiverApp>) {
+    let id = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .last_message()
+        .unwrap()
+        .key
+        .clone();
+    let [x, y, _, h] = rect_of(rt, &format!("md-{id}"));
+    let (x, y) = (x + 10.0, y + h / 2.0);
+    rt.pointer_move(x, y);
+    rt.frame(0.1);
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    settle(rt);
+}
+
+#[test]
+fn clicking_a_mention_chip_opens_the_member_dialog() {
+    let scheme = super::model::mention_scheme();
+    let (mut rt, jonas) = chat_with_chip(|uid| format!("[@Jonas]({scheme}:member:{uid})"));
+    assert!(rt.state.chat.member_modal.is_none());
+    press_chip(&mut rt);
+    assert_eq!(rt.state.chat.member_modal, Some(jonas));
+    assert!(rt.find("member-info-dialog").is_some());
+}
+
+#[test]
+fn a_forged_chip_opens_nothing() {
+    let (mut rt, _) = chat_with_chip(|uid| format!("[@Jonas](rvm-0000000000000000:member:{uid})"));
+    press_chip(&mut rt);
+    assert!(rt.state.chat.member_modal.is_none());
+}
+
+#[test]
+fn a_chip_of_someone_not_in_the_room_opens_nothing() {
+    let scheme = super::model::mention_scheme();
+    let (mut rt, _) = chat_with_chip(|_| format!("[@Jonas]({scheme}:member:NOSUCHID)"));
+    press_chip(&mut rt);
+    assert!(rt.state.chat.member_modal.is_none());
+}
+
+#[test]
+fn clicking_an_author_name_or_avatar_opens_their_dialog() {
+    for part in ["author-name", "author-avatar"] {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        let room = rt.state.chat.room().unwrap();
+        // The newest run of one author's messages, which is on screen.
+        let n = room.messages.len();
+        let at = (1..n)
+            .rev()
+            .find(|&i| room.messages[i - 1].author != room.messages[i].author)
+            .unwrap();
+        let first = &room.messages[at];
+        let uid = room.member(first.author).unwrap().uid.clone();
+        let key = format!("{part}-{}", first.key);
+        assert!(rt.find("member-info-dialog").is_none());
+        press(&mut rt, &key);
+        assert_eq!(rt.state.chat.member_modal, Some(uid), "{part}");
+        assert!(rt.find("member-info-dialog").is_some(), "{part}");
+    }
+}

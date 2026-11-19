@@ -445,6 +445,11 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat.select(chat::example::PRIVATE_ROOM);
     }),
+    ("chat-mention-popup", |s| {
+        connect(s);
+        s.chat.composer.replace_text("Thanks for the review @");
+        s.chat.composer.focused = true;
+    }),
     ("chat-composing", |s| {
         connect(s);
         s.chat

@@ -18,6 +18,7 @@ mod keys;
 mod links;
 mod markdown;
 mod member_modal;
+mod mention;
 pub mod model;
 mod notify_dialog;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
@@ -191,6 +192,11 @@ pub struct Chat {
     /// The composer's emoji picker is open, and on which category.
     pub emoji_open: bool,
     pub emoji_category: usize,
+    /// The highlighted row of the @mention popup, and the query it was moved under (a new query
+    /// starts again at the top).
+    mention_sel: (String, usize),
+    /// The `@` an Escape closed the popup at, which stays closed until the caret leaves its word.
+    mention_off: Option<usize>,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
     /// What is typed in the nickname field of your own member info dialog.
@@ -326,6 +332,8 @@ impl Chat {
             link_menu: None,
             emoji_open: false,
             emoji_category: 0,
+            mention_sel: (String::new(), 0),
+            mention_off: None,
             member_modal: None,
             nickname: TextEdit::new(""),
             nickname_error: None,

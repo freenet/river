@@ -144,10 +144,12 @@ impl LiveRoom {
                     } else {
                         name
                     };
+                    // A member this room knows carries their id, so a click on the chip can
+                    // open their dialog.
                     let kind = match id {
-                        Some(id) if Some(id) == me => "self",
-                        Some(_) => "member",
-                        None => "unknown",
+                        Some(id) if Some(id) == me => format!("self:{id}"),
+                        Some(id) => format!("member:{id}"),
+                        None => "unknown".to_owned(),
                     };
                     out.push_str(&format!(
                         "[@{}]({}:{kind})",
