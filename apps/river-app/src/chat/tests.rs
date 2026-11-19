@@ -231,7 +231,7 @@ fn the_send_button_sends_too() {
 #[test]
 fn controls_that_do_nothing_yet_say_so() {
     let rt = render(connected(), WINDOW_SIZE);
-    for key in ["create-room", "enter-invite", "invite", "emoji"] {
+    for key in ["create-room", "enter-invite", "invite"] {
         let e = rt
             .elements()
             .into_iter()
@@ -1144,4 +1144,73 @@ fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
     ctrl(&mut rt, Key::Right, true);
     key(&mut rt, Key::Text("!".into()));
     assert_eq!(rt.state.chat.composer.text, "! Xthree");
+}
+
+#[test]
+fn the_emoji_button_opens_a_picker_that_types_into_the_composer() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    assert!(rt.find("emoji-panel").is_none());
+    press(&mut rt, "emoji");
+    assert!(rt.find("emoji-panel").is_some());
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("hi ".into()));
+    press(&mut rt, "emoji-0-1");
+    assert!(
+        rt.elements()
+            .into_iter()
+            .any(|e| e.key.as_deref() == Some("composer-field") && e.focused),
+        "the composer has the focus again"
+    );
+    let text = rt.state.chat.composer.text.clone();
+    assert!(
+        text.starts_with("hi ") && text.chars().count() == 4,
+        "{text:?}"
+    );
+    // Another category, and the button closes the picker.
+    press(&mut rt, "emoji-tab-hearts");
+    press(&mut rt, "emoji");
+    assert!(rt.find("emoji-panel").is_none());
+}
+
+#[test]
+fn a_description_with_a_link_is_markdown_and_a_long_one_expands() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        rooms[0].description =
+            "[Freenet](https://freenet.org) is the place.\nSecond line, with `code`.".into();
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    let key = format!("description-{}", rt.state.chat.room().unwrap().key);
+    assert!(
+        rt.find(&key).is_some(),
+        "the first line is drawn as markdown"
+    );
+    assert!(rt.find("description-scroll").is_none());
+    press(&mut rt, "description-toggle");
+    assert!(
+        rt.find("description-scroll").is_some(),
+        "the whole description shows"
+    );
+    press(&mut rt, "description-toggle");
+    assert!(rt.find("description-scroll").is_none());
+}
+
+#[test]
+fn a_description_that_starts_with_a_blank_line_still_shows() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        rooms[0].description = "\n\nThe actual description".into();
+    });
+    let rt = render(state, WINDOW_SIZE);
+    assert!(shows(&rt, "The actual description"));
+}
+
+#[test]
+fn escape_closes_the_emoji_picker() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "emoji");
+    assert!(rt.find("emoji-panel").is_some());
+    press(&mut rt, "emoji-0-0");
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("emoji-panel").is_none());
 }

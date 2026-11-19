@@ -10,6 +10,7 @@
 //! [`Command`] too, and what became of it comes back as [`WorkView`]s and an invitation's link.
 
 mod conversation;
+mod emoji;
 pub mod example;
 mod icons;
 mod keys;
@@ -183,6 +184,11 @@ pub struct Chat {
     /// The link a right-click landed on, and where: the link menu (Open, Copy link) is open
     /// there. Cleared when the menu closes.
     pub link_menu: Option<(String, rune::PointerPress)>,
+    /// The composer's emoji picker is open, and on which category.
+    pub emoji_open: bool,
+    pub emoji_category: usize,
+    /// The room header shows the whole description, not one line of it.
+    pub description_open: bool,
     /// Today's day number in message time (whose day 0 is `day_zero`).
     pub today: u32,
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
@@ -247,6 +253,9 @@ impl Chat {
             members_open: true,
             members_overlay: false,
             link_menu: None,
+            emoji_open: false,
+            emoji_category: 0,
+            description_open: false,
             today,
             day_zero,
             now,
@@ -295,6 +304,8 @@ impl Chat {
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
         if self.rooms.is_empty() {
+            self.emoji_open = false;
+            self.description_open = false;
             // An empty list is often a reload on its way to the full one: keep the open room's
             // text as its draft, remember which room it was, and open nothing.
             let mut open = std::mem::replace(&mut self.composer, TextEdit::new(""));
@@ -453,6 +464,8 @@ impl Chat {
         }
         // A reply, edit or deletion belongs to the room it was started in.
         self.cancel();
+        self.emoji_open = false;
+        self.description_open = false;
         if self.selected.is_empty() {
             // Nothing was open, so what the composer holds belongs to no room yet: keep it,
             // unless it is empty and this room has a draft.
@@ -621,6 +634,25 @@ impl Chat {
             self.composer = *draft;
         }
         self.picker = None;
+    }
+
+    /// Open or close the composer's emoji picker.
+    pub fn toggle_emoji(&mut self) {
+        self.emoji_open = !self.emoji_open;
+        // The expanded description and the picker together would crowd a short window.
+        if self.emoji_open {
+            self.description_open = false;
+        }
+    }
+
+    /// Put `emoji` into the composer at the caret (in place of the selection) and give the
+    /// composer back the focus; the picker stays open for more, as a person picks a few.
+    pub fn insert_emoji(&mut self, emoji: &str) {
+        if self.room().is_some_and(|r| r.send_block.is_some()) {
+            return;
+        }
+        self.composer.insert(emoji);
+        self.composer.focused = true;
     }
 
     /// Open or close the reaction picker on the message keyed `target`.

@@ -22,6 +22,11 @@ on:
       # A test checks the apps use the freenet-stdlib river-core resolves to here.
       - 'Cargo.lock'
       - 'ui/assets/river_logo.svg'
+      - 'ui/src/util/share_link.rs'
+      - 'ui/src/util/share-link-vectors.json'
+      - 'ui/src/util/confusable.rs'
+      - 'ui/src/util/display_name.rs'
+      - 'ui/src/components/conversation/emoji_picker.rs'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
       # The app reads River's pointer records to tell when River has moved past the WASM
@@ -39,6 +44,11 @@ on:
       # A test checks the apps use the freenet-stdlib river-core resolves to here.
       - 'Cargo.lock'
       - 'ui/assets/river_logo.svg'
+      - 'ui/src/util/share_link.rs'
+      - 'ui/src/util/share-link-vectors.json'
+      - 'ui/src/util/confusable.rs'
+      - 'ui/src/util/display_name.rs'
+      - 'ui/src/components/conversation/emoji_picker.rs'
       - 'ui/public/contracts/chat_delegate.wasm'
       - 'ui/public/contracts/room_contract.wasm'
       # The app reads River's pointer records to tell when River has moved past the WASM
