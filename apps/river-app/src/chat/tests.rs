@@ -1421,14 +1421,14 @@ fn the_owner_and_you_are_tagged() {
 fn what_needs_commands_this_app_lacks_is_shown_unavailable() {
     let mut rt = render(connected(), WINDOW_SIZE);
     open_member(&mut rt, "Jonas");
-    for k in ["member-dm", "member-mention"] {
-        let e = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some(k))
-            .unwrap_or_else(|| panic!("no {k}"));
-        assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET), "{k}");
-    }
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("member-dm"))
+        .expect("no member-dm");
+    assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET));
+    // The web dialog has no Mention button; mentions come from the composer.
+    assert!(rt.find("member-mention").is_none());
     // Sam did not invite Jonas, so Sam has no say over him.
     assert!(rt.find("member-ban").is_none());
     key(&mut rt, Key::Escape);

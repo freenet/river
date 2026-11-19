@@ -3,8 +3,8 @@
 //! they came to be in the room, and a warning when their name imitates the owner's.
 //!
 //! What it leaves out is what this app cannot do or know yet: sending a direct message, sharing
-//! an invite by one, mentioning (the composer has no mention tokens), banning, deputizing, and
-//! editing your own nickname (all moderation and profile commands). The first four are shown
+//! an invite by one, banning, deputizing, and
+//! editing your own nickname (all moderation and profile commands). The first three are shown
 //! dimmed with the app's "not available yet" tooltip, not faked.
 //!
 //! PARITY-GAPS: deputies. The view model carries no deputy grants, so there is no Deputy tag or
@@ -14,10 +14,11 @@
 
 use std::collections::HashMap;
 
-use rune::{El, col, el, row};
+use rune::{El, col, el, icon, row};
 use rune_kit::{Button, ButtonVariant, Dialog, Kit};
 
 use super::conversation::avatar;
+use super::icons;
 use super::model::{Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{label, not_yet};
@@ -78,35 +79,41 @@ fn chip(key: &str, text: &str, color: rune::Color, line: rune::Color) -> El {
         .child(label(text.to_owned(), st::SMALL_STRONG, color))
 }
 
-fn field(key: &str, name: &str, value: &str, copy_what: &'static str, p: &Palette, k: &Kit) -> El {
+fn field(key: &str, name: &str, value: &str, copy_what: &'static str, p: &Palette) -> El {
     let copied = value.to_owned();
     col()
         .key(key.to_owned())
         .w_full()
         .gap(2.0)
+        .child(label(name.to_owned(), st::SMALL_STRONG, p.text_muted))
         .child(
             row()
                 .w_full()
-                .center_y()
-                .child(label(name.to_owned(), st::SMALL_STRONG, p.text_muted))
-                .child(rune::spacer())
+                .gap(6.0)
                 .child(
-                    Button::new("Copy")
-                        .variant(ButtonVariant::Ghost)
+                    label(value.to_owned(), st::BODY, p.text)
+                        .wrap_anywhere()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .key(format!("{key}-value")),
+                )
+                .child(
+                    row()
+                        .key(format!("{key}-copy"))
+                        .role("button")
+                        .label(copy_what)
+                        .help(copy_what)
+                        .size(24.0, 24.0)
+                        .radius(6.0)
+                        .center()
+                        .hover(p.surface_hover)
+                        .cursor(rune::Cursor::Pointer)
                         .on_press_tx(move |_: &mut RiverApp, tx: &mut rune::Tx| {
                             tx.copy(copied.clone())
                         })
-                        .build(k)
-                        .label(copy_what)
-                        .key(format!("{key}-copy")),
+                        .child(icon(&icons::COPY, 14.0).color(p.text_muted)),
                 ),
-        )
-        .child(
-            label(value.to_owned(), st::BODY, p.text)
-                .wrap_anywhere()
-                .w_full()
-                .min_w(0.0)
-                .key(format!("{key}-value")),
         )
 }
 
@@ -223,7 +230,6 @@ pub(super) fn member_modal(room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>)
         &m.uid,
         "Copy member ID",
         &p,
-        k,
     ));
     if !m.key.is_empty() {
         body = body.child(field(
@@ -232,7 +238,6 @@ pub(super) fn member_modal(room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>)
             &m.key,
             "Copy verifying key",
             &p,
-            k,
         ));
     }
     let mut invited_by = row().key("member-invited-by").w_full().center_y();
@@ -272,7 +277,7 @@ pub(super) fn member_modal(room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>)
     // What needs commands this app does not send yet is shown, not faked.
     let mut actions = row().key("member-actions").w_full().gap(8.0).flex_wrap();
     if !is_me {
-        let mut names = vec![("member-dm", "Message"), ("member-mention", "Mention")];
+        let mut names = vec![("member-dm", "DM")];
         if above && !is_owner {
             names.extend([("member-ban", "Ban user"), ("member-deputize", "Deputize")]);
         }
