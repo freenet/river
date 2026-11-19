@@ -1844,7 +1844,7 @@ fn a_failed_change_says_why_and_offers_retry_and_discard() {
     let mut rt = own_dialog(|r| {
         r[0].own_nickname = Some(super::model::Pending {
             entry: 7,
-            failed: Some("Freenet refused it: no room".into()),
+            failed: Some("Not saved. Freenet refused it: no room".into()),
             retry: true,
         })
     });
@@ -2019,4 +2019,45 @@ fn a_rename_shows_in_the_room_list_preview() {
     });
     settle(&mut rt);
     assert!(shows(&rt, "Renamed Rae: "), "{:?}", texts(&rt));
+}
+
+#[test]
+fn the_same_name_with_other_spacing_is_the_same_name() {
+    let mut rt = own_dialog(|r| {
+        let room = &mut r[0];
+        let me = room.me;
+        room.members
+            .iter_mut()
+            .find(|m| m.id == me)
+            .unwrap()
+            .nickname = "Bob Smith".into();
+    });
+    assert_eq!(rt.state.chat.nickname.text, "Bob Smith");
+    type_nickname(&mut rt, "  Bob   Smith ");
+    press(&mut rt, "nickname-save");
+    assert!(sent(&mut rt).is_empty());
+    assert!(rt.state.chat.member_modal.is_none());
+}
+
+#[test]
+fn members_whose_names_are_only_symbols_are_all_unnamed_with_their_id_to_tell_them_apart() {
+    // As the web UI: every such member is "Unnamed" in the list; the Member ID in the dialog
+    // (and here, the row's hint) is what distinguishes them.
+    let rt = node_rooms(|r| {
+        let room = &mut r[0];
+        for m in room.members.iter_mut().filter(|m| m.id != room.me).take(2) {
+            m.nickname = super::visual_fold::UNNAMED.to_owned();
+        }
+    });
+    let hinted: Vec<_> = rt
+        .elements()
+        .into_iter()
+        .filter(|e| {
+            e.help
+                .as_deref()
+                .is_some_and(|h| h.starts_with("Member ID "))
+        })
+        .collect();
+    assert_eq!(hinted.len(), 2);
+    assert_ne!(hinted[0].help, hinted[1].help);
 }

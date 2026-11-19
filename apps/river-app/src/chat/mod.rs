@@ -807,9 +807,12 @@ impl Chat {
         let refusal = crate::rooms::outbox::nickname_refusal_in(&typed, room.nickname_limit);
         let key = room.key.clone();
         let me = room.me;
+        // The name is compared as it is shown (the web UI's sanitiser, which also collapses
+        // runs of spaces), so "Bob  Smith" is the name "Bob Smith" already is.
+        let shown = visual_fold::sanitize_display_name(&typed);
         let same = room
             .member(me)
-            .is_some_and(|m| m.claimed && m.nickname == typed);
+            .is_some_and(|m| m.claimed && m.nickname == shown);
         if refusal.is_some() {
             self.nickname_error = refusal;
             return;

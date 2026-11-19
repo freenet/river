@@ -99,8 +99,8 @@ pub struct Command {
     pub action: Action,
 }
 
-/// Messages are named by their key (`Message::key`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Messages are named by their key (`Message::key`). `Debug` does not print a nickname.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Action {
     Send {
         text: String,
@@ -150,6 +150,46 @@ pub enum Action {
     DismissWork {
         id: u64,
     },
+}
+
+impl std::fmt::Debug for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Action::Send { text, reply_to } => f
+                .debug_struct("Send")
+                .field("text", text)
+                .field("reply_to", reply_to)
+                .finish(),
+            Action::Edit { target, text } => f
+                .debug_struct("Edit")
+                .field("target", target)
+                .field("text", text)
+                .finish(),
+            Action::Delete { target } => f.debug_struct("Delete").field("target", target).finish(),
+            Action::React { target, emoji } => f
+                .debug_struct("React")
+                .field("target", target)
+                .field("emoji", emoji)
+                .finish(),
+            Action::Retry { entry } => f.debug_struct("Retry").field("entry", entry).finish(),
+            Action::Discard { entry } => f.debug_struct("Discard").field("entry", entry).finish(),
+            Action::SetNickname { .. } => f.write_str("SetNickname { nickname: <hidden> }"),
+            Action::Invite => f.write_str("Invite"),
+            Action::CreateRoom { name, private, .. } => f
+                .debug_struct("CreateRoom")
+                .field("name", name)
+                .field("nickname", &"<hidden>")
+                .field("private", private)
+                .finish(),
+            Action::Join { code, .. } => f
+                .debug_struct("Join")
+                .field("code", code)
+                .field("nickname", &"<hidden>")
+                .finish(),
+            Action::RetryWork { id } => f.debug_struct("RetryWork").field("id", id).finish(),
+            Action::DismissWork { id } => f.debug_struct("DismissWork").field("id", id).finish(),
+        }
+    }
 }
 
 /// A pasted invite code or link. It is a bearer credential (it carries the invitee's signing
@@ -339,11 +379,13 @@ pub(super) fn delta(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> ChatRo
     }
 }
 
-/// Why a nickname can't be changed while the room has removed you for inactivity.
+/// Why a nickname can't be changed while the room does not list you as a member: removed for
+/// inactivity, or not yet shown as joined. Which of those it is cannot be told from here.
 pub const PRUNED_MESSAGE: &str = PRUNED;
 
-pub(crate) const PRUNED: &str = "The room removed you after a long time without a message, and \
-     only a message brings you back. Send one, then change your nickname.";
+pub(crate) const PRUNED: &str = "The room doesn't list you as a member right now (it removes \
+     members who haven't written for a long time). Send a message to be added back, then \
+     change your nickname.";
 
 /// What an entry labels itself as when it is about your nickname.
 const NICKNAME_LABEL: &str = "Your nickname";
@@ -729,7 +771,7 @@ enum Status {
 const LATE: &str =
     "Freenet didn't confirm it in time. It may still arrive; if it does, this goes away.";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Entry {
     id: u64,
     room: VerifyingKey,
@@ -748,6 +790,19 @@ struct Entry {
     sent: bool,
     /// How many connections were dropped because this was owed an answer for too long.
     forced: u32,
+}
+
+/// `Debug` shows where an entry stands, not what it carries (a nickname, a message).
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("status", &self.status)
+            .field("sent", &self.sent)
+            .field("forced", &self.forced)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Entry {
@@ -913,7 +968,7 @@ impl Outbox {
             // would let a retry of the older one come back later at a higher version.
             self.entries.retain(|e| {
                 !(e.room == room.stored.owner_vk
-                    && e.info.is_some()
+                    && e.label == NICKNAME_LABEL
                     && !e.sent
                     && matches!(e.status, Status::Queued | Status::Failed(_)))
             });
@@ -1363,11 +1418,50 @@ impl Outbox {
 
     /// Entries whose messages `room` now holds (the network brought them in) are done,
     /// whatever their status. True when any were.
-    pub fn reconcile(&mut self, room: &LiveRoom) -> bool {
-        let before = self.entries.len();
-        self.entries
-            .retain(|e| e.room != room.stored.owner_vk || !e.has_payload() || !e.held_in(room));
-        self.entries.len() != before
+    ///
+    /// A nickname the room holds as the canonical record is also written to the cache that
+    /// re-adds a pruned member (as when the node answers), and one another record of yours
+    /// replaced is not dropped silently: it stays as a notice saying so.
+    pub fn reconcile(&mut self, room: &mut LiveRoom) -> bool {
+        let mut changed = false;
+        let mut cache = None;
+        let vk = room.stored.owner_vk;
+        let mut keep = Vec::with_capacity(self.entries.len());
+        for mut e in std::mem::take(&mut self.entries) {
+            if e.room != vk || !e.has_payload() {
+                keep.push(e);
+                continue;
+            }
+            match e.info.as_ref().map(|i| info_state(room, i)) {
+                Some(InfoState::Superseded) => {
+                    let already = matches!(&e.status, Status::Failed(w) | Status::Unconfirmed(w) if w == SUPERSEDED);
+                    if !already {
+                        e.status = if e.sent {
+                            Status::Unconfirmed(SUPERSEDED.into())
+                        } else {
+                            Status::Failed(SUPERSEDED.into())
+                        };
+                        changed = true;
+                    }
+                    keep.push(e);
+                }
+                Some(InfoState::Ours) if e.held_in(room) => {
+                    if let (Some(info), Some(Intent::Nickname { nickname })) = (&e.info, &e.intent)
+                    {
+                        cache = Some((info.clone(), nickname.clone()));
+                    }
+                    changed = true;
+                }
+                _ if e.held_in(room) => changed = true,
+                _ => keep.push(e),
+            }
+        }
+        self.entries = keep;
+        if let Some((info, nickname)) = cache {
+            room.stored.self_member_info = Some(info);
+            room.stored.self_nickname = Some(nickname);
+        }
+        changed
     }
 
     /// Forget the rooms no longer shown: what was waiting there goes with them.
@@ -1413,7 +1507,13 @@ impl Outbox {
                 // The newest nickname change is the one the dialog shows.
                 own_nickname = Some(Pending {
                     entry: e.id,
-                    failed: trouble.clone(),
+                    // Said as the dialog shows it: each outcome in its own words.
+                    failed: match &e.status {
+                        Status::Failed(why) => Some(format!("Not saved. {why}")),
+                        Status::Unconfirmed(why) => Some(why.clone()),
+                        Status::InFlight { late: true, .. } => Some(LATE.to_owned()),
+                        _ => None,
+                    },
                     retry: e.retryable(),
                 });
             }

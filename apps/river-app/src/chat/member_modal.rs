@@ -197,7 +197,7 @@ fn nickname_editor(room: &Room, m: &Member, chat: &Chat, p: &Palette, k: &Kit) -
             }
             Some(why) => {
                 status = status.child(
-                    label(format!("Not saved. {why}"), st::SMALL, p.danger)
+                    label(why.clone(), st::SMALL, p.danger)
                         .wrap()
                         .shrink()
                         .min_w(0.0),

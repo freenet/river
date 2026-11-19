@@ -935,7 +935,7 @@ fn an_unanswered_update_is_settled_when_the_network_brings_it_in() {
         ..Default::default()
     })
     .unwrap();
-    assert!(outbox.reconcile(&room));
+    assert!(outbox.reconcile(&mut room));
     assert!(outbox.is_empty());
     assert_eq!(pending_of(&outbox, &room, "late"), Some(None));
 }
@@ -1181,7 +1181,7 @@ fn an_owed_answer_after_the_network_settled_its_update_is_not_the_next_ones() {
         ..Default::default()
     })
     .unwrap();
-    assert!(outbox.reconcile(&room));
+    assert!(outbox.reconcile(&mut room));
     assert!(
         next(&mut outbox, &room, Instant::now()).is_none(),
         "A's answer is owed"
@@ -1391,7 +1391,7 @@ fn an_unconfirmed_message_is_settled_when_the_network_brings_it_in() {
             ..Default::default()
         })
         .unwrap();
-    assert!(outbox.reconcile(&newer));
+    assert!(outbox.reconcile(&mut newer));
     assert!(outbox.is_empty());
 }
 
@@ -1862,7 +1862,10 @@ fn a_refused_nickname_stays_with_the_reason_and_retry_signs_it_again_discard_dro
     assert!(outbox.answered(&mut room, Err("no room".into())));
     let view = outbox.view(&room, &minutes);
     let own = view.own_nickname.clone().unwrap();
-    assert_eq!(own.failed.as_deref(), Some("Freenet refused it: no room"));
+    assert_eq!(
+        own.failed.as_deref(),
+        Some("Not saved. Freenet refused it: no room")
+    );
     assert!(own.retry);
     assert_eq!(
         view.notices[0].text,
@@ -1899,7 +1902,7 @@ fn a_nickname_the_network_brings_in_is_settled_and_an_unanswered_one_goes_again_
     // The network brings it in (another connection of mine, or the node's earlier copy).
     let mut other = room.clone();
     other.apply_delta(delta).unwrap();
-    assert!(outbox.reconcile(&other));
+    assert!(outbox.reconcile(&mut other));
     assert!(outbox.is_empty());
 }
 
@@ -1924,8 +1927,11 @@ fn a_newer_record_from_elsewhere_settles_mine_instead_of_being_overwritten() {
         ..Default::default()
     })
     .unwrap();
-    assert!(outbox.reconcile(&room));
-    assert!(outbox.is_empty());
+    assert!(outbox.reconcile(&mut room));
+    // Not dropped silently: said, and nothing more is reported by looking again.
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices[0].text.contains("replaced this one"));
+    assert!(!outbox.reconcile(&mut room));
     assert_eq!(shown_name(&outbox, &room), "Elsewhere");
 }
 
@@ -2079,8 +2085,18 @@ fn an_equal_version_record_that_won_settles_mine_on_reconcile() {
         })
         .unwrap();
     merge_info(&mut room, other);
-    assert!(outbox.reconcile(&room));
-    assert!(outbox.is_empty());
+    assert!(outbox.reconcile(&mut room));
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices[0].text.contains("replaced this one"));
+    // Mine was sent, so it is "took it, replaced", with no dialog "Not saved".
+    assert!(
+        !view
+            .own_nickname
+            .unwrap()
+            .failed
+            .unwrap()
+            .starts_with("Not saved")
+    );
 }
 
 #[test]
@@ -2236,7 +2252,10 @@ fn the_dialog_follows_a_real_outbox_view() {
     let view = outbox.view(&room, &minutes);
     chat.set_rooms(vec![view]);
     let own = chat.room().unwrap().own_nickname.clone().unwrap();
-    assert_eq!(own.failed.as_deref(), Some("Freenet refused it: nope"));
+    assert_eq!(
+        own.failed.as_deref(),
+        Some("Not saved. Freenet refused it: nope")
+    );
     chat.submit_nickname();
     assert_eq!(chat.outgoing.len(), 1);
 }
@@ -2283,4 +2302,127 @@ fn names_read_the_same_here_as_in_the_browser() {
     assert_eq!(shown_name(&Outbox::default(), &room), "Bob");
     merge_info(&mut room, record(&f, 3, "\u{1f6e1}"));
     assert_eq!(shown_name(&Outbox::default(), &room), "Unnamed");
+}
+
+#[test]
+fn a_nickname_that_failed_while_being_built_is_replaced_by_the_next_and_cannot_be_retried() {
+    let f = Fixture::new();
+    // A private room whose secret has not reached this computer.
+    let mut state = f.private_state();
+    state.secrets.encrypted_secrets.clear();
+    let mut room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    outbox.command(&room, nick("A"));
+    assert_eq!(outbox.view(&room, &minutes).notices.len(), 1);
+    // The secret arrives; "B" is written, sent and held.
+    let full = private_room(&f);
+    room.merge_state(&full.stored.room_state).unwrap();
+    let mut room = LiveRoom::new({
+        let mut s = full.stored.clone();
+        s.room_state = room.stored.room_state.clone();
+        s
+    });
+    outbox.command(&room, nick("B"));
+    let view = outbox.view(&room, &minutes);
+    assert!(
+        view.notices.is_empty(),
+        "A's notice is gone: {:?}",
+        view.notices
+    );
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        river_core::ecies::unseal_bytes(&info.member_info.preferred_nickname, Some(&SECRET))
+            .unwrap(),
+        b"B"
+    );
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(
+        outbox.is_empty(),
+        "nothing is left to retry and bring A back"
+    );
+    assert_eq!(shown_name(&outbox, &room), "B");
+}
+
+#[test]
+fn a_record_the_network_brings_in_is_cached_for_rejoining_like_one_the_node_answered() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Echoed"));
+    let (delta, info) = next_info(&mut outbox, &room);
+    room.apply_delta(delta).unwrap();
+    assert!(outbox.reconcile(&mut room));
+    assert!(outbox.is_empty());
+    assert_eq!(room.stored.self_member_info.as_ref(), Some(&info));
+    assert_eq!(room.stored.self_nickname.as_deref(), Some("Echoed"));
+}
+
+#[test]
+fn the_dialog_words_each_outcome_in_its_own_way() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Words"));
+    let why = |o: &Outbox, r: &LiveRoom| o.view(r, &minutes).own_nickname.unwrap().failed;
+    assert_eq!(why(&outbox, &room), None, "sending says nothing yet");
+    next(&mut outbox, &room, Instant::now()).unwrap();
+    // Not answered in time.
+    assert!(outbox.expire(
+        Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(5)
+    ));
+    assert!(why(&outbox, &room).unwrap().contains("didn't confirm"));
+    // Refused.
+    outbox.requeue();
+    next(&mut outbox, &room, Instant::now()).unwrap();
+    assert!(outbox.answered(&mut room, Err("full".into())));
+    assert_eq!(
+        why(&outbox, &room).unwrap(),
+        "Not saved. Freenet refused it: full"
+    );
+}
+
+#[test]
+fn nothing_prints_a_nickname() {
+    let secret = "hunter2-secret";
+    let all = [
+        format!(
+            "{:?}",
+            Action::SetNickname {
+                nickname: secret.into()
+            }
+        ),
+        format!(
+            "{:?}",
+            Action::CreateRoom {
+                name: "r".into(),
+                nickname: secret.into(),
+                private: false
+            }
+        ),
+        format!(
+            "{:?}",
+            Command {
+                room: "r".into(),
+                action: Action::SetNickname {
+                    nickname: secret.into()
+                }
+            }
+        ),
+    ];
+    for shown in all {
+        assert!(!shown.contains("hunter2"), "{shown}");
+    }
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick(secret));
+    assert!(!format!("{:?}", outbox.entries).contains("hunter2"));
+}
+
+#[test]
+fn a_member_just_joined_or_with_a_removed_inviter_is_told_neutrally() {
+    // Not listed as a member, for whatever reason: the message does not claim inactivity.
+    assert!(!PRUNED.contains("removed you"));
+    assert!(PRUNED.contains("doesn't list you as a member"));
 }

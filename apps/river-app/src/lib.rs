@@ -549,7 +549,7 @@ pub const SCENES: &[Scene] = &[
             chat.nickname.replace_text("Sam");
             room.own_nickname = Some(chat::model::Pending {
                 entry: 1,
-                failed: Some("Freenet refused it: the room is full.".into()),
+                failed: Some("Not saved. Freenet refused it: the room is full.".into()),
                 retry: true,
             });
         })

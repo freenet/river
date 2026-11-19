@@ -1582,7 +1582,7 @@ impl Rooms {
         if self.complete {
             self.outbox.keep_rooms(&shown);
         }
-        for room in &self.list {
+        for room in &mut self.list {
             self.outbox.reconcile(room);
         }
         new_ids
