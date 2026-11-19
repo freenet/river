@@ -197,6 +197,9 @@ pub struct Chat {
     mention_sel: (String, usize),
     /// The `@` (and what was typed after it) an Escape closed the popup at, closed until that word is gone.
     mention_off: Option<(usize, String)>,
+    /// Whether the open room's history shows its newest message (the Latest button hides
+    /// then). Reported by the history's scroll area.
+    pub at_bottom: bool,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
     /// What is typed in the nickname field of your own member info dialog.
@@ -331,6 +334,7 @@ impl Chat {
             emoji_category: 0,
             mention_sel: (String::new(), 0),
             mention_off: None,
+            at_bottom: true,
             member_modal: None,
             nickname: TextEdit::new(""),
             nickname_error: None,
@@ -560,6 +564,8 @@ impl Chat {
         // A reply, edit or deletion belongs to the room it was started in.
         self.cancel();
         self.emoji_open = false;
+        // The new room's history reports where it stands once laid out.
+        self.at_bottom = true;
         // A member's dialog, and the details dialog, belong to the room they were opened in.
         self.member_modal = None;
         self.notify_dialog = None;
@@ -590,7 +596,7 @@ impl Chat {
     /// sends nothing.
     pub fn send(&mut self) -> bool {
         let text = self.composer.text.trim().to_owned();
-        if text.is_empty() || matches!(self.mode, Mode::Delete(_)) {
+        if text.is_empty() || matches!(self.mode, Mode::Delete(_)) || self.over_limit() {
             return false;
         }
         self.mention_off = None;
@@ -640,6 +646,89 @@ impl Chat {
             ),
         }
         self.composer.clear();
+        true
+    }
+
+    /// What the composer would send, in the bytes the room measures against its size limit
+    /// (the web UI's `measure_draft`: the encoded message body, so a reply, a private room's
+    /// encryption and multi-byte characters all count), and that limit. `None` while deleting
+    /// or with no open room, and for a room with no limit known.
+    pub fn draft_size(&self) -> Option<(usize, usize)> {
+        use river_core::room_state::message::{MessageId, RoomMessageBody};
+        let room = self.room()?;
+        let max = room.details.limits.max_message_size;
+        if max == 0 {
+            return None;
+        }
+        let text = self.composer.text.trim();
+        // Ids are 64-bit hashes that encode in nine bytes almost always; the longest form is
+        // measured, so the count is never short.
+        // Ids are 64-bit hashes that encode in nine bytes almost always; where the real id is
+        // not known the longest form is measured, so the count is never short.
+        let worst = || MessageId(freenet_scaffold::util::FastHash(i64::MAX));
+        let wrap = |key: &str| room.wraps.as_ref()?.get(key);
+        let bytes = match &self.mode {
+            Mode::Delete(_) => return None,
+            Mode::Edit { key, .. } => RoomMessageBody::measure_edit(
+                wrap(key).map_or_else(worst, |w| w.id.clone()),
+                text,
+                room.private,
+            ),
+            Mode::Reply(key) => match (&room.wraps, wrap(key)) {
+                (_, Some(w)) => RoomMessageBody::measure_reply(
+                    text,
+                    w.id.clone(),
+                    &w.author_name,
+                    &w.preview,
+                    room.private,
+                ),
+                // A node room that no longer shows the target: sending fails ("the message you
+                // replied to is gone") and nothing is wrapped, so only the text counts.
+                (Some(_), None) => RoomMessageBody::measure_text(text, room.private),
+                // An example room, which sends nothing: as the view shows it.
+                (None, None) => match room.message_by_key(key) {
+                    Some(m) => RoomMessageBody::measure_reply(
+                        text,
+                        worst(),
+                        room.nickname(m.author),
+                        &m.text
+                            .chars()
+                            .take(model::REPLY_WRAP_CHARS)
+                            .collect::<String>(),
+                        room.private,
+                    ),
+                    None => RoomMessageBody::measure_text(text, room.private),
+                },
+            },
+            Mode::Write => RoomMessageBody::measure_text(text, room.private),
+        };
+        Some((bytes, max))
+    }
+
+    /// Whether what the composer holds is too long for the room, so Send is refused.
+    pub fn over_limit(&self) -> bool {
+        self.draft_size().is_some_and(|(bytes, max)| bytes > max)
+    }
+
+    /// Start editing your newest message that can still be changed, as Up in an empty composer
+    /// does in the web UI. Returns whether it did: not while replying or editing, or with nothing of yours to edit.
+    pub fn edit_last(&mut self) -> bool {
+        if !matches!(self.mode, Mode::Write) {
+            return false;
+        }
+        // Your NEWEST message, whatever its state: one still on its way, one that failed, or one
+        // this computer can't read is refused, never skipped for an older one.
+        let Some(key) = self.actionable().and_then(|room| {
+            room.messages
+                .iter()
+                .rev()
+                .find(|m| m.author == room.me)
+                .filter(|m| m.pending.is_none() && !m.source.is_empty())
+                .map(|m| m.key.clone())
+        }) else {
+            return false;
+        };
+        self.start_edit(&key);
         true
     }
 
@@ -734,6 +823,37 @@ impl Chat {
         }
         self.picker = None;
         self.mention_off = None;
+    }
+
+    /// Escape with focus nowhere in particular (the window's key handler, and the conversation's
+    /// when a control in it has focus): closes the emoji picker, then abandons a reply or an
+    /// edit. Does nothing while a dialog or the narrow members panel is open, which take their
+    /// own Escape. Returns whether it acted.
+    pub fn escape(&mut self) -> bool {
+        let covered = self.form.open.is_some()
+            || self.member_modal.is_some()
+            || self.details.is_some()
+            || self.notify_dialog.is_some()
+            || self.link_menu.is_some()
+            || self.members_overlay
+            || self.picker.is_some();
+        if covered {
+            return false;
+        }
+        if self.emoji_open {
+            self.emoji_open = false;
+            return true;
+        }
+        self.cancel_compose()
+    }
+
+    /// Abandon a reply or an edit in progress. Returns whether there was one.
+    pub fn cancel_compose(&mut self) -> bool {
+        let active = matches!(self.mode, Mode::Reply(_) | Mode::Edit { .. });
+        if active {
+            self.cancel();
+        }
+        active
     }
 
     /// Open or close the composer's emoji picker.

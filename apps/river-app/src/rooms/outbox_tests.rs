@@ -3547,3 +3547,101 @@ fn a_private_change_waiting_when_the_room_turns_public_goes_out_public() {
     );
     through_the_contract(&public, &delta);
 }
+
+/// The composer's counter (`Chat::draft_size`) against the body sending actually builds: they
+/// must agree to the byte, because the node has no other gate and the contract silently prunes
+/// a message over its limit (freenet/river#430).
+fn counted_vs_built(room: &LiveRoom, text: &str, mode: crate::chat::Mode, action: Action) {
+    use crate::chat::{Chat, LinkStatus, Source};
+    let view = Outbox::default().view(room, &minutes);
+    let mut chat = Chat::new(Source::Node(LinkStatus::Live), Vec::new(), 0, 0, 0);
+    chat.show_node_rooms(vec![view], None, LinkStatus::Live, 0);
+    chat.composer.replace_text(text);
+    chat.mode = mode;
+    let counted = chat.draft_size().expect("a limit").0;
+    let intent = match Outbox::default().intent(room, action) {
+        Ok(intent) => intent,
+        Err(e) => panic!("{text:?}: {e:?}"),
+    };
+    let (_, built) = build(room, &intent, at(1_000)).expect("builds");
+    assert_eq!(counted, built[0].message.content.content_len(), "{text:?}");
+}
+
+#[test]
+fn the_composers_count_is_the_size_of_the_body_sending_builds() {
+    use crate::chat::Mode;
+    let f = Fixture::new();
+    // A member who wrote and is gone, to reply to.
+    let ghost = SigningKey::from_bytes(&[77; 32]);
+    let mut public = public_state(&f);
+    public.recent_messages.messages.push(f.message(
+        &ghost,
+        BASE - 20,
+        RoomMessageBody::public("a long-gone voice \u{20ac}\u{20ac}".into()),
+    ));
+    let mut private = f.private_state();
+    private.recent_messages.messages.push(f.message(
+        &ghost,
+        BASE - 20,
+        RoomMessageBody::public("a long-gone voice".into()),
+    ));
+    for state in [public, private] {
+        let room = LiveRoom::new(f.stored(state));
+        let ghost_key = room
+            .stored
+            .room_state
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| message_key(&m.id()))
+            .next_back()
+            .unwrap();
+        let owner_key = key_of(&room, &f.owner);
+        let mine = key_of(&room, &f.me);
+        for text in ["hi", "caf\u{e9} \u{20ac} \u{1f389}", &"x".repeat(300)] {
+            counted_vs_built(&room, text, Mode::Write, say(text));
+            for target in [&owner_key, &ghost_key, &mine] {
+                counted_vs_built(
+                    &room,
+                    text,
+                    Mode::Reply(target.clone()),
+                    Action::Send {
+                        text: text.into(),
+                        reply_to: Some(target.clone()),
+                    },
+                );
+            }
+            counted_vs_built(
+                &room,
+                text,
+                Mode::Edit {
+                    key: mine.clone(),
+                    draft: Box::new(rune::TextEdit::new("")),
+                },
+                Action::Edit {
+                    target: mine.clone(),
+                    text: text.into(),
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn a_reply_to_a_message_the_room_no_longer_shows_counts_as_plain_text() {
+    use crate::chat::{Chat, LinkStatus, Mode, Source};
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let view = Outbox::default().view(&room, &minutes);
+    let mut chat = Chat::new(Source::Node(LinkStatus::Live), Vec::new(), 0, 0, 0);
+    chat.show_node_rooms(vec![view], None, LinkStatus::Live, 0);
+    chat.composer.replace_text("answering");
+    let plain = chat.draft_size().unwrap().0;
+    chat.mode = Mode::Reply("gone".into());
+    assert_eq!(chat.draft_size().unwrap().0, plain);
+    let gone = Action::Send {
+        text: "answering".into(),
+        reply_to: Some("gone".into()),
+    };
+    assert!(Outbox::default().intent(&room, gone).is_err());
+}

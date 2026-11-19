@@ -86,3 +86,9 @@ pub static BELL_OFF: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M4 11V7a4 4 0 0 1 6.8-2.8M12 8v3l1.2 1.5H2.8L4 11" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/><path d="M6.5 14a1.7 1.7 0 0 0 3 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M2.5 2.5l11 11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#,
 };
+
+pub static CHEVRON_DOWN: Icon = Icon {
+    name: "river-chevron-down",
+    view: 16.0,
+    body: r#"<path d="M3.5 6 8 10.5 12.5 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
