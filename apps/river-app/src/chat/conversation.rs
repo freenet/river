@@ -320,7 +320,7 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
                     .min_w(0.0)
                     .gap(4.0)
                     .child(name_row.take().unwrap_or_else(row))
-                    .child(message_el(chat, room, m, p, k)),
+                    .child(message_el(room, m, p, k)),
             )
         } else {
             (
@@ -328,10 +328,7 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
                     label(model::clock(m.time), st::GUTTER_TIME, p.text_muted)
                         .group_opacity(0.0, 1.0),
                 ),
-                col()
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .child(message_el(chat, room, m, p, k)),
+                col().grow(1.0).min_w(0.0).child(message_el(room, m, p, k)),
             )
         };
         let mut line = row()
@@ -441,6 +438,31 @@ const QUICK_REACTIONS: &[&str] = &[
     "👍", "❤️", "😂", "👀", "🔥", "😮", "😢", "😡", "🎉", "🤔", "👋", "✅", "💯", "🙏", "😍", "👏",
 ];
 
+/// The open reaction picker, mounted in the window's overlay layer under the message it
+/// reacts to. As for the kit's menus, a scrim takes a press anywhere outside and the surface
+/// is modal, so Escape or that press closes it without reacting. The press goes no further:
+/// another message's React button needs a second press.
+pub(super) fn picker_overlay(chat: &Chat, room: &Room, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
+    let Some(m) = chat
+        .picker
+        .as_deref()
+        .and_then(|key| room.messages.iter().find(|m| m.key == key))
+    else {
+        return;
+    };
+    layer.push(rune_kit::scrim("picker-scrim", |s: &mut RiverApp| {
+        s.chat.picker = None
+    }));
+    let surface = picker(room, m, p).modal(true, |s: &mut RiverApp| s.chat.picker = None);
+    layer.push(rune_kit::popover::anchored(
+        k,
+        surface,
+        &format!("msg-{}", m.key),
+        rune_kit::Placement::BottomStart,
+        4.0,
+    ));
+}
+
 fn picker(room: &Room, m: &Message, p: &Palette) -> El {
     let mine = room.own_reaction(&m.key);
     let mut strip = row()
@@ -538,7 +560,7 @@ fn text_button(
         .child(label(name, st::SMALL_STRONG, color))
 }
 
-fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
+fn message_el(room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
     let mut c = col().key(format!("msg-{}", m.key)).w_full().gap(5.0);
     if let Some(reply) = &m.reply_to {
         let author = room.nickname(reply.author).to_owned();
@@ -608,9 +630,6 @@ fn message_el(chat: &Chat, room: &Room, m: &Message, p: &Palette, k: &Kit) -> El
             );
         }
         c = c.child(pills);
-    }
-    if can_react && chat.picker.as_deref() == Some(m.key.as_str()) {
-        c = c.child(picker(room, m, p));
     }
     c
 }

@@ -618,6 +618,47 @@ fn reply_edit_delete_and_react_become_commands() {
     assert!(rt.state.chat.picker.is_none());
 }
 
+fn two_message_ids(rt: &Runtime<RiverApp>) -> (String, String) {
+    let ms = &rt.state.chat.room().unwrap().messages;
+    (ms[ms.len() - 2].key.clone(), ms[ms.len() - 1].key.clone())
+}
+
+#[test]
+fn a_press_outside_the_reaction_picker_closes_it_and_reacts_to_nothing() {
+    let mut rt = node_rooms(|_| {});
+    let (_, last) = two_message_ids(&rt);
+    hover_press(&mut rt, &format!("react-{last}"));
+    assert!(rt.state.chat.picker.is_some());
+    press(&mut rt, "composer");
+    assert!(rt.state.chat.picker.is_none());
+    assert!(sent(&mut rt).is_empty());
+    assert!(rt.find(&format!("picker-{last}")).is_none());
+}
+
+#[test]
+fn escape_closes_the_reaction_picker() {
+    let mut rt = node_rooms(|_| {});
+    let (_, last) = two_message_ids(&rt);
+    hover_press(&mut rt, &format!("react-{last}"));
+    assert!(rt.state.chat.picker.is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.state.chat.picker.is_none());
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn the_react_button_of_another_message_opens_its_picker_after_the_outside_press() {
+    let mut rt = node_rooms(|_| {});
+    let (prev, last) = two_message_ids(&rt);
+    hover_press(&mut rt, &format!("react-{last}"));
+    // The press outside only closes; a second press opens the other message's picker.
+    hover_press(&mut rt, &format!("react-{prev}"));
+    assert!(rt.state.chat.picker.is_none());
+    hover_press(&mut rt, &format!("react-{prev}"));
+    assert_eq!(rt.state.chat.picker.as_deref(), Some(prev.as_str()));
+    assert!(sent(&mut rt).is_empty());
+}
+
 #[test]
 fn pressing_a_reaction_toggles_it() {
     let mut rt = node_rooms(|rooms| {
