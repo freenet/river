@@ -88,7 +88,9 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
         let key = format!("description-{}", room.key);
         let rendered = markdown::header_inline(first)
             .filter(|line| markdown::is_cheap(line))
-            .and_then(|line| markdown::render(line, false, st::SMALL, p.text_muted, key, p, k));
+            .and_then(|line| {
+                markdown::render(line, false, st::SMALL, p.text_muted, key, p, k, false)
+            });
         let line = match rendered {
             Some(md) => md.max_h(18.0).clip_soft(0.0),
             None => label(markdown::strip(desc), st::SMALL, p.text_muted).truncate(),
@@ -681,6 +683,7 @@ fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> Option<El> {
         format!("md-{}", m.key),
         p,
         k,
+        true,
     )?;
     // The history is one selection group, so a drag from one message into another selects
     // across them as in a browser; the message's own group would end the selection at its edge.

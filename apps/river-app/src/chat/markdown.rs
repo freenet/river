@@ -162,6 +162,10 @@ fn thematic(t: &str) -> bool {
 /// item shows its words with their links, and a line that starts with bold text is not taken
 /// for a list. `None` for a line that is itself a block (fence, table, html, image) or empty.
 pub fn header_inline(line: &str) -> Option<&str> {
+    // Four spaces or a tab of indent make code, not prose.
+    if line.starts_with("    ") || line.starts_with('\t') {
+        return None;
+    }
     let mut t = line.trim();
     if t.contains(['\n', '\r']) {
         return None;
@@ -188,12 +192,21 @@ pub fn header_inline(line: &str) -> Option<&str> {
             None => break,
         }
     }
-    (!t.is_empty() && !thematic(line) && !thematic(t) && !t.starts_with(['`', '~', '<', '|', '!']))
-        .then_some(t)
+    // A marker with nothing after it (`-`, `#`, `1.`) is no text.
+    let marker_only = t
+        .chars()
+        .all(|c| matches!(c, '-' | '*' | '+' | '#' | '>' | '.' | ')') || c.is_ascii_digit());
+    (!t.is_empty()
+        && !marker_only
+        && !thematic(line)
+        && !thematic(t)
+        && !t.starts_with(['`', '~', '<', '|', '!']))
+    .then_some(t)
 }
 
 /// Markdown for `src` under `key`. `keep_breaks` is true for messages. `None` when the text
 /// cannot be made safe to draw as markdown (see `links::prepare`): show it as plain text.
+#[allow(clippy::too_many_arguments)] // one call site per kind of text; a struct would only rename them
 pub fn render(
     src: &str,
     keep_breaks: bool,
@@ -202,6 +215,7 @@ pub fn render(
     key: String,
     p: &Palette,
     k: &Kit,
+    selectable: bool,
 ) -> Option<El> {
     let src = if keep_breaks {
         keep_line_breaks(src)
@@ -250,7 +264,9 @@ pub fn render(
             )
             // Text can be selected and copied. A message drawn in the history joins the history's
             // selection group (conversation.rs), so a drag can run on into the next message.
-            .selectable(true)
+            // The header's line is a press target (it opens the room details), and a press
+            // on selectable text starts a selection instead.
+            .selectable(selectable)
             .render(&style(p, k, font, color))
             .key(key),
     )
@@ -350,7 +366,23 @@ mod tests {
         assert_eq!(ok("1. a"), Some("a"));
         assert_eq!(ok("-5 degrees"), Some("-5 degrees"));
         for no in [
-            "```", "a\nb", "| a |", "***", "- - -", "", "<b>x", "![i](x)",
+            "```",
+            "a\nb",
+            "| a |",
+            "***",
+            "- - -",
+            "",
+            "<b>x",
+            "![i](x)",
+            "-",
+            "#",
+            "1.",
+            "> -",
+            "    indented code",
+            "\tcode",
+            "- | a | b |",
+            "> | a |",
+            "\r",
         ] {
             assert_eq!(ok(no), None, "{no:?}");
         }
@@ -370,6 +402,7 @@ mod tests {
                 "k".into(),
                 &p,
                 &k,
+                true,
             )
         };
         assert!(draw("hello [a](https://example.com/)").is_some());

@@ -40,7 +40,7 @@ use pulldown_cmark::{CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use super::model;
 use super::share_link::{self, parse_share_link};
-use super::visual_fold::is_display_hidden;
+use super::visual_fold::{is_display_hidden, is_format_or_control};
 use crate::rooms::NODE_AUTHORITY;
 
 /// Most rewrites made to one text. Past it [`prepare`] gives up (`None`) and the caller shows
@@ -70,7 +70,7 @@ fn options() -> Options {
 pub fn prepare(src: &str) -> Option<String> {
     let (edits, kept) = rewrites(src)?;
     if edits.is_empty() && !src.contains('|') {
-        return Some(src.to_owned());
+        return Some(strip_label_format(src));
     }
     // What the links in the output must be: the ones kept as written, and the ones the edits
     // wrote (each edit parsed on its own).
@@ -79,13 +79,35 @@ pub fn prepare(src: &str) -> Option<String> {
         expected.extend(link_dests(&e.text));
     }
     expected.sort();
-    let out = apply(src, edits)?;
+    let out = strip_label_format(&apply(src, edits)?);
     // The output is parsed again, as the widget will. Text that reads differently next to what
     // we wrote around it (a `[label](<dest>)` right after a `]` becoming a reference link, a
     // definition turning a shortcut into a link) shows up as a link we did not write.
     let mut got = link_dests(&out);
     got.sort();
     (got == expected && !has_definitions(&out)).then_some(out)
+}
+
+/// `md` without the control and format characters (bidi overrides, zero-width spaces) inside
+/// its links, so a label cannot be drawn reordered or hidden. The web UI's sanitiser drops them
+/// from the whole rendered text; here only links are touched, which leaves the joiners of emoji
+/// sequences elsewhere alone. Destinations are checked on their own, so only labels change.
+fn strip_label_format(md: &str) -> String {
+    let bad = |c: char| is_format_or_control(c) && !matches!(c, '\n' | '\r' | '\t');
+    if !md.chars().any(bad) {
+        return md.to_owned();
+    }
+    let ranges: Vec<std::ops::Range<usize>> = Parser::new_ext(md, options())
+        .into_offset_iter()
+        .filter_map(|(ev, r)| matches!(ev, Event::Start(Tag::Link { .. })).then_some(r))
+        .collect();
+    let mut out = String::with_capacity(md.len());
+    for (i, c) in md.char_indices() {
+        if !(bad(c) && ranges.iter().any(|r| r.contains(&i))) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The destination of every link in `md`.
@@ -2434,5 +2456,24 @@ mod tests {
             assert_eq!(got.len(), 1, "{t:?}: {md:?}");
             assert_eq!(got[0].trim(), t.trim(), "{t:?}: {md:?}");
         }
+    }
+
+    #[test]
+    fn bidi_and_format_characters_are_stripped_from_link_labels() {
+        for md in [
+            "[evil\u{202e}gnp.exe](https://freenet.org/a)",
+            "[zero\u{200b}width](https://freenet.org/a)",
+            "see [a\u{2066}b\u{2069}](https://freenet.org/a) and https://freenet.org/b",
+        ] {
+            let out = prepare(md);
+            assert!(
+                !out.chars().any(super::is_format_or_control),
+                "{md:?} -> {out:?}"
+            );
+            assert!(!opens(&out).is_empty());
+        }
+        // Outside a link, an emoji's joiner is left as it is.
+        let family = "x \u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(prepare(family), family);
     }
 }

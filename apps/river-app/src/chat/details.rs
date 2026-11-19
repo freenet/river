@@ -393,7 +393,8 @@ fn description_section(
     k: &Kit,
 ) -> El {
     // The owner sees what they have typed; everyone else the room's description.
-    let desc = if editable {
+    // (A description that could not be unsealed has an empty source: show the room's own.)
+    let desc = if editable && !form.description.text.is_empty() {
         form.description.text.as_str()
     } else {
         room.description.as_str()
@@ -420,6 +421,7 @@ fn description_section(
                     if let Some(f) = &mut s.chat.details {
                         f.editing_description = true;
                         f.description.focused = true;
+                        f.name.focused = false;
                     }
                 })
                 .child(icon(&icons::EDIT, 14.0).color(p.text_muted)),
@@ -453,7 +455,7 @@ fn description_section(
     let body = if desc.trim().is_empty() {
         label("No description", st::BODY, p.text_muted)
     } else if markdown::is_cheap(desc) {
-        match markdown::render(desc, false, st::BODY, p.text, key, p, k) {
+        match markdown::render(desc, false, st::BODY, p.text, key, p, k, true) {
             Some(md) => md,
             None => label(desc.to_owned(), st::BODY, p.text).wrap().w_full(),
         }
@@ -547,7 +549,7 @@ fn captioned(caption: String, input: El, p: &Palette) -> El {
 fn limit_hint(i: usize, d: &Details) -> Option<String> {
     match i {
         0 => Some(format!(
-            "{}/{} without the owner",
+            "{}/{} members",
             d.usage.members, d.limits.max_members
         )),
         1 => Some(format!("{} held now", d.usage.messages)),
@@ -813,7 +815,7 @@ pub(super) fn details_modal(
         .key("details-scroll")
         .w_full()
         // The dialog's title and footer and the window's margins take the rest of the window.
-        .max_h((win_h - 240.0).clamp(140.0, 700.0))
+        .max_h((win_h - 240.0).clamp(60.0, 700.0))
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         })
