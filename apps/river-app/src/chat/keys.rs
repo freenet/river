@@ -8,7 +8,13 @@ use rune::{Key, KeyEvent, Mods, TextEdit};
 /// Backspace or Delete as "to the line edge": Ctrl+Left and Ctrl+Right jumped to the ends of the
 /// line and Ctrl+Backspace deleted to the start of it. A word is what every other desktop app
 /// does, and what rune's own `alt` modifier does, so the key is handed to the editor as Alt.
-/// Returns whether it handled the key. Remove this when the pinned rune revision has the fix
+/// Returns whether it handled the key.
+///
+/// Limits: a consumed key skips rune's own follow-up for a key (it scrolls the caret into view
+/// and snaps the field's height animation), so in a field that scrolls (a composer past eight
+/// lines, a dialog field wider than its box) the caret may stay out of view after one of these
+/// keys until the next key; and a field using `on_change` would not see these edits. Neither
+/// field has one today. Both go away with the upstream fix. Remove this when the pinned rune revision has the fix
 /// (rune's `dev` reads `line` as Cmd without Ctrl off macOS).
 pub fn word_keys(edit: &mut TextEdit, ev: &KeyEvent) -> bool {
     if cfg!(target_os = "macos") {
