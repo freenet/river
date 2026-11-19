@@ -182,10 +182,16 @@ impl RiverApp {
         let (chat, focused) = (&self.chat, self.focused);
         let open = chat.room().map(|r| r.key.as_str());
         self.limiter.retain_held(|k| {
+            // A room muted since its notification was held back has nothing to show.
+            if chat.mode_of(k) == rooms::modes::NotificationMode::Muted {
+                return false;
+            }
             if open == Some(k) {
                 !focused
             } else {
-                chat.rooms().iter().any(|r| r.key == k && r.unread > 0)
+                chat.rooms()
+                    .iter()
+                    .any(|r| r.key == k && chat.unread_of(r) > 0)
             }
         });
     }
@@ -287,12 +293,16 @@ impl RiverApp {
             RoomsUpdate::Rooms {
                 rooms,
                 open,
+                modes,
+                settled,
                 status,
                 now,
                 issues,
                 work,
             } => {
                 self.chat.issues = issues;
+                // Before the rooms, so what arrives in them is judged by their modes.
+                self.chat.apply_modes(modes, &settled);
                 let arrived = self
                     .chat
                     .show_node_rooms(rooms, open.as_deref(), status, now);
@@ -560,6 +570,39 @@ pub const SCENES: &[Scene] = &[
             chat.nickname.replace_text("Sam");
             room.nickname_block = Some(rooms::outbox::PRUNED_MESSAGE.into());
         })
+    }),
+    // The bell in the conversation header opens a room's notification dialog: its three modes,
+    // the current one checked. The name says what changes between the variants.
+    ("chat-notification-modes", |s| {
+        connect(s);
+        s.chat.open_notify_dialog();
+    }),
+    ("chat-notification-modes-mentions", |s| {
+        connect(s);
+        let room = s.chat.room().expect("a room").key.clone();
+        s.chat
+            .set_mode(&room, rooms::modes::NotificationMode::MentionsAndReplies);
+        s.chat.open_notify_dialog();
+    }),
+    // The master switch is off: the dialog says so.
+    ("chat-notification-modes-off", |s| {
+        connect(s);
+        s.chat.notifications = false;
+        s.chat.open_notify_dialog();
+    }),
+    // A muted room that is open: its bell is struck through.
+    ("chat-notification-modes-muted", |s| {
+        connect(s);
+        let key = "rust-help";
+        s.chat.set_mode(key, rooms::modes::NotificationMode::Muted);
+        s.chat.select(key);
+    }),
+    // A muted room that is not open: its row shows no unread count, as the web UI's does not,
+    // where Design Crew's does.
+    ("chat-notification-modes-muted-list", |s| {
+        connect(s);
+        s.chat
+            .set_mode("rust-help", rooms::modes::NotificationMode::Muted);
     }),
     ("chat-description-open", |s| {
         connect(s);
@@ -1290,6 +1333,8 @@ mod tests {
                 RoomsUpdate::Rooms {
                     rooms,
                     open: Some(first),
+                    modes: Default::default(),
+                    settled: Vec::new(),
                     status: chat::LinkStatus::Loading,
                     now: 29_000_000,
                     issues: Default::default(),
@@ -1344,6 +1389,8 @@ mod tests {
                 RoomsUpdate::Rooms {
                     rooms,
                     open: None,
+                    modes: Default::default(),
+                    settled: Vec::new(),
                     status: chat::LinkStatus::Live,
                     now: 29_000_000,
                     issues: Default::default(),

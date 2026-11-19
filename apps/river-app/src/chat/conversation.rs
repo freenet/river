@@ -14,6 +14,7 @@ use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label};
 use super::{Chat, Mode};
 use crate::RiverApp;
+use crate::rooms::modes::NotificationMode;
 
 const AVATAR: f32 = 36.0;
 /// The ring around your own avatar sits this far outside the disc, and is this wide, as the
@@ -159,6 +160,31 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
             st::SMALL_STRONG,
             if open { p.text } else { p.text_secondary },
         ));
+    // The room's notification mode, as the web UI's bell: struck through when muted. Opens the
+    // dialog to change it.
+    let mode = chat.mode_of(&room.key);
+    let bell = Some({
+        let title = super::notify_dialog::bell_title(mode);
+        let muted = mode == NotificationMode::Muted;
+        row()
+            .key("notification-bell")
+            .role("button")
+            .label(title.clone())
+            .help(title)
+            .size(32.0, 32.0)
+            .radius(8.0)
+            .center()
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.open_notify_dialog())
+            .child(
+                icon(super::notify_dialog::bell(mode), 18.0).color(if muted {
+                    p.text_muted
+                } else {
+                    p.text_secondary
+                }),
+            )
+    });
     let mut header = row()
         .key("room-header")
         .w_full()
@@ -171,6 +197,9 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
         .child(info);
     if let Some(more) = more {
         header = header.child(more);
+    }
+    if let Some(bell) = bell {
+        header = header.child(bell);
     }
     header.child(toggle)
 }

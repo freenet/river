@@ -38,6 +38,7 @@ use river_app::rooms::generation::{
     Artifact, BuildRecord, NodePointers, Records, UPDATE_REQUIRED, UPDATE_REQUIRED_WORK, Watch,
     watched_pointers,
 };
+use river_app::rooms::modes::NotificationMode;
 use river_app::rooms::socket::NodeSocket;
 use river_app::rooms::token::TokenStore;
 use river_app::rooms::work::WorkState;
@@ -58,6 +59,7 @@ struct App {
     rooms: Vec<Room>,
     issues: Issues,
     work: Vec<river_app::rooms::work::WorkView>,
+    modes: std::collections::HashMap<String, NotificationMode>,
     invites: Vec<(String, Result<String, String>)>,
     access: Option<Access>,
 }
@@ -87,6 +89,7 @@ impl App {
             rooms: Vec::new(),
             issues: Issues::default(),
             work: Vec::new(),
+            modes: Default::default(),
             invites: Vec::new(),
             access: None,
         }
@@ -119,8 +122,10 @@ impl App {
                     rooms,
                     issues,
                     work,
+                    modes,
                     ..
                 } => {
+                    self.modes = modes;
                     self.rooms = rooms;
                     self.issues = issues;
                     self.work = work;
@@ -520,6 +525,48 @@ fn rename_both_ways(
     });
 }
 
+/// A room's notification mode is stored in the chat delegate beside the room list (the web UI's
+/// `rooms_meta`): set in one app, it is read back by an app started afterwards, as after the app
+/// is restarted, and picking it did not lose the room or the open room the create stored.
+fn notification_modes(alice: &mut App, authority: &str, dir: &Path, room: &str, key: &str) {
+    assert_eq!(alice.modes.get(key), None, "a new room notifies for all");
+    alice.send(
+        key,
+        Action::SetNotificationMode {
+            mode: NotificationMode::MentionsAndReplies,
+        },
+    );
+    alice.until("the mode is shown", |app| {
+        app.modes.get(key) == Some(&NotificationMode::MentionsAndReplies)
+    });
+    // Stored, not just remembered: the app's work is done once its task has left the list.
+    alice.until("the mode is stored", |app| app.work.is_empty());
+
+    let mut again = App::start("A (restarted)", authority, dir);
+    again.until("the rooms and the stored mode are read back", |app| {
+        app.access == Some(Access::Ready)
+            && app.room(room).is_some()
+            && app.modes.get(key) == Some(&NotificationMode::MentionsAndReplies)
+    });
+    // And back to the default, read back the same way.
+    again.send(
+        key,
+        Action::SetNotificationMode {
+            mode: NotificationMode::All,
+        },
+    );
+    again.until("the default is stored", |app| {
+        app.modes.get(key) == Some(&NotificationMode::All) && app.work.is_empty()
+    });
+    let mut last = App::start("A (restarted again)", authority, dir);
+    last.until("the default is read back", |app| {
+        app.access == Some(Access::Ready)
+            && app.room(room).is_some()
+            && app.modes.get(key) == Some(&NotificationMode::All)
+    });
+    println!("notification modes round-trip through the node");
+}
+
 fn ready_and_empty(app: &App) -> bool {
     app.access == Some(Access::Ready) && app.rooms.is_empty() && !app.issues.store_missing
 }
@@ -681,6 +728,8 @@ fn main() {
     let owner = expect_signing_key("A", &alice.authority, &dir_a, &key);
     let member = expect_signing_key("B", &bob.authority, &dir_b, &key);
     assert_ne!(owner, member, "the joiner's key is not the owner's");
+
+    notification_modes(&mut alice, a, &dir_a, ROOM, &key);
 
     newer_river(a, &dir, &dir_a, ROOM, &key, &mut bob);
     // Nothing the outdated app was asked to write reached the room: the app on node B, which

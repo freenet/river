@@ -19,7 +19,8 @@
 //! `ROOMS_CAS_MAX_ATTEMPTS`. What to store comes from `river_core::stored_rooms`: a room is
 //! only ever added where its key holds nothing (or a tombstone, when joining, as the web UI's
 //! explicit rejoin overwrites one), never over a room already stored, and `rooms_meta` has only
-//! its open room changed, with every other field kept. A conflict never overwrites: what the
+//! its open room, or one room's notification mode ([`super::modes`]), changed, with every other
+//! field kept. A conflict never overwrites: what the
 //! other writer stored is read and worked from.
 //!
 //! **Rooms from an earlier River need no guard here.** On a node that also holds rooms in an
@@ -93,6 +94,7 @@ use river_core::stored_rooms::{
 
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
+use super::modes::{NotificationMode, meta_with_mode};
 
 /// How many times a write is worked out again after another writer got in first. The web UI's
 /// `ROOMS_CAS_MAX_ATTEMPTS`.
@@ -156,6 +158,13 @@ enum Kind {
         /// retried much later is not stamped with a time the room has trimmed.
         plan: Option<Box<JoinPlan>>,
     },
+    /// Store `mode` as `room`'s notification mode in `rooms_meta` (the one step, `Meta`).
+    /// Not about a room being created or joined: it has no owner as far as the rest of this
+    /// module is concerned (so it holds no room), and is not shown unless it fails.
+    Mode {
+        room: VerifyingKey,
+        mode: NotificationMode,
+    },
     /// Refused before it started; never works.
     Refused(String),
 }
@@ -208,6 +217,8 @@ struct Task {
     failed: Option<(String, bool)>,
     /// Whether the stored rooms were asked to be read again for this task's finishing.
     reload_asked: bool,
+    /// For a mode task: whether its end (stored, or failed) was handed to [`Work::settle_modes`].
+    settled: bool,
     /// Whether the node answered the last request with a refusal of it (the UPDATE was not
     /// taken, or the room is not there), rather than leaving its outcome unknown.
     refused: bool,
@@ -225,6 +236,7 @@ impl Task {
             conflicts: 0,
             failed: None,
             reload_asked: false,
+            settled: false,
             refused: false,
         }
     }
@@ -233,8 +245,13 @@ impl Task {
         match &self.kind {
             Kind::Create(plan) => Some(plan.room.owner_vk),
             Kind::Join { invitation, .. } => Some(invitation.room),
-            Kind::Refused(_) => None,
+            Kind::Mode { .. } | Kind::Refused(_) => None,
         }
+    }
+
+    /// Whether this only saves a notification mode.
+    fn is_mode(&self) -> bool {
+        matches!(self.kind, Kind::Mode { .. })
     }
 
     /// The room being stored, once there is one.
@@ -242,7 +259,7 @@ impl Task {
         match &self.kind {
             Kind::Create(plan) => Some(&plan.room),
             Kind::Join { plan, .. } => plan.as_ref().map(|p| &p.room),
-            Kind::Refused(_) => None,
+            Kind::Mode { .. } | Kind::Refused(_) => None,
         }
     }
 
@@ -254,6 +271,7 @@ impl Task {
                 super::room::LiveRoom::new(stored(&p.room)).name()
             ),
             Kind::Join { .. } => "Joining a room".to_owned(),
+            Kind::Mode { .. } => "Saving the notification setting".to_owned(),
             Kind::Refused(what) => what.clone(),
         };
         let state = match (&self.failed, self.step, self.owner()) {
@@ -312,6 +330,14 @@ impl Task {
     /// done), or why it can't. A refusal here does not change by trying again, so it is final.
     fn decide(&mut self, value: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
         let unexpected = || "Something unexpected went wrong.".to_owned();
+        if let Kind::Mode { room, mode } = &self.kind {
+            return meta_with_mode(value, room, *mode).map_err(|e| {
+                format!(
+                    "The notification setting was not saved: River's room list in its storage \
+                     can't be read by this app ({e}), so it stays as it was."
+                )
+            });
+        }
         let owner = self.owner().ok_or_else(unexpected)?;
         if self.step == Step::Meta {
             return meta_with_current_room(value, &owner).map_err(|e| {
@@ -431,6 +457,58 @@ impl Work {
         );
     }
 
+    /// Store `mode` as `room`'s notification mode. A save still waiting to start for the same
+    /// room is changed instead of queueing another, so picking quickly writes the last pick.
+    pub fn set_mode(&mut self, room: VerifyingKey, mode: NotificationMode) {
+        if let Some(Task {
+            kind: Kind::Mode { mode: queued, .. },
+            ..
+        }) = self.tasks.iter_mut().rev().find(|t| {
+            matches!(&t.kind, Kind::Mode { room: r, .. } if *r == room)
+                && t.running()
+                && t.out.is_none()
+                && t.phase == Phase::Read
+        }) {
+            *queued = mode;
+            return;
+        }
+        self.push(Kind::Mode { room, mode }, Step::Meta);
+        // Nothing here changes what the stored rooms say beyond what the screen already shows.
+        if let Some(t) = self.tasks.back_mut() {
+            t.reload_asked = true;
+        }
+    }
+
+    /// The modes chosen and still being stored: they override what the store says, which is
+    /// older. One that failed is not here: it was not saved, so the store's word stands.
+    pub fn pending_modes(&self) -> Vec<(VerifyingKey, NotificationMode)> {
+        self.tasks
+            .iter()
+            .filter(|t| t.running())
+            .filter_map(|t| match &t.kind {
+                Kind::Mode { room, mode } => Some((*room, *mode)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The mode saves that ended since the last call: the room, the mode, and whether it was
+    /// stored (else it failed and the store still holds what it did). Each is reported once.
+    pub fn settle_modes(&mut self) -> Vec<(VerifyingKey, NotificationMode, bool)> {
+        let mut out = Vec::new();
+        for t in &mut self.tasks {
+            let Kind::Mode { room, mode } = &t.kind else {
+                continue;
+            };
+            if t.settled || t.running() {
+                continue;
+            }
+            t.settled = true;
+            out.push((*room, *mode, t.failed.is_none()));
+        }
+        out
+    }
+
     /// Try a failed task again from the step it failed at.
     pub fn retry(&mut self, id: u64) -> bool {
         let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) else {
@@ -440,6 +518,7 @@ impl Work {
             return false;
         }
         t.failed = None;
+        t.settled = false;
         t.reconnects = 0;
         t.conflicts = 0;
         t.out = None;
@@ -535,10 +614,10 @@ impl Work {
         if t.out.is_some() {
             return None;
         }
-        let owner = t.owner()?;
+        let owner = t.owner();
         let (out, request) = match (t.step, &t.kind) {
             (Step::Get, _) => {
-                let id = *create::contract_key(&owner).id();
+                let id = *create::contract_key(&owner?).id();
                 (
                     Out::Contract(id),
                     ClientRequest::ContractOp(ContractRequest::Get {
@@ -551,7 +630,7 @@ impl Work {
             }
             (Step::Slot | Step::Meta, _) => {
                 let key = if t.step == Step::Slot {
-                    room_storage_key(&owner)
+                    room_storage_key(&owner?)
                 } else {
                     ROOMS_META_KEY.to_vec()
                 };
@@ -833,13 +912,20 @@ impl Work {
     }
 
     pub fn views(&self) -> Vec<WorkView> {
-        self.tasks.iter().map(Task::view).collect()
+        // A mode that was saved needs no row; one still working or failed does.
+        self.tasks
+            .iter()
+            .filter(|t| !(t.is_mode() && t.step == Step::Done))
+            .map(Task::view)
+            .collect()
     }
 
     /// Drop finished tasks whose room is shown.
     pub fn forget_done(&mut self, shown: &dyn Fn(&VerifyingKey) -> bool) {
         self.tasks.retain(|t| {
-            !(t.step == Step::Done && t.failed.is_none() && t.owner().is_some_and(|o| shown(&o)))
+            !(t.step == Step::Done
+                && t.failed.is_none()
+                && (t.is_mode() || t.owner().is_some_and(|o| shown(&o))))
         });
     }
 }

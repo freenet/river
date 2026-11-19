@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::chat::model::{Message, Room, mention_scheme};
+use crate::rooms::modes::NotificationMode;
 use crate::rooms::room::is_hidden;
 
 /// The most notifications one update of the rooms may show. Beyond it, the rest are folded
@@ -108,20 +109,32 @@ fn tidy(text: &str, max: usize) -> String {
 /// The messages in `new` that were not in `old`, one [`Arrival`] per room.
 ///
 /// A message counts when its key is new in a room that was in `old`, it is not yours and not
-/// still on its way (`pending`). Edits and reactions keep a message's key, so they give
-/// nothing. A room that was not in `old` gives nothing, and the [`Limiter`] drops what fills a
+/// still on its way (`pending`), and the room's [`NotificationMode`] (`mode_of`, by room key)
+/// lets it through: every message in `All`, only those that mention you or reply to one of
+/// yours in `MentionsAndReplies` (`Room::is_for_me`), none in `Muted`. The count and the
+/// message shown are of what the mode lets through, so an away window's unread count follows
+/// the mode too, as the web UI's title does. Edits and reactions keep a message's key, so they
+/// give nothing. A room that was not in `old` gives nothing, and the [`Limiter`] drops what fills a
 /// room that just appeared or was empty: that is history.
 ///
 /// Message times are NOT used. They are whatever their author's clock said (one far in the
 /// future, or a skewed member, would otherwise silence a room), and a message that reaches
 /// this device late is still news.
-pub fn arrivals(old: &[Room], new: &[Room]) -> Vec<Arrival> {
+pub fn arrivals(
+    old: &[Room],
+    new: &[Room],
+    mode_of: &dyn Fn(&str) -> NotificationMode,
+) -> Vec<Arrival> {
     let chip = format!("{}:self", mention_scheme());
     let mut out = Vec::new();
     for room in new {
         let Some(before) = old.iter().find(|r| r.key == room.key) else {
             continue;
         };
+        let mode = mode_of(&room.key);
+        if mode == NotificationMode::Muted {
+            continue;
+        }
         let fresh: Vec<&Message> = room
             .messages
             .iter()
@@ -129,6 +142,7 @@ pub fn arrivals(old: &[Room], new: &[Room]) -> Vec<Arrival> {
                 m.author != room.me
                     && m.pending.is_none()
                     && !before.messages.iter().any(|b| b.key == m.key)
+                    && (mode == NotificationMode::All || room.is_for_me(m))
             })
             .collect();
         let Some(newest) = fresh.last() else { continue };
@@ -1180,5 +1194,210 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].mention);
         assert_eq!(out[0].count, 4);
+    }
+
+    // Per-room modes ---------------------------------------------------------------------------
+
+    fn set_mode(s: &mut RiverApp, room: &Room, mode: NotificationMode) {
+        s.chat.set_mode(&room.key, mode);
+    }
+
+    fn mention_of_you(room: &Room, key: &str) -> Message {
+        let mut m = from_other(room, key, "hey you");
+        m.md = format!("hey [@you]({}:self)", mention_scheme());
+        m
+    }
+
+    /// A reply from someone else to the message of `target_author`.
+    fn reply_to(room: &Room, key: &str, target_author: crate::chat::model::MemberId) -> Message {
+        let mut m = from_other(room, key, "replying");
+        m.reply_to = Some(crate::chat::model::ReplyTo {
+            message: room.messages[0].id,
+            author: target_author,
+            preview: "earlier".into(),
+        });
+        m
+    }
+
+    fn someone_else(room: &Room) -> crate::chat::model::MemberId {
+        room.members
+            .iter()
+            .find(|m| m.id != room.me)
+            .expect("another member")
+            .id
+    }
+
+    #[test]
+    fn all_messages_notifies_for_every_kind_of_message() {
+        let (mut s, rec, rooms) = live();
+        set_mode(&mut s, &rooms[0], NotificationMode::All);
+        deliver(
+            &mut s,
+            with(&rooms, 0, vec![from_other(&rooms[0], "p", "plain")]),
+        );
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
+    #[test]
+    fn mentions_and_replies_lets_through_a_mention() {
+        let (mut s, rec, rooms) = live();
+        set_mode(&mut s, &rooms[0], NotificationMode::MentionsAndReplies);
+        deliver(
+            &mut s,
+            with(&rooms, 0, vec![mention_of_you(&rooms[0], "m")]),
+        );
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1);
+        assert!(n[0].mention);
+        assert!(n[0].title.contains("mentioned you"));
+    }
+
+    #[test]
+    fn mentions_and_replies_lets_through_a_reply_to_you_but_not_to_someone_else() {
+        let (mut s, rec, rooms) = live();
+        let room = &rooms[0];
+        set_mode(&mut s, room, NotificationMode::MentionsAndReplies);
+        // A reply to someone else's message: nothing.
+        deliver(
+            &mut s,
+            with(&rooms, 0, vec![reply_to(room, "r1", someone_else(room))]),
+        );
+        assert!(shown(&rec).is_empty());
+        // A reply to yours: shown, though it does not mention you.
+        let next = with(&rooms, 0, vec![reply_to(room, "r2", room.me)]);
+        deliver(&mut s, next);
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1);
+        assert!(!n[0].mention);
+        assert_eq!(n[0].count, 1);
+    }
+
+    #[test]
+    fn mentions_and_replies_drops_a_plain_message_and_your_own() {
+        let (mut s, rec, rooms) = live();
+        let room = &rooms[0];
+        set_mode(&mut s, room, NotificationMode::MentionsAndReplies);
+        let mut own = mention_of_you(room, "own");
+        own.author = room.me;
+        deliver(
+            &mut s,
+            with(&rooms, 0, vec![from_other(room, "p", "plain"), own]),
+        );
+        assert!(shown(&rec).is_empty());
+    }
+
+    #[test]
+    fn a_burst_in_mentions_mode_counts_only_what_qualifies() {
+        let (mut s, rec, rooms) = live();
+        let room = &rooms[0];
+        set_mode(&mut s, room, NotificationMode::MentionsAndReplies);
+        let add = vec![
+            from_other(room, "a", "noise"),
+            mention_of_you(room, "b"),
+            from_other(room, "c", "more noise"),
+            reply_to(room, "d", room.me),
+        ];
+        deliver(&mut s, with(&rooms, 0, add));
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].count, 2);
+        assert!(n[0].mention, "the mention is the one shown");
+    }
+
+    #[test]
+    fn muted_notifies_nothing_even_for_a_mention() {
+        let (mut s, rec, rooms) = live();
+        let room = &rooms[0];
+        set_mode(&mut s, room, NotificationMode::Muted);
+        deliver(
+            &mut s,
+            with(
+                &rooms,
+                0,
+                vec![mention_of_you(room, "m"), reply_to(room, "r", room.me)],
+            ),
+        );
+        assert!(shown(&rec).is_empty());
+    }
+
+    #[test]
+    fn a_mode_is_per_room() {
+        let (mut s, rec, rooms) = live();
+        set_mode(&mut s, &rooms[0], NotificationMode::Muted);
+        let mut next = with(&rooms, 0, vec![from_other(&rooms[0], "x", "muted room")]);
+        next[1]
+            .messages
+            .push(from_other(&rooms[1], "y", "other room"));
+        deliver(&mut s, next);
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].room_key, rooms[1].key);
+    }
+
+    #[test]
+    fn the_footer_switch_is_the_master_over_every_mode() {
+        let (mut s, rec, rooms) = live();
+        set_mode(&mut s, &rooms[0], NotificationMode::All);
+        s.chat.notifications = false;
+        deliver(
+            &mut s,
+            with(&rooms, 0, vec![mention_of_you(&rooms[0], "m")]),
+        );
+        assert!(shown(&rec).is_empty());
+    }
+
+    /// The title's count follows the mode as the web UI's does: nothing when muted, only
+    /// mentions and replies in that mode, as the window is away.
+    #[test]
+    fn the_unread_count_follows_the_mode() {
+        let (mut s, _rec, rooms) = live();
+        let room = &rooms[1];
+        let mut next = rooms.clone();
+        next[1].messages.extend([
+            from_other(room, "a", "noise"),
+            mention_of_you(room, "b"),
+            reply_to(room, "c", room.me),
+        ]);
+        next[1].unread = 3;
+        let count = |s: &RiverApp| s.chat.unread_of(&s.chat.rooms()[1]);
+        s.chat.edit_rooms(|r| *r = next.clone());
+        // Reading the open room would clear it: show a different room as open.
+        s.chat.select(&rooms[0].key);
+        s.chat.edit_rooms(|r| *r = next.clone());
+        assert_eq!(count(&s), 3);
+        set_mode(&mut s, room, NotificationMode::MentionsAndReplies);
+        assert_eq!(count(&s), 2);
+        set_mode(&mut s, room, NotificationMode::Muted);
+        assert_eq!(count(&s), 0);
+        // The room's share of the total is what moves.
+        let total = s.chat.unread_total();
+        set_mode(&mut s, room, NotificationMode::All);
+        assert_eq!(s.chat.unread_total(), total + 3);
+        set_mode(&mut s, room, NotificationMode::Muted);
+        set_mode(&mut s, room, NotificationMode::All);
+        assert_eq!(count(&s), 3);
+    }
+
+    /// While the window is away, what arrives in the open room is counted as the mode lets it.
+    #[test]
+    fn the_away_count_of_the_open_room_follows_the_mode() {
+        let (mut s, _rec, rooms) = live();
+        let open = s.chat.room().unwrap().clone();
+        let i = rooms.iter().position(|r| r.key == open.key).unwrap();
+        set_mode(&mut s, &rooms[i], NotificationMode::MentionsAndReplies);
+        s.focus_changed(false);
+        let before = s.unread();
+        deliver(
+            &mut s,
+            with(
+                &rooms,
+                i,
+                vec![
+                    from_other(&rooms[i], "n", "noise"),
+                    mention_of_you(&rooms[i], "m"),
+                ],
+            ),
+        );
+        assert_eq!(s.unread(), before + 1);
     }
 }

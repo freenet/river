@@ -27,6 +27,7 @@ freenet-stdlib = { version = "=0.12.1", features = ["contract"] }
 freenet-scaffold = "0.2.2"
 ed25519-dalek = "2"
 ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
 bincode = "1"
 bs58 = "0.5"
 serde_json = "1"
@@ -46,4 +47,3 @@ toml = "0.8"
 [dev-dependencies]
 # Encrypting test rooms needs the randomized helpers.
 river-core = { path = "../../common", features = ["ecies-randomized"] }
-serde = { version = "1", features = ["derive"] }
