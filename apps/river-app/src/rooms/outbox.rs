@@ -87,6 +87,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::ecies::{encrypt_with_symmetric_key, seal_bytes};
 use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
@@ -177,6 +178,9 @@ pub enum Action {
     SetNotificationMode {
         mode: super::modes::NotificationMode,
     },
+    /// Leave the room, as the web UI does ([`super::leave`]): it is removed from the stored
+    /// rooms and does not come back.
+    LeaveRoom,
 }
 
 impl std::fmt::Debug for Action {
@@ -228,6 +232,7 @@ impl std::fmt::Debug for Action {
                 .debug_struct("SetNotificationMode")
                 .field("mode", mode)
                 .finish(),
+            Action::LeaveRoom => f.write_str("LeaveRoom"),
         }
     }
 }
@@ -476,6 +481,7 @@ impl Action {
                 | Action::RetryWork { .. }
                 | Action::DismissWork { .. }
                 | Action::SetNotificationMode { .. }
+                | Action::LeaveRoom
         )
     }
 }
@@ -1628,6 +1634,10 @@ pub(super) struct Outbox {
     /// The user asked to send again something still owed an answer: that needs a new
     /// connection, since a second copy on this one would owe a second answer to the same one.
     reconnect: bool,
+    /// By room contract, how many answers were owed by a room that was left: they may still
+    /// come, and are not the answer to anything sent to the room if it is back. A new
+    /// connection owes nothing, so this empties with `owed`.
+    stale: HashMap<ContractInstanceId, usize>,
 }
 
 impl Default for Outbox {
@@ -1640,6 +1650,7 @@ impl Default for Outbox {
             clock: Box::new(SystemTime::now),
             owed: HashMap::new(),
             reconnect: false,
+            stale: HashMap::new(),
         }
     }
 }
@@ -2139,9 +2150,8 @@ impl Outbox {
             | Action::Join { .. }
             | Action::RetryWork { .. }
             | Action::DismissWork { .. }
-            | Action::SetNotificationMode { .. } => {
-                Err(("Your message", "Nothing to do.".to_owned()))
-            }
+            | Action::SetNotificationMode { .. }
+            | Action::LeaveRoom => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 
@@ -2504,6 +2514,7 @@ impl Outbox {
     pub fn requeue(&mut self) {
         self.work.connection_lost();
         self.owed.clear();
+        self.stale.clear();
         self.reconnect = false;
         for e in &mut self.entries {
             if matches!(e.status, Status::InFlight { .. }) {
@@ -2598,6 +2609,41 @@ impl Outbox {
             }
         }
         changed
+    }
+
+    /// Forget everything waiting for `room`: its unsent entries and the answers owed. For a
+    /// room just left, as the web UI's `clear_outbox_for_room_now` does.
+    /// The answers it owed (the room's contract is `id`) are remembered, to be discarded when
+    /// they come.
+    pub fn purge_room(&mut self, room: &VerifyingKey, id: ContractInstanceId) {
+        self.entries.retain(|e| e.room != *room);
+        if let Some(owed) = self.owed.remove(room)
+            && !owed.is_empty()
+        {
+            *self.stale.entry(id).or_default() += owed.len();
+        }
+    }
+
+    /// Whether `answer` for the contract `id` is one owed by a room that was left: it is taken
+    /// and forgotten.
+    pub fn take_stale(&mut self, id: &ContractInstanceId) -> bool {
+        match self.stale.get_mut(id) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                true
+            }
+            Some(_) => {
+                self.stale.remove(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether answers owed by rooms left may still come, so an error that names nothing
+    /// cannot be blamed on a room that is shown.
+    pub fn has_stale(&self) -> bool {
+        !self.stale.is_empty()
     }
 
     /// Forget the rooms no longer shown: what was waiting there goes with them.

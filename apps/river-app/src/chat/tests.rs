@@ -4419,3 +4419,157 @@ fn deputizing_in_a_private_room_sends_to_that_room() {
         }
     );
 }
+
+// Leaving a room -----------------------------------------------------------------------------------
+
+use crate::rooms::{Action as RoomAction, Command as RoomCommand};
+
+/// The dialog of the room `room` from the node, open.
+fn details_open(room: &str) -> Runtime<RiverApp> {
+    let mut rt = render(from_node(room), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("room-details-dialog").is_some());
+    rt
+}
+
+#[test]
+fn the_details_dialog_offers_leave_room_to_a_member_and_to_the_owner() {
+    for room in ["town-square", OWNED] {
+        let rt = details_open(room);
+        assert!(rt.find("details-leave").is_some(), "{room}");
+        assert!(shows(&rt, "Leave Room"));
+        // Nothing is asked until it is pressed.
+        assert!(rt.find("details-leave-confirm").is_none());
+    }
+}
+
+#[test]
+fn pressing_leave_room_asks_with_the_web_uis_wording_and_sends_nothing() {
+    let mut rt = details_open("town-square");
+    press(&mut rt, "details-leave");
+    assert!(details(&rt).leaving);
+    assert!(shows(
+        &rt,
+        "Are you sure you want to leave this room? This action cannot be undone."
+    ));
+    // The signing key going with the room is said.
+    assert!(shows(&rt, "signing key"));
+    assert!(rt.find("details-leave-confirm").is_some());
+    assert!(rt.find("details-leave-cancel").is_some());
+    // The save controls are out of the way while asking.
+    assert!(rt.find("details-leave").is_none());
+    assert!(rt.state.chat.outgoing.is_empty());
+}
+
+#[test]
+fn the_owner_is_warned_that_leaving_deletes_the_room_for_them() {
+    let mut rt = details_open(OWNED);
+    press(&mut rt, "details-leave");
+    assert!(shows(
+        &rt,
+        "Warning: You are the owner of this room. Leaving will permanently delete it for you."
+    ));
+    assert!(shows(
+        &rt,
+        "Other members might retain access if they have the contract key, but coordination will be lost."
+    ));
+    assert!(shows(&rt, "signing key"));
+}
+
+#[test]
+fn cancelling_leave_changes_nothing() {
+    let mut rt = details_open("town-square");
+    let before = rt.state.chat.rooms().len();
+    press(&mut rt, "details-leave");
+    press(&mut rt, "details-leave-cancel");
+    assert!(!details(&rt).leaving);
+    assert!(rt.find("details-leave").is_some());
+    assert!(rt.find("details-leave-confirm").is_none());
+    assert!(rt.state.chat.outgoing.is_empty());
+    assert_eq!(rt.state.chat.rooms().len(), before);
+    // Escape out of the question closes the dialog, and the next time it asks again.
+    press(&mut rt, "details-leave");
+    key(&mut rt, Key::Escape);
+    assert!(rt.state.chat.details.is_none());
+    assert!(rt.state.chat.outgoing.is_empty());
+    press(&mut rt, "room-title");
+    assert!(!details(&rt).leaving);
+}
+
+#[test]
+fn confirming_leave_sends_it_closes_the_dialogs_and_the_next_room_opens_when_the_list_drops_it() {
+    for room in ["town-square", OWNED] {
+        let mut rt = details_open(room);
+        // Unsent text in the room goes with it.
+        rt.state.chat.composer.replace_text("half a thought");
+        redraw_now(&mut rt);
+        press(&mut rt, "details-leave");
+        assert!(details(&rt).leaving, "{room}: asking");
+        press(&mut rt, "details-leave-confirm");
+        assert_eq!(
+            std::mem::take(&mut rt.state.chat.outgoing),
+            vec![RoomCommand {
+                room: room.to_owned(),
+                action: RoomAction::LeaveRoom
+            }]
+        );
+        assert!(rt.state.chat.details.is_none());
+        assert!(rt.find("room-details-dialog").is_none());
+        assert!(rt.state.chat.composer.text.is_empty());
+        // The node side no longer lists it: another room opens, and it is not this one.
+        let rest: Vec<super::Room> = rt
+            .state
+            .chat
+            .rooms()
+            .iter()
+            .filter(|r| r.key != room)
+            .cloned()
+            .collect();
+        rt.state
+            .chat
+            .show_node_rooms(rest, None, LinkStatus::Live, 29_000_000);
+        redraw_now(&mut rt);
+        let now = rt.state.chat.room().expect("another room is open");
+        assert_ne!(now.key, room);
+        assert!(rt.state.chat.rooms().iter().all(|r| r.key != room));
+        // Its half-written text did not follow to the next room.
+        assert!(rt.state.chat.composer.text.is_empty());
+    }
+}
+
+#[test]
+fn an_owner_whose_details_are_blocked_is_still_warned_as_the_owner() {
+    let mut s = from_node(OWNED);
+    s.chat.edit_rooms(|rooms| {
+        if let Some(r) = rooms.iter_mut().find(|r| r.key == OWNED) {
+            r.details.editable = super::model::Editable::Blocked("no secret yet".into());
+        }
+    });
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    press(&mut rt, "details-leave");
+    assert!(shows(&rt, "You are the owner of this room"));
+    assert!(shows(&rt, "owner cannot get ownership back"));
+}
+
+#[test]
+fn confirming_leave_twice_asks_the_node_once() {
+    let mut rt = details_open("town-square");
+    press(&mut rt, "details-leave");
+    press(&mut rt, "details-leave-confirm");
+    // The dialog is closed: a second confirm has nothing to confirm.
+    rt.state.chat.confirm_leave();
+    assert_eq!(rt.state.chat.outgoing.len(), 1);
+}
+
+#[test]
+fn leaving_an_example_room_just_removes_it() {
+    let mut s = connected();
+    s.chat.select("town-square");
+    s.chat.open_details();
+    s.chat.ask_leave();
+    s.chat.confirm_leave();
+    assert!(s.chat.outgoing.is_empty(), "nothing goes to a node");
+    assert!(s.chat.rooms().iter().all(|r| r.key != "town-square"));
+    assert!(s.chat.room().is_some());
+}

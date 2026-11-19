@@ -782,6 +782,13 @@ pub const SCENES: &[Scene] = &[
     ("chat-room-details-owner", |s| {
         details_scene(s, chat::example::EMPTY_ROOM, |_, _| {})
     }),
+    // Leave Room: the question as a member and as the owner sees it.
+    ("chat-room-leave-member", |s| {
+        details_scene(s, "town-square", |chat, _| chat.ask_leave())
+    }),
+    ("chat-room-leave-owner", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |chat, _| chat.ask_leave())
+    }),
     ("chat-room-details-editing", |s| {
         details_scene(s, chat::example::EMPTY_ROOM, |chat, _| {
             let form = chat.details.as_mut().expect("open");

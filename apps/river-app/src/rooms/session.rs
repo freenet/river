@@ -1535,6 +1535,8 @@ impl Rooms {
             self.store_missing = loaded.store_missing;
             return Vec::new();
         }
+        // The rooms stored now are the ones there are: a finished leave has done its work.
+        self.outbox.work.rooms_read();
         let mut old: HashMap<VerifyingKey, LiveRoom> = self
             .list
             .drain(..)
@@ -1544,6 +1546,11 @@ impl Rooms {
         let mut by_key: HashMap<VerifyingKey, LiveRoom> = HashMap::new();
         for slot in loaded.slots {
             let vk = slot.owner_vk;
+            // A room being left stays off the list (and unsubscribed) while its tombstone
+            // is on its way: the read just made may have come first.
+            if self.outbox.work.leaving(&vk) {
+                continue;
+            }
             let room = match old.remove(&vk) {
                 Some(mut kept) if same_room(&kept.stored, &slot) => {
                     kept.stored.last_read_message_id = slot.last_read_message_id.clone();
@@ -1646,17 +1653,62 @@ impl Rooms {
         changed
     }
 
+    /// Take every room being left out of the list at once, with what was waiting to be sent to
+    /// it, so nothing more is sent, subscribed to or shown for it, and a join of the same room
+    /// is not refused as "already here". A leave that fails before the tombstone is stored
+    /// asks for the stored rooms to be read again, which puts the room back.
+    fn drop_leaving(&mut self) {
+        let work = &self.outbox.work;
+        let gone: Vec<(VerifyingKey, ContractInstanceId)> = self
+            .list
+            .iter()
+            .filter(|r| work.leaving(&r.stored.owner_vk))
+            .map(|r| (r.stored.owner_vk, r.contract_id()))
+            .collect();
+        for (vk, id) in gone {
+            self.list.retain(|r| r.stored.owner_vk != vk);
+            self.outbox.purge_room(&vk, id);
+            self.not_updated.remove(&vk);
+            self.not_following.remove(&vk);
+        }
+    }
+
     /// Create, join, or try again or drop one that failed ([`super::work`]). True when it
     /// changed what shows.
     fn list_command(&mut self, room: &str, action: Action) -> bool {
+        let shown_owner = || {
+            bs58::decode(room)
+                .into_vec()
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .and_then(|b| VerifyingKey::from_bytes(&b).ok())
+                .filter(|vk| self.list.iter().any(|r| &r.stored.owner_vk == vk))
+        };
         match action {
+            Action::LeaveRoom => {
+                let Some(owner) = shown_owner() else {
+                    eprintln!("River: leaving a room no longer shown was dropped");
+                    return false;
+                };
+                let name = self
+                    .list
+                    .iter()
+                    .find(|r| r.stored.owner_vk == owner)
+                    .map(LiveRoom::name)
+                    .unwrap_or_default();
+                let identity = self
+                    .list
+                    .iter()
+                    .find(|r| r.stored.owner_vk == owner)
+                    .and_then(|r| r.stored.self_verifying_key());
+                if !self.outbox.work.leave(owner, name, identity) {
+                    return false;
+                }
+                self.drop_leaving();
+                true
+            }
             Action::SetNotificationMode { mode } => {
-                let owner = bs58::decode(room)
-                    .into_vec()
-                    .ok()
-                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                    .and_then(|b| VerifyingKey::from_bytes(&b).ok())
-                    .filter(|vk| self.list.iter().any(|r| &r.stored.owner_vk == vk));
+                let owner = shown_owner();
                 let Some(owner) = owner else {
                     eprintln!(
                         "River: a notification setting for a room no longer shown was dropped"
@@ -1682,7 +1734,13 @@ impl Rooms {
                     .join(&code.0, &nickname, &|vk| shown.contains(vk));
                 true
             }
-            Action::RetryWork { id } => self.outbox.work.retry(id),
+            Action::RetryWork { id } => {
+                let retried = self.outbox.work.retry(id);
+                if retried {
+                    self.drop_leaving();
+                }
+                retried
+            }
             Action::DismissWork { id } => self.outbox.work.dismiss(id),
             _ => false,
         }
@@ -1718,6 +1776,7 @@ impl Rooms {
             | ErrorKind::OperationError { .. }
             | ErrorKind::FailedOperation
                 if owing.len() == 1
+                    && !self.outbox.has_stale()
                     && subs.pending.is_empty()
                     && !reloading
                     && !self.outbox.work.has_out() =>
@@ -1774,6 +1833,10 @@ impl Rooms {
     /// The node answered the oldest update the room under contract `id` owes an answer
     /// ([`Outbox::answered`]). True when that changed what shows.
     fn update_answered(&mut self, id: &ContractInstanceId, result: Result<(), String>) -> bool {
+        // An answer owed by a room that was left, which may be back.
+        if self.outbox.take_stale(id) {
+            return false;
+        }
         let Some(room) = self.list.iter_mut().find(|r| r.contract_id() == *id) else {
             return false;
         };

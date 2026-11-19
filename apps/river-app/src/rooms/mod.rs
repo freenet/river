@@ -19,11 +19,12 @@
 //! deletions of their own messages, reactions, a change of their own nickname and (for a room's
 //! owner) changes to the room's details, each as an UPDATE of the room contract ([`outbox`]).
 //! It makes invitations, creates rooms and joins them from invitations
-//! ([`create`], [`work`]). Those are the only times it writes the chat delegate's storage,
-//! which the web UI writes too, at the same time: it writes only with the web UI's generation
-//! compare-and-swap, only adds a room where none is stored, and in `rooms_meta` only changes
-//! the open room and the user's per-room notification modes ([`work`] has the details,
-//! [`modes`] the modes). The one other thing it writes is each room's signing
+//! ([`create`], [`work`]), and leaves them ([`leave`]). Those are the only times it writes the
+//! chat delegate's storage, which the web UI writes too, at the same time: it writes only with
+//! the web UI's generation compare-and-swap, only adds a room where none is stored (or, to
+//! leave one, replaces it with the web UI's tombstone), and in `rooms_meta` only changes the
+//! open room, the user's per-room notification modes and, when a room is left, the entries
+//! naming it ([`work`] has the details, [`modes`] the modes). The one other thing it writes is each room's signing
 //! key, in the delegate's own namespace for keys, only where the delegate holds none ([`keys`]).
 //! Its only PUT is the seed PUT of a room it has just created, under that room's own contract;
 //! it never seeds a room the network lacks, which the web UI does.
@@ -38,6 +39,7 @@ pub mod deputies;
 pub mod generation;
 pub mod grant;
 pub mod keys;
+pub mod leave;
 pub mod modes;
 pub mod outbox;
 pub mod room;
