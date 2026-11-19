@@ -216,7 +216,8 @@ pub fn render(
                     s.chat.open_link_menu(url, press);
                 },
             )
-            // Text can be selected and copied, within a message.
+            // Text can be selected and copied. A message drawn in the history joins the history's
+            // selection group (conversation.rs), so a drag can run on into the next message.
             .selectable(true)
             .render(&style(p, k, font, color))
             .key(key),

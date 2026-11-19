@@ -140,6 +140,7 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .placeholder(placeholder.to_owned())
             .width(None)
             .on_edit(get)
+            .on_key(move |s: &mut RiverApp, ev, _| super::keys::word_keys(get(s), ev))
             .on_submit(move |s: &mut RiverApp, _| submit(s))
             .build(k)
             .key(key.to_owned())
