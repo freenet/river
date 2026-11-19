@@ -32,6 +32,11 @@ pub struct Palette {
     pub accent_line: Color,
     /// Text that says something failed (the web UI's `--color-danger-text`).
     pub danger: Color,
+    /// A similar-name warning's text, fill and rule (the web UI's `--color-warning-text`,
+    /// `--color-warning-bg` and `--color-warning`).
+    pub warning_text: Color,
+    pub warning_bg: Color,
+    pub warning: Color,
 }
 
 fn hex(s: &str) -> Color {
@@ -69,6 +74,9 @@ pub fn palette() -> Palette {
         accent_soft: hex("#282c34"),
         accent_line: hex("#5d6f8f"),
         danger: hex("#f97066"),
+        warning_text: hex("#e3a845"),
+        warning_bg: hex("#422006"),
+        warning: hex("#eab308"),
     }
 }
 

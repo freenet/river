@@ -466,6 +466,28 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat.emoji_open = true;
     }),
+    // A member's info dialog, for a name that imitates the owner's (the first letter after the
+    // owner's is Cyrillic).
+    ("chat-member-modal", |s| {
+        connect(s);
+        s.chat.edit_rooms(|rooms| {
+            let room = &mut rooms[0];
+            let owner = room
+                .members
+                .iter()
+                .find(|m| m.role == chat::model::Role::Owner);
+            let owner = owner.map_or(0, |m| m.id);
+            let mut m = chat::model::Member::new(
+                90,
+                "Maya Chen".replacen('a', "\u{0430}", 1),
+                chat::model::Role::Member,
+            );
+            m.invited_by = Some(owner);
+            m.key = "7Zq2mWc9Lk4HfXtN8vRbYp3JdEaGu5sQoT1iKxVnCwMh".into();
+            room.members.push(m);
+        });
+        s.chat.open_member("90");
+    }),
     ("chat-description-open", |s| {
         connect(s);
         s.chat.edit_rooms(|rooms| {

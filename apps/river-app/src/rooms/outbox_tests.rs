@@ -1422,3 +1422,28 @@ fn an_update_never_answered_costs_a_bounded_number_of_reconnects() {
     assert!(!pending.retry, "Discard only");
     assert!(!outbox.wants_reconnect(bound, t + bound));
 }
+
+#[test]
+fn the_view_says_who_invited_whom_and_gives_each_members_keys() {
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(public_state(&f)));
+    let view = Outbox::default().view(&room, &minutes);
+    let owner = view
+        .members
+        .iter()
+        .find(|m| m.role == crate::chat::model::Role::Owner)
+        .unwrap();
+    let me = view.member(view.me).unwrap();
+    assert_eq!(owner.invited_by, None);
+    assert_eq!(me.invited_by, Some(owner.id));
+    assert_eq!(owner.uid, f.owner_id().to_string());
+    assert_eq!(me.uid, f.me_id().to_string());
+    assert_eq!(
+        owner.key,
+        bs58::encode(f.owner.verifying_key().as_bytes()).into_string()
+    );
+    assert_eq!(
+        me.key,
+        bs58::encode(f.me.verifying_key().as_bytes()).into_string()
+    );
+}

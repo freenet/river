@@ -28,6 +28,27 @@ pub struct Member {
     pub id: MemberId,
     pub nickname: String,
     pub role: Role,
+    /// River's member id in decimal, which the web UI shows as "Member ID". Stable across
+    /// updates, unlike `id`.
+    pub uid: String,
+    /// Who invited them. `None` for the owner, and when the inviter is no longer a member.
+    pub invited_by: Option<MemberId>,
+    /// Their verifying key, in base58. Empty when this computer does not know it.
+    pub key: String,
+}
+
+impl Member {
+    /// A member known only by name and role, as in the example rooms: its `uid` is its `id`.
+    pub fn new(id: MemberId, nickname: impl Into<String>, role: Role) -> Self {
+        Member {
+            id,
+            nickname: nickname.into(),
+            role,
+            uid: id.to_string(),
+            invited_by: None,
+            key: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +140,10 @@ pub struct Room {
 impl Room {
     pub fn member(&self, id: MemberId) -> Option<&Member> {
         self.members.iter().find(|m| m.id == id)
+    }
+
+    pub fn member_by_uid(&self, uid: &str) -> Option<&Member> {
+        self.members.iter().find(|m| m.uid == uid)
     }
 
     pub fn nickname(&self, id: MemberId) -> &str {

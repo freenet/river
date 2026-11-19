@@ -16,6 +16,7 @@ mod icons;
 mod keys;
 mod links;
 mod markdown;
+mod member_modal;
 pub mod model;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
@@ -189,6 +190,8 @@ pub struct Chat {
     pub emoji_category: usize,
     /// The room header shows the whole description, not one line of it.
     pub description_open: bool,
+    /// The member (by `Member::uid`) whose info dialog is open, in the open room.
+    pub member_modal: Option<String>,
     /// Today's day number in message time (whose day 0 is `day_zero`).
     pub today: u32,
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
@@ -256,6 +259,7 @@ impl Chat {
             emoji_open: false,
             emoji_category: 0,
             description_open: false,
+            member_modal: None,
             today,
             day_zero,
             now,
@@ -306,6 +310,7 @@ impl Chat {
         if self.rooms.is_empty() {
             self.emoji_open = false;
             self.description_open = false;
+            self.member_modal = None;
             // An empty list is often a reload on its way to the full one: keep the open room's
             // text as its draft, remember which room it was, and open nothing.
             let mut open = std::mem::replace(&mut self.composer, TextEdit::new(""));
@@ -466,6 +471,8 @@ impl Chat {
         self.cancel();
         self.emoji_open = false;
         self.description_open = false;
+        // A member's dialog belongs to the room it was opened in.
+        self.member_modal = None;
         if self.selected.is_empty() {
             // Nothing was open, so what the composer holds belongs to no room yet: keep it,
             // unless it is empty and this room has a draft.
@@ -719,6 +726,17 @@ impl Chat {
             DialogKind::Create => self.form.name.focused = true,
             DialogKind::Join => self.form.code.focused = true,
         }
+    }
+
+    /// Open the info dialog of the member with `uid` in the open room.
+    pub fn open_member(&mut self, uid: &str) {
+        if self.room().is_some_and(|r| r.member_by_uid(uid).is_some()) {
+            self.member_modal = Some(uid.to_owned());
+        }
+    }
+
+    pub fn close_member(&mut self) {
+        self.member_modal = None;
     }
 
     pub fn close_dialog(&mut self) {

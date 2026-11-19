@@ -1306,4 +1306,214 @@ fn the_reaction_picker_stays_in_the_window_and_off_its_own_toolbar() {
             && bar[1] < pk[1] + pk[3];
         assert!(!overlap, "{size:?} picker {pk:?} covers toolbar {bar:?}");
     }
+
+// The member info dialog ----------------------------------------------------------------------
+
+/// Run frames long enough for a dialog's opening or closing motion to finish.
+fn settle(rt: &mut Runtime<RiverApp>) {
+    for i in 1..=30 {
+        rt.frame(10.0 + f64::from(i) * 0.05);
+    }
+}
+
+/// The `uid` of the open room's member called `name`.
+fn uid_of(rt: &Runtime<RiverApp>, name: &str) -> String {
+    let room = rt.state.chat.room().unwrap();
+    room.members
+        .iter()
+        .find(|m| m.nickname == name)
+        .unwrap_or_else(|| panic!("no member {name}"))
+        .uid
+        .clone()
+}
+
+fn open_member(rt: &mut Runtime<RiverApp>, name: &str) {
+    let id = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .member_by_uid(&uid_of(rt, name))
+        .unwrap()
+        .id;
+    press(rt, &format!("member-{id}"));
+}
+
+#[test]
+fn clicking_a_member_opens_their_info() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    assert!(rt.find("member-info-dialog").is_none());
+    open_member(&mut rt, "Jonas");
+    assert!(rt.find("member-info-dialog").is_some());
+    assert_eq!(rt.state.chat.member_modal, Some(uid_of(&rt, "Jonas")));
+    assert!(shows(&rt, "Member Info"));
+    assert!(shows(&rt, "Jonas"));
+    assert!(shows(&rt, "Member ID"));
+    // Jonas was invited by the owner, whose name opens the owner's own dialog.
+    assert!(shows(&rt, "Invited by"));
+    assert!(rt.find("member-inviter").is_some());
+    assert!(rt.find("member-tag-owner").is_none());
+    assert!(rt.find("member-tag-you").is_none());
+    assert!(rt.find("member-tag-impersonation").is_none());
+    press(&mut rt, "member-inviter");
+    assert_eq!(rt.state.chat.member_modal, Some(uid_of(&rt, "Maya Chen")));
+    assert!(rt.find("member-tag-owner").is_some());
+}
+
+#[test]
+fn a_member_row_opens_from_the_keyboard() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let id = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .member_by_uid(&uid_of(&rt, "Jonas"))
+        .unwrap()
+        .id;
+    let want = format!("member-{id}");
+    let mut reached = false;
+    for _ in 0..80 {
+        key(&mut rt, Key::Tab);
+        if rt
+            .elements()
+            .into_iter()
+            .any(|e| e.focused && e.key.as_deref() == Some(want.as_str()))
+        {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab never reached {want}");
+    // Space presses a focused button, as it does every button in the app.
+    key(&mut rt, Key::Text(" ".into()));
+    assert_eq!(rt.state.chat.member_modal, Some(uid_of(&rt, "Jonas")));
+}
+
+#[test]
+fn escape_closes_the_member_dialog() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    assert!(rt.find("member-info-dialog").is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("member-info-dialog").is_none());
+    assert!(rt.state.chat.member_modal.is_none());
+}
+
+#[test]
+fn the_owner_and_you_are_tagged() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Maya Chen");
+    assert!(rt.find("member-tag-owner").is_some());
+    assert!(shows(&rt, "Room Owner"));
+    assert!(shows(&rt, "N/A (Room Owner)"));
+    assert!(rt.find("member-tag-impersonation").is_none());
+    key(&mut rt, Key::Escape);
+    open_member(&mut rt, "Sam Rivers");
+    assert!(rt.find("member-tag-you").is_some());
+    assert!(rt.find("member-tag-owner").is_none());
+    // Nothing to message or moderate in yourself.
+    assert!(rt.find("member-dm").is_none());
+}
+
+#[test]
+fn what_needs_commands_this_app_lacks_is_shown_unavailable() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    for k in ["member-dm", "member-mention"] {
+        let e = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(k))
+            .unwrap_or_else(|| panic!("no {k}"));
+        assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET), "{k}");
+    }
+    // Sam did not invite Jonas, so Sam has no say over him.
+    assert!(rt.find("member-ban").is_none());
+    key(&mut rt, Key::Escape);
+    // The owner moderates everyone but themselves.
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let me = rooms[0].me;
+        for m in &mut rooms[0].members {
+            m.role = if m.id == me {
+                super::model::Role::Owner
+            } else {
+                super::model::Role::Member
+            };
+        }
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    for k in ["member-ban", "member-deputize"] {
+        let e = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(k))
+            .unwrap_or_else(|| panic!("no {k}"));
+        assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET), "{k}");
+    }
+    assert!(rt.find("member-tag-invited-by-you").is_some());
+}
+
+#[test]
+fn the_dialog_closes_when_the_room_changes() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    assert!(rt.find("member-info-dialog").is_some());
+    rt.state.chat.select(PRIVATE_ROOM);
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(rt.state.chat.member_modal.is_none());
+    assert!(rt.find("member-info-dialog").is_none());
+    assert_eq!(rt.state.chat.room().unwrap().key, PRIVATE_ROOM);
+}
+
+#[test]
+fn a_name_that_imitates_the_owner_is_warned_about() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let owner = room
+            .members
+            .iter()
+            .find(|m| m.role == super::model::Role::Owner)
+            .unwrap()
+            .id;
+        // Cyrillic "а" for the first "a", and an invisible character.
+        for (id, name) in [
+            (91, "M\u{0430}ya Chen"),
+            (92, "Maya\u{200B} Chen"),
+            (93, "Maya Chen2"),
+        ] {
+            let mut m = super::model::Member::new(id, name, super::model::Role::Member);
+            m.invited_by = Some(owner);
+            room.members.push(m);
+        }
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    for (uid, warned) in [("91", true), ("92", true), ("93", false)] {
+        rt.state.chat.open_member(uid);
+        rt.invalidate();
+        settle(&mut rt);
+        assert_eq!(
+            rt.find("member-tag-impersonation").is_some(),
+            warned,
+            "member {uid}"
+        );
+        assert_eq!(
+            rt.find("member-impersonation").is_some(),
+            warned,
+            "member {uid}"
+        );
+        if warned {
+            assert!(shows(&rt, "NOT the room owner"));
+            assert!(shows(&rt, "Resembles:"));
+        }
+        key(&mut rt, Key::Escape);
+        settle(&mut rt);
+    }
+    // The real owner is not accused of imitating themselves.
+    open_member(&mut rt, "Maya Chen");
+    assert!(rt.find("member-tag-impersonation").is_none());
 }

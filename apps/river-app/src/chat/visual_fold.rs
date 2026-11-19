@@ -7,6 +7,19 @@
 //! re-copy the changed item. The `//@@` marker lines name each item's source file.
 #![allow(dead_code, clippy::all)]
 
+/// Whether two display names are a tier-1 (same skeleton) match under either fold: what the
+/// web UI's `folds_together` answers, built from the copied items below. Not itself a copy.
+pub(crate) fn names_fold_together(a: &str, b: &str) -> bool {
+    let folds =
+        |n: &str| [Fold::Visual, Fold::CaseInsensitive].map(|f| strip_spaces(&skeleton_with(n, f)));
+    let [a_visual, a_case] = folds(a);
+    if a_visual.is_empty() {
+        return false;
+    }
+    let [b_visual, b_case] = folds(b);
+    a_visual == b_visual || a_case == b_case
+}
+
 //@@ confusable.rs
 /// Combining marks, dropped so `"I" + U+0300` folds like `"Ì"`.
 fn is_combining_mark(c: char) -> bool {
@@ -999,6 +1012,254 @@ pub fn is_display_hidden(c: char) -> bool {
         | 0xF0000..=0xFFFFD
         | 0x100000..=0x10FFFD
     )
+}
+
+//@@ confusable.rs
+/// The two skeletons a name folds to. **Both are needed, and neither alone is
+/// sufficient** — this is the fix for a false-positive class found in review.
+///
+/// The bar-shaped characters (`I`, `l`, `1`, `|`, `!`) render identically, and
+/// lowercase `i` does NOT (it has a dot). But case-insensitivity says `I` ≡ `i`.
+/// Composing the two transitively gives `i` ≡ `l`, and then any two names
+/// differing only in `i` vs `l` collide:
+///
+/// * `Ilan` (Hebrew) / `Lian` (Chinese)
+/// * `Alia` (Arabic) / `Alla` (Russian), `Ilya` / `Liya`, `Ila` / `Lia`
+///
+/// That transitive collapse is unavoidable in ONE skeleton: `Ian` ≡ `ian` (case)
+/// and `Ian` ≡ `lan` (the live attack) force `i` ≡ `l`. Verified exhaustively —
+/// every single-skeleton variant either keeps those false positives or breaks a
+/// row of the validated table (moving the fold before the case step drops
+/// `IAN CLARKE`, because capital `L` is then no longer folded).
+///
+/// So the collapse is split across two skeletons and a name matches if EITHER
+/// agrees. Each keeps the bar class as a `'1'` sentinel that never merges with
+/// the letter `i`, so neither one alone equates them:
+///
+/// * [`Fold::Visual`] folds the bar class BEFORE case, so `I` and `l` merge and
+///   lowercase `i` stays distinct. Catches `lan Clarke`, `1an Clarke`,
+///   `Ian CIarke`.
+/// * [`Fold::CaseInsensitive`] folds it AFTER case, so `L`/`l` and `I`/`i` merge
+///   as letters. Catches `IAN CLARKE`, `ian clarke`.
+///
+/// `Ilan`/`Lian` agree under neither, so they are no longer flagged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fold {
+    Visual,
+    CaseInsensitive,
+}
+
+//@@ confusable.rs
+fn strip_spaces(s: &str) -> String {
+    s.chars().filter(|c| *c != ' ').collect()
+}
+
+//@@ confusable.rs
+/// [`skeleton`] under a chosen [`Fold`]. See that type for why there are two.
+fn skeleton_with(name: &str, fold: Fold) -> String {
+    // 1. Drop what a reader cannot see, and fold presentation-only variants of
+    //    ASCII. The invisible set is reused from the display-name table rather
+    //    than re-listed here, so the two cannot drift. A hidden character that
+    //    WAS whitespace becomes a space, matching `sanitize_display_name`.
+    //
+    //    In practice the input is already sanitised (callers pass rendered
+    //    text), so the invisible strip is defence in depth — and it is what
+    //    lets the unit tests feed raw attacker strings.
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if is_display_hidden(c) {
+            if c.is_whitespace() {
+                out.push(' ');
+            }
+            continue;
+        }
+        // 1b. **Joiners, dropped unconditionally** — the OTHER half of #488's
+        //     kept-in-context residual.
+        //
+        //     `is_display_hidden` deliberately does NOT report U+200C/U+200D,
+        //     because they are orthography in Persian, Sinhala and Malayalam and
+        //     blanket-stripping them mangles real names at RENDER time. But this
+        //     is not render, it is comparison, and a joiner never distinguishes
+        //     two people's names to a reader — which is the entire premise of
+        //     the residual `display_name.rs`'s header documents. So dropping
+        //     them here has zero false-positive cost and closes the clone:
+        //     without it `"李\u{200D}小龍"` and `"李小龍"` fold apart and the
+        //     impostor is unflagged, leaving every CJK, Persian, Sinhala and
+        //     Malayalam deputy name cloneable.
+        if c == '\u{200C}' || c == '\u{200D}' {
+            continue;
+        }
+        // 2. Fullwidth forms, and the "mathematical alphanumeric" blocks that
+        //    every online fancy-text generator emits (`𝐈𝐚𝐧`, `𝗜𝗮𝗻`, `𝙸𝚊𝚗` all
+        //    read as "Ian"). NFKC does this in the reference; these are the
+        //    ranges that matter for names.
+        if let Some(ascii) = fold_presentation_form(c) {
+            out.push(ascii);
+            continue;
+        }
+        // 2b. Small capitals — the single commonest fancy-text style on chat
+        //     platforms after the mathematical blocks, and one NFKC does NOT
+        //     touch, so it needs its own judgement. See [`fold_small_capital`].
+        if let Some(folded) = fold_small_capital(c) {
+            out.push(folded);
+            continue;
+        }
+        // 3. Combining marks. `"I" + U+0300 + "n"` must fold like `"Ìn"`.
+        if is_combining_mark(c) {
+            continue;
+        }
+        // 4. Precomposed Latin letters, which carry no combining mark to strip
+        //    (`à` is one codepoint). This is the NFD-then-drop-marks step.
+        out.push(strip_latin_accent(c).unwrap_or(c));
+    }
+
+    // 5. Cross-script homoglyphs, BEFORE case folding. Case matters here: `Η`
+    //    (Greek capital eta) looks like `H`, but its lowercase `η` looks like
+    //    `n`, so one case-insensitive rule would be wrong for both. (The Python
+    //    engine case-folds first, which silently disables its Greek entries;
+    //    handling case properly is the one place this port deliberately
+    //    improves on it, and it cannot affect that engine's validated results,
+    //    which are all Latin or Cyrillic.)
+    let out: String = out.chars().map(fold_homoglyph).collect();
+
+    // 6/7. The bar class and case, in the order this [`Fold`] calls for.
+    //
+    //   * `Visual` folds bars FIRST, so capital `I` joins lowercase `l` (both
+    //     are a plain vertical stroke) while lowercase `i` — which has a dot —
+    //     stays a separate letter.
+    //   * `CaseInsensitive` lowercases first, so capital `L` has become `l` and
+    //     capital `I` has become `i` before the bar fold runs; that gives the
+    //     case-variant match without ever equating `i` with `l`.
+    //
+    // Both map the bar class to the SENTINEL `'1'`, never to the letter `i`.
+    // That is the whole point: folding to `i` is what made `Alia` and `Alla`
+    // collide. See [`Fold`].
+    let out = match fold {
+        Fold::Visual => fold_bar_class(&out).to_lowercase(),
+        Fold::CaseInsensitive => fold_bar_class(&out.to_lowercase()),
+    };
+
+    // 7a. **Homoglyphs, AGAIN, after the case fold.**
+    //
+    // The pass at step 5 runs before `to_lowercase`, which is correct for the
+    // uppercase entries (`Η` looks like `H` but its lowercase `η` looks like
+    // `n`, so one case-insensitive rule would be wrong for both). But it left a
+    // whole class through: any UPPERCASE codepoint absent from the table whose
+    // Unicode lowercase IS in the table survived as the raw codepoint, because
+    // nothing folded it after the case step. The lowercase forms were caught;
+    // the uppercase ones were not.
+    //
+    //   * `Ӏ` U+04C0 CYRILLIC PALOCHKA — a bare vertical stroke, pixel-identical
+    //     to Latin capital I, and the single most-used I-spoof in IDN attacks.
+    //   * `Ԁ` U+0500 CYRILLIC KOMI DE, `Ѵ` U+0474 CYRILLIC IZHITSA.
+    //
+    // Running the same table a second time closes the class rather than the
+    // three instances: `to_lowercase` has already mapped each of them onto its
+    // lowercase form (`ӏ`, `ԁ`, `ѵ`), all of which the table already carried.
+    //
+    // **A character this pass rewrites must then go through the bar fold too,
+    // and ONLY such a character.** The palochka lowercases to `ӏ`, which this
+    // table maps to `l` — a bar — but the bar fold at step 6/7 has already run,
+    // so without this it stayed a literal `l` and `"Ӏan Clarke"` folded to
+    // `"lan c1arke"` against the real `"1an c1arke"`. It still evaded.
+    //
+    // Re-running the bar fold over the WHOLE string instead would be wrong: in
+    // the visual fold a capital `L` legitimately reaches this point as `l` (it
+    // is not a bar — it has a foot), and folding it here would re-merge
+    // `Lisa`/`Iisa`, undoing the split [`Fold`] exists to make. So the bar fold
+    // is applied per character, conditional on this pass having changed it.
+    let out: String = out
+        .chars()
+        .map(|c| {
+            let folded = fold_homoglyph(c);
+            if folded == c {
+                c
+            } else {
+                fold_bar_char(folded)
+            }
+        })
+        .collect();
+
+    // 7b. The remaining ASCII confusables, which are case-agnostic (they all
+    //     produce a lowercase letter, which the case step above leaves alone).
+    let out: String = out.chars().map(fold_ascii_confusable).collect();
+
+    // 8. Multi-character confusables: `rn` reads as `m`, `vv` as `w`.
+    let mut out = out;
+    for (from, to) in MULTI_CONFUSABLES {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+
+    // 9. Collapse whitespace runs and trim, so `"Ian  Clarke"` folds onto
+    //    `"Ian Clarke"`. Every whitespace character becomes a plain space
+    //    first: an impostor who separates the words with U+3000 renders a
+    //    visibly different name, but is one keystroke from the real thing and
+    //    is worth catching.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut last_was_space = false;
+    for c in out.chars() {
+        let c = if c.is_whitespace() { ' ' } else { c };
+        let is_space = c == ' ';
+        if !(is_space && last_was_space) {
+            collapsed.push(c);
+        }
+        last_was_space = is_space;
+    }
+    collapsed.trim().to_string()
+}
+
+//@@ confusable.rs
+/// Multi-character confusables, applied after the single-character map.
+///
+/// `cl -> d` is inert: the bar fold has already rewritten `l`. It is retained
+/// for fidelity with the upstream engine, and `skeleton_folds_in_reference_order`
+/// pins that it stays inert.
+///
+/// **`nn -> m` was here and was REMOVED.** `rn` and `vv` are genuine visual
+/// confusables — `rn` really does read as `m` at UI sizes, which is what catches
+/// `Roorn Owner`. `nn` does not: `nn` and `m` are different shapes in every
+/// font, joined at the shoulder or not. And doubled-n is one of the commonest
+/// pairs in given names, so the rule accused a long tail of real people —
+/// `Annie`/`Amie`, `Anna`/`Ama` (Akan), `Hanna`/`Hama`, `Donna`/`Doma`,
+/// `Jenna`/`Jema`. It was a straight loss: no attack needs it, and it fired on
+/// names nobody chose to make confusable. Do not re-add it.
+const MULTI_CONFUSABLES: [(&str, &str); 3] = [("rn", "m"), ("cl", "d"), ("vv", "w")];
+
+//@@ confusable.rs
+/// The bar-shaped characters, folded to a `'1'` sentinel.
+///
+/// Deliberately NOT folded to the letter `i`: `i` has a dot and is a different
+/// shape, and merging them is what made `Alia`/`Alla` and `Ilan`/`Lian` collide.
+/// See [`Fold`]. Which characters are in the class depends on whether the case
+/// step has already run — the caller decides by choosing the [`Fold`].
+fn fold_bar_class(s: &str) -> String {
+    s.chars().map(fold_bar_char).collect()
+}
+
+//@@ confusable.rs
+/// [`fold_bar_class`] for one character.
+fn fold_bar_char(c: char) -> char {
+    match c {
+        // `I` is here for the pre-case pass; after `to_lowercase` it can no
+        // longer appear, so the same table serves both directions.
+        'l' | 'I' | '1' | '|' | '!' => '1',
+        other => other,
+    }
+}
+
+//@@ confusable.rs
+/// Single-character ASCII lookalikes OTHER than the bar class.
+fn fold_ascii_confusable(c: char) -> char {
+    match c {
+        '0' => 'o',
+        '5' | '$' => 's',
+        '3' => 'e',
+        '@' | '4' => 'a',
+        '7' => 't',
+        other => other,
+    }
 }
 
 #[cfg(test)]

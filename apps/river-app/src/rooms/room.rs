@@ -367,18 +367,31 @@ impl LiveRoom {
 
         let mut ids = Ids::default();
         let mut members = Vec::new();
-        let mut push_member = |id: RiverMemberId, role: Role, ids: &mut Ids| {
+        let mut push_member = |id: RiverMemberId, role: Role, key: String, ids: &mut Ids| {
             members.push(Member {
                 id: ids.of(id),
                 nickname: self.nickname(id, me),
                 role,
+                uid: id.to_string(),
+                invited_by: None,
+                key,
             });
         };
-        push_member(owner, Role::Owner, &mut ids);
+        let key_of = |vk: &ed25519_dalek::VerifyingKey| bs58::encode(vk.as_bytes()).into_string();
+        push_member(owner, Role::Owner, key_of(&self.stored.owner_vk), &mut ids);
+        let mut inviters = Vec::new();
         for m in &state.members.members {
             let id = m.member.id();
             if id != owner {
-                push_member(id, Role::Member, &mut ids);
+                push_member(id, Role::Member, key_of(&m.member.member_vk), &mut ids);
+                inviters.push((ids.of(id), m.member.invited_by));
+            }
+        }
+        // The inviter is looked up, not added: someone no longer a member is not listed.
+        for (id, inviter) in inviters {
+            let inviter = ids.map.get(&inviter).copied();
+            if let Some(m) = members.iter_mut().find(|m| m.id == id) {
+                m.invited_by = inviter;
             }
         }
 
@@ -449,9 +462,8 @@ impl LiveRoom {
         // Someone who reacted or wrote but is no longer a member still needs a name.
         for (river_id, id) in ids.extra(members.iter().map(|m| m.id)) {
             members.push(Member {
-                id,
-                nickname: self.nickname(river_id, me),
-                role: Role::Member,
+                uid: river_id.to_string(),
+                ..Member::new(id, self.nickname(river_id, me), Role::Member)
             });
         }
 

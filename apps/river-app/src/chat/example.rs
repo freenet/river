@@ -25,11 +25,13 @@ const fn at(day: u32, h: u32, m: u32) -> u32 {
 }
 
 fn member(id: MemberId, nickname: &str, role: Role) -> Member {
-    Member {
-        id,
-        nickname: nickname.into(),
-        role,
-    }
+    Member::new(id, nickname, role)
+}
+
+/// `m`, invited by `by`.
+fn invited(mut m: Member, by: MemberId) -> Member {
+    m.invited_by = Some(by);
+    m
 }
 
 struct Builder {
@@ -160,12 +162,12 @@ fn town_square() -> Room {
         private: false,
         members: vec![
             member(MAYA, "Maya Chen", Role::Owner),
-            member(JONAS, "Jonas", Role::Member),
-            member(PRIYA, "Priya Raman", Role::Member),
-            member(TOMAS, "Tomás", Role::Member),
-            member(ELENA, "Elena Petrova", Role::Member),
-            member(KWAME, "Kwame Mensah", Role::Member),
-            member(ME, "Sam Rivers", Role::Member),
+            invited(member(JONAS, "Jonas", Role::Member), MAYA),
+            invited(member(PRIYA, "Priya Raman", Role::Member), MAYA),
+            invited(member(TOMAS, "Tomás", Role::Member), JONAS),
+            invited(member(ELENA, "Elena Petrova", Role::Member), PRIYA),
+            invited(member(KWAME, "Kwame Mensah", Role::Member), JONAS),
+            invited(member(ME, "Sam Rivers", Role::Member), PRIYA),
         ],
         messages: b.messages,
         me: ME,
