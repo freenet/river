@@ -79,7 +79,18 @@ fn chip(key: &str, text: &str, color: rune::Color, line: rune::Color) -> El {
         .child(label(text.to_owned(), st::SMALL_STRONG, color))
 }
 
-fn field(key: &str, name: &str, value: &str, copy_what: &'static str, p: &Palette) -> El {
+/// The verifying key is 44 characters: one size under the body text fits it on a line at the
+/// dialog's width, where the body size left a lone character on a second line.
+const KEY_TEXT: rune::tok::TextStyle = rune::tok::TextStyle::new(13.0, 400.0);
+
+fn field(
+    key: &str,
+    name: &str,
+    value: &str,
+    copy_what: &'static str,
+    text: rune::tok::TextStyle,
+    p: &Palette,
+) -> El {
     let copied = value.to_owned();
     col()
         .key(key.to_owned())
@@ -91,7 +102,7 @@ fn field(key: &str, name: &str, value: &str, copy_what: &'static str, p: &Palett
                 .w_full()
                 .gap(6.0)
                 .child(
-                    label(value.to_owned(), st::BODY, p.text)
+                    label(value.to_owned(), text, p.text)
                         .wrap_anywhere()
                         .grow(1.0)
                         .shrink()
@@ -229,6 +240,7 @@ pub(super) fn member_modal(room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>)
         "Member ID",
         &m.uid,
         "Copy member ID",
+        st::BODY,
         &p,
     ));
     if !m.key.is_empty() {
@@ -237,6 +249,7 @@ pub(super) fn member_modal(room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>)
             "Verifying key",
             &m.key,
             "Copy verifying key",
+            KEY_TEXT,
             &p,
         ));
     }
