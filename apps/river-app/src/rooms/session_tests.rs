@@ -602,6 +602,8 @@ struct World {
     cas_delay: Duration,
     /// Take the next CAS store of a room key, but answer nothing (then clear this).
     silence_first_room_store: bool,
+    /// Answer every CAS store of this delegate key with a refusal (`CasStoreResult::Failed`).
+    fail_cas: Option<Vec<u8>>,
     /// Answer the next listing with nothing (then clear this).
     silence_next_list: bool,
     /// The reads the last listing's reader still has to make.
@@ -1011,6 +1013,7 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                             hook(slots, generations, key.as_bytes());
                             w.before_cas = Some(hook);
                         }
+                        let failing = w.fail_cas.as_deref() == Some(key.as_bytes());
                         let current = w.generations.get(key.as_bytes()).copied().unwrap_or(0);
                         let taken = current == expected_generation;
                         w.cas.push((key.as_bytes().to_vec(), taken));
@@ -1023,7 +1026,9 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                             w.generations.insert(key.as_bytes().to_vec(), current + 1);
                             continue;
                         }
-                        let result = if taken {
+                        let result = if failing {
+                            CasStoreResult::Failed("disk".into())
+                        } else if taken {
                             w.slots.insert(key.as_bytes().to_vec(), value);
                             w.generations.insert(key.as_bytes().to_vec(), current + 1);
                             CasStoreResult::Stored {
@@ -4751,4 +4756,346 @@ fn a_settled_rename_survives_a_store_read_and_a_newer_stored_one_wins() {
         shown(&rooms, &a).stored.self_nickname.as_deref(),
         Some("From The Web")
     );
+}
+
+// Leaving a room -----------------------------------------------------------------------------------
+
+/// A `rooms_meta` as the web UI wrote it: `open` is the open room, `order` the room order, and
+/// `muted` has a mode; plus a field this app does not know.
+fn web_ui_meta_open(open: VerifyingKey, order: &[VerifyingKey], muted: VerifyingKey) -> Vec<u8> {
+    use ciborium::Value;
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(
+        &Value::Map(vec![
+            (
+                Value::Text("current_room_key".into()),
+                Value::serialized(&open).unwrap(),
+            ),
+            (
+                Value::Text("notification_modes".into()),
+                Value::Map(vec![(
+                    Value::serialized(&muted).unwrap(),
+                    Value::serialized(&NotificationMode::Muted).unwrap(),
+                )]),
+            ),
+            (
+                Value::Text("room_order".into()),
+                Value::serialized(&order.to_vec()).unwrap(),
+            ),
+            (Value::Text("web_ui_marker".into()), Value::from(11)),
+        ]),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+fn is_tombstone(bytes: &[u8]) -> bool {
+    matches!(decode_room_slot(bytes), Ok(StoredRoomSlot::Tombstone))
+}
+
+/// Leaving writes what the web UI's leave writes, shows the room gone at once, keeps what it
+/// does not own, and the room stays gone when the app starts again.
+#[test]
+fn a_room_left_here_is_a_tombstone_for_both_apps_and_stays_gone_on_the_next_run() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    node.with(|w| {
+        w.slots.insert(
+            ROOMS_META_KEY.to_vec(),
+            web_ui_meta_open(b.vk(), &[b.vk(), a.vk()], b.vk()),
+        );
+    });
+    let (session, dir) = following(&node, &[&a, &b], "leave-roundtrip", quick());
+    let a_slot_before = node.with(|w| w.slots.get(&room_storage_key(&a.vk())).cloned());
+    session.act(&b, Action::LeaveRoom);
+    session.wait_rooms("the room is gone from the list", |r, _, _| {
+        r.len() == 1 && r[0].name == "A"
+    });
+    session.wait_until("the leave is done", || {
+        session.last_work().is_empty()
+            && node.with(|w| {
+                w.slots
+                    .get(ROOMS_META_KEY)
+                    .and_then(|m| decode_rooms_meta(m).ok())
+                    .is_some_and(|m| !m.room_order.contains(&b.vk()))
+            })
+    });
+    node.with(|w| {
+        // The web UI's tombstone, byte for byte, and the other room untouched.
+        let slot = w.slots.get(&room_storage_key(&b.vk())).unwrap();
+        assert!(is_tombstone(slot));
+        assert_eq!(slot, &[&[0x69][..], b"Tombstone"].concat());
+        assert_eq!(
+            w.slots.get(&room_storage_key(&a.vk())),
+            a_slot_before.as_ref()
+        );
+        let meta = w.slots.get(ROOMS_META_KEY).unwrap();
+        let read = decode_rooms_meta(meta).unwrap();
+        assert_eq!(read.room_order, vec![a.vk()]);
+        assert_eq!(read.current_room_key, None);
+        // The web UI keeps the mode of a room left, and the unknown field.
+        assert_eq!(
+            crate::rooms::modes::decode_modes(meta)[&b.vk()],
+            NotificationMode::Muted
+        );
+        assert_eq!(meta_marker(meta), Some(11));
+        assert_eq!(w.overlaps, 0);
+    });
+    drop(session);
+
+    // A new run, as after restarting the app, reads the store and does not bring it back.
+    let again = Running::start(&node, &dir, quick());
+    again.wait_rooms("the rooms are live", |r, _, s| {
+        r.len() == 1 && s == LinkStatus::Live
+    });
+    assert!(again.last_rooms().unwrap().0.iter().all(|r| r.name != "B"));
+}
+
+/// The web UI writes the room between this app's read and its store: the store is refused, and
+/// the tombstone goes over what the web UI wrote.
+#[test]
+fn a_room_the_web_ui_changed_meanwhile_is_still_tombstoned() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    let key = room_storage_key(&b.vk());
+    node.with(|w| {
+        let again = b.slot();
+        let k = key.clone();
+        let mut once = true;
+        w.before_cas = Some(Box::new(move |slots, generations, cas_key| {
+            if cas_key == k.as_slice() && std::mem::take(&mut once) {
+                slots.insert(k.clone(), again.clone());
+                *generations.entry(k.clone()).or_default() += 1;
+            }
+        }));
+    });
+    let (session, _dir) = following(&node, &[&a, &b], "leave-conflict", quick());
+    session.act(&b, Action::LeaveRoom);
+    session.wait_until("the tombstone is stored", || {
+        node.with(|w| w.slots.get(&key).is_some_and(|s| is_tombstone(s)))
+    });
+    node.with(|w| {
+        let stores: Vec<bool> = w
+            .cas
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, ok)| *ok)
+            .collect();
+        assert_eq!(stores, [false, true], "refused once, then taken");
+        assert_eq!(w.overlaps, 0);
+    });
+    session.wait_rooms("the room is gone", |r, _, _| {
+        r.len() == 1 && r[0].name == "A"
+    });
+}
+
+/// Leaving the only room leaves an empty list, not a store that reads as missing.
+#[test]
+fn leaving_the_last_room_empties_the_list() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "leave-last", quick());
+    session.act(&a, Action::LeaveRoom);
+    session.wait_rooms("no rooms are shown", |r, i, _| {
+        r.is_empty() && !i.store_missing
+    });
+    session.wait_until("the leave is done", || {
+        session.last_work().is_empty()
+            && node.with(|w| {
+                w.slots
+                    .get(&room_storage_key(&a.vk()))
+                    .is_some_and(|s| is_tombstone(s))
+            })
+    });
+}
+
+/// Go offline: every new connection is dropped until `node.plays` is cleared.
+fn go_offline(node: &FakeNode, session: &Running) {
+    node.with(|w| {
+        w.plays.extend(std::iter::repeat_n(Play::Drop, 1000));
+        w.drop_live = true;
+    });
+    session.wait_until("reconnecting", || {
+        session
+            .updates()
+            .iter()
+            .any(|u| matches!(u, RoomsUpdate::Status(LinkStatus::Reconnecting)))
+    });
+}
+
+fn tombstoned(node: &FakeNode, room: &TestRoom) -> bool {
+    node.with(|w| {
+        w.slots
+            .get(&room_storage_key(&room.vk()))
+            .is_some_and(|s| is_tombstone(s))
+    })
+}
+
+/// A message written for the only room, then the room is left while offline: when the
+/// connection returns, nothing is sent to the room or subscribed to, and the room is gone.
+#[test]
+fn leaving_the_only_room_drops_what_was_unsent_for_good() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "leave-unsent-only", quick());
+    go_offline(&node, &session);
+    session.act(&a, say("never to be sent"));
+    session.wait_until("shown while disconnected", || {
+        matches!(delivery_of(&session, "never to be sent"), Some(Some(_)))
+    });
+    session.act(&a, Action::LeaveRoom);
+    session.wait_rooms("the room is gone at once", |r, _, _| r.is_empty());
+    let subscribed = node.with(|w| w.subscribes_to(a.id()));
+    node.with(|w| w.plays.clear());
+    session.wait_until("the leave is stored", || tombstoned(&node, &a));
+    session.wait_until("the leave is done", || session.last_work().is_empty());
+    // Live again with no rooms: nothing was sent to the room or asked for.
+    session.wait_rooms("live and empty", |r, _, s| {
+        r.is_empty() && s == LinkStatus::Live
+    });
+    node.with(|w| {
+        assert!(
+            w.updates.is_empty(),
+            "an update was sent: {:?}",
+            w.updates.len()
+        );
+        assert_eq!(
+            w.subscribes_to(a.id()),
+            subscribed,
+            "the room was subscribed again"
+        );
+    });
+}
+
+/// A message queued before Confirm, with another task working ahead of the leave, is not
+/// published once the connection returns.
+#[test]
+fn a_message_queued_before_leaving_behind_another_task_is_not_sent() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    let (session, _dir) = following(&node, &[&a, &b], "leave-unsent-queued", quick());
+    go_offline(&node, &session);
+    session.act(&a, say("queued before confirm"));
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.act(&a, Action::LeaveRoom);
+    node.with(|w| w.plays.clear());
+    session.wait_until("the leave is stored", || tombstoned(&node, &a));
+    session.wait_rooms("the new room is shown and A is not", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club") && r.iter().all(|r| r.name != "A")
+    });
+    assert!(node.with(|w| w.updates.is_empty()), "an update was sent");
+}
+
+/// Leaving the last room, then accepting an invitation to it: the join is not refused as "you
+/// already have this room".
+#[test]
+fn a_room_left_can_be_joined_again_at_once() {
+    let node = fake_node(vec![]);
+    let room = TestRoom::new(3, "Theirs", 1, &["t1"]);
+    let real = super::super::create::contract_key(&room.vk());
+    let (_, link) =
+        super::super::create::invitation(&LiveRoom::new(room.stored()), "http://x/").unwrap();
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&room.state))));
+    });
+    let (session, _dir) = following(&node, &[&room], "leave-rejoin", quick());
+    session.act(&room, Action::LeaveRoom);
+    session.wait_rooms("no rooms are shown", |r, _, _| r.is_empty());
+    session.wait_until("the leave is stored", || tombstoned(&node, &room));
+    session.list(Action::Join {
+        code: InviteCode(link),
+        nickname: "Bea".into(),
+    });
+    session.wait_rooms("the room is back", |r, _, _| {
+        r.iter().any(|r| r.name == "Theirs")
+    });
+    assert!(
+        !session
+            .last_work()
+            .iter()
+            .any(|w| matches!(&w.state, WorkState::Failed { .. }))
+    );
+}
+
+/// A leave the store refuses puts the room back on screen, says why, and Try again takes it
+/// off again once the store takes the write.
+#[test]
+fn a_failed_leave_restores_the_room_and_try_again_finishes_it() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    let key = room_storage_key(&b.vk());
+    node.with(|w| w.fail_cas = Some(key.clone()));
+    let (session, _dir) = following(&node, &[&a, &b], "leave-fails", quick());
+    session.act(&b, Action::LeaveRoom);
+    session.wait_until("the leave failed and the room is shown again", || {
+        session.last_work().iter().any(
+            |w| matches!(&w.state, WorkState::Failed { why, retry: true } if why.contains("disk")),
+        ) && session
+            .last_rooms()
+            .is_some_and(|(r, _, _)| r.iter().any(|r| r.name == "B"))
+    });
+    assert!(!tombstoned(&node, &b));
+    node.with(|w| w.fail_cas = None);
+    let id = session.last_work()[0].id;
+    session.list(Action::RetryWork { id });
+    session.wait_until("the tombstone is stored", || tombstoned(&node, &b));
+    session.wait_rooms("the room is gone", |r, _, _| {
+        r.len() == 1 && r[0].name == "A"
+    });
+}
+
+/// The leave timed out though its tombstone was written; the room is joined again (here, by the
+/// web UI, under another key); Try again on the old row leaves the new room alone.
+#[test]
+fn trying_a_failed_leave_again_never_tombstones_a_room_joined_since() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    let key = room_storage_key(&b.vk());
+    node.with(|w| w.fail_cas = Some(key.clone()));
+    let (session, _dir) = following(&node, &[&a, &b], "leave-stale-retry", quick());
+    session.act(&b, Action::LeaveRoom);
+    session.wait_until("the leave failed with Try again", || {
+        session
+            .last_work()
+            .iter()
+            .any(|w| matches!(&w.state, WorkState::Failed { retry: true, .. }))
+    });
+    // The room is joined again under another key before Try again is pressed.
+    let rejoined = cbor(&Slot::Present(Box::new(SlotData {
+        owner_vk: b.vk(),
+        room_state: b.state.clone(),
+        self_sk: Some(SigningKey::from_bytes(&[77; 32])),
+        self_vk: None,
+        contract_key: b.key,
+        last_read_message_id: None,
+        self_nickname: None,
+        invitation_secrets: BTreeMap::new(),
+    })));
+    node.with(|w| {
+        w.fail_cas = None;
+        w.slots.insert(key.clone(), rejoined.clone());
+    });
+    let id = session.last_work()[0].id;
+    session.list(Action::RetryWork { id });
+    session.wait_until("the retry is refused", || {
+        session.last_work().iter().any(|w| {
+            matches!(&w.state, WorkState::Failed { why, retry: false } if why.contains("joined this room again"))
+        })
+    });
+    // The rejoined room is intact and shown again.
+    node.with(|w| assert_eq!(w.slots.get(&key), Some(&rejoined)));
+    session.wait_rooms("the room is shown", |r, _, _| {
+        r.iter().any(|r| r.name == "B")
+    });
 }

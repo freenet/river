@@ -45,7 +45,10 @@ use river_app::rooms::token::TokenStore;
 use river_app::rooms::work::WorkState;
 use river_app::rooms::{Access, Action, Command, InviteCode, Issues, Link, RoomsUpdate};
 use river_core::chat_delegate::ChatDelegateResponseMsg;
-use river_core::stored_rooms::{StoredRoomSlot, decode_room_slot, room_storage_key};
+use river_core::stored_rooms::{
+    ROOMS_META_KEY, StoredRoomSlot, StoredRoomsMeta, decode_room_slot, decode_rooms_meta,
+    room_storage_key,
+};
 
 /// How long each step may take. Network operations between two loopback nodes take seconds;
 /// this is generous so a slow CI runner does not fail it.
@@ -237,6 +240,34 @@ fn delegate_key(
             Ok((identity, public_key))
         }
         other => Err(format!("unexpected answer: {other:?}")),
+    }
+}
+
+/// The room list's view preferences (`rooms_meta`) as the delegate on `authority` holds them.
+fn stored_meta(authority: &str, dir: &Path) -> Result<StoredRoomsMeta, String> {
+    let token = TokenStore::in_dir(dir)
+        .load()
+        .ok_or("the app has no grant token")?;
+    let mut socket = NodeSocket::connect(authority, &token, &Default::default())
+        .map_err(|e| format!("{e:?}"))?;
+    socket
+        .set_read_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("{e:?}"))?;
+    socket
+        .send(&delegate::request(&Read::Get(ROOMS_META_KEY.to_vec())))
+        .map_err(|e| format!("{e:?}"))?;
+    loop {
+        match socket.recv().map_err(|e| format!("{e:?}"))? {
+            Ok(response @ HostResponse::DelegateResponse { .. }) => {
+                if let Some(ChatDelegateResponseMsg::GetResponse { value, .. }) =
+                    delegate::answers(&response).pop()
+                {
+                    return decode_rooms_meta(&value.ok_or("no rooms_meta")?);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("the node answered with an error: {e}")),
+        }
     }
 }
 
@@ -639,6 +670,68 @@ fn notification_modes(alice: &mut App, authority: &str, dir: &Path, room: &str, 
     println!("notification modes round-trip through the node");
 }
 
+/// Leaving a room: the app drops it at once, the chat delegate's slot for it holds the web UI's
+/// tombstone (read from the delegate itself, as the web UI would read it), and an app started
+/// afterwards, as after restarting, does not bring it back while the room `keep` is still
+/// there.
+fn leave_room(
+    app: &mut App,
+    authority: &str,
+    dir: &Path,
+    name: &str,
+    key: &str,
+    keep: Option<&str>,
+) {
+    let bytes: [u8; 32] = bs58::decode(key)
+        .into_vec()
+        .expect("a base58 room key")
+        .try_into()
+        .expect("32 bytes");
+    let owner = VerifyingKey::from_bytes(&bytes).expect("the room key is the owner's key");
+    app.send(key, Action::LeaveRoom);
+    app.until("the room is gone and the leave is stored", |a| {
+        a.room(name).is_none() && a.work.is_empty()
+    });
+    if let Some(keep) = keep {
+        assert!(app.room(keep).is_some(), "leaving one room kept the other");
+    }
+    let deadline = Instant::now() + STEP;
+    loop {
+        match delegate_key(authority, dir, &owner) {
+            Err(e) if e.contains("tombstone") => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "the delegate never held a tombstone for the room (last: {other:?})"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // The room list the web UI reads no longer names the room: not in its order, not open.
+    let meta = stored_meta(authority, dir).expect("rooms_meta is stored");
+    assert!(
+        !meta.room_order.contains(&owner),
+        "rooms_meta still orders the room"
+    );
+    assert_ne!(
+        meta.current_room_key,
+        Some(owner),
+        "rooms_meta still opens the room"
+    );
+    let mut again = App::start("restarted after leaving", authority, dir);
+    // Ready is after the stored rooms were read; with another room, that room shows too.
+    match keep {
+        Some(keep) => again.until("the rooms are read back without the room left", |a| {
+            a.access == Some(Access::Ready) && a.room(keep).is_some()
+        }),
+        None => again.until("the empty room list is read back", ready_and_empty),
+    }
+    assert!(
+        again.room(name).is_none(),
+        "the room came back after a restart"
+    );
+    println!("left “{name}”: a tombstone in the delegate, and it stays gone after a restart");
+}
+
 /// The owner on node A changes the room's name, description and a limit; the app on node B,
 /// which follows the room, shows them. B's member cannot change the room, and the owner puts the
 /// name back so the steps after this still find the room by it.
@@ -899,6 +992,10 @@ fn main() {
     room_details(&mut alice, &mut bob, ROOM, &key);
     notification_modes(&mut alice, a, &dir_a, ROOM, &key);
 
+    // A member leaves, then the owner leaves: each room is gone for good in its own app.
+    leave_room(&mut bob, b, &dir_b, PRIVATE, &pkey, Some(ROOM));
+    leave_room(&mut alice, a, &dir_a, PRIVATE, &pkey, Some(ROOM));
+
     newer_river(a, &dir, &dir_a, ROOM, &key, &mut bob);
     // Nothing the outdated app was asked to write reached the room: the app on node B, which
     // follows the room, never receives it.
@@ -907,5 +1004,8 @@ fn main() {
         !bob.has_text(ROOM, "Sent from an outdated app"),
         "a message from the outdated app reached the room"
     );
+    // Last, a member leaves the only room they have left: an empty list, and the delegate's
+    // `rooms_meta` no longer names it.
+    leave_room(&mut bob, b, &dir_b, ROOM, &key, None);
     println!("E2E OK");
 }

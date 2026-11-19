@@ -11,11 +11,15 @@
 //! - The description is shown as rendered markdown, in full, to everyone; the owner edits its
 //!   source after pressing the pencil beside its heading.
 //!
-//! PARITY-GAPS: the web UI's "Leave Room" and the private room's "Rotate" (secret rotation)
-//! are in its dialog too; this app has neither command yet, so the dialog has neither button.
-//! Privacy is shown, never changed: the web UI cannot change it either.
+//! - "Leave Room" is at the foot of the dialog for the owner and for members, as in the web UI,
+//!   with the same confirmation wording plus a line saying the room's saved signing key goes
+//!   too. Leaving is [`Action::LeaveRoom`] ([`crate::rooms::leave`]).
+//!
+//! PARITY-GAPS: the private room's "Rotate" (secret rotation) is in the web UI's dialog too;
+//! this app has no such command yet, so the dialog has no such button. Privacy is shown, never
+//! changed: the web UI cannot change it either.
 
-use rune::{El, col, el, icon, row};
+use rune::{El, TextEdit, col, el, icon, row};
 use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextArea, TextInput};
 
 use super::icons;
@@ -23,7 +27,7 @@ use super::markdown;
 use super::model::{Details, Editable, Limits, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::label;
-use super::{Chat, Source};
+use super::{Chat, Mode, Source};
 use crate::RiverApp;
 use crate::rooms::outbox::{Action, ConfigEdit, LIMIT_LABELS, details_refusal, lowering_warnings};
 
@@ -55,6 +59,8 @@ pub struct DetailsForm {
     /// Save would lower a limit below what the room uses: the consequences, waiting for the
     /// owner to confirm.
     pub confirming: Option<Vec<String>>,
+    /// Leave Room was pressed: the confirmation is showing.
+    pub leaving: bool,
 }
 
 /// The limits as the form lists them.
@@ -87,6 +93,7 @@ impl DetailsForm {
             orig_description: d.description_source.clone(),
             orig_limits: limit_values(&d.limits),
             confirming: None,
+            leaving: false,
         }
     }
 }
@@ -103,6 +110,57 @@ impl Chat {
 
     pub fn close_details(&mut self) {
         self.details = None;
+    }
+
+    /// Leave Room was pressed: show what leaving does, and ask. Nothing is sent yet.
+    pub fn ask_leave(&mut self) {
+        if let Some(form) = &mut self.details {
+            form.leaving = true;
+        }
+    }
+
+    /// Back from the leave confirmation: nothing was changed.
+    pub fn cancel_leave(&mut self) {
+        if let Some(form) = &mut self.details {
+            form.leaving = false;
+        }
+    }
+
+    /// The user confirmed leaving the open room. Unsent text in its composer goes with it (its
+    /// unsent messages are dropped by the node side once the room is gone), the dialogs
+    /// close, and the room is left; the next room opens when the list no longer has it.
+    pub fn confirm_leave(&mut self) {
+        let Some(form) = self.details.as_ref().filter(|f| f.leaving) else {
+            return;
+        };
+        let key = form.room.clone();
+        if self.room().is_none_or(|r| r.key != key) {
+            self.details = None;
+            return;
+        }
+        self.details = None;
+        self.member_modal = None;
+        self.notify_dialog = None;
+        self.invite = self.invite.take().filter(|(room, _)| *room != key);
+        self.mode = Mode::Write;
+        self.picker = None;
+        self.composer = TextEdit::new("");
+        self.drafts.remove(&key);
+        // Where it was read up to is not kept: joined again, it counts unread afresh.
+        self.read.remove(&key);
+        match self.source {
+            Source::Node(_) => self.emit(key, Action::LeaveRoom),
+            // Example rooms are only in memory: the room just goes.
+            Source::Example => {
+                let rest: Vec<Room> = self
+                    .rooms
+                    .iter()
+                    .filter(|r| r.key != key)
+                    .cloned()
+                    .collect();
+                self.set_rooms(rest);
+            }
+        }
     }
 
     /// Open the owner's own member dialog from the details dialog, which closes.
@@ -695,6 +753,65 @@ fn compact_field(key: &str, name: &str, value: &str, copy_what: &'static str, p:
         )
 }
 
+/// What the web UI asks before leaving (its owner and member wording), and what this app adds:
+/// the room's saved signing key goes with it.
+pub const LEAVE_OWNER: &str = "Warning: You are the owner of this room. Leaving will \
+permanently delete it for you. Other members might retain access if they have the contract key, \
+but coordination will be lost.";
+pub const LEAVE_MEMBER: &str = "Are you sure you want to leave this room? This action cannot be \
+undone.";
+pub const LEAVE_KEY: &str = "Your signing key for this room is removed from River's saved \
+rooms on this computer (River in your browser stops showing the room too). A copy may remain \
+with the Freenet delegate, which this app cannot remove. If you have no other copy of the \
+key, you cannot post as yourself in the room again, and an owner cannot get ownership back.";
+
+fn leave_confirm(owner: bool, p: &Palette, k: &Kit) -> El {
+    col()
+        .key("details-leave-ask")
+        .w_full()
+        .padding(12.0)
+        .gap(10.0)
+        .radius(8.0)
+        .fill(p.warning_bg)
+        .border(1.0, p.warning)
+        .child(
+            label(
+                if owner { LEAVE_OWNER } else { LEAVE_MEMBER },
+                st::SMALL,
+                p.text,
+            )
+            .wrap()
+            .w_full()
+            .key("details-leave-text"),
+        )
+        .child(
+            label(LEAVE_KEY, st::SMALL, p.text)
+                .wrap()
+                .w_full()
+                .key("details-leave-key"),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .justify_end()
+                .child(
+                    Button::new("Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut RiverApp| s.chat.cancel_leave())
+                        .build(k)
+                        .key("details-leave-cancel"),
+                )
+                .child(
+                    Button::new("Confirm Leave")
+                        .variant(ButtonVariant::Danger)
+                        .on_press(|s: &mut RiverApp| s.chat.confirm_leave())
+                        .build(k)
+                        .key("details-leave-confirm"),
+                ),
+        )
+}
+
 pub(super) fn details_modal(
     chat: &Chat,
     room: &Room,
@@ -842,7 +959,10 @@ pub(super) fn details_modal(
     if let Some(status) = status(room, &p, k) {
         footer = footer.child(status);
     }
-    if let Some(warnings) = form.confirming.as_ref().filter(|_| editable) {
+    if form.leaving {
+        // The owner is warned even when the room's details cannot be edited from here yet.
+        footer = footer.child(leave_confirm(d.editable != Editable::No, &p, k));
+    } else if let Some(warnings) = form.confirming.as_ref().filter(|_| editable) {
         let mut sure = col()
             .key("details-confirm")
             .w_full()
@@ -896,6 +1016,17 @@ pub(super) fn details_modal(
                         .key("details-cancel"),
                 )
                 .child(save),
+        );
+    }
+    if !form.leaving {
+        footer = footer.child(
+            row().w_full().child(
+                Button::new("Leave Room")
+                    .variant(ButtonVariant::Outline)
+                    .on_press(|s: &mut RiverApp| s.chat.ask_leave())
+                    .build(k)
+                    .key("details-leave"),
+            ),
         );
     }
     let dialog_body = col()

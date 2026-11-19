@@ -987,3 +987,429 @@ fn a_mode_that_cannot_be_stored_is_said_and_can_be_tried_again() {
     assert!(w.dismiss(id));
     assert!(w.settle_modes().is_empty());
 }
+
+// Leaving a room ---------------------------------------------------------------------------------
+
+/// A room as the web UI would have it stored: its owner and slot bytes.
+fn present_room(seed: u8) -> (VerifyingKey, Vec<u8>) {
+    let plan = crate::rooms::create::new_room(
+        SigningKey::from_bytes(&[seed; 32]),
+        "Book club",
+        "Ada",
+        false,
+    )
+    .unwrap();
+    (
+        plan.room.owner_vk,
+        river_core::stored_rooms::encode_new_room(&plan.room).unwrap(),
+    )
+}
+
+fn tombstone_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&"Tombstone", &mut out).unwrap();
+    out
+}
+
+/// Leaving, up to the point where the tombstone has been stored and `rooms_meta` is read.
+fn leaving_to_meta(w: &mut Work, owner: VerifyingKey, slot: &[u8]) {
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    assert!(w.leave(owner, "Book club".into(), None));
+    expect_read(w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot.to_vec()), 6)));
+    let value = expect_store(w, &key, 6);
+    assert_eq!(value, tombstone_bytes());
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Stored { generation: 7 }
+    )));
+    expect_read(w, ROOMS_META_KEY);
+}
+
+#[test]
+fn leaving_tombstones_the_room_then_takes_it_out_of_rooms_meta_keeping_the_rest() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    assert!(w.leave(owner, "Book club".into(), None));
+    // Working: the room is already gone from the screen, and nothing else goes to it.
+    assert!(w.leaving(&owner));
+    assert!(w.holds(&owner));
+    assert_eq!(state(&w), WorkState::Working);
+    assert_eq!(w.views()[0].what, "Leaving “Book club”");
+    // A second leave of the same room queues nothing.
+    assert!(!w.leave(owner, "Book club".into(), None));
+
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot), 6)));
+    assert_eq!(expect_store(&mut w, &key, 6), tombstone_bytes());
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Stored { generation: 7 }
+    )));
+
+    // rooms_meta as the web UI wrote it (room 1 open, rooms 2 and 1 ordered, room 2 muted) plus a
+    // field from a newer build. The room left here is room 1.
+    assert_eq!(owner, room_vk(1));
+    use ciborium::Value;
+    let mut entries = match ciborium::de::from_reader::<Value, _>(&web_meta_bytes()[..]).unwrap() {
+        Value::Map(e) => e,
+        _ => unreachable!(),
+    };
+    entries.push((Value::Text("from_a_newer_build".into()), Value::from(7u32)));
+    let mut meta = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(entries), &mut meta).unwrap();
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(meta), 9)));
+    let stored = expect_store(&mut w, ROOMS_META_KEY, 9);
+    let read = decode_rooms_meta(&stored).unwrap();
+    assert_eq!(read.current_room_key, None);
+    assert_eq!(read.room_order, vec![room_vk(2)]);
+    assert_eq!(
+        crate::rooms::modes::decode_modes(&stored)[&room_vk(2)],
+        NotificationMode::Muted
+    );
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Stored { generation: 10 }
+    )));
+    // Done, but the stored rooms have not been read since: still hidden, no row shown.
+    assert!(w.views().is_empty());
+    assert!(w.leaving(&owner));
+    assert!(w.take_reload(), "the stored rooms are read again");
+    w.rooms_read();
+    assert!(!w.leaving(&owner));
+    assert!(w.views().is_empty());
+}
+
+#[test]
+fn leaving_the_open_room_clears_it_from_the_stored_meta_and_keeps_other_fields() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    leaving_to_meta(&mut w, owner, &slot);
+    use ciborium::Value;
+    let entries = vec![
+        (
+            Value::Text("current_room_key".into()),
+            Value::serialized(&owner).unwrap(),
+        ),
+        (
+            Value::Text("room_order".into()),
+            Value::serialized(&vec![room_vk(2), owner]).unwrap(),
+        ),
+        (
+            Value::Text("notification_modes".into()),
+            Value::Map(vec![(
+                Value::serialized(&owner).unwrap(),
+                Value::serialized(&NotificationMode::Muted).unwrap(),
+            )]),
+        ),
+        (Value::Text("future".into()), Value::from(3u32)),
+    ];
+    let mut meta = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(entries), &mut meta).unwrap();
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(meta), 2)));
+    let stored = expect_store(&mut w, ROOMS_META_KEY, 2);
+    let read = decode_rooms_meta(&stored).unwrap();
+    assert_eq!(read.current_room_key, None);
+    assert_eq!(read.room_order, vec![room_vk(2)]);
+    // The mode stays, as the web UI keeps it; an unknown field stays.
+    assert_eq!(
+        crate::rooms::modes::decode_modes(&stored)[&owner],
+        NotificationMode::Muted
+    );
+    let Value::Map(after) = ciborium::de::from_reader::<Value, _>(&stored[..]).unwrap() else {
+        panic!("a map")
+    };
+    assert!(
+        after
+            .iter()
+            .any(|(k, v)| k.as_text() == Some("future") && *v == Value::from(3u32))
+    );
+}
+
+#[test]
+fn a_tombstone_already_stored_skips_to_the_meta_and_a_meta_without_the_room_writes_nothing() {
+    // Room 5 is in neither the order nor the open room of `web_meta_bytes`.
+    let (owner, _) = present_room(5);
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    let mut w = Work::default();
+    assert!(w.leave(owner, "Book club".into(), None));
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(tombstone_bytes()), 3)));
+    // No store of the slot: straight to the meta.
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web_meta_bytes()), 4)));
+    assert!(!w.busy());
+    assert!(w.leaving(&owner));
+    assert!(w.take_reload());
+}
+
+#[test]
+fn leaving_when_the_slot_changes_reads_again_and_tombstones_what_is_there_now() {
+    let (owner, slot) = present_room(1);
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    let mut w = Work::default();
+    assert!(w.leave(owner, "Book club".into(), None));
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot.clone()), 6)));
+    expect_store(&mut w, &key, 6);
+    // The web UI wrote the room first (a read-position update, say).
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Conflict {
+            current_generation: 7,
+            current_value: Some(slot.clone()),
+        }
+    )));
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot), 7)));
+    assert_eq!(expect_store(&mut w, &key, 7), tombstone_bytes());
+    // Another writer tombstoned it meanwhile: nothing more to store there.
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Conflict {
+            current_generation: 8,
+            current_value: Some(tombstone_bytes()),
+        }
+    )));
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(tombstone_bytes()), 8)));
+    expect_read(&mut w, ROOMS_META_KEY);
+}
+
+#[test]
+fn a_slot_that_keeps_changing_fails_and_the_room_is_shown_again_until_it_is_tried_again() {
+    let (owner, slot) = present_room(1);
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    let mut w = Work::default();
+    assert!(w.leave(owner, "Book club".into(), None));
+    for generation in 0..u64::from(CAS_ATTEMPTS) {
+        expect_read(&mut w, &key);
+        assert!(w.on_delegate(&read_answer(&key, Some(slot.clone()), generation)));
+        expect_store(&mut w, &key, generation);
+        assert!(w.on_delegate(&store_answer(
+            &key,
+            CasStoreResult::Conflict {
+                current_generation: generation + 1,
+                current_value: Some(slot.clone()),
+            }
+        )));
+    }
+    let WorkState::Failed { retry, .. } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(retry);
+    // Nothing was tombstoned: the room is still the user's, so the stored rooms are read to
+    // show it again.
+    assert!(!w.leaving(&owner));
+    assert!(w.take_reload());
+    assert!(w.next_request(false, Instant::now()).is_none());
+    // Try again starts over, and the room is on its way out again.
+    let id = w.views()[0].id;
+    assert!(w.retry(id));
+    assert!(w.leaving(&owner));
+    expect_read(&mut w, &key);
+}
+
+#[test]
+fn a_refused_store_fails_with_try_again() {
+    let (owner, slot) = present_room(1);
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    let mut w = Work::default();
+    assert!(w.leave(owner, "Book club".into(), None));
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot), 1)));
+    expect_store(&mut w, &key, 1);
+    assert!(w.on_delegate(&store_answer(&key, CasStoreResult::Failed("disk".into()))));
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(retry);
+    assert!(why.contains("disk"), "{why}");
+    assert!(!w.leaving(&owner));
+}
+
+#[test]
+fn an_unreadable_meta_after_the_tombstone_is_said_and_the_room_stays_gone() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    leaving_to_meta(&mut w, owner, &slot);
+    let mut text = Vec::new();
+    ciborium::ser::into_writer(&"not a map", &mut text).unwrap();
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(text), 1)));
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(!retry);
+    assert!(why.contains("You left the room"), "{why}");
+    // The room's key holds the tombstone: a read lists nothing for it, and the failed row
+    // does not hide a room rejoined since.
+    assert!(!w.leaving(&owner));
+}
+
+#[test]
+fn a_dropped_connection_starts_the_step_again_from_its_read() {
+    let (owner, slot) = present_room(1);
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    let mut w = Work::default();
+    assert!(w.leave(owner, "Book club".into(), None));
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot), 1)));
+    expect_store(&mut w, &key, 1);
+    w.connection_lost();
+    expect_read(&mut w, &key);
+}
+
+#[test]
+fn a_finished_leave_does_not_stop_the_room_being_joined_again() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    leaving_to_meta(&mut w, owner, &slot);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 0)));
+    assert!(!w.busy());
+    // The room's invitation, accepted again: not refused for the leave that just finished.
+    let (_, link) = {
+        let plan = crate::rooms::create::new_room(
+            SigningKey::from_bytes(&[1; 32]),
+            "Book club",
+            "Ada",
+            false,
+        )
+        .unwrap();
+        invitation(&LiveRoom::new(stored(&plan.room)), "http://x/").unwrap()
+    };
+    w.join(&link, "Bea", &|_| false);
+    let last = w.views().last().cloned().expect("a task");
+    assert!(
+        !matches!(&last.state, WorkState::Failed { why, .. } if why.contains("just joined")),
+        "{last:?}"
+    );
+}
+
+#[test]
+fn a_conflict_at_the_meta_step_reads_it_again_and_edits_what_the_web_ui_stored() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    leaving_to_meta(&mut w, owner, &slot);
+    // The first read has the room in its order; the store is refused, and the web UI has
+    // since put another room in the order.
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web_meta_bytes()), 2)));
+    expect_store(&mut w, ROOMS_META_KEY, 2);
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Conflict {
+            current_generation: 3,
+            current_value: None,
+        }
+    )));
+    expect_read(&mut w, ROOMS_META_KEY);
+    let newer = {
+        use ciborium::Value;
+        let entries = vec![(
+            Value::Text("room_order".into()),
+            Value::serialized(&vec![room_vk(7), owner]).unwrap(),
+        )];
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(entries), &mut out).unwrap();
+        out
+    };
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(newer), 3)));
+    let stored = expect_store(&mut w, ROOMS_META_KEY, 3);
+    assert_eq!(
+        decode_rooms_meta(&stored).unwrap().room_order,
+        vec![room_vk(7)]
+    );
+}
+
+/// Fail a leave of `owner` at its slot step, the way a refused store does.
+fn failed_leave(w: &mut Work, owner: VerifyingKey, slot: &[u8], identity: Option<VerifyingKey>) {
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    assert!(w.leave(owner, "Book club".into(), identity));
+    expect_read(w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot.to_vec()), 1)));
+    expect_store(w, &key, 1);
+    assert!(w.on_delegate(&store_answer(&key, CasStoreResult::Failed("disk".into()))));
+}
+
+#[test]
+fn a_failed_leave_says_unsent_messages_were_discarded() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    failed_leave(&mut w, owner, &slot, None);
+    let WorkState::Failed { why, .. } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(
+        why.contains("Unsent messages for this room were discarded"),
+        "{why}"
+    );
+}
+
+#[test]
+fn leaving_again_replaces_a_failed_leave_instead_of_adding_a_row() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    failed_leave(&mut w, owner, &slot, None);
+    assert!(w.leave(owner, "Book club".into(), None));
+    assert_eq!(w.views().len(), 1);
+    assert_eq!(state(&w), WorkState::Working);
+}
+
+#[test]
+fn joining_a_room_dismisses_its_failed_leave() {
+    let (owner, slot) = present_room(1);
+    let mut w = Work::default();
+    failed_leave(&mut w, owner, &slot, None);
+    let (_, link) = {
+        let plan = crate::rooms::create::new_room(
+            SigningKey::from_bytes(&[1; 32]),
+            "Book club",
+            "Ada",
+            false,
+        )
+        .unwrap();
+        invitation(&LiveRoom::new(stored(&plan.room)), "http://x/").unwrap()
+    };
+    w.join(&link, "Bea", &|_| false);
+    // No failed leave left to try again over the room joined now.
+    assert!(w.views().iter().all(|v| !v.what.starts_with("Leaving")));
+}
+
+#[test]
+fn trying_a_leave_again_over_a_room_joined_since_changes_nothing() {
+    let (owner, slot) = present_room(1);
+    let key = river_core::stored_rooms::room_storage_key(&owner);
+    let mut w = Work::default();
+    // Left as the identity of seed 1 (the stored room's own key).
+    failed_leave(&mut w, owner, &slot, Some(owner));
+    let id = w.views()[0].id;
+    assert!(w.retry(id));
+    expect_read(&mut w, &key);
+    // The store now holds the room under another identity: joined again since.
+    let plan =
+        crate::rooms::create::new_room(SigningKey::from_bytes(&[1; 32]), "Book club", "Ada", false)
+            .unwrap();
+    let mut room = plan.room;
+    room.self_sk = Some(SigningKey::from_bytes(&[99; 32]));
+    room.self_vk = None;
+    let rejoined = river_core::stored_rooms::encode_new_room(&room).unwrap();
+    assert!(w.on_delegate(&read_answer(&key, Some(rejoined), 2)));
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("refused");
+    };
+    assert!(!retry);
+    assert!(why.contains("joined this room again"), "{why}");
+    // Nothing was stored.
+    assert!(w.next_request(false, Instant::now()).is_none());
+}
+
+#[test]
+fn halting_a_leave_shows_its_room_again_at_once() {
+    let (owner, _) = present_room(1);
+    let mut w = Work::default();
+    assert!(w.leave(owner, "Book club".into(), None));
+    assert!(w.halt("River has moved on."));
+    assert!(!w.leaving(&owner));
+    assert!(w.take_reload());
+}

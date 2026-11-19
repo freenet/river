@@ -1,5 +1,15 @@
-//! Creating a room and joining one from an invitation: the steps each takes on the node, one
-//! request at a time, and the only writes this app makes to the chat delegate's storage.
+//! Creating a room, joining one from an invitation and leaving one: the steps each takes on the
+//! node, one request at a time, and the only writes this app makes to the chat delegate's
+//! storage.
+//!
+//! **Leaving** ([`super::leave`]) is two writes with no network request: the room's key gets
+//! the web UI's tombstone (replacing the room, which holds the user's signing key for it), then
+//! `rooms_meta` drops the room from its order, identity sources and open room. The room is
+//! hidden from the screen as soon as the task starts and for as long as the tombstone is, or
+//! is about to be, stored; a task that fails before the tombstone is stored shows the room
+//! again, with Try again. Nothing is published to the room's contract, as in the web UI.
+//! Taking the room out of the follow list needs no step: the client API has no unsubscribe,
+//! and a room that is no longer listed is no longer shown whatever arrives for it.
 //!
 //! **The steps.** Creating: store the room, publish it (the seed PUT, the one PUT this app
 //! makes, of the new room's own contract), then point `rooms_meta` at it. Joining: read the
@@ -19,9 +29,10 @@
 //! `ROOMS_CAS_MAX_ATTEMPTS`. What to store comes from `river_core::stored_rooms`: a room is
 //! only ever added where its key holds nothing (or a tombstone, when joining, as the web UI's
 //! explicit rejoin overwrites one), never over a room already stored, and `rooms_meta` has only
-//! its open room, or one room's notification mode ([`super::modes`]), changed, with every other
-//! field kept. A conflict never overwrites: what the
-//! other writer stored is read and worked from.
+//! its open room, or one room's notification mode ([`super::modes`]), changed (or, leaving, the
+//! entries naming the room taken out), with every other field kept. A conflict never
+//! overwrites: what the other writer stored is read and worked from. The one deliberate
+//! replacement of a stored room is leaving it, which is what the user asked for.
 //!
 //! **Rooms from an earlier River need no guard here.** On a node that also holds rooms in an
 //! older chat delegate (a re-key the web UI has not carried forward yet), a room this app
@@ -94,6 +105,7 @@ use river_core::stored_rooms::{
 
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
+use super::leave::{meta_without_room, tombstone_write};
 use super::modes::{NotificationMode, meta_with_mode};
 
 /// How many times a write is worked out again after another writer got in first. The web UI's
@@ -164,6 +176,15 @@ enum Kind {
     Mode {
         room: VerifyingKey,
         mode: NotificationMode,
+    },
+    /// Leave `room` (named `name` on the screen): tombstone its key (the step `Slot`), then take
+    /// it out of `rooms_meta` (`Meta`), as the web UI's leave does ([`super::leave`]).
+    /// `identity` is the user's key in the room when it was left: a stored room under another
+    /// one was joined again since, and a retry must not tombstone it.
+    Leave {
+        room: VerifyingKey,
+        name: String,
+        identity: Option<Box<VerifyingKey>>,
     },
     /// Refused before it started; never works.
     Refused(String),
@@ -245,6 +266,7 @@ impl Task {
         match &self.kind {
             Kind::Create(plan) => Some(plan.room.owner_vk),
             Kind::Join { invitation, .. } => Some(invitation.room),
+            Kind::Leave { room, .. } => Some(*room),
             Kind::Mode { .. } | Kind::Refused(_) => None,
         }
     }
@@ -254,12 +276,17 @@ impl Task {
         matches!(self.kind, Kind::Mode { .. })
     }
 
+    /// Whether this leaves a room.
+    fn is_leave(&self) -> bool {
+        matches!(self.kind, Kind::Leave { .. })
+    }
+
     /// The room being stored, once there is one.
     fn room(&self) -> Option<&NewRoom> {
         match &self.kind {
             Kind::Create(plan) => Some(&plan.room),
             Kind::Join { plan, .. } => plan.as_ref().map(|p| &p.room),
-            Kind::Mode { .. } | Kind::Refused(_) => None,
+            Kind::Leave { .. } | Kind::Mode { .. } | Kind::Refused(_) => None,
         }
     }
 
@@ -272,11 +299,16 @@ impl Task {
             ),
             Kind::Join { .. } => "Joining a room".to_owned(),
             Kind::Mode { .. } => "Saving the notification setting".to_owned(),
+            Kind::Leave { name, .. } => format!("Leaving “{name}”"),
             Kind::Refused(what) => what.clone(),
         };
         let state = match (&self.failed, self.step, self.owner()) {
             (Some((why, retry)), _, _) => WorkState::Failed {
-                why: why.clone(),
+                why: if self.is_leave() {
+                    format!("{why} Unsent messages for this room were discarded.")
+                } else {
+                    why.clone()
+                },
                 retry: *retry,
             },
             (None, Step::Done, Some(owner)) => WorkState::Done {
@@ -317,6 +349,7 @@ impl Task {
             }
             (Kind::Join { .. }, Step::Slot) => Step::Update,
             (Kind::Join { .. }, Step::Update) => Step::Meta,
+            (Kind::Leave { .. }, Step::Slot) => Step::Meta,
             (_, Step::Meta) => Step::Done,
             (_, step) => step,
         };
@@ -337,6 +370,29 @@ impl Task {
                      can't be read by this app ({e}), so it stays as it was."
                 )
             });
+        }
+        if let Kind::Leave { room, identity, .. } = &self.kind {
+            return if self.step == Step::Slot {
+                // Joined again since (another invitation, or the web UI), under another key:
+                // that room is not the one left, and is left alone.
+                if let (Some(mine), Some(bytes)) = (identity, value)
+                    && let Ok(StoredRoomSlot::Present(stored)) = decode_room_slot(bytes)
+                    && stored.self_verifying_key().is_some_and(|k| k != **mine)
+                {
+                    return Err("You have joined this room again since, so it was not \
+                                left. Nothing was changed."
+                        .into());
+                }
+                tombstone_write(value)
+            } else {
+                meta_without_room(value, room).map_err(|e| {
+                    format!(
+                        "You left the room, but River's room list in its storage can't be read \
+                         by this app ({e}), so River in your browser may still list it until it \
+                         next saves. You can dismiss this."
+                    )
+                })
+            };
         }
         let owner = self.owner().ok_or_else(unexpected)?;
         if self.step == Step::Meta {
@@ -429,7 +485,7 @@ impl Work {
         let earlier = self
             .tasks
             .iter()
-            .filter(|t| t.owner() == Some(invitation.room))
+            .filter(|t| t.owner() == Some(invitation.room) && !t.is_leave())
             .find_map(|t| {
                 if t.step == Step::Done && t.failed.is_none() {
                     Some("You have just joined this room.")
@@ -447,6 +503,11 @@ impl Work {
         if let Some(why) = earlier {
             return self.refuse(WHAT, why.into());
         }
+        // A leave of this room that failed is over: it must not be tried again over the room
+        // joined now.
+        self.tasks.retain(|t| {
+            !(t.is_leave() && t.owner() == Some(invitation.room) && t.failed.is_some())
+        });
         self.push(
             Kind::Join {
                 invitation: Box::new(invitation),
@@ -455,6 +516,41 @@ impl Work {
             },
             Step::Get,
         );
+    }
+
+    /// Leave `room`, which the screen calls `name`. Nothing is queued when it is being left
+    /// already. Returns whether anything was.
+    pub fn leave(
+        &mut self,
+        room: VerifyingKey,
+        name: String,
+        identity: Option<VerifyingKey>,
+    ) -> bool {
+        if self.leaving(&room) {
+            return false;
+        }
+        // An earlier leave that failed is replaced by this one, not shown beside it.
+        self.tasks
+            .retain(|t| !(t.is_leave() && t.owner() == Some(room) && t.failed.is_some()));
+        self.push(
+            Kind::Leave {
+                room,
+                name,
+                identity: identity.map(Box::new),
+            },
+            Step::Slot,
+        );
+        true
+    }
+
+    /// Whether `room` is being left, or was left and the stored rooms have not been read since.
+    /// A leave that failed does not count: before its tombstone was stored the room is still
+    /// the user's (the stored rooms are read again to show it), and after, a read finds the
+    /// tombstone.
+    pub fn leaving(&self, room: &VerifyingKey) -> bool {
+        self.tasks.iter().any(|t| {
+            matches!(&t.kind, Kind::Leave { room: r, .. } if r == room) && t.failed.is_none()
+        })
     }
 
     /// Store `mode` as `room`'s notification mode. A save still waiting to start for the same
@@ -519,6 +615,7 @@ impl Work {
         }
         t.failed = None;
         t.settled = false;
+        t.reload_asked = t.is_mode();
         t.reconnects = 0;
         t.conflicts = 0;
         t.out = None;
@@ -551,6 +648,8 @@ impl Work {
                 changed = true;
             }
         }
+        // A leave halted before its tombstone shows its room again.
+        self.note_done();
         changed
     }
 
@@ -866,6 +965,7 @@ impl Work {
         };
         t.fail(why, true);
         t.refused = refused;
+        self.note_done();
         true
     }
 
@@ -897,6 +997,7 @@ impl Work {
         t.reconnects += 1;
         if t.reconnects > MAX_RECONNECTS {
             t.fail("Freenet didn't answer.", true);
+            self.note_done();
         }
         true
     }
@@ -904,7 +1005,10 @@ impl Work {
     /// A task that just finished asks for the stored rooms to be read, once.
     fn note_done(&mut self) {
         for t in &mut self.tasks {
-            if t.step == Step::Done && !t.reload_asked {
+            // A leave that failed before the tombstone was stored: the room was taken off the
+            // screen, so the stored rooms are read to show it again.
+            let restored = t.is_leave() && t.failed.is_some() && t.step == Step::Slot;
+            if (t.step == Step::Done || restored) && !t.reload_asked {
                 t.reload_asked = true;
                 self.reload = true;
             }
@@ -915,9 +1019,16 @@ impl Work {
         // A mode that was saved needs no row; one still working or failed does.
         self.tasks
             .iter()
-            .filter(|t| !(t.is_mode() && t.step == Step::Done))
+            .filter(|t| !((t.is_mode() || t.is_leave()) && t.step == Step::Done))
             .map(Task::view)
             .collect()
+    }
+
+    /// The stored rooms were just read, and say which rooms there are: a finished leave has
+    /// done its work (the read does not list the room, or a rejoin since put it back).
+    pub fn rooms_read(&mut self) {
+        self.tasks
+            .retain(|t| !(t.is_leave() && t.step == Step::Done && t.failed.is_none()));
     }
 
     /// Drop finished tasks whose room is shown.
@@ -925,7 +1036,7 @@ impl Work {
         self.tasks.retain(|t| {
             !(t.step == Step::Done
                 && t.failed.is_none()
-                && (t.is_mode() || t.owner().is_some_and(|o| shown(&o))))
+                && (t.is_mode() || (!t.is_leave() && t.owner().is_some_and(|o| shown(&o)))))
         });
     }
 }

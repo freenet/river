@@ -10467,6 +10467,54 @@ mod stored_rooms_drift {
         }
     }
 
+    /// What the native app's leave writes (`apps/river-app/src/rooms/leave.rs`): a tombstone
+    /// that is the CBOR text `"Tombstone"`, and a `rooms_meta` it edits in place by these field
+    /// names, leaving `identity_sources` out when empty. Changing any of them here fails this
+    /// test instead of leaving the two clients disagreeing about a left room.
+    #[test]
+    fn leave_is_stored_as_the_native_app_writes_it() {
+        use ciborium::Value;
+        assert_eq!(
+            cbor(&RoomSlot::Tombstone),
+            [&[0x69][..], b"Tombstone"].concat()
+        );
+        let a = SigningKey::from_bytes(&[41u8; 32]).verifying_key();
+        let meta = RoomsMeta {
+            current_room_key: Some(a),
+            room_order: vec![a],
+            identity_sources: vec![(a, [3u8; 32])],
+            ..RoomsMeta::default()
+        };
+        let Value::Map(entries) = ciborium::de::from_reader(cbor(&meta).as_slice()).unwrap() else {
+            panic!("a map");
+        };
+        let field = |name: &str| entries.iter().find(|(k, _)| k.as_text() == Some(name));
+        assert_eq!(
+            field("current_room_key").unwrap().1,
+            Value::serialized(&a).unwrap()
+        );
+        assert_eq!(
+            field("room_order").unwrap().1,
+            Value::serialized(&vec![a]).unwrap()
+        );
+        // Each identity source is a `(room, delegate key)` pair.
+        let Value::Array(sources) = &field("identity_sources").unwrap().1 else {
+            panic!("a list");
+        };
+        let Value::Array(pair) = &sources[0] else {
+            panic!("a pair");
+        };
+        assert_eq!(pair[0], Value::serialized(&a).unwrap());
+        // Empty: the field is left out.
+        let bare = RoomsMeta::default();
+        let Value::Map(entries) = ciborium::de::from_reader(cbor(&bare).as_slice()).unwrap() else {
+            panic!("a map");
+        };
+        assert!(entries
+            .iter()
+            .all(|(k, _)| k.as_text() != Some("identity_sources")));
+    }
+
     /// The reader's storage keys are the writer's.
     #[test]
     fn storage_keys_match_the_writer() {

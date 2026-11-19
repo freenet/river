@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ed25519_dalek::SigningKey;
+use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::ecies::decrypt_with_symmetric_key;
 use river_core::room_state::ChatRoomStateV1;
 use river_core::room_state::ChatRoomStateV1Delta;
@@ -4681,4 +4682,48 @@ fn a_refused_deputy_change_replaced_by_a_newer_record_edit_is_not_lost_silently(
     // And it cannot come back with the rename.
     let (_, info) = next_info(&mut outbox, &room);
     assert_eq!(info.member_info.deputies, [pal_id()]);
+}
+
+#[test]
+fn answers_owed_by_a_room_that_was_left_are_discarded_when_they_come() {
+    let mut o = Outbox::default();
+    let room = SigningKey::from_bytes(&[1; 32]).verifying_key();
+    let id = ContractInstanceId::new([5; 32]);
+    o.owed
+        .entry(room)
+        .or_default()
+        .extend([(1, Instant::now()), (2, Instant::now())]);
+    o.purge_room(&room, id);
+    assert!(o.owed.is_empty());
+    // An error that names nothing is not blamed on a room that is shown meanwhile.
+    assert!(o.has_stale());
+    // Exactly the two owed are taken, then the next answer is the room's own.
+    assert!(o.take_stale(&id));
+    assert!(o.take_stale(&id));
+    assert!(!o.take_stale(&id));
+    assert!(!o.has_stale());
+    // A new connection owes nothing.
+    o.owed
+        .entry(room)
+        .or_default()
+        .push_back((3, Instant::now()));
+    o.purge_room(&room, id);
+    o.requeue();
+    assert!(!o.has_stale());
+}
+
+#[test]
+fn leaving_a_room_drops_its_queued_messages_and_record_entries() {
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, say("unsent"));
+    outbox.command(&room, nick("Queued Name"));
+    outbox.command(&room, grant(pal_id()));
+    assert!(!outbox.is_empty());
+    outbox.purge_room(
+        &room.stored.owner_vk,
+        freenet_stdlib::prelude::ContractInstanceId::new([9; 32]),
+    );
+    assert!(outbox.is_empty(), "every entry of the room is gone");
 }
