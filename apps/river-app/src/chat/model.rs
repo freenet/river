@@ -35,6 +35,9 @@ pub struct Member {
     pub invited_by: Option<MemberId>,
     /// Their verifying key, in base58. Empty when this computer does not know it.
     pub key: String,
+    /// Whether they chose the nickname shown: false for a stand-in ("Member <id>") used when
+    /// they have none this computer can read.
+    pub claimed: bool,
 }
 
 impl Member {
@@ -47,6 +50,7 @@ impl Member {
             uid: id.to_string(),
             invited_by: None,
             key: String::new(),
+            claimed: true,
         }
     }
 }

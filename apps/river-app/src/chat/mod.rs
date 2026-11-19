@@ -27,7 +27,7 @@ pub(crate) mod style;
 #[cfg(test)]
 mod tests;
 mod view;
-mod visual_fold;
+pub(crate) mod visual_fold;
 
 use std::collections::{HashMap, HashSet};
 
@@ -332,6 +332,13 @@ impl Chat {
                 self.rooms[0].key.clone()
             };
             self.select(&key);
+        }
+        // A member who left, or a list that no longer has them, closes their dialog for good:
+        // it does not come back if they reappear.
+        if let Some(uid) = &self.member_modal
+            && !self.room().is_some_and(|r| r.member_by_uid(uid).is_some())
+        {
+            self.member_modal = None;
         }
     }
 

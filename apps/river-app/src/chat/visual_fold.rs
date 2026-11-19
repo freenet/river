@@ -7,17 +7,16 @@
 //! re-copy the changed item. The `//@@` marker lines name each item's source file.
 #![allow(dead_code, clippy::all)]
 
-/// Whether two display names are a tier-1 (same skeleton) match under either fold: what the
-/// web UI's `folds_together` answers, built from the copied items below. Not itself a copy.
+/// Whether two display names are a tier-1 (same skeleton) match: the web UI's own
+/// `folds_together`, copied below.
 pub(crate) fn names_fold_together(a: &str, b: &str) -> bool {
-    let folds =
-        |n: &str| [Fold::Visual, Fold::CaseInsensitive].map(|f| strip_spaces(&skeleton_with(n, f)));
-    let [a_visual, a_case] = folds(a);
-    if a_visual.is_empty() {
-        return false;
-    }
-    let [b_visual, b_case] = folds(b);
-    a_visual == b_visual || a_case == b_case
+    folds_together(a, b)
+}
+
+/// Whether `name` folds to one of the handles River generates for a member with no nickname,
+/// which the web UI never protects (`folds_to_generated_handle`, copied below).
+pub(crate) fn names_fold_to_generated_handle(name: &str) -> bool {
+    folds_to_generated_handle(name)
 }
 
 //@@ confusable.rs
@@ -1262,6 +1261,256 @@ fn fold_ascii_confusable(c: char) -> char {
     }
 }
 
+//@@ confusable.rs
+/// The space-stripped form of BOTH folds of `name`.
+///
+/// This is the pair a *guard* must compare when it wants to answer "could this
+/// name ever tier-1 match that one?". [`ImpersonationChecker::tier_one_for`]
+/// accepts a hit under any of four comparisons, and the two space-stripped ones
+/// subsume the other two: equality WITH spaces implies equality without them.
+/// So two names that disagree on both of these can never be a tier-1 match, and
+/// two that agree on either always are.
+///
+/// It exists because the filters deciding which names ENTER the protected set
+/// used to compare exact strings while the matcher they gate compares folds — a
+/// guard weaker than the thing it guards, which is not a guard. See
+/// [`crate::components::members::impersonation_checker_for_viewer`].
+pub fn comparison_folds(name: &str) -> [String; 2] {
+    [
+        strip_spaces(&skeleton_with(name, Fold::Visual)),
+        strip_spaces(&skeleton_with(name, Fold::CaseInsensitive)),
+    ]
+}
+
+//@@ confusable.rs
+/// Whether `a` and `b` are a tier-1 (same-skeleton) match under either fold.
+///
+/// The identity-free form of [`ImpersonationChecker::check_identical`], for
+/// guards that compare a candidate against a fixed literal rather than against
+/// the room's protected set.
+pub fn folds_together(a: &str, b: &str) -> bool {
+    let [a_visual, a_case] = comparison_folds(a);
+    if a_visual.is_empty() {
+        // A name that folds to nothing can never match: `candidate_folds`
+        // rejects it before any comparison runs.
+        return false;
+    }
+    let [b_visual, b_case] = comparison_folds(b);
+    a_visual == b_visual || a_case == b_case
+}
+
+//@@ nickname.rs
+/// First half of the handle. Exactly 100 entries — see `pools_are_100`.
+pub const FIRST_NAMES: [&str; 100] = [
+    "Acid", "Zero", "Crash", "Cyber", "Ghost", "Neon", "Razor", "Static", "Phantom", "Chrome",
+    "Glitch", "Cipher", "Daemon", "Null", "Hex", "Rogue", "Vapor", "Plasma", "Volt", "Frost",
+    "Quantum", "Binary", "Proxy", "Logic", "Echo", "Pixel", "Neural", "Photon", "Onyx", "Cobalt",
+    "Nitro", "Turbo", "Solar", "Lunar", "Cosmic", "Astro", "Argon", "Xenon", "Neutron", "Proton",
+    "Flux", "Prism", "Laser", "Lumen", "Nova", "Pulsar", "Quasar", "Comet", "Meteor", "Orbit",
+    "Zenith", "Nebula", "Aurora", "Halcyon", "Obsidian", "Titanium", "Iridium", "Mercury",
+    "Silicon", "Carbon", "Crystal", "Granite", "Velvet", "Indigo", "Violet", "Crimson", "Scarlet",
+    "Azure", "Magenta", "Amber", "Copper", "Silver", "Ember", "Cinder", "Blaze", "Tempest",
+    "Thunder", "Monsoon", "Zephyr", "Glacier", "Tundra", "Midnight", "Twilight", "Umbra",
+    "Eclipse", "Stellar", "Astral", "Lucid", "Silent", "Hollow", "Feral", "Wired", "Analog",
+    "Digital", "Modular", "Fractal", "Syntax", "Bitwise", "Cache", "Packet",
+];
+
+//@@ nickname.rs
+/// Second half of the handle. Exactly 100 entries — see `pools_are_100`.
+pub const LAST_NAMES: [&str; 100] = [
+    "Override",
+    "Phreak",
+    "Wraith",
+    "Surge",
+    "Spike",
+    "Pulse",
+    "Breaker",
+    "Worm",
+    "Drift",
+    "Storm",
+    "Specter",
+    "Cascade",
+    "Cortex",
+    "Reaper",
+    "Circuit",
+    "Modem",
+    "Kernel",
+    "Daylight",
+    "Vector",
+    "Falcon",
+    "Raven",
+    "Socket",
+    "Glider",
+    "Nomad",
+    "Sentinel",
+    "Havoc",
+    "Relay",
+    "Vertex",
+    "Payload",
+    "Mainframe",
+    "Runner",
+    "Prowler",
+    "Seeker",
+    "Voyager",
+    "Corsair",
+    "Ronin",
+    "Vagabond",
+    "Wanderer",
+    "Pilgrim",
+    "Courier",
+    "Beacon",
+    "Lantern",
+    "Compass",
+    "Anchor",
+    "Harbor",
+    "Keystone",
+    "Bastion",
+    "Citadel",
+    "Rampart",
+    "Bulwark",
+    "Talon",
+    "Osprey",
+    "Kestrel",
+    "Condor",
+    "Harrier",
+    "Albatross",
+    "Skylark",
+    "Nightjar",
+    "Peregrine",
+    "Corvid",
+    "Lynx",
+    "Jackal",
+    "Viper",
+    "Cobra",
+    "Mantis",
+    "Panther",
+    "Jaguar",
+    "Ocelot",
+    "Wolfhound",
+    "Serpent",
+    "Foundry",
+    "Forge",
+    "Anvil",
+    "Crucible",
+    "Furnace",
+    "Bellows",
+    "Piston",
+    "Turbine",
+    "Dynamo",
+    "Flywheel",
+    "Lattice",
+    "Matrix",
+    "Nexus",
+    "Conduit",
+    "Junction",
+    "Gateway",
+    "Bridge",
+    "Tunnel",
+    "Terminal",
+    "Console",
+    "Sigil",
+    "Rune",
+    "Glyph",
+    "Token",
+    "Ledger",
+    "Archive",
+    "Codex",
+    "Almanac",
+    "Manifest",
+    "Protocol",
+];
+
+//@@ nickname.rs
+/// The folded word pools backing [`folds_to_generated_handle`], built once.
+///
+/// Indexed by fold: `[0]` is the visual fold, `[1]` the case-insensitive one,
+/// matching the order [`crate::util::confusable::comparison_folds`] returns.
+struct HandleSkeletons {
+    first: [std::collections::HashSet<String>; 2],
+    last: [std::collections::HashSet<String>; 2],
+}
+
+//@@ nickname.rs
+fn handle_skeletons() -> &'static HandleSkeletons {
+    static POOLS: std::sync::OnceLock<HandleSkeletons> = std::sync::OnceLock::new();
+    POOLS.get_or_init(|| {
+        let fold_pool = |words: &[&str]| {
+            let mut sets = [
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            ];
+            for word in words {
+                for (i, folded) in crate::util::confusable::comparison_folds(word)
+                    .into_iter()
+                    .enumerate()
+                {
+                    sets[i].insert(folded);
+                }
+            }
+            sets
+        };
+        HandleSkeletons {
+            first: fold_pool(&FIRST_NAMES),
+            last: fold_pool(&LAST_NAMES),
+        }
+    })
+}
+
+//@@ nickname.rs
+/// Whether `name` could be a tier-1 confusable match for one of the 10,000
+/// handles this module can assign.
+///
+/// **A guard must be at least as wide as the thing it guards.**
+/// [`is_generated_handle`] compares exact strings; the impersonation matcher it
+/// used to gate compares [`crate::util::confusable::comparison_folds`]. Every
+/// one of `amber worm`, `AMBER WORM`, `AmberWorm`, `Amber\u{3000}Worm`,
+/// `Arnber Worm`, `Amber W0rm` and `Amber Worrn` is "not a generated handle" to
+/// `==`, and every one of them is a tier-1 match for the member River assigned
+/// `Amber Worm`. Letting any of them into the protected set puts "this member is
+/// NOT a moderator" on a member who did nothing at all.
+///
+/// **No attacker is required.** A moderator who styles their own name in lower
+/// case — `cipher daylight` — is enough to accuse every member holding the
+/// handle `Cipher Daylight`. That is exactly the birthday-collision harm the
+/// original exact filter was written to prevent, arriving through the filter.
+///
+/// ## Why this is a per-word split rather than 10,000 skeletons
+///
+/// The space-stripped fold of `"First Last"` is the space-stripped fold of
+/// `"First"` followed by that of `"Last"`: the multi-character confusables
+/// (`rn -> m`, `vv -> w`) run BEFORE spaces are removed, so none of them can
+/// span the word boundary, and no word folds to leading or trailing space. So a
+/// name matches some handle exactly when its fold splits into a folded
+/// FIRST_NAME and a folded LAST_NAME — 200 skeletons to build instead of 20,000,
+/// and a linear scan of split points instead of a 10,000-entry set probe.
+///
+/// `every_generated_handle_is_rejected_by_the_fold_guard` proves the equivalence
+/// the cheap way round: it sweeps all 10,000 handles and requires each to be
+/// rejected.
+pub fn folds_to_generated_handle(name: &str) -> bool {
+    let pools = handle_skeletons();
+    for (fold_index, candidate) in crate::util::confusable::comparison_folds(name)
+        .iter()
+        .enumerate()
+    {
+        if candidate.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = candidate.chars().collect();
+        for split in 1..chars.len() {
+            let head: String = chars[..split].iter().collect();
+            if !pools.first[fold_index].contains(&head) {
+                continue;
+            }
+            let tail: String = chars[split..].iter().collect();
+            if pools.last[fold_index].contains(&tail) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1290,6 +1539,10 @@ mod tests {
                 "display_name.rs",
                 include_str!("../../../../ui/src/util/display_name.rs"),
             ),
+            (
+                "nickname.rs",
+                include_str!("../../../../ui/src/nickname.rs"),
+            ),
         ];
         // A Windows checkout may turn every newline into CRLF; compare line content only.
         let unix = |s: &str| s.replace("\r\n", "\n");
@@ -1315,6 +1568,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 14, "only {checked} items found");
+        assert!(checked >= 21, "only {checked} items found");
     }
 }

@@ -1461,8 +1461,7 @@ fn the_dialog_closes_when_the_room_changes() {
     let mut rt = render(connected(), WINDOW_SIZE);
     open_member(&mut rt, "Jonas");
     assert!(rt.find("member-info-dialog").is_some());
-    rt.state.chat.select(PRIVATE_ROOM);
-    rt.invalidate();
+    rt.update(|s, _| s.chat.select(PRIVATE_ROOM));
     settle(&mut rt);
     assert!(rt.state.chat.member_modal.is_none());
     assert!(rt.find("member-info-dialog").is_none());
@@ -1516,4 +1515,235 @@ fn a_name_that_imitates_the_owner_is_warned_about() {
     // The real owner is not accused of imitating themselves.
     open_member(&mut rt, "Maya Chen");
     assert!(rt.find("member-tag-impersonation").is_none());
+}
+
+#[test]
+fn a_member_who_leaves_closes_the_dialog_for_good() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    let jonas = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .member_by_uid(&uid_of(&rt, "Jonas"))
+        .unwrap()
+        .clone();
+    rt.update(|s, _| {
+        s.chat
+            .edit_rooms(|rooms| rooms[0].members.retain(|m| m.nickname != "Jonas"));
+    });
+    settle(&mut rt);
+    assert!(rt.state.chat.member_modal.is_none());
+    assert!(rt.find("member-info-dialog").is_none());
+    // They come back, and the dialog does not.
+    rt.update(|s, _| {
+        s.chat.edit_rooms(|rooms| rooms[0].members.push(jonas));
+    });
+    settle(&mut rt);
+    assert!(rt.state.chat.member_modal.is_none());
+    assert!(rt.find("member-info-dialog").is_none());
+}
+
+#[test]
+fn an_invite_cycle_or_a_missing_inviter_still_renders() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let owner = room
+            .members
+            .iter()
+            .find(|m| m.role == super::model::Role::Owner)
+            .unwrap()
+            .id;
+        let mut a = super::model::Member::new(81, "Ann", super::model::Role::Member);
+        let mut b = super::model::Member::new(82, "Bo", super::model::Role::Member);
+        let mut c = super::model::Member::new(83, "Cy", super::model::Role::Member);
+        a.invited_by = Some(82);
+        b.invited_by = Some(81);
+        c.invited_by = Some(83);
+        let mut d = super::model::Member::new(84, "Di", super::model::Role::Member);
+        d.invited_by = Some(9999);
+        room.members.extend([a, b, c, d]);
+        // The viewer is invited through the cycle, so the walk must end.
+        room.members
+            .iter_mut()
+            .find(|m| m.id == room.me)
+            .unwrap()
+            .invited_by = Some(81);
+        let _ = owner;
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    for name in ["Ann", "Bo", "Cy", "Di"] {
+        open_member(&mut rt, name);
+        assert!(rt.find("member-info-dialog").is_some(), "{name}");
+        key(&mut rt, Key::Escape);
+        settle(&mut rt);
+    }
+    open_member(&mut rt, "Di");
+    assert!(shows(&rt, "Unknown"), "a missing inviter is Unknown");
+}
+
+#[test]
+fn the_copy_buttons_copy_the_id_and_the_key() {
+    let board = rune::clipboard::memory();
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        for m in &mut rooms[0].members {
+            m.key = format!("key-of-{}", m.uid);
+        }
+    });
+    let env = Env {
+        system_dark: true,
+        scale: 1.0,
+    };
+    let mut rt = Runtime::new(state, view, WINDOW_SIZE, env);
+    rt.use_clipboard(&board);
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+    open_member(&mut rt, "Jonas");
+    let uid = uid_of(&rt, "Jonas");
+    press(&mut rt, "member-id-copy");
+    assert_eq!(
+        board.text().as_deref().map(String::as_str),
+        Some(uid.as_str())
+    );
+    press(&mut rt, "member-vk-copy");
+    assert_eq!(
+        board.text().as_deref().map(String::as_str),
+        Some(format!("key-of-{uid}").as_str())
+    );
+}
+
+#[test]
+fn a_long_unbroken_name_stays_inside_the_dialog() {
+    let long = "W".repeat(48);
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let owner = room
+            .members
+            .iter()
+            .find(|m| m.role == super::model::Role::Owner)
+            .unwrap()
+            .id;
+        let mut m = super::model::Member::new(85, long.clone(), super::model::Role::Member);
+        m.invited_by = Some(owner);
+        m.key = "k".repeat(60);
+        let mut kid = super::model::Member::new(86, "Kid", super::model::Role::Member);
+        kid.invited_by = Some(85);
+        kid.key = "k".repeat(60);
+        room.members.extend([m, kid]);
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    open_member(&mut rt, "Kid");
+    let dialog = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("member-info-dialog"))
+        .unwrap();
+    let [dx, _, dw, _] = dialog.rect;
+    for k in ["member-inviter", "member-vk-value"] {
+        let e = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(k))
+            .unwrap_or_else(|| panic!("no {k}"));
+        assert!(
+            e.rect[0] >= dx - 0.5 && e.rect[0] + e.rect[2] <= dx + dw + 0.5,
+            "{k} {:?} outside {:?}",
+            e.rect,
+            dialog.rect
+        );
+    }
+    key(&mut rt, Key::Escape);
+    settle(&mut rt);
+    open_member(&mut rt, &long);
+    let name = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("member-name"))
+        .unwrap();
+    assert!(
+        name.rect[0] + name.rect[2] <= dx + dw + 0.5,
+        "{:?} outside {:?}",
+        name.rect,
+        dialog.rect
+    );
+}
+
+#[test]
+fn a_departed_member_is_not_one_you_invited() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        for m in &mut room.members {
+            m.role = if m.id == me {
+                super::model::Role::Owner
+            } else {
+                super::model::Role::Member
+            };
+        }
+        // Someone who wrote but is no longer a member: no inviter, no key, a stand-in name.
+        let mut gone = super::model::Member::new(87, "Member 87", super::model::Role::Member);
+        gone.claimed = false;
+        room.members.push(gone);
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    open_member(&mut rt, "Member 87");
+    assert!(rt.find("member-info-dialog").is_some());
+    assert!(rt.find("member-tag-invited-by-you").is_none());
+    assert!(rt.find("member-ban").is_none());
+    assert!(rt.find("member-vk").is_none());
+}
+
+#[test]
+fn only_a_name_the_owner_chose_is_protected() {
+    let imitate = |owner_name: &str, claimed: bool, copy: &str| {
+        let mut state = connected();
+        state.chat.edit_rooms(|rooms| {
+            let room = &mut rooms[0];
+            let owner = room
+                .members
+                .iter_mut()
+                .find(|m| m.role == super::model::Role::Owner)
+                .unwrap();
+            owner.nickname = owner_name.into();
+            owner.claimed = claimed;
+            let oid = owner.id;
+            let mut m = super::model::Member::new(88, copy, super::model::Role::Member);
+            m.invited_by = Some(oid);
+            room.members.push(m);
+        });
+        let mut rt = render(state, WINDOW_SIZE);
+        open_member(&mut rt, copy);
+        rt.find("member-tag-impersonation").is_some()
+    };
+    // The control: a chosen name is protected.
+    assert!(imitate("Maya Chen", true, "M\u{0430}ya Chen"));
+    // Not one the owner chose (shown as a stand-in), nor a placeholder or a generated handle.
+    assert!(!imitate("Member 12", false, "Member 12 "));
+    assert!(!imitate("Unknown", true, "Unkn0wn"));
+    assert!(!imitate("Unnamed", true, "unnamed"));
+    assert!(!imitate("Amber Worm", true, "AmberWorm"));
+}
+
+#[test]
+fn following_the_inviter_keeps_the_keyboard_inside_the_dialog() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    press(&mut rt, "member-inviter");
+    // The owner has no inviter, so the pressed button is gone.
+    assert!(rt.find("member-inviter").is_none());
+    key(&mut rt, Key::Tab);
+    let focused: Vec<_> = rt.elements().into_iter().filter(|e| e.focused).collect();
+    assert!(!focused.is_empty(), "Tab finds something to focus");
+    for e in focused {
+        assert!(
+            e.path.contains("member-info-layer"),
+            "focus left the dialog: {}",
+            e.path
+        );
+    }
 }

@@ -9,6 +9,13 @@ pub mod notify;
 pub mod rooms;
 pub mod setup;
 
+/// Where the web UI's code, copied verbatim into `chat/visual_fold.rs`, finds its neighbours.
+mod util {
+    pub(crate) mod confusable {
+        pub(crate) use crate::chat::visual_fold::comparison_folds;
+    }
+}
+
 use rune::{AppHandle, AppSpec, Cx, El, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Kit};
 
