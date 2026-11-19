@@ -27,9 +27,10 @@ use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use river_core::stored_rooms::StoredRoom;
 
+use super::deputies;
 use crate::chat::model::{
-    self, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role, Room,
-    Usage,
+    self, Appointer, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role,
+    Room, Usage,
 };
 
 /// Why the owner can't change the room's details here (the web UI's `edit-room-no-key-notice`).
@@ -394,15 +395,40 @@ impl LiveRoom {
 
         let mut ids = Ids::default();
         let mut members = Vec::new();
+        // Who is a deputy in this viewer's view. Without a local identity nobody is "you" and
+        // no grant is relative to anyone, so none shows (as in the web UI).
+        let badges = me
+            .map(|me| deputies::badges(&state.members, &state.member_info, owner, me))
+            .unwrap_or_default();
         let mut push_member = |id: RiverMemberId, role: Role, key: String, ids: &mut Ids| {
+            let badge = badges.get(&id);
+            let deputized_by = badge
+                .map(|b| {
+                    b.deputized_by
+                        .iter()
+                        .map(|a| match *a {
+                            a if a == owner => Appointer::Owner,
+                            a if Some(a) == me => Appointer::You,
+                            a => Appointer::Member(ids.of(a)),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             members.push(Member {
                 id: ids.of(id),
                 nickname: self.nickname(id, me),
-                role,
+                role: if badge.is_some() && role == Role::Member {
+                    Role::Deputy
+                } else {
+                    role
+                },
                 uid: id.to_string(),
                 invited_by: None,
                 key,
                 claimed: self.claimed_nickname(id),
+                deputized_by,
+                can_ban_you: badge.and_then(|b| b.can_ban_viewer),
+                order: id.0.0,
             });
         };
         let key_of = |vk: &ed25519_dalek::VerifyingKey| bs58::encode(vk.as_bytes()).into_string();
@@ -496,6 +522,7 @@ impl LiveRoom {
             members.push(Member {
                 uid: river_id.to_string(),
                 claimed: false,
+                order: river_id.0.0,
                 ..Member::new(id, self.nickname(river_id, me), Role::Member)
             });
         }

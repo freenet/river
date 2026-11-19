@@ -34,6 +34,7 @@
 
 pub mod create;
 pub mod delegate;
+pub mod deputies;
 pub mod generation;
 pub mod grant;
 pub mod keys;

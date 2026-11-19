@@ -20,37 +20,80 @@ use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextInput};
 use super::Chat;
 use super::conversation::avatar;
 use super::icons;
-use super::model::{Member, MemberId, Role, Room};
+use super::model::{Appointer, Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{label, not_yet};
 use crate::RiverApp;
 
 /// The web UI's `ImpersonationWarning::tooltip` for an imitated owner. The text before the
 /// first colon is the chip's label.
+/// The web UI's `ImpersonationWarning::tooltip` for a member imitating the owner.
 pub(super) const IMPERSONATION: &str = "Impersonation warning: this member is NOT the room \
      owner, but their name closely resembles the owner's. The real owner has a crown icon in the \
      member list and an OWNER tag on their messages.";
+/// The same for a member imitating a deputy.
+pub(super) const IMPERSONATION_DEPUTY: &str = "Impersonation warning: this member is NOT a \
+     moderator, but their name closely resembles one. A real moderator has a shield icon next \
+     to their name and a DEPUTY tag on their messages.";
+/// The same when the flagged member has privileges too, so "NOT the owner" would be false.
+pub(super) const NAME_CONFLICT: &str = "Name conflict: this member's name is visually the same \
+     as another member's who also has privileges in this room. Both are real; check the member \
+     ID shown on hover to tell them apart.";
 
 /// The web UI's `UNNAMED` and `UNKNOWN_MEMBER` (`ui/src/util/display_name.rs`), which it never
 /// protects.
 const PLACEHOLDERS: [&str; 2] = ["Unnamed", "Unknown"];
 
-/// The owner `m`'s name resembles without being the owner, if it does.
+/// A member whose name resembles a privileged member's, and who that is.
+pub(super) struct Imitation<'a> {
+    pub who: &'a Member,
+    /// The warning's sentence. It names no member: a name could forge a role in a flat string.
+    pub text: &'static str,
+}
+
+impl Imitation<'_> {
+    /// The text before the first colon, the dialog's chip label.
+    pub fn label(&self) -> &'static str {
+        self.text.split(':').next().unwrap_or_default()
+    }
+}
+
+/// The privileged member `m`'s name resembles without being them, if it does.
 ///
-/// The owner's name is protected as the web UI's `impersonation_checker_for_viewer` does: not
-/// when they have not chosen one this computer can read, nor when it folds to a placeholder or
-/// to a generated handle (each shared by a whole class of members). A member is never accused of
-/// imitating a name that is theirs.
-pub(super) fn imitated_owner<'a>(room: &'a Room, m: &Member) -> Option<&'a Member> {
+/// The protected names are the owner's and every deputy's in this viewer's view, as the web
+/// UI's `impersonation_checker_for_viewer` builds them: a name only counts when its member chose
+/// it and this computer can read it, and not when it folds to a placeholder or to a generated
+/// handle (each shared by a whole class of members). The owner is checked first, then the
+/// deputies in River's member id order (`Member::order`). A member is never accused of imitating a name that is theirs,
+/// and a flagged member who holds privileges themselves gets a sentence that is true of both.
+pub(super) fn imitation<'a>(room: &'a Room, m: &Member) -> Option<Imitation<'a>> {
     use super::visual_fold::{names_fold_to_generated_handle, names_fold_together};
-    let owner = room.members.iter().find(|o| o.role == Role::Owner)?;
-    let protected = owner.claimed
-        && !PLACEHOLDERS
-            .iter()
-            .any(|p| names_fold_together(&owner.nickname, p))
-        && !names_fold_to_generated_handle(&owner.nickname);
-    (protected && owner.id != m.id && names_fold_together(&m.nickname, &owner.nickname))
-        .then_some(owner)
+    let protected = |p: &Member| {
+        p.claimed
+            && !PLACEHOLDERS
+                .iter()
+                .any(|ph| names_fold_together(&p.nickname, ph))
+            && !names_fold_to_generated_handle(&p.nickname)
+    };
+    let mut deputies: Vec<&Member> = room
+        .members
+        .iter()
+        .filter(|d| d.role == Role::Deputy)
+        .collect();
+    deputies.sort_by_key(|d| d.order);
+    let owners = room.members.iter().filter(|o| o.role == Role::Owner);
+    let who = owners
+        .chain(deputies)
+        .filter(|p| protected(p))
+        .find(|p| p.id != m.id && names_fold_together(&m.nickname, &p.nickname))?;
+    let text = if m.role != Role::Member {
+        NAME_CONFLICT
+    } else if who.role == Role::Owner {
+        IMPERSONATION
+    } else {
+        IMPERSONATION_DEPUTY
+    };
+    Some(Imitation { who, text })
 }
 
 /// Whether `m` was invited, directly or not, by `by`. The walk is bounded by the member count,
@@ -246,6 +289,61 @@ fn nickname_editor(room: &Room, m: &Member, chat: &Chat, p: &Palette, k: &Kit) -
     )
 }
 
+/// "Deputized by:" and each appointer as its own button that opens their dialog, as the web UI
+/// lists them: the owner and you as the fixed labels "the room owner" and "you", any other
+/// member by nickname (or "an unknown member" when they are no longer listed). Each is its own
+/// element, never one joined string, so a name cannot pass as two appointers.
+fn deputized_by_row(
+    room: &Room,
+    m: &Member,
+    by_id: &HashMap<MemberId, &Member>,
+    p: &Palette,
+) -> Option<El> {
+    if m.deputized_by.is_empty() {
+        return None;
+    }
+    let mut names = row()
+        .key("member-deputized-by")
+        .w_full()
+        .gap(6.0)
+        .flex_wrap()
+        .center_y()
+        .child(label("Deputized by:", st::SMALL, p.text_muted));
+    for (n, a) in m.deputized_by.iter().enumerate() {
+        let target = match a {
+            Appointer::Owner => by_id.values().find(|o| o.role == Role::Owner).copied(),
+            Appointer::You => by_id.get(&room.me).copied(),
+            Appointer::Member(id) => by_id.get(id).copied(),
+        };
+        let text = match (a, target) {
+            (Appointer::Owner, _) => "the room owner".to_owned(),
+            (Appointer::You, _) => "you".to_owned(),
+            (_, Some(t)) => t.nickname.clone(),
+            (_, None) => "an unknown member".to_owned(),
+        };
+        let mut chip = row()
+            .key(format!("member-appointer-{n}"))
+            .h(22.0)
+            .px(8.0)
+            .radius(6.0)
+            .center()
+            .fill(p.surface)
+            .border(1.0, p.line)
+            .child(label(text.clone(), st::SMALL, p.accent).truncate().shrink());
+        if let Some(t) = target {
+            let uid = t.uid.clone();
+            chip = chip
+                .role("button")
+                .label(format!("Member info: {text}"))
+                .focusable(true)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid));
+        }
+        names = names.child(chip);
+    }
+    Some(names)
+}
+
 pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
     let Some(m) = room.member_by_uid(uid) else {
@@ -260,7 +358,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
     let above = me
         .filter(|_| !is_me && m.invited_by.is_some())
         .is_some_and(|me| me.role == Role::Owner || invited_through(&by_id, m, me));
-    let imitated = imitated_owner(room, m);
+    let imitated = imitation(room, m);
 
     let mut tags = row().key("member-tags").w_full().gap(8.0).flex_wrap();
     if is_owner {
@@ -270,6 +368,24 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             p.text,
             p.line_strong,
         ));
+    }
+    if let Some(tooltip) = m.deputy_tooltip() {
+        // The web UI's `member-info-deputy-tag`: the shield and the word, with who appointed
+        // them in the tooltip (the names are listed below).
+        tags = tags.child(
+            row()
+                .key("member-tag-deputy")
+                .h(22.0)
+                .px(8.0)
+                .gap(4.0)
+                .radius(11.0)
+                .center()
+                .border(1.0, p.line_strong)
+                .label(tooltip.clone())
+                .help(tooltip)
+                .child(icon(&icons::SHIELD, 12.0).color(p.text))
+                .child(label("Deputy".to_owned(), st::SMALL_STRONG, p.text)),
+        );
     }
     if is_me {
         tags = tags.child(chip("member-tag-you", "You", p.text, p.line_strong));
@@ -290,11 +406,10 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             p.line_strong,
         ));
     }
-    if imitated.is_some() {
-        let short = IMPERSONATION.split(':').next().unwrap_or_default();
+    if let Some(i) = &imitated {
         tags = tags.child(chip(
             "member-tag-impersonation",
-            &format!("\u{26a0} {short}"),
+            &format!("\u{26a0} {}", i.label()),
             p.warning_text,
             p.warning,
         ));
@@ -322,10 +437,13 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
                 ),
         );
     body = body.child(tags);
+    if let Some(row) = deputized_by_row(room, m, &by_id, &p) {
+        body = body.child(row);
+    }
     if is_me {
         body = body.child(nickname_editor(room, m, chat, &p, k));
     }
-    if let Some(owner) = imitated {
+    if let Some(Imitation { who: owner, text }) = imitated {
         body = body.child(
             col()
                 .key("member-impersonation")
@@ -335,11 +453,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
                 .radius(8.0)
                 .fill(p.warning_bg)
                 .border(1.0, p.warning)
-                .child(
-                    label(IMPERSONATION, st::SMALL, p.text)
-                        .wrap_anywhere()
-                        .w_full(),
-                )
+                .child(label(text, st::SMALL, p.text).wrap_anywhere().w_full())
                 .child(
                     row()
                         .w_full()

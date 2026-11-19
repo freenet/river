@@ -842,6 +842,16 @@ fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
                 .label("Owner")
                 .help("Room owner"),
         );
+    } else if let Some(tooltip) = m.deputy_tooltip() {
+        // The web UI's member-list shield: an icon after the name, the tooltip saying who
+        // appointed them and whether they can ban you.
+        r = r.child(
+            icon(&icons::SHIELD, 14.0)
+                .color(p.text_muted)
+                .key(format!("member-deputy-{}", m.id))
+                .label(tooltip.clone())
+                .help(tooltip),
+        );
     }
     r
 }

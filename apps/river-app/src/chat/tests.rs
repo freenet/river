@@ -3905,3 +3905,229 @@ fn the_mention_popup_gets_escape_and_up_before_the_reply_edit_and_picker_handler
     key(&mut rt, Key::Escape);
     assert!(rt.find("replying").is_none(), "then the reply");
 }
+
+// Deputies, as the web UI shows them. In the example Town Square Jonas is the owner's deputy
+// (he can ban you) and Elena is your own.
+
+#[test]
+fn a_deputy_has_a_tag_on_their_messages_and_a_shield_in_the_list() {
+    let rt = render(connected(), WINDOW_SIZE);
+    // Elena's messages carry DEPUTY and the owner's OWNER.
+    assert!(rt.find("tag-deputy").is_some());
+    assert!(rt.find("tag-owner").is_some());
+    assert!(shows(&rt, "DEPUTY"));
+    let room = rt.state.chat.room().unwrap();
+    let elena = room
+        .members
+        .iter()
+        .find(|m| m.nickname == "Elena Petrova")
+        .unwrap();
+    let jonas = room.members.iter().find(|m| m.nickname == "Jonas").unwrap();
+    let kwame = room
+        .members
+        .iter()
+        .find(|m| m.nickname == "Kwame Mensah")
+        .unwrap();
+    let (elena, jonas, kwame) = (elena.id, jonas.id, kwame.id);
+    assert!(rt.find(&format!("member-deputy-{elena}")).is_some());
+    assert!(rt.find(&format!("member-deputy-{jonas}")).is_some());
+    assert!(rt.find(&format!("member-deputy-{kwame}")).is_none());
+    // The shield says who appointed them and what that means for you.
+    let tip = |rt: &Runtime<RiverApp>, id: u32| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(format!("member-deputy-{id}").as_str()))
+            .and_then(|e| e.help)
+    };
+    assert_eq!(
+        tip(&rt, jonas).as_deref(),
+        Some("Deputy (appointed by the room owner). Can ban you.")
+    );
+    assert_eq!(
+        tip(&rt, elena).as_deref(),
+        Some("Deputy (appointed by you). Cannot ban you.")
+    );
+    // The owner keeps the crown, not a shield.
+    let maya = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .members
+        .iter()
+        .find(|m| m.role == super::model::Role::Owner)
+        .unwrap()
+        .id;
+    assert!(rt.find(&format!("member-deputy-{maya}")).is_none());
+}
+
+#[test]
+fn a_deputys_dialog_has_the_tag_and_who_deputized_them() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    assert!(rt.find("member-tag-deputy").is_some());
+    assert!(shows(&rt, "Deputy"));
+    assert!(shows(&rt, "Deputized by:"));
+    assert!(shows(&rt, "the room owner"));
+    // The appointer opens their own dialog.
+    press(&mut rt, "member-appointer-0");
+    assert_eq!(rt.state.chat.member_modal, Some(uid_of(&rt, "Maya Chen")));
+    assert!(rt.find("member-tag-deputy").is_none());
+    assert!(rt.find("member-deputized-by").is_none());
+    key(&mut rt, Key::Escape);
+    // A plain member has neither.
+    open_member(&mut rt, "Kwame Mensah");
+    assert!(rt.find("member-tag-deputy").is_none());
+    assert!(rt.find("member-deputized-by").is_none());
+}
+
+#[test]
+fn a_name_that_imitates_a_deputy_is_warned_about() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let owner = room
+            .members
+            .iter()
+            .find(|m| m.role == super::model::Role::Owner)
+            .unwrap()
+            .id;
+        // A Cyrillic "о" for Jonas's first "o"; a name of their own; Elena's name with a
+        // zero-width character; and the owner's.
+        for (id, name) in [
+            (91, "J\u{043e}nas"),
+            (92, "Jonas2"),
+            (93, "Elena\u{200B} Petrova"),
+        ] {
+            let mut m = super::model::Member::new(id, name, super::model::Role::Member);
+            m.invited_by = Some(owner);
+            room.members.push(m);
+        }
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    for (uid, warned, text) in [
+        ("91", true, "NOT a moderator"),
+        ("92", false, ""),
+        ("93", true, "NOT a moderator"),
+    ] {
+        rt.state.chat.open_member(uid);
+        rt.invalidate();
+        settle(&mut rt);
+        assert_eq!(
+            rt.find("member-tag-impersonation").is_some(),
+            warned,
+            "member {uid}"
+        );
+        if warned {
+            assert!(shows(&rt, text), "member {uid}");
+            assert!(shows(&rt, "Resembles:"));
+        }
+        key(&mut rt, Key::Escape);
+        settle(&mut rt);
+    }
+    // The real deputies are not accused of imitating themselves.
+    for name in ["Jonas", "Elena Petrova"] {
+        open_member(&mut rt, name);
+        assert!(rt.find("member-tag-impersonation").is_none(), "{name}");
+        key(&mut rt, Key::Escape);
+        settle(&mut rt);
+    }
+}
+
+#[test]
+fn deputy_names_with_nothing_chosen_are_not_protected() {
+    use super::model::{Member, Role};
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        // A deputy who never chose a name (shown as a stand-in), and one whose name is a
+        // placeholder. Neither protects the name it wears.
+        let jonas = room
+            .members
+            .iter_mut()
+            .find(|m| m.nickname == "Jonas")
+            .unwrap();
+        jonas.claimed = false;
+        let elena = room
+            .members
+            .iter_mut()
+            .find(|m| m.nickname == "Elena Petrova")
+            .unwrap();
+        elena.nickname = "Unknown".into();
+        for (id, name) in [(91, "Jonas"), (92, "unknown")] {
+            let mut m = Member::new(id, name, Role::Member);
+            m.invited_by = Some(12);
+            room.members.push(m);
+        }
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    for uid in ["91", "92"] {
+        rt.state.chat.open_member(uid);
+        rt.invalidate();
+        settle(&mut rt);
+        assert!(
+            rt.find("member-tag-impersonation").is_none(),
+            "member {uid}"
+        );
+        key(&mut rt, Key::Escape);
+        settle(&mut rt);
+    }
+}
+
+#[test]
+fn two_deputies_with_the_same_name_get_a_sentence_true_of_both() {
+    use super::model::{Appointer, Member, Role};
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let mut twin = Member::new(91, "J\u{043e}nas", Role::Deputy);
+        twin.invited_by = Some(12);
+        twin.deputized_by = vec![Appointer::Owner];
+        twin.can_ban_you = Some(true);
+        room.members.push(twin);
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    rt.state.chat.open_member("91");
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(rt.find("member-tag-impersonation").is_some());
+    assert!(shows(&rt, "Both are real"));
+    assert!(!shows(&rt, "NOT a moderator"));
+}
+
+#[test]
+fn colliding_deputy_names_are_taken_in_member_id_order_not_list_order() {
+    use super::model::{Appointer, Member, Role};
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        // Real uids are truncated base32, which a number parse cannot order. The listed-first
+        // twin has the LATER member id, so the other must be the one named.
+        for (id, uid, name, order) in [
+            (91, "q7xk3m2f", "Zed", 5),
+            (92, "b4tn8w6c", "Z\u{0435}d", 1),
+        ] {
+            let mut m = Member::new(id, name, Role::Deputy);
+            m.uid = uid.into();
+            m.order = order;
+            m.invited_by = Some(12);
+            m.deputized_by = vec![Appointer::Owner];
+            m.can_ban_you = Some(true);
+            room.members.push(m);
+        }
+        let mut imp = Member::new(93, "ZE\u{0044}", Role::Member);
+        imp.uid = "h2p5v9ra".into();
+        imp.invited_by = Some(12);
+        room.members.push(imp);
+    });
+    let room = state.chat.room().unwrap();
+    let imp = room.member_by_uid("h2p5v9ra").unwrap();
+    let hit = super::member_modal::imitation(room, imp).expect("imitation");
+    assert_eq!(hit.who.nickname, "Z\u{0435}d");
+    // And the dialog shows the warning.
+    let mut rt = render(state, WINDOW_SIZE);
+    rt.state.chat.open_member("h2p5v9ra");
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(rt.find("member-tag-impersonation").is_some());
+}

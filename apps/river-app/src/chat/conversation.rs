@@ -301,6 +301,24 @@ fn tag(s: &str, p: &Palette) -> El {
         .child(label(s.to_owned(), st::TAG, p.text_secondary))
 }
 
+/// The "DEPUTY" tag after a deputy's name: the web UI's `message-author-deputy-badge`, the same
+/// outlined small caps as the OWNER tag with the shield before the word. `tooltip` says who
+/// appointed them and whether they can ban you.
+fn deputy_tag(tooltip: String, p: &Palette) -> El {
+    row()
+        .key("tag-deputy")
+        .h(18.0)
+        .px(5.0)
+        .gap(3.0)
+        .radius(4.0)
+        .center()
+        .border(1.0, p.line_strong)
+        .label(tooltip.clone())
+        .help(tooltip)
+        .child(icon(&icons::SHIELD, 11.0).color(p.text_secondary))
+        .child(label("DEPUTY".to_owned(), st::TAG, p.text_secondary))
+}
+
 /// One author's run of messages. Each message is its own row, as in the web UI: the first
 /// carries the avatar and the name line, and the others show their time in the gutter while
 /// the pointer is over them.
@@ -345,6 +363,8 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
     let mut name_row = row().gap(8.0).center_y().child(name);
     if author.is_some_and(|m| m.role == Role::Owner) {
         name_row = name_row.child(tag("OWNER", p));
+    } else if let Some(tooltip) = author.and_then(Member::deputy_tooltip) {
+        name_row = name_row.child(deputy_tag(tooltip, p));
     }
     name_row = name_row.child(
         label(model::clock(first.time), st::SMALL, p.text_muted)
