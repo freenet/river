@@ -85,7 +85,22 @@ pub fn prepare(src: &str) -> Option<String> {
     // definition turning a shortcut into a link) shows up as a link we did not write.
     let mut got = link_dests(&out);
     got.sort();
-    (got == expected && !has_definitions(&out)).then_some(out)
+    (got == expected && !has_definitions(&out) && !has_table_like_paragraph(&out)).then_some(out)
+}
+
+/// Whether some paragraph of `md` has a line the widget would take as a table row (see
+/// [`starts_like_table_row`]). Run on the OUTPUT too: removing format characters from a label
+/// can leave a line blank and put a `|` line first in a paragraph that was not one before.
+fn has_table_like_paragraph(md: &str) -> bool {
+    let mut starts = Vec::new();
+    for (ev, r) in Parser::new_ext(md, options()).into_offset_iter() {
+        if matches!(ev, Event::Start(Tag::Paragraph)) {
+            starts.push(r);
+        }
+    }
+    starts
+        .iter()
+        .any(|r| md[r.clone()].lines().any(starts_like_table_row))
 }
 
 /// `md` without the control and format characters (bidi overrides, zero-width spaces) inside
@@ -2182,6 +2197,16 @@ mod tests {
         }
         let out = super::prepare("Docs | [site](https://freenet.org)").unwrap();
         assert_eq!(opens(&out).len(), 1, "{out:?}");
+        // The first two keep their vetted links, not merely avoid one substring.
+        let out = super::prepare("Official room | [Freenet](https://freenet.org/news) | be kind")
+            .unwrap();
+        assert_eq!(opens(&out).len(), 1, "{out:?}");
+        // A line made blank by stripping a label's invisible characters cannot expose a `|`
+        // line as the first line of a paragraph the widget would re-parse as a table.
+        let hostile = "[a\n\u{200b}\n| `x` [https://paypal.com](https://evil.example/)](https://good.example/)";
+        if let Some(out) = super::prepare(hostile) {
+            assert!(!has_table_like_paragraph(&out), "{out:?}");
+        }
         // A pipe alone, or links with no pipe in the last paragraph, are fine; a link in an
         // earlier paragraph does not matter.
         assert_eq!(super::prepare("a | b").as_deref(), Some("a | b"));
