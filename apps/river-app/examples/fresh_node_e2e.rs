@@ -476,7 +476,6 @@ fn newer_river(
     println!("C: an app River has moved past writes nothing");
 }
 
-/// A fresh store: registered (not missing), with no rooms.
 /// `bob` (a member) and then `alice` (the owner) change their own nickname in `room`, and each
 /// other's app shows the new name everywhere the room names a member, with nothing left
 /// waiting on the changer's own screen. The names are `<name>` plus a suffix, so reruns in the
@@ -567,6 +566,99 @@ fn notification_modes(alice: &mut App, authority: &str, dir: &Path, room: &str, 
     println!("notification modes round-trip through the node");
 }
 
+/// The owner on node A changes the room's name, description and a limit; the app on node B,
+/// which follows the room, shows them. B's member cannot change the room, and the owner puts the
+/// name back so the steps after this still find the room by it.
+fn room_details(alice: &mut App, bob: &mut App, name: &str, key: &str) {
+    use river_app::rooms::outbox::ConfigEdit;
+    const RENAMED: &str = "Renamed by its owner";
+    const ABOUT: &str = "What **this** room is for";
+    alice.send(
+        key,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                name: Some(RENAMED.into()),
+                description: Some(ABOUT.into()),
+                max_user_bans: Some(7),
+                ..ConfigEdit::default()
+            },
+        },
+    );
+    alice.until(
+        "node A shows the owner's change, taken by the node",
+        |app| {
+            app.room(RENAMED).is_some_and(|r| {
+                r.description == ABOUT
+                    && r.details.limits.max_user_bans == 7
+                    && r.details.pending.is_none()
+            })
+        },
+    );
+    bob.until("node B shows the new name, description and limit", |app| {
+        app.room(RENAMED)
+            .is_some_and(|r| r.description == ABOUT && r.details.limits.max_user_bans == 7)
+    });
+    assert!(bob.room(name).is_none(), "the old name is gone on B");
+    let on_b = bob.room(RENAMED).unwrap();
+    assert!(
+        matches!(on_b.details.editable, river_app::chat::model::Editable::No),
+        "B's member only views the details"
+    );
+    // An app-side guard: the member's app refuses before signing anything, so this never
+    // reaches the node (the contract's own refusal of a configuration the owner did not sign is
+    // covered by the room contract's tests).
+    bob.send(
+        key,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                name: Some("Hijacked".into()),
+                ..ConfigEdit::default()
+            },
+        },
+    );
+    bob.until("node B's member is told only the owner can", |app| {
+        app.room(RENAMED).is_some_and(|r| {
+            r.details
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.failed.as_deref().is_some_and(|f| f.contains("owner")))
+        })
+    });
+    let entry = bob
+        .room(RENAMED)
+        .unwrap()
+        .details
+        .pending
+        .as_ref()
+        .unwrap()
+        .entry;
+    bob.send(key, Action::Discard { entry });
+    bob.until("the refused change is discarded", |app| {
+        app.room(RENAMED)
+            .is_some_and(|r| r.details.pending.is_none())
+    });
+    // Back to the original name and limit.
+    alice.send(
+        key,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                name: Some(name.into()),
+                description: Some(String::new()),
+                max_user_bans: Some(10),
+                ..ConfigEdit::default()
+            },
+        },
+    );
+    bob.until("node B shows the name put back", |app| {
+        app.room(name)
+            .is_some_and(|r| r.description.is_empty() && r.details.limits.max_user_bans == 10)
+    });
+    alice.until("node A has nothing more on its way", |app| {
+        app.room(name).is_some_and(|r| r.details.pending.is_none())
+    });
+}
+
+/// A fresh store: registered (not missing), with no rooms.
 fn ready_and_empty(app: &App) -> bool {
     app.access == Some(Access::Ready) && app.rooms.is_empty() && !app.issues.store_missing
 }
@@ -729,6 +821,7 @@ fn main() {
     let member = expect_signing_key("B", &bob.authority, &dir_b, &key);
     assert_ne!(owner, member, "the joiner's key is not the owner's");
 
+    room_details(&mut alice, &mut bob, ROOM, &key);
     notification_modes(&mut alice, a, &dir_a, ROOM, &key);
 
     newer_river(a, &dir, &dir_a, ROOM, &key, &mut bob);

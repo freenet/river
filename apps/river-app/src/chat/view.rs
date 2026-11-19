@@ -68,6 +68,9 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
             &mut layer,
         );
     }
+    if let Some(form) = &chat.details {
+        super::details::details_modal(chat, room, form, &k, &mut layer);
+    }
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);
     if chat.members_shown(narrow) {

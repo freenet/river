@@ -2534,3 +2534,991 @@ fn an_older_nickname_refused_after_a_newer_one_was_written_is_gone_and_cannot_co
     assert!(outbox.is_empty());
     assert_eq!(shown_name(&outbox, &room), "Newer");
 }
+
+// The room's details ----------------------------------------------------------------------------
+
+/// A public room the local identity OWNS, with the owner's key.
+fn owner_public(f: &Fixture) -> LiveRoom {
+    let mut stored = f.stored(public_state(f));
+    stored.self_sk = Some(f.owner.clone());
+    LiveRoom::new(stored)
+}
+
+/// A private room the local identity owns, holding the room's secret.
+fn owner_private(f: &Fixture) -> LiveRoom {
+    let mut state = f.private_state();
+    add_secret(f, &mut state, 0, &SECRET, &f.owner);
+    let mut stored = f.stored(state);
+    stored.self_sk = Some(f.owner.clone());
+    LiveRoom::new(stored)
+}
+
+fn rename(name: &str) -> Action {
+    Action::SetRoomDetails {
+        edit: ConfigEdit {
+            name: Some(name.into()),
+            ..ConfigEdit::default()
+        },
+    }
+}
+
+fn the_config(delta: &ChatRoomStateV1Delta) -> AuthorizedConfigurationV1 {
+    delta
+        .configuration
+        .clone()
+        .expect("a configuration goes out")
+}
+
+/// What the room CONTRACT does with `delta`: its own `apply_delta`, then its own `verify`.
+fn through_the_contract(room: &LiveRoom, delta: &ChatRoomStateV1Delta) -> ChatRoomStateV1 {
+    use freenet_scaffold::ComposableState;
+    let params = room.params();
+    let mut state = room.stored.room_state.clone();
+    state
+        .apply_delta(&ChatRoomStateV1::default(), &params, &Some(delta.clone()))
+        .expect("the contract takes it");
+    state
+        .verify(&state, &params)
+        .expect("and the state still verifies");
+    state
+}
+
+#[test]
+fn a_public_rename_is_signed_by_the_owner_and_the_contract_takes_it() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let held = room.stored.room_state.configuration.configuration.clone();
+    let mut outbox = outbox();
+    let edit = ConfigEdit {
+        name: Some("  New Town  ".into()),
+        description: Some("About *us*".into()),
+        max_members: Some(7),
+        ..ConfigEdit::default()
+    };
+    assert!(outbox.command(&room, Action::SetRoomDetails { edit }));
+    // Shown at once, with the edit on its way.
+    let view = outbox.view(&room, &minutes);
+    assert_eq!(view.name, "New Town");
+    assert_eq!(view.description, "About *us*");
+    assert_eq!(view.details.limits.max_members, 7);
+    assert!(
+        view.details
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.failed.is_none())
+    );
+
+    let delta = next(&mut outbox, &room, Instant::now()).expect("an update goes out");
+    let config = the_config(&delta);
+    assert!(config.verify_signature(&f.owner.verifying_key()).is_ok());
+    let c = &config.configuration;
+    assert_eq!(c.configuration_version, held.configuration_version + 1);
+    assert_eq!(c.max_members, 7);
+    // Nothing else moved.
+    assert_eq!(c.max_message_size, held.max_message_size);
+    assert_eq!(c.privacy_mode, held.privacy_mode);
+    assert_eq!(c.owner_member_id, f.owner_id());
+    assert_eq!(c.display.name, SealedBytes::public(b"New Town".to_vec()));
+    assert_eq!(
+        c.display.description,
+        Some(SealedBytes::public(b"About *us*".to_vec()))
+    );
+    let state = through_the_contract(&room, &delta);
+    assert_eq!(state.configuration, config);
+
+    // Answered: done, and the room itself shows it.
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    let view = outbox.view(&room, &minutes);
+    assert_eq!(
+        (view.name.as_str(), view.details.pending),
+        ("New Town", None)
+    );
+}
+
+#[test]
+fn a_private_rename_is_sealed_under_the_current_secret() {
+    let f = Fixture::new();
+    let mut room = owner_private(&f);
+    let mut outbox = outbox();
+    let edit = ConfigEdit {
+        name: Some("Winter garden".into()),
+        description: Some("Bulbs only".into()),
+        ..ConfigEdit::default()
+    };
+    assert!(outbox.command(&room, Action::SetRoomDetails { edit }));
+    let delta = next(&mut outbox, &room, Instant::now()).expect("an update goes out");
+    let config = the_config(&delta);
+    let display = &config.configuration.display;
+    for (sealed, plain) in [
+        (&display.name, "Winter garden"),
+        (display.description.as_ref().unwrap(), "Bulbs only"),
+    ] {
+        let SealedBytes::Private {
+            ciphertext,
+            nonce,
+            secret_version,
+            declared_len_bytes,
+        } = sealed
+        else {
+            panic!("a private room's name and description must be sealed, never plain");
+        };
+        assert_eq!(*secret_version, 0);
+        assert_eq!(*declared_len_bytes as usize, plain.len());
+        assert_eq!(
+            decrypt_with_symmetric_key(&SECRET, ciphertext, nonce).unwrap(),
+            plain.as_bytes()
+        );
+    }
+    assert!(config.verify_signature(&f.owner.verifying_key()).is_ok());
+    through_the_contract(&room, &delta);
+    assert!(outbox.answered(&mut room, Ok(())));
+    let view = outbox.view(&room, &minutes);
+    assert_eq!(view.name, "Winter garden");
+    assert_eq!(view.description, "Bulbs only");
+    assert!(view.private);
+}
+
+#[test]
+fn a_private_room_without_its_secret_refuses_and_sends_nothing() {
+    let f = Fixture::new();
+    // The secret is sealed to `me`, not the owner, so this computer has none.
+    let mut stored = f.stored(f.private_state());
+    stored.self_sk = Some(f.owner.clone());
+    let room = LiveRoom::new(stored);
+    assert!(room.current_secret().is_none());
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Plain leak")));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    let view = outbox.view(&room, &minutes);
+    let pending = view.details.pending.expect("said");
+    assert_eq!(
+        pending.failed.as_deref(),
+        Some(format!("Not saved. {}", Blocked::NoSecret.reason()).as_str())
+    );
+    assert_eq!(
+        view.details.editable,
+        crate::chat::model::Editable::Blocked(crate::rooms::room::NO_SECRET_TO_EDIT.into())
+    );
+}
+
+#[test]
+fn only_the_owner_changes_the_details() {
+    let f = Fixture::new();
+    let room = public_room(&f);
+    assert_eq!(
+        room.details().editable,
+        crate::chat::model::Editable::No,
+        "a member is only shown the details"
+    );
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Mine now")));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    let pending = outbox.view(&room, &minutes).details.pending.unwrap();
+    assert_eq!(
+        pending.failed.as_deref(),
+        Some(format!("Not saved. {NOT_OWNER}").as_str())
+    );
+    assert!(pending.retry);
+    // The owner on a computer with only the PUBLIC half of the key cannot sign either.
+    let mut stored = f.stored(public_state(&f));
+    stored.self_sk = None;
+    stored.self_vk = Some(f.owner.verifying_key());
+    let keyless = LiveRoom::new(stored);
+    assert_eq!(
+        keyless.details().editable,
+        crate::chat::model::Editable::Blocked(crate::rooms::room::NO_KEY_TO_EDIT.into())
+    );
+    let mut outbox = self::outbox();
+    assert!(outbox.command(&keyless, rename("Nope")));
+    assert!(next(&mut outbox, &keyless, Instant::now()).is_none());
+}
+
+#[test]
+fn values_the_room_would_refuse_are_refused_before_anything_is_signed() {
+    let f = Fixture::new();
+    let room = owner_public(&f);
+    let held = room.details();
+    let long = "x".repeat(held.limits.max_room_name + 1);
+    let cases: [(ConfigEdit, &str); 7] = [
+        (
+            ConfigEdit {
+                name: Some("   ".into()),
+                ..Default::default()
+            },
+            "Give the room a name.",
+        ),
+        (
+            ConfigEdit {
+                name: Some("a\u{202e}b".into()),
+                ..Default::default()
+            },
+            "characters that don't show",
+        ),
+        (
+            ConfigEdit {
+                name: Some(long),
+                ..Default::default()
+            },
+            "Max Room Name Size",
+        ),
+        (
+            ConfigEdit {
+                description: Some("d".repeat(held.limits.max_room_description + 1)),
+                ..Default::default()
+            },
+            "Max Room Description Size",
+        ),
+        (
+            ConfigEdit {
+                max_members: Some(0),
+                ..Default::default()
+            },
+            "Members must be at least 1.",
+        ),
+        (
+            ConfigEdit {
+                max_nickname_size: Some(river_core::room_state::member_info::NICKNAME_CEILING + 1),
+                ..Default::default()
+            },
+            "at most",
+        ),
+        (ConfigEdit::default(), "nothing to change"),
+    ];
+    for (edit, expect) in cases {
+        let mut outbox = outbox();
+        assert!(outbox.command(&room, Action::SetRoomDetails { edit: edit.clone() }));
+        assert!(
+            next(&mut outbox, &room, Instant::now()).is_none(),
+            "{edit:?} must not be sent"
+        );
+        let view = outbox.view(&room, &minutes);
+        let said = view
+            .notices
+            .iter()
+            .map(|n| n.text.clone())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        assert!(said.contains(expect), "{edit:?}: {said}");
+    }
+    // A name over the limit is also refused with the room's limit LOWERED by the same edit.
+    let edit = ConfigEdit {
+        max_room_name: Some(3),
+        ..Default::default()
+    };
+    assert!(details_refusal(&held.limits, "Town", "", &edit).is_some());
+    assert!(details_refusal(&held.limits, "Tow", "", &edit).is_none());
+}
+
+#[test]
+fn a_held_nickname_limit_over_the_ceiling_does_not_block_an_unrelated_edit() {
+    let f = Fixture::new();
+    let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
+    let state = with_config(&f, public_state(&f), |c| c.max_nickname_size = ceiling + 5);
+    let mut stored = f.stored(state);
+    stored.self_sk = Some(f.owner.clone());
+    let room = LiveRoom::new(stored);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Still works")));
+    let delta = next(&mut outbox, &room, Instant::now()).expect("sent");
+    // Lowered to what the room enforces anyway, as riverctl does.
+    assert_eq!(the_config(&delta).configuration.max_nickname_size, ceiling);
+    through_the_contract(&room, &delta);
+}
+
+#[test]
+fn edits_made_in_a_row_become_one_change_at_the_next_version() {
+    let f = Fixture::new();
+    let room = owner_public(&f);
+    let held = room
+        .stored
+        .room_state
+        .configuration
+        .configuration
+        .configuration_version;
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("First")));
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                max_user_bans: Some(3),
+                ..Default::default()
+            }
+        }
+    ));
+    let delta = next(&mut outbox, &room, Instant::now()).expect("sent");
+    let c = the_config(&delta).configuration;
+    assert_eq!(c.configuration_version, held + 1);
+    assert_eq!(c.display.name, SealedBytes::public(b"First".to_vec()));
+    assert_eq!(c.max_user_bans, 3);
+    // And one on its way keeps its turn, with the next one built on top of it.
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                max_members: Some(9),
+                ..Default::default()
+            }
+        }
+    ));
+    assert!(
+        next(&mut outbox, &room, Instant::now()).is_none(),
+        "one at a time"
+    );
+}
+
+#[test]
+fn a_change_made_while_another_is_on_its_way_keeps_the_one_on_its_way() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Renamed")));
+    let first = the_config(&next(&mut outbox, &room, Instant::now()).unwrap());
+    // Out, unanswered. A second change, to another field only.
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                max_user_bans: Some(4),
+                ..Default::default()
+            }
+        }
+    ));
+    assert!(outbox.answered(&mut room, Ok(())));
+    let second = the_config(&next(&mut outbox, &room, Instant::now()).unwrap());
+    assert!(second.configuration.configuration_version > first.configuration.configuration_version);
+    assert_eq!(second.configuration.max_user_bans, 4);
+    assert_eq!(
+        second.configuration.display.name,
+        SealedBytes::public(b"Renamed".to_vec()),
+        "the rename the first change made is not undone by the second"
+    );
+}
+
+/// The owner's OTHER device signs `edit` at `version` on top of `room`'s configuration.
+fn other_device(
+    f: &Fixture,
+    room: &LiveRoom,
+    version: u32,
+    edit: impl FnOnce(&mut Configuration),
+) -> ChatRoomStateV1Delta {
+    let mut c = room.stored.room_state.configuration.configuration.clone();
+    edit(&mut c);
+    c.configuration_version = version;
+    ChatRoomStateV1Delta {
+        configuration: Some(AuthorizedConfigurationV1::new(c, &f.owner)),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_change_waiting_when_the_owners_other_device_changed_the_room_goes_on_top_of_it() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Mine")));
+    // Before it is sent, the other device sets the member cap at the version this was built at.
+    let version = the_config(&outbox.entries[0].delta(&room))
+        .configuration
+        .configuration_version;
+    let theirs = other_device(&f, &room, version, |c| c.max_members = 12);
+    room.apply_delta(theirs).unwrap();
+    assert!(!outbox.reconcile(&mut room), "not ours, so not done");
+    let delta = next(&mut outbox, &room, Instant::now()).expect("still goes out");
+    let c = the_config(&delta).configuration;
+    assert!(
+        c.configuration_version > version,
+        "signed again above theirs"
+    );
+    assert_eq!(c.max_members, 12, "their change is kept");
+    assert_eq!(c.display.name, SealedBytes::public(b"Mine".to_vec()));
+    through_the_contract(&room, &delta);
+}
+
+#[test]
+fn a_change_sent_and_outranked_by_the_other_device_is_said_to_be_replaced() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Mine")));
+    let mine = the_config(&next(&mut outbox, &room, Instant::now()).unwrap());
+    let version = mine.configuration.configuration_version;
+    // The other device gets in first, at a HIGHER version.
+    let theirs = other_device(&f, &room, version + 1, |c| c.max_members = 12);
+    room.apply_delta(theirs).unwrap();
+    assert!(outbox.reconcile(&mut room));
+    let view = outbox.view(&room, &minutes);
+    let pending = view.details.pending.expect("not dropped silently");
+    assert_eq!(pending.failed.as_deref(), Some(CONFIG_SUPERSEDED));
+    // The node's answer (taken) changes nothing more: the room still holds theirs.
+    assert!(!outbox.answered(&mut room, Ok(())));
+    assert_eq!(
+        room.stored
+            .room_state
+            .configuration
+            .configuration
+            .max_members,
+        12
+    );
+    assert_eq!(room.name(), "Town");
+    // Discard clears it.
+    let id = outbox.view(&room, &minutes).details.pending.unwrap().entry;
+    assert!(outbox.command(&room, Action::Discard { entry: id }));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn equal_versions_are_settled_by_the_contracts_rank() {
+    let f = Fixture::new();
+    // The other device's change differs between runs, and with it its signature digest, so the
+    // tie goes each way: both outcomes must be reached and each must be said right.
+    let (mut saw_theirs, mut saw_ours) = (false, false);
+    for cap in 10..200usize {
+        let mut room = owner_public(&f);
+        let mut outbox = outbox();
+        assert!(outbox.command(&room, rename("Mine")));
+        let mine = the_config(&next(&mut outbox, &room, Instant::now()).unwrap());
+        let version = mine.configuration.configuration_version;
+        let theirs = other_device(&f, &room, version, |c| c.max_members = cap);
+        let theirs_config = theirs.configuration.clone().unwrap();
+        // Whichever outranks wins in the room itself; the entry's state must say the same.
+        room.apply_delta(through_the_contract_delta(&mine)).unwrap();
+        room.apply_delta(theirs).unwrap();
+        let params = room.params();
+        let theirs_wins = theirs_config.rank(&params) > mine.rank(&params);
+        outbox.reconcile(&mut room);
+        let pending = outbox.view(&room, &minutes).details.pending;
+        if theirs_wins {
+            saw_theirs = true;
+            assert_eq!(
+                room.stored.room_state.configuration.signature,
+                theirs_config.signature
+            );
+            assert_eq!(pending.unwrap().failed.as_deref(), Some(CONFIG_SUPERSEDED));
+            assert_eq!(config_state(&room, &mine), ConfigState::Superseded);
+        } else {
+            saw_ours = true;
+            assert_eq!(
+                room.stored.room_state.configuration.signature,
+                mine.signature
+            );
+            assert!(pending.is_none(), "ours holds, so it is done");
+            assert!(outbox.is_empty());
+            assert_eq!(config_state(&room, &mine), ConfigState::Ours);
+        }
+        if saw_theirs && saw_ours {
+            return;
+        }
+    }
+    panic!("the tie never went both ways (theirs: {saw_theirs}, ours: {saw_ours})");
+}
+
+fn through_the_contract_delta(config: &AuthorizedConfigurationV1) -> ChatRoomStateV1Delta {
+    config_delta(config)
+}
+
+#[test]
+fn a_change_waiting_when_the_room_turns_private_is_never_sent_plain() {
+    let f = Fixture::new();
+    let public = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&public, rename("Quiet")));
+    // The room becomes private (with the owner's secret) before the change goes out.
+    let private = owner_private(&f);
+    let delta = next(&mut outbox, &private, Instant::now()).expect("sent, built again");
+    let config = the_config(&delta);
+    assert!(
+        !config.configuration.display.name.is_public(),
+        "a name written while the room was public must not go out plain into a private one"
+    );
+    assert_eq!(
+        config.configuration.privacy_mode,
+        private
+            .stored
+            .room_state
+            .configuration
+            .configuration
+            .privacy_mode
+    );
+    through_the_contract(&private, &delta);
+}
+
+#[test]
+fn a_refused_change_is_signed_again_at_a_new_version_on_retry() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Try")));
+    let first = the_config(&next(&mut outbox, &room, Instant::now()).unwrap());
+    assert!(outbox.answered(&mut room, Err("busy".into())));
+    let view = outbox.view(&room, &minutes);
+    let pending = view.details.pending.unwrap();
+    assert_eq!(
+        pending.failed.as_deref(),
+        Some("Not saved. Freenet refused it: busy")
+    );
+    // The shown room does not carry a refused change.
+    assert_eq!(view.name, "Town");
+    assert!(outbox.command(
+        &room,
+        Action::Retry {
+            entry: pending.entry
+        }
+    ));
+    let second = the_config(&next(&mut outbox, &room, Instant::now()).unwrap());
+    assert!(
+        second.configuration.configuration_version > first.configuration.configuration_version
+            || second.signature != first.signature
+    );
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    assert_eq!(room.name(), "Try");
+}
+
+#[test]
+fn the_network_bringing_the_change_in_settles_it() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Seen")));
+    let delta = next(&mut outbox, &room, Instant::now()).unwrap();
+    room.apply_delta(delta).unwrap();
+    assert!(outbox.reconcile(&mut room));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_change_for_a_clone_of_the_edit_is_merged_by_field() {
+    let a = ConfigEdit {
+        name: Some("A".into()),
+        max_members: Some(1),
+        ..Default::default()
+    };
+    let b = ConfigEdit {
+        name: Some("B".into()),
+        max_user_bans: Some(2),
+        ..Default::default()
+    };
+    let merged = b.over(&a);
+    assert_eq!(merged.name.as_deref(), Some("B"));
+    assert_eq!(merged.max_members, Some(1));
+    assert_eq!(merged.max_user_bans, Some(2));
+}
+
+#[test]
+fn a_refused_older_change_is_replaced_by_a_newer_one_and_cannot_come_back() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Old")));
+    let _ = next(&mut outbox, &room, Instant::now()).unwrap();
+    // A newer change while the older is out and unanswered: it waits its turn.
+    assert!(outbox.command(&room, rename("New")));
+    // The older is refused: nothing is left to Retry it back above the newer.
+    assert!(outbox.answered(&mut room, Err("busy".into())));
+    let pending = outbox
+        .view(&room, &minutes)
+        .details
+        .pending
+        .expect("the newer");
+    assert_eq!(pending.failed, None, "only the newer is left, waiting");
+    let delta = next(&mut outbox, &room, Instant::now()).expect("the newer goes out");
+    assert_eq!(
+        the_config(&delta).configuration.display.name,
+        SealedBytes::public(b"New".to_vec())
+    );
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    assert_eq!(room.name(), "New");
+}
+
+#[test]
+fn my_own_newer_change_is_not_reported_as_made_elsewhere() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("One")));
+    let _ = next(&mut outbox, &room, Instant::now()).unwrap();
+    assert!(outbox.command(&room, rename("Two")));
+    // The older is answered, then the newer goes out and is answered.
+    assert!(outbox.answered(&mut room, Ok(())));
+    let _ = next(&mut outbox, &room, Instant::now()).unwrap();
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty(), "nothing is left saying it was replaced");
+    assert_eq!(room.name(), "Two");
+    // The network bringing the newer in first settles the older without a notice too.
+    let mut room = owner_public(&f);
+    let mut outbox = self::outbox();
+    assert!(outbox.command(&room, rename("One")));
+    let first = next(&mut outbox, &room, Instant::now()).unwrap();
+    assert!(outbox.command(&room, rename("Two")));
+    room.apply_delta(first).unwrap();
+    assert!(outbox.reconcile(&mut room));
+    // The older's answer is still owed; it is consumed, and the newer goes out after it.
+    assert!(!outbox.answered(&mut room, Ok(())));
+    let second = next(&mut outbox, &room, Instant::now()).expect("the newer is sent");
+    room.apply_delta(second).unwrap();
+    outbox.reconcile(&mut room);
+    assert!(outbox.view(&room, &minutes).notices.is_empty());
+    assert!(outbox.view(&room, &minutes).details.pending.is_none());
+}
+
+#[test]
+fn nothing_prints_a_rooms_name_or_description() {
+    let f = Fixture::new();
+    let room = owner_private(&f);
+    let mut outbox = outbox();
+    let action = Action::SetRoomDetails {
+        edit: ConfigEdit {
+            name: Some("Hidden Name".into()),
+            description: Some("Hidden Description".into()),
+            ..Default::default()
+        },
+    };
+    assert!(!format!("{action:?}").contains("Hidden"));
+    assert!(outbox.command(&room, action));
+    assert!(!format!("{:?}", outbox.entries).contains("Hidden"));
+}
+
+/// Take the delta of the next update, after the owed answer of any entry before it.
+fn after_answer(outbox: &mut Outbox, room: &mut LiveRoom, ok: bool) {
+    let result = if ok { Ok(()) } else { Err("busy".into()) };
+    outbox.answered(room, result);
+}
+
+#[test]
+fn a_change_the_dialog_never_showed_does_not_come_back_in_a_newer_one() {
+    let f = Fixture::new();
+    // The room replaced the name this owner wrote with the other device's.
+    let mut room = owner_public(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("Alpha")));
+    let mine = the_config(&next(&mut outbox, &room, Instant::now()).unwrap());
+    let version = mine.configuration.configuration_version;
+    let theirs = other_device(&f, &room, version + 1, |c| {
+        c.display.name = SealedBytes::public(b"Beta".to_vec())
+    });
+    room.apply_delta(theirs).unwrap();
+    outbox.reconcile(&mut room);
+    assert_eq!(
+        outbox
+            .view(&room, &minutes)
+            .details
+            .pending
+            .unwrap()
+            .failed
+            .as_deref(),
+        Some(CONFIG_SUPERSEDED)
+    );
+    // Then only the description is edited: the name Alpha is not signed back over Beta.
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                description: Some("About".into()),
+                ..Default::default()
+            }
+        }
+    ));
+    after_answer(&mut outbox, &mut room, true);
+    let c = the_config(&next(&mut outbox, &room, Instant::now()).unwrap()).configuration;
+    assert_eq!(c.display.name, SealedBytes::public(b"Beta".to_vec()));
+    assert_eq!(
+        c.display.description,
+        Some(SealedBytes::public(b"About".to_vec()))
+    );
+}
+
+#[test]
+fn a_refused_change_the_dialog_did_not_show_is_not_merged_into_a_newer_one() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let held_cap = room
+        .stored
+        .room_state
+        .configuration
+        .configuration
+        .max_members;
+    let mut outbox = outbox();
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                max_members: Some(3),
+                ..Default::default()
+            }
+        }
+    ));
+    let _ = next(&mut outbox, &room, Instant::now()).unwrap();
+    assert!(outbox.answered(&mut room, Err("busy".into())));
+    assert!(outbox.command(&room, rename("Only the name")));
+    let c = the_config(&next(&mut outbox, &room, Instant::now()).unwrap()).configuration;
+    assert_eq!(
+        c.max_members, held_cap,
+        "the refused cap is not resurrected"
+    );
+}
+
+#[test]
+fn a_waiting_change_is_built_again_when_the_other_device_gets_in_at_its_version() {
+    let f = Fixture::new();
+    // Whichever way the digest tie goes, the other device's change must survive.
+    let (mut saw_theirs, mut saw_ours) = (false, false);
+    for cap in 10..200usize {
+        let mut room = owner_public(&f);
+        let mut outbox = outbox();
+        assert!(outbox.command(&room, rename("Mine")));
+        let mine = outbox.entries[0].config.clone().unwrap();
+        let version = mine.configuration.configuration_version;
+        let theirs = other_device(&f, &room, version, |c| c.max_members = cap);
+        let theirs_rank = theirs.configuration.clone().unwrap().rank(&room.params());
+        room.apply_delta(theirs).unwrap();
+        if theirs_rank > mine.rank(&room.params()) {
+            saw_theirs = true;
+        } else {
+            saw_ours = true;
+        }
+        let delta = next(&mut outbox, &room, Instant::now()).expect("goes out");
+        let c = the_config(&delta).configuration;
+        assert_eq!(c.max_members, cap, "their change is kept (cap {cap})");
+        assert!(c.configuration_version > version);
+        through_the_contract(&room, &delta);
+        if saw_theirs && saw_ours {
+            return;
+        }
+    }
+    panic!("the tie never went both ways");
+}
+
+#[test]
+fn a_change_built_on_one_that_is_then_refused_is_built_again() {
+    let f = Fixture::new();
+    let mut room = owner_public(&f);
+    let held_bans = room
+        .stored
+        .room_state
+        .configuration
+        .configuration
+        .max_user_bans;
+    let mut outbox = outbox();
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                max_user_bans: Some(3),
+                ..Default::default()
+            }
+        }
+    ));
+    let _ = next(&mut outbox, &room, Instant::now()).unwrap();
+    // Built on top of the one on its way, which carries bans = 3.
+    assert!(outbox.command(&room, rename("B")));
+    assert_eq!(
+        outbox.entries[1]
+            .config
+            .as_ref()
+            .unwrap()
+            .configuration
+            .max_user_bans,
+        3
+    );
+    assert!(outbox.answered(&mut room, Err("busy".into())));
+    let c = the_config(&next(&mut outbox, &room, Instant::now()).unwrap()).configuration;
+    assert_eq!(c.display.name, SealedBytes::public(b"B".to_vec()));
+    assert_eq!(
+        c.max_user_bans, held_bans,
+        "the refused values are not published"
+    );
+}
+
+#[test]
+fn limits_are_bounded_by_the_contracts_u32_and_a_sanity_ceiling() {
+    let f = Fixture::new();
+    let held = owner_public(&f).details();
+    let edit = |f: fn(&mut ConfigEdit, usize), v: usize| {
+        let mut e = ConfigEdit::default();
+        f(&mut e, v);
+        details_refusal(
+            &held.limits,
+            &held.name_source,
+            &held.description_source,
+            &e,
+        )
+    };
+    let big = u32::MAX as usize + 1;
+    assert!(
+        edit(|e, v| e.max_members = Some(v), big)
+            .unwrap()
+            .contains("at most 4294967295")
+    );
+    assert!(edit(|e, v| e.max_message_size = Some(v), usize::MAX).is_some());
+    // Each limit has a ceiling, and the ceiling itself is allowed.
+    let setters: [fn(&mut ConfigEdit, usize); 7] = [
+        |e, v| e.max_members = Some(v),
+        |e, v| e.max_recent_messages = Some(v),
+        |e, v| e.max_message_size = Some(v),
+        |e, v| e.max_user_bans = Some(v),
+        |e, v| e.max_nickname_size = Some(v),
+        |e, v| e.max_room_name = Some(v),
+        |e, v| e.max_room_description = Some(v),
+    ];
+    for (i, set) in setters.iter().enumerate() {
+        assert!(LIMIT_SANITY_CEILINGS[i] <= u32::MAX as usize);
+        // Above the ceiling is refused; the web UI's defaults are far below every one.
+        assert!(edit(*set, LIMIT_SANITY_CEILINGS[i] + 1).is_some(), "{i}");
+        let defaults = [200, 100, 1000, 10, 50, 100, 500];
+        assert!(LIMIT_SANITY_CEILINGS[i] >= defaults[i] * 2, "{i}");
+    }
+}
+
+#[test]
+fn lowering_a_limit_below_what_the_room_uses_is_said_in_plain_words() {
+    use crate::chat::model::{Details, Usage};
+    let d = Details {
+        usage: Usage {
+            members: 7,
+            bans: 4,
+            messages: 90,
+        },
+        ..Details::default()
+    };
+    let w = lowering_warnings(
+        &d,
+        &ConfigEdit {
+            max_members: Some(3),
+            max_user_bans: Some(1),
+            max_recent_messages: Some(50),
+            ..Default::default()
+        },
+    );
+    assert_eq!(w.len(), 3);
+    assert!(w[0].contains("Lowering Members to 3 removes 4 members, starting with the longest invite chains. This cannot be undone."));
+    assert!(w[1].contains("3 of the room's 4 bans"));
+    assert!(w[2].contains("oldest 40 of the room's 90 messages"));
+    // At or above what is used: nothing to warn about.
+    assert!(
+        lowering_warnings(
+            &d,
+            &ConfigEdit {
+                max_members: Some(7),
+                max_recent_messages: Some(90),
+                max_user_bans: Some(4),
+                ..Default::default()
+            }
+        )
+        .is_empty()
+    );
+}
+
+const SECRET1: [u8; 32] = [43; 32];
+
+fn owner_private_rotated(f: &Fixture) -> LiveRoom {
+    let mut state = f.private_state();
+    add_secret(f, &mut state, 0, &SECRET, &f.owner);
+    add_secret(f, &mut state, 1, &SECRET1, &f.owner);
+    let mut stored = f.stored(state);
+    stored.self_sk = Some(f.owner.clone());
+    LiveRoom::new(stored)
+}
+
+#[test]
+fn a_private_rename_after_a_rotation_is_sealed_under_the_newest_secret() {
+    let f = Fixture::new();
+    let room = owner_private_rotated(&f);
+    assert_eq!(room.current_secret().map(|(_, v)| v), Some(1));
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, rename("After rotation")));
+    let delta = next(&mut outbox, &room, Instant::now()).unwrap();
+    let c = the_config(&delta).configuration;
+    let SealedBytes::Private {
+        ciphertext,
+        nonce,
+        secret_version,
+        declared_len_bytes,
+    } = &c.display.name
+    else {
+        panic!("sealed");
+    };
+    assert_eq!(*secret_version, 1);
+    assert_eq!(*declared_len_bytes as usize, "After rotation".len());
+    assert_eq!(
+        decrypt_with_symmetric_key(&SECRET1, ciphertext, nonce).unwrap(),
+        b"After rotation"
+    );
+    through_the_contract(&room, &delta);
+}
+
+#[test]
+fn a_change_waiting_when_the_secret_rotates_is_sealed_again_under_the_new_one() {
+    let f = Fixture::new();
+    let before = owner_private(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&before, rename("Queued")));
+    let after = owner_private_rotated(&f);
+    let delta = next(&mut outbox, &after, Instant::now()).unwrap();
+    let c = the_config(&delta).configuration;
+    assert_eq!(c.display.name.secret_version(), Some(1));
+    through_the_contract(&after, &delta);
+}
+
+#[test]
+fn clearing_a_private_description_publishes_none_and_trimming_applies() {
+    let f = Fixture::new();
+    let room = owner_private(&f);
+    assert!(room.details().description_source == "Plants only");
+    let mut outbox = outbox();
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                description: Some("   ".into()),
+                ..Default::default()
+            }
+        }
+    ));
+    let delta = next(&mut outbox, &room, Instant::now()).unwrap();
+    assert_eq!(the_config(&delta).configuration.display.description, None);
+    through_the_contract(&room, &delta);
+    // Padding is trimmed from a description and a name.
+    let room = owner_public(&f);
+    let mut outbox = self::outbox();
+    assert!(outbox.command(
+        &room,
+        Action::SetRoomDetails {
+            edit: ConfigEdit {
+                name: Some("  Padded  ".into()),
+                description: Some("\n  words \n".into()),
+                ..Default::default()
+            }
+        }
+    ));
+    let c = the_config(&next(&mut outbox, &room, Instant::now()).unwrap()).configuration;
+    assert_eq!(c.display.name, SealedBytes::public(b"Padded".to_vec()));
+    assert_eq!(
+        c.display.description,
+        Some(SealedBytes::public(b"words".to_vec()))
+    );
+}
+
+#[test]
+fn a_private_change_waiting_when_the_room_turns_public_goes_out_public() {
+    let f = Fixture::new();
+    let private = owner_private(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&private, rename("Open")));
+    let public = owner_public(&f);
+    let delta = next(&mut outbox, &public, Instant::now()).unwrap();
+    let c = the_config(&delta).configuration;
+    assert!(c.display.name.is_public());
+    assert_eq!(
+        c.privacy_mode,
+        public
+            .stored
+            .room_state
+            .configuration
+            .configuration
+            .privacy_mode
+    );
+    through_the_contract(&public, &delta);
+}

@@ -44,6 +44,20 @@
 //!   along with a record sent with their re-adding. The web UI does not compare the name with
 //!   other members' (it warns readers), and neither does this.
 //!
+//! - **The room's details.** A new signed `configuration` (`Action::SetRoomDetails`), as the web
+//!   UI's room details dialog builds it (`sign_and_apply_configuration`): the held configuration
+//!   with the owner's changes, its version one above the held one, normalized and checked the way
+//!   `riverctl` does (`Configuration::normalize_for_signing`, `signing_refusal`), and signed with
+//!   the owner's key. A private room's name and description are sealed under the room's current
+//!   secret; with none here it refuses (freenet/river#299). Only the fields the owner changed
+//!   are kept, and applied to whatever the room holds when it is built, so an edit waiting while
+//!   another device of the owner changed something else does not undo that. It rides the same
+//!   queue, in order with messages. Two owner devices at one version are settled by the
+//!   contract's rank (version, then signature digest): the loser is told it was replaced.
+//!   The web UI saves one field at a time as each loses focus; this sends one change for the
+//!   whole dialog, on Save.
+//!
+//!
 //! Where this differs: the web UI marks a room to sync and never hears whether the node took
 //! the update. Here one update per room is out at a time, and its answer decides: an
 //! `UpdateResponse` means sent (if the room then holds the messages), an update error means
@@ -75,6 +89,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ed25519_dalek::VerifyingKey;
 use river_core::ecies::{encrypt_with_symmetric_key, seal_bytes};
 use river_core::room_state::ChatRoomStateV1Delta;
+use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::content::{
     ACTION_CONTENT_VERSION, ActionContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_REPLY,
     CONTENT_TYPE_TEXT, REPLY_CONTENT_VERSION, ReplyContentV1, TEXT_CONTENT_VERSION, TextContentV1,
@@ -123,6 +138,10 @@ pub enum Action {
     },
     Discard {
         entry: u64,
+    },
+    /// Change the room's details (owner only): a new signed configuration with these changes.
+    SetRoomDetails {
+        edit: ConfigEdit,
     },
     /// Change your own nickname in the room: a new signed `member_info` record at the next
     /// version, sealed under the room's current secret in a private room.
@@ -179,6 +198,10 @@ impl std::fmt::Debug for Action {
             Action::Retry { entry } => f.debug_struct("Retry").field("entry", entry).finish(),
             Action::Discard { entry } => f.debug_struct("Discard").field("entry", entry).finish(),
             Action::SetNickname { .. } => f.write_str("SetNickname { nickname: <hidden> }"),
+            Action::SetRoomDetails { edit } => f
+                .debug_struct("SetRoomDetails")
+                .field("edit", edit)
+                .finish(),
             Action::Invite => f.write_str("Invite"),
             Action::CreateRoom { name, private, .. } => f
                 .debug_struct("CreateRoom")
@@ -198,6 +221,229 @@ impl std::fmt::Debug for Action {
                 .field("mode", mode)
                 .finish(),
         }
+    }
+}
+
+/// The changes to a room's details the owner asked for: only the fields that changed. The name
+/// and description are plain text here and sealed when built; an empty description clears it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConfigEdit {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub max_members: Option<usize>,
+    pub max_recent_messages: Option<usize>,
+    pub max_message_size: Option<usize>,
+    pub max_user_bans: Option<usize>,
+    pub max_nickname_size: Option<usize>,
+    pub max_room_name: Option<usize>,
+    pub max_room_description: Option<usize>,
+}
+
+impl ConfigEdit {
+    /// Whether it changes nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == ConfigEdit::default()
+    }
+
+    /// This edit made after `older`: what this sets wins, the rest is `older`'s.
+    fn over(self, older: &ConfigEdit) -> ConfigEdit {
+        ConfigEdit {
+            name: self.name.or_else(|| older.name.clone()),
+            description: self.description.or_else(|| older.description.clone()),
+            max_members: self.max_members.or(older.max_members),
+            max_recent_messages: self.max_recent_messages.or(older.max_recent_messages),
+            max_message_size: self.max_message_size.or(older.max_message_size),
+            max_user_bans: self.max_user_bans.or(older.max_user_bans),
+            max_nickname_size: self.max_nickname_size.or(older.max_nickname_size),
+            max_room_name: self.max_room_name.or(older.max_room_name),
+            max_room_description: self.max_room_description.or(older.max_room_description),
+        }
+    }
+
+    /// `held` with the limits this sets.
+    fn apply_limits(&self, held: &mut Configuration) {
+        let set = |field: &mut usize, new: Option<usize>| {
+            if let Some(n) = new {
+                *field = n;
+            }
+        };
+        set(&mut held.max_members, self.max_members);
+        set(&mut held.max_recent_messages, self.max_recent_messages);
+        set(&mut held.max_message_size, self.max_message_size);
+        set(&mut held.max_user_bans, self.max_user_bans);
+        set(&mut held.max_nickname_size, self.max_nickname_size);
+        set(&mut held.max_room_name, self.max_room_name);
+        set(&mut held.max_room_description, self.max_room_description);
+    }
+}
+
+/// The limits' names as the web UI's room details dialog labels them.
+pub const LIMIT_LABELS: [&str; 7] = [
+    "Members",
+    "Max Recent Messages",
+    "Max Message Size (bytes)",
+    "Max User Bans",
+    "Max Nickname Size",
+    "Max Room Name Size",
+    "Max Room Description Size",
+];
+
+/// The most each limit may be set to in this app, in [`LIMIT_LABELS`] order (the nickname limit
+/// has the room's own ceiling instead). Generous against the web UI's defaults (200 members,
+/// 100 messages, 1000 bytes, 10 bans, 100 and 500 bytes): they only stop a slipped digit, and
+/// they are not rules of the room contract, whose only bound is the u32 range.
+pub const LIMIT_SANITY_CEILINGS: [usize; 7] = [
+    100_000,
+    100_000,
+    1_000_000,
+    100_000,
+    river_core::room_state::member_info::NICKNAME_CEILING,
+    10_000,
+    100_000,
+];
+
+/// What lowering a limit does to what the room holds, said in plain words, for each limit the
+/// edit lowers below the current usage. These are irreversible: the room removes the excess
+/// members, stops enforcing the excess bans and drops the oldest messages as soon as it applies
+/// the new configuration.
+pub fn lowering_warnings(details: &crate::chat::model::Details, edit: &ConfigEdit) -> Vec<String> {
+    let u = &details.usage;
+    let mut out = Vec::new();
+    if let Some(n) = edit.max_members
+        && u.members > n
+    {
+        out.push(format!(
+            "Lowering Members to {n} removes {} members, starting with the longest invite chains. \
+             This cannot be undone.",
+            u.members - n
+        ));
+    }
+    if let Some(n) = edit.max_user_bans
+        && u.bans > n
+    {
+        out.push(format!(
+            "Lowering Max User Bans to {n} stops {} of the room's {} bans from applying. \
+             This cannot be undone.",
+            u.bans - n,
+            u.bans
+        ));
+    }
+    if let Some(n) = edit.max_recent_messages
+        && u.messages > n
+    {
+        out.push(format!(
+            "Lowering Max Recent Messages to {n} deletes the oldest {} of the room's {} messages. \
+             This cannot be undone.",
+            u.messages - n,
+            u.messages
+        ));
+    }
+    out
+}
+
+/// Why `edit` can't be made to a room with these `held` limits and `name` and `description` (as
+/// stored, empty when unreadable), if it can't: what the web UI refuses before signing
+/// (`Configuration::signing_refusal`) said in the dialog's terms, and what its create dialog
+/// refuses in a name (empty, characters that don't show).
+pub fn details_refusal(
+    held: &crate::chat::model::Limits,
+    name: &str,
+    description: &str,
+    edit: &ConfigEdit,
+) -> Option<String> {
+    let new_name = edit.name.as_deref().unwrap_or(name).trim();
+    if edit.name.is_some() {
+        if new_name.is_empty() {
+            return Some("Give the room a name.".into());
+        }
+        if new_name.chars().any(super::room::is_hidden) {
+            return Some("The room name has characters that don't show. Type it again.".into());
+        }
+    }
+    let limits = [
+        edit.max_members.unwrap_or(held.max_members),
+        edit.max_recent_messages.unwrap_or(held.max_recent_messages),
+        edit.max_message_size.unwrap_or(held.max_message_size),
+        edit.max_user_bans.unwrap_or(held.max_user_bans),
+        edit.max_nickname_size.unwrap_or(held.max_nickname_size),
+        edit.max_room_name.unwrap_or(held.max_room_name),
+        edit.max_room_description
+            .unwrap_or(held.max_room_description),
+    ];
+    for (label, value) in LIMIT_LABELS.iter().zip(limits) {
+        if value == 0 {
+            return Some(format!("{label} must be at least 1."));
+        }
+    }
+    // The room contract is wasm32, where a limit is a u32: a larger one is signed and then
+    // refused by the node with no reason. The sanity ceilings are this app's own guard against
+    // a slip of the keyboard, not a rule of the room.
+    for (i, (label, set)) in LIMIT_LABELS
+        .iter()
+        .zip([
+            edit.max_members,
+            edit.max_recent_messages,
+            edit.max_message_size,
+            edit.max_user_bans,
+            edit.max_nickname_size,
+            edit.max_room_name,
+            edit.max_room_description,
+        ])
+        .enumerate()
+    {
+        let Some(v) = set else { continue };
+        if v as u64 > u64::from(u32::MAX) {
+            return Some(format!(
+                "{label} can be at most {} (the largest number a room can hold).",
+                u32::MAX
+            ));
+        }
+        if i != 4 && v > LIMIT_SANITY_CEILINGS[i] {
+            return Some(format!(
+                "{label} can be at most {} here. That is far more than a room needs.",
+                LIMIT_SANITY_CEILINGS[i]
+            ));
+        }
+    }
+    let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
+    // A held limit over the ceiling is lowered by `normalize_for_signing`; only one set
+    // here is refused.
+    if edit.max_nickname_size.is_some_and(|n| n > ceiling) {
+        return Some(format!("Max nickname size can be at most {ceiling} bytes."));
+    }
+    let new_description = edit.description.as_deref().unwrap_or(description).trim();
+    if !new_name.is_empty() && new_name.len() > limits[5] {
+        return Some(format!(
+            "The room name is {} bytes, and this room's limit is {} (Max Room Name Size).",
+            new_name.len(),
+            limits[5]
+        ));
+    }
+    if new_description.len() > limits[6] {
+        return Some(format!(
+            "The description is {} bytes, and this room's limit is {} (Max Room Description Size).",
+            new_description.len(),
+            limits[6]
+        ));
+    }
+    None
+}
+
+/// As derived, except the name and description (a private room's are secret) are not printed.
+impl std::fmt::Debug for ConfigEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hidden = |o: &Option<String>| o.as_ref().map(|_| "<hidden>");
+        f.debug_struct("ConfigEdit")
+            .field("name", &hidden(&self.name))
+            .field("description", &hidden(&self.description))
+            .field("max_members", &self.max_members)
+            .field("max_recent_messages", &self.max_recent_messages)
+            .field("max_message_size", &self.max_message_size)
+            .field("max_user_bans", &self.max_user_bans)
+            .field("max_nickname_size", &self.max_nickname_size)
+            .field("max_room_name", &self.max_room_name)
+            .field("max_room_description", &self.max_room_description)
+            .finish()
     }
 }
 
@@ -552,6 +798,144 @@ fn held_deputies(room: &LiveRoom, me: MemberId) -> Vec<MemberId> {
 /// What a message is stamped with. Tests set it.
 pub(super) type Clock = Box<dyn Fn() -> SystemTime + Send>;
 
+/// What an entry labels itself as when it is about the room's details.
+const CONFIG_LABEL: &str = "Your change to the room's details";
+
+pub(super) const CONFIG_SUPERSEDED: &str =
+    "A newer change to the room's details, made elsewhere, replaced this one.";
+pub(super) const CONFIG_NO_VERSION_LEFT: &str =
+    "The room's details have been changed as many times as the room can count.";
+const NOT_OWNER: &str = "Only the room's owner can change its details.";
+
+/// The update that publishes `config`, the owner's next configuration.
+pub(super) fn config_delta(config: &AuthorizedConfigurationV1) -> ChatRoomStateV1Delta {
+    ChatRoomStateV1Delta {
+        configuration: Some(config.clone()),
+        ..Default::default()
+    }
+}
+
+/// Build and sign the owner's next configuration for `edit` at `version`, as the web UI's room
+/// details dialog does: the configuration the room holds with the changes, the name and
+/// description sealed under the room's CURRENT secret in a private room (never plain: a private
+/// room with no secret here refuses, freenet/river#299; an empty description is `None`, which
+/// has nothing to leak), normalized and checked as `riverctl` does before signing, signed with
+/// the owner's key.
+fn build_config(
+    room: &LiveRoom,
+    edit: &ConfigEdit,
+    ctx: &ConfigCtx,
+) -> Result<AuthorizedConfigurationV1, String> {
+    let sk = room
+        .stored
+        .self_sk
+        .as_ref()
+        .ok_or_else(|| Blocked::NoKey.reason().to_owned())?;
+    if sk.verifying_key() != room.stored.owner_vk {
+        return Err(NOT_OWNER.into());
+    }
+    let held = &ctx.base;
+    let details = room.details_of(held);
+    if let Some(why) = details_refusal(
+        &details.limits,
+        &details.name_source,
+        &details.description_source,
+        edit,
+    ) {
+        return Err(why);
+    }
+    let secret = if room.is_private() {
+        Some(
+            room.current_secret()
+                .ok_or_else(|| Blocked::NoSecret.reason().to_owned())?,
+        )
+    } else {
+        None
+    };
+    let seal = |text: &str| match secret {
+        Some((secret, v)) => seal_bytes(text.as_bytes(), &secret, v),
+        None => SealedBytes::public(text.as_bytes().to_vec()),
+    };
+    let mut next = held.clone();
+    next.configuration_version = ctx
+        .version
+        .ok_or_else(|| CONFIG_NO_VERSION_LEFT.to_owned())?;
+    if let Some(name) = &edit.name {
+        next.display.name = seal(name.trim());
+    }
+    if let Some(description) = &edit.description {
+        let description = description.trim();
+        next.display.description = (!description.is_empty()).then(|| seal(description));
+    }
+    edit.apply_limits(&mut next);
+    let params = room.params();
+    next.normalize_for_signing(held, &params);
+    if let Some(why) = next.signing_refusal(&params) {
+        return Err(why);
+    }
+    Ok(AuthorizedConfigurationV1::new(next, sk))
+}
+
+/// What a configuration is built on, and at which version.
+struct ConfigCtx {
+    /// The configuration to apply the owner's changes to: the room's, or one of this app's own
+    /// that the node may yet take (sent and not refused), so a change made while another is on
+    /// its way keeps that one's.
+    base: Configuration,
+    /// The version to sign at: above the base and above every change still waiting. `None`
+    /// when no version is left.
+    version: Option<u32>,
+}
+
+/// Where `config` stands in `room`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigState {
+    /// The room's configuration is this one.
+    Ours,
+    /// The room holds another that outranks it: a later version, or the same version that wins
+    /// on the signature digest, as when the owner's other device changed the room at the same
+    /// time.
+    Superseded,
+    /// The room holds nothing as new as this (it was not taken).
+    Absent,
+}
+
+fn config_state(room: &LiveRoom, config: &AuthorizedConfigurationV1) -> ConfigState {
+    let held = &room.stored.room_state.configuration;
+    if held.signature == config.signature {
+        return ConfigState::Ours;
+    }
+    let params = room.params();
+    if held.rank(&params) > config.rank(&params) {
+        ConfigState::Superseded
+    } else {
+        ConfigState::Absent
+    }
+}
+
+/// Whether the room holds a configuration at the version of `config` or later that is not
+/// `config` itself: another device of the owner got there first (whichever wins the tie on the
+/// signature digest), and `config`, built without that device's changes, would replace them.
+fn config_outdated(room: &LiveRoom, config: &AuthorizedConfigurationV1) -> bool {
+    let held = &room.stored.room_state.configuration;
+    held.signature != config.signature
+        && held.configuration.configuration_version >= config.configuration.configuration_version
+}
+
+/// Whether a configuration's sealing is the room's kind now: its name sealed in a private room,
+/// plain in a public one. One made while the room was the other kind must be signed again.
+fn config_privacy_matches(room: &LiveRoom, config: &AuthorizedConfigurationV1) -> bool {
+    let c = &config.configuration;
+    c.privacy_mode
+        == room
+            .stored
+            .room_state
+            .configuration
+            .configuration
+            .privacy_mode
+        && c.display.name.is_public() != room.is_private()
+}
+
 /// What the user wrote or did, kept so it can be built again (on Retry, or sealed again).
 #[derive(Clone)]
 enum Intent {
@@ -565,6 +949,8 @@ enum Intent {
     },
     /// Your own nickname, as the user typed it (trimmed).
     Nickname { nickname: String },
+    /// A change to the room's details.
+    Config(ConfigEdit),
 }
 
 /// As derived, except a nickname is not printed.
@@ -582,6 +968,7 @@ impl std::fmt::Debug for Intent {
                 .field("actions", actions)
                 .finish(),
             Intent::Nickname { .. } => f.write_str("Nickname(<hidden>)"),
+            Intent::Config(edit) => f.debug_tuple("Config").field(edit).finish(),
         }
     }
 }
@@ -600,6 +987,7 @@ impl Intent {
             Intent::Text { reply: Some(_), .. } => "Your reply",
             Intent::Actions { label, .. } => label,
             Intent::Nickname { .. } => NICKNAME_LABEL,
+            Intent::Config(_) => CONFIG_LABEL,
         }
     }
 
@@ -630,6 +1018,8 @@ impl Intent {
                 .collect(),
             // Not a message: built by `build_info`.
             Intent::Nickname { .. } => Vec::new(),
+            // Not a message: built by `build_config`.
+            Intent::Config(_) => Vec::new(),
         }
     }
 }
@@ -792,6 +1182,9 @@ struct Entry {
     messages: Vec<AuthorizedMessageV1>,
     /// For a nickname change: the signed record to publish (and `messages` is empty).
     info: Option<AuthorizedMemberInfo>,
+    /// For a change to the room's details: the signed configuration to publish (and `messages`
+    /// is empty).
+    config: Option<AuthorizedConfigurationV1>,
     status: Status,
     /// These messages went to the node at least once. From then on they are only ever sent
     /// again as they are, never rebuilt: the node may have taken them, and a rebuilt message
@@ -836,18 +1229,38 @@ impl Entry {
                     .iter()
                     .filter_map(|i| i.member_info.preferred_nickname.secret_version()),
             )
+            .chain(self.config.iter().flat_map(|c| {
+                let display = &c.configuration.display;
+                display.name.secret_version().into_iter().chain(
+                    display
+                        .description
+                        .as_ref()
+                        .and_then(|d| d.secret_version()),
+                )
+            }))
     }
 
     /// The update that publishes it.
     fn delta(&self, room: &LiveRoom) -> ChatRoomStateV1Delta {
-        match &self.info {
-            Some(info) => info_delta(room, info),
-            None => delta(room, &self.messages),
+        match (&self.info, &self.config) {
+            (Some(info), _) => info_delta(room, info),
+            (None, Some(config)) => config_delta(config),
+            (None, None) => delta(room, &self.messages),
         }
     }
 
     /// `room` with it applied, or why the room would not take it.
     fn applied(&self, room: &LiveRoom) -> Result<LiveRoom, String> {
+        if let Some(config) = &self.config {
+            let mut next = room.clone();
+            next.apply_delta(config_delta(config))
+                .map_err(|e| format!("The room refused it: {e}"))?;
+            return match config_state(&next, config) {
+                ConfigState::Ours => Ok(next),
+                ConfigState::Superseded => Err(CONFIG_SUPERSEDED.into()),
+                ConfigState::Absent => Err(REMOVED.into()),
+            };
+        }
         let Some(info) = &self.info else {
             return applied(room, &self.messages);
         };
@@ -869,11 +1282,15 @@ impl Entry {
                 .info
                 .as_ref()
                 .is_none_or(|i| info_state(room, i) != InfoState::Absent)
+            && self
+                .config
+                .as_ref()
+                .is_none_or(|c| config_state(room, c) != ConfigState::Absent)
     }
 
     /// Whether it carries anything to publish.
     fn has_payload(&self) -> bool {
-        !self.messages.is_empty() || self.info.is_some()
+        !self.messages.is_empty() || self.info.is_some() || self.config.is_some()
     }
 
     /// Whether Retry can do anything for it.
@@ -968,10 +1385,86 @@ impl Outbox {
             .checked_add(1)
     }
 
-    fn add(&mut self, room: &LiveRoom, label: &'static str, intent: Option<Intent>) -> u64 {
+    /// What the next configuration of `room` is built on ([`ConfigCtx`]), leaving out the
+    /// entry `exclude`.
+    fn config_ctx(&self, room: &LiveRoom, exclude: u64) -> ConfigCtx {
+        let mut base = room.stored.room_state.configuration.configuration.clone();
+        let mut top = base.configuration_version;
+        for e in self
+            .entries
+            .iter()
+            .filter(|e| e.room == room.stored.owner_vk && e.id != exclude)
+        {
+            let Some(c) = &e.config else {
+                continue;
+            };
+            let version = c.configuration.configuration_version;
+            top = top.max(version);
+            // Only one that went to the node can still land, and so must be kept.
+            if e.sent
+                && !matches!(e.status, Status::Failed(_))
+                && version > base.configuration_version
+            {
+                base = c.configuration.clone();
+            }
+        }
+        ConfigCtx {
+            base,
+            version: top.checked_add(1),
+        }
+    }
+
+    /// A configuration refused, or replaced, is no longer something a waiting one is built on:
+    /// build each waiting configuration of `room` again on what the room holds.
+    fn rebuild_waiting_configs(&mut self, room: &LiveRoom) {
+        let ids: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.room == room.stored.owner_vk && e.status == Status::Queued && e.config.is_some()
+            })
+            .map(|e| e.id)
+            .collect();
+        for id in ids {
+            let ctx = self.config_ctx(room, id);
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                e.config = None;
+                rebuild(e, room, None, &ctx);
+            }
+        }
+    }
+
+    fn add(&mut self, room: &LiveRoom, label: &'static str, mut intent: Option<Intent>) -> u64 {
         self.next += 1;
         let id = self.next;
         let fresh = self.fresh_info_version(room, id);
+        if let Some(Intent::Config(edit)) = &mut intent {
+            // A newer change to the details replaces every older one that is not on its way
+            // (waiting, refused, or taken but replaced), keeping what the older ones changed
+            // that this does not: the dialog starts from the room as shown, which counts them.
+            // Keeping one would let its Retry bring the old values back at a higher version.
+            // One that is out keeps its turn: the node's answer for it is still owed.
+            let mut merged = std::mem::take(edit);
+            let (older, keep): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut self.entries)
+                .into_iter()
+                .partition(|e| {
+                    e.room == room.stored.owner_vk
+                        && matches!(e.intent, Some(Intent::Config(_)))
+                        && !matches!(e.status, Status::InFlight { .. })
+                });
+            self.entries = keep;
+            for e in older {
+                // Only what the dialog showed is kept: one that failed, or that the room
+                // replaced, was not shown, and its values would come back over a newer change
+                // (of this owner's other device, or the node's refusal of them).
+                let shown = !matches!(e.status, Status::Failed(_)) && e.applied(room).is_ok();
+                if shown && let Some(Intent::Config(old)) = &e.intent {
+                    merged = merged.over(old);
+                }
+            }
+            *edit = merged;
+        }
+        let ctx = self.config_ctx(room, id);
         if matches!(intent, Some(Intent::Nickname { .. })) {
             // A newer nickname replaces every older one that is not on its way: waiting,
             // refused, or taken but replaced. Keeping one would let its Retry bring the old
@@ -993,11 +1486,12 @@ impl Outbox {
             time: (self.clock)(),
             messages: Vec::new(),
             info: None,
+            config: None,
             status: Status::Queued,
             sent: false,
             forced: 0,
         };
-        rebuild(&mut entry, room, fresh);
+        rebuild(&mut entry, room, fresh, &ctx);
         self.entries.push(entry);
         id
     }
@@ -1045,6 +1539,23 @@ impl Outbox {
             }
             Ok(m.id())
         };
+        if let Action::SetRoomDetails { edit } = &action {
+            // Refused before it is queued, so a bad value shows as a failed entry with its
+            // reason rather than a silent no-op.
+            let details = room.details();
+            if edit.is_empty() {
+                return Err((CONFIG_LABEL, "There is nothing to change.".into()));
+            }
+            return match details_refusal(
+                &details.limits,
+                &details.name_source,
+                &details.description_source,
+                edit,
+            ) {
+                Some(why) => Err((CONFIG_LABEL, why)),
+                None => Ok(Intent::Config(edit.clone())),
+            };
+        }
         if let Action::SetNickname { nickname } = &action {
             let nickname = nickname.trim().to_owned();
             let max = room
@@ -1132,6 +1643,7 @@ impl Outbox {
             Action::Retry { .. }
             | Action::Discard { .. }
             | Action::SetNickname { .. }
+            | Action::SetRoomDetails { .. }
             | Action::Invite
             | Action::CreateRoom { .. }
             | Action::Join { .. }
@@ -1145,6 +1657,7 @@ impl Outbox {
 
     fn retry(&mut self, id: u64, room: &LiveRoom) -> bool {
         let fresh = self.fresh_info_version(room, id);
+        let ctx = self.config_ctx(room, id);
         let current = room.current_secret().map(|(_, v)| v);
         let Some(entry) = self
             .entries
@@ -1189,7 +1702,21 @@ impl Outbox {
                     (_, None) if had => None,
                     (f, _) => f,
                 };
-                rebuild(entry, room, fresh);
+                // Likewise a refused configuration: a fresh version, never one it had.
+                let had_config = entry.config.is_some();
+                let above_old_config = entry
+                    .config
+                    .take()
+                    .and_then(|c| c.configuration.configuration_version.checked_add(1));
+                let ctx = ConfigCtx {
+                    version: match (ctx.version, above_old_config) {
+                        (Some(f), Some(o)) => Some(f.max(o)),
+                        (_, None) if had_config => None,
+                        (f, _) => f,
+                    },
+                    ..ctx
+                };
+                rebuild(entry, room, fresh, &ctx);
             }
         }
         true
@@ -1210,7 +1737,12 @@ impl Outbox {
         let current = room.current_secret().map(|(_, v)| v);
         let me = room.stored.self_verifying_key();
         let fresh = self.fresh_info_version(room, 0);
-        for entry in self.entries.iter_mut() {
+        let ctxs: Vec<ConfigCtx> = self
+            .entries
+            .iter()
+            .map(|e| self.config_ctx(room, e.id))
+            .collect();
+        for (entry, ctx) in self.entries.iter_mut().zip(&ctxs) {
             if entry.room != vk || entry.status != Status::Queued {
                 continue;
             }
@@ -1231,11 +1763,26 @@ impl Outbox {
                 if stale {
                     entry.info = None;
                     entry.sent = false;
-                    rebuild(entry, room, fresh);
+                    rebuild(entry, room, fresh, ctx);
                     *changed = true;
                     if entry.status != Status::Queued {
                         continue;
                     }
+                }
+            }
+            // A configuration signed for what the room was is signed again for what it is: its
+            // name must never go out plain into a room that has since turned private, and the
+            // room may have moved to a version it no longer outranks (another device of the
+            // owner). It is a new one, built on what the room holds now.
+            if !entry.sent
+                && let Some(config) = &entry.config
+                && (!config_privacy_matches(room, config) || config_outdated(room, config))
+            {
+                entry.config = None;
+                rebuild(entry, room, fresh, ctx);
+                *changed = true;
+                if entry.status != Status::Queued {
+                    continue;
                 }
             }
             if !entry.sent {
@@ -1246,7 +1793,7 @@ impl Outbox {
                 }
                 if entry.sealed_before(current) {
                     // Sealed again under the room's current secret, keeping its time.
-                    rebuild(entry, room, None);
+                    rebuild(entry, room, None, ctx);
                     *changed = true;
                     if entry.status != Status::Queued {
                         continue;
@@ -1309,7 +1856,12 @@ impl Outbox {
                 let entry = self.entries[i].clone();
                 let applied = room.apply_delta(entry.delta(room));
                 let state = entry.info.as_ref().map(|info| info_state(room, info));
+                let config_state_now = entry.config.as_ref().map(|c| config_state(room, c));
                 match applied {
+                    // Taken, but another configuration outranks it (the owner's other device).
+                    Ok(()) if config_state_now == Some(ConfigState::Superseded) => {
+                        self.entries[i].status = Status::Unconfirmed(CONFIG_SUPERSEDED.into());
+                    }
                     Ok(()) if state == Some(InfoState::Superseded) => {
                         // Taken, but another record of yours won: never the cache.
                         self.entries[i].status = Status::Unconfirmed(SUPERSEDED.into());
@@ -1328,14 +1880,17 @@ impl Outbox {
                         // A newer change of yours is the room's now, so an older one still
                         // waiting for its answer is explained by it.
                         self.entries.retain(|e| {
-                            !(e.room == entry.room && e.label == NICKNAME_LABEL && e.id < entry.id)
+                            !(e.room == entry.room
+                                && e.id < entry.id
+                                && (e.label == NICKNAME_LABEL
+                                    || (entry.config.is_some() && e.label == CONFIG_LABEL)))
                         });
                     }
                     // Taken by the node, so never built or sent again from here.
                     Ok(()) => {
                         self.entries[i].status = Status::Unconfirmed(format!(
                             "Freenet took it, but the room here doesn't show it. {}",
-                            if entry.info.is_some() {
+                            if entry.info.is_some() || entry.config.is_some() {
                                 REMOVED.to_owned()
                             } else {
                                 why_not_kept(room, &messages)
@@ -1351,19 +1906,24 @@ impl Outbox {
                 }
             }
             Err(reason) => {
-                // A nickname refused while a newer one of yours exists is simply replaced:
-                // a Retry would sign it above the newer and put the old name back.
+                // A nickname (or change to the details) refused while a newer one of yours
+                // exists is simply replaced: a Retry would sign it above the newer and put the
+                // old values back.
                 let (vk, id) = (self.entries[i].room, self.entries[i].id);
-                let replaced = self.entries[i].label == NICKNAME_LABEL
+                let label = self.entries[i].label;
+                let replaced = (label == NICKNAME_LABEL || label == CONFIG_LABEL)
                     && self
                         .entries
                         .iter()
-                        .any(|e| e.room == vk && e.label == NICKNAME_LABEL && e.id > id);
+                        .any(|e| e.room == vk && e.label == label && e.id > id);
                 if replaced {
                     self.entries.remove(i);
                 } else {
                     self.entries[i].status =
                         Status::Failed(format!("Freenet refused it: {reason}"));
+                }
+                if label == CONFIG_LABEL {
+                    self.rebuild_waiting_configs(room);
                 }
             }
         }
@@ -1465,10 +2025,38 @@ impl Outbox {
             .filter(|e| e.room == vk && e.info.is_some())
             .map(|e| e.id)
             .max();
+        // Likewise for the details.
+        let newest_config = entries
+            .iter()
+            .filter(|e| e.room == vk && e.config.is_some())
+            .map(|e| e.id)
+            .max();
         for mut e in entries {
             if e.room != vk || !e.has_payload() {
                 keep.push(e);
                 continue;
+            }
+            match e.config.as_ref().map(|c| config_state(room, c)) {
+                Some(ConfigState::Superseded) if newest_config.is_some_and(|n| n > e.id) => {
+                    changed = true;
+                    continue;
+                }
+                Some(ConfigState::Superseded) => {
+                    let already = matches!(&e.status, Status::Failed(w) | Status::Unconfirmed(w) if w == CONFIG_SUPERSEDED);
+                    // Waiting, it is built again on top of what the room holds when it goes
+                    // out; only one that was sent is replaced.
+                    if e.sent && !already {
+                        e.status = Status::Unconfirmed(CONFIG_SUPERSEDED.into());
+                        changed = true;
+                    }
+                    keep.push(e);
+                    continue;
+                }
+                Some(ConfigState::Ours) => {
+                    changed = true;
+                    continue;
+                }
+                _ => {}
             }
             match e.info.as_ref().map(|i| info_state(room, i)) {
                 Some(InfoState::Superseded) if newest_own.is_some_and(|n| n > e.id) => {
@@ -1513,19 +2101,12 @@ impl Outbox {
 
     /// `room` with what is on its way applied, which entries show as rows (by message key),
     /// and the troubles with no row to show them on.
-    fn overlay(
-        &self,
-        room: &LiveRoom,
-    ) -> (
-        LiveRoom,
-        HashMap<String, Pending>,
-        Vec<Notice>,
-        Option<Pending>,
-    ) {
+    fn overlay(&self, room: &LiveRoom) -> Overlay {
         let mut shown = room.clone();
         let mut rows = HashMap::new();
         let mut notices = Vec::new();
         let mut own_nickname = None;
+        let mut config_pending = None;
         for e in self
             .entries
             .iter()
@@ -1547,6 +2128,19 @@ impl Outbox {
             if e.info.is_some() || matches!(e.intent, Some(Intent::Nickname { .. })) {
                 // The newest nickname change is the one the dialog shows.
                 own_nickname = Some(Pending {
+                    entry: e.id,
+                    // Said as the dialog shows it: each outcome in its own words.
+                    failed: match &e.status {
+                        Status::Failed(why) => Some(format!("Not saved. {why}")),
+                        Status::Unconfirmed(why) => Some(why.clone()),
+                        Status::InFlight { late: true, .. } => Some(LATE.to_owned()),
+                        _ => None,
+                    },
+                    retry: e.retryable(),
+                });
+            }
+            if matches!(e.intent, Some(Intent::Config(_))) {
+                config_pending = Some(Pending {
                     entry: e.id,
                     // Said as the dialog shows it: each outcome in its own words.
                     failed: match &e.status {
@@ -1581,19 +2175,20 @@ impl Outbox {
                 });
             }
         }
-        (shown, rows, notices, own_nickname)
+        (shown, rows, notices, own_nickname, config_pending)
     }
 
     /// The chat screen's view of `room`, with what is on its way shown as if sent and marked.
     pub fn view(&self, room: &LiveRoom, minutes: &dyn Fn(SystemTime) -> u32) -> Room {
         let mut view = if self.entries.iter().any(|e| e.room == room.stored.owner_vk) {
-            let (shown, rows, notices, own_nickname) = self.overlay(room);
+            let (shown, rows, notices, own_nickname, config_pending) = self.overlay(room);
             let mut view = shown.view(minutes);
             for m in &mut view.messages {
                 m.pending = rows.get(&m.key).cloned();
             }
             view.notices = notices;
             view.own_nickname = own_nickname;
+            view.details.pending = config_pending;
             view
         } else {
             room.view(minutes)
@@ -1604,13 +2199,42 @@ impl Outbox {
     }
 }
 
+/// `room` with what is on its way applied, the pending message rows, the notices, and the
+/// pending nickname and details changes.
+type Overlay = (
+    LiveRoom,
+    HashMap<String, Pending>,
+    Vec<Notice>,
+    Option<Pending>,
+    Option<Pending>,
+);
+
 /// Build `entry` again against `room`: at its time, under the room's current secret. Fails
 /// it when it cannot be built, or when the room's identity is no longer the one it was
 /// written as.
-fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>) {
+fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: &ConfigCtx) {
     let Some(intent) = &entry.intent else {
         return;
     };
+    if let Intent::Config(edit) = intent {
+        match build_config(room, edit, ctx) {
+            Ok(config) => {
+                // Written as the owner it is signed as.
+                let author = room.stored.self_verifying_key();
+                if entry.author.is_some() && entry.author != author {
+                    entry.status = Status::Failed(IDENTITY_CHANGED.into());
+                    return;
+                }
+                entry.author = author;
+                entry.config = Some(config);
+                if let Err(e) = entry.applied(room) {
+                    entry.status = Status::Failed(e);
+                }
+            }
+            Err(e) => entry.status = Status::Failed(e),
+        }
+        return;
+    }
     if let Intent::Nickname { nickname } = intent {
         // Sealed again keeps the version it had; a new one takes `fresh_version`.
         let Some(version) = entry

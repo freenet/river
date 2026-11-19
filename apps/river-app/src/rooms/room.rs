@@ -15,6 +15,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::ecies::{
     decrypt_with_symmetric_key, try_decrypt_secret_from_member_blob_raw, unseal_bytes_with_secrets,
 };
+use river_core::room_state::configuration::Configuration;
 use river_core::room_state::content::{
     CONTENT_TYPE_REPLY, CONTENT_TYPE_TEXT, ReplyContentV1, TextContentV1,
 };
@@ -26,7 +27,17 @@ use river_core::room_state::privacy::{PrivacyMode, SealedBytes};
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use river_core::stored_rooms::StoredRoom;
 
-use crate::chat::model::{self, Member, MemberId, Message, Reaction, ReplyTo, Role, Room};
+use crate::chat::model::{
+    self, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role, Room,
+    Usage,
+};
+
+/// Why the owner can't change the room's details here (the web UI's `edit-room-no-key-notice`).
+pub const NO_KEY_TO_EDIT: &str =
+    "This device doesn't hold your key for this room, so you can't change its settings here.";
+/// Why the owner of a private room can't change its name or description yet (the web UI's
+/// privacy guard, freenet/river#299, which refuses with only a log line).
+pub const NO_SECRET_TO_EDIT: &str = "This private room's key hasn't reached this computer yet, so you can't change its settings here until it does.";
 
 /// How many characters of the replied-to message a reply quotes.
 const REPLY_PREVIEW_CHARS: usize = 100;
@@ -506,6 +517,58 @@ impl LiveRoom {
                 .min(river_core::room_state::member_info::NICKNAME_CEILING),
             own_nickname: None,
             nickname_block: None,
+            details: self.details(),
+        }
+    }
+
+    /// What the room details dialog shows beyond the name, description and privacy: the web
+    /// UI's `EditRoomModal` fields, and whether this member may change them (its
+    /// `OwnerEditGate`: the owner, holding the private half of the key, since every change is
+    /// signed).
+    pub fn details(&self) -> Details {
+        self.details_of(&self.stored.room_state.configuration.configuration)
+    }
+
+    /// [`details`](Self::details) as `config`, a configuration of this room (the room's, or
+    /// one waiting to be published), would show.
+    pub fn details_of(&self, config: &Configuration) -> Details {
+        let is_owner = self.stored.self_verifying_key() == Some(self.stored.owner_vk);
+        let editable = if !is_owner {
+            Editable::No
+        } else if self.stored.self_sk.is_none() {
+            Editable::Blocked(NO_KEY_TO_EDIT.into())
+        } else if self.is_private() && self.current_secret().is_none() {
+            Editable::Blocked(NO_SECRET_TO_EDIT.into())
+        } else {
+            Editable::Yes
+        };
+        Details {
+            contract_id: self.contract_id().to_string(),
+            owner_key: bs58::encode(self.stored.owner_vk.to_bytes()).into_string(),
+            limits: Limits {
+                max_members: config.max_members,
+                max_recent_messages: config.max_recent_messages,
+                max_message_size: config.max_message_size,
+                max_user_bans: config.max_user_bans,
+                max_nickname_size: config.max_nickname_size,
+                max_room_name: config.max_room_name,
+                max_room_description: config.max_room_description,
+            },
+            usage: Usage {
+                members: self.stored.room_state.members.members.len(),
+                bans: self.stored.room_state.bans.0.len(),
+                messages: self.stored.room_state.recent_messages.messages.len(),
+            },
+            secret_version: self.stored.room_state.secrets.current_version,
+            name_source: self.unseal(&config.display.name).unwrap_or_default(),
+            description_source: config
+                .display
+                .description
+                .as_ref()
+                .and_then(|d| self.unseal(d))
+                .unwrap_or_default(),
+            editable,
+            pending: None,
         }
     }
 

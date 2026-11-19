@@ -16,9 +16,9 @@
 //! this does NOT protect against").
 //!
 //! It sends what the user writes in a room they are a member of: messages, replies, edits and
-//! deletions of their own messages, reactions, and a change of their own nickname, each as an
-//! UPDATE of the room contract
-//! ([`outbox`]). It makes invitations, creates rooms and joins them from invitations
+//! deletions of their own messages, reactions, a change of their own nickname and (for a room's
+//! owner) changes to the room's details, each as an UPDATE of the room contract ([`outbox`]).
+//! It makes invitations, creates rooms and joins them from invitations
 //! ([`create`], [`work`]). Those are the only times it writes the chat delegate's storage,
 //! which the web UI writes too, at the same time: it writes only with the web UI's generation
 //! compare-and-swap, only adds a room where none is stored, and in `rooms_meta` only changes
