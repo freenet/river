@@ -2366,6 +2366,10 @@ fn a_link_in_the_header_description_opens_the_page_not_the_dialog() {
         "# Welcome to [Freenet](https://freenet.org/news)\n\nMore below.",
         "- [Freenet](https://freenet.org/news) news\n- other",
         "\nRead https://freenet.org/news first.",
+        // A pipe in the text (a separator) must not turn the links off.
+        "Official room | [Freenet](https://freenet.org/news) | be kind",
+        "Official room - https://freenet.org/news | be kind",
+        "Docs: <https://freenet.org/news> | Matrix: ask",
     ] {
         let mut state = connected();
         state
