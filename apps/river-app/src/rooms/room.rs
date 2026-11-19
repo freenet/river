@@ -307,7 +307,7 @@ impl LiveRoom {
             .collect()
     }
 
-    fn unseal(&self, sealed: &SealedBytes) -> Option<String> {
+    pub(super) fn unseal(&self, sealed: &SealedBytes) -> Option<String> {
         unseal_bytes_with_secrets(sealed, &self.secrets)
             .ok()
             .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -400,6 +400,10 @@ impl LiveRoom {
         let badges = me
             .map(|me| deputies::badges(&state.members, &state.member_info, owner, me))
             .unwrap_or_default();
+        // Who you have made a deputy yourself (your own canonical record), whoever else has.
+        let my_deputies: &[RiverMemberId] = me
+            .map(|me| state.member_info.deputies_of(me))
+            .unwrap_or_default();
         let mut push_member = |id: RiverMemberId, role: Role, key: String, ids: &mut Ids| {
             let badge = badges.get(&id);
             let deputized_by = badge
@@ -428,6 +432,7 @@ impl LiveRoom {
                 claimed: self.claimed_nickname(id),
                 deputized_by,
                 can_ban_you: badge.and_then(|b| b.can_ban_viewer),
+                my_deputy: my_deputies.contains(&id),
                 order: id.0.0,
             });
         };
@@ -560,6 +565,10 @@ impl LiveRoom {
                 .min(river_core::room_state::member_info::NICKNAME_CEILING),
             own_nickname: None,
             nickname_block: None,
+            deputy_changes: Vec::new(),
+            deputy_block: None,
+            deputy_grant_block: None,
+            deputies_full: my_deputies.len() >= river_core::room_state::member_info::MAX_DEPUTIES,
             details: self.details(),
             wraps: Some(
                 shown
@@ -647,7 +656,7 @@ impl LiveRoom {
             .is_some_and(|n| !shown_nickname(&n).is_empty())
     }
 
-    fn nickname(&self, id: RiverMemberId, me: Option<RiverMemberId>) -> String {
+    pub(super) fn nickname(&self, id: RiverMemberId, me: Option<RiverMemberId>) -> String {
         let state = &self.stored.room_state;
         let sealed = state
             .member_info

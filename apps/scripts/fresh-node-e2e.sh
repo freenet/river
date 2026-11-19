@@ -7,7 +7,8 @@
 # node the app approves its grant, registers the chat delegate and reads an empty room list;
 # the app on the gateway creates a room and an invitation, the app on the peer joins from
 # it, each receives the other's message, and each changes its own nickname and the other sees
-# it. Last, the example asks each node's chat delegate for
+# it; the owner makes the joiner a deputy, whose app shows the Deputy tag, and revokes it. Last,
+# the example asks each node's chat delegate for
 # the room's signing key and requires it to be that app's own member key (the app's background
 # sweep stores it). Then the owner's app changes the room's name, description and a limit (a new
 # signed configuration) and the other app shows them, and the other app's member is refused when

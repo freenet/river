@@ -369,6 +369,46 @@ fn nickname_scene(s: &mut RiverApp, edit: fn(&mut Chat, &mut chat::model::Room))
     });
 }
 
+/// The member dialog of `uid` in the example room `room`, shown as a room from the node (so
+/// the deputy buttons send commands), after `room_edit` changed the room and `chat_edit` the chat.
+fn deputy_scene(
+    s: &mut RiverApp,
+    room: &str,
+    uid: &str,
+    room_edit: fn(&mut chat::model::Room),
+    chat_edit: fn(&mut Chat),
+) {
+    connect(s);
+    let mut rooms = chat::example::data().rooms;
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    if let Some(r) = rooms.iter_mut().find(|r| r.key == room) {
+        room_edit(r);
+    }
+    s.chat
+        .show_node_rooms(rooms, None, chat::LinkStatus::Live, 29_000_000);
+    s.chat.select(room);
+    s.chat.open_member(uid);
+    chat_edit(&mut s.chat);
+}
+
+/// One of your own pending changes for the deputy scenes.
+fn deputy_change(
+    uid: &str,
+    grant: bool,
+    failed: Option<&str>,
+    retry: bool,
+) -> chat::model::DeputyChange {
+    chat::model::DeputyChange {
+        uid: uid.into(),
+        grant,
+        pending: chat::model::Pending {
+            entry: 1,
+            failed: failed.map(str::to_owned),
+            retry,
+        },
+    }
+}
+
 /// A long description for the details scenes: paragraphs, links and a list.
 const LONG_DESCRIPTION: &str = "Welcome to the **Book Club**. We read one book a month and talk about it on the last Sunday, see [the schedule](https://freenet.org/schedule).\n\nHow it works:\n\n- Pick up the book from [the library](https://freenet.org/library) or any shop\n- Post your thoughts here as you read, spoilers marked\n- Vote for the next book in the poll at the start of each month\n\nBe kind and read the [rules](https://freenet.org/rules) before you post.";
 
@@ -640,6 +680,68 @@ pub const SCENES: &[Scene] = &[
             chat.nickname.replace_text("Sam");
             room.nickname_block = Some(rooms::outbox::PRUNED_MESSAGE.into());
         })
+    }),
+    // Deputize and Revoke deputy in a member's dialog. Sam owns Design Crew, so Priya can be
+    // made a deputy; in Town Square Elena is already Sam's deputy and can be revoked, though Sam
+    // invited nobody there. Each step: the button, the confirmation, on its way, failed, and
+    // when the room would not take a change.
+    ("chat-deputize", |s| {
+        deputy_scene(s, chat::example::PRIVATE_ROOM, "27", |_| {}, |_| {})
+    }),
+    ("chat-deputize-confirm", |s| {
+        deputy_scene(
+            s,
+            chat::example::PRIVATE_ROOM,
+            "27",
+            |_| {},
+            |c| c.ask_deputy(),
+        )
+    }),
+    ("chat-deputize-sending", |s| {
+        deputy_scene(
+            s,
+            chat::example::PRIVATE_ROOM,
+            "27",
+            |r| {
+                if let Some(m) = r.members.iter_mut().find(|m| m.uid == "27") {
+                    m.my_deputy = true;
+                }
+                r.deputy_changes
+                    .push(deputy_change("27", true, None, false));
+            },
+            |_| {},
+        )
+    }),
+    ("chat-deputize-failed", |s| {
+        deputy_scene(
+            s,
+            chat::example::PRIVATE_ROOM,
+            "27",
+            |r| {
+                r.deputy_changes.push(deputy_change(
+                    "27",
+                    true,
+                    Some("Not saved. Freenet refused it: the room is full."),
+                    true,
+                ));
+            },
+            |_| {},
+        )
+    }),
+    ("chat-deputize-blocked", |s| {
+        deputy_scene(
+            s,
+            chat::example::PRIVATE_ROOM,
+            "27",
+            |r| r.deputy_block = Some(rooms::outbox::PRUNED_MESSAGE.into()),
+            |_| {},
+        )
+    }),
+    ("chat-revoke-deputy", |s| {
+        deputy_scene(s, "town-square", "16", |_| {}, |_| {})
+    }),
+    ("chat-revoke-deputy-confirm", |s| {
+        deputy_scene(s, "town-square", "16", |_| {}, |c| c.ask_deputy())
     }),
     // The bell in the conversation header opens a room's notification dialog: its three modes,
     // the current one checked. The name says what changes between the variants.

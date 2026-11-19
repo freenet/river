@@ -100,7 +100,7 @@ use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1,
 use river_core::room_state::privacy::SealedBytes;
 
 use super::room::{LiveRoom, message_key};
-use crate::chat::model::{Notice, Pending, ReplyWrap, Room};
+use crate::chat::model::{DeputyChange, Notice, Pending, ReplyWrap, Room};
 
 /// Something the user did in a room, sent from the chat screen to the background work.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +143,13 @@ pub enum Action {
     /// version, sealed under the room's current secret in a private room.
     SetNickname {
         nickname: String,
+    },
+    /// Make the member `target` (River's member id, as `Member::uid`) one of your deputies, or
+    /// end that: your own `member_info` record again, with that member added to or removed from
+    /// its `deputies`, as the web UI's `DeputyButton` does.
+    SetDeputy {
+        target: String,
+        grant: bool,
     },
     /// Make an invitation to the room, for its link to be copied ([`super::create`]).
     Invite,
@@ -194,6 +201,11 @@ impl std::fmt::Debug for Action {
             Action::Retry { entry } => f.debug_struct("Retry").field("entry", entry).finish(),
             Action::Discard { entry } => f.debug_struct("Discard").field("entry", entry).finish(),
             Action::SetNickname { .. } => f.write_str("SetNickname { nickname: <hidden> }"),
+            Action::SetDeputy { target, grant } => f
+                .debug_struct("SetDeputy")
+                .field("target", target)
+                .field("grant", grant)
+                .finish(),
             Action::SetRoomDetails { edit } => f
                 .debug_struct("SetRoomDetails")
                 .field("edit", edit)
@@ -635,11 +647,25 @@ pub(super) fn delta(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> ChatRo
 /// inactivity, or not yet shown as joined. Which of those it is cannot be told from here.
 pub const PRUNED_MESSAGE: &str = PRUNED;
 
+/// The same for a change to your deputies.
+pub(crate) const PRUNED_DEPUTIES: &str = "The room doesn't list you as a member yet. Send a message \
+     first, then change your deputies.";
+
 pub(crate) const PRUNED: &str = "The room doesn't list you as a member yet. Send a message \
      first, then change your nickname.";
 
 /// What an entry labels itself as when it is about your nickname.
 const NICKNAME_LABEL: &str = "Your nickname";
+/// ... about who your deputies are.
+const DEPUTY_LABEL: &str = "Your change to a deputy";
+/// ... about both, one record carrying the two changes.
+const RECORD_LABEL: &str = "Your nickname and deputies";
+
+/// Whether an entry with this label is about your own `member_info` record. A newer change to
+/// that record replaces an older one that is not on its way.
+fn is_record_label(label: &str) -> bool {
+    label == NICKNAME_LABEL || label == DEPUTY_LABEL || label == RECORD_LABEL
+}
 
 /// The update that publishes `info`, your own `member_info` record, in `room`. Like the web
 /// UI's nickname field it carries the rejoin's `members` delta, but that does not keep a pruned
@@ -672,15 +698,269 @@ pub fn nickname_refusal_in(nickname: &str, max_nickname_size: usize) -> Option<S
     river_core::room_state::member_info::nickname_refusal(nickname.len(), &config)
 }
 
-/// Build and sign your `member_info` record for `nickname` at `version`, as the web UI's
-/// nickname field does: the nickname sealed under the room's CURRENT secret in a private room
-/// (never plain: a private room with no secret here refuses, freenet/river#299), signed with
-/// your key, and your deputy grants carried over from the room's canonical record, since
-/// republishing replaces the whole record (#410).
-fn build_info(
+/// What you changed in your own `member_info` record: only the fields that changed. The record
+/// holds a nickname and your deputy grants, and republishing replaces all of it, so a change to
+/// one carries the other over from what the room holds (or, while an earlier change is on its
+/// way, from that).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(super) struct RecordEdit {
+    /// A new nickname, as typed (trimmed). `None` keeps the one the record has.
+    nickname: Option<String>,
+    /// Members to add to (`true`) or remove from (`false`) your deputies, at most one entry
+    /// per member, in the order made.
+    deputies: Vec<(MemberId, bool)>,
+}
+
+impl RecordEdit {
+    fn nickname(nickname: String) -> Self {
+        RecordEdit {
+            nickname: Some(nickname),
+            deputies: Vec::new(),
+        }
+    }
+
+    fn deputy(target: MemberId, grant: bool) -> Self {
+        RecordEdit {
+            nickname: None,
+            deputies: vec![(target, grant)],
+        }
+    }
+
+    /// This change made after `older`: what this sets wins, and what it leaves alone is
+    /// `older`'s.
+    fn over(self, older: &RecordEdit) -> RecordEdit {
+        let mut deputies: Vec<(MemberId, bool)> = older
+            .deputies
+            .iter()
+            .filter(|(t, _)| !self.deputies.iter().any(|(n, _)| n == t))
+            .copied()
+            .collect();
+        deputies.extend(self.deputies.iter().copied());
+        RecordEdit {
+            nickname: self.nickname.or_else(|| older.nickname.clone()),
+            deputies,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match (&self.nickname, self.deputies.is_empty()) {
+            (Some(_), true) => NICKNAME_LABEL,
+            (None, _) => DEPUTY_LABEL,
+            (Some(_), false) => RECORD_LABEL,
+        }
+    }
+
+    /// `base` with these changes made, in the order the web UI makes them: a grant is added at
+    /// the end, a revoked member is removed, and one already as asked is left alone. The room
+    /// takes at most [`MAX_DEPUTIES`].
+    fn apply_deputies(&self, mut base: Vec<MemberId>) -> Result<Vec<MemberId>, String> {
+        for (target, grant) in &self.deputies {
+            let at = base.iter().position(|d| d == target);
+            match (grant, at) {
+                (true, None) => base.push(*target),
+                (false, Some(i)) => {
+                    base.remove(i);
+                }
+                _ => {}
+            }
+        }
+        if base.len() > MAX_DEPUTIES {
+            return Err(too_many_deputies());
+        }
+        Ok(base)
+    }
+
+    /// Whether this only ends deputies. A revoke is possible whenever the room takes a write from
+    /// you (the web UI's `DeputyButton`: the appointer must be able to take a grant back), even
+    /// with no nickname to make again; a member the room removed for inactivity still has to
+    /// send a message first, as the room drops their record with them.
+    fn only_revokes(&self) -> bool {
+        self.nickname.is_none() && !self.deputies.is_empty() && self.deputies.iter().all(|d| !d.1)
+    }
+
+    /// What `Entry::superseded` says when another record of yours wins.
+    fn superseded(&self) -> &'static str {
+        if self.deputies.is_empty() {
+            SUPERSEDED
+        } else {
+            RECORD_SUPERSEDED
+        }
+    }
+
+    fn no_version_left(&self) -> &'static str {
+        if self.deputies.is_empty() {
+            NO_VERSION_LEFT
+        } else {
+            RECORD_NO_VERSION_LEFT
+        }
+    }
+}
+
+/// As derived, except a nickname is not printed.
+impl std::fmt::Debug for RecordEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordEdit")
+            .field("nickname", &self.nickname.as_ref().map(|_| "<hidden>"))
+            .field("deputies", &self.deputies)
+            .finish()
+    }
+}
+
+/// The most deputies one member may list (`river_core`'s `MAX_DEPUTIES`).
+pub const MAX_DEPUTIES: usize = river_core::room_state::member_info::MAX_DEPUTIES;
+
+pub fn too_many_deputies() -> String {
+    format!("You already have the most deputies a member can have ({MAX_DEPUTIES}).")
+}
+
+const NO_RECORD: &str = "This computer has no current record of your deputies for this room, so \
+     it can't change them without risking ending them all. Try again once the room has loaded.";
+
+/// What an entry labels itself as when it only says that part of a deputy change was lost.
+const DEPUTY_NOTE_LABEL: &str = "Your deputy change";
+
+/// Whether `id` is the room's owner or one of its members now.
+fn is_member(room: &LiveRoom, id: &MemberId) -> bool {
+    *id == MemberId::from(&room.stored.owner_vk)
+        || room
+            .stored
+            .room_state
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.id() == *id)
+}
+
+const NO_RECORD_NICKNAME: &str = "Your record is not loaded yet; try again in a moment.";
+
+/// A grant whose member has since left the room (banned, or removed for inactivity).
+const GONE_MEMBER: &str = "That member is no longer in the room, so they can't be made a deputy.";
+
+const NO_NICKNAME: &str = "You have no nickname in this room yet. Choose one first, then change \
+     your deputies.";
+
+/// Your nickname for a record that does not change it: the sealed one `base` (the record the
+/// room holds, or one of yours on its way) carries, as the web UI republishes it. A record
+/// sealed the way the room is not sealed now (the room turned private or public since), or under
+/// a secret older than the current one that this computer can read, is sealed again, so a
+/// private room never gets a plain nickname from here.
+fn carried_nickname(
     room: &LiveRoom,
-    nickname: &str,
+    base: Option<&AuthorizedMemberInfo>,
+) -> Result<SealedBytes, String> {
+    let held = base.map(|b| &b.member_info.preferred_nickname);
+    let current = room.current_secret();
+    let same_kind = held.is_some_and(|s| s.is_private() == room.is_private());
+    if let Some(s) = held
+        && same_kind
+        && match (s.secret_version(), current) {
+            (Some(v), Some((_, c))) => v >= c,
+            _ => true,
+        }
+    {
+        return Ok(s.clone());
+    }
+    let plain = match held {
+        Some(s) => room.unseal(s),
+        // No record: the name chosen here, if one was.
+        None => room.stored.self_nickname.clone(),
+    }
+    .filter(|n| !n.trim().is_empty());
+    let Some(plain) = plain else {
+        // Sealed under an older secret this computer can't read: it stays as it is.
+        return match held {
+            Some(s) if same_kind => Ok(s.clone()),
+            _ => Err(NO_NICKNAME.to_owned()),
+        };
+    };
+    if room.is_private() {
+        let (secret, v) = current.ok_or_else(|| Blocked::NoSecret.reason().to_owned())?;
+        Ok(seal_bytes(plain.as_bytes(), &secret, v))
+    } else {
+        Ok(SealedBytes::public(plain.into_bytes()))
+    }
+}
+
+/// The nickname and deputies of the record `edit` makes on top of `base`: the typed nickname
+/// sealed under the room's CURRENT secret in a private room (never plain: a private room with
+/// no secret here refuses, freenet/river#299), or the one `base` carries.
+fn record_parts(
+    room: &LiveRoom,
+    edit: &RecordEdit,
+    base: Option<&AuthorizedMemberInfo>,
+) -> Result<(SealedBytes, Vec<MemberId>), String> {
+    // No record of yours to build on, yet a cached one lists deputies: an empty list from here
+    // would end them all without anyone asking.
+    if base.is_none()
+        && room
+            .stored
+            .self_member_info
+            .as_ref()
+            .is_some_and(|c| !c.member_info.deputies.is_empty())
+    {
+        return Err(if edit.deputies.is_empty() {
+            NO_RECORD_NICKNAME
+        } else {
+            NO_RECORD
+        }
+        .to_owned());
+    }
+    // A grant is only honoured for a current member (a ban reads only those), so one whose
+    // member has since left is dropped, and a record that was only that is refused.
+    let mut edit = edit.clone();
+    let asked = edit.deputies.len();
+    edit.deputies
+        .retain(|(t, grant)| !*grant || is_member(room, t));
+    if edit.deputies.len() < asked && edit.nickname.is_none() && edit.deputies.is_empty() {
+        return Err(GONE_MEMBER.to_owned());
+    }
+    let edit = &edit;
+    let deputies = edit.apply_deputies(
+        base.map(|b| b.member_info.deputies.clone())
+            .unwrap_or_default(),
+    )?;
+    let preferred_nickname = match &edit.nickname {
+        Some(nickname) => {
+            let max = room
+                .stored
+                .room_state
+                .configuration
+                .configuration
+                .max_nickname_size;
+            if let Some(why) = nickname_refusal_in(nickname, max) {
+                return Err(why);
+            }
+            if room.is_private() {
+                let (secret, v) = room
+                    .current_secret()
+                    .ok_or_else(|| Blocked::NoSecret.reason().to_owned())?;
+                seal_bytes(nickname.as_bytes(), &secret, v)
+            } else {
+                SealedBytes::public(nickname.as_bytes().to_vec())
+            }
+        }
+        // A revoke is made again the way a grant is (a name held plain in a room that turned
+        // private is sealed, never republished plain), but is not stopped by a name that can't
+        // be made again: then the held one is carried as it is.
+        None if edit.only_revokes() => match (carried_nickname(room, base), base) {
+            (Ok(sealed), _) => sealed,
+            (Err(_), Some(b)) => b.member_info.preferred_nickname.clone(),
+            (Err(e), None) => return Err(e),
+        },
+        None => carried_nickname(room, base)?,
+    };
+    Ok((preferred_nickname, deputies))
+}
+
+/// Build and sign your `member_info` record for `edit` at `version`, as the web UI's nickname
+/// field and deputy button do: signed with your key, and what `edit` leaves alone (your deputy
+/// grants, or your nickname) carried over from `base` (#410), since republishing replaces the
+/// whole record.
+fn build_record(
+    room: &LiveRoom,
+    edit: &RecordEdit,
     version: u32,
+    base: Option<&AuthorizedMemberInfo>,
 ) -> Result<(VerifyingKey, AuthorizedMemberInfo), String> {
     participation(room).map_err(|b| b.reason().to_owned())?;
     let sk = room
@@ -690,29 +970,17 @@ fn build_info(
         .ok_or_else(|| Blocked::NoKey.reason().to_owned())?;
     // The room removes a member with no recent message as soon as it applies anything, so a
     // record sent with the re-adding would be dropped with the member. A message re-adds them
-    // for good, and a nickname after it holds.
+    // for good, and a change after it holds.
     if rejoin(room).0.is_some() {
-        return Err(PRUNED.into());
+        return Err(if edit.nickname.is_some() {
+            PRUNED
+        } else {
+            PRUNED_DEPUTIES
+        }
+        .into());
     }
-    let max = room
-        .stored
-        .room_state
-        .configuration
-        .configuration
-        .max_nickname_size;
-    if let Some(why) = nickname_refusal_in(nickname, max) {
-        return Err(why);
-    }
-    let preferred_nickname = if room.is_private() {
-        let (secret, v) = room
-            .current_secret()
-            .ok_or_else(|| Blocked::NoSecret.reason().to_owned())?;
-        seal_bytes(nickname.as_bytes(), &secret, v)
-    } else {
-        SealedBytes::public(nickname.as_bytes().to_vec())
-    };
+    let (preferred_nickname, deputies) = record_parts(room, edit, base)?;
     let me = MemberId::from(&sk.verifying_key());
-    let deputies = held_deputies(room, me);
     let info = AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
             member_id: me,
@@ -723,6 +991,30 @@ fn build_info(
         sk,
     );
     Ok((sk.verifying_key(), info))
+}
+
+/// Whether `info`, built for `edit` on an earlier view of the room, is not what `edit` makes of
+/// the room now (`base`): another device of yours changed the deputies or the nickname it
+/// carried over, or the room changed kind. It is signed again, at a fresh version, so a grant
+/// revoked elsewhere does not come back and a nickname renamed elsewhere is not undone.
+fn record_stale(
+    room: &LiveRoom,
+    edit: &RecordEdit,
+    info: &AuthorizedMemberInfo,
+    base: Option<&AuthorizedMemberInfo>,
+) -> bool {
+    if !privacy_matches(room, info) {
+        return true;
+    }
+    match record_parts(room, edit, base) {
+        // What it would be now can't be made: build again, which says why.
+        Err(_) => true,
+        Ok((nickname, deputies)) => {
+            deputies != info.member_info.deputies
+                || (edit.nickname.is_none()
+                    && room.unseal(&nickname) != room.unseal(&info.member_info.preferred_nickname))
+        }
+    }
 }
 
 /// The version of your `member_info` record the room (or the record cached for rejoining)
@@ -781,16 +1073,6 @@ fn privacy_matches(room: &LiveRoom, info: &AuthorizedMemberInfo) -> bool {
     )
 }
 
-/// The deputy grants the room holds for you now.
-fn held_deputies(room: &LiveRoom, me: MemberId) -> Vec<MemberId> {
-    room.stored
-        .room_state
-        .member_info
-        .canonical(me)
-        .map(|i| i.member_info.deputies.clone())
-        .unwrap_or_default()
-}
-
 /// What a message is stamped with. Tests set it.
 pub(super) type Clock = Box<dyn Fn() -> SystemTime + Send>;
 
@@ -820,7 +1102,7 @@ pub(super) fn config_delta(config: &AuthorizedConfigurationV1) -> ChatRoomStateV
 fn build_config(
     room: &LiveRoom,
     edit: &ConfigEdit,
-    ctx: &ConfigCtx,
+    ctx: &BuildCtx,
 ) -> Result<AuthorizedConfigurationV1, String> {
     let sk = room
         .stored
@@ -873,7 +1155,7 @@ fn build_config(
 }
 
 /// What a configuration is built on, and at which version.
-struct ConfigCtx {
+struct BuildCtx {
     /// The configuration to apply the owner's changes to: the room's, or one of this app's own
     /// that the node may yet take (sent and not refused), so a change made while another is on
     /// its way keeps that one's.
@@ -881,6 +1163,11 @@ struct ConfigCtx {
     /// The version to sign at: above the base and above every change still waiting. `None`
     /// when no version is left.
     version: Option<u32>,
+    /// What a new `member_info` record of yours is built on: the room's canonical one, or one of
+    /// this app's own that the node may yet take (sent and not refused), so a nickname changed
+    /// while a deputy change is on its way keeps that deputy, and the other way round. `None`
+    /// when there is none.
+    info: Option<AuthorizedMemberInfo>,
 }
 
 /// Where `config` stands in `room`.
@@ -943,8 +1230,8 @@ enum Intent {
         label: &'static str,
         actions: Vec<ActionContentV1>,
     },
-    /// Your own nickname, as the user typed it (trimmed).
-    Nickname { nickname: String },
+    /// A change to your own `member_info` record: your nickname, your deputies, or both.
+    Record(RecordEdit),
     /// A change to the room's details.
     Config(ConfigEdit),
 }
@@ -963,7 +1250,7 @@ impl std::fmt::Debug for Intent {
                 .field("label", label)
                 .field("actions", actions)
                 .finish(),
-            Intent::Nickname { .. } => f.write_str("Nickname(<hidden>)"),
+            Intent::Record(edit) => f.debug_tuple("Record").field(edit).finish(),
             Intent::Config(edit) => f.debug_tuple("Config").field(edit).finish(),
         }
     }
@@ -975,7 +1262,7 @@ impl Intent {
             Intent::Text { reply: None, .. } => "Your message",
             Intent::Text { reply: Some(_), .. } => "Your reply",
             Intent::Actions { label, .. } => label,
-            Intent::Nickname { .. } => NICKNAME_LABEL,
+            Intent::Record(edit) => edit.label(),
             Intent::Config(_) => CONFIG_LABEL,
         }
     }
@@ -1005,8 +1292,8 @@ impl Intent {
                 .iter()
                 .map(|a| (CONTENT_TYPE_ACTION, ACTION_CONTENT_VERSION, a.encode()))
                 .collect(),
-            // Not a message: built by `build_info`.
-            Intent::Nickname { .. } => Vec::new(),
+            // Not a message: built by `build_record`.
+            Intent::Record(_) => Vec::new(),
             // Not a message: built by `build_config`.
             Intent::Config(_) => Vec::new(),
         }
@@ -1117,6 +1404,10 @@ pub(super) const NO_VERSION_LEFT: &str =
     "Your nickname has been changed as many times as the room can count.";
 pub(super) const SUPERSEDED: &str =
     "A newer change to your nickname, made elsewhere, replaced this one.";
+pub(super) const RECORD_NO_VERSION_LEFT: &str =
+    "Your nickname and deputies have been changed as many times as the room can count.";
+pub(super) const RECORD_SUPERSEDED: &str =
+    "A newer change to your nickname or deputies, made elsewhere, replaced this one.";
 pub(super) const REMOVED: &str = "The room didn't take it. You may have been removed or banned.";
 /// How many times an update the node never answers is sent again on a new connection before
 /// it is left unconfirmed: each time costs every room a reconnect.
@@ -1258,7 +1549,7 @@ impl Entry {
             .map_err(|e| format!("The room refused it: {e}"))?;
         match info_state(&next, info) {
             InfoState::Ours => Ok(next),
-            InfoState::Superseded => Err(SUPERSEDED.into()),
+            InfoState::Superseded => Err(self.superseded().into()),
             InfoState::Absent => Err(REMOVED.into()),
         }
     }
@@ -1275,6 +1566,14 @@ impl Entry {
                 .config
                 .as_ref()
                 .is_none_or(|c| config_state(room, c) != ConfigState::Absent)
+    }
+
+    /// What it says when another record of yours replaced it.
+    fn superseded(&self) -> &'static str {
+        match &self.intent {
+            Some(Intent::Record(edit)) => edit.superseded(),
+            _ => SUPERSEDED,
+        }
     }
 
     /// Whether it carries anything to publish.
@@ -1374,16 +1673,35 @@ impl Outbox {
             .checked_add(1)
     }
 
-    /// What the next configuration of `room` is built on ([`ConfigCtx`]), leaving out the
+    /// What the next configuration of `room` is built on ([`BuildCtx`]), leaving out the
     /// entry `exclude`.
-    fn config_ctx(&self, room: &LiveRoom, exclude: u64) -> ConfigCtx {
+    fn config_ctx(&self, room: &LiveRoom, exclude: u64) -> BuildCtx {
         let mut base = room.stored.room_state.configuration.configuration.clone();
         let mut top = base.configuration_version;
+        let mut info = room
+            .stored
+            .self_verifying_key()
+            .and_then(|vk| {
+                room.stored
+                    .room_state
+                    .member_info
+                    .canonical(MemberId::from(&vk))
+            })
+            .cloned();
         for e in self
             .entries
             .iter()
             .filter(|e| e.room == room.stored.owner_vk && e.id != exclude)
         {
+            if let Some(i) = &e.info
+                && e.sent
+                && !matches!(e.status, Status::Failed(_))
+                && info
+                    .as_ref()
+                    .is_none_or(|b| i.member_info.version > b.member_info.version)
+            {
+                info = Some(i.clone());
+            }
             let Some(c) = &e.config else {
                 continue;
             };
@@ -1397,9 +1715,10 @@ impl Outbox {
                 base = c.configuration.clone();
             }
         }
-        ConfigCtx {
+        BuildCtx {
             base,
             version: top.checked_add(1),
+            info,
         }
     }
 
@@ -1419,6 +1738,112 @@ impl Outbox {
             if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
                 e.config = None;
                 rebuild(e, room, None, &ctx);
+            }
+        }
+    }
+
+    /// Say, as a trouble to discard, that part of a deputy change was lost.
+    fn note(&mut self, room: &LiveRoom, reason: String) {
+        self.next += 1;
+        let entry = Entry {
+            id: self.next,
+            room: room.stored.owner_vk,
+            intent: None,
+            label: DEPUTY_NOTE_LABEL,
+            author: room.stored.self_verifying_key(),
+            time: (self.clock)(),
+            messages: Vec::new(),
+            info: None,
+            config: None,
+            status: Status::Failed(reason),
+            sent: false,
+            forced: 0,
+        };
+        self.entries.push(entry);
+    }
+
+    /// Before a waiting record goes out: a grant whose member has left the room is not sent
+    /// (and said), and a change already as asked (a revoke of one who is no deputy any more)
+    /// is not published as a new version that changes nothing. A record left with no change is
+    /// dropped as done.
+    fn settle_deputy_changes(&mut self, room: &LiveRoom, changed: &mut bool) {
+        let vk = room.stored.owner_vk;
+        let me = room.stored.self_verifying_key().map(|k| MemberId::from(&k));
+        let ids: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| e.room == vk && e.status == Status::Queued && !e.sent)
+            .filter(|e| matches!(&e.intent, Some(Intent::Record(r)) if !r.deputies.is_empty()))
+            .map(|e| e.id)
+            .collect();
+        for id in ids {
+            let ctx = self.config_ctx(room, id);
+            let base: Vec<MemberId> = ctx
+                .info
+                .as_ref()
+                .map(|i| i.member_info.deputies.clone())
+                .unwrap_or_default();
+            let Some(Intent::Record(edit)) = self
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.intent.clone())
+            else {
+                continue;
+            };
+            let mut gone = Vec::new();
+            let mut kept = Vec::new();
+            for (target, grant) in &edit.deputies {
+                if *grant && !is_member(room, target) {
+                    gone.push(*target);
+                } else if base.contains(target) != *grant {
+                    kept.push((*target, *grant));
+                }
+            }
+            if kept.len() == edit.deputies.len() {
+                continue;
+            }
+            *changed = true;
+            for target in gone {
+                let name = room.nickname(target, me);
+                self.note(
+                    room,
+                    format!("The grant for {name} was not sent: they are no longer a member."),
+                );
+            }
+            if edit.nickname.is_none() && kept.is_empty() {
+                self.entries.retain(|e| e.id != id);
+                continue;
+            }
+            let fresh = self.fresh_info_version(room, id);
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                let mut edit = edit;
+                edit.deputies = kept;
+                e.label = edit.label();
+                e.intent = Some(Intent::Record(edit));
+                e.info = None;
+                rebuild(e, room, fresh, &ctx);
+            }
+        }
+    }
+
+    /// A record of yours refused, or replaced, is no longer something a waiting one is built on:
+    /// build each waiting record of `room` again on what the room holds.
+    fn rebuild_waiting_records(&mut self, room: &LiveRoom) {
+        let ids: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.room == room.stored.owner_vk && e.status == Status::Queued && e.info.is_some()
+            })
+            .map(|e| e.id)
+            .collect();
+        for id in ids {
+            let ctx = self.config_ctx(room, id);
+            let fresh = self.fresh_info_version(room, id);
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                e.info = None;
+                rebuild(e, room, fresh, &ctx);
             }
         }
     }
@@ -1453,18 +1878,54 @@ impl Outbox {
             }
             *edit = merged;
         }
-        let ctx = self.config_ctx(room, id);
-        if matches!(intent, Some(Intent::Nickname { .. })) {
-            // A newer nickname replaces every older one that is not on its way: waiting,
-            // refused, or taken but replaced. Keeping one would let its Retry bring the old
-            // name back at a higher version than this. One that is out keeps its turn: the
-            // node's answer for it is still owed.
+        let mut label = label;
+        if let Some(Intent::Record(edit)) = &mut intent {
+            // A newer change to the record replaces every older one that is not on its way
+            // (waiting, refused, or taken but replaced), keeping what the older ones changed
+            // that this does not: a nickname typed, and a deputy made, one after the other
+            // while the first still waits, are one record. Keeping one would let its Retry
+            // bring the old values back at a higher version than this. One that is out keeps
+            // its turn: the node's answer for it is still owed.
+            let mut merged = std::mem::take(edit);
+            let (older, keep): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut self.entries)
+                .into_iter()
+                .partition(|e| {
+                    e.room == room.stored.owner_vk
+                        && is_record_label(e.label)
+                        && !matches!(e.status, Status::InFlight { .. })
+                });
+            self.entries = keep;
+            let mut lost = Vec::new();
+            for e in older {
+                // Only what the room showed is kept: one that failed, or that the room
+                // replaced, was not shown, and its values would come back over a newer change
+                // (of this member's other device, or the node's refusal of them).
+                let shown = !matches!(e.status, Status::Failed(_)) && e.applied(room).is_ok();
+                if shown && let Some(Intent::Record(old)) = &e.intent {
+                    merged = merged.over(old);
+                } else if let (Status::Failed(why), Some(Intent::Record(old))) =
+                    (&e.status, &e.intent)
+                    && !old.deputies.is_empty()
+                {
+                    // A refused change to who is a deputy is not lost without a word.
+                    lost.push(why.clone());
+                }
+            }
+            for why in lost {
+                self.note(room, why);
+            }
+            label = merged.label();
+            *edit = merged;
+        } else if intent.is_none() && is_record_label(label) {
+            // One refused before it was built replaces the older refusals, but not a change
+            // still waiting, which is not affected by it.
             self.entries.retain(|e| {
                 !(e.room == room.stored.owner_vk
-                    && e.label == NICKNAME_LABEL
-                    && !matches!(e.status, Status::InFlight { .. }))
+                    && is_record_label(e.label)
+                    && matches!(e.status, Status::Failed(_)))
             });
         }
+        let ctx = self.config_ctx(room, id);
         let mut entry = Entry {
             id,
             room: room.stored.owner_vk,
@@ -1555,8 +2016,55 @@ impl Outbox {
                 .max_nickname_size;
             return match nickname_refusal_in(&nickname, max) {
                 Some(why) => Err((NICKNAME_LABEL, why)),
-                None => Ok(Intent::Nickname { nickname }),
+                None => Ok(Intent::Record(RecordEdit::nickname(nickname))),
             };
+        }
+        if let Action::SetDeputy { target, grant } = &action {
+            let label = DEPUTY_LABEL;
+            let me = me.ok_or((label, Blocked::NoKey.reason().to_owned()))?;
+            let owner = MemberId::from(&room.stored.owner_vk);
+            // Yours as shown, counting changes still on their way.
+            let shown = self.overlay(room).0;
+            let held: Vec<MemberId> = shown
+                .stored
+                .room_state
+                .member_info
+                .canonical(me)
+                .map(|i| i.member_info.deputies.clone())
+                .unwrap_or_default();
+            let target = std::iter::once(owner)
+                .chain(
+                    room.stored
+                        .room_state
+                        .members
+                        .members
+                        .iter()
+                        .map(|m| m.member.id()),
+                )
+                .chain(held.iter().copied())
+                .find(|id| id.to_string() == *target)
+                .ok_or((label, "That member is gone.".to_owned()))?;
+            if target == me {
+                return Err((label, "You can't make yourself a deputy.".to_owned()));
+            }
+            if target == owner {
+                return Err((
+                    label,
+                    "The room's owner already has full authority, so can't be made a deputy."
+                        .to_owned(),
+                ));
+            }
+            let is_deputy = held.contains(&target);
+            if *grant && is_deputy {
+                return Err((label, "They are already your deputy.".to_owned()));
+            }
+            if !*grant && !is_deputy {
+                return Err((label, "They are not your deputy.".to_owned()));
+            }
+            if *grant && held.len() >= MAX_DEPUTIES {
+                return Err((label, too_many_deputies()));
+            }
+            return Ok(Intent::Record(RecordEdit::deputy(target, *grant)));
         }
         let empty = match &action {
             Action::Send { text, .. } => text.trim().is_empty().then_some("Your message"),
@@ -1624,6 +2132,7 @@ impl Outbox {
             Action::Retry { .. }
             | Action::Discard { .. }
             | Action::SetNickname { .. }
+            | Action::SetDeputy { .. }
             | Action::SetRoomDetails { .. }
             | Action::Invite
             | Action::CreateRoom { .. }
@@ -1689,7 +2198,7 @@ impl Outbox {
                     .config
                     .take()
                     .and_then(|c| c.configuration.configuration_version.checked_add(1));
-                let ctx = ConfigCtx {
+                let ctx = BuildCtx {
                     version: match (ctx.version, above_old_config) {
                         (Some(f), Some(o)) => Some(f.max(o)),
                         (_, None) if had_config => None,
@@ -1715,10 +2224,11 @@ impl Outbox {
         if self.owed.get(&vk).is_some_and(|o| !o.is_empty()) {
             return None;
         }
+        self.settle_deputy_changes(room, changed);
         let current = room.current_secret().map(|(_, v)| v);
         let me = room.stored.self_verifying_key();
         let fresh = self.fresh_info_version(room, 0);
-        let ctxs: Vec<ConfigCtx> = self
+        let ctxs: Vec<BuildCtx> = self
             .entries
             .iter()
             .map(|e| self.config_ctx(room, e.id))
@@ -1732,15 +2242,14 @@ impl Outbox {
                 *changed = true;
                 continue;
             }
-            // A nickname signed for what the room was is signed again for what it is: a record
+            // A record signed for what the room was is signed again for what it is: a nickname
             // made while the room was public must never go out plain into a room that has
-            // since turned private, and the deputy grants it carries must be the ones the room
-            // holds now (one revoked elsewhere would come back). It is a new record, at a
-            // fresh version above what the room holds.
-            if let Some(info) = &entry.info {
-                let me = info.member_info.member_id;
+            // since turned private, and the deputy grants and nickname it carries over must be
+            // the ones the room holds now (a grant revoked elsewhere would come back, a rename
+            // be undone). It is a new record, at a fresh version above what the room holds.
+            if let (Some(info), Some(Intent::Record(edit))) = (&entry.info, &entry.intent) {
                 let stale = !privacy_matches(room, info)
-                    || (!entry.sent && held_deputies(room, me) != info.member_info.deputies);
+                    || (!entry.sent && record_stale(room, edit, info, ctx.info.as_ref()));
                 if stale {
                     entry.info = None;
                     entry.sent = false;
@@ -1845,17 +2354,19 @@ impl Outbox {
                     }
                     Ok(()) if state == Some(InfoState::Superseded) => {
                         // Taken, but another record of yours won: never the cache.
-                        self.entries[i].status = Status::Unconfirmed(SUPERSEDED.into());
+                        self.entries[i].status = Status::Unconfirmed(entry.superseded().into());
                     }
                     Ok(()) if entry.held_in(room) => {
                         // Keep what is cached for re-adding us in step with the edit, as the
                         // web UI's `record_self_nickname_edit` does, but only when this record
                         // is the room's.
-                        if let (Some(info), Some(Intent::Nickname { nickname })) =
+                        if let (Some(info), Some(Intent::Record(edit))) =
                             (&entry.info, &entry.intent)
                         {
                             room.stored.self_member_info = Some(info.clone());
-                            room.stored.self_nickname = Some(nickname.clone());
+                            if let Some(nickname) = &edit.nickname {
+                                room.stored.self_nickname = Some(nickname.clone());
+                            }
                         }
                         self.entries.remove(i);
                         // A newer change of yours is the room's now, so an older one still
@@ -1863,7 +2374,7 @@ impl Outbox {
                         self.entries.retain(|e| {
                             !(e.room == entry.room
                                 && e.id < entry.id
-                                && (e.label == NICKNAME_LABEL
+                                && ((entry.info.is_some() && is_record_label(e.label))
                                     || (entry.config.is_some() && e.label == CONFIG_LABEL)))
                         });
                     }
@@ -1892,19 +2403,32 @@ impl Outbox {
                 // old values back.
                 let (vk, id) = (self.entries[i].room, self.entries[i].id);
                 let label = self.entries[i].label;
-                let replaced = (label == NICKNAME_LABEL || label == CONFIG_LABEL)
-                    && self
-                        .entries
-                        .iter()
-                        .any(|e| e.room == vk && e.label == label && e.id > id);
+                let replaced = (is_record_label(label) || label == CONFIG_LABEL)
+                    && self.entries.iter().any(|e| {
+                        e.room == vk
+                            && e.id > id
+                            && if is_record_label(label) {
+                                is_record_label(e.label)
+                            } else {
+                                e.label == label
+                            }
+                    });
                 if replaced {
+                    let lost = matches!(&self.entries[i].intent,
+                        Some(Intent::Record(r)) if !r.deputies.is_empty());
                     self.entries.remove(i);
+                    if lost {
+                        self.note(room, format!("Freenet refused it: {reason}"));
+                    }
                 } else {
                     self.entries[i].status =
                         Status::Failed(format!("Freenet refused it: {reason}"));
                 }
                 if label == CONFIG_LABEL {
                     self.rebuild_waiting_configs(room);
+                }
+                if is_record_label(label) {
+                    self.rebuild_waiting_records(room);
                 }
             }
         }
@@ -2044,21 +2568,21 @@ impl Outbox {
                     changed = true;
                 }
                 Some(InfoState::Superseded) => {
-                    let already = matches!(&e.status, Status::Failed(w) | Status::Unconfirmed(w) if w == SUPERSEDED);
+                    let text = e.superseded();
+                    let already = matches!(&e.status, Status::Failed(w) | Status::Unconfirmed(w) if w == text);
                     if !already {
                         e.status = if e.sent {
-                            Status::Unconfirmed(SUPERSEDED.into())
+                            Status::Unconfirmed(text.into())
                         } else {
-                            Status::Failed(SUPERSEDED.into())
+                            Status::Failed(text.into())
                         };
                         changed = true;
                     }
                     keep.push(e);
                 }
                 Some(InfoState::Ours) if e.held_in(room) => {
-                    if let (Some(info), Some(Intent::Nickname { nickname })) = (&e.info, &e.intent)
-                    {
-                        cache = Some((info.clone(), nickname.clone()));
+                    if let (Some(info), Some(Intent::Record(edit))) = (&e.info, &e.intent) {
+                        cache = Some((info.clone(), edit.nickname.clone()));
                     }
                     changed = true;
                 }
@@ -2069,7 +2593,9 @@ impl Outbox {
         self.entries = keep;
         if let Some((info, nickname)) = cache {
             room.stored.self_member_info = Some(info);
-            room.stored.self_nickname = Some(nickname);
+            if nickname.is_some() {
+                room.stored.self_nickname = nickname;
+            }
         }
         changed
     }
@@ -2088,6 +2614,7 @@ impl Outbox {
         let mut notices = Vec::new();
         let mut own_nickname = None;
         let mut config_pending = None;
+        let mut deputy_changes = Vec::new();
         for e in self
             .entries
             .iter()
@@ -2106,32 +2633,39 @@ impl Outbox {
                     }
                     Err(_) => false,
                 };
-            if e.info.is_some() || matches!(e.intent, Some(Intent::Nickname { .. })) {
-                // The newest nickname change is the one the dialog shows.
-                own_nickname = Some(Pending {
-                    entry: e.id,
-                    // Said as the dialog shows it: each outcome in its own words.
-                    failed: match &e.status {
-                        Status::Failed(why) => Some(format!("Not saved. {why}")),
-                        Status::Unconfirmed(why) => Some(why.clone()),
-                        Status::InFlight { late: true, .. } => Some(LATE.to_owned()),
-                        _ => None,
-                    },
-                    retry: e.retryable(),
-                });
+            // Said as the dialog shows it: each outcome in its own words.
+            let dialog_pending = || Pending {
+                entry: e.id,
+                failed: match &e.status {
+                    Status::Failed(why) => Some(format!("Not saved. {why}")),
+                    Status::Unconfirmed(why) => Some(why.clone()),
+                    Status::InFlight { late: true, .. } => Some(LATE.to_owned()),
+                    _ => None,
+                },
+                retry: e.retryable(),
+            };
+            if let Some(Intent::Record(edit)) = &e.intent {
+                if edit.nickname.is_some() {
+                    // The newest nickname change is the one the dialog shows.
+                    own_nickname = Some(dialog_pending());
+                }
+                // Likewise, for each member, the newest change to whether they are a deputy.
+                for (target, grant) in &edit.deputies {
+                    // A grant for one who has left is not sent, so it is not shown as on its way.
+                    if *grant && !is_member(room, target) {
+                        continue;
+                    }
+                    let uid = target.to_string();
+                    deputy_changes.retain(|c: &DeputyChange| c.uid != uid);
+                    deputy_changes.push(DeputyChange {
+                        uid,
+                        grant: *grant,
+                        pending: dialog_pending(),
+                    });
+                }
             }
             if matches!(e.intent, Some(Intent::Config(_))) {
-                config_pending = Some(Pending {
-                    entry: e.id,
-                    // Said as the dialog shows it: each outcome in its own words.
-                    failed: match &e.status {
-                        Status::Failed(why) => Some(format!("Not saved. {why}")),
-                        Status::Unconfirmed(why) => Some(why.clone()),
-                        Status::InFlight { late: true, .. } => Some(LATE.to_owned()),
-                        _ => None,
-                    },
-                    retry: e.retryable(),
-                });
+                config_pending = Some(dialog_pending());
             }
             if on_screen && e.is_text() {
                 for m in &e.messages {
@@ -2156,13 +2690,21 @@ impl Outbox {
                 });
             }
         }
-        (shown, rows, notices, own_nickname, config_pending)
+        (
+            shown,
+            rows,
+            notices,
+            own_nickname,
+            config_pending,
+            deputy_changes,
+        )
     }
 
     /// The chat screen's view of `room`, with what is on its way shown as if sent and marked.
     pub fn view(&self, room: &LiveRoom, minutes: &dyn Fn(SystemTime) -> u32) -> Room {
         let mut view = if self.entries.iter().any(|e| e.room == room.stored.owner_vk) {
-            let (shown, rows, notices, own_nickname, config_pending) = self.overlay(room);
+            let (shown, rows, notices, own_nickname, config_pending, deputy_changes) =
+                self.overlay(room);
             let mut view = shown.view(minutes);
             for m in &mut view.messages {
                 m.pending = rows.get(&m.key).cloned();
@@ -2170,30 +2712,52 @@ impl Outbox {
             view.notices = notices;
             view.own_nickname = own_nickname;
             view.details.pending = config_pending;
+            view.deputy_changes = deputy_changes;
             view
         } else {
             room.view(minutes)
         };
         view.send_block = participation(room).err().map(|b| b.reason().to_owned());
         view.nickname_block = rejoin(room).0.is_some().then(|| PRUNED.to_owned());
+        // A change to your deputies is a change to your record: the room must take it, and it
+        // must have a nickname to carry over.
+        view.deputy_block = view.send_block.clone().or_else(|| {
+            view.nickname_block
+                .is_some()
+                .then(|| PRUNED_DEPUTIES.to_owned())
+        });
+        // A grant also needs a nickname to carry over and a record to build on; a revoke does
+        // not (it is possible whenever the room takes a write from you, except that a member the
+        // room removed for inactivity must send a message first).
+        view.deputy_grant_block = (|| {
+            let me = room
+                .stored
+                .self_verifying_key()
+                .map(|vk| MemberId::from(&vk))?;
+            let base = room.stored.room_state.member_info.canonical(me);
+            record_parts(room, &RecordEdit::deputy(me, true), base)
+                .err()
+                .filter(|why| why != GONE_MEMBER)
+        })();
         view
     }
 }
 
-/// `room` with what is on its way applied, the pending message rows, the notices, and the
-/// pending nickname and details changes.
+/// `room` with what is on its way applied, the pending message rows, the notices, the pending
+/// nickname and details changes, and the pending changes to who your deputies are.
 type Overlay = (
     LiveRoom,
     HashMap<String, Pending>,
     Vec<Notice>,
     Option<Pending>,
     Option<Pending>,
+    Vec<DeputyChange>,
 );
 
 /// Build `entry` again against `room`: at its time, under the room's current secret. Fails
 /// it when it cannot be built, or when the room's identity is no longer the one it was
 /// written as.
-fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: &ConfigCtx) {
+fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: &BuildCtx) {
     let Some(intent) = &entry.intent else {
         return;
     };
@@ -2216,7 +2780,7 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: 
         }
         return;
     }
-    if let Intent::Nickname { nickname } = intent {
+    if let Intent::Record(edit) = intent {
         // Sealed again keeps the version it had; a new one takes `fresh_version`.
         let Some(version) = entry
             .info
@@ -2224,10 +2788,10 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: 
             .map(|i| i.member_info.version)
             .or(fresh_version)
         else {
-            entry.status = Status::Failed(NO_VERSION_LEFT.into());
+            entry.status = Status::Failed(edit.no_version_left().into());
             return;
         };
-        match build_info(room, nickname, version) {
+        match build_record(room, edit, version, ctx.info.as_ref()) {
             Ok((author, info)) => {
                 if entry.author.is_some_and(|a| a != author) {
                     entry.status = Status::Failed(IDENTITY_CHANGED.into());

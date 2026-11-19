@@ -202,6 +202,9 @@ pub struct Chat {
     pub at_bottom: bool,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
+    /// In the open member dialog: the deputy change being confirmed, by member (`Member::uid`)
+    /// and whether it makes them a deputy (`true`) or ends that.
+    pub deputy_confirm: Option<(String, bool)>,
     /// What is typed in the nickname field of your own member info dialog.
     pub nickname: TextEdit,
     /// Why the nickname typed was refused when Save was pressed with nothing in it.
@@ -336,6 +339,7 @@ impl Chat {
             mention_off: None,
             at_bottom: true,
             member_modal: None,
+            deputy_confirm: None,
             nickname: TextEdit::new(""),
             nickname_error: None,
             details: None,
@@ -962,6 +966,7 @@ impl Chat {
         edit.focused = member.id == self.room().map_or(0, |r| r.me);
         self.nickname = edit;
         self.nickname_error = None;
+        self.deputy_confirm = None;
         self.details = None;
         self.member_modal = Some(uid.to_owned());
     }
@@ -969,6 +974,100 @@ impl Chat {
     pub fn close_member(&mut self) {
         self.member_modal = None;
         self.nickname_error = None;
+        self.deputy_confirm = None;
+    }
+
+    /// What the open member dialog offers about making this member your deputy, and what stops
+    /// it now: the offer (as the web UI's deputy button decides it), then why it can't be used
+    /// yet, if it can't.
+    pub fn deputy_offer(&self) -> Option<(member_modal::DeputyOffer, Option<String>)> {
+        let room = self.room()?;
+        let m = room.member_by_uid(self.member_modal.as_deref()?)?;
+        let offer = member_modal::deputy_offer(room, m)?;
+        let sending = room
+            .deputy_changes
+            .iter()
+            .any(|c| c.uid == m.uid && c.pending.failed.is_none());
+        let why = if sending {
+            Some("Sending\u{2026}".to_owned())
+        } else if let Some(block) = &room.deputy_block {
+            Some(block.clone())
+        } else if offer == member_modal::DeputyOffer::Deputize && room.deputies_full {
+            Some(crate::rooms::outbox::too_many_deputies())
+        } else if offer == member_modal::DeputyOffer::Deputize {
+            room.deputy_grant_block.clone()
+        } else {
+            None
+        };
+        Some((offer, why))
+    }
+
+    /// Ask to confirm making the member in the open dialog your deputy, or ending that.
+    pub fn ask_deputy(&mut self) {
+        if let Some(uid) = self.member_modal.clone()
+            && let Some((offer, None)) = self.deputy_offer()
+        {
+            self.deputy_confirm = Some((uid, offer == member_modal::DeputyOffer::Deputize));
+        }
+    }
+
+    /// Back out of the confirmation.
+    pub fn cancel_deputy(&mut self) {
+        self.deputy_confirm = None;
+    }
+
+    /// The confirmed change goes to the node (rooms from the node), or is made in memory
+    /// (example rooms). Nothing goes if it is no longer what the dialog offers.
+    pub fn confirm_deputy(&mut self) {
+        let Some((uid, grant)) = self.deputy_confirm.take() else {
+            return;
+        };
+        if self.member_modal.as_deref() != Some(uid.as_str()) {
+            return;
+        }
+        let offered = match self.deputy_offer() {
+            Some((offer, None)) => offer == member_modal::DeputyOffer::Deputize,
+            _ => return,
+        };
+        if offered != grant {
+            return;
+        }
+        let Some(key) = self.room().map(|r| r.key.clone()) else {
+            return;
+        };
+        match self.source {
+            Source::Example => {
+                if let Some(m) = self
+                    .room_mut()
+                    .and_then(|r| r.members.iter_mut().find(|m| m.uid == uid))
+                {
+                    m.my_deputy = grant;
+                }
+            }
+            Source::Node(_) => self.emit(key, Action::SetDeputy { target: uid, grant }),
+        }
+    }
+
+    /// Try the deputy change of the open member that failed again, or drop it.
+    pub fn retry_deputy(&mut self) {
+        if let Some(entry) = self.deputy_change_entry() {
+            self.retry(entry);
+        }
+    }
+
+    pub fn discard_deputy(&mut self) {
+        if let Some(entry) = self.deputy_change_entry() {
+            self.discard(entry);
+        }
+    }
+
+    fn deputy_change_entry(&self) -> Option<u64> {
+        let uid = self.member_modal.as_deref()?;
+        self.room()?
+            .deputy_changes
+            .iter()
+            .find(|c| c.uid == uid)
+            .map(|c| c.pending.entry)
     }
 
     /// Whether the open member dialog is yours.

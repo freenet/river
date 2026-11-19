@@ -3,14 +3,10 @@
 //! they came to be in the room, and a warning when their name imitates the owner's.
 //!
 //! What it leaves out is what this app cannot do or know yet: sending a direct message, sharing
-//! an invite by one, banning and deputizing (moderation commands). Those are shown dimmed with
-//! the app's "not available yet" tooltip, not faked. Your own dialog edits your nickname
-//! (`nickname_editor`), as the web UI's `NicknameField` does.
-//!
-//! PARITY-GAPS: deputies. The view model carries no deputy grants, so there is no Deputy tag or
-//! "Deputized by" line, and only the owner's name is protected from imitation (the web UI also
-//! protects every badged deputy's name). Closing it means carrying the viewer's deputy badges
-//! (`deputy_badges_for_viewer` in `ui/src/components/members.rs`) into `Member`.
+//! an invite by one, and banning (moderation commands). Those are shown dimmed with the app's
+//! "not available yet" tooltip, not faked. Your own dialog edits your nickname
+//! (`nickname_editor`), as the web UI's `NicknameField` does. Deputize and Revoke deputy
+//! (`deputy_block`) work as the web UI's `DeputyButton` does, with a confirmation first.
 
 use std::collections::HashMap;
 
@@ -344,6 +340,170 @@ fn deputized_by_row(
     Some(names)
 }
 
+/// What the dialog offers about making a member your deputy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeputyOffer {
+    Deputize,
+    Revoke,
+}
+
+/// The web UI's `deputy_button_visible`, for `m` as `room` shows them. Nothing for yourself or the
+/// owner (who already has full authority). **Revoke** for one of your deputies, always, even when
+/// you no longer have anyone to moderate: otherwise the appointer could never take it back after
+/// a deputy removed their last invitee. **Deputize** only when you hold authority, as the owner or
+/// with someone you invited in the room, so a member who can ban nobody is not offered a power
+/// they do not have.
+pub(super) fn deputy_offer(room: &Room, m: &Member) -> Option<DeputyOffer> {
+    if m.id == room.me || m.role == Role::Owner {
+        return None;
+    }
+    if m.my_deputy {
+        return Some(DeputyOffer::Revoke);
+    }
+    let by_id: HashMap<MemberId, &Member> = room.members.iter().rev().map(|m| (m.id, m)).collect();
+    let me = by_id.get(&room.me).copied()?;
+    let authority = me.role == Role::Owner
+        || room
+            .members
+            .iter()
+            .any(|x| x.id != me.id && invited_through(&by_id, x, me));
+    authority.then_some(DeputyOffer::Deputize)
+}
+
+/// The deputy action of the dialog: its button and what it does (the web UI's own words), a
+/// confirmation in its place once asked for, and the state of a change on its way or failed.
+fn deputy_block(
+    chat: &Chat,
+    room: &Room,
+    m: &Member,
+    offer: DeputyOffer,
+    why_not: Option<String>,
+    p: &Palette,
+    k: &Kit,
+) -> El {
+    let grant = offer == DeputyOffer::Deputize;
+    let name = m.nickname.clone();
+    let words = if grant {
+        format!("Let {name} help moderate people you invited.")
+    } else {
+        format!("{name} can currently help moderate people you invited.")
+    };
+    let mut block = col().key("member-deputy").w_full().gap(8.0);
+    if chat.deputy_confirm.as_ref() == Some(&(m.uid.clone(), grant)) {
+        let title = if grant {
+            "Deputize this member?"
+        } else {
+            "Revoke this deputy?"
+        };
+        return block
+            .padding(12.0)
+            .radius(8.0)
+            .fill(p.warning_bg)
+            .border(1.0, p.warning)
+            .child(label(title, st::ROOM_STRONG, p.text).key("member-deputy-title"))
+            .child(
+                label(words, st::SMALL, p.text)
+                    .wrap_anywhere()
+                    .w_full()
+                    .key("member-deputy-words"),
+            )
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .justify_end()
+                    .child(
+                        Button::new("Cancel")
+                            .variant(ButtonVariant::Ghost)
+                            .on_press(|s: &mut RiverApp| s.chat.cancel_deputy())
+                            .build(k)
+                            .key("member-deputy-cancel"),
+                    )
+                    .child(
+                        Button::new(if grant { "Deputize" } else { "Revoke deputy" })
+                            .variant(ButtonVariant::Contrast)
+                            .on_press(|s: &mut RiverApp| s.chat.confirm_deputy())
+                            .build(k)
+                            .key("member-deputy-confirm"),
+                    ),
+            );
+    }
+    let mut button = Button::new(if grant { "Deputize" } else { "Revoke deputy" })
+        .variant(ButtonVariant::Ghost)
+        .on_press(|s: &mut RiverApp| s.chat.ask_deputy())
+        .build(k)
+        .key(if grant {
+            "member-deputize"
+        } else {
+            "member-revoke-deputy"
+        });
+    if why_not.is_some() {
+        button = button.disabled(true).opacity(0.45);
+    }
+    block = block.child(row().child(button)).child(
+        label(words, st::SMALL, p.text_muted)
+            .wrap_anywhere()
+            .w_full()
+            .key("member-deputy-words"),
+    );
+    let change = room.deputy_changes.iter().find(|c| c.uid == m.uid);
+    match change {
+        // On its way: the button says so.
+        Some(c) if c.pending.failed.is_none() => {
+            block = block.child(
+                label("Sending\u{2026}", st::SMALL, p.text_muted).key("member-deputy-status"),
+            );
+        }
+        Some(c) => {
+            let mut status = row()
+                .key("member-deputy-status")
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    label(
+                        c.pending.failed.clone().unwrap_or_default(),
+                        st::SMALL,
+                        p.danger,
+                    )
+                    .wrap()
+                    .shrink()
+                    .min_w(0.0),
+                );
+            if c.pending.retry {
+                status = status.child(
+                    Button::new("Retry")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut RiverApp| s.chat.retry_deputy())
+                        .build(k)
+                        .key("deputy-retry"),
+                );
+            }
+            status = status.child(
+                Button::new("Discard")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.discard_deputy())
+                    .build(k)
+                    .key("deputy-discard"),
+            );
+            block = block.child(status);
+        }
+        None => {}
+    }
+    // Why it can't be used now, said under it (a change on its way says "Sending" above).
+    if change.is_none()
+        && let Some(why) = why_not
+    {
+        block = block.child(
+            label(why, st::SMALL, p.text_muted)
+                .wrap()
+                .w_full()
+                .key("member-deputy-blocked"),
+        );
+    }
+    block
+}
+
 pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
     let Some(m) = room.member_by_uid(uid) else {
@@ -527,7 +687,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
     if !is_me {
         let mut names = vec![("member-dm", "DM")];
         if above && !is_owner {
-            names.extend([("member-ban", "Ban user"), ("member-deputize", "Deputize")]);
+            names.push(("member-ban", "Ban user"));
         }
         for (key, name) in names {
             actions = actions.child(not_yet(
@@ -539,6 +699,9 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         }
     }
     body = body.child(el().w_full().h(1.0).fill(p.line)).child(actions);
+    if let Some((offer, why_not)) = chat.deputy_offer().filter(|_| !is_me) {
+        body = body.child(deputy_block(chat, room, m, offer, why_not, &p, k));
+    }
 
     Dialog::new("member-info", "Member Info")
         .width(440.0)

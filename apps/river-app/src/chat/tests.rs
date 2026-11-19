@@ -1474,14 +1474,20 @@ fn what_needs_commands_this_app_lacks_is_shown_unavailable() {
     });
     let mut rt = render(state, WINDOW_SIZE);
     open_member(&mut rt, "Jonas");
-    for k in ["member-ban", "member-deputize"] {
-        let e = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some(k))
-            .unwrap_or_else(|| panic!("no {k}"));
-        assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET), "{k}");
-    }
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("member-ban"))
+        .expect("no member-ban");
+    assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET));
+    // Deputize is real: it works, so it does not say it is not available yet.
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("member-deputize"))
+        .expect("no member-deputize");
+    assert_ne!(e.help.as_deref(), Some(super::view::NOT_YET));
+    assert!(!dimmed(&rt, "member-deputize"), "Deputize is usable");
     assert!(rt.find("member-tag-invited-by-you").is_some());
 }
 
@@ -4130,4 +4136,286 @@ fn colliding_deputy_names_are_taken_in_member_id_order_not_list_order() {
     rt.invalidate();
     settle(&mut rt);
     assert!(rt.find("member-tag-impersonation").is_some());
+}
+
+// Deputize and Revoke deputy -------------------------------------------------------------------
+
+/// Node rooms where Sam (the viewer) is the owner of the first room and every other member is a
+/// plain member, after `edit`.
+fn as_owner(edit: impl FnOnce(&mut super::Room)) -> Runtime<RiverApp> {
+    node_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        for m in &mut room.members {
+            m.role = if m.id == me {
+                super::model::Role::Owner
+            } else {
+                super::model::Role::Member
+            };
+            m.my_deputy = false;
+            m.deputized_by.clear();
+            m.can_ban_you = None;
+        }
+        edit(room);
+    })
+}
+
+fn dialog_of(rt: &mut Runtime<RiverApp>, name: &str) {
+    open_member(rt, name);
+    settle(rt);
+}
+
+#[test]
+fn the_owner_is_offered_deputize_for_any_other_member_and_it_asks_first() {
+    let mut rt = as_owner(|_| {});
+    dialog_of(&mut rt, "Jonas");
+    assert!(rt.find("member-deputize").is_some());
+    assert!(rt.find("member-revoke-deputy").is_none());
+    assert!(shows(&rt, "Let Jonas help moderate people you invited."));
+    press(&mut rt, "member-deputize");
+    // Nothing is sent by the first press: it asks.
+    assert!(sent(&mut rt).is_empty());
+    assert!(rt.find("member-deputy-confirm").is_some());
+    assert!(shows(&rt, "Deputize this member?"));
+    press(&mut rt, "member-deputy-cancel");
+    assert!(sent(&mut rt).is_empty());
+    assert!(rt.find("member-deputy-confirm").is_none());
+    assert!(rt.find("member-deputize").is_some());
+    press(&mut rt, "member-deputize");
+    press(&mut rt, "member-deputy-confirm");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::SetDeputy {
+            target: uid_of(&rt, "Jonas"),
+            grant: true
+        }]
+    );
+    assert!(rt.state.chat.deputy_confirm.is_none());
+    assert!(
+        rt.state.chat.member_modal.is_some(),
+        "stays to show its state"
+    );
+}
+
+#[test]
+fn one_of_my_deputies_is_offered_revoke_even_when_i_invited_nobody() {
+    // Sam invited nobody in the example, and is not the owner; Elena is Sam's deputy.
+    let mut rt = node_rooms(|_| {});
+    dialog_of(&mut rt, "Elena Petrova");
+    assert!(rt.find("member-deputize").is_none());
+    assert!(rt.find("member-revoke-deputy").is_some());
+    assert!(shows(
+        &rt,
+        "Elena Petrova can currently help moderate people you invited."
+    ));
+    press(&mut rt, "member-revoke-deputy");
+    assert!(sent(&mut rt).is_empty());
+    assert!(shows(&rt, "Revoke this deputy?"));
+    press(&mut rt, "member-deputy-confirm");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::SetDeputy {
+            target: uid_of(&rt, "Elena Petrova"),
+            grant: false
+        }]
+    );
+}
+
+#[test]
+fn a_member_who_invited_nobody_is_not_offered_deputize() {
+    let mut rt = node_rooms(|_| {});
+    dialog_of(&mut rt, "Jonas");
+    assert!(rt.find("member-deputize").is_none());
+    assert!(rt.find("member-revoke-deputy").is_none());
+}
+
+#[test]
+fn a_member_with_someone_in_their_invite_subtree_is_offered_deputize() {
+    // Sam did not invite Tomas in the example (Jonas did): make Sam his inviter.
+    let mut rt = node_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        let tomas = room
+            .members
+            .iter_mut()
+            .find(|m| m.nickname == "Tomás")
+            .unwrap();
+        tomas.invited_by = Some(me);
+    });
+    dialog_of(&mut rt, "Jonas");
+    assert!(rt.find("member-deputize").is_some());
+}
+
+#[test]
+fn nobody_offers_deputize_for_the_owner_or_yourself() {
+    let mut rt = as_owner(|_| {});
+    dialog_of(&mut rt, "Sam Rivers");
+    assert!(rt.find("member-deputize").is_none());
+    assert!(rt.find("member-revoke-deputy").is_none());
+    key(&mut rt, Key::Escape);
+    // A member who is not the owner cannot make the owner a deputy, nor is Revoke shown for them.
+    let mut rt = node_rooms(|_| {});
+    dialog_of(&mut rt, "Maya Chen");
+    assert!(rt.find("member-deputize").is_none());
+    assert!(rt.find("member-revoke-deputy").is_none());
+}
+
+#[test]
+fn a_change_on_its_way_waits_and_a_failed_one_says_why_with_retry_and_discard() {
+    let mut rt = as_owner(|room| {
+        let uid = room
+            .members
+            .iter()
+            .find(|m| m.nickname == "Jonas")
+            .unwrap()
+            .uid
+            .clone();
+        room.members
+            .iter_mut()
+            .find(|m| m.uid == uid)
+            .unwrap()
+            .my_deputy = true;
+        room.deputy_changes.push(super::model::DeputyChange {
+            uid,
+            grant: true,
+            pending: super::model::Pending {
+                entry: 3,
+                failed: None,
+                retry: false,
+            },
+        });
+    });
+    dialog_of(&mut rt, "Jonas");
+    assert!(shows(&rt, "Sending"));
+    press(&mut rt, "member-revoke-deputy");
+    assert!(
+        rt.find("member-deputy-confirm").is_none(),
+        "one change at a time"
+    );
+    assert!(sent(&mut rt).is_empty());
+    // Failed: why, Retry and Discard; the button is usable again.
+    rt.state.chat.edit_rooms(|r| {
+        let c = &mut r[0].deputy_changes[0];
+        c.pending.failed = Some("Not saved. Freenet refused it: no".into());
+        c.pending.retry = true;
+        for m in &mut r[0].members {
+            m.my_deputy = false;
+        }
+    });
+    redraw(&mut rt);
+    assert!(shows(&rt, "Not saved. Freenet refused it: no"));
+    press(&mut rt, "deputy-retry");
+    press(&mut rt, "deputy-discard");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::Retry { entry: 3 }, Action::Discard { entry: 3 }]
+    );
+    press(&mut rt, "member-deputize");
+    assert!(rt.find("member-deputy-confirm").is_some());
+}
+
+#[test]
+fn what_the_room_would_not_take_is_said_and_the_button_is_off() {
+    let mut rt = as_owner(|room| room.deputy_block = Some("The room says no.".into()));
+    dialog_of(&mut rt, "Jonas");
+    assert!(shows(&rt, "The room says no."));
+    press(&mut rt, "member-deputize");
+    assert!(rt.find("member-deputy-confirm").is_none());
+    assert!(sent(&mut rt).is_empty());
+
+    // Full: Deputize is off and says so, Revoke is not.
+    let mut rt = as_owner(|room| room.deputies_full = true);
+    dialog_of(&mut rt, "Jonas");
+    assert!(shows(&rt, "most deputies a member can have"));
+    press(&mut rt, "member-deputize");
+    assert!(rt.find("member-deputy-confirm").is_none());
+}
+
+#[test]
+fn a_confirmation_does_not_outlive_its_dialog() {
+    let mut rt = as_owner(|_| {});
+    dialog_of(&mut rt, "Jonas");
+    press(&mut rt, "member-deputize");
+    assert!(rt.state.chat.deputy_confirm.is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.state.chat.deputy_confirm.is_none());
+    dialog_of(&mut rt, "Jonas");
+    assert!(rt.find("member-deputy-confirm").is_none());
+    // A confirmation made stale (the member is already a deputy by another device) sends nothing.
+    press(&mut rt, "member-deputize");
+    rt.state.chat.edit_rooms(|r| {
+        for m in &mut r[0].members {
+            if m.nickname == "Jonas" {
+                m.my_deputy = true;
+            }
+        }
+    });
+    rt.state.chat.confirm_deputy();
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn in_the_example_rooms_deputizing_changes_only_the_screen() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    dialog_of(&mut rt, "Elena Petrova");
+    press(&mut rt, "member-revoke-deputy");
+    press(&mut rt, "member-deputy-confirm");
+    assert!(sent(&mut rt).is_empty());
+    let room = rt.state.chat.room().unwrap();
+    assert!(
+        !room
+            .member_by_uid(&uid_of(&rt, "Elena Petrova"))
+            .unwrap()
+            .my_deputy
+    );
+}
+
+/// Whether the control keyed `key` is drawn dimmed, as a disabled one is.
+fn dimmed(rt: &Runtime<RiverApp>, key: &str) -> bool {
+    rt.elements()
+        .into_iter()
+        .any(|e| e.key.as_deref() == Some(key) && e.opacity < 0.9)
+}
+
+#[test]
+fn the_offered_buttons_are_usable_and_the_blocked_ones_are_dimmed() {
+    let mut rt = as_owner(|_| {});
+    dialog_of(&mut rt, "Jonas");
+    assert!(!dimmed(&rt, "member-deputize"));
+    let mut rt = as_owner(|r| r.deputy_block = Some("no".into()));
+    dialog_of(&mut rt, "Jonas");
+    assert!(dimmed(&rt, "member-deputize"));
+    // A revoke is not held back by what stops a grant.
+    let mut rt = node_rooms(|rooms| {
+        rooms[0].deputy_grant_block = Some("no nickname".into());
+    });
+    dialog_of(&mut rt, "Elena Petrova");
+    assert!(!dimmed(&rt, "member-revoke-deputy"));
+    // Nor is a grant held back by nothing: only by its own block.
+    let mut rt = as_owner(|r| r.deputy_grant_block = Some("no nickname".into()));
+    dialog_of(&mut rt, "Jonas");
+    assert!(dimmed(&rt, "member-deputize"));
+    assert!(shows(&rt, "no nickname"));
+}
+
+#[test]
+fn deputizing_in_a_private_room_sends_to_that_room() {
+    let mut rt = node_rooms(|_| {});
+    rt.update(|s, _| s.chat.select(PRIVATE_ROOM));
+    settle(&mut rt);
+    // Sam owns Design Crew.
+    dialog_of(&mut rt, "Priya Raman");
+    assert!(!dimmed(&rt, "member-deputize"));
+    press(&mut rt, "member-deputize");
+    press(&mut rt, "member-deputy-confirm");
+    let sent: Vec<_> = std::mem::take(&mut rt.state.chat.outgoing);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].room, PRIVATE_ROOM);
+    assert_eq!(
+        sent[0].action,
+        Action::SetDeputy {
+            target: uid_of(&rt, "Priya Raman"),
+            grant: true
+        }
+    );
 }
