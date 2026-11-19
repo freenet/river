@@ -8,17 +8,18 @@
 //!   publishes room state, so here it is one explicit Save (Enter in a one-line field saves
 //!   too) and a Cancel, and all the changes go as one new configuration.
 //! - Everyone sees the limits, read-only. The web UI shows them to the owner only.
-//! - The description is shown as markdown, in full.
+//! - The description is shown as rendered markdown, in full, to everyone; the owner edits its
+//!   source after pressing the pencil beside its heading.
 //!
 //! PARITY-GAPS: the web UI's "Leave Room" and the private room's "Rotate" (secret rotation)
 //! are in its dialog too; this app has neither command yet, so the dialog has neither button.
 //! Privacy is shown, never changed: the web UI cannot change it either.
 
-use rune::{El, col, el, row};
+use rune::{El, col, el, icon, row};
 use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextArea, TextInput};
 
+use super::icons;
 use super::markdown;
-use super::member_modal::field;
 use super::model::{Details, Editable, Limits, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::label;
@@ -36,6 +37,8 @@ pub struct DetailsForm {
     pub room: String,
     pub name: rune::TextEdit,
     pub description: rune::TextEdit,
+    /// The owner pressed the pencil: the description is the text area, not rendered markdown.
+    pub editing_description: bool,
     /// The limits as text, in [`limit_values`] order.
     pub limits: [rune::TextEdit; LIMIT_COUNT],
     /// Save was pressed and the change went to the node: the dialog closes once the room
@@ -76,6 +79,7 @@ impl DetailsForm {
             room: room.key.clone(),
             name,
             description: rune::TextEdit::new(&d.description_source),
+            editing_description: false,
             limits: limit_values(&d.limits).map(|v| rune::TextEdit::new(v.to_string())),
             saving: false,
             sent: None,
@@ -373,51 +377,100 @@ fn badge(p: &Palette) -> El {
         .child(label("PRIVATE", st::TAG, p.text_secondary))
 }
 
-/// A read-only row: a name and its value.
-fn fact(key: &str, name: &str, value: String, p: &Palette) -> El {
-    row()
-        .key(key.to_owned())
-        .w_full()
-        .gap(12.0)
-        .child(
-            label(name.to_owned(), st::SMALL_STRONG, p.text_muted)
-                .w(190.0)
-                .shrink(),
-        )
-        .child(
-            label(value, st::BODY, p.text)
-                .wrap_anywhere()
-                .grow(1.0)
-                .shrink()
-                .min_w(0.0)
-                .key(format!("{key}-value")),
-        )
-}
+/// The width of the name column of the one-line rows.
+const LABEL_W: f32 = 110.0;
 
-fn description_view(room: &Room, p: &Palette, k: &Kit) -> El {
-    let desc = room.description.as_str();
-    let key = format!("details-description-{}", room.key);
-    let body = if markdown::is_cheap(desc) {
-        markdown::render(desc, false, st::BODY, p.text, key, p, k)
+/// Key and address text, a little under the body size so a 44-character key fits one line.
+const KEY_TEXT: rune::tok::TextStyle = rune::tok::TextStyle::new(12.0, 400.0);
+
+/// The description, rendered as markdown (links open as in messages), under its heading. The
+/// owner has a pencil beside the heading that turns it into the text area.
+fn description_section(
+    room: &Room,
+    form: &DetailsForm,
+    editable: bool,
+    p: &Palette,
+    k: &Kit,
+) -> El {
+    // The owner sees what they have typed; everyone else the room's description.
+    let desc = if editable {
+        form.description.text.as_str()
     } else {
-        None
+        room.description.as_str()
+    };
+    let mut head = row().w_full().gap(6.0).h(24.0).center_y().child(label(
+        "Description",
+        st::SMALL_STRONG,
+        p.text_muted,
+    ));
+    if editable && !form.editing_description {
+        head = head.child(
+            row()
+                .key("details-description-edit")
+                .role("button")
+                .label("Edit description")
+                .help("Edit description")
+                .focusable(true)
+                .size(24.0, 24.0)
+                .radius(6.0)
+                .center()
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(|s: &mut RiverApp| {
+                    if let Some(f) = &mut s.chat.details {
+                        f.editing_description = true;
+                        f.description.focused = true;
+                    }
+                })
+                .child(icon(&icons::EDIT, 14.0).color(p.text_muted)),
+        );
     }
-    .unwrap_or_else(|| label(desc.to_owned(), st::BODY, p.text).wrap().w_full());
-    col()
+    let mut section = col()
         .key("details-description")
         .w_full()
-        .gap(4.0)
-        .child(label("Description", st::SMALL_STRONG, p.text_muted))
-        .child(
-            col()
-                .key("details-description-scroll")
-                .w_full()
-                .max_h(160.0)
-                .scroll(rune::ScrollSpec {
-                    stick_bottom: false,
+        .gap(2.0)
+        .child(head);
+    if editable && form.editing_description {
+        return section.child(
+            TextArea::new(&form.description)
+                .label("Room Description".to_owned())
+                .placeholder("Optional room description".to_owned())
+                .width(None)
+                .auto_grow(2, 4)
+                .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").description)
+                .on_key(|s: &mut RiverApp, ev, _| {
+                    super::keys::word_keys(
+                        &mut s.chat.details.as_mut().expect("open").description,
+                        ev,
+                    )
                 })
-                .child(body),
-        )
+                .build(k)
+                .key("details-description-input")
+                .w_full(),
+        );
+    }
+    let key = format!("details-description-{}", room.key);
+    let body = if desc.trim().is_empty() {
+        label("No description", st::BODY, p.text_muted)
+    } else if markdown::is_cheap(desc) {
+        match markdown::render(desc, false, st::BODY, p.text, key, p, k) {
+            Some(md) => md,
+            None => label(desc.to_owned(), st::BODY, p.text).wrap().w_full(),
+        }
+    } else {
+        label(desc.to_owned(), st::BODY, p.text).wrap().w_full()
+    };
+    section = section.child(
+        col()
+            .key("details-description-scroll")
+            .w_full()
+            .max_h(120.0)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(body),
+    );
+    section
 }
 
 fn status(room: &Room, p: &Palette, k: &Kit) -> Option<El> {
@@ -489,121 +542,170 @@ fn captioned(caption: String, input: El, p: &Palette) -> El {
         .child(input)
 }
 
-/// A limit's caption: its label, and for those that cutting off loses something, how much of it
-/// the room uses now.
-fn limit_caption(i: usize, d: &Details) -> String {
+/// What a limit's room uses now, where cutting it off would lose something, shown under it.
+/// The member count does not include the owner.
+fn limit_hint(i: usize, d: &Details) -> Option<String> {
     match i {
-        1 => format!("{} ({} held now)", LIMIT_LABELS[i], d.usage.messages),
-        3 => format!("{} ({} in force now)", LIMIT_LABELS[i], d.usage.bans),
-        _ => LIMIT_LABELS[i].to_owned(),
+        0 => Some(format!(
+            "{}/{} without the owner",
+            d.usage.members, d.limits.max_members
+        )),
+        1 => Some(format!("{} held now", d.usage.messages)),
+        3 => Some(format!("{} in force now", d.usage.bans)),
+        _ => None,
     }
 }
 
-fn editor(room: &Room, form: &DetailsForm, p: &Palette, k: &Kit) -> El {
-    let d = &room.details;
-    let count = d.usage.members;
-    let held_max = d.limits.max_members;
-    let mut col_ = col().key("details-edit").w_full().gap(12.0);
-    col_ = col_
-        .child(captioned(
-            "Room Name".into(),
-            TextInput::new(&form.name)
-                .label("Room Name".to_owned())
-                .placeholder("Room name".to_owned())
-                .width(None)
-                .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").name)
-                .on_key(|s: &mut RiverApp, ev, _| {
-                    super::keys::word_keys(&mut s.chat.details.as_mut().expect("open").name, ev)
-                })
-                .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
-                .build(k)
-                .key("details-name-input")
-                .w_full(),
-            p,
-        ))
-        .child(captioned(
-            "Room Description".into(),
-            TextArea::new(&form.description)
-                .label("Room Description".to_owned())
-                .placeholder("Optional room description".to_owned())
-                .width(None)
-                .auto_grow(3, 6)
-                .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").description)
-                .on_key(|s: &mut RiverApp, ev, _| {
-                    super::keys::word_keys(
-                        &mut s.chat.details.as_mut().expect("open").description,
-                        ev,
-                    )
-                })
-                .build(k)
-                .key("details-description-input")
-                .w_full(),
-            p,
-        ));
-    let mut members_caption = format!("Members ({count}/{held_max}, not counting the owner)");
-    if count >= held_max {
-        members_caption.push_str(" - the room is full, so new members will be rejected");
+/// `cells` in rows of `cols`, each cell as wide as the others.
+fn grid(cells: Vec<El>, cols: usize) -> El {
+    let mut out = col().w_full().gap(8.0);
+    let mut cells = cells.into_iter();
+    loop {
+        let mut line = row().w_full().gap(10.0);
+        let mut any = false;
+        for _ in 0..cols {
+            match cells.next() {
+                Some(c) => {
+                    any = true;
+                    line = line.child(c);
+                }
+                None => line = line.child(el().grow(1.0).shrink().min_w(0.0)),
+            }
+        }
+        if !any {
+            return out;
+        }
+        out = out.child(line);
     }
-    col_ = col_.child(captioned(
-        members_caption,
-        limit_input(0, LIMIT_LABELS[0], form, k),
+}
+
+/// The owner's name field.
+fn name_field(form: &DetailsForm, p: &Palette, k: &Kit) -> El {
+    captioned(
+        "Room Name".into(),
+        TextInput::new(&form.name)
+            .label("Room Name".to_owned())
+            .placeholder("Room name".to_owned())
+            .width(None)
+            .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").name)
+            .on_key(|s: &mut RiverApp, ev, _| {
+                super::keys::word_keys(&mut s.chat.details.as_mut().expect("open").name, ev)
+            })
+            .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
+            .build(k)
+            .key("details-name-input")
+            .w_full(),
         p,
-    ));
-    for pair in [(1, 2), (3, 4), (5, 6)] {
-        col_ = col_.child(
-            row()
-                .w_full()
-                .gap(12.0)
-                .child(captioned(
-                    limit_caption(pair.0, &room.details),
-                    limit_input(pair.0, LIMIT_LABELS[pair.0], form, k),
-                    p,
-                ))
-                .child(captioned(
-                    limit_caption(pair.1, &room.details),
-                    limit_input(pair.1, LIMIT_LABELS[pair.1], form, k),
-                    p,
-                )),
-        );
-    }
-    col_
+    )
 }
 
-fn viewer(room: &Room, p: &Palette) -> El {
+/// The seven limits as a grid, the name over each and how much the room uses under it, with
+/// `extra` cells after them. The owner's limits are fields.
+fn limits_grid(
+    room: &Room,
+    form: &DetailsForm,
+    editable: bool,
+    cols: usize,
+    extra: Vec<El>,
+    p: &Palette,
+    k: &Kit,
+) -> El {
     let d = &room.details;
-    let count = d.usage.members;
-    let mut facts = col().key("details-facts").w_full().gap(6.0);
-    let mut members = format!(
-        "{count} of {} (not counting the owner)",
-        d.limits.max_members
-    );
-    if count >= d.limits.max_members {
-        members.push_str(" (full)");
-    }
-    facts = facts.child(fact("details-members", "Members", members, p));
-    let l = &d.limits;
-    for (i, (name, value)) in LIMIT_LABELS.iter().zip(limit_values(l)).enumerate().skip(1) {
-        facts = facts.child(fact(
-            &format!("details-limit-{i}"),
-            name,
-            value.to_string(),
-            p,
+    let held = limit_values(&d.limits);
+    let mut cells: Vec<El> = (0..LIMIT_COUNT)
+        .map(|i| {
+            let hint = limit_hint(i, d);
+            let mut cell = col()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .gap(4.0)
+                .child(label(LIMIT_LABELS[i], st::SMALL_STRONG, p.text_muted).truncate());
+            cell = if editable {
+                cell.child(limit_input(i, LIMIT_LABELS[i], form, k))
+            } else {
+                cell.child(
+                    label(held[i].to_string(), st::BODY, p.text)
+                        .key(format!("details-limit-{i}"))
+                        .wrap_anywhere(),
+                )
+            };
+            if let Some(hint) = hint {
+                cell = cell.child(label(hint, st::SMALL, p.text_muted).truncate());
+            }
+            cell
+        })
+        .collect();
+    cells.extend(extra);
+    let mut out = col()
+        .key("details-limits")
+        .w_full()
+        .gap(6.0)
+        .child(grid(cells, cols));
+    if d.usage.members >= held[0] {
+        out = out.child(label(
+            if editable {
+                "The room is full, so new members will be rejected."
+            } else {
+                "The room is full."
+            },
+            st::SMALL,
+            p.text_muted,
         ));
     }
-    facts
+    out
+}
+
+/// A name, its value on one line, and a copy button.
+fn compact_field(key: &str, name: &str, value: &str, copy_what: &'static str, p: &Palette) -> El {
+    let copied = value.to_owned();
+    row()
+        .key(key.to_owned())
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(
+            label(name.to_owned(), st::SMALL_STRONG, p.text_muted)
+                .w(LABEL_W)
+                .shrink(),
+        )
+        .child(
+            label(value.to_owned(), KEY_TEXT, p.text)
+                .wrap_anywhere()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .key(format!("{key}-value")),
+        )
+        .child(
+            row()
+                .key(format!("{key}-copy"))
+                .role("button")
+                .label(copy_what)
+                .help(copy_what)
+                .size(24.0, 24.0)
+                .radius(6.0)
+                .center()
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press_tx(move |_: &mut RiverApp, tx: &mut rune::Tx| tx.copy(copied.clone()))
+                .child(icon(&icons::COPY, 14.0).color(p.text_muted)),
+        )
 }
 
 pub(super) fn details_modal(
     chat: &Chat,
     room: &Room,
     form: &DetailsForm,
+    narrow: bool,
+    win_h: f32,
     k: &Kit,
     layer: &mut Vec<El>,
 ) {
     let p = st::palette();
     let d: &Details = &room.details;
     let editable = d.editable == Editable::Yes;
-    let mut body = col().key("details").w_full().px(16.0).pb(16.0).gap(14.0);
+    let mut body = col().key("details").w_full().px(16.0).pb(12.0).gap(10.0);
     if !editable {
         let mut title = row()
             .key("details-title")
@@ -621,9 +723,6 @@ pub(super) fn details_modal(
             title = title.child(badge(&p));
         }
         body = body.child(title);
-        if !room.description.is_empty() {
-            body = body.child(description_view(room, &p, k));
-        }
     } else if room.private {
         body = body.child(
             row()
@@ -651,71 +750,70 @@ pub(super) fn details_modal(
         );
     }
     if editable {
-        body = body.child(editor(room, form, &p, k));
-    } else {
-        body = body.child(viewer(room, &p));
+        body = body.child(name_field(form, &p, k));
     }
-    // The owner opens their own dialog from here, as the web UI's member list does.
+    body = body.child(description_section(room, form, editable, &p, k));
+    // The owner opens their own dialog from here, as the web UI's member list does. The owner
+    // and a private room's secret version are cells of the limits' grid.
+    let mut extra = Vec::new();
     if let Some(owner) = room.members.iter().find(|m| m.role == Role::Owner) {
         let uid = owner.uid.clone();
-        body = body.child(
-            row()
-                .key("details-owner")
-                .w_full()
-                .gap(12.0)
-                .child(
-                    label("Owner", st::SMALL_STRONG, p.text_muted)
-                        .w(190.0)
-                        .shrink(),
-                )
-                .child(
-                    row()
-                        .key("details-owner-open")
-                        .role("button")
-                        .label(format!("Member info: {}", owner.nickname))
-                        .focusable(true)
-                        .cursor(rune::Cursor::Pointer)
-                        .shrink()
-                        .min_w(0.0)
-                        .on_press(move |s: &mut RiverApp| s.chat.open_owner_from_details(&uid))
-                        .child(
-                            label(owner.nickname.clone(), st::BODY, p.accent)
-                                .wrap_anywhere()
-                                .shrink()
-                                .min_w(0.0),
-                        ),
-                ),
+        extra.push(
+            captioned(
+                "Owner".into(),
+                row()
+                    .key("details-owner-open")
+                    .role("button")
+                    .label(format!("Member info: {}", owner.nickname))
+                    .focusable(true)
+                    .cursor(rune::Cursor::Pointer)
+                    .h(if editable { 32.0 } else { 20.0 })
+                    .center_y()
+                    .on_press(move |s: &mut RiverApp| s.chat.open_owner_from_details(&uid))
+                    .child(
+                        label(owner.nickname.clone(), st::BODY, p.accent)
+                            .truncate()
+                            .shrink()
+                            .min_w(0.0),
+                    ),
+                &p,
+            )
+            .key("details-owner"),
         );
     }
+    if room.private {
+        extra.push(
+            captioned(
+                "Secret Version".into(),
+                label(d.secret_version.to_string(), st::BODY, p.text),
+                &p,
+            )
+            .key("details-secret"),
+        );
+    }
+    // Three columns where the window is wide, two in a narrow one.
+    let cols = if narrow { 2 } else { 3 };
+    body = body.child(limits_grid(room, form, editable, cols, extra, &p, k));
     body = body.child(el().w_full().h(1.0).fill(p.line));
-    body = body.child(field(
+    body = body.child(compact_field(
         "details-owner-key",
         "Room Public Key",
         &d.owner_key,
         "Copy room public key",
-        st::BODY,
         &p,
     ));
-    body = body.child(field(
+    body = body.child(compact_field(
         "details-contract-id",
         "Contract ID",
         &d.contract_id,
         "Copy contract ID",
-        st::BODY,
         &p,
     ));
-    if room.private {
-        body = body.child(fact(
-            "details-secret",
-            "Secret Version",
-            d.secret_version.to_string(),
-            &p,
-        ));
-    }
     let scroll = col()
         .key("details-scroll")
         .w_full()
-        .max_h(520.0)
+        // The dialog's title and footer and the window's margins take the rest of the window.
+        .max_h((win_h - 240.0).clamp(140.0, 700.0))
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         })
@@ -726,8 +824,8 @@ pub(super) fn details_modal(
         .key("details-footer")
         .w_full()
         .px(16.0)
-        .pb(16.0)
-        .gap(10.0);
+        .pb(12.0)
+        .gap(8.0);
     if editable {
         // What would be refused is said as it is typed; Save says it too.
         if let Some(problem) = chat.details_edit().err() {
@@ -805,7 +903,7 @@ pub(super) fn details_modal(
         .child(scroll)
         .child(footer);
     Dialog::new("room-details", "Room Details")
-        .width(520.0)
+        .width(560.0)
         .fit()
         .open(true)
         .on_close(|s: &mut RiverApp| s.chat.close_details())

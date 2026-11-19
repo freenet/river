@@ -375,6 +375,9 @@ fn nickname_scene(s: &mut RiverApp, edit: fn(&mut Chat, &mut chat::model::Room))
     });
 }
 
+/// A long description for the details scenes: paragraphs, links and a list.
+const LONG_DESCRIPTION: &str = "Welcome to the **Book Club**. We read one book a month and talk about it on the last Sunday, see [the schedule](https://freenet.org/schedule).\n\nHow it works:\n\n- Pick up the book from [the library](https://freenet.org/library) or any shop\n- Post your thoughts here as you read, spoilers marked\n- Vote for the next book in the poll at the start of each month\n\nBe kind and read the [rules](https://freenet.org/rules) before you post.";
+
 /// The room details dialog open on the example room `room`, shown as a room from the node (so
 /// Save sends a command), after `edit` set the room and what is typed.
 fn details_scene(s: &mut RiverApp, room: &str, edit: fn(&mut Chat, &mut chat::model::Room)) {
@@ -651,10 +654,31 @@ pub const SCENES: &[Scene] = &[
         details_scene(s, chat::example::EMPTY_ROOM, |chat, _| {
             let form = chat.details.as_mut().expect("open");
             form.name.replace_text("Reading Circle");
+            form.editing_description = true;
             form.description
                 .replace_text("This month: **The Dispossessed**.\nSecond week: chapters 5-8.");
             form.limits[0].replace_text("40");
         })
+    }),
+    // A long, multi-paragraph description with links and a list: the dialog stays inside the
+    // window and the description scrolls in its own box. For the owner and for a member.
+    ("chat-room-details-long-description", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |chat, _| {
+            let form = chat.details.as_mut().expect("open");
+            form.description.replace_text(LONG_DESCRIPTION);
+        })
+    }),
+    ("chat-room-details-long-description-member", |s| {
+        details_scene(s, "town-square", |_, room| {
+            room.description = LONG_DESCRIPTION.into();
+        });
+        s.chat.edit_rooms(|r| {
+            if let Some(r) = r.iter_mut().find(|r| r.key == "town-square") {
+                r.description = LONG_DESCRIPTION.into();
+                r.details.description_source = LONG_DESCRIPTION.into();
+            }
+        });
+        s.chat.open_details();
     }),
     ("chat-room-details-error", |s| {
         details_scene(s, chat::example::EMPTY_ROOM, |chat, _| {

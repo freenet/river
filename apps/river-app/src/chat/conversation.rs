@@ -86,11 +86,9 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
         .unwrap_or("");
     if !desc.is_empty() {
         let key = format!("description-{}", room.key);
-        let rendered = if markdown::is_one_line(first) && markdown::is_cheap(first) {
-            markdown::render(first, false, st::SMALL, p.text_muted, key, p, k)
-        } else {
-            None
-        };
+        let rendered = markdown::header_inline(first)
+            .filter(|line| markdown::is_cheap(line))
+            .and_then(|line| markdown::render(line, false, st::SMALL, p.text_muted, key, p, k));
         let line = match rendered {
             Some(md) => md.max_h(18.0).clip_soft(0.0),
             None => label(markdown::strip(desc), st::SMALL, p.text_muted).truncate(),
