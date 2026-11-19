@@ -1089,6 +1089,31 @@ fn the_view_keeps_mention_tokens_for_editing() {
 }
 
 #[test]
+fn a_chip_names_a_member_the_dialog_can_open() {
+    let f = Fixture::new();
+    let mut state = public_state(&f);
+    let token = river_core::mention::encode_mention(f.owner_id(), "Olive");
+    state.recent_messages.messages.push(f.message(
+        &f.me,
+        BASE - 5,
+        RoomMessageBody::public(format!("hi {token}")),
+    ));
+    let room = LiveRoom::new(f.stored(state));
+    let view = Outbox::default().view(&room, &minutes);
+    let m = view.messages.last().unwrap();
+    let url =
+        m.md.rsplit_once('(')
+            .and_then(|(_, u)| u.strip_suffix(')'))
+            .expect("a chip link");
+    let uid = crate::chat::markdown::mention_member(url).expect("the chip carries a member id");
+    assert_eq!(uid, f.owner_id().to_string());
+    assert!(
+        view.members.iter().any(|x| x.uid == uid),
+        "the chip's id is a member's uid in the room view"
+    );
+}
+
+#[test]
 fn a_mention_becomes_a_chip_link_with_a_safe_name() {
     let f = Fixture::new();
     let mut state = public_state(&f);

@@ -136,9 +136,23 @@ pub fn openable(url: &str) -> bool {
         && !u.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-/// The mention kind named by a chip link, `None` for any other link.
+/// The mention kind named by a chip link, `None` for any other link. A chip is
+/// `<scheme>:<kind>` or, for a member this room knows, `<scheme>:<kind>:<member uid>`.
 fn mention_kind(url: &str) -> Option<&str> {
-    url.strip_prefix(model::mention_scheme())?.strip_prefix(':')
+    let rest = url
+        .strip_prefix(model::mention_scheme())?
+        .strip_prefix(':')?;
+    Some(rest.split_once(':').map_or(rest, |(kind, _)| kind))
+}
+
+/// The member a chip link names, `None` for any other link and for a chip of someone this room
+/// does not know. Only a chip written with this process's scheme names anyone.
+pub(crate) fn mention_member(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix(model::mention_scheme())?
+        .strip_prefix(':')?;
+    let (kind, uid) = rest.split_once(':')?;
+    (matches!(kind, "self" | "member") && !uid.is_empty()).then_some(uid)
 }
 
 fn style(p: &Palette, k: &Kit, font: rune::tok::TextStyle, color: Color) -> MarkdownStyle {
@@ -189,8 +203,11 @@ pub fn render(
             // Nothing is linked unless `links::prepare` wrote it as a link, so a bare URL
             // it has not checked is only text.
             .autolink(false)
-            .on_link_tx(|_: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
-                if openable(url) {
+            .on_link_tx(|s: &mut RiverApp, url: &str, tx: &mut rune::Tx| {
+                if let Some(uid) = mention_member(url) {
+                    // A mention chip opens the member's dialog, as in the web UI.
+                    s.chat.open_member(uid);
+                } else if openable(url) {
                     let _ = tx.open_url(url.trim());
                 }
             })
@@ -258,6 +275,13 @@ mod tests {
         assert_eq!(mention_kind("rv:abc"), None);
         let real = format!("{}:member", model::mention_scheme());
         assert_eq!(mention_kind(&real), Some("member"));
+        assert_eq!(mention_member(&real), None);
+        let with_uid = format!("{}:member:ABCD2345", model::mention_scheme());
+        assert_eq!(mention_kind(&with_uid), Some("member"));
+        assert_eq!(mention_member(&with_uid), Some("ABCD2345"));
+        assert_eq!(mention_member("rvm-0000000000000000:member:ABCD2345"), None);
+        let unknown = format!("{}:unknown:ABCD2345", model::mention_scheme());
+        assert_eq!(mention_member(&unknown), None);
     }
 
     #[test]

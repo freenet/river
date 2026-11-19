@@ -16,8 +16,9 @@ pub mod example;
 mod icons;
 mod keys;
 mod links;
-mod markdown;
+pub(crate) mod markdown;
 mod member_modal;
+mod mention;
 pub mod model;
 mod notify_dialog;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
@@ -191,6 +192,11 @@ pub struct Chat {
     /// The composer's emoji picker is open, and on which category.
     pub emoji_open: bool,
     pub emoji_category: usize,
+    /// The highlighted row of the @mention popup, and the query it was moved under (a new query
+    /// starts again at the top).
+    mention_sel: (String, usize),
+    /// The `@` (and what was typed after it) an Escape closed the popup at, closed until that word is gone.
+    mention_off: Option<(usize, String)>,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
     /// What is typed in the nickname field of your own member info dialog.
@@ -323,6 +329,8 @@ impl Chat {
             link_menu: None,
             emoji_open: false,
             emoji_category: 0,
+            mention_sel: (String::new(), 0),
+            mention_off: None,
             member_modal: None,
             nickname: TextEdit::new(""),
             nickname_error: None,
@@ -585,6 +593,7 @@ impl Chat {
         if text.is_empty() || matches!(self.mode, Mode::Delete(_)) {
             return false;
         }
+        self.mention_off = None;
         let Some(room) = self.actionable() else {
             return false;
         };
@@ -724,6 +733,7 @@ impl Chat {
             self.composer = *draft;
         }
         self.picker = None;
+        self.mention_off = None;
     }
 
     /// Open or close the composer's emoji picker.
@@ -811,6 +821,18 @@ impl Chat {
 
     /// Open the info dialog of the member with `uid` in the open room.
     pub fn open_member(&mut self, uid: &str) {
+        if self.room().and_then(|r| r.member_by_uid(uid)).is_none() {
+            return;
+        }
+        // Already open for this member: leave it as it is, so a nickname being typed stays.
+        if self.member_modal.as_deref() == Some(uid) {
+            return;
+        }
+        // What else is open (opened from a message, which a dialog does not cover) closes.
+        self.emoji_open = false;
+        self.link_menu = None;
+        self.notify_dialog = None;
+        self.picker = None;
         let Some(member) = self.room().and_then(|r| r.member_by_uid(uid)) else {
             return;
         };

@@ -281,11 +281,30 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
             .border(RING_W, p.accent)
             .child(face);
     }
-    let mut name_row = row().gap(8.0).center_y().child(label(
+    // The avatar and the name open the author's dialog, as in the web UI.
+    let author_uid = author.map(|m| m.uid.clone());
+    if let Some(uid) = author_uid.clone() {
+        face = face
+            .key(format!("author-avatar-{}", first.key))
+            .role("button")
+            .label(format!("Member info: {}", room.nickname(group.author)))
+            .cursor(rune::Cursor::Pointer)
+            .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid));
+    }
+    let mut name = label(
         room.nickname(group.author).to_owned(),
         st::NAME,
         if mine { p.accent } else { p.text },
-    ));
+    );
+    if let Some(uid) = author_uid {
+        name = name
+            .key(format!("author-name-{}", first.key))
+            .role("button")
+            .label(format!("Member info: {}", room.nickname(group.author)))
+            .cursor(rune::Cursor::Pointer)
+            .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid));
+    }
+    let mut name_row = row().gap(8.0).center_y().child(name);
     if author.is_some_and(|m| m.role == Role::Owner) {
         name_row = name_row.child(tag("OWNER", p));
     }
@@ -717,6 +736,10 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         input = input
             .on_input_key(|s: &mut RiverApp, ev, _| {
                 // Escape closes the emoji picker, whichever of the two has the focus.
+                s.chat.mention_sync();
+                if s.chat.mention_key(ev) {
+                    return true;
+                }
                 if ev.key == rune::Key::Escape && s.chat.emoji_open {
                     s.chat.emoji_open = false;
                     return true;
@@ -904,6 +927,31 @@ fn emoji_panel(chat: &Chat, p: &Palette) -> El {
                 })
                 .child(grid),
         )
+}
+
+/// The @mention popup, floating above the composer: the members the typed `@query` matches.
+/// It takes no focus, so typing carries on in the composer while it is open.
+pub(super) fn mention_overlay(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
+    let Some(popup) = chat.mention_popup() else {
+        return;
+    };
+    let items = popup.candidates.iter().map(|c| {
+        // Two members with one name look the same, so say which is which.
+        let item = rune_kit::PopupItem::new(c.uid.clone(), format!("@{}", c.name));
+        if c.duplicate {
+            item.description(c.uid.clone())
+        } else {
+            item
+        }
+    });
+    rune_kit::PopupList::new("mention-popup", "composer-box")
+        .label("Mention a member")
+        .width(280.0)
+        .items(items)
+        .active(Some(popup.selected))
+        .on_active(|s: &mut RiverApp, i| s.chat.mention_highlight(i))
+        .on_choose(|s: &mut RiverApp, uid: &str, _: &mut rune::Tx| s.chat.mention_pick_uid(uid))
+        .build(k, layer);
 }
 
 /// A failed edit, deletion or reaction, with Retry (when it can be sent again) and Dismiss.

@@ -112,7 +112,8 @@ pub struct Message {
     /// message, which then can't be edited.
     pub source: String,
     /// `source` as markdown for display: each mention token a link to `mention_scheme()`
-    /// (`[@name](<scheme>:self|member|unknown)`). Empty when this computer can't read the
+    /// (`[@name](<scheme>:self:<uid>|member:<uid>|unknown)`, the uid being the `Member::uid` of a
+    /// member this room knows). Empty when this computer can't read the
     /// message, whose `text` is then shown as plain text.
     pub md: String,
     pub reply_to: Option<ReplyTo>,
