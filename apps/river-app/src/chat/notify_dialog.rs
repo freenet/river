@@ -8,7 +8,7 @@
 //! "Browser permission" section has no counterpart: the operating system asks the first time
 //! this app shows a notification.
 
-use rune::{El, col, icon};
+use rune::{El, col};
 use rune_kit::{Dialog, Kit, RadioGroup, RadioItem};
 
 use super::icons;
@@ -31,13 +31,7 @@ pub(super) fn bell_title(mode: NotificationMode) -> String {
     format!("Notifications: {}", mode.label())
 }
 
-pub(super) fn notify_dialog(
-    room: &Room,
-    mode: NotificationMode,
-    master_on: bool,
-    k: &Kit,
-    layer: &mut Vec<El>,
-) {
+pub(super) fn notify_dialog(room: &Room, mode: NotificationMode, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
     let mut group = RadioGroup::new();
     for m in NotificationMode::ALL {
@@ -48,7 +42,7 @@ pub(super) fn notify_dialog(
                 .on_select(move |s: &mut RiverApp| s.chat.set_mode(&key, m)),
         );
     }
-    let mut body = col()
+    let body = col()
         .key("notify-modes")
         .w_full()
         .px(16.0)
@@ -65,31 +59,6 @@ pub(super) fn notify_dialog(
             .w_full()
             .key("notify-modes-note"),
         );
-    if !master_on {
-        // The switch in the room list's footer is the master: while it is off nothing
-        // notifies, whatever a room's mode says.
-        body = body.child(
-            col()
-                .key("notify-master-off")
-                .w_full()
-                .gap(4.0)
-                .child(
-                    icon(&icons::BELL_OFF, 14.0)
-                        .color(p.warning_text)
-                        .label("Notifications are off"),
-                )
-                .child(
-                    label(
-                        "Notifications are switched off for every room, in the room list. \
-                         Turn them on there for this choice to take effect.",
-                        st::SMALL,
-                        p.warning_text,
-                    )
-                    .wrap()
-                    .w_full(),
-                ),
-        );
-    }
     Dialog::new("notify", "Notifications")
         .description(room.name.clone())
         .width(400.0)

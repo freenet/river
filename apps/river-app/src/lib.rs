@@ -55,11 +55,7 @@ pub struct RiverApp {
     private_previews: bool,
     /// The unread count last given to the notifier, so it hears only changes.
     reported_unread: Option<usize>,
-    prefs: rune::prefs::Prefs,
 }
-
-/// The preference that holds [`Chat::notifications`].
-const PREF_NOTIFICATIONS: &str = "notifications";
 
 /// The logo and the cache that keeps its pixels alive.
 struct Logo {
@@ -110,7 +106,6 @@ impl RiverApp {
             reported_unread: None,
             limiter: Default::default(),
             private_previews: false,
-            prefs: rune::prefs::Prefs::memory(),
         }
     }
 
@@ -126,7 +121,6 @@ impl RiverApp {
             0,
             0,
         );
-        chat.notifications = prefs.get(PREF_NOTIFICATIONS).unwrap_or(true);
         // What the user does in a room goes to the background work, which sends it.
         let sink = link.clone();
         chat.set_sink(Box::new(move |command| sink.send(command)));
@@ -143,7 +137,6 @@ impl RiverApp {
             reported_unread: None,
             limiter: Default::default(),
             private_previews: prefs.get("notification_previews").unwrap_or(false),
-            prefs,
         }
     }
 
@@ -159,14 +152,6 @@ impl RiverApp {
         if focused {
             self.missed = Default::default();
             self.drop_read_held();
-        }
-    }
-
-    /// Turn notifications on or off, and keep the choice.
-    pub fn set_notifications(&mut self, on: bool) {
-        self.chat.notifications = on;
-        if let Err(e) = self.prefs.set(PREF_NOTIFICATIONS, &on) {
-            eprintln!("river: could not save the notification setting: {e}");
         }
     }
 
@@ -208,10 +193,6 @@ impl RiverApp {
     /// Show held-back notifications whose cooldown has ended, for a room that went quiet.
     pub(crate) fn flush_held(&mut self, now: std::time::Instant) {
         self.drop_read_held();
-        if !self.chat.notifications {
-            self.limiter.retain_held(|_| false);
-            return;
-        }
         let due = self.limiter.admit(Vec::new(), now);
         self.show(due, now);
     }
@@ -245,9 +226,6 @@ impl RiverApp {
             if !a.quiet {
                 shown.push(a);
             }
-        }
-        if !self.chat.notifications {
-            return;
         }
         self.drop_read_held();
         let admitted = self.limiter.admit(shown, now);
@@ -475,6 +453,15 @@ pub const SCENES: &[Scene] = &[
             0,
         );
     }),
+    // The connection dot and its words, for each state of the link.
+    ("chat-connection-live", |s| {
+        connect(s);
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    }),
+    ("chat-connection-connecting", |s| {
+        connect(s);
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Loading);
+    }),
     ("chat-connection-lost", |s| {
         connect(s);
         s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
@@ -613,12 +600,6 @@ pub const SCENES: &[Scene] = &[
         let room = s.chat.room().expect("a room").key.clone();
         s.chat
             .set_mode(&room, rooms::modes::NotificationMode::MentionsAndReplies);
-        s.chat.open_notify_dialog();
-    }),
-    // The master switch is off: the dialog says so.
-    ("chat-notification-modes-off", |s| {
-        connect(s);
-        s.chat.notifications = false;
         s.chat.open_notify_dialog();
     }),
     // A muted room that is open: its bell is struck through.

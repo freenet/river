@@ -4,7 +4,7 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, Pixels, ScrollSpec, col, el, icon, row, spacer, text};
-use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, Switch, TextInput};
+use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, TextInput};
 
 use super::conversation::{avatar, conversation, picker_overlay};
 use super::icons;
@@ -60,13 +60,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     if let Some(open) = &chat.notify_dialog
         && let Some(room) = chat.rooms().iter().find(|r| &r.key == open)
     {
-        super::notify_dialog::notify_dialog(
-            room,
-            chat.mode_of(&room.key),
-            chat.notifications,
-            &k,
-            &mut layer,
-        );
+        super::notify_dialog::notify_dialog(room, chat.mode_of(&room.key), &k, &mut layer);
     }
     if let Some(form) = &chat.details {
         super::details::details_modal(chat, room, form, &k, &mut layer);
@@ -352,9 +346,7 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
     for w in &chat.work {
         footer = footer.child(work_row(w, p, k));
     }
-    let footer = footer
-        .child(notifications_switch(chat, p, k))
-        .child(source_status(chat, p, k));
+    let footer = footer.child(source_status(chat, p, k));
     let column = col()
         .key("rooms")
         .w(width)
@@ -376,31 +368,6 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         .h_full()
         .child(column)
         .child(vline(p))
-}
-
-/// The switch for notifications. Hidden for the example rooms, which have nothing to notify of.
-fn notifications_switch(chat: &Chat, p: &Palette, k: &Kit) -> El {
-    if chat.source == Source::Example {
-        return el().key("notifications-none");
-    }
-    row()
-        .key("notifications")
-        .px(4.0)
-        .gap(8.0)
-        .center_y()
-        .child(icon(&icons::BELL, 15.0).color(p.text_muted))
-        .child(label("Notifications", st::SMALL, p.text_secondary))
-        .child(spacer())
-        .child(
-            Switch::new(chat.notifications)
-                .label("Notifications")
-                .hide_label()
-                .on_toggle(|s: &mut RiverApp| {
-                    let on = !s.chat.notifications;
-                    s.set_notifications(on);
-                })
-                .build(k),
-        )
 }
 
 /// A room being created or joined: working, or failed with why, Try again and Dismiss.
@@ -475,23 +442,69 @@ fn work_row(w: &WorkView, p: &Palette, k: &Kit) -> El {
     r
 }
 
+/// How the connection to Freenet is shown: the dot, the words, their colour and the tooltip.
+pub(super) struct Pill {
+    pub dot: rune::Color,
+    pub text: &'static str,
+    pub color: rune::Color,
+    pub tip: &'static str,
+}
+
+/// The web UI's connection pill (`ConnectionStatusIndicator`): a green dot and "Connected", an
+/// amber dot and "Connecting...", a red dot and "Disconnected" in the error colour. The app
+/// has no per-attempt error report to explain, so the tooltip says what the state means.
+pub(super) fn connection_pill(source: Source, p: &Palette) -> Pill {
+    match source {
+        Source::Example => Pill {
+            dot: p.text_muted,
+            text: "Example rooms, not connected to Freenet",
+            color: p.text_muted,
+            tip: "These are example rooms. River is not connected to Freenet.",
+        },
+        Source::Node(LinkStatus::Loading) => Pill {
+            dot: p.warning,
+            text: "Connecting...",
+            color: p.text_muted,
+            tip: "Showing your stored rooms while River catches up with Freenet.",
+        },
+        Source::Node(LinkStatus::Live) => Pill {
+            dot: p.success,
+            text: "Connected",
+            color: p.text_muted,
+            tip: "Connected to Freenet.",
+        },
+        Source::Node(LinkStatus::Reconnecting) => Pill {
+            dot: p.error,
+            text: "Disconnected",
+            color: p.danger,
+            tip: "Connection to Freenet lost. The rooms shown are as last seen. River is reconnecting.",
+        },
+    }
+}
+
 /// Where the rooms come from, at the foot of the room list, and for rooms from the node the
 /// connection's state, as the web UI's connection pill shows it.
 fn source_status(chat: &Chat, p: &Palette, k: &Kit) -> El {
-    let (text, color) = match chat.source {
-        Source::Example => ("Example rooms, not connected to Freenet", p.text_muted),
-        Source::Node(LinkStatus::Loading) => ("Catching up with Freenet…", p.text_muted),
-        Source::Node(LinkStatus::Live) => ("Connected to Freenet", p.text_muted),
-        Source::Node(LinkStatus::Reconnecting) => (
-            "Connection to Freenet lost. Reconnecting…",
-            p.text_secondary,
-        ),
-    };
-    let mut status = col()
-        .key("source-status")
-        .px(4.0)
-        .gap(4.0)
-        .child(label(text, st::SMALL, color).wrap().w_full());
+    let pill = connection_pill(chat.source, p);
+    let mut status = col().key("source-status").px(4.0).gap(4.0).child(
+        row()
+            .key("connection-pill")
+            .gap(8.0)
+            .center_y()
+            .help(pill.tip)
+            .child(
+                el().key("connection-dot")
+                    .size(7.0, 7.0)
+                    .radius(3.5)
+                    .fill(pill.dot),
+            )
+            .child(
+                label(pill.text, st::SMALL_STRONG, pill.color)
+                    .key("connection-label")
+                    .wrap()
+                    .w_full(),
+            ),
+    );
     let issues = &chat.issues;
     let mut notes: Vec<(&str, String)> = Vec::new();
     if issues.update_required {

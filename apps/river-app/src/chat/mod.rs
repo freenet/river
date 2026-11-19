@@ -237,11 +237,8 @@ pub struct Chat {
     /// Whether the last rooms shown were live and not a catch-up: the whole list, not a partial
     /// one while reconnecting.
     full_list: bool,
-    /// Whether new messages produce notifications: the switch in the room list's footer. The
-    /// app keeps it across runs.
-    pub notifications: bool,
     /// Each room's notification mode by room key, shared with the web UI; a room not named is
-    /// [`NotificationMode::All`]. The switch above turns every room off whatever these say.
+    /// [`NotificationMode::All`].
     modes: HashMap<String, NotificationMode>,
     /// Modes picked here that the node's updates have not echoed yet, so an update sent before
     /// the pick was taken does not put the old mode back on screen.
@@ -347,7 +344,6 @@ impl Chat {
             invite: None,
             catching_up: true,
             full_list: false,
-            notifications: true,
             modes: HashMap::new(),
             picked: HashMap::new(),
             notify_dialog: None,
