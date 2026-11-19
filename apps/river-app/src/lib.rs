@@ -462,6 +462,19 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.access = Access::PermissionRemoved;
     }),
+    ("chat-emoji", |s| {
+        connect(s);
+        s.chat.emoji_open = true;
+    }),
+    ("chat-description-open", |s| {
+        connect(s);
+        s.chat.edit_rooms(|rooms| {
+            rooms[0].description =
+                "The **public** room for [Freenet](https://freenet.org) users.\n\n- Be kind\n- Read the [rules](https://freenet.org/rules)\n\nSee `#help` for questions."
+                    .into();
+        });
+        s.chat.description_open = true;
+    }),
     // Markdown in a room's description and messages, with mention chips.
     ("chat-markdown", |s| {
         connect(s);

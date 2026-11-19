@@ -156,7 +156,7 @@ fn style(p: &Palette, k: &Kit, font: rune::tok::TextStyle, color: Color) -> Mark
 pub fn is_one_line(text: &str) -> bool {
     let t = text.trim_start();
     !t.contains(['\n', '\r'])
-        && !t.starts_with(['#', '-', '*', '+', '>', '|', '`', '~', '<', '[', '!'])
+        && !t.starts_with(['#', '-', '*', '+', '>', '|', '`', '~', '<', '!'])
         && !t.starts_with(|c: char| c.is_ascii_digit())
 }
 
@@ -302,9 +302,8 @@ mod tests {
     #[test]
     fn only_a_plain_line_is_a_header_description() {
         assert!(is_one_line("The **public** room, see [x](https://a.b)"));
-        for no in [
-            "# Title", "- a", "> q", "```\nx", "a\nb", "1. a", "| a |", "[r]: x",
-        ] {
+        assert!(is_one_line("[Freenet](https://freenet.org) is the place"));
+        for no in ["# Title", "- a", "> q", "```\nx", "a\nb", "1. a", "| a |"] {
             assert!(!is_one_line(no), "{no:?}");
         }
         assert_eq!(strip("a <b>html</b> c"), "a <b>html</b> c");

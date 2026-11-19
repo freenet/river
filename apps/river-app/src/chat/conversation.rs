@@ -4,13 +4,14 @@ use rune::tok::TextStyle;
 use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::Kit;
 
+use super::emoji;
 use super::icons;
 use super::keys;
 use super::links;
 use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
-use super::view::{HEADER_H, hline, label, not_yet};
+use super::view::{HEADER_H, hline, label};
 use super::{Chat, Mode};
 use crate::RiverApp;
 
@@ -26,6 +27,8 @@ const BODY_MAX_W: f32 = 604.0;
 /// The history and composer column, centred on a wide window: the web UI's
 /// `.conversation-column` (`60px + 76ch + 24px`).
 const COLUMN_MAX_W: f32 = GUTTER + BODY_MAX_W + 24.0;
+/// The tallest the header's full description grows to before it scrolls.
+const DESCRIPTION_MAX_H: f32 = 220.0;
 /// The most lines the composer grows to before it scrolls.
 const COMPOSER_MAX_LINES: usize = 8;
 
@@ -64,27 +67,67 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
         );
     }
     let mut info = col().grow(1.0).min_w(0.0).gap(2.0).child(title);
-    if !room.description.is_empty() {
-        // One line of the description, drawn as markdown; what does not fit is cut off.
-        let rendered =
-            if markdown::is_one_line(&room.description) && markdown::is_cheap(&room.description) {
-                markdown::render(
-                    &room.description,
-                    false,
-                    st::SMALL,
-                    p.text_muted,
-                    format!("description-{}", room.key),
-                    p,
-                    k,
-                )
-            } else {
-                None
-            };
-        info = info.child(match rendered {
-            Some(md) => md.max_h(18.0).clip_soft(0.0),
-            None => label(markdown::strip(&room.description), st::SMALL, p.text_muted).truncate(),
+    // The description is markdown. Collapsed it is its first line (links work there); a longer
+    // one has a More button that shows the whole of it, scrolling past a height.
+    let desc = room.description.as_str();
+    let first = desc.lines().next().unwrap_or("").trim();
+    let expandable = desc.lines().filter(|l| !l.trim().is_empty()).count() > 1
+        || desc.chars().count() > 90
+        || !markdown::is_one_line(first);
+    let show_all = chat.description_open && expandable;
+    if !desc.is_empty() {
+        let key = format!("description-{}", room.key);
+        let source = if show_all { desc } else { first };
+        let rendered = if (show_all || markdown::is_one_line(source)) && markdown::is_cheap(source)
+        {
+            markdown::render(source, false, st::SMALL, p.text_muted, key, p, k)
+        } else {
+            None
+        };
+        info = info.child(match (rendered, show_all) {
+            (Some(md), true) => col()
+                .key("description-scroll")
+                .w_full()
+                .max_h(DESCRIPTION_MAX_H)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(md),
+            (Some(md), false) => md.max_h(18.0).clip_soft(0.0),
+            (None, true) => col()
+                .key("description-scroll")
+                .w_full()
+                .max_h(DESCRIPTION_MAX_H)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(label(desc.to_owned(), st::SMALL, p.text_muted).wrap()),
+            (None, false) => label(markdown::strip(desc), st::SMALL, p.text_muted).truncate(),
         });
     }
+    let more = expandable.then(|| {
+        let open = show_all;
+        row()
+            .key("description-toggle")
+            .role("button")
+            .label(if open {
+                "Show less of the description"
+            } else {
+                "Show the whole description"
+            })
+            .h(26.0)
+            .px(8.0)
+            .radius(6.0)
+            .center()
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.description_open = !s.chat.description_open)
+            .child(label(
+                if open { "Less" } else { "More" },
+                st::SMALL_STRONG,
+                p.accent,
+            ))
+    });
     let open = chat.members_shown(narrow);
     let toggle = row()
         .key("toggle-members")
@@ -106,16 +149,20 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
             st::SMALL_STRONG,
             if open { p.text } else { p.text_secondary },
         ));
-    row()
+    let mut header = row()
         .key("room-header")
         .w_full()
-        .h(HEADER_H)
+        .min_h(HEADER_H)
+        .py(if show_all { 10.0 } else { 0.0 })
         .pl(20.0)
         .pr(12.0)
         .gap(16.0)
         .center_y()
-        .child(info)
-        .child(toggle)
+        .child(info);
+    if let Some(more) = more {
+        header = header.child(more);
+    }
+    header.child(toggle)
 }
 
 fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
@@ -684,16 +731,30 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     if !can_send {
         send = send.disabled(true).opacity(0.45);
     }
-    let emoji = not_yet(
-        row()
+    let emoji = {
+        let open = chat.emoji_open;
+        let mut b = row()
             .key("emoji")
             .role("button")
-            .label("Emoji")
+            .label(if open { "Close emoji picker" } else { "Emoji" })
+            .help("Emoji")
             .size(36.0, 36.0)
             .radius(8.0)
             .center()
-            .child(icon(&icons::SMILE, 19.0).color(p.text_muted)),
-    );
+            .fill(if open {
+                p.surface_hover
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.toggle_emoji())
+            .child(icon(&icons::SMILE, 19.0).color(if open { p.text } else { p.text_muted }));
+        if !can_send {
+            b = b.disabled(true).opacity(0.45);
+        }
+        b
+    };
     let mut column = col()
         .key("composer")
         .w_full()
@@ -717,6 +778,9 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         );
     } else if let Some(bar) = mode_bar(chat, room, p) {
         column = column.child(bar);
+    }
+    if chat.emoji_open && can_send {
+        column = column.child(emoji_panel(chat, p));
     }
     column.child(
         row()
@@ -742,6 +806,71 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
             .child(field)
             .child(send),
     )
+}
+
+/// The composer's emoji picker: the web UI's categories as a row of tabs, and the chosen
+/// category's emoji below, scrolling when there are more than fit.
+fn emoji_panel(chat: &Chat, p: &Palette) -> El {
+    let cats = emoji::EMOJI_CATEGORIES;
+    let current = chat.emoji_category.min(cats.len() - 1);
+    let mut tabs = row().key("emoji-tabs").gap(2.0);
+    for (i, (name, glyph, _)) in cats.iter().enumerate() {
+        tabs = tabs.child(
+            row()
+                .key(format!("emoji-tab-{name}"))
+                .role("button")
+                .label(format!("{name} emoji"))
+                .size(34.0, 30.0)
+                .radius(6.0)
+                .center()
+                .fill(if i == current {
+                    p.accent_soft
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut RiverApp| s.chat.emoji_category = i)
+                .child(label((*glyph).to_owned(), st::EMOJI, p.text)),
+        );
+    }
+    let mut grid = row().key("emoji-grid").gap(2.0).flex_wrap().w_full();
+    for (i, e) in cats[current].2.iter().enumerate() {
+        let picked = (*e).to_owned();
+        grid = grid.child(
+            row()
+                .key(format!("emoji-{current}-{i}"))
+                .role("button")
+                .label((*e).to_owned())
+                .size(34.0, 34.0)
+                .radius(6.0)
+                .center()
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut RiverApp| s.chat.insert_emoji(&picked))
+                .child(label((*e).to_owned(), st::EMOJI, p.text)),
+        );
+    }
+    col()
+        .key("emoji-panel")
+        .w_full()
+        .gap(6.0)
+        .padding(8.0)
+        .radius(12.0)
+        .fill(p.surface)
+        .border(1.0, p.line_strong)
+        .shadow(8.0, 24.0, p.shadow)
+        .child(tabs)
+        .child(
+            col()
+                .key("emoji-scroll")
+                .w_full()
+                .max_h(200.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(grid),
+        )
 }
 
 /// A failed edit, deletion or reaction, with Retry (when it can be sent again) and Dismiss.
