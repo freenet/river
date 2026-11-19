@@ -304,6 +304,8 @@ impl Chat {
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
         if self.rooms.is_empty() {
+            self.emoji_open = false;
+            self.description_open = false;
             // An empty list is often a reload on its way to the full one: keep the open room's
             // text as its draft, remember which room it was, and open nothing.
             let mut open = std::mem::replace(&mut self.composer, TextEdit::new(""));
@@ -637,6 +639,10 @@ impl Chat {
     /// Open or close the composer's emoji picker.
     pub fn toggle_emoji(&mut self) {
         self.emoji_open = !self.emoji_open;
+        // The expanded description and the picker together would crowd a short window.
+        if self.emoji_open {
+            self.description_open = false;
+        }
     }
 
     /// Put `emoji` into the composer at the caret (in place of the selection) and give the

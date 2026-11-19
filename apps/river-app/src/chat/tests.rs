@@ -1155,6 +1155,12 @@ fn the_emoji_button_opens_a_picker_that_types_into_the_composer() {
     press(&mut rt, "composer-field");
     key(&mut rt, Key::Text("hi ".into()));
     press(&mut rt, "emoji-0-1");
+    assert!(
+        rt.elements()
+            .into_iter()
+            .any(|e| e.key.as_deref() == Some("composer-field") && e.focused),
+        "the composer has the focus again"
+    );
     let text = rt.state.chat.composer.text.clone();
     assert!(
         text.starts_with("hi ") && text.chars().count() == 4,
@@ -1187,4 +1193,24 @@ fn a_description_with_a_link_is_markdown_and_a_long_one_expands() {
     );
     press(&mut rt, "description-toggle");
     assert!(rt.find("description-scroll").is_none());
+}
+
+#[test]
+fn a_description_that_starts_with_a_blank_line_still_shows() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        rooms[0].description = "\n\nThe actual description".into();
+    });
+    let rt = render(state, WINDOW_SIZE);
+    assert!(shows(&rt, "The actual description"));
+}
+
+#[test]
+fn escape_closes_the_emoji_picker() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "emoji");
+    assert!(rt.find("emoji-panel").is_some());
+    press(&mut rt, "emoji-0-0");
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("emoji-panel").is_none());
 }

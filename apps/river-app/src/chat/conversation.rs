@@ -70,7 +70,12 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
     // The description is markdown. Collapsed it is its first line (links work there); a longer
     // one has a More button that shows the whole of it, scrolling past a height.
     let desc = room.description.as_str();
-    let first = desc.lines().next().unwrap_or("").trim();
+    // The first line that says something: a description may start with a blank line.
+    let first = desc
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     let expandable = desc.lines().filter(|l| !l.trim().is_empty()).count() > 1
         || desc.chars().count() > 90
         || !markdown::is_one_line(first);
@@ -121,7 +126,12 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
             .center()
             .hover(p.surface_hover)
             .cursor(rune::Cursor::Pointer)
-            .on_press(|s: &mut RiverApp| s.chat.description_open = !s.chat.description_open)
+            .on_press(|s: &mut RiverApp| {
+                s.chat.description_open = !s.chat.description_open;
+                if s.chat.description_open {
+                    s.chat.emoji_open = false;
+                }
+            })
             .child(label(
                 if open { "Less" } else { "More" },
                 st::SMALL_STRONG,
@@ -696,7 +706,14 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .disabled(!can_send);
     if can_send {
         input = input
-            .on_input_key(|s: &mut RiverApp, ev, _| keys::word_keys(&mut s.chat.composer, ev))
+            .on_input_key(|s: &mut RiverApp, ev, _| {
+                // Escape closes the emoji picker, whichever of the two has the focus.
+                if ev.key == rune::Key::Escape && s.chat.emoji_open {
+                    s.chat.emoji_open = false;
+                    return true;
+                }
+                keys::word_keys(&mut s.chat.composer, ev)
+            })
             .on_edit(|s: &mut RiverApp| &mut s.chat.composer)
             .on_submit(|s: &mut RiverApp, _| {
                 s.chat.send();
@@ -853,6 +870,13 @@ fn emoji_panel(chat: &Chat, p: &Palette) -> El {
     }
     col()
         .key("emoji-panel")
+        .on_key(|s: &mut RiverApp, ev, _| {
+            let esc = ev.key == rune::Key::Escape;
+            if esc {
+                s.chat.emoji_open = false;
+            }
+            esc
+        })
         .w_full()
         .gap(6.0)
         .padding(8.0)
