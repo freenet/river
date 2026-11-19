@@ -439,20 +439,18 @@ const QUICK_REACTIONS: &[&str] = &[
 ];
 
 /// The open reaction picker, mounted in the window's overlay layer under the message it
-/// reacts to. As for the kit's menus, a scrim takes a press anywhere outside and the surface
-/// is modal, so Escape or that press closes it without reacting. The press goes no further:
-/// another message's React button needs a second press.
+/// reacts to. The surface is modal with click-outside: Escape or a press anywhere outside it
+/// closes it without reacting, and that press goes no further (another message's React button
+/// needs a second press). Not shown where the message can't be reacted to.
 pub(super) fn picker_overlay(chat: &Chat, room: &Room, p: &Palette, k: &Kit, layer: &mut Vec<El>) {
     let Some(m) = chat
         .picker
         .as_deref()
         .and_then(|key| room.messages.iter().find(|m| m.key == key))
+        .filter(|m| room.send_block.is_none() && m.pending.is_none())
     else {
         return;
     };
-    layer.push(rune_kit::scrim("picker-scrim", |s: &mut RiverApp| {
-        s.chat.picker = None
-    }));
     let surface = picker(room, m, p).modal(true, |s: &mut RiverApp| s.chat.picker = None);
     layer.push(rune_kit::popover::anchored(
         k,

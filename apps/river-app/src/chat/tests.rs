@@ -1255,3 +1255,55 @@ fn escape_closes_the_emoji_picker() {
     key(&mut rt, Key::Escape);
     assert!(rt.find("emoji-panel").is_none());
 }
+
+#[test]
+fn the_reaction_picker_goes_when_the_room_stops_taking_reactions() {
+    let mut rt = node_rooms(|_| {});
+    let (_, last) = two_message_ids(&rt);
+    hover_press(&mut rt, &format!("react-{last}"));
+    assert!(rt.find(&format!("picker-{last}")).is_some());
+    // The tests module is a child of `chat`, so it reaches the private room list.
+    for r in &mut rt.state.chat.rooms {
+        r.send_block = Some("You have been banned.".into());
+    }
+    // State changed outside an event: tell the runtime to build the view again.
+    rt.invalidate();
+    for i in 0..10 {
+        rt.frame(1.0 + f64::from(i) * 0.1);
+    }
+    assert!(rt.find(&format!("picker-{last}")).is_none());
+}
+
+fn rect_of(rt: &Runtime<RiverApp>, key: &str) -> [f32; 4] {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+        .unwrap_or_else(|| panic!("no element {key}"))
+        .rect
+}
+
+#[test]
+fn the_reaction_picker_stays_in_the_window_and_off_its_own_toolbar() {
+    for size in [WINDOW_SIZE, NARROW_SCENE_SIZE, (480.0, 720.0)] {
+        let mut s = node_chat();
+        let rooms = super::example::data().rooms;
+        s.chat
+            .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_000);
+        let mut rt = render(s, size);
+        let (_, last) = two_message_ids(&rt);
+        hover_press(&mut rt, &format!("react-{last}"));
+        let pk = rect_of(&rt, &format!("picker-{last}"));
+        let bar = rect_of(&rt, &format!("actions-{last}"));
+        eprintln!("{size:?} picker {pk:?} bar {bar:?}");
+        assert!(pk[0] >= 0.0 && pk[1] >= 0.0, "{size:?} {pk:?}");
+        assert!(
+            pk[0] + pk[2] <= size.0 + 0.5 && pk[1] + pk[3] <= size.1 + 0.5,
+            "{size:?} {pk:?}"
+        );
+        let overlap = pk[0] < bar[0] + bar[2]
+            && bar[0] < pk[0] + pk[2]
+            && pk[1] < bar[1] + bar[3]
+            && bar[1] < pk[1] + pk[3];
+        assert!(!overlap, "{size:?} picker {pk:?} covers toolbar {bar:?}");
+    }
+}
