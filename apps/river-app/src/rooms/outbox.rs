@@ -89,7 +89,6 @@ use std::time::{Duration, Instant, SystemTime};
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::ecies::{encrypt_with_symmetric_key, seal_bytes};
-use river_core::room_state::ChatRoomStateV1Delta;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::content::{
     ACTION_CONTENT_VERSION, ActionContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_REPLY,
@@ -99,6 +98,7 @@ use river_core::room_state::member::{AuthorizedMember, MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
 use river_core::room_state::privacy::SealedBytes;
+use river_core::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
 
 use super::room::{LiveRoom, message_key};
 use crate::chat::model::{DeputyChange, Notice, Pending, ReplyWrap, Room};
@@ -181,6 +181,15 @@ pub enum Action {
     /// Leave the room, as the web UI does ([`super::leave`]): it is removed from the stored
     /// rooms and does not come back.
     LeaveRoom,
+    /// Make the identity export token for the room ([`super::identity`]). Nothing is sent to
+    /// the node; the token comes back as [`super::RoomsUpdate::Export`].
+    ExportId,
+    /// Import the identity a pasted token holds ([`super::identity`]): add its room, or with
+    /// `replace` swap the identity of the room already stored. `room` is empty.
+    ImportId {
+        token: super::identity::IdentityToken,
+        replace: bool,
+    },
 }
 
 impl std::fmt::Debug for Action {
@@ -233,6 +242,12 @@ impl std::fmt::Debug for Action {
                 .field("mode", mode)
                 .finish(),
             Action::LeaveRoom => f.write_str("LeaveRoom"),
+            Action::ExportId => f.write_str("ExportId"),
+            Action::ImportId { replace, .. } => f
+                .debug_struct("ImportId")
+                .field("token", &"<hidden>")
+                .field("replace", replace)
+                .finish(),
         }
     }
 }
@@ -482,6 +497,7 @@ impl Action {
                 | Action::DismissWork { .. }
                 | Action::SetNotificationMode { .. }
                 | Action::LeaveRoom
+                | Action::ImportId { .. }
         )
     }
 }
@@ -542,34 +558,47 @@ pub fn participation(room: &LiveRoom) -> Result<(), Blocked> {
 /// their invite chain put back if the room already removed them, so a ban on an ancestor
 /// still counts.
 fn self_banned(room: &LiveRoom, vk: &VerifyingKey) -> bool {
-    let state = &room.stored.room_state;
+    banned_by_state(
+        &room.stored.room_state,
+        &room.params(),
+        vk,
+        room.stored.self_authorized_member.as_ref(),
+        &room.stored.invite_chain,
+    )
+}
+
+/// [`self_banned`] for any state: whether the contract's own rule (`banned_member_ids`) takes
+/// `vk` out of `state`, with `admitted` and their `chain` put back when the room already removed
+/// them.
+pub(super) fn banned_by_state(
+    state: &ChatRoomStateV1,
+    params: &river_core::room_state::ChatRoomParametersV1,
+    vk: &VerifyingKey,
+    admitted: Option<&AuthorizedMember>,
+    chain: &[AuthorizedMember],
+) -> bool {
     let me = MemberId::from(vk);
     let mut members = state.members.clone();
     if !members.members.iter().any(|m| m.member.id() == me) {
-        if let Some(admitted) = &room.stored.self_authorized_member {
+        if let Some(admitted) = admitted {
             members.members.push(admitted.clone());
         }
         let mut present: HashSet<MemberId> =
             members.members.iter().map(|m| m.member.id()).collect();
-        for ancestor in &room.stored.invite_chain {
+        for ancestor in chain {
             if present.insert(ancestor.member.id()) {
                 members.members.push(ancestor.clone());
             }
         }
     }
     members
-        .banned_member_ids(
-            &state.ban_evidence,
-            &state.bans,
-            &state.member_info,
-            &room.params(),
-        )
+        .banned_member_ids(&state.ban_evidence, &state.bans, &state.member_info, params)
         .contains(&me)
 }
 
 /// The web UI's `build_rejoin_delta`: what re-adds a member the room pruned for inactivity.
 /// Nothing for the owner, a current member, or a member with no stored admission.
-fn rejoin(room: &LiveRoom) -> (Option<MembersDelta>, Option<Vec<AuthorizedMemberInfo>>) {
+pub(super) fn rejoin(room: &LiveRoom) -> (Option<MembersDelta>, Option<Vec<AuthorizedMemberInfo>>) {
     let Some(sk) = &room.stored.self_sk else {
         return (None, None);
     };
@@ -1859,6 +1888,15 @@ impl Outbox {
         }
     }
 
+    /// Say something plainly in the room, as a failed entry with nothing to send: for what this
+    /// app wanted to do for the user and could not.
+    pub fn notice(&mut self, room: &LiveRoom, label: &'static str, reason: String) {
+        let id = self.add(room, label, None);
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.status = Status::Failed(reason);
+        }
+    }
+
     fn add(&mut self, room: &LiveRoom, label: &'static str, mut intent: Option<Intent>) -> u64 {
         self.next += 1;
         let id = self.next;
@@ -2151,7 +2189,9 @@ impl Outbox {
             | Action::RetryWork { .. }
             | Action::DismissWork { .. }
             | Action::SetNotificationMode { .. }
-            | Action::LeaveRoom => Err(("Your message", "Nothing to do.".to_owned())),
+            | Action::LeaveRoom
+            | Action::ExportId
+            | Action::ImportId { .. } => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 

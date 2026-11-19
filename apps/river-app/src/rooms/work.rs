@@ -98,6 +98,7 @@ use freenet_stdlib::prelude::{ContractInstanceId, StateDelta, UpdateData};
 use river_core::chat_delegate::{CasStoreResult, ChatDelegateResponseMsg};
 use river_core::invitation::{Invitation, invitation_text_from_paste};
 use river_core::room_state::ChatRoomStateV1;
+use river_core::room_state::identity::IdentityExport;
 use river_core::stored_rooms::{
     NewRoom, NewRoomWrite, ROOMS_META_KEY, StoredRoom, StoredRoomSlot, decode_room_slot,
     encode_new_room, meta_with_current_room, reconcile_new_room, room_storage_key,
@@ -105,6 +106,7 @@ use river_core::stored_rooms::{
 
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
+use super::identity::{self, IdentityToken, ImportWrite};
 use super::leave::{meta_without_room, tombstone_write};
 use super::modes::{NotificationMode, meta_with_mode};
 
@@ -135,6 +137,16 @@ pub fn stored(room: &NewRoom) -> StoredRoom {
             self_member_info: room.self_member_info.clone(),
         },
     }
+}
+
+/// An import that was stored. No `Debug`: the nickname is private.
+pub struct ImportDone {
+    /// Whether the room was read from the network for this import (an add), so the state it
+    /// was stored with is current.
+    pub fetched: bool,
+    pub room: VerifyingKey,
+    pub identity: VerifyingKey,
+    pub nickname: Option<String>,
 }
 
 /// A task as the screen shows it.
@@ -185,6 +197,14 @@ enum Kind {
         room: VerifyingKey,
         name: String,
         identity: Option<Box<VerifyingKey>>,
+    },
+    /// Import an identity (`export`, checked already): add its room, or with `replace` swap the
+    /// identity of the room the store holds ([`super::identity`]). Adding reads the room from the
+    /// network first (`plan` holds the room built from it); replacing starts at the slot.
+    Import {
+        export: Box<IdentityExport>,
+        replace: bool,
+        plan: Option<Box<NewRoom>>,
     },
     /// Refused before it started; never works.
     Refused(String),
@@ -267,6 +287,7 @@ impl Task {
             Kind::Create(plan) => Some(plan.room.owner_vk),
             Kind::Join { invitation, .. } => Some(invitation.room),
             Kind::Leave { room, .. } => Some(*room),
+            Kind::Import { export, .. } => Some(export.room_owner),
             Kind::Mode { .. } | Kind::Refused(_) => None,
         }
     }
@@ -287,6 +308,7 @@ impl Task {
             Kind::Create(plan) => Some(&plan.room),
             Kind::Join { plan, .. } => plan.as_ref().map(|p| &p.room),
             Kind::Leave { .. } | Kind::Mode { .. } | Kind::Refused(_) => None,
+            Kind::Import { plan, .. } => plan.as_deref(),
         }
     }
 
@@ -298,6 +320,8 @@ impl Task {
                 super::room::LiveRoom::new(stored(&p.room)).name()
             ),
             Kind::Join { .. } => "Joining a room".to_owned(),
+            Kind::Import { replace: true, .. } => "Replacing your ID in a room".to_owned(),
+            Kind::Import { .. } => "Importing your ID".to_owned(),
             Kind::Mode { .. } => "Saving the notification setting".to_owned(),
             Kind::Leave { name, .. } => format!("Leaving “{name}”"),
             Kind::Refused(what) => what.clone(),
@@ -337,7 +361,7 @@ impl Task {
         self.step = match (&self.kind, self.step) {
             (Kind::Create(_), Step::Slot) => Step::Put,
             (Kind::Create(_), Step::Put) => Step::Meta,
-            (Kind::Join { .. }, Step::Get) => Step::Slot,
+            (Kind::Join { .. } | Kind::Import { .. }, Step::Get) => Step::Slot,
             // Nothing to send: the room, read just before, already has the invitee as a member
             // (another tab that accepted the same invitation, or an invitation accepted twice).
             // That is decided from the room alone, as the web UI's `build_state_for_put` does,
@@ -350,6 +374,7 @@ impl Task {
             (Kind::Join { .. }, Step::Slot) => Step::Update,
             (Kind::Join { .. }, Step::Update) => Step::Meta,
             (Kind::Leave { .. }, Step::Slot) => Step::Meta,
+            (Kind::Import { .. }, Step::Slot) => Step::Meta,
             (_, Step::Meta) => Step::Done,
             (_, step) => step,
         };
@@ -404,7 +429,26 @@ impl Task {
                 )
             });
         }
+        if let Kind::Import {
+            export,
+            replace: true,
+            ..
+        } = &self.kind
+        {
+            return match identity::slot_with_identity(value, export)? {
+                ImportWrite::Store(bytes) => Ok(Some(bytes)),
+                ImportWrite::Unchanged => Ok(None),
+                ImportWrite::Refuse(why) => Err(why),
+            };
+        }
         let room = self.room().ok_or_else(unexpected)?;
+        if let Kind::Import { export, .. } = &self.kind {
+            return match identity::add_room(value, room, export) {
+                ImportWrite::Store(bytes) => Ok(Some(bytes)),
+                ImportWrite::Unchanged => Ok(None),
+                ImportWrite::Refuse(why) => Err(why),
+            };
+        }
         // Joining may overwrite a tombstone: accepting an invitation is an explicit rejoin.
         let over_tombstone = matches!(self.kind, Kind::Join { .. });
         match reconcile_new_room(value, room, over_tombstone) {
@@ -553,6 +597,66 @@ impl Work {
         })
     }
 
+    /// Import the identity `pasted` holds. Without `replace` it adds the room (refused if one
+    /// is shown); with it, it swaps the identity of the room the store holds. `shown` says
+    /// whether a room is in the list already.
+    pub fn import_identity(
+        &mut self,
+        pasted: &IdentityToken,
+        replace: bool,
+        shown: &dyn Fn(&VerifyingKey) -> bool,
+    ) {
+        const WHAT: &str = "Importing your ID";
+        let export = match identity::parse_token(&pasted.0) {
+            Ok(e) => e,
+            Err(why) => return self.refuse(WHAT, why),
+        };
+        let owner = export.room_owner;
+        if shown(&owner) && !replace {
+            return self.refuse(
+                WHAT,
+                "You already have this room. Import again and choose to replace your identity in it."
+                    .into(),
+            );
+        }
+        // Another create, join or import of this room, working or waiting for Try again: a
+        // second one would race it for the same slot.
+        // A leave of the room is not "another change" here: tasks run one at a time, so an import
+        // queued behind a leave runs after it and finds its tombstone (an explicit rejoin).
+        let earlier = self
+            .tasks
+            .iter()
+            .filter(|t| t.owner() == Some(owner) && !t.is_leave())
+            .find_map(|t| {
+            if t.running() {
+                Some("This room is being changed: wait for that to finish first.")
+            } else if matches!(t.failed, Some((_, true))) {
+                Some("This room has a change that failed: use Try again on it, or dismiss it first.")
+            } else {
+                None
+            }
+        });
+        if let Some(why) = earlier {
+            return self.refuse(WHAT, why.into());
+        }
+        // A leave of this room that failed is over when the room is added again: it must not be
+        // tried again over it. A replace keeps the row: the user still meant to leave, and a retry
+        // does not tombstone a room whose identity changed since.
+        if !replace {
+            self.tasks
+                .retain(|t| !(t.is_leave() && t.owner() == Some(owner) && t.failed.is_some()));
+        }
+        let step = if replace { Step::Slot } else { Step::Get };
+        self.push(
+            Kind::Import {
+                export: Box::new(export),
+                replace,
+                plan: None,
+            },
+            step,
+        );
+    }
+
     /// Store `mode` as `room`'s notification mode. A save still waiting to start for the same
     /// room is changed instead of queueing another, so picking quickly writes the last pick.
     pub fn set_mode(&mut self, room: VerifyingKey, mode: NotificationMode) {
@@ -605,6 +709,31 @@ impl Work {
         out
     }
 
+    /// The imports that finished since the last call: the room, the imported identity, and the
+    /// nickname the token carries, if any. Each is reported once.
+    pub fn take_done_imports(&mut self) -> Vec<ImportDone> {
+        let mut out = Vec::new();
+        for t in &mut self.tasks {
+            let Kind::Import {
+                export, replace, ..
+            } = &t.kind
+            else {
+                continue;
+            };
+            if t.settled || t.step != Step::Done || t.failed.is_some() {
+                continue;
+            }
+            t.settled = true;
+            out.push(ImportDone {
+                fetched: !*replace,
+                room: export.room_owner,
+                identity: export.signing_key.verifying_key(),
+                nickname: identity::nickname_of(export),
+            });
+        }
+        out
+    }
+
     /// Try a failed task again from the step it failed at.
     pub fn retry(&mut self, id: u64) -> bool {
         let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) else {
@@ -629,6 +758,18 @@ impl Work {
         let refused = std::mem::take(&mut t.refused);
         if let Kind::Join { plan, .. } = &mut t.kind
             && (matches!(t.step, Step::Get | Step::Slot) || (t.step == Step::Update && refused))
+        {
+            *plan = None;
+            t.step = Step::Get;
+        }
+        // An import that adds a room reads it again, as a join does. One that replaces an
+        // identity has nothing to read: it works out its write from the slot again.
+        if let Kind::Import {
+            replace: false,
+            plan,
+            ..
+        } = &mut t.kind
+            && matches!(t.step, Step::Get | Step::Slot)
         {
             *plan = None;
             t.step = Step::Get;
@@ -845,24 +986,34 @@ impl Work {
         match (t.step, response) {
             (Step::Get, ContractResponse::GetResponse { key, state, .. }) if *key.id() == id => {
                 match ciborium::de::from_reader::<ChatRoomStateV1, _>(state.as_ref()) {
-                    Ok(state) => {
-                        let Kind::Join {
+                    Ok(state) => match &mut t.kind {
+                        Kind::Join {
                             invitation,
                             nickname,
                             plan,
-                        } = &mut t.kind
-                        else {
-                            return false;
-                        };
-                        let key = create::contract_key(&invitation.room);
-                        match create::join(invitation, nickname, &state, key, SystemTime::now()) {
-                            Ok(p) => {
-                                *plan = Some(Box::new(p));
-                                t.advance();
+                        } => {
+                            let key = create::contract_key(&invitation.room);
+                            match create::join(invitation, nickname, &state, key, SystemTime::now())
+                            {
+                                Ok(p) => {
+                                    *plan = Some(Box::new(p));
+                                    t.advance();
+                                }
+                                Err(r) => t.fail(r.why, r.retry),
                             }
-                            Err(r) => t.fail(r.why, r.retry),
                         }
-                    }
+                        Kind::Import { export, plan, .. } => {
+                            let key = create::contract_key(&export.room_owner);
+                            match identity::new_room(export, &state, key) {
+                                Ok(room) => {
+                                    *plan = Some(Box::new(room));
+                                    t.advance();
+                                }
+                                Err(r) => t.fail(r.why, r.retry),
+                            }
+                        }
+                        _ => return false,
+                    },
                     Err(e) => t.fail(
                         format!("Freenet gave back a room this app can't read ({e})."),
                         true,

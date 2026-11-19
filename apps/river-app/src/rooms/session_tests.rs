@@ -1,4 +1,5 @@
 use super::*;
+use crate::rooms::identity::IdentityToken;
 use crate::rooms::outbox::InviteCode;
 use crate::rooms::outbox::{Action, Outbox};
 use crate::rooms::room::message_key;
@@ -12,7 +13,8 @@ use freenet_stdlib::prelude::{
 use river_core::chat_delegate::{CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg};
 use river_core::room_state::ChatRoomParametersV1;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
-use river_core::room_state::member::MemberId;
+use river_core::room_state::identity::IdentityExport;
+use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
 use river_core::room_state::privacy::RoomDisplayMetadata;
 use std::collections::{BTreeMap, VecDeque};
@@ -3871,6 +3873,527 @@ fn an_invitation_for_a_room_gone_is_said_to_have_failed() {
         }
     );
     assert!(!shown.contains("SECRETCODE"), "{shown}");
+}
+
+// Export ID and Import ID -----------------------------------------------------------------------
+
+fn exports(session: &Running) -> Vec<(String, Result<String, String>)> {
+    session
+        .updates()
+        .into_iter()
+        .filter_map(|u| match u {
+            RoomsUpdate::Export { room, token } => Some((room, token)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An export asked for in a room is made from the stored room, reported once, and nothing is
+/// written or sent for it.
+#[test]
+fn an_identity_export_is_made_from_the_stored_room_and_nothing_is_written() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "export", quick());
+    node.with(|w| w.cas.clear());
+    session.act(&a, Action::ExportId);
+    session.wait_until("the export is reported", || !exports(&session).is_empty());
+    let (room, token) = exports(&session).remove(0);
+    assert_eq!(room, bs58::encode(a.vk().to_bytes()).into_string());
+    let export = IdentityExport::from_armored_string(&token.unwrap()).unwrap();
+    assert_eq!(export.room_owner, a.vk());
+    assert_eq!(export.signing_key.to_bytes(), a.owner.to_bytes());
+    assert_eq!(export.room_name.as_deref(), Some("A"));
+    // Quiescence: a later command is answered, so everything the export could have caused was
+    // processed before it (the session handles commands in order).
+    session.act(&a, Action::Invite);
+    session.wait_until("the later command is answered", || {
+        !session.invites().is_empty()
+    });
+    node.with(|w| assert!(w.cas.is_empty() && w.updates.is_empty() && w.puts.is_empty()));
+}
+
+/// An export asked for in a room that has gone is said to have failed, and the report that
+/// carries a token never prints it.
+#[test]
+fn an_identity_export_for_a_room_gone_is_said_to_have_failed() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let gone = TestRoom::new(2, "B", 1, &["b1"]);
+    let (session, _dir) = following(&node, &[&a], "export-gone", quick());
+    session.act(&gone, Action::ExportId);
+    session.wait_until("the export is said to have failed", || {
+        exports(&session).iter().any(|(room, t)| {
+            *room == bs58::encode(gone.vk().to_bytes()).into_string() && t.is_err()
+        })
+    });
+}
+
+/// A member of room `room` (invited by its owner), as an identity token.
+fn member_token(room: &TestRoom, seed: u8, nickname: &str) -> (SigningKey, String) {
+    let member = SigningKey::from_bytes(&[seed; 32]);
+    let owner_id = MemberId::from(&room.vk());
+    let export = IdentityExport {
+        room_owner: room.vk(),
+        signing_key: member.clone(),
+        authorized_member: AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member.verifying_key(),
+            },
+            &room.owner,
+        ),
+        invite_chain: vec![],
+        member_info: None,
+        room_name: None,
+        self_nickname: Some(nickname.into()),
+        invitation_secrets: Default::default(),
+    };
+    (member, export.to_armored_string())
+}
+
+/// Importing the identity of a room this node's store does not hold reads the room from the
+/// network, stores it under that identity, and shows it.
+#[test]
+fn importing_an_identity_adds_the_room_under_that_identity() {
+    let node = fake_node(vec![]);
+    let room = TestRoom::new(3, "Garden", 1, &["t1"]);
+    let real = super::super::create::contract_key(&room.vk());
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&room.state))));
+    });
+    let other = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&other], "import-add", quick());
+    let (member, token) = member_token(&room, 70, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: false,
+    });
+    session.wait_rooms("the imported room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Garden")
+    });
+    node.with(|w| {
+        let StoredRoomSlot::Present(stored) =
+            decode_room_slot(&w.slots[&room_storage_key(&room.vk())]).unwrap()
+        else {
+            panic!("a present room");
+        };
+        assert_eq!(stored.self_verifying_key(), Some(member.verifying_key()));
+        assert_eq!(stored.self_nickname.as_deref(), Some("Bea"));
+        assert_eq!(stored.contract_key, real);
+        // Nothing was sent to the room: an import is not a join.
+        assert!(w.updates.is_empty() && w.puts.is_empty());
+        assert_eq!(w.overlaps, 0);
+    });
+}
+
+/// Replacing keeps the stored room and its fields, and swaps the identity; the room then shows
+/// as the imported member.
+#[test]
+fn replacing_an_identity_swaps_it_in_the_stored_room_and_keeps_the_rest() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "import-replace", quick());
+    let slot = room_storage_key(&a.vk());
+    let before = node.with(|w| w.slots[&slot].clone());
+    let (member, token) = member_token(&a, 71, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the identity is replaced", || {
+        node.with(|w| {
+            matches!(decode_room_slot(&w.slots[&slot]),
+                Ok(StoredRoomSlot::Present(r)) if r.self_verifying_key() == Some(member.verifying_key()))
+        })
+    });
+    node.with(|w| {
+        let StoredRoomSlot::Present(now) = decode_room_slot(&w.slots[&slot]).unwrap() else {
+            panic!("present");
+        };
+        let StoredRoomSlot::Present(was) = decode_room_slot(&before).unwrap() else {
+            panic!("present");
+        };
+        assert_eq!(now.contract_key, was.contract_key);
+        assert_eq!(now.owner_vk, was.owner_vk);
+        assert_eq!(now.self_nickname.as_deref(), Some("Bea"));
+        assert_eq!(
+            cbor(&now.room_state),
+            cbor(&was.room_state),
+            "the room's state is kept"
+        );
+        assert_eq!(w.overlaps, 0);
+    });
+    // The screen follows: the room is still there, and you are the imported member.
+    session.wait_rooms("the room is still shown", |r, _, _| {
+        r.iter().any(|r| r.name == "A")
+    });
+}
+
+/// Room "A" with `member` (seed `seed`) already in its members and holding no nickname record,
+/// as a member the room has but nobody has heard a name from.
+fn room_with_nameless_member(seed: u8) -> (TestRoom, SigningKey) {
+    let mut a = TestRoom::new(1, "A", 1, &["a1"]);
+    let member = SigningKey::from_bytes(&[seed; 32]);
+    let owner_id = MemberId::from(&a.vk());
+    a.state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member.verifying_key(),
+        },
+        &a.owner,
+    ));
+    // A message of theirs, so the room does not prune them as inactive.
+    a.state
+        .recent_messages
+        .messages
+        .push(AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner_id,
+                author: MemberId::from(&member.verifying_key()),
+                time: SystemTime::now() - Duration::from_secs(10),
+                content: RoomMessageBody::public("hello".into()),
+            },
+            &member,
+        ));
+    (a, member)
+}
+
+/// After a replace, the imported member the room holds with no nickname record gets one
+/// published, signed with their own key (the web UI's member-info heal, river#414).
+#[test]
+fn replacing_an_identity_publishes_the_nickname_the_room_lacks_for_it() {
+    let node = fake_node(vec![]);
+    let (a, member) = room_with_nameless_member(72);
+    let (session, _dir) = following(&node, &[&a], "import-heal", quick());
+    let (_, token) = member_token(&a, 72, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the nickname record is published", || {
+        node.with(|w| w.updates.iter().any(|(_, d)| d.member_info.is_some()))
+    });
+    node.with(|w| {
+        let records: Vec<_> = w
+            .updates
+            .iter()
+            .filter_map(|(_, d)| d.member_info.as_ref())
+            .flatten()
+            .collect();
+        assert_eq!(records.len(), 1, "once");
+        let r = records[0];
+        assert_eq!(
+            r.member_info.member_id,
+            MemberId::from(&member.verifying_key())
+        );
+        r.verify_signature_with_key(&member.verifying_key())
+            .expect("signed by the imported key");
+        assert_eq!(
+            r.member_info.preferred_nickname,
+            river_core::room_state::privacy::SealedBytes::public(b"Bea".to_vec())
+        );
+    });
+}
+
+/// A stored copy of the room that lacks the member's nickname record while the network's has
+/// it: the heal is decided on the network's state, so the newer record is never published over.
+#[test]
+fn a_stale_stored_state_does_not_make_the_heal_publish_over_the_networks_record() {
+    let node = fake_node(vec![]);
+    let (stale, member) = room_with_nameless_member(72);
+    let mut network = stale.state.clone();
+    network.member_info.member_info.push(
+        river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
+            river_core::room_state::member_info::MemberInfo {
+                member_id: MemberId::from(&member.verifying_key()),
+                version: 3,
+                preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                    b"Newer on the network".to_vec(),
+                ),
+                deputies: Vec::new(),
+            },
+            &member,
+        ),
+    );
+    let (session, _dir) = following(&node, &[&stale], "import-stale", quick());
+    // The network has the record the stored copy lacks.
+    node.with(|w| {
+        w.contracts
+            .insert(stale.id(), (stale.key, Contract::State(cbor(&network))));
+    });
+    let (_, token) = member_token(&stale, 72, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the identity is replaced", || {
+        node.with(|w| {
+            matches!(decode_room_slot(&w.slots[&room_storage_key(&stale.vk())]),
+                Ok(StoredRoomSlot::Present(r)) if r.self_verifying_key() == Some(member.verifying_key()))
+        })
+    });
+    session.act(&stale, Action::Invite);
+    session.wait_until("a later command is answered", || {
+        !session.invites().is_empty()
+    });
+    node.with(|w| assert!(w.updates.iter().all(|(_, d)| d.member_info.is_none())));
+}
+
+/// In a private room whose secret the imported identity does not have, nothing is published and
+/// no failed "Your nickname" entry appears: the heal waits for the secret.
+#[test]
+fn the_heal_in_a_private_room_without_the_secret_is_skipped_quietly() {
+    let node = fake_node(vec![]);
+    let mut a = TestRoom::private(1);
+    let member = SigningKey::from_bytes(&[72; 32]);
+    let owner_id = MemberId::from(&a.vk());
+    a.state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk: member.verifying_key(),
+        },
+        &a.owner,
+    ));
+    let (session, _dir) = following(&node, &[&a], "import-private-heal", quick());
+    let (_, token) = member_token(&a, 72, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the identity is replaced", || {
+        node.with(|w| {
+            matches!(decode_room_slot(&w.slots[&room_storage_key(&a.vk())]),
+                Ok(StoredRoomSlot::Present(r)) if r.self_verifying_key() == Some(member.verifying_key()))
+        })
+    });
+    session.act(&a, Action::Invite);
+    session.wait_until("a later command is answered", || {
+        !session.invites().is_empty()
+    });
+    node.with(|w| assert!(w.updates.iter().all(|(_, d)| d.member_info.is_none())));
+    let (rooms, _, _) = session.last_rooms().unwrap();
+    assert!(
+        rooms.iter().all(|r| r.notices.is_empty()),
+        "no unexplained failure"
+    );
+}
+
+/// A replace asks for the room's current state again, and the heal waits for it: the member-info
+/// check is made on a read after the import, not on one from before it.
+#[test]
+fn a_replace_reads_the_room_again_and_the_heal_waits_for_that_read() {
+    let node = fake_node(vec![]);
+    let (a, member) = room_with_nameless_member(72);
+    let (session, _dir) = following(&node, &[&a], "import-refresh", quick());
+    let before = node.with(|w| w.subscribes_to(a.id()));
+    let (_, token) = member_token(&a, 72, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the room is asked for again", || {
+        node.with(|w| w.subscribes_to(a.id()) > before)
+    });
+    session.wait_until("the nickname record is published", || {
+        node.with(|w| w.updates.iter().any(|(_, d)| d.member_info.is_some()))
+    });
+    let _ = member;
+}
+
+/// A heal that never gets its read says so instead of vanishing.
+#[test]
+fn a_heal_that_cannot_be_decided_says_so() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut rooms = Rooms::default();
+    rooms.list.push(LiveRoom::new(a.stored()));
+    rooms.heals.push((
+        super::super::work::ImportDone {
+            fetched: false,
+            room: a.vk(),
+            identity: a.vk(),
+            nickname: Some("Bea".into()),
+        },
+        500,
+    ));
+    // No network state was seen after the import.
+    rooms.run_heals();
+    assert!(rooms.heals.is_empty());
+    let view = rooms.outbox.view(&rooms.list[0], &local_minutes);
+    assert!(
+        view.notices
+            .iter()
+            .any(|n| n.text.contains("could not be checked yet")),
+        "{:?}",
+        view.notices
+            .iter()
+            .map(|n| n.text.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The owner has no nickname record to heal, and a member who already has one is left alone.
+#[test]
+fn replacing_an_identity_heals_nobody_the_room_already_names() {
+    let node = fake_node(vec![]);
+    let (mut a, member) = room_with_nameless_member(72);
+    a.state.member_info.member_info.push(
+        river_core::room_state::member_info::AuthorizedMemberInfo::new_with_member_key(
+            river_core::room_state::member_info::MemberInfo {
+                member_id: MemberId::from(&member.verifying_key()),
+                version: 0,
+                preferred_nickname: river_core::room_state::privacy::SealedBytes::public(
+                    b"Already".to_vec(),
+                ),
+                deputies: Vec::new(),
+            },
+            &member,
+        ),
+    );
+    let (session, _dir) = following(&node, &[&a], "import-no-heal", quick());
+    let (_, token) = member_token(&a, 72, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the identity is replaced", || {
+        node.with(|w| {
+            matches!(decode_room_slot(&w.slots[&room_storage_key(&a.vk())]),
+                Ok(StoredRoomSlot::Present(r)) if r.self_verifying_key() == Some(member.verifying_key()))
+        })
+    });
+    session.wait_rooms("the room shows again", |r, _, _| {
+        r.iter().any(|r| r.name == "A")
+    });
+    node.with(|w| assert!(w.updates.iter().all(|(_, d)| d.member_info.is_none())));
+}
+
+/// What the app does to the delegate's key namespace after an import: the key the delegate
+/// holds for the room becomes the imported one, over the old one, as the web UI's import does
+/// (`migrate_signing_key` with the authoritative flag). Without it the delegate's own signing
+/// (rotation of a private room by its owner) would go on with the key the user replaced.
+#[test]
+fn an_import_replaces_the_delegates_key_for_the_room_with_the_imported_one() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let (session, _dir) = following(&node, &[&a], "import-key", quick());
+    session.wait_until("the room's own key is in the delegate", || {
+        node.with(|w| w.signing_keys.get(&a.vk().to_bytes()) == Some(&a.owner.to_bytes().to_vec()))
+    });
+    let (member, token) = member_token(&a, 73, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the delegate holds the imported key", || {
+        node.with(|w| w.signing_keys.get(&a.vk().to_bytes()) == Some(&member.to_bytes().to_vec()))
+    });
+}
+
+/// A room the user left (its key holds a tombstone) is added by an import, as an explicit
+/// rejoin: the web UI's import clears a tombstone too.
+#[test]
+fn importing_an_identity_for_a_left_room_adds_it_over_the_tombstone() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let real = super::super::create::contract_key(&a.vk());
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&a.state))));
+    });
+    let (session, _dir) = following(&node, &[&a, &b], "import-after-leave", quick());
+    session.act(&a, Action::LeaveRoom);
+    session.wait_until("the leave is stored and done", || {
+        tombstoned(&node, &a) && session.last_work().is_empty()
+    });
+    session.wait_rooms("the room is gone", |r, _, _| {
+        r.len() == 1 && r[0].name == "B"
+    });
+    let (member, token) = member_token(&a, 74, "Bea");
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: false,
+    });
+    session.wait_rooms("the room is back", |r, _, _| {
+        r.iter().any(|r| r.name == "A")
+    });
+    node.with(|w| {
+        let StoredRoomSlot::Present(now) =
+            decode_room_slot(&w.slots[&room_storage_key(&a.vk())]).unwrap()
+        else {
+            panic!("the tombstone was replaced by the room");
+        };
+        assert_eq!(now.self_verifying_key(), Some(member.verifying_key()));
+        assert_eq!(w.overlaps, 0);
+    });
+}
+
+/// An import sent right behind a leave of the same room runs after it, finds the tombstone and
+/// adds the room: nothing is refused, and the leave is not tried again over the imported room.
+#[test]
+fn an_import_queued_behind_a_leave_adds_the_room_after_it() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let real = super::super::create::contract_key(&a.vk());
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&a.state))));
+    });
+    let (session, _dir) = following(&node, &[&a, &b], "import-while-leaving", quick());
+    let (member, token) = member_token(&a, 75, "Bea");
+    session.act(&a, Action::LeaveRoom);
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: false,
+    });
+    session.wait_until("the imported room is stored under the imported key", || {
+        node.with(|w| {
+            matches!(decode_room_slot(&w.slots[&room_storage_key(&a.vk())]),
+                Ok(StoredRoomSlot::Present(r)) if r.self_verifying_key() == Some(member.verifying_key()))
+        })
+    });
+    session.wait_rooms("both rooms show", |r, _, _| r.len() == 2);
+    session.wait_until("no task is left", || session.last_work().is_empty());
+    node.with(|w| {
+        assert_eq!(w.overlaps, 0);
+        // The leave wrote its tombstone first, then the import replaced it; nothing came after.
+        let stores: Vec<bool> = w
+            .cas
+            .iter()
+            .filter(|(k, _)| *k == room_storage_key(&a.vk()))
+            .map(|(_, ok)| *ok)
+            .collect();
+        assert_eq!(stores, [true, true], "{stores:?}");
+    });
+}
+
+/// A replace sent behind a leave has no identity left to replace: the room stays left.
+#[test]
+fn a_replace_queued_behind_a_leave_leaves_the_room_left() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let (session, _dir) = following(&node, &[&a, &b], "replace-while-leaving", quick());
+    let (_, token) = member_token(&a, 76, "Bea");
+    session.act(&a, Action::LeaveRoom);
+    session.list(Action::ImportId {
+        token: IdentityToken(token),
+        replace: true,
+    });
+    session.wait_until("the replace is refused", || {
+        session.last_work().iter().any(|w| {
+            matches!(&w.state, WorkState::Failed { why, retry: false }
+                if why.contains("no longer in River's storage"))
+        })
+    });
+    assert!(tombstoned(&node, &a), "the leave stands");
+    session.wait_rooms("only B shows", |r, _, _| r.len() == 1 && r[0].name == "B");
 }
 
 // Setting up River's storage --------------------------------------------------------------------

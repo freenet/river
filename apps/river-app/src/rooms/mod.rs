@@ -24,8 +24,12 @@
 //! the web UI's generation compare-and-swap, only adds a room where none is stored (or, to
 //! leave one, replaces it with the web UI's tombstone), and in `rooms_meta` only changes the
 //! open room, the user's per-room notification modes and, when a room is left, the entries
-//! naming it ([`work`] has the details, [`modes`] the modes). The one other thing it writes is each room's signing
-//! key, in the delegate's own namespace for keys, only where the delegate holds none ([`keys`]).
+//! naming it ([`work`] has the details, [`modes`] the modes). It also imports an identity the
+//! user pasted ([`identity`]): it adds the room where none is stored (or a tombstone is), or, only
+//! when the user said replace, swaps the identity fields of the stored room in place and keeps
+//! everything else in the slot. The one other thing it writes is each room's signing
+//! key, in the delegate's own namespace for keys, only where the delegate holds none, or holds
+//! another after the user imported that room's identity ([`keys`]).
 //! Its only PUT is the seed PUT of a room it has just created, under that room's own contract;
 //! it never seeds a room the network lacks, which the web UI does.
 //!
@@ -38,6 +42,7 @@ pub mod delegate;
 pub mod deputies;
 pub mod generation;
 pub mod grant;
+pub mod identity;
 pub mod keys;
 pub mod leave;
 pub mod modes;
@@ -55,6 +60,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
+pub use identity::IdentityToken;
 pub use outbox::{Action, Command, InviteCode};
 pub use session::{Access, Issues, LinkStatus, RoomsUpdate};
 

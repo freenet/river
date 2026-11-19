@@ -317,6 +317,10 @@ impl RiverApp {
                 }
                 self.chat.invitation_made(room, link);
             }
+            // Not copied: the user presses Copy in the dialog, as in the web UI.
+            RoomsUpdate::Export { room, token } => {
+                self.chat.identity_exported(room, token);
+            }
         }
     }
 
@@ -407,6 +411,43 @@ fn deputy_change(
             retry,
         },
     }
+}
+
+/// An identity token for the scenes, made from fixed throwaway keys.
+fn scene_token() -> String {
+    use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let member = ed25519_dalek::SigningKey::from_bytes(&[70; 32]);
+    let owner_id = MemberId::from(&owner.verifying_key());
+    river_core::room_state::identity::IdentityExport {
+        room_owner: owner.verifying_key(),
+        signing_key: member.clone(),
+        authorized_member: AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member.verifying_key(),
+            },
+            &owner,
+        ),
+        invite_chain: vec![],
+        member_info: None,
+        room_name: Some("Town Square".into()),
+        self_nickname: Some("Bea".into()),
+        invitation_secrets: Default::default(),
+    }
+    .to_armored_string()
+}
+
+/// The chat screen for the identity scenes: the example rooms as rooms from the node, so the
+/// export and import buttons are live.
+fn identity_scene(s: &mut RiverApp, edit: fn(&mut Chat)) {
+    connect(s);
+    let rooms = chat::example::data().rooms;
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    s.chat
+        .show_node_rooms(rooms, None, chat::LinkStatus::Live, 29_000_000);
+    edit(&mut s.chat);
 }
 
 /// A long description for the details scenes: paragraphs, links and a list.
@@ -769,6 +810,73 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat
             .set_mode("rust-help", rooms::modes::NotificationMode::Muted);
+    }),
+    // Export ID and Import ID: the token ready to copy, being made, refused; the import box
+    // empty, with a token that does not check, and asking before it replaces an identity.
+    ("chat-export-id", |s| {
+        identity_scene(s, |c| {
+            c.open_export();
+            let room = c.room().map(|r| r.key.clone()).unwrap_or_default();
+            c.identity_exported(room, Ok(scene_token()));
+        })
+    }),
+    ("chat-export-id-copied", |s| {
+        identity_scene(s, |c| {
+            c.open_export();
+            let room = c.room().map(|r| r.key.clone()).unwrap_or_default();
+            c.identity_exported(room, Ok(scene_token()));
+            c.export_copied();
+        })
+    }),
+    ("chat-export-id-making", |s| {
+        identity_scene(s, |c| c.open_export())
+    }),
+    ("chat-export-id-refused", |s| {
+        identity_scene(s, |c| {
+            c.open_export();
+            let room = c.room().map(|r| r.key.clone()).unwrap_or_default();
+            c.identity_exported(
+                room,
+                Err(
+                    "Cannot export: membership data not available. Try sending a message first."
+                        .into(),
+                ),
+            );
+        })
+    }),
+    ("chat-import-id", |s| identity_scene(s, |c| c.open_import())),
+    ("chat-import-id-pasted", |s| {
+        identity_scene(s, |c| {
+            c.open_import();
+            c.form.token.replace_text(scene_token());
+        })
+    }),
+    ("chat-import-id-invalid", |s| {
+        identity_scene(s, |c| {
+            c.open_import();
+            c.form.token.replace_text(
+                "-----BEGIN RIVER IDENTITY-----\n3mJr7AoUXx2Wqd\n-----END RIVER IDENTITY-----",
+            );
+            c.submit_import();
+        })
+    }),
+    ("chat-import-id-replace", |s| {
+        identity_scene(s, |c| {
+            // The token's room is in the list: the owner of the first example room is not a
+            // key this scene can sign for, so the list's first room takes the token's key.
+            let (owner, token) = (
+                ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key(),
+                scene_token(),
+            );
+            let mut rooms = c.rooms().to_vec();
+            if let Some(r) = rooms.first_mut() {
+                r.key = bs58::encode(owner.to_bytes()).into_string();
+            }
+            c.set_rooms(rooms);
+            c.open_import();
+            c.form.token.replace_text(&token);
+            c.submit_import();
+        })
     }),
     // The room details dialog: as a member sees it (a public and a private room), as the owner
     // edits it, with values the room would refuse, on its way to the node, after the node
@@ -1788,6 +1896,311 @@ mod tests {
                 },
             }]
         );
+    }
+
+    /// An identity token for a member (seed `member`) of the room owned by seed `owner`.
+    fn identity_token(owner: u8, member: u8) -> (String, ed25519_dalek::VerifyingKey) {
+        use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[owner; 32]);
+        let member = ed25519_dalek::SigningKey::from_bytes(&[member; 32]);
+        let owner_id = MemberId::from(&owner.verifying_key());
+        let export = river_core::room_state::identity::IdentityExport {
+            room_owner: owner.verifying_key(),
+            signing_key: member.clone(),
+            authorized_member: AuthorizedMember::new(
+                Member {
+                    owner_member_id: owner_id,
+                    invited_by: owner_id,
+                    member_vk: member.verifying_key(),
+                },
+                &owner,
+            ),
+            invite_chain: vec![],
+            member_info: None,
+            room_name: Some("Garden".into()),
+            self_nickname: Some("Bea".into()),
+            invitation_secrets: Default::default(),
+        };
+        (export.to_armored_string(), owner.verifying_key())
+    }
+
+    #[test]
+    fn export_id_shows_the_warning_and_copies_only_when_asked() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let open = rt.state.chat.room().unwrap().key.clone();
+        press(&mut rt, "export-id");
+        assert!(rt.find("export-identity-dialog").is_some());
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: open.clone(),
+                action: rooms::Action::ExportId,
+            }]
+        );
+        assert!(
+            rt.find("export-status").is_some(),
+            "says it is preparing the token"
+        );
+        assert!(
+            rt.find("export-warning").is_some(),
+            "the private-key warning shows at once"
+        );
+        let (token, _) = identity_token(3, 70);
+        let (room, shown) = (open.clone(), token.clone());
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Export {
+                    room,
+                    token: Ok(shown),
+                },
+                tx,
+            )
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("export-token").is_some());
+        assert!(rt.find("export-status").is_none());
+        assert_eq!(board.text(), None, "nothing is copied until the user asks");
+        press(&mut rt, "export-copy");
+        assert_eq!(
+            board.text().as_deref().map(String::as_str),
+            Some(token.as_str())
+        );
+        assert!(rt.state.chat.export.as_ref().is_some_and(|d| d.copied));
+        // The token is never in a printed state.
+        let printed = format!("{:?}", rt.state.chat.export);
+        assert!(
+            !printed.contains("BEGIN") && !printed.contains(&token[40..80]),
+            "{printed}"
+        );
+        press(&mut rt, "export-close");
+        assert!(rt.find("export-identity-dialog").is_none());
+        assert!(rt.state.chat.export.is_none(), "closing drops the token");
+    }
+
+    #[test]
+    fn an_export_that_arrives_after_the_dialog_closed_is_dropped() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let open = rt.state.chat.room().unwrap().key.clone();
+        press(&mut rt, "export-id");
+        press(&mut rt, "export-close");
+        let (token, _) = identity_token(3, 70);
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Export {
+                    room: open,
+                    token: Ok(token),
+                },
+                tx,
+            )
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.chat.export.is_none());
+    }
+
+    #[test]
+    fn an_export_that_cannot_be_made_says_why_and_cannot_be_copied() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let open = rt.state.chat.room().unwrap().key.clone();
+        press(&mut rt, "export-id");
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Export {
+                    room: open,
+                    token: Err(
+                        "Cannot export: the signing key for this room is not stored here.".into(),
+                    ),
+                },
+                tx,
+            )
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("export-error").is_some());
+        assert!(rt.find("export-token").is_none());
+        press(&mut rt, "export-copy");
+        assert_eq!(board.text(), None, "a disabled Copy copies nothing");
+    }
+
+    #[test]
+    fn import_id_checks_the_token_and_sends_it_for_a_room_not_in_the_list() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "import-id");
+        assert!(rt.find("import-identity-dialog").is_some());
+        press(&mut rt, "form-submit");
+        assert!(rt.find("form-error").is_some(), "an empty box is said");
+        rt.update(|s, _| s.chat.form.token.replace_text("not a token"));
+        press(&mut rt, "form-submit");
+        assert!(
+            rt.state
+                .chat
+                .form
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("Invalid token: ")),
+            "{:?}",
+            rt.state.chat.form.error
+        );
+        assert!(rt.state.chat.outgoing.is_empty());
+        let (token, _) = identity_token(3, 70);
+        let pasted = token.clone();
+        rt.update(move |s, _| s.chat.form.token.replace_text(&pasted));
+        press(&mut rt, "form-submit");
+        assert!(
+            rt.find("import-identity-dialog").is_none(),
+            "the dialog closes"
+        );
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: String::new(),
+                action: rooms::Action::ImportId {
+                    token: rooms::IdentityToken(token),
+                    replace: false,
+                },
+            }]
+        );
+        assert!(
+            rt.state.chat.form.token.text.is_empty(),
+            "the pasted key is dropped"
+        );
+    }
+
+    #[test]
+    fn import_id_for_a_room_in_the_list_asks_before_replacing_and_sends_what_it_asked_about() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let (token_a, owner_a) = identity_token(3, 70);
+        let (token_b, _) = identity_token(4, 71);
+        // A room in the list that is the token's.
+        rt.update(move |s, _| {
+            let mut room = s.chat.rooms()[0].clone();
+            room.key = bs58::encode(owner_a.to_bytes()).into_string();
+            s.chat.set_rooms(vec![room]);
+        });
+        press(&mut rt, "import-id");
+        let a = token_a.clone();
+        rt.update(move |s, _| s.chat.form.token.replace_text(&a));
+        press(&mut rt, "form-submit");
+        assert!(rt.find("import-identity-replace-warning").is_some());
+        assert!(
+            rt.find("import-identity-replace-multitab-warning")
+                .is_some()
+        );
+        assert!(
+            rt.state.chat.outgoing.is_empty(),
+            "nothing is sent before the user confirms"
+        );
+        // Cancel: back to the box, the paste kept.
+        press(&mut rt, "import-identity-replace-cancel");
+        assert!(rt.find("import-identity-replace-warning").is_none());
+        assert_eq!(rt.state.chat.form.token.text, token_a);
+        // Ask again, then edit the box to another room's token without going through the
+        // box's change hook: Replace still imports the token the warning was about.
+        press(&mut rt, "form-submit");
+        let b = token_b.clone();
+        rt.update(move |s, _| s.chat.form.token.replace_text(&b));
+        press(&mut rt, "import-identity-replace-confirm");
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: String::new(),
+                action: rooms::Action::ImportId {
+                    token: rooms::IdentityToken(token_a.clone()),
+                    replace: true,
+                },
+            }]
+        );
+        assert!(rt.find("import-identity-dialog").is_none());
+        // Editing the box drops the warning.
+        press(&mut rt, "import-id");
+        let a = token_a.clone();
+        rt.update(move |s, _| s.chat.form.token.replace_text(&a));
+        press(&mut rt, "form-submit");
+        assert!(rt.find("import-identity-replace-warning").is_some());
+        rt.update(|s, _| {
+            s.chat.form.token.replace_text("x");
+            s.chat.import_token_edited();
+        });
+        settle(&mut rt);
+        assert!(rt.find("import-identity-replace-warning").is_none());
+        assert!(rt.find("import-identity-replace-confirm").is_none());
+    }
+
+    /// Ctrl+Backspace edits the box by word without the field's change hook: the warning raised
+    /// for the text before it must still go, and Replace must not import the old token.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_word_key_edit_while_the_replace_warning_is_up_drops_the_warning() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let (token_a, owner_a) = identity_token(3, 70);
+        rt.update(move |s, _| {
+            let mut room = s.chat.rooms()[0].clone();
+            room.key = bs58::encode(owner_a.to_bytes()).into_string();
+            s.chat.set_rooms(vec![room]);
+        });
+        press(&mut rt, "import-id");
+        let a = token_a.clone();
+        rt.update(move |s, _| s.chat.form.token.replace_text(&a));
+        press(&mut rt, "form-submit");
+        assert!(rt.find("import-identity-replace-warning").is_some());
+        rt.update(|s, _| s.chat.form.token.focused = true);
+        settle(&mut rt);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Backspace,
+            mods: rune::Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        });
+        settle(&mut rt);
+        assert_ne!(
+            rt.state.chat.form.token.text, token_a,
+            "the key edited the box"
+        );
+        assert!(
+            rt.find("import-identity-replace-warning").is_none(),
+            "the warning was for the text before the edit"
+        );
+        assert!(rt.find("import-identity-replace-confirm").is_none());
+        assert!(rt.state.chat.outgoing.is_empty());
+    }
+
+    /// The replace dialog names the room you have, not what the token says it is called.
+    #[test]
+    fn the_replace_dialog_names_the_stored_room_not_the_tokens() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let (token, owner) = identity_token(3, 70);
+        rt.update(move |s, _| {
+            let mut room = s.chat.rooms()[0].clone();
+            room.key = bs58::encode(owner.to_bytes()).into_string();
+            room.name = "Stored name".into();
+            s.chat.set_rooms(vec![room]);
+        });
+        press(&mut rt, "import-id");
+        rt.update(move |s, _| s.chat.form.token.replace_text(&token));
+        press(&mut rt, "form-submit");
+        let confirm = rt.state.chat.form.replace.as_ref().expect("asked");
+        assert_eq!(confirm.room_name.as_deref(), Some("Stored name"));
+        assert_ne!(
+            confirm.room_name.as_deref(),
+            Some("Garden"),
+            "the token's name"
+        );
+    }
+
+    #[test]
+    fn export_and_import_are_not_offered_for_the_example_rooms() {
+        let mut chat = chat::Chat::new(chat::Source::Example, Vec::new(), 0, 0, 0);
+        chat.open_import();
+        assert!(chat.form.open.is_none());
+        chat.open_export();
+        assert!(chat.export.is_none());
+        assert!(chat.outgoing.is_empty());
     }
 
     #[test]

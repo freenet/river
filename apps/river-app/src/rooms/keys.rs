@@ -15,7 +15,9 @@
 //! whose key was not stored because the app ended first, with no state kept: a new run starts
 //! the sweep again.
 //!
-//! **A key that is there is never replaced.** The delegate overwrites without comparing
+//! **A key that is there is never replaced, except after the user imported that room's identity**
+//! ([`KeySweep::authoritative`]): the web UI's import replaces it too.
+//! The rest of this paragraph is the rule without that exception. The delegate overwrites without comparing
 //! (`handle_store_signing_key`, `delegates/chat-delegate/src/handlers.rs`), so the check is
 //! this app's. A key equal to ours is done. A different one is what the web UI's
 //! `migrate_signing_key` reports as `StaleKeyOverwritten`, and its caller then removes the
@@ -111,6 +113,11 @@ pub struct KeySweep {
     /// Rooms the delegate holds a different key for: left alone, named once.
     mismatched: HashSet<Key>,
     backoff: HashMap<Key, Backoff>,
+    /// Rooms whose identity the user just imported: the delegate's key for them is replaced
+    /// even when it holds another, as the web UI's import does (`migrate_signing_key` with the
+    /// authoritative flag). Kept in memory until the key is stored; an entry for a room that never
+    /// shows is a few bytes, and a restart forgets it (the next sweep then leaves a different key).
+    authoritative: HashSet<Key>,
     /// The wait that holds for the whole sweep.
     overall: Option<Backoff>,
 }
@@ -126,6 +133,15 @@ pub fn wait_after(failures: u32, first: Duration, max: Duration) -> Duration {
 pub type Pace = (Duration, Duration);
 
 impl KeySweep {
+    /// The user imported `identity` for `owner`'s room: the delegate's key for the room is made
+    /// this one, over whatever it holds. (The only case it is replaced: the user chose it.)
+    pub fn authoritative(&mut self, owner: VerifyingKey, identity: VerifyingKey) {
+        self.authoritative.insert((owner, identity));
+        self.verified.remove(&(owner, identity));
+        self.mismatched.remove(&(owner, identity));
+        self.backoff.remove(&(owner, identity));
+    }
+
     /// Whether a request is out: nothing else may be sent to the delegate meanwhile.
     pub fn busy(&self) -> bool {
         self.current.is_some_and(|c| c.sent.is_some())
@@ -234,6 +250,10 @@ impl KeySweep {
             ) if *room_key == owner.to_bytes() => match (cur.phase, public_key) {
                 (Phase::Check, None) => self.go(Phase::Store),
                 (_, Some(held)) if *held == ours.to_bytes() => self.done(cur.room),
+                // Imported by the user: theirs replaces what the delegate holds.
+                (Phase::Check, Some(_)) if self.authoritative.contains(&cur.room) => {
+                    self.go(Phase::Store)
+                }
                 (Phase::Check, Some(_)) => {
                     // The owner's key names the room; a room's own name may be private.
                     eprintln!(
@@ -300,6 +320,7 @@ impl KeySweep {
         self.current = None;
         self.backoff.remove(&room);
         self.verified.insert(room);
+        self.authoritative.remove(&room);
         self.overall = None;
     }
 

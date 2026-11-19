@@ -13,8 +13,9 @@ use rune::{Key, KeyEvent, Mods, TextEdit};
 /// Limits: a consumed key skips rune's own follow-up for a key (it scrolls the caret into view
 /// and snaps the field's height animation), so in a field that scrolls (a composer past eight
 /// lines, a dialog field wider than its box) the caret may stay out of view after one of these
-/// keys until the next key; and a field using `on_change` would not see these edits. Neither
-/// field has one today. Both go away with the upstream fix. Remove this when the pinned rune revision has the fix
+/// keys until the next key; and a field using `on_change` does not see these edits, so such a
+/// field (the import dialog's token box) compares its text before and after the key itself. Both
+/// go away with the upstream fix. Remove this when the pinned rune revision has the fix
 /// (rune's `dev` reads `line` as Cmd without Ctrl off macOS).
 pub fn word_keys(edit: &mut TextEdit, ev: &KeyEvent) -> bool {
     if cfg!(target_os = "macos") {

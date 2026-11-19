@@ -1413,3 +1413,507 @@ fn halting_a_leave_shows_its_room_again_at_once() {
     assert!(!w.leaving(&owner));
     assert!(w.take_reload());
 }
+
+// Importing an identity ----------------------------------------------------------------------
+
+mod importing {
+    use super::*;
+    use crate::rooms::identity::IdentityToken;
+    use crate::rooms::identity::tests::{World, member_export, world};
+
+    fn token(w: &World) -> IdentityToken {
+        IdentityToken(member_export(w).to_armored_string())
+    }
+
+    fn slot_of(w: &World) -> Vec<u8> {
+        room_slot(w, &member_export(w))
+    }
+
+    /// The slot a room holds for `export`'s identity, as a join stores it.
+    fn room_slot(w: &World, export: &river_core::room_state::identity::IdentityExport) -> Vec<u8> {
+        river_core::stored_rooms::encode_new_room(
+            &crate::rooms::identity::new_room(export, &w.state, w.key).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The owner's own identity in the same room: a different one than the token's.
+    fn owners_slot(w: &World) -> Vec<u8> {
+        let plan = crate::rooms::create::new_room(w.owner.clone(), "Open", "Olive", false).unwrap();
+        river_core::stored_rooms::encode_new_room(&plan.room).unwrap()
+    }
+
+    fn slot_key(w: &World) -> Vec<u8> {
+        room_storage_key(&w.owner.verifying_key())
+    }
+
+    fn view_state(w: &Work) -> WorkState {
+        w.views().last().expect("a task").state.clone()
+    }
+
+    fn failed(w: &Work) -> (String, bool) {
+        match view_state(w) {
+            WorkState::Failed { why, retry } => (why, retry),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    fn stored_identity(bytes: &[u8]) -> river_core::stored_rooms::StoredRoom {
+        match decode_room_slot(bytes).unwrap() {
+            StoredRoomSlot::Present(r) => *r,
+            StoredRoomSlot::Tombstone => panic!("a present room"),
+        }
+    }
+
+    /// Run an add-room import up to its slot read: the room was read from the network first.
+    fn adding_to_slot(w: &mut Work, world: &World) {
+        w.import_identity(&token(world), false, &|_| false);
+        let ClientRequest::ContractOp(ContractRequest::Get { key: id, .. }) = next(w) else {
+            panic!("the room is read from the network first");
+        };
+        assert_eq!(id, *world.key.id());
+        get_answer(w, world.key, &world.state);
+        expect_read(w, &slot_key(world));
+    }
+
+    fn finish_meta(w: &mut Work, world: &World) {
+        expect_read(w, ROOMS_META_KEY);
+        assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 0)));
+        let meta = expect_store(w, ROOMS_META_KEY, 0);
+        let m = decode_rooms_meta_for_test(&meta);
+        assert_eq!(m, Some(world.owner.verifying_key()), "the room opens first");
+        assert!(w.on_delegate(&store_answer(
+            ROOMS_META_KEY,
+            CasStoreResult::Stored { generation: 1 }
+        )));
+    }
+
+    fn decode_rooms_meta_for_test(bytes: &[u8]) -> Option<VerifyingKey> {
+        decode_rooms_meta(bytes).unwrap().current_room_key
+    }
+
+    #[test]
+    fn adding_reads_the_room_stores_it_with_the_identity_then_opens_it() {
+        let world = world();
+        let mut w = Work::default();
+        adding_to_slot(&mut w, &world);
+        assert!(w.on_delegate(&read_answer(&slot_key(&world), None, 0)));
+        let bytes = expect_store(&mut w, &slot_key(&world), 0);
+        let room = stored_identity(&bytes);
+        assert_eq!(
+            room.self_verifying_key(),
+            Some(world.member.verifying_key())
+        );
+        assert_eq!(room.self_nickname.as_deref(), Some("Bea"));
+        assert_eq!(room.self_authorized_member, Some(world.invitee.clone()));
+        assert_eq!(room.contract_key, world.key);
+        // The room's real state from the network, not an empty placeholder.
+        assert_eq!(
+            room.room_state.configuration.configuration.display,
+            world.state.configuration.configuration.display
+        );
+        assert!(w.on_delegate(&store_answer(
+            &slot_key(&world),
+            CasStoreResult::Stored { generation: 1 }
+        )));
+        finish_meta(&mut w, &world);
+        assert!(matches!(view_state(&w), WorkState::Done { .. }));
+        assert!(w.take_reload(), "the stored rooms are read again");
+        // Nothing but the room's GET and the delegate's slot and meta was sent.
+        assert!(w.next_request(false, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn replacing_goes_straight_to_the_slot_and_changes_only_the_identity() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), true, &|_| true);
+        // No GET: the stored room's state is kept.
+        expect_read(&mut w, &slot_key(&world));
+        let held = owners_slot(&world);
+        assert!(w.on_delegate(&read_answer(&slot_key(&world), Some(held.clone()), 4)));
+        let bytes = expect_store(&mut w, &slot_key(&world), 4);
+        let room = stored_identity(&bytes);
+        assert_eq!(
+            room.self_verifying_key(),
+            Some(world.member.verifying_key())
+        );
+        assert_eq!(room.self_nickname.as_deref(), Some("Bea"));
+        assert_eq!(
+            room.room_state.configuration,
+            stored_identity(&held).room_state.configuration
+        );
+        assert!(w.on_delegate(&store_answer(
+            &slot_key(&world),
+            CasStoreResult::Stored { generation: 5 }
+        )));
+        finish_meta(&mut w, &world);
+        assert!(matches!(view_state(&w), WorkState::Done { .. }));
+    }
+
+    #[test]
+    fn a_room_that_is_shown_is_not_replaced_unless_the_user_said_so() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), false, &|_| true);
+        let (why, retry) = failed(&w);
+        assert_eq!(
+            why,
+            "You already have this room. Import again and choose to replace your identity in it."
+        );
+        assert!(!retry);
+        assert!(w.next_request(false, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_bad_token_is_refused_before_anything_is_sent() {
+        let mut w = Work::default();
+        w.import_identity(&IdentityToken("garbage".into()), false, &|_| false);
+        let (why, retry) = failed(&w);
+        assert!(why.starts_with("Invalid token"), "{why}");
+        assert!(!retry);
+        assert!(w.next_request(false, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_second_import_of_the_same_room_is_refused_while_the_first_works() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), true, &|_| true);
+        w.import_identity(&token(&world), true, &|_| true);
+        let views = w.views();
+        assert_eq!(views.len(), 2);
+        assert!(matches!(
+            &views[1].state,
+            WorkState::Failed { retry: false, .. }
+        ));
+    }
+
+    #[test]
+    fn replacing_a_slot_that_is_gone_or_left_writes_nothing() {
+        let world = world();
+        for held in [
+            None,
+            Some({
+                let mut t = Vec::new();
+                ciborium::ser::into_writer(&ciborium::Value::Text("Tombstone".into()), &mut t)
+                    .unwrap();
+                t
+            }),
+        ] {
+            let mut w = Work::default();
+            w.import_identity(&token(&world), true, &|_| true);
+            expect_read(&mut w, &slot_key(&world));
+            assert!(w.on_delegate(&read_answer(&slot_key(&world), held, 2)));
+            let (why, retry) = failed(&w);
+            assert!(why.contains("no longer in River's storage"), "{why}");
+            assert!(!retry);
+            assert!(
+                w.next_request(false, Instant::now()).is_none(),
+                "nothing was stored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slot_this_app_cannot_read_is_never_overwritten() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), true, &|_| true);
+        expect_read(&mut w, &slot_key(&world));
+        assert!(w.on_delegate(&read_answer(
+            &slot_key(&world),
+            Some(b"\xff\xfe".to_vec()),
+            2
+        )));
+        let (why, retry) = failed(&w);
+        assert!(why.contains("can't read"), "{why}");
+        assert!(!retry);
+        assert!(w.next_request(false, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_conflict_is_read_again_and_decided_on_what_the_other_writer_stored() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), true, &|_| true);
+        expect_read(&mut w, &slot_key(&world));
+        assert!(w.on_delegate(&read_answer(
+            &slot_key(&world),
+            Some(owners_slot(&world)),
+            1
+        )));
+        expect_store(&mut w, &slot_key(&world), 1);
+        assert!(w.on_delegate(&store_answer(
+            &slot_key(&world),
+            CasStoreResult::Conflict {
+                current_generation: 2,
+                current_value: None,
+            }
+        )));
+        // Read again. The other writer (the web UI) left the room meanwhile.
+        expect_read(&mut w, &slot_key(&world));
+        let mut tomb = Vec::new();
+        ciborium::ser::into_writer(&ciborium::Value::Text("Tombstone".into()), &mut tomb).unwrap();
+        assert!(w.on_delegate(&read_answer(&slot_key(&world), Some(tomb), 2)));
+        let (why, retry) = failed(&w);
+        assert!(why.contains("no longer in River's storage"), "{why}");
+        assert!(!retry);
+        assert!(
+            w.next_request(false, Instant::now()).is_none(),
+            "the tombstone stands"
+        );
+    }
+
+    #[test]
+    fn a_conflict_where_the_other_writer_stored_this_identity_is_done_without_a_write() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), true, &|_| true);
+        expect_read(&mut w, &slot_key(&world));
+        assert!(w.on_delegate(&read_answer(
+            &slot_key(&world),
+            Some(owners_slot(&world)),
+            1
+        )));
+        let ours = expect_store(&mut w, &slot_key(&world), 1);
+        assert!(w.on_delegate(&store_answer(
+            &slot_key(&world),
+            CasStoreResult::Conflict {
+                current_generation: 2,
+                current_value: None,
+            }
+        )));
+        expect_read(&mut w, &slot_key(&world));
+        // It holds exactly what we meant to store.
+        assert!(w.on_delegate(&read_answer(&slot_key(&world), Some(ours), 2)));
+        // On to the meta, with no second slot store.
+        expect_read(&mut w, ROOMS_META_KEY);
+    }
+
+    #[test]
+    fn a_storage_that_keeps_changing_fails_with_try_again() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), true, &|_| true);
+        for n in 0..CAS_ATTEMPTS {
+            expect_read(&mut w, &slot_key(&world));
+            assert!(w.on_delegate(&read_answer(
+                &slot_key(&world),
+                Some(owners_slot(&world)),
+                n as u64
+            )));
+            expect_store(&mut w, &slot_key(&world), n as u64);
+            assert!(w.on_delegate(&store_answer(
+                &slot_key(&world),
+                CasStoreResult::Conflict {
+                    current_generation: n as u64 + 1,
+                    current_value: None,
+                }
+            )));
+        }
+        let (_, retry) = failed(&w);
+        assert!(retry);
+        // Try again starts from the slot.
+        let id = w.views()[0].id;
+        assert!(w.retry(id));
+        expect_read(&mut w, &slot_key(&world));
+    }
+
+    #[test]
+    fn a_refusal_by_the_storage_fails_with_try_again_and_stores_nothing_more() {
+        let world = world();
+        let mut w = Work::default();
+        adding_to_slot(&mut w, &world);
+        assert!(w.on_delegate(&read_answer(&slot_key(&world), None, 0)));
+        expect_store(&mut w, &slot_key(&world), 0);
+        assert!(w.on_delegate(&store_answer(
+            &slot_key(&world),
+            CasStoreResult::Failed("disk full".into())
+        )));
+        let (why, retry) = failed(&w);
+        assert!(why.contains("disk full"), "{why}");
+        assert!(retry);
+        // Try again reads the room again (the add path builds the slot from the room as it is).
+        let id = w.views()[0].id;
+        assert!(w.retry(id));
+        let ClientRequest::ContractOp(ContractRequest::Get { .. }) = next(&mut w) else {
+            panic!("the room is read again");
+        };
+    }
+
+    #[test]
+    fn a_room_freenet_cannot_find_fails_with_try_again_and_stores_nothing() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), false, &|_| false);
+        let ClientRequest::ContractOp(ContractRequest::Get { key: id, .. }) = next(&mut w) else {
+            panic!("a GET");
+        };
+        assert!(w.on_contract(&ContractResponse::NotFound { instance_id: id }));
+        let (why, retry) = failed(&w);
+        assert!(why.contains("couldn't find this room"), "{why}");
+        assert!(retry);
+        assert!(w.next_request(false, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_different_room_from_the_network_is_refused() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), false, &|_| false);
+        let _ = next(&mut w);
+        let other =
+            crate::rooms::create::new_room(SigningKey::from_bytes(&[55; 32]), "Other", "O", false)
+                .unwrap();
+        get_answer(&mut w, world.key, &other.room.room_state);
+        let (why, retry) = failed(&w);
+        assert!(why.contains("isn't the one"), "{why}");
+        assert!(!retry);
+        assert!(w.next_request(false, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn adding_never_overwrites_a_room_another_writer_stored_meanwhile() {
+        let world = world();
+        let mut w = Work::default();
+        adding_to_slot(&mut w, &world);
+        // The web UI stored this room under the OWNER's identity since the screen last looked.
+        assert!(w.on_delegate(&read_answer(
+            &slot_key(&world),
+            Some(owners_slot(&world)),
+            3
+        )));
+        let (why, retry) = failed(&w);
+        assert!(why.contains("choose to replace"), "{why}");
+        assert!(!retry);
+        assert!(
+            w.next_request(false, Instant::now()).is_none(),
+            "nothing stored"
+        );
+    }
+
+    #[test]
+    fn a_room_that_has_banned_the_identity_is_not_added() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), false, &|_| false);
+        let _ = next(&mut w);
+        let mut state = world.state.clone();
+        let owner_id = river_core::room_state::member::MemberId::from(&world.owner.verifying_key());
+        state
+            .bans
+            .0
+            .push(river_core::room_state::ban::AuthorizedUserBan::new(
+                river_core::room_state::ban::UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: SystemTime::now(),
+                    banned_user: river_core::room_state::member::MemberId::from(
+                        &world.member.verifying_key(),
+                    ),
+                },
+                owner_id,
+                &world.owner,
+            ));
+        get_answer(&mut w, world.key, &state);
+        let (why, retry) = failed(&w);
+        assert_eq!(why, crate::rooms::identity::BANNED);
+        assert!(
+            retry,
+            "the copy read may be stale: Try again reads it again"
+        );
+        assert!(
+            w.next_request(false, Instant::now()).is_none(),
+            "nothing stored"
+        );
+    }
+
+    #[test]
+    fn a_finished_import_is_reported_once_with_its_identity_and_nickname() {
+        let world = world();
+        let mut w = Work::default();
+        adding_to_slot(&mut w, &world);
+        assert!(w.take_done_imports().is_empty(), "not while it works");
+        assert!(w.on_delegate(&read_answer(&slot_key(&world), None, 0)));
+        expect_store(&mut w, &slot_key(&world), 0);
+        assert!(w.on_delegate(&store_answer(
+            &slot_key(&world),
+            CasStoreResult::Stored { generation: 1 }
+        )));
+        finish_meta(&mut w, &world);
+        let done = w.take_done_imports();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].room, world.owner.verifying_key());
+        assert_eq!(done[0].identity, world.member.verifying_key());
+        assert_eq!(done[0].nickname.as_deref(), Some("Bea"));
+        assert!(w.take_done_imports().is_empty(), "once");
+    }
+
+    #[test]
+    fn adding_over_a_room_with_this_very_identity_stores_nothing() {
+        let world = world();
+        let mut w = Work::default();
+        adding_to_slot(&mut w, &world);
+        assert!(w.on_delegate(&read_answer(&slot_key(&world), Some(slot_of(&world)), 3)));
+        expect_read(&mut w, ROOMS_META_KEY);
+    }
+
+    #[test]
+    fn a_failed_leave_of_the_room_is_dropped_so_it_cannot_run_over_the_import() {
+        let world = world();
+        let mut w = Work::default();
+        assert!(w.leave(world.owner.verifying_key(), "Open".into(), None));
+        assert!(w.halt("River has moved on."));
+        w.import_identity(&token(&world), false, &|_| false);
+        let views = w.views();
+        assert_eq!(views.len(), 1, "{views:?}");
+        assert_eq!(views[0].what, "Importing your ID");
+        assert_eq!(views[0].state, WorkState::Working);
+    }
+
+    #[test]
+    fn a_failed_leave_is_kept_when_the_import_replaces_and_dropped_only_when_it_adds() {
+        let world = world();
+        // Replace: the user's leave intent stays visible as a failed row.
+        let mut w = Work::default();
+        assert!(w.leave(world.owner.verifying_key(), "Open".into(), None));
+        assert!(w.halt("River has moved on."));
+        w.import_identity(&token(&world), true, &|_| true);
+        assert_eq!(
+            w.views().len(),
+            2,
+            "the failed leave stays beside the replace"
+        );
+        // Add: the failed leave is over.
+        let mut w = Work::default();
+        assert!(w.leave(world.owner.verifying_key(), "Open".into(), None));
+        assert!(w.halt("River has moved on."));
+        w.import_identity(&token(&world), false, &|_| false);
+        assert_eq!(w.views().len(), 1);
+    }
+
+    #[test]
+    fn an_import_waits_behind_a_leave_that_is_working() {
+        let world = world();
+        let mut w = Work::default();
+        assert!(w.leave(world.owner.verifying_key(), "Open".into(), None));
+        w.import_identity(&token(&world), false, &|_| false);
+        let views = w.views();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[1].state, WorkState::Working, "queued, not refused");
+        // The leave goes first.
+        expect_read(&mut w, &slot_key(&world));
+    }
+
+    #[test]
+    fn the_row_shown_says_what_it_is_and_hides_the_token() {
+        let world = world();
+        let mut w = Work::default();
+        w.import_identity(&token(&world), true, &|_| true);
+        assert_eq!(w.views()[0].what, "Replacing your ID in a room");
+        let mut w = Work::default();
+        w.import_identity(&token(&world), false, &|_| false);
+        assert_eq!(w.views()[0].what, "Importing your ID");
+        let _ = room_slot;
+    }
+}
