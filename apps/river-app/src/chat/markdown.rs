@@ -147,7 +147,7 @@ fn mention_kind(url: &str) -> Option<&str> {
 
 /// The member a chip link names, `None` for any other link and for a chip of someone this room
 /// does not know. Only a chip written with this process's scheme names anyone.
-fn mention_member(url: &str) -> Option<&str> {
+pub(crate) fn mention_member(url: &str) -> Option<&str> {
     let rest = url
         .strip_prefix(model::mention_scheme())?
         .strip_prefix(':')?;

@@ -736,6 +736,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         input = input
             .on_input_key(|s: &mut RiverApp, ev, _| {
                 // Escape closes the emoji picker, whichever of the two has the focus.
+                s.chat.mention_sync();
                 if s.chat.mention_key(ev) {
                     return true;
                 }

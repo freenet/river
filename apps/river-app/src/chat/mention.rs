@@ -61,40 +61,38 @@ pub fn detect(text: &str, caret: usize) -> Option<(usize, &str)> {
     Some((at, &prefix[at + 1..]))
 }
 
-/// Who `query` offers: members other than you with a name of their own, those whose name starts
-/// with it first, then those that contain it, each by name; at most `LIMIT`.
+/// Who `query` offers: members other than you with a name of their own (one that is still a
+/// name once its hidden characters are removed), those whose name starts with it first, then
+/// those that contain it, each by name; at most `LIMIT`. Whether two share a name is judged over
+/// all that match, not only those listed.
 pub fn candidates(members: &[Member], me: u32, query: &str) -> Vec<Candidate> {
     let q = query.to_lowercase();
-    let mut named: Vec<&Member> = members
+    // (lowercased name, shown name, member), the names worked out once.
+    let mut named: Vec<(String, String, &Member)> = members
         .iter()
-        .filter(|m| m.id != me && m.claimed && !m.nickname.is_empty())
+        .filter(|m| m.id != me && m.claimed)
+        .filter_map(|m| {
+            let shown = super::visual_fold::sanitize_display_name(&m.nickname);
+            let wire = river_core::mention::sanitize_name(&m.nickname);
+            (shown != super::visual_fold::UNNAMED && !wire.is_empty())
+                .then(|| (shown.to_lowercase(), shown, m))
+        })
+        .filter(|(lower, ..)| lower.contains(&q))
         .collect();
-    named.sort_by_key(|m| m.nickname.to_lowercase());
-    let (mut prefix, mut inside) = (Vec::new(), Vec::new());
-    for m in named {
-        let name = m.nickname.to_lowercase();
-        if name.starts_with(&q) {
-            prefix.push(m);
-        } else if name.contains(&q) {
-            inside.push(m);
-        }
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (lower, ..) in &named {
+        *counts.entry(lower.clone()).or_default() += 1;
     }
-    prefix.extend(inside);
-    prefix.truncate(LIMIT);
-    let dup = |m: &Member| {
-        prefix
-            .iter()
-            .filter(|o| o.nickname.to_lowercase() == m.nickname.to_lowercase())
-            .count()
-            > 1
-    };
-    prefix
-        .iter()
-        .map(|m| Candidate {
+    // Starting with the query ranks first; the sort is stable.
+    named.sort_by_cached_key(|(lower, ..)| (!lower.starts_with(&q), lower.clone()));
+    named.truncate(LIMIT);
+    named
+        .into_iter()
+        .map(|(lower, shown, m)| Candidate {
             uid: m.uid.clone(),
             id: m.id,
-            name: m.nickname.clone(),
-            duplicate: dup(m),
+            duplicate: counts[&lower] > 1,
+            name: shown,
         })
         .collect()
 }
@@ -110,6 +108,28 @@ pub fn token(uid: &str, name: &str) -> String {
 }
 
 impl Chat {
+    /// Whether an Escape closed the popup for this word: the same `@`, and what is typed still
+    /// starts with what was typed then.
+    fn mention_closed(&self, anchor: usize, query: &str) -> bool {
+        self.mention_off
+            .as_ref()
+            .is_some_and(|(a, q)| *a == anchor && query.starts_with(q.as_str()))
+    }
+
+    /// Forget an Escape once its word is gone. Run before each key, so by the key after the
+    /// word was deleted or left, a new `@` at the same place opens the popup again.
+    pub fn mention_sync(&mut self) {
+        if self.mention_off.is_none() {
+            return;
+        }
+        let c = &self.composer;
+        let open = c.anchor == c.focus
+            && detect(&c.text, c.focus).is_some_and(|(a, q)| self.mention_closed(a, q));
+        if !open {
+            self.mention_off = None;
+        }
+    }
+
     /// The popup the composer shows now, if any.
     pub fn mention_popup(&self) -> Option<Popup> {
         let room = self.actionable()?;
@@ -118,7 +138,7 @@ impl Chat {
             return None;
         }
         let (anchor, query) = detect(&c.text, c.focus)?;
-        if self.mention_off == Some(anchor) {
+        if self.mention_closed(anchor, query) {
             return None;
         }
         let candidates = candidates(&room.members, room.me, query);
@@ -137,12 +157,13 @@ impl Chat {
         })
     }
 
-    /// Write the mention of the `index`th candidate in place of the `@query`, and a space after.
-    pub fn mention_pick(&mut self, index: usize) {
+    /// Write the mention of the candidate with member id `uid` in place of the `@query`, and a
+    /// space after.
+    pub fn mention_pick_uid(&mut self, uid: &str) {
         let Some(p) = self.mention_popup() else {
             return;
         };
-        let Some(c) = p.candidates.get(index) else {
+        let Some(c) = p.candidates.iter().find(|c| c.uid == uid) else {
             return;
         };
         let text = format!("{} ", token(&c.uid, &c.name));
@@ -150,16 +171,6 @@ impl Chat {
         self.composer.insert(&text);
         self.composer.focused = true;
         self.mention_off = None;
-    }
-
-    /// Pick the candidate whose member id is `uid` (a press on its row).
-    pub fn mention_pick_uid(&mut self, uid: &str) {
-        let at = self
-            .mention_popup()
-            .and_then(|p| p.candidates.iter().position(|c| c.uid == uid));
-        if let Some(i) = at {
-            self.mention_pick(i);
-        }
     }
 
     /// Highlight row `index` (the pointer is over it).
@@ -176,8 +187,12 @@ impl Chat {
             return false;
         };
         let n = p.candidates.len();
+        // Only the bare key: with Ctrl, Alt or Cmd (word keys, Option+Enter's newline) or Shift
+        // (a selection, a newline) it belongs to the composer.
+        let m = ev.mods;
+        let bare = !(m.shift || m.ctrl || m.alt || m.logo);
         match ev.key {
-            Key::Down | Key::Up if !ev.mods.shift => {
+            Key::Down | Key::Up if bare => {
                 let down = ev.key == Key::Down;
                 let i = if down {
                     (p.selected + 1) % n
@@ -186,8 +201,11 @@ impl Chat {
                 };
                 self.mention_sel = (p.query, i);
             }
-            Key::Escape => self.mention_off = Some(p.anchor),
-            Key::Enter | Key::Tab if !ev.mods.shift => self.mention_pick(p.selected),
+            Key::Escape => self.mention_off = Some((p.anchor, p.query)),
+            Key::Enter | Key::Tab if bare => {
+                let uid = p.candidates[p.selected].uid.clone();
+                self.mention_pick_uid(&uid);
+            }
             _ => return false,
         }
         true

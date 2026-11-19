@@ -3110,3 +3110,140 @@ fn clicking_an_author_name_or_avatar_opens_their_dialog() {
         assert!(rt.find("member-info-dialog").is_some(), "{part}");
     }
 }
+
+fn mods(m: rune::Mods) -> KeyEvent {
+    KeyEvent {
+        key: Key::Enter,
+        mods: m,
+    }
+}
+
+#[test]
+fn escape_then_send_then_a_new_at_sign_opens_the_popup_again() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "@ma");
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("mention-popup-content").is_none());
+    key(&mut rt, Key::Enter);
+    assert_eq!(rt.state.chat.composer.text, "");
+    key(&mut rt, Key::Text("@".into()));
+    assert!(rt.find("mention-popup-content").is_some());
+}
+
+#[test]
+fn escape_then_deleting_the_word_then_an_at_sign_opens_the_popup_again() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "@ma");
+    key(&mut rt, Key::Escape);
+    for _ in 0..3 {
+        key(&mut rt, Key::Backspace);
+    }
+    key(&mut rt, Key::Text("@".into()));
+    assert!(rt.find("mention-popup-content").is_some());
+}
+
+#[test]
+fn modified_enter_and_word_keys_belong_to_the_composer() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    type_text(&mut rt, "@jo");
+    for m in [
+        rune::Mods {
+            alt: true,
+            ..Default::default()
+        },
+        rune::Mods {
+            ctrl: true,
+            ..Default::default()
+        },
+        rune::Mods {
+            shift: true,
+            ..Default::default()
+        },
+    ] {
+        rt.key(mods(m));
+        rt.frame(0.3);
+        assert!(
+            !rt.state.chat.composer.text.contains("rv:"),
+            "{m:?} picked a member"
+        );
+    }
+    let before = rt.state.chat.composer.focus;
+    rt.key(KeyEvent {
+        key: Key::Left,
+        mods: rune::Mods {
+            ctrl: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.3);
+    assert!(
+        rt.state.chat.composer.focus < before,
+        "Ctrl+Left moved the caret"
+    );
+}
+
+#[test]
+fn opening_a_member_closes_other_overlays_and_keeps_a_nickname_being_typed() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.state.chat.emoji_open = true;
+    let me = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .member(rt.state.chat.room().unwrap().me)
+        .unwrap()
+        .uid
+        .clone();
+    rt.state.chat.open_member(&me);
+    assert!(!rt.state.chat.emoji_open);
+    rt.state.chat.nickname.replace_text("half typed");
+    rt.state.chat.open_member(&me);
+    assert_eq!(rt.state.chat.nickname.text, "half typed");
+}
+
+#[test]
+fn a_name_with_hidden_characters_is_listed_cleaned_and_an_empty_one_not_at_all() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let ms = &mut rooms[0].members;
+        ms.iter_mut()
+            .find(|m| m.nickname == "Jonas")
+            .unwrap()
+            .nickname = "Jo\u{202e}nas".into();
+        ms.iter_mut()
+            .find(|m| m.nickname == "Tomás")
+            .unwrap()
+            .nickname = "\u{200b}".into();
+    });
+    type_text(&mut rt, "@");
+    let names = mention_names(&rt);
+    assert!(names.contains(&"Jonas".to_owned()), "{names:?}");
+    assert!(!names.iter().any(|n| n.is_empty() || n.contains('\u{200b}')));
+    assert_eq!(names.len(), 5);
+}
+
+#[test]
+fn duplicates_are_judged_over_every_match_not_only_the_first_eight() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let ms = &mut rooms[0].members;
+        for i in 0..9u32 {
+            let mut m =
+                super::model::Member::new(500 + i, format!("Aaa{i}"), super::model::Role::Member);
+            m.uid = format!("U{i}");
+            ms.push(m);
+        }
+        // Ties with the eighth listed and sorts after it, so it is not listed.
+        let mut m = super::model::Member::new(600, "aaa7", super::model::Role::Member);
+        m.uid = "U600".into();
+        ms.push(m);
+    });
+    type_text(&mut rt, "@aaa");
+    let p = rt.state.chat.mention_popup().unwrap();
+    assert_eq!(p.candidates.len(), 8);
+    assert!(
+        p.candidates[7].duplicate,
+        "Aaa7 shares its name with a member past the eighth"
+    );
+}
