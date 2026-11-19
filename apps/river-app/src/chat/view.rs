@@ -53,6 +53,9 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
+    if let Some(uid) = &chat.member_modal {
+        super::member_modal::member_modal(room, uid, &k, &mut layer);
+    }
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);
     if chat.members_shown(narrow) {
@@ -774,6 +777,7 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
 }
 
 fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
+    let uid = m.uid.clone();
     let mut r = row()
         .key(format!("member-{}", m.id))
         .h(40.0)
@@ -781,6 +785,11 @@ fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
         .gap(10.0)
         .radius(8.0)
         .center_y()
+        .role("button")
+        .label(format!("Member info: {}", m.nickname))
+        .focusable(true)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid))
         .hover(p.surface)
         .child(avatar(Some(m), m.id, 28.0))
         .child(
