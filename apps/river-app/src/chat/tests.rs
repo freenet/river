@@ -2356,6 +2356,50 @@ fn clicking_the_room_name_or_description_opens_the_details() {
 }
 
 #[test]
+fn a_link_in_the_header_description_opens_the_page_not_the_dialog() {
+    // Descriptions that start with bold text, a heading or a list item used to be shown as
+    // plain words, so their links could not be followed and a press opened the dialog.
+    for desc in [
+        "Read [Freenet](https://freenet.org/news) first.",
+        "**Welcome!** Read [Freenet](https://freenet.org/news) first.",
+        "# Welcome to [Freenet](https://freenet.org/news)\n\nMore below.",
+        "- [Freenet](https://freenet.org/news) news\n- other",
+        "\nRead https://freenet.org/news first.",
+    ] {
+        let mut state = connected();
+        state
+            .chat
+            .edit_rooms(|rooms| rooms[0].description = desc.into());
+        let mut rt = render(state, WINDOW_SIZE);
+        let key = format!("description-{}", rt.state.chat.room().unwrap().key);
+        assert!(rt.find(&key).is_some(), "{desc:?} is drawn as markdown");
+        let link = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("https://freenet.org/news") && e.rect[1] < 60.0)
+            .unwrap_or_else(|| panic!("{desc:?}: no link in the header"));
+        let (x, y) = (
+            link.rect[0] + link.rect[2] / 2.0,
+            link.rect[1] + link.rect[3] / 2.0,
+        );
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        rt.frame(0.2);
+        assert_eq!(
+            rt.take_url_requests(),
+            ["https://freenet.org/news"],
+            "{desc:?}"
+        );
+        assert!(rt.find("room-details-dialog").is_none(), "{desc:?}");
+        // The words around it still open the dialog.
+        press(&mut rt, "description-open");
+        assert!(rt.find("room-details-dialog").is_some(), "{desc:?}");
+    }
+}
+
+#[test]
 fn the_room_name_opens_the_details_from_the_keyboard() {
     let mut rt = render(connected(), WINDOW_SIZE);
     // The name is the first thing Tab reaches; Space presses it, as it does any button.
@@ -2434,12 +2478,17 @@ fn the_owner_edits_the_room_and_it_shows_everywhere() {
     press(&mut rt, "room-title");
     for edit in [
         "details-name-input",
-        "details-description-input",
+        "details-description-edit",
         "details-save",
         "details-cancel",
     ] {
         assert!(rt.find(edit).is_some(), "the owner has {edit}");
     }
+    // The description is rendered until the pencil turns it into the text area.
+    assert!(rt.find("details-description-input").is_none());
+    press(&mut rt, "details-description-edit");
+    assert!(rt.find("details-description-input").is_some());
+    assert!(rt.find("details-description-edit").is_none());
     type_into(&mut rt, "details-name-input", "Reading Circle");
     assert_eq!(details(&rt).name.text, "Reading Circle");
     rt.state
@@ -2754,6 +2803,189 @@ fn lowering_a_limit_below_what_is_used_asks_first_in_plain_words() {
 }
 
 #[test]
+fn the_dialog_shows_the_description_rendered_with_links_that_open() {
+    for owner in [false, true] {
+        let mut state = from_node(if owner { OWNED } else { "town-square" });
+        state.chat.edit_rooms(|rooms| {
+            for r in rooms
+                .iter_mut()
+                .filter(|r| r.key == OWNED || r.key == "town-square")
+            {
+                r.description =
+                    "Some **bold** words and a [link](https://freenet.org/rules).\n\n- one\n- two"
+                        .into();
+                r.details.description_source = r.description.clone();
+            }
+        });
+        let mut rt = render(state, WINDOW_SIZE);
+        press(&mut rt, "room-title");
+        let key = format!("details-description-{}", rt.state.chat.room().unwrap().key);
+        assert!(
+            rt.find(&key).is_some(),
+            "rendered as markdown, owner {owner}"
+        );
+        assert!(!shows(&rt, "**bold**"), "no raw markdown, owner {owner}");
+        assert!(rt.find("details-description-input").is_none());
+        let link = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("https://freenet.org/rules") && e.rect[1] > 80.0)
+            .expect("the link is drawn in the dialog");
+        let (x, y) = (
+            link.rect[0] + link.rect[2] / 2.0,
+            link.rect[1] + link.rect[3] / 2.0,
+        );
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        assert_eq!(rt.take_url_requests(), ["https://freenet.org/rules"]);
+        assert_eq!(rt.find("details-description-edit").is_some(), owner);
+    }
+}
+
+#[test]
+fn cancelling_the_description_edit_returns_the_form_to_the_room() {
+    let mut rt = render(from_node(OWNED), WINDOW_SIZE);
+    let before = rt.state.chat.room().unwrap().description.clone();
+    press(&mut rt, "room-title");
+    press(&mut rt, "details-description-edit");
+    assert!(
+        !details(&rt).name.focused,
+        "only the text area has the keyboard"
+    );
+    type_into(&mut rt, "details-description-input", "Scratch");
+    assert_eq!(details(&rt).description.text, "Scratch");
+    press(&mut rt, "details-cancel");
+    assert!(rt.find("room-details-dialog").is_none());
+    assert_eq!(rt.state.chat.room().unwrap().description, before);
+    assert!(rt.state.chat.outgoing.is_empty(), "nothing was queued");
+    // Reopened, the form starts from the room again, rendered, not left in the editor.
+    press(&mut rt, "room-title");
+    assert_eq!(details(&rt).description.text, before);
+    assert!(!details(&rt).editing_description);
+    assert!(rt.find("details-description-input").is_none());
+}
+
+#[test]
+fn text_in_the_header_description_opens_the_dialog_and_a_link_follows() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        rooms[0].description = "Read the [Freenet](https://freenet.org/news) page first.".into();
+    });
+    let mut rt = render(state, WINDOW_SIZE);
+    let key = format!("description-{}", rt.state.chat.room().unwrap().key);
+    let md = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(&key))
+        .expect("the header description");
+    // A point on the first words of the line, well inside the text and left of the link.
+    let (x, y) = (md.rect[0] + 12.0, md.rect[1] + md.rect[3] / 2.0);
+    rt.pointer_move(x, y);
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(0.1);
+    rt.frame(0.2);
+    assert!(
+        rt.find("room-details-dialog").is_some(),
+        "text opens the dialog"
+    );
+    assert!(rt.take_url_requests().is_empty());
+    key_escape(&mut rt);
+    let link = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("https://freenet.org/news") && e.rect[1] < 60.0)
+        .expect("the link");
+    let (x, y) = (
+        link.rect[0] + link.rect[2] / 2.0,
+        link.rect[1] + link.rect[3] / 2.0,
+    );
+    rt.pointer_move(x, y);
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(0.1);
+    rt.frame(0.2);
+    assert_eq!(rt.take_url_requests(), ["https://freenet.org/news"]);
+    assert!(rt.find("room-details-dialog").is_none());
+}
+
+fn key_escape(rt: &mut Runtime<RiverApp>) {
+    key(rt, Key::Escape);
+}
+
+#[test]
+fn hidden_characters_in_link_labels_never_reach_the_screen() {
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        rooms[0].description = "See [evil\u{202e}gnp](https://freenet.org/a) now".into();
+        if let Some(m) = rooms[0].messages.last_mut() {
+            m.md = "a [fake\u{202e}txt](https://freenet.org/b) label".into();
+        }
+    });
+    let rt = render(state, WINDOW_SIZE);
+    assert!(shows(&rt, "evilgnp"), "the header label is drawn");
+    assert!(shows(&rt, "faketxt"), "the message label is drawn");
+    assert!(!texts(&rt).iter().any(|t| t.contains('\u{202e}')));
+}
+
+/// A room with a long, multi-paragraph description still fits a normal window without
+/// scrolling, and a small window scrolls inside the dialog instead of past the screen.
+#[test]
+fn the_dialog_fits_the_window() {
+    let long = "A long description, with [a link](https://freenet.org).\n\n".repeat(12);
+    let build = |size: (f32, f32)| {
+        let mut state = from_node(OWNED);
+        state.chat.edit_rooms(|rooms| {
+            for r in rooms.iter_mut().filter(|r| r.key == OWNED) {
+                r.description = long.clone();
+                r.details.description_source = long.clone();
+            }
+        });
+        let mut rt = render(state, size);
+        press(&mut rt, "room-title");
+        rt
+    };
+    let rect = |rt: &Runtime<RiverApp>, key: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no {key}"))
+            .rect
+    };
+    for size in [
+        WINDOW_SIZE,
+        NARROW_SCENE_SIZE,
+        (640.0, 480.0),
+        (640.0, 300.0),
+    ] {
+        let rt = build(size);
+        let dialog = rect(&rt, "room-details-dialog");
+        assert!(
+            dialog[1] >= 0.0 && dialog[1] + dialog[3] <= size.1,
+            "{size:?}: the dialog {dialog:?} is inside the window"
+        );
+        assert!(rt.find("details-save").is_some());
+    }
+    // The limits are three to a row in a wide window and two in a narrow one.
+    let wide = build(WINDOW_SIZE);
+    assert_eq!(
+        rect(&wide, "details-limit-0")[1],
+        rect(&wide, "details-limit-2")[1]
+    );
+    let narrow = build(NARROW_SCENE_SIZE);
+    assert_eq!(
+        rect(&narrow, "details-limit-0")[1],
+        rect(&narrow, "details-limit-1")[1]
+    );
+    assert_ne!(
+        rect(&narrow, "details-limit-0")[1],
+        rect(&narrow, "details-limit-2")[1]
+    );
+}
+
+#[test]
 fn the_dialog_shows_how_much_of_a_limit_is_used() {
     let mut rt = render(from_node(OWNED), WINDOW_SIZE);
     rt.state.chat.edit_rooms(|rooms| {
@@ -2762,8 +2994,8 @@ fn the_dialog_shows_how_much_of_a_limit_is_used() {
         r.details.usage.messages = 61;
     });
     press(&mut rt, "room-title");
-    assert!(shows(&rt, "Max Recent Messages (61 held now)"));
-    assert!(shows(&rt, "Max User Bans (4 in force now)"));
+    assert!(shows(&rt, "61 held now"));
+    assert!(shows(&rt, "4 in force now"));
 }
 
 #[test]

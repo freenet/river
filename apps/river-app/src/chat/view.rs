@@ -63,7 +63,8 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         super::notify_dialog::notify_dialog(room, chat.mode_of(&room.key), &k, &mut layer);
     }
     if let Some(form) = &chat.details {
-        super::details::details_modal(chat, room, form, &k, &mut layer);
+        let win_h = cx.layout_with("chat", |r| r[3]).unwrap_or(800.0);
+        super::details::details_modal(chat, room, form, narrow, win_h, &k, &mut layer);
     }
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);

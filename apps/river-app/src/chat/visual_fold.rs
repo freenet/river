@@ -19,6 +19,12 @@ pub(crate) fn names_fold_to_generated_handle(name: &str) -> bool {
     folds_to_generated_handle(name)
 }
 
+/// Whether `c` is a control or format character (bidi overrides, zero-width spaces), which a
+/// link label must not carry. Not the emoji and symbol ranges of [`is_display_hidden`].
+pub fn is_format_or_control(c: char) -> bool {
+    c.is_control() || is_format_control(c)
+}
+
 //@@ confusable.rs
 /// Combining marks, dropped so `"I" + U+0300` folds like `"Ì"`.
 fn is_combining_mark(c: char) -> bool {

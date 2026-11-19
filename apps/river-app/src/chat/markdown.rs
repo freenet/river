@@ -164,18 +164,63 @@ fn style(p: &Palette, k: &Kit, font: rune::tok::TextStyle, color: Color) -> Mark
         .body_font(font)
 }
 
-/// Whether a description is one plain paragraph, which is what fits the header's one line as
-/// markdown. Anything that opens a block (heading, list, quote, fence, table, several lines)
-/// is shown as one line of its words instead.
-pub fn is_one_line(text: &str) -> bool {
-    let t = text.trim_start();
-    !t.contains(['\n', '\r'])
-        && !t.starts_with(['#', '-', '*', '+', '>', '|', '`', '~', '<', '!'])
-        && !t.starts_with(|c: char| c.is_ascii_digit())
+/// A horizontal rule: three or more `-`, `*` or `_` and spaces.
+fn thematic(t: &str) -> bool {
+    let t = t.trim();
+    t.chars().filter(|c| !c.is_whitespace()).count() >= 3
+        && t.chars().all(|c| matches!(c, '-' | '*' | '_' | ' '))
+}
+
+/// The inline markdown of a description's first line, for the header's one line: the line
+/// without the block marker that opens it (`#`, `-`, `*`, `+`, `>`, `1.`), so a heading or a list
+/// item shows its words with their links, and a line that starts with bold text is not taken
+/// for a list. `None` for a line that is itself a block (fence, table, html, image) or empty.
+pub fn header_inline(line: &str) -> Option<&str> {
+    // Four spaces or a tab of indent make code, not prose.
+    if line.starts_with("    ") || line.starts_with('\t') {
+        return None;
+    }
+    let mut t = line.trim();
+    if t.contains(['\n', '\r']) {
+        return None;
+    }
+    // A marker is followed by a space; `**bold**` and `-5` are text.
+    fn after(rest: &str) -> Option<&str> {
+        rest.strip_prefix([' ', '\t']).map(str::trim_start)
+    }
+    loop {
+        let next = if let Some(rest) = t.strip_prefix('#') {
+            after(rest.trim_start_matches('#'))
+        } else if let Some(rest) = t.strip_prefix('>') {
+            Some(rest.trim_start())
+        } else if let Some(rest) = t.strip_prefix(['-', '*', '+']) {
+            after(rest)
+        } else if t.starts_with(|c: char| c.is_ascii_digit()) {
+            let digits = t.trim_start_matches(|c: char| c.is_ascii_digit());
+            digits.strip_prefix(['.', ')']).and_then(after)
+        } else {
+            None
+        };
+        match next {
+            Some(n) => t = n,
+            None => break,
+        }
+    }
+    // A marker with nothing after it (`-`, `#`, `1.`) is no text.
+    let marker_only = t
+        .chars()
+        .all(|c| matches!(c, '-' | '*' | '+' | '#' | '>' | '.' | ')') || c.is_ascii_digit());
+    (!t.is_empty()
+        && !marker_only
+        && !thematic(line)
+        && !thematic(t)
+        && !t.starts_with(['`', '~', '<', '|', '!']))
+    .then_some(t)
 }
 
 /// Markdown for `src` under `key`. `keep_breaks` is true for messages. `None` when the text
 /// cannot be made safe to draw as markdown (see `links::prepare`): show it as plain text.
+#[allow(clippy::too_many_arguments)] // one call site per kind of text; a struct would only rename them
 pub fn render(
     src: &str,
     keep_breaks: bool,
@@ -184,6 +229,7 @@ pub fn render(
     key: String,
     p: &Palette,
     k: &Kit,
+    selectable: bool,
 ) -> Option<El> {
     let src = if keep_breaks {
         keep_line_breaks(src)
@@ -235,7 +281,9 @@ pub fn render(
             )
             // Text can be selected and copied. A message drawn in the history joins the history's
             // selection group (conversation.rs), so a drag can run on into the next message.
-            .selectable(true)
+            // The header's line is a press target (it opens the room details), and a press
+            // on selectable text starts a selection instead.
+            .selectable(selectable)
             .render(&style(p, k, font, color))
             .key(key),
     )
@@ -325,10 +373,42 @@ mod tests {
 
     #[test]
     fn only_a_plain_line_is_a_header_description() {
-        assert!(is_one_line("The **public** room, see [x](https://a.b)"));
-        assert!(is_one_line("[Freenet](https://freenet.org) is the place"));
-        for no in ["# Title", "- a", "> q", "```\nx", "a\nb", "1. a", "| a |"] {
-            assert!(!is_one_line(no), "{no:?}");
+        let ok = |s| header_inline(s);
+        assert_eq!(ok("The **public** room"), Some("The **public** room"));
+        assert_eq!(
+            ok("**Welcome** to [x](https://a.b)"),
+            Some("**Welcome** to [x](https://a.b)")
+        );
+        assert_eq!(
+            ok("[Freenet](https://freenet.org) is it"),
+            Some("[Freenet](https://freenet.org) is it")
+        );
+        // A block marker is dropped, its words kept.
+        assert_eq!(ok("# Title"), Some("Title"));
+        assert_eq!(ok("- a [x](https://a.b)"), Some("a [x](https://a.b)"));
+        assert_eq!(ok("> q"), Some("q"));
+        assert_eq!(ok("1. a"), Some("a"));
+        assert_eq!(ok("-5 degrees"), Some("-5 degrees"));
+        for no in [
+            "```",
+            "a\nb",
+            "| a |",
+            "***",
+            "- - -",
+            "",
+            "<b>x",
+            "![i](x)",
+            "-",
+            "#",
+            "1.",
+            "> -",
+            "    indented code",
+            "\tcode",
+            "- | a | b |",
+            "> | a |",
+            "\r",
+        ] {
+            assert_eq!(ok(no), None, "{no:?}");
         }
         assert_eq!(strip("a <b>html</b> c"), "a <b>html</b> c");
     }
@@ -346,6 +426,7 @@ mod tests {
                 "k".into(),
                 &p,
                 &k,
+                true,
             )
         };
         assert!(draw("hello [a](https://example.com/)").is_some());
