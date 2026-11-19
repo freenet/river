@@ -2,7 +2,7 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
-use rune_kit::{Kit, TextInput};
+use rune_kit::Kit;
 
 use super::icons;
 use super::links;
@@ -25,6 +25,8 @@ const BODY_MAX_W: f32 = 604.0;
 /// The history and composer column, centred on a wide window: the web UI's
 /// `.conversation-column` (`60px + 76ch + 24px`).
 const COLUMN_MAX_W: f32 = GUTTER + BODY_MAX_W + 24.0;
+/// The most lines the composer grows to before it scrolls.
+const COMPOSER_MAX_LINES: usize = 8;
 
 pub(super) fn conversation(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
     col()
@@ -629,22 +631,30 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         None => format!("Message {}", room.name),
         Some(reason) => reason.clone(),
     };
-    let field = TextInput::new(&chat.composer)
-        .plain()
-        .width(None)
-        .height(44.0)
-        .text_style(st::MESSAGE.lh(24.0))
-        .placeholder(placeholder)
-        .disabled(!can_send)
-        .label("Message")
-        .on_edit(|s: &mut RiverApp| &mut s.chat.composer)
-        .on_submit(|s: &mut RiverApp, _| {
-            s.chat.send();
-        })
-        .build(k)
+    // A multi-line field that grows with its text (up to eight lines), so Shift+Enter (or
+    // Option+Enter) inserts a newline and plain Enter sends, as in the web UI.
+    let mut input = rune::text_input(&chat.composer, st::MESSAGE.lh(24.0))
         .key("composer-field")
+        .w_full()
+        .color(p.text)
+        .placeholder(placeholder.clone(), p.text_muted)
+        .caret(p.text, k.selection())
+        .label("Message")
+        .disabled(!can_send);
+    if can_send {
+        input = input
+            .on_edit(|s: &mut RiverApp| &mut s.chat.composer)
+            .on_submit(|s: &mut RiverApp, _| {
+                s.chat.send();
+            });
+    }
+    let field = row()
+        .key("composer-input")
         .grow(1.0)
-        .min_w(0.0);
+        .min_w(0.0)
+        .px(8.0)
+        .py(6.0)
+        .child(rune::auto_grow(input, 1, COMPOSER_MAX_LINES));
     let mut send = row()
         .key("send")
         .role("button")
@@ -700,10 +710,11 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         row()
             .key("composer-box")
             .w_full()
-            .h(50.0)
+            .min_h(50.0)
             .px(6.0)
             .gap(4.0)
-            .center_y()
+            .items_end()
+            .py(7.0)
             .radius(12.0)
             .fill(p.surface)
             .border(
