@@ -4,7 +4,8 @@
 //! work ([`Link`]) asks for a grant (approved here as the user would approve it on the page),
 //! registers the chat delegate, and reads an empty room list. Then the app on node A creates a
 //! room and makes an invitation, the app on node B joins from it, and each sends a message the
-//! other receives; each then changes its own nickname and the other sees it everywhere. Last,
+//! other receives; each then changes its own nickname and the other sees it everywhere, and the
+//! owner makes the joiner a deputy (the joiner's app shows the Deputy tag) and revokes it. Last,
 //! each node's chat delegate is asked directly (on a connection of its own with the app's
 //! grant) for the room's signing key, and must hold the key of that app's own
 //! member: the app's background key sweep puts it there.
@@ -524,6 +525,78 @@ fn rename_both_ways(
     });
 }
 
+/// The owner on node A makes Bob (renamed by [`rename_both_ways`]) a deputy: a new signed record
+/// of the owner's with Bob in its `deputies` and the owner's nickname carried over. The app on
+/// node B, Bob's, shows him with the Deputy role, appointed by the owner. Revoking removes it
+/// on both, and the owner's nickname survives both changes.
+fn deputize_and_revoke(alice: &mut App, bob: &mut App, room: &str, key: &str) {
+    use river_app::chat::model::{Appointer, Role};
+    const BOB: &str = "Bob Two";
+    const ALICE: &str = "Alice Prime";
+    let uid = alice
+        .room(room)
+        .and_then(|r| r.members.iter().find(|m| m.nickname == BOB))
+        .map(|m| m.uid.clone())
+        .expect("Bob is a member on node A");
+    let is_deputy = |app: &App| {
+        app.room(room).is_some_and(|r| {
+            r.members.iter().any(|m| {
+                m.nickname == BOB && m.role == Role::Deputy && m.deputized_by == [Appointer::Owner]
+            })
+        })
+    };
+    let not_deputy = |app: &App| {
+        app.room(room).is_some_and(|r| {
+            r.members
+                .iter()
+                .any(|m| m.nickname == BOB && m.role == Role::Member && !m.my_deputy)
+        })
+    };
+    let settled = |app: &App| app.room(room).is_some_and(|r| r.deputy_changes.is_empty());
+    let owner_named = |app: &App| {
+        app.room(room)
+            .is_some_and(|r| r.members.iter().any(|m| m.nickname == ALICE))
+    };
+    alice.send(
+        key,
+        Action::SetDeputy {
+            target: uid.clone(),
+            grant: true,
+        },
+    );
+    alice.until("node A shows Bob as its owner's deputy, settled", |app| {
+        is_deputy(app)
+            && settled(app)
+            && app
+                .room(room)
+                .is_some_and(|r| r.members.iter().any(|m| m.nickname == BOB && m.my_deputy))
+    });
+    bob.until("node B's app shows Bob with the Deputy tag", |app| {
+        is_deputy(app)
+    });
+    assert!(
+        owner_named(alice) && owner_named(bob),
+        "the owner's nickname was kept"
+    );
+    alice.send(
+        key,
+        Action::SetDeputy {
+            target: uid,
+            grant: false,
+        },
+    );
+    alice.until("node A shows Bob as a plain member again, settled", |app| {
+        not_deputy(app) && settled(app)
+    });
+    bob.until("node B's app shows Bob without the Deputy tag", |app| {
+        not_deputy(app)
+    });
+    assert!(
+        owner_named(alice) && owner_named(bob),
+        "the owner's nickname was kept"
+    );
+}
+
 /// A room's notification mode is stored in the chat delegate beside the room list (the web UI's
 /// `rooms_meta`): set in one app, it is read back by an app started afterwards, as after the app
 /// is restarted, and picking it did not lose the room or the open room the create stored.
@@ -755,6 +828,7 @@ fn main() {
     // member's record, signed by their own key) and for the creator (the owner's, which the
     // room checks against the owner's key).
     rename_both_ways(&mut alice, &mut bob, ROOM, &key, "Bob", "Alice");
+    deputize_and_revoke(&mut alice, &mut bob, ROOM, &key);
     // A nickname over the room's limit (50 bytes) is refused by the app and said, and is
     // never signed: what the app shows is checked, not how long a wait stayed quiet.
     bob.send(
@@ -815,6 +889,7 @@ fn main() {
             .is_some_and(|r| r.members.iter().any(|m| m.nickname == "Bob"))
     });
     rename_both_ways(&mut alice, &mut bob, PRIVATE, &pkey, "Bob", "Alice");
+    deputize_and_revoke(&mut alice, &mut bob, PRIVATE, &pkey);
     // Each app's own key is in its node's delegate for the room, asked of the delegate itself:
     // the creator's is the owner's, the joiner's is the invitee's own, and they differ.
     let owner = expect_signing_key("A", &alice.authority, &dir_a, &key);

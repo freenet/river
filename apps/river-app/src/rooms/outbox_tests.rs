@@ -2173,9 +2173,7 @@ fn no_version_left_fails_the_nickname_instead_of_wrapping() {
 fn an_intent_never_prints_the_nickname() {
     let shown = format!(
         "{:?}",
-        Intent::Nickname {
-            nickname: "hunter2-secret".into()
-        }
+        Intent::Record(RecordEdit::nickname("hunter2-secret".into()))
     );
     assert!(!shown.contains("hunter2"));
 }
@@ -3644,4 +3642,1043 @@ fn a_reply_to_a_message_the_room_no_longer_shows_counts_as_plain_text() {
         reply_to: Some("gone".into()),
     };
     assert!(Outbox::default().intent(&room, gone).is_err());
+}
+
+// Your deputies ---------------------------------------------------------------------------------
+
+fn grant(who: MemberId) -> Action {
+    Action::SetDeputy {
+        target: who.to_string(),
+        grant: true,
+    }
+}
+
+fn revoke(who: MemberId) -> Action {
+    Action::SetDeputy {
+        target: who.to_string(),
+        grant: false,
+    }
+}
+
+fn pal() -> SigningKey {
+    SigningKey::from_bytes(&[3; 32])
+}
+
+fn pal_id() -> MemberId {
+    MemberId::from(&pal().verifying_key())
+}
+
+fn other() -> SigningKey {
+    SigningKey::from_bytes(&[4; 32])
+}
+
+fn other_id() -> MemberId {
+    MemberId::from(&other().verifying_key())
+}
+
+/// `public_state` with two more members the owner invited, and a record of mine at version 3
+/// naming `deputies`.
+fn deputy_state(f: &Fixture, deputies: Vec<MemberId>) -> ChatRoomStateV1 {
+    let mut state = public_state(f);
+    // A member with no recent message is removed by the room at its next change, so each has one.
+    for (n, who) in [pal(), other()].into_iter().enumerate() {
+        state.members.members.push(admitted_by(f, &f.owner, &who));
+        state.recent_messages.messages.push(f.message(
+            &who,
+            BASE - 40 + n as u64,
+            RoomMessageBody::public("hi".into()),
+        ));
+    }
+    state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.me_id(),
+                version: 3,
+                preferred_nickname: SealedBytes::public(b"Mia".to_vec()),
+                deputies,
+            },
+            &f.me,
+        ));
+    state
+}
+
+fn deputy_room(f: &Fixture, deputies: Vec<MemberId>) -> LiveRoom {
+    LiveRoom::new(f.stored(deputy_state(f, deputies)))
+}
+
+/// Who the room, run through its own contract code, lists as my deputies after `delta`.
+fn deputies_after(room: &LiveRoom, f: &Fixture, delta: ChatRoomStateV1Delta) -> Vec<MemberId> {
+    contract_takes(room, delta)
+        .member_info
+        .deputies_of(f.me_id())
+        .to_vec()
+}
+
+/// The deputy shield `viewer` would see on `target`, run through the app's own reading of the
+/// room: the appointers the view shows for them.
+fn shield_for_me(room: &LiveRoom, target: MemberId) -> Vec<crate::rooms::deputies::Badge> {
+    let state = &room.stored.room_state;
+    crate::rooms::deputies::badges(
+        &state.members,
+        &state.member_info,
+        MemberId::from(&room.stored.owner_vk),
+        MemberId::from(&room.stored.self_verifying_key().unwrap()),
+    )
+    .remove(&target)
+    .into_iter()
+    .collect()
+}
+
+#[test]
+fn a_grant_is_my_own_record_with_the_member_added_and_the_room_takes_it() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![f.owner_id()]);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, grant(pal_id())));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.member_id, f.me_id());
+    assert_eq!(info.member_info.version, 4);
+    // Added at the end, as the web UI does; the nickname and the old grant are carried over.
+    assert_eq!(info.member_info.deputies, [f.owner_id(), pal_id()]);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Mia".to_vec())
+    );
+    assert!(delta.members.is_none() && delta.recent_messages.is_none());
+    // The contract's own apply and verify are the oracle for the result.
+    assert_eq!(deputies_after(&room, &f, delta), [f.owner_id(), pal_id()]);
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    // The app's reading of the room now shows them as my deputy.
+    assert_eq!(shield_for_me(&room, pal_id())[0].deputized_by, [f.me_id()]);
+    let view = outbox.view(&room, &minutes);
+    let pal = view
+        .members
+        .iter()
+        .find(|m| m.uid == pal_id().to_string())
+        .unwrap();
+    assert!(pal.my_deputy);
+    assert!(view.deputy_changes.is_empty());
+}
+
+#[test]
+fn a_revoke_removes_only_that_member_and_keeps_the_nickname() {
+    let f = Fixture::new();
+    let room = deputy_room(&f, vec![pal_id(), other_id()]);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, revoke(pal_id())));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.deputies, [other_id()]);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Mia".to_vec())
+    );
+    assert_eq!(deputies_after(&room, &f, delta), [other_id()]);
+}
+
+#[test]
+fn a_private_rooms_deputy_change_carries_the_nickname_sealed_and_never_plain() {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    state
+        .members
+        .members
+        .push(admitted_by(&f, &f.owner, &pal()));
+    let room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, grant(pal_id())));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert!(matches!(
+        info.member_info.preferred_nickname,
+        SealedBytes::Private { .. }
+    ));
+    assert_eq!(
+        river_core::ecies::unseal_bytes(&info.member_info.preferred_nickname, Some(&SECRET))
+            .unwrap(),
+        b"Mia"
+    );
+    assert_eq!(deputies_after(&room, &f, delta), [pal_id()]);
+}
+
+#[test]
+fn a_change_with_no_nickname_to_carry_is_refused_and_the_dialog_says_so_first() {
+    let f = Fixture::new();
+    let mut state = deputy_state(&f, vec![]);
+    state.member_info.member_info.clear();
+    let mut stored = f.stored(state);
+    stored.self_nickname = None;
+    let room = LiveRoom::new(stored);
+    let view = Outbox::default().view(&room, &minutes);
+    assert_eq!(view.deputy_grant_block.as_deref(), Some(NO_NICKNAME));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    let text = &outbox.view(&room, &minutes).notices[0].text;
+    assert!(text.contains(NO_NICKNAME), "{text}");
+}
+
+#[test]
+fn nothing_goes_out_for_a_change_the_room_would_not_take() {
+    let f = Fixture::new();
+    let room = deputy_room(&f, vec![pal_id()]);
+    let refused = |action: Action, expect: &str| {
+        let mut outbox = outbox();
+        outbox.command(&room, action);
+        assert!(next(&mut outbox, &room, Instant::now()).is_none());
+        let text = outbox.view(&room, &minutes).notices[0].text.clone();
+        assert!(text.contains(expect), "{text}");
+    };
+    refused(grant(f.me_id()), "yourself");
+    refused(grant(f.owner_id()), "owner already has full authority");
+    refused(grant(pal_id()), "already your deputy");
+    refused(revoke(other_id()), "not your deputy");
+    refused(
+        Action::SetDeputy {
+            target: "12345".into(),
+            grant: true,
+        },
+        "gone",
+    );
+}
+
+#[test]
+fn a_member_who_cannot_write_is_told_why_and_nothing_goes_out() {
+    let f = Fixture::new();
+    let mut state = deputy_state(&f, vec![]);
+    state.bans.0.push(ban(&f, f.me_id()));
+    let room = LiveRoom::new(f.stored(state));
+    let view = Outbox::default().view(&room, &minutes);
+    assert_eq!(view.deputy_block, view.send_block);
+    assert!(view.deputy_block.is_some());
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+}
+
+#[test]
+fn the_room_takes_at_most_the_most_deputies_a_record_may_list() {
+    use river_core::room_state::member_info::MAX_DEPUTIES;
+    let f = Fixture::new();
+    let full: Vec<MemberId> = (0..MAX_DEPUTIES as u8)
+        .map(|i| MemberId::from(&SigningKey::from_bytes(&[100 + i; 32]).verifying_key()))
+        .collect();
+    let room = deputy_room(&f, full.clone());
+    let view = Outbox::default().view(&room, &minutes);
+    assert!(view.deputies_full);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    let text = &outbox.view(&room, &minutes).notices[0].text;
+    assert!(text.contains("most deputies"), "{text}");
+    // A revoke is still possible when full, and the result verifies.
+    let mut outbox = self::outbox();
+    outbox.command(&room, revoke(full[0]));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.deputies.len(), MAX_DEPUTIES - 1);
+    contract_takes(&room, delta);
+}
+
+#[test]
+fn a_nickname_and_a_deputy_waiting_together_are_one_record_neither_undoing_the_other() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    // A first change is out, so the next two wait.
+    outbox.command(&room, nick("One"));
+    let (_, one) = next_info(&mut outbox, &room);
+    outbox.command(&room, nick("Two"));
+    outbox.command(&room, grant(pal_id()));
+    outbox.command(&room, grant(other_id()));
+    outbox.command(&room, revoke(other_id()));
+    assert!(
+        next(&mut outbox, &room, Instant::now()).is_none(),
+        "one at a time"
+    );
+    // As shown: the new name, the grant.
+    assert_eq!(shown_name(&outbox, &room), "Two");
+    let shown = outbox.view(&room, &minutes);
+    assert!(
+        shown
+            .members
+            .iter()
+            .find(|m| m.uid == pal_id().to_string())
+            .unwrap()
+            .my_deputy
+    );
+    assert!(outbox.answered(&mut room, Ok(())));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert!(info.member_info.version > one.member_info.version);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Two".to_vec())
+    );
+    assert_eq!(info.member_info.deputies, [pal_id()]);
+    assert_eq!(deputies_after(&room, &f, delta), [pal_id()]);
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_deputy_waiting_is_not_undone_by_a_nickname_written_after_it() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    outbox.command(&room, nick("Renamed"));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.deputies, [pal_id()]);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Renamed".to_vec())
+    );
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_change_made_while_another_is_out_is_built_on_the_one_out() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (_, first) = next_info(&mut outbox, &room);
+    // The grant is on its way; a rename now must keep it, even before the room shows it.
+    outbox.command(&room, nick("Renamed"));
+    let (_, second) = {
+        assert!(outbox.answered(&mut room, Ok(())));
+        next_info(&mut outbox, &room)
+    };
+    assert_eq!(second.member_info.deputies, [pal_id()]);
+    assert!(second.member_info.version > first.member_info.version);
+    // And the display, before the answer, already counted both.
+    let f2 = Fixture::new();
+    let room2 = deputy_room(&f2, vec![]);
+    let mut outbox2 = self::outbox();
+    outbox2.command(&room2, grant(pal_id()));
+    next_info(&mut outbox2, &room2);
+    outbox2.command(&room2, nick("Renamed"));
+    let view = outbox2.view(&room2, &minutes);
+    assert!(
+        view.members
+            .iter()
+            .find(|m| m.uid == pal_id().to_string())
+            .unwrap()
+            .my_deputy
+    );
+    assert_eq!(view.member(view.me).unwrap().nickname, "Renamed");
+}
+
+#[test]
+fn a_refused_deputy_change_is_replaced_by_a_newer_one_and_cannot_come_back() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    let refused = outbox
+        .view(&room, &minutes)
+        .deputy_changes
+        .pop()
+        .expect("the refusal is shown");
+    assert!(refused.pending.retry);
+    assert!(refused.pending.failed.unwrap().starts_with("Not saved"));
+    // A change to someone else: the refused grant of `pal` is not brought back with it.
+    outbox.command(&room, grant(other_id()));
+    assert!(!outbox.command(
+        &room,
+        Action::Retry {
+            entry: refused.pending.entry
+        }
+    ));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.deputies, [other_id()]);
+}
+
+#[test]
+fn retry_of_a_refused_deputy_change_signs_it_again_at_a_fresh_version() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (_, first) = next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    let change = outbox.view(&room, &minutes).deputy_changes.pop().unwrap();
+    // Refused: not shown as made.
+    assert!(
+        !outbox
+            .view(&room, &minutes)
+            .members
+            .iter()
+            .any(|m| m.my_deputy)
+    );
+    assert!(outbox.command(
+        &room,
+        Action::Retry {
+            entry: change.pending.entry
+        }
+    ));
+    let (_, again) = next_info(&mut outbox, &room);
+    assert!(again.member_info.version > first.member_info.version);
+    assert_eq!(again.member_info.deputies, [pal_id()]);
+}
+
+#[test]
+fn a_waiting_change_does_not_bring_back_what_my_other_device_changed() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![pal_id()]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(other_id()));
+    // Another device revoked `pal` and renamed me, at a higher version, before this was sent.
+    merge_info(
+        &mut room,
+        AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.me_id(),
+                version: 6,
+                preferred_nickname: SealedBytes::public(b"Renamed Elsewhere".to_vec()),
+                deputies: vec![],
+            },
+            &f.me,
+        ),
+    );
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert!(info.member_info.version > 6);
+    assert_eq!(info.member_info.deputies, [other_id()], "pal stays revoked");
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Renamed Elsewhere".to_vec()),
+        "the rename is not undone"
+    );
+    assert_eq!(deputies_after(&room, &f, delta), [other_id()]);
+}
+
+#[test]
+fn a_deputy_change_queued_before_the_room_turned_private_is_sealed_not_sent_plain() {
+    let f = Fixture::new();
+    let public = deputy_room(&f, vec![]);
+    let mut private_state = f.private_state();
+    private_state
+        .members
+        .members
+        .push(admitted_by(&f, &f.owner, &pal()));
+    private_state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.me_id(),
+                version: 3,
+                preferred_nickname: SealedBytes::public(b"Mia".to_vec()),
+                deputies: vec![],
+            },
+            &f.me,
+        ));
+    let private = LiveRoom::new(f.stored(private_state));
+    let mut outbox = outbox();
+    outbox.command(&public, grant(pal_id()));
+    let (delta, info) = next_info(&mut outbox, &private);
+    assert!(matches!(
+        info.member_info.preferred_nickname,
+        SealedBytes::Private { .. }
+    ));
+    assert_eq!(
+        river_core::ecies::unseal_bytes(&info.member_info.preferred_nickname, Some(&SECRET))
+            .unwrap(),
+        b"Mia"
+    );
+    contract_takes(&private, delta);
+}
+
+#[test]
+fn a_deputy_change_queued_before_the_room_turned_public_is_not_sent_sealed() {
+    let f = Fixture::new();
+    let mut private_state = f.private_state();
+    private_state
+        .members
+        .members
+        .push(admitted_by(&f, &f.owner, &pal()));
+    let private = LiveRoom::new(f.stored(private_state));
+    let public = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&private, grant(pal_id()));
+    let (_, info) = next_info(&mut outbox, &public);
+    assert!(info.member_info.preferred_nickname.is_public());
+}
+
+#[test]
+fn an_equal_version_record_that_wins_settles_a_deputy_change_as_replaced_not_as_saved() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (delta, mine) = next_info(&mut outbox, &room);
+    let version = mine.member_info.version;
+    // Another device signed a different record at the same version; find one the room ranks
+    // above mine.
+    let rival = (0..200)
+        .map(|i| {
+            AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo {
+                    member_id: f.me_id(),
+                    version,
+                    preferred_nickname: SealedBytes::public(format!("Rival {i}").into_bytes()),
+                    deputies: vec![other_id()],
+                },
+                &f.me,
+            )
+        })
+        .find(|o| {
+            let mut t = room.clone();
+            merge_info(&mut t, o.clone());
+            t.apply_delta(delta.clone()).unwrap();
+            t.stored.room_state.member_info.canonical(f.me_id()) == Some(o)
+        })
+        .expect("some record outranks mine");
+    merge_info(&mut room, rival);
+    assert!(outbox.answered(&mut room, Ok(())));
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices[0].text.contains(RECORD_SUPERSEDED));
+    let change = &view.deputy_changes[0];
+    assert!(
+        !change
+            .pending
+            .failed
+            .as_ref()
+            .unwrap()
+            .starts_with("Not saved")
+    );
+    // The room's record is the rival's, so I show no grant for `pal`.
+    assert!(
+        !view
+            .members
+            .iter()
+            .find(|m| m.uid == pal_id().to_string())
+            .unwrap()
+            .my_deputy
+    );
+}
+
+#[test]
+fn my_own_newer_deputy_change_is_not_reported_as_made_elsewhere() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (_, older) = next_info(&mut outbox, &room);
+    assert!(outbox.expire(
+        Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(5)
+    ));
+    outbox.command(&room, grant(other_id()));
+    // The newer record reaches the room by another route, outranking the older.
+    let newer = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: f.me_id(),
+            version: older.member_info.version + 1,
+            preferred_nickname: SealedBytes::public(b"Mia".to_vec()),
+            deputies: vec![pal_id(), other_id()],
+        },
+        &f.me,
+    );
+    merge_info(&mut room, newer);
+    outbox.requeue();
+    assert!(outbox.reconcile(&mut room));
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices.is_empty(), "{:?}", view.notices);
+    assert!(view.deputy_changes.is_empty());
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_waiting_change_built_on_one_that_is_then_refused_is_built_again_without_it() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    next_info(&mut outbox, &room);
+    outbox.command(&room, grant(other_id()));
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    let view = outbox.view(&room, &minutes);
+    let mine: Vec<_> = view
+        .members
+        .iter()
+        .filter(|m| m.my_deputy)
+        .map(|m| m.uid.clone())
+        .collect();
+    assert_eq!(
+        mine,
+        [other_id().to_string()],
+        "only what is still on its way"
+    );
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.deputies, [other_id()]);
+}
+
+#[test]
+fn no_version_left_fails_a_deputy_change_instead_of_wrapping() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    merge_info(&mut room, record(&f, u32::MAX, "Last"));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert_eq!(
+        outbox.view(&room, &minutes).notices[0].text,
+        format!("Your change to a deputy couldn't be sent. {RECORD_NO_VERSION_LEFT}")
+    );
+}
+
+#[test]
+fn a_pruned_member_is_told_to_send_a_message_first_for_a_deputy_change_too() {
+    let f = Fixture::new();
+    let mut state = deputy_state(&f, vec![]);
+    state
+        .members
+        .members
+        .retain(|m| m.member.member_vk != f.me.verifying_key());
+    let mut stored = f.stored(state);
+    stored.self_authorized_member = Some(admitted(&f));
+    let room = LiveRoom::new(stored);
+    let view = Outbox::default().view(&room, &minutes);
+    assert_eq!(view.deputy_block.as_deref(), Some(PRUNED_DEPUTIES));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert!(
+        outbox.view(&room, &minutes).notices[0]
+            .text
+            .contains(PRUNED_DEPUTIES)
+    );
+}
+
+#[test]
+fn nothing_about_a_deputy_change_prints_a_nickname() {
+    let shown = format!(
+        "{:?}",
+        RecordEdit {
+            nickname: Some("hunter2-secret".into()),
+            deputies: vec![(pal_id(), true)]
+        }
+    );
+    assert!(!shown.contains("hunter2"));
+    let f = Fixture::new();
+    let room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("hunter2-secret"));
+    outbox.command(&room, grant(pal_id()));
+    assert!(!format!("{:?}", outbox.entries).contains("hunter2"));
+}
+
+// Review round: a revoke is always possible; carrying the nickname; a grant's member -----------
+
+/// A private room whose current secret is v1 (`[7; 32]`), with `pal` a member and my record at
+/// version 3 holding `nickname` and `deputies`. `keep_v0` keeps the v0 secret readable here.
+fn rotated_state(
+    f: &Fixture,
+    nickname: SealedBytes,
+    deputies: Vec<MemberId>,
+    keep_v0: bool,
+) -> ChatRoomStateV1 {
+    let mut state = f.private_state();
+    state.members.members.push(admitted_by(f, &f.owner, &pal()));
+    state.member_info.member_info.clear();
+    state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.me_id(),
+                version: 3,
+                preferred_nickname: nickname,
+                deputies,
+            },
+            &f.me,
+        ));
+    if !keep_v0 {
+        state.secrets.encrypted_secrets.clear();
+    }
+    add_secret(f, &mut state, 1, &[7; 32], &f.me);
+    state
+}
+
+fn plain_of(room: &LiveRoom, s: &SealedBytes) -> Option<String> {
+    room.unseal(s)
+}
+
+#[test]
+fn a_revoke_carries_the_held_nickname_unchanged_even_when_it_cannot_be_made_again() {
+    let f = Fixture::new();
+    // Held under an older secret this computer cannot read: a grant would need the name, a
+    // revoke does not.
+    let held = f.seal("Mia");
+    let room = LiveRoom::new(f.stored(rotated_state(&f, held.clone(), vec![pal_id()], false)));
+    let view = Outbox::default().view(&room, &minutes);
+    assert_eq!(view.deputy_block, None);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, revoke(pal_id())));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.preferred_nickname, held);
+    assert!(info.member_info.deputies.is_empty());
+    assert!(deputies_after(&room, &f, delta).is_empty());
+}
+
+#[test]
+fn a_revoke_with_no_nickname_known_here_still_goes_out() {
+    let f = Fixture::new();
+    let mut stored = f.stored(deputy_state(&f, vec![pal_id()]));
+    stored.self_nickname = None;
+    let room = LiveRoom::new(stored);
+    let view = Outbox::default().view(&room, &minutes);
+    assert_eq!(view.deputy_block, None);
+    let mut outbox = outbox();
+    outbox.command(&room, revoke(pal_id()));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert!(info.member_info.deputies.is_empty());
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Mia".to_vec())
+    );
+}
+
+#[test]
+fn a_revoke_seals_a_name_held_plain_in_a_room_that_turned_private() {
+    let f = Fixture::new();
+    let held = SealedBytes::public(b"Mia".to_vec());
+    let room = LiveRoom::new(f.stored(rotated_state(&f, held, vec![pal_id()], true)));
+    let mut outbox = outbox();
+    outbox.command(&room, revoke(pal_id()));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname.secret_version(),
+        Some(1)
+    );
+    assert_eq!(
+        plain_of(&room, &info.member_info.preferred_nickname).as_deref(),
+        Some("Mia")
+    );
+    assert!(deputies_after(&room, &f, delta).is_empty());
+}
+
+#[test]
+fn a_revoke_carries_a_sealed_name_it_cannot_open_in_a_public_room_as_it_is() {
+    let f = Fixture::new();
+    let mut state = deputy_state(&f, vec![pal_id()]);
+    state.member_info.member_info.clear();
+    let held_bytes = f.seal("Sealed Mia");
+    state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.me_id(),
+                version: 3,
+                preferred_nickname: held_bytes.clone(),
+                deputies: vec![pal_id()],
+            },
+            &f.me,
+        ));
+    let room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    outbox.command(&room, revoke(pal_id()));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.preferred_nickname, held_bytes);
+}
+
+#[test]
+fn a_revoke_is_blocked_only_when_the_room_takes_no_write_from_me() {
+    let f = Fixture::new();
+    // A private room whose secret never reached this computer: nothing can be written.
+    let mut state = rotated_state(&f, f.seal("Mia"), vec![pal_id()], false);
+    state.secrets.encrypted_secrets.clear();
+    let room = LiveRoom::new(f.stored(state));
+    let view = Outbox::default().view(&room, &minutes);
+    assert!(view.send_block.is_some());
+    assert_eq!(view.deputy_block, view.send_block);
+    let mut outbox = outbox();
+    outbox.command(&room, revoke(pal_id()));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+}
+
+#[test]
+fn a_grant_with_no_nickname_is_blocked_in_the_view_but_a_revoke_is_not() {
+    let f = Fixture::new();
+    let mut state = deputy_state(&f, vec![pal_id()]);
+    state.member_info.member_info.clear();
+    let mut stored = f.stored(state);
+    stored.self_nickname = None;
+    let room = LiveRoom::new(stored);
+    let view = Outbox::default().view(&room, &minutes);
+    assert_eq!(view.deputy_grant_block.as_deref(), Some(NO_NICKNAME));
+    assert_eq!(view.deputy_block, None);
+}
+
+#[test]
+fn a_grant_for_a_member_who_left_is_refused_and_a_mixed_record_drops_only_that_grant() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    // The room banned or removed `pal` before it went out.
+    let mut state = room.stored.room_state.clone();
+    state.members.members.retain(|m| m.member.id() != pal_id());
+    room.stored.room_state = state;
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    let text = &outbox.view(&room, &minutes).notices[0].text;
+    assert!(text.contains("no longer a member"), "{text}");
+
+    // Together with a nickname the name still goes out, without the grant.
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = self::outbox();
+    outbox.command(&room, grant(pal_id()));
+    outbox.command(&room, nick("Renamed"));
+    room.stored
+        .room_state
+        .members
+        .members
+        .retain(|m| m.member.id() != pal_id());
+    let (_, info) = next_info(&mut outbox, &room);
+    assert!(info.member_info.deputies.is_empty());
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Renamed".to_vec())
+    );
+}
+
+#[test]
+fn no_record_here_but_a_cached_one_with_deputies_is_never_published_as_an_empty_list() {
+    let f = Fixture::new();
+    let mut state = deputy_state(&f, vec![]);
+    state.member_info.member_info.clear();
+    let mut stored = f.stored(state);
+    stored.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: f.me_id(),
+            version: 5,
+            preferred_nickname: SealedBytes::public(b"Mia".to_vec()),
+            deputies: vec![other_id()],
+        },
+        &f.me,
+    ));
+    let room = LiveRoom::new(stored);
+    assert_eq!(
+        Outbox::default()
+            .view(&room, &minutes)
+            .deputy_grant_block
+            .as_deref(),
+        Some(NO_RECORD)
+    );
+    for (action, said) in [
+        (grant(pal_id()), NO_RECORD),
+        (nick("New"), NO_RECORD_NICKNAME),
+    ] {
+        let mut outbox = outbox();
+        outbox.command(&room, action);
+        assert!(next(&mut outbox, &room, Instant::now()).is_none());
+        assert!(outbox.view(&room, &minutes).notices[0].text.contains(said));
+    }
+    // With an empty cache (or none) it still works from the name chosen here.
+    let mut state = deputy_state(&f, vec![]);
+    state.member_info.member_info.clear();
+    let room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.deputies, [pal_id()]);
+}
+
+#[test]
+fn a_held_name_sealed_under_an_older_secret_is_sealed_again_under_the_current_one() {
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(rotated_state(&f, f.seal("Mia"), vec![], true)));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname.secret_version(),
+        Some(1)
+    );
+    assert_eq!(
+        river_core::ecies::unseal_bytes(&info.member_info.preferred_nickname, Some(&[7; 32]))
+            .unwrap(),
+        b"Mia"
+    );
+    contract_takes(&room, delta);
+}
+
+#[test]
+fn a_held_name_under_a_secret_this_computer_cannot_read_is_carried_unchanged_for_a_grant() {
+    let f = Fixture::new();
+    let held = f.seal("Mia");
+    let room = LiveRoom::new(f.stored(rotated_state(&f, held.clone(), vec![], false)));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.preferred_nickname, held);
+    assert_eq!(info.member_info.deputies, [pal_id()]);
+}
+
+#[test]
+fn with_no_record_the_name_chosen_here_is_sealed_for_a_grant_in_a_private_room() {
+    let f = Fixture::new();
+    let mut state = rotated_state(&f, f.seal("x"), vec![], true);
+    state.member_info.member_info.clear();
+    let room = LiveRoom::new(f.stored(state));
+    assert_eq!(room.stored.self_nickname.as_deref(), Some("Mia"));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname.secret_version(),
+        Some(1)
+    );
+    assert_eq!(
+        plain_of(&room, &info.member_info.preferred_nickname).as_deref(),
+        Some("Mia")
+    );
+}
+
+#[test]
+fn a_plain_held_name_in_a_private_room_is_sealed_for_a_grant_and_an_unreadable_sealed_one_in_a_public_room_is_refused()
+ {
+    let f = Fixture::new();
+    // Kind mismatch one way: plain held, room private: sealed, never republished plain.
+    let room = LiveRoom::new(f.stored(rotated_state(
+        &f,
+        SealedBytes::public(b"Mia".to_vec()),
+        vec![],
+        true,
+    )));
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname.secret_version(),
+        Some(1)
+    );
+    assert_eq!(
+        plain_of(&room, &info.member_info.preferred_nickname).as_deref(),
+        Some("Mia")
+    );
+    // Not readable: refused rather than guessed.
+    // The other way: sealed held, room public, nothing here to open it with.
+    let mut state = deputy_state(&f, vec![]);
+    state.member_info.member_info.clear();
+    state
+        .member_info
+        .member_info
+        .push(f.nickname(&f.me, "Sealed Mia"));
+    let mut stored = f.stored(state);
+    stored.self_nickname = None;
+    let room = LiveRoom::new(stored);
+    let mut outbox = self::outbox();
+    outbox.command(&room, grant(pal_id()));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+}
+
+// The shared change: a settled entry only explains the entries of its own kind ----------------
+
+#[test]
+fn a_settled_message_leaves_an_older_failed_or_queued_record_entry_alone() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    // An older deputy change was refused; an older nickname still waits behind a message.
+    outbox.command(&room, grant(pal_id()));
+    next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    outbox.command(&room, say("hello"));
+    let sent_text = next(&mut outbox, &room, Instant::now()).expect("the message goes out");
+    assert!(sent_text.recent_messages.is_some());
+    assert!(outbox.answered(&mut room, Ok(())));
+    let view = outbox.view(&room, &minutes);
+    assert_eq!(view.deputy_changes.len(), 1, "the refusal is still there");
+    assert!(view.deputy_changes[0].pending.failed.is_some());
+}
+
+#[test]
+fn a_settled_deputy_record_removes_an_older_failed_nickname_entry() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Refused"));
+    next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    // The deputy change does not carry the refused nickname (it was not shown).
+    outbox.command(&room, grant(pal_id()));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Mia".to_vec())
+    );
+    assert!(outbox.answered(&mut room, Ok(())));
+    let view = outbox.view(&room, &minutes);
+    assert!(view.own_nickname.is_none());
+    assert!(view.notices.is_empty(), "{:?}", view.notices);
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_grant_dropped_because_its_member_left_is_said_and_not_shown_as_sending() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![]);
+    let mut outbox = outbox();
+    outbox.command(&room, grant(pal_id()));
+    outbox.command(&room, nick("Renamed"));
+    room.stored
+        .room_state
+        .members
+        .members
+        .retain(|m| m.member.id() != pal_id());
+    // Not shown as on its way once the member is gone.
+    assert!(outbox.view(&room, &minutes).deputy_changes.is_empty());
+    let (_, info) = next_info(&mut outbox, &room);
+    assert!(info.member_info.deputies.is_empty());
+    let view = outbox.view(&room, &minutes);
+    let note = view
+        .notices
+        .iter()
+        .find(|n| {
+            n.text
+                .contains("was not sent: they are no longer a member.")
+        })
+        .expect("the lost grant is said");
+    // It stays until dismissed.
+    assert!(outbox.command(&room, Action::Discard { entry: note.entry }));
+}
+
+#[test]
+fn a_revoke_of_one_who_is_no_deputy_any_more_is_dropped_not_published_as_a_no_op() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![pal_id()]);
+    let mut outbox = outbox();
+    outbox.command(&room, revoke(pal_id()));
+    // Another device already revoked, at a higher version.
+    merge_info(&mut room, record(&f, 6, "Mia"));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert!(outbox.is_empty(), "done, nothing to say");
+}
+
+#[test]
+fn a_refused_deputy_change_replaced_by_a_newer_record_edit_is_not_lost_silently() {
+    let f = Fixture::new();
+    let mut room = deputy_room(&f, vec![pal_id()]);
+    let mut outbox = outbox();
+    outbox.command(&room, revoke(pal_id()));
+    next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    outbox.command(&room, nick("Renamed"));
+    let view = outbox.view(&room, &minutes);
+    assert!(
+        view.notices
+            .iter()
+            .any(|n| n.text.contains("Freenet refused it: no")),
+        "{:?}",
+        view.notices
+    );
+    // And it cannot come back with the rename.
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.deputies, [pal_id()]);
 }

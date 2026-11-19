@@ -42,6 +42,7 @@ fn deputy(mut m: Member, by: &[Appointer], can_ban_you: bool) -> Member {
     m.role = Role::Deputy;
     m.deputized_by = by.to_vec();
     m.can_ban_you = Some(can_ban_you);
+    m.my_deputy = by.contains(&Appointer::You);
     m
 }
 
@@ -197,6 +198,10 @@ fn town_square() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        deputy_changes: Vec::new(),
+        deputy_block: None,
+        deputy_grant_block: None,
+        deputies_full: false,
         wraps: None,
         details: Details::default(),
     }
@@ -248,6 +253,10 @@ fn design_crew() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        deputy_changes: Vec::new(),
+        deputy_block: None,
+        deputy_grant_block: None,
+        deputies_full: false,
         wraps: None,
         details: Details::default(),
     }
@@ -289,6 +298,10 @@ fn rust_help() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        deputy_changes: Vec::new(),
+        deputy_block: None,
+        deputy_grant_block: None,
+        deputies_full: false,
         wraps: None,
         details: Details::default(),
     }
@@ -319,6 +332,10 @@ fn family() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        deputy_changes: Vec::new(),
+        deputy_block: None,
+        deputy_grant_block: None,
+        deputies_full: false,
         wraps: None,
         details: Details::default(),
     }
@@ -339,6 +356,10 @@ fn book_club() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        deputy_changes: Vec::new(),
+        deputy_block: None,
+        deputy_grant_block: None,
+        deputies_full: false,
         wraps: None,
         details: Details::default(),
     }

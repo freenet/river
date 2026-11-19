@@ -45,6 +45,9 @@ pub struct Member {
     /// Whether this deputy can get you removed from the room. `None` unless they are a deputy,
     /// and for yourself.
     pub can_ban_you: Option<bool>,
+    /// Whether they are one of YOUR deputies (listed in your own record, counting a change of
+    /// yours still on its way), which the web UI's deputy button decides Revoke by.
+    pub my_deputy: bool,
     /// River's own ordering of member ids (the hash a `MemberId` wraps), which the web UI sorts
     /// protected names by. `uid` is a label and does not sort the same way. 0 in example rooms.
     pub order: i64,
@@ -111,6 +114,7 @@ impl Member {
             claimed: true,
             deputized_by: Vec::new(),
             can_ban_you: None,
+            my_deputy: false,
             order: 0,
         }
     }
@@ -161,6 +165,16 @@ pub struct Pending {
     pub failed: Option<String>,
     /// Whether Retry can send it again.
     pub retry: bool,
+}
+
+/// A change of yours to whether one member is your deputy, not yet taken by the node or failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeputyChange {
+    /// The member, by `Member::uid`.
+    pub uid: String,
+    /// Whether it makes them a deputy (`true`) or ends that.
+    pub grant: bool,
+    pub pending: Pending,
 }
 
 /// Something you did that could not be sent and has no message row to say so on (an edit, a
@@ -285,6 +299,17 @@ pub struct Room {
     /// Why your nickname can't be changed now even though you can write, if it can't: the room
     /// removed you for inactivity, and only a message brings you back.
     pub nickname_block: Option<String>,
+    /// Changes of yours to who your deputies are that the node has not taken yet, or that
+    /// failed, by member.
+    pub deputy_changes: Vec<DeputyChange>,
+    /// Why your deputies can't be changed now, if they can't: you can't write here, the room
+    /// removed you for inactivity, or you have no nickname to carry over.
+    pub deputy_block: Option<String>,
+    /// Why nobody more can be made a deputy now, though one can be revoked: no nickname or
+    /// record to build the change on.
+    pub deputy_grant_block: Option<String>,
+    /// Whether you already have the most deputies a member can have, so nobody more can be added.
+    pub deputies_full: bool,
     pub details: Details,
     /// For rooms read from the node: each message's reply wrapper, by key, exactly as sending
     /// builds it. A key missing from it is a message the node no longer shows, which a reply
@@ -760,6 +785,10 @@ mod tests {
             nickname_limit: 50,
             own_nickname: None,
             nickname_block: None,
+            deputy_changes: Vec::new(),
+            deputy_block: None,
+            deputy_grant_block: None,
+            deputies_full: false,
             wraps: None,
             details: Details::default(),
         };
