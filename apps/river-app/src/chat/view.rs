@@ -6,7 +6,7 @@ use rune::tok::TextStyle;
 use rune::{Color, Cx, El, Pixels, ScrollSpec, col, el, icon, row, spacer, text};
 use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, Switch, TextInput};
 
-use super::conversation::{avatar, conversation};
+use super::conversation::{avatar, conversation, picker_overlay};
 use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
@@ -54,6 +54,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
+    picker_overlay(chat, room, &p, &k, &mut layer);
     if chat.members_shown(narrow) {
         let panel = members(chat, room, narrow, &p, &k);
         if narrow {
