@@ -132,6 +132,54 @@ fn typing_and_pressing_return_sends_and_clears_the_composer() {
 }
 
 #[test]
+fn shift_return_adds_a_line_and_only_return_sends() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let before = rt.state.chat.room().unwrap().messages.len();
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("first".into()));
+    rt.key(KeyEvent {
+        key: Key::Enter,
+        mods: rune::Mods {
+            shift: true,
+            ..rune::Mods::default()
+        },
+    });
+    rt.frame(0.0);
+    key(&mut rt, Key::Text("second".into()));
+    assert_eq!(rt.state.chat.composer.text, "first\nsecond");
+    assert_eq!(
+        rt.state.chat.room().unwrap().messages.len(),
+        before,
+        "nothing sent yet"
+    );
+    key(&mut rt, Key::Enter);
+    let room = rt.state.chat.room().unwrap();
+    assert_eq!(room.messages.len(), before + 1);
+    assert_eq!(room.last_message().unwrap().text, "first\nsecond");
+    assert_eq!(rt.state.chat.composer.text, "");
+}
+
+#[test]
+fn a_press_on_the_composer_boxs_padding_focuses_the_editor() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let boxed = rt.find("composer-input").expect("the input row");
+    // The row's own top-left padding, outside the one-line editor.
+    let el = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("composer-input"))
+        .unwrap();
+    let (x, y) = (el.rect[0] + 3.0, el.rect[1] + 2.0);
+    let _ = boxed;
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(0.1);
+    rt.frame(0.2);
+    key(&mut rt, Key::Text("hi".into()));
+    assert_eq!(rt.state.chat.composer.text, "hi");
+}
+
+#[test]
 fn a_draft_stays_in_the_room_it_was_typed_in() {
     let mut rt = render(connected(), WINDOW_SIZE);
     let texts_in = |rt: &Runtime<RiverApp>, key: &str| {
