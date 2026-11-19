@@ -648,13 +648,18 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
                 s.chat.send();
             });
     }
-    let field = row()
+    // role "textbox" makes a press anywhere in the box (its padding too) focus the editor.
+    let mut field = row()
         .key("composer-input")
+        .role("textbox")
         .grow(1.0)
         .min_w(0.0)
         .px(8.0)
         .py(6.0)
         .child(rune::auto_grow(input, 1, COMPOSER_MAX_LINES));
+    if !can_send {
+        field = field.opacity(0.5);
+    }
     let mut send = row()
         .key("send")
         .role("button")
