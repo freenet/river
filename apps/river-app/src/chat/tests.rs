@@ -2061,3 +2061,213 @@ fn members_whose_names_are_only_symbols_are_all_unnamed_with_their_id_to_tell_th
     assert_eq!(hinted.len(), 2);
     assert_ne!(hinted[0].help, hinted[1].help);
 }
+
+// Notification modes ---------------------------------------------------------------------------
+
+use crate::rooms::modes::NotificationMode;
+
+fn open_bell(rt: &mut Runtime<RiverApp>) {
+    press(rt, "notification-bell");
+}
+
+/// The mode radio rows are `item0..item2`, in the web UI's order.
+fn pick(rt: &mut Runtime<RiverApp>, mode: NotificationMode) {
+    let i = NotificationMode::ALL
+        .iter()
+        .position(|m| *m == mode)
+        .unwrap();
+    press(rt, &format!("item{i}"));
+}
+
+#[test]
+fn the_bell_opens_the_dialog_with_the_three_modes_and_the_current_one_checked() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    assert!(rt.find("notify-dialog").is_none());
+    open_bell(&mut rt);
+    assert!(rt.find("notify-dialog").is_some());
+    for m in NotificationMode::ALL {
+        assert!(shows(&rt, m.label()), "{}", m.label());
+        assert!(shows(&rt, m.help()), "{}", m.help());
+    }
+    assert!(shows(
+        &rt,
+        "Applies to this room and syncs across your devices."
+    ));
+    // The default is checked: exactly the first radio.
+    let checked: Vec<bool> = (0..3)
+        .map(|i| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(format!("item{i}").as_str()))
+                .map(|e| e.item_selected)
+                .expect("a radio row")
+        })
+        .collect();
+    assert_eq!(checked, [true, false, false]);
+}
+
+#[test]
+fn choosing_a_mode_applies_it_closes_the_dialog_and_sends_it_to_be_stored() {
+    let mut rt = node_rooms(|_| {});
+    let room = rt.state.chat.room().unwrap().key.clone();
+    open_bell(&mut rt);
+    pick(&mut rt, NotificationMode::MentionsAndReplies);
+    assert!(rt.find("notify-dialog").is_none());
+    assert_eq!(
+        rt.state.chat.mode_of(&room),
+        NotificationMode::MentionsAndReplies
+    );
+    assert_eq!(
+        rt.state.chat.outgoing,
+        [Command {
+            room: room.clone(),
+            action: Action::SetNotificationMode {
+                mode: NotificationMode::MentionsAndReplies
+            }
+        }]
+    );
+    // The bell names the mode, and the dialog shows it checked on the next open.
+    assert!(
+        rt.elements()
+            .iter()
+            .any(|e| e.key.as_deref() == Some("notification-bell")
+                && e.label.as_deref() == Some("Notifications: Mentions & replies only"))
+    );
+    open_bell(&mut rt);
+    let selected = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("item1"))
+        .unwrap()
+        .item_selected;
+    assert!(selected);
+}
+
+#[test]
+fn choosing_the_current_mode_stores_nothing() {
+    let mut rt = node_rooms(|_| {});
+    open_bell(&mut rt);
+    pick(&mut rt, NotificationMode::All);
+    assert!(rt.find("notify-dialog").is_none());
+    assert!(rt.state.chat.outgoing.is_empty());
+}
+
+#[test]
+fn example_rooms_change_in_memory_and_send_nothing() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_bell(&mut rt);
+    pick(&mut rt, NotificationMode::Muted);
+    assert!(rt.state.chat.outgoing.is_empty());
+    let room = rt.state.chat.room().unwrap().key.clone();
+    assert_eq!(rt.state.chat.mode_of(&room), NotificationMode::Muted);
+}
+
+#[test]
+fn escape_and_a_press_outside_close_the_dialog_without_changing_anything() {
+    let mut rt = node_rooms(|_| {});
+    open_bell(&mut rt);
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("notify-dialog").is_none());
+    open_bell(&mut rt);
+    // The window's corner is the scrim, outside the dialog.
+    rt.pointer_down(4.0, 4.0);
+    rt.pointer_up(4.0, 4.0);
+    rt.frame(0.1);
+    rt.frame(0.2);
+    assert!(rt.find("notify-dialog").is_none());
+    open_bell(&mut rt);
+    press(&mut rt, "close");
+    assert!(rt.find("notify-dialog").is_none());
+    assert!(rt.state.chat.outgoing.is_empty());
+    let room = rt.state.chat.room().unwrap().key.clone();
+    assert_eq!(rt.state.chat.mode_of(&room), NotificationMode::All);
+}
+
+#[test]
+fn the_dialog_belongs_to_its_room() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_bell(&mut rt);
+    rt.update(|s, _| s.chat.select("rust-help"));
+    rt.frame(0.1);
+    assert!(rt.find("notify-dialog").is_none());
+}
+
+#[test]
+fn the_dialog_says_when_the_master_switch_is_off() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_bell(&mut rt);
+    assert!(rt.find("notify-master-off").is_none());
+    let mut off = connected();
+    off.chat.notifications = false;
+    let mut rt = render(off, WINDOW_SIZE);
+    open_bell(&mut rt);
+    assert!(rt.find("notify-master-off").is_some());
+    assert!(shows(&rt, "switched off for every room"));
+}
+
+#[test]
+fn a_muted_room_shows_no_unread_count_in_the_list() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    // Design Crew and Rust Help each have two unread.
+    assert!(rt.find("room-rust-help").is_some());
+    let badges = |rt: &Runtime<RiverApp>| {
+        rt.elements()
+            .into_iter()
+            .filter(|e| e.key.as_deref() == Some("unread"))
+            .count()
+    };
+    assert_eq!(badges(&rt), 2);
+    rt.update(|s, _| s.chat.set_mode("rust-help", NotificationMode::Muted));
+    for i in 1..20 {
+        rt.frame(f64::from(i) * 0.1);
+    }
+    assert_eq!(badges(&rt), 1);
+}
+
+#[test]
+fn a_mode_picked_here_survives_an_older_update_until_the_node_echoes_it() {
+    let mut s = node_chat();
+    s.chat.set_mode("rust-help", NotificationMode::Muted);
+    // An update the node sent before it took the pick: still the old mode.
+    s.chat.apply_modes(Default::default(), &[]);
+    assert_eq!(s.chat.mode_of("rust-help"), NotificationMode::Muted);
+    // The echo ends the hold; after it the node's word is taken, so a change made in the
+    // browser shows here.
+    s.chat.apply_modes(
+        [("rust-help".to_owned(), NotificationMode::Muted)].into(),
+        &[],
+    );
+    s.chat.apply_modes(
+        [("rust-help".to_owned(), NotificationMode::All)].into(),
+        &[],
+    );
+    assert_eq!(s.chat.mode_of("rust-help"), NotificationMode::All);
+}
+
+/// The pick is the screen's until the node says it ended; then the node's word is shown.
+#[test]
+fn a_failed_or_dismissed_save_reverts_the_display_and_a_stored_one_follows_the_store() {
+    let room = "rust-help".to_owned();
+    let settled = [room.clone()];
+    // Failed: the node settles it with the mode the store still holds (none: All).
+    let mut s = node_chat();
+    s.chat.set_mode(&room, NotificationMode::Muted);
+    s.chat.apply_modes(Default::default(), &settled);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+    // It does not come back with a later update either.
+    s.chat.apply_modes(Default::default(), &[]);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+
+    // Stored, then a web tab reverts the store: the display follows the store.
+    s.chat.set_mode(&room, NotificationMode::Muted);
+    s.chat
+        .apply_modes([(room.clone(), NotificationMode::Muted)].into(), &settled);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::Muted);
+    s.chat.apply_modes(Default::default(), &[]);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+
+    // Stored, and the update that settles it still carries the old mode: the node's word wins.
+    s.chat.set_mode(&room, NotificationMode::Muted);
+    s.chat.apply_modes(Default::default(), &settled);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+}

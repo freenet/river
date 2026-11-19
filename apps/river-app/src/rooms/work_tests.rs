@@ -834,3 +834,156 @@ fn w_link(_: &Work) -> String {
         .unwrap()
         .1
 }
+
+// Notification modes -----------------------------------------------------------------------------
+
+fn room_vk(seed: u8) -> VerifyingKey {
+    SigningKey::from_bytes(&[seed; 32]).verifying_key()
+}
+
+/// A `rooms_meta` as the web UI wrote it: an order, the open room and another room's mode.
+fn web_meta_bytes() -> Vec<u8> {
+    use ciborium::Value;
+    let entries = vec![
+        (
+            Value::Text("current_room_key".into()),
+            Value::serialized(&room_vk(1)).unwrap(),
+        ),
+        (
+            Value::Text("notification_modes".into()),
+            Value::Map(vec![(
+                Value::serialized(&room_vk(2)).unwrap(),
+                Value::serialized(&NotificationMode::Muted).unwrap(),
+            )]),
+        ),
+        (
+            Value::Text("room_order".into()),
+            Value::serialized(&vec![room_vk(2), room_vk(1)]).unwrap(),
+        ),
+    ];
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(entries), &mut out).unwrap();
+    out
+}
+
+#[test]
+fn a_mode_is_stored_by_reading_rooms_meta_then_a_cas_store_that_keeps_the_rest() {
+    let mut w = Work::default();
+    w.set_mode(room_vk(1), NotificationMode::MentionsAndReplies);
+    // Not about a room being created or joined: it holds no room, and shows no row yet it works.
+    assert!(w.busy());
+    assert!(!w.holds(&room_vk(1)));
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web_meta_bytes()), 4)));
+    let value = expect_store(&mut w, ROOMS_META_KEY, 4);
+    let after = crate::rooms::modes::decode_modes(&value);
+    assert_eq!(after[&room_vk(1)], NotificationMode::MentionsAndReplies);
+    assert_eq!(after[&room_vk(2)], NotificationMode::Muted);
+    let meta = decode_rooms_meta(&value).unwrap();
+    assert_eq!(meta.room_order, vec![room_vk(2), room_vk(1)]);
+    assert_eq!(meta.current_room_key, Some(room_vk(1)));
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Stored { generation: 5 }
+    )));
+    // Done: no row, no re-read of the rooms, and nothing left to override a later read.
+    assert!(!w.busy());
+    assert!(w.views().is_empty());
+    assert!(!w.take_reload());
+    assert!(w.pending_modes().is_empty());
+    // Reported once as stored.
+    assert_eq!(
+        w.settle_modes(),
+        vec![(room_vk(1), NotificationMode::MentionsAndReplies, true)]
+    );
+    assert!(w.settle_modes().is_empty());
+    w.forget_done(&|_| false);
+    assert!(w.next_request(false, Instant::now()).is_none());
+}
+
+#[test]
+fn a_mode_conflict_reads_again_and_stores_over_what_the_web_ui_wrote() {
+    let mut w = Work::default();
+    w.set_mode(room_vk(1), NotificationMode::Muted);
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 0)));
+    let first = expect_store(&mut w, ROOMS_META_KEY, 0);
+    assert!(crate::rooms::modes::decode_modes(&first).contains_key(&room_vk(1)));
+    // The web UI stored first, with another room's mode and an order.
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Conflict {
+            current_generation: 3,
+            current_value: None,
+        }
+    )));
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web_meta_bytes()), 3)));
+    let second = expect_store(&mut w, ROOMS_META_KEY, 3);
+    let modes = crate::rooms::modes::decode_modes(&second);
+    assert_eq!(modes[&room_vk(1)], NotificationMode::Muted);
+    assert_eq!(modes[&room_vk(2)], NotificationMode::Muted);
+    assert_eq!(
+        decode_rooms_meta(&second).unwrap().room_order,
+        vec![room_vk(2), room_vk(1)]
+    );
+}
+
+#[test]
+fn a_mode_the_store_already_holds_writes_nothing() {
+    let mut w = Work::default();
+    w.set_mode(room_vk(2), NotificationMode::Muted);
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web_meta_bytes()), 4)));
+    assert!(!w.busy());
+}
+
+#[test]
+fn picking_quickly_writes_the_last_pick_once() {
+    let mut w = Work::default();
+    w.set_mode(room_vk(1), NotificationMode::MentionsAndReplies);
+    w.set_mode(room_vk(1), NotificationMode::Muted);
+    // Another room is its own save.
+    w.set_mode(room_vk(2), NotificationMode::All);
+    assert_eq!(
+        w.pending_modes(),
+        vec![
+            (room_vk(1), NotificationMode::Muted),
+            (room_vk(2), NotificationMode::All)
+        ]
+    );
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 0)));
+    let value = expect_store(&mut w, ROOMS_META_KEY, 0);
+    assert_eq!(
+        crate::rooms::modes::decode_modes(&value)[&room_vk(1)],
+        NotificationMode::Muted
+    );
+}
+
+#[test]
+fn a_mode_that_cannot_be_stored_is_said_and_can_be_tried_again() {
+    let mut w = Work::default();
+    w.set_mode(room_vk(1), NotificationMode::Muted);
+    expect_read(&mut w, ROOMS_META_KEY);
+    // A room list this app does not understand is left alone.
+    let mut text = Vec::new();
+    ciborium::ser::into_writer(&"not a map", &mut text).unwrap();
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(text), 1)));
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(!retry);
+    assert!(why.contains("was not saved"), "{why}");
+    // Not saved: not pending, and reported once as ended without being stored, so the
+    // screen goes back to what the store holds. Dismissing changes nothing more.
+    assert!(w.pending_modes().is_empty());
+    assert_eq!(
+        w.settle_modes(),
+        vec![(room_vk(1), NotificationMode::Muted, false)]
+    );
+    assert!(w.settle_modes().is_empty());
+    let id = w.views()[0].id;
+    assert!(w.dismiss(id));
+    assert!(w.settle_modes().is_empty());
+}

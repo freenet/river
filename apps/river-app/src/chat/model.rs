@@ -277,6 +277,32 @@ impl Room {
         true
     }
 
+    /// Whether `m` mentions you or replies to one of your messages: what the web UI's
+    /// "Mentions & replies only" mode lets through (`text_mentions_or_replies_to_self`).
+    ///
+    /// The reply target is the one the message names, read from this room's messages, so a
+    /// reply to a message that is no longer in the room is not counted, as in the web UI. A
+    /// message you can't read has no mention to find.
+    pub fn is_for_me(&self, m: &Message) -> bool {
+        m.md.contains(&format!("{}:self", mention_scheme()))
+            || m.reply_to.as_ref().is_some_and(|r| r.author == self.me)
+    }
+
+    /// How many of the newest `unread` messages from others mention you or reply to yours:
+    /// the unread count of a room in "Mentions & replies only" mode.
+    ///
+    /// The node says how many messages are unread, not which, so they are taken to be the
+    /// newest ones from others.
+    pub fn unread_for_me(&self, unread: usize) -> usize {
+        self.messages
+            .iter()
+            .rev()
+            .filter(|m| m.author != self.me && m.pending.is_none())
+            .take(unread)
+            .filter(|m| self.is_for_me(m))
+            .count()
+    }
+
     /// How many messages in the room someone else wrote: the most `unread` can honestly be.
     pub fn from_others(&self) -> usize {
         self.messages.iter().filter(|m| m.author != self.me).count()

@@ -150,6 +150,11 @@ pub enum Action {
     DismissWork {
         id: u64,
     },
+    /// Set the room's notification mode, stored in `rooms_meta` beside the web UI's
+    /// ([`super::modes`]).
+    SetNotificationMode {
+        mode: super::modes::NotificationMode,
+    },
 }
 
 impl std::fmt::Debug for Action {
@@ -188,6 +193,10 @@ impl std::fmt::Debug for Action {
                 .finish(),
             Action::RetryWork { id } => f.debug_struct("RetryWork").field("id", id).finish(),
             Action::DismissWork { id } => f.debug_struct("DismissWork").field("id", id).finish(),
+            Action::SetNotificationMode { mode } => f
+                .debug_struct("SetNotificationMode")
+                .field("mode", mode)
+                .finish(),
         }
     }
 }
@@ -212,6 +221,7 @@ impl Action {
                 | Action::Join { .. }
                 | Action::RetryWork { .. }
                 | Action::DismissWork { .. }
+                | Action::SetNotificationMode { .. }
         )
     }
 }
@@ -1126,7 +1136,10 @@ impl Outbox {
             | Action::CreateRoom { .. }
             | Action::Join { .. }
             | Action::RetryWork { .. }
-            | Action::DismissWork { .. } => Err(("Your message", "Nothing to do.".to_owned())),
+            | Action::DismissWork { .. }
+            | Action::SetNotificationMode { .. } => {
+                Err(("Your message", "Nothing to do.".to_owned()))
+            }
         }
     }
 

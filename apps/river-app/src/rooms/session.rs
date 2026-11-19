@@ -88,6 +88,7 @@ use super::generation::{
     CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_SEND, UPDATE_REQUIRED_WORK, Watch,
 };
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
+use super::modes::{NotificationMode, decode_modes};
 use super::outbox::{Action, Command, Outbox};
 use super::room::{LiveRoom, local_minutes};
 use super::socket::{NodeSocket, SocketError, TokenVerdict, token_verdict};
@@ -256,6 +257,11 @@ pub enum RoomsUpdate {
     Rooms {
         rooms: Vec<Room>,
         open: Option<String>,
+        /// Each room's notification mode by room key; a room not named is `All`.
+        modes: HashMap<String, NotificationMode>,
+        /// Rooms whose mode pick ended (stored, or failed) since the last update: the screen
+        /// stops holding its own pick and follows `modes`.
+        settled: Vec<String>,
         status: LinkStatus,
         /// The current time in message time (local minutes since 1970-01-01).
         now: u32,
@@ -280,6 +286,8 @@ impl std::fmt::Debug for RoomsUpdate {
             RoomsUpdate::Rooms {
                 rooms,
                 open,
+                modes,
+                settled,
                 status,
                 now,
                 issues,
@@ -288,6 +296,8 @@ impl std::fmt::Debug for RoomsUpdate {
                 .debug_struct("Rooms")
                 .field("rooms", rooms)
                 .field("open", open)
+                .field("modes", modes)
+                .field("settled", settled)
                 .field("status", status)
                 .field("now", now)
                 .field("issues", issues)
@@ -1166,6 +1176,8 @@ fn failed_contract(e: &ClientError) -> Option<ContractInstanceId> {
 struct Loaded {
     slots: Vec<StoredRoom>,
     meta: StoredRoomsMeta,
+    /// The rooms' notification modes, from the same `rooms_meta` (rooms with none are `All`).
+    modes: HashMap<VerifyingKey, NotificationMode>,
     /// The delegate is not on this node.
     store_missing: bool,
     /// How many `room:` keys the store listed (tombstones included).
@@ -1179,6 +1191,7 @@ impl Loaded {
         Loaded {
             slots: Vec::new(),
             meta: StoredRoomsMeta::default(),
+            modes: HashMap::new(),
             store_missing: true,
             listed: 0,
             unreadable: 0,
@@ -1250,14 +1263,15 @@ impl Loader {
 
     fn finish(&mut self) -> Loaded {
         let mut wanted = self.wanted.take().unwrap_or_default();
-        let meta = match wanted.remove(ROOMS_META_KEY) {
-            Some(Some(bytes)) if !bytes.is_empty() => {
+        let (meta, modes) = match wanted.remove(ROOMS_META_KEY) {
+            Some(Some(bytes)) if !bytes.is_empty() => (
                 decode_rooms_meta(&bytes).unwrap_or_else(|e| {
                     eprintln!("River: {e}");
                     StoredRoomsMeta::default()
-                })
-            }
-            _ => StoredRoomsMeta::default(),
+                }),
+                decode_modes(&bytes),
+            ),
+            _ => (StoredRoomsMeta::default(), HashMap::new()),
         };
         let mut slots = Vec::new();
         let mut unreadable = 0;
@@ -1281,6 +1295,7 @@ impl Loader {
         Loaded {
             slots,
             meta,
+            modes,
             store_missing: false,
             listed: self.rooms.len(),
             unreadable,
@@ -1466,6 +1481,10 @@ struct Rooms {
     /// In the room list's order.
     list: Vec<LiveRoom>,
     open: Option<String>,
+    /// Each room's notification mode as the store holds it: as last read, and as this app
+    /// stored it since. A room with none is `All`. What is shown is this with the picks still
+    /// being stored laid over it.
+    modes: HashMap<VerifyingKey, NotificationMode>,
     /// Whether the rooms have been read at least once this run.
     loaded: bool,
     store_missing: bool,
@@ -1570,6 +1589,7 @@ impl Rooms {
             .current_room_key
             .filter(|k| shown.contains(k))
             .map(|k| bs58::encode(k.to_bytes()).into_string());
+        self.modes = loaded.modes;
         self.store_missing = loaded.store_missing;
         if !self.store_missing {
             // Found: the next failure starts the retry wait from the beginning.
@@ -1598,7 +1618,7 @@ impl Rooms {
         let mut changed = false;
         for command in std::mem::take(&mut self.outbox.waiting) {
             if command.action.is_list_level() {
-                changed |= self.list_command(command.action);
+                changed |= self.list_command(&command.room, command.action);
                 continue;
             }
             match self.list.iter().find(|r| r.key() == command.room) {
@@ -1628,8 +1648,24 @@ impl Rooms {
 
     /// Create, join, or try again or drop one that failed ([`super::work`]). True when it
     /// changed what shows.
-    fn list_command(&mut self, action: Action) -> bool {
+    fn list_command(&mut self, room: &str, action: Action) -> bool {
         match action {
+            Action::SetNotificationMode { mode } => {
+                let owner = bs58::decode(room)
+                    .into_vec()
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .and_then(|b| VerifyingKey::from_bytes(&b).ok())
+                    .filter(|vk| self.list.iter().any(|r| &r.stored.owner_vk == vk));
+                let Some(owner) = owner else {
+                    eprintln!(
+                        "River: a notification setting for a room no longer shown was dropped"
+                    );
+                    return false;
+                };
+                self.outbox.work.set_mode(owner, mode);
+                true
+            }
             Action::CreateRoom {
                 name,
                 nickname,
@@ -1884,9 +1920,25 @@ impl Rooms {
     }
 
     fn report(&mut self, status: LinkStatus, report: &dyn Fn(RoomsUpdate)) {
+        // A pick that was stored is the store's now; one that failed never was.
+        let mut settled = Vec::new();
+        for (vk, mode, stored) in self.outbox.work.settle_modes() {
+            if stored {
+                self.modes.insert(vk, mode);
+            }
+            settled.push(bs58::encode(vk.to_bytes()).into_string());
+        }
+        // What is shown: the store's modes, with the picks still being stored over them.
+        let mut shown = self.modes.clone();
+        shown.extend(self.outbox.work.pending_modes());
         report(RoomsUpdate::Rooms {
             rooms: self.views(),
             open: self.open.clone(),
+            modes: shown
+                .iter()
+                .map(|(vk, m)| (bs58::encode(vk.to_bytes()).into_string(), *m))
+                .collect(),
+            settled,
             status,
             now: local_minutes(SystemTime::now()),
             issues: self.issues(),

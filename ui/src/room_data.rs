@@ -10430,6 +10430,43 @@ mod stored_rooms_drift {
         assert_eq!(read.room_order, vec![b, a]);
     }
 
+    /// The native app reads and edits `notification_modes` in the stored meta
+    /// (`apps/river-app/src/rooms/modes.rs`, which carries its own copy of
+    /// [`NotificationMode`] and pins the same bytes). Both sides pin the field's
+    /// name, the room key as the map key, and each mode as a text string of its
+    /// variant name, so renaming either here fails this test instead of silently
+    /// sharing nothing.
+    #[test]
+    fn notification_modes_are_stored_as_the_native_app_reads_them() {
+        use ciborium::Value;
+        let a = SigningKey::from_bytes(&[21u8; 32]).verifying_key();
+        let meta = RoomsMeta {
+            notification_modes: HashMap::from([(a, NotificationMode::MentionsAndReplies)]),
+            ..RoomsMeta::default()
+        };
+        let value: Value = ciborium::de::from_reader(cbor(&meta).as_slice()).unwrap();
+        let Value::Map(entries) = value else {
+            panic!("a map");
+        };
+        let (_, modes) = entries
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("notification_modes"))
+            .expect("the field keeps its name");
+        let Value::Map(modes) = modes else {
+            panic!("the field is a map");
+        };
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].0.deserialized::<VerifyingKey>().unwrap(), a);
+        assert_eq!(modes[0].1.as_text(), Some("MentionsAndReplies"));
+        for (mode, text) in [
+            (NotificationMode::All, "All"),
+            (NotificationMode::MentionsAndReplies, "MentionsAndReplies"),
+            (NotificationMode::Muted, "Muted"),
+        ] {
+            assert_eq!(Value::serialized(&mode).unwrap().as_text(), Some(text));
+        }
+    }
+
     /// The reader's storage keys are the writer's.
     #[test]
     fn storage_keys_match_the_writer() {

@@ -57,6 +57,17 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     if let Some(uid) = &chat.member_modal {
         super::member_modal::member_modal(chat, room, uid, &k, &mut layer);
     }
+    if let Some(open) = &chat.notify_dialog
+        && let Some(room) = chat.rooms().iter().find(|r| &r.key == open)
+    {
+        super::notify_dialog::notify_dialog(
+            room,
+            chat.mode_of(&room.key),
+            chat.notifications,
+            &k,
+            &mut layer,
+        );
+    }
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);
     if chat.members_shown(narrow) {
@@ -318,7 +329,7 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
     let mut list = col().key("room-list").gap(2.0).px(10.0).pb(10.0);
     for room in chat.rooms() {
         let selected = chat.room().is_some_and(|r| r.key == room.key);
-        list = list.child(room_row(room, selected, width, p));
+        list = list.child(room_row(room, chat.unread_of(room), selected, width, p));
     }
     let enter = outlined("enter-invite", "Enter invite code", &icons::INVITE, 34.0, p);
     let mut footer = col()
@@ -546,9 +557,9 @@ fn preview_chars(row_width: f32, badge: bool) -> usize {
     (text_w / 6.4).max(8.0) as usize
 }
 
-fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
+fn room_row(room: &Room, unread_count: usize, selected: bool, width: f32, p: &Palette) -> El {
     let key = room.key.clone();
-    let unread = room.unread > 0 && !selected;
+    let unread = unread_count > 0 && !selected;
     let strong = unread || selected;
     let preview = room.last_message().map_or_else(
         || "No messages yet".into(),
@@ -604,7 +615,7 @@ fn room_row(room: &Room, selected: bool, width: f32, p: &Palette) -> El {
                 .radius(9.0)
                 .center()
                 .fill(p.accent_soft)
-                .child(label(room.unread.to_string(), st::BADGE, p.accent)),
+                .child(label(unread_count.to_string(), st::BADGE, p.accent)),
         );
     }
     if selected {

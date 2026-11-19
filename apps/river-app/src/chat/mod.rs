@@ -18,6 +18,7 @@ mod links;
 mod markdown;
 mod member_modal;
 pub mod model;
+mod notify_dialog;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
 #[path = "../../../../ui/src/util/share_link.rs"]
@@ -33,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use rune::TextEdit;
 
+use crate::rooms::modes::NotificationMode;
 use crate::rooms::work::{WorkState, WorkView};
 use crate::rooms::{Action, Command};
 
@@ -237,9 +239,70 @@ pub struct Chat {
     /// Whether new messages produce notifications: the switch in the room list's footer. The
     /// app keeps it across runs.
     pub notifications: bool,
+    /// Each room's notification mode by room key, shared with the web UI; a room not named is
+    /// [`NotificationMode::All`]. The switch above turns every room off whatever these say.
+    modes: HashMap<String, NotificationMode>,
+    /// Modes picked here that the node's updates have not echoed yet, so an update sent before
+    /// the pick was taken does not put the old mode back on screen.
+    picked: HashMap<String, NotificationMode>,
+    /// The room whose notification dialog is open.
+    notify_dialog: Option<String>,
 }
 
 impl Chat {
+    /// The notification mode of the room keyed `room`.
+    pub fn mode_of(&self, room: &str) -> NotificationMode {
+        self.modes.get(room).copied().unwrap_or_default()
+    }
+
+    /// Take the modes the node says the rooms have. A pick made here stays until the node
+    /// echoes it, or says it `settled` (stored, or failed); after that the node's word is
+    /// shown, whatever it is.
+    pub fn apply_modes(&mut self, modes: HashMap<String, NotificationMode>, settled: &[String]) {
+        self.picked.retain(|room, mode| {
+            !settled.contains(room) && modes.get(room).copied().unwrap_or_default() != *mode
+        });
+        self.modes = modes;
+        for (room, mode) in &self.picked {
+            self.modes.insert(room.clone(), *mode);
+        }
+    }
+
+    /// Set the notification mode of the room keyed `room`, and close the dialog. For a room
+    /// from the node it is sent to be stored beside the web UI's, so both apps share it.
+    pub fn set_mode(&mut self, room: &str, mode: NotificationMode) {
+        self.notify_dialog = None;
+        if self.mode_of(room) == mode && !self.picked.contains_key(room) {
+            return;
+        }
+        self.modes.insert(room.to_owned(), mode);
+        if matches!(self.source, Source::Node(_)) {
+            self.picked.insert(room.to_owned(), mode);
+            self.emit(room.to_owned(), Action::SetNotificationMode { mode });
+        }
+    }
+
+    /// Open the notification dialog of the open room.
+    pub fn open_notify_dialog(&mut self) {
+        if let Some(room) = self.room() {
+            self.notify_dialog = Some(room.key.clone());
+        }
+    }
+
+    pub fn close_notify_dialog(&mut self) {
+        self.notify_dialog = None;
+    }
+
+    /// How many messages of `room` count as unread, by its mode, as the web UI's title does:
+    /// all of them, only those that mention you or reply to yours, or none when muted.
+    pub fn unread_of(&self, room: &Room) -> usize {
+        match self.mode_of(&room.key) {
+            NotificationMode::All => room.unread,
+            NotificationMode::MentionsAndReplies => room.unread_for_me(room.unread),
+            NotificationMode::Muted => 0,
+        }
+    }
+
     /// Open the link menu for `url` at `press`: only for a web link, and with the address
     /// trimmed so Copy and Open act on the same text.
     pub fn open_link_menu(&mut self, url: &str, press: rune::PointerPress) {
@@ -284,6 +347,9 @@ impl Chat {
             catching_up: true,
             full_list: false,
             notifications: true,
+            modes: HashMap::new(),
+            picked: HashMap::new(),
+            notify_dialog: None,
         };
         chat.set_rooms(rooms);
         chat
@@ -346,6 +412,11 @@ impl Chat {
         {
             self.member_modal = None;
         }
+        if let Some(room) = &self.notify_dialog
+            && !self.rooms.iter().any(|r| &r.key == room)
+        {
+            self.notify_dialog = None;
+        }
     }
 
     /// Show the user's rooms as read from the node, replacing what is shown. `open` is the room
@@ -373,7 +444,7 @@ impl Chat {
         // unread while the window is away, they just are not shown as notifications.
         let arrived = if status == LinkStatus::Live && self.node_rooms_shown {
             let quiet = self.catching_up;
-            let mut arrived = crate::notify::arrivals(&self.rooms, &rooms);
+            let mut arrived = crate::notify::arrivals(&self.rooms, &rooms, &|k| self.mode_of(k));
             arrived.iter_mut().for_each(|a| a.quiet = quiet);
             arrived
         } else {
@@ -436,7 +507,7 @@ impl Chat {
 
     /// Unread messages across all rooms.
     pub fn unread_total(&self) -> usize {
-        self.rooms.iter().map(|r| r.unread).sum()
+        self.rooms.iter().map(|r| self.unread_of(r)).sum()
     }
 
     /// Bring the room keyed `key` to the front, as a click on its notification does: open it,
@@ -486,6 +557,7 @@ impl Chat {
         self.description_open = false;
         // A member's dialog belongs to the room it was opened in.
         self.member_modal = None;
+        self.notify_dialog = None;
         if self.selected.is_empty() {
             // Nothing was open, so what the composer holds belongs to no room yet: keep it,
             // unless it is empty and this room has a draft.

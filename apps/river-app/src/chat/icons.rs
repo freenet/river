@@ -79,3 +79,10 @@ pub static COPY: Icon = Icon {
     view: 16.0,
     body: r#"<rect x="5.5" y="5.5" width="8" height="8" rx="1.8" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 3.5v-.2a1.8 1.8 0 0 0-1.8-1.8H3.8A1.8 1.8 0 0 0 2 3.3v4.9a1.8 1.8 0 0 0 1.8 1.8h.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#,
 };
+
+/// The bell struck through: a muted room.
+pub static BELL_OFF: Icon = Icon {
+    name: "river-bell-off",
+    view: 16.0,
+    body: r#"<path d="M4 11V7a4 4 0 0 1 6.8-2.8M12 8v3l1.2 1.5H2.8L4 11" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/><path d="M6.5 14a1.7 1.7 0 0 0 3 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M2.5 2.5l11 11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#,
+};

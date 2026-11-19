@@ -341,6 +341,7 @@ fn loaded(slots: Vec<StoredRoom>) -> Loaded {
         listed: slots.len(),
         slots,
         meta: StoredRoomsMeta::default(),
+        modes: Default::default(),
         store_missing: false,
         unreadable: 0,
     }
@@ -2770,6 +2771,112 @@ fn a_room_created_here_is_stored_published_and_opened() {
     session.wait_until("the finished task is dropped", || {
         session.last_work().is_empty()
     });
+}
+
+/// A `rooms_meta` as the web UI wrote it with a muted room and a room order, plus a field this
+/// app does not know.
+fn web_ui_meta_with_modes(muted: VerifyingKey, order: &[VerifyingKey]) -> Vec<u8> {
+    use ciborium::Value;
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(
+        &Value::Map(vec![
+            (
+                Value::Text("notification_modes".into()),
+                Value::Map(vec![(
+                    Value::serialized(&muted).unwrap(),
+                    Value::serialized(&NotificationMode::Muted).unwrap(),
+                )]),
+            ),
+            (
+                Value::Text("room_order".into()),
+                Value::serialized(&order.to_vec()).unwrap(),
+            ),
+            (Value::Text("web_ui_marker".into()), Value::from(11)),
+        ]),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+impl Running {
+    fn last_modes(&self) -> HashMap<String, NotificationMode> {
+        self.updates()
+            .into_iter()
+            .rev()
+            .find_map(|u| match u {
+                RoomsUpdate::Rooms { modes, .. } => Some(modes),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The two apps share the setting: the mode the web UI stored is shown, a pick here is stored in
+/// the same `rooms_meta` without losing the web UI's order or unknown fields, and a new run
+/// reads the pick back.
+#[test]
+fn a_room_mode_is_read_from_the_web_ui_stored_here_and_read_back_on_the_next_run() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    node.with(|w| {
+        w.slots.insert(
+            ROOMS_META_KEY.to_vec(),
+            web_ui_meta_with_modes(a.vk(), &[b.vk(), a.vk()]),
+        );
+    });
+    let (session, dir) = following(&node, &[&a, &b], "modes-roundtrip", quick());
+    let key = |r: &TestRoom| bs58::encode(r.vk().to_bytes()).into_string();
+    // Muted in the browser: muted here.
+    assert_eq!(
+        session.last_modes().get(&key(&a)),
+        Some(&NotificationMode::Muted)
+    );
+    assert_eq!(session.last_modes().get(&key(&b)), None);
+
+    session.act(
+        &b,
+        Action::SetNotificationMode {
+            mode: NotificationMode::MentionsAndReplies,
+        },
+    );
+    session.wait_until("the pick is stored", || {
+        node.with(|w| {
+            crate::rooms::modes::decode_modes(w.slots.get(ROOMS_META_KEY).unwrap())
+                .contains_key(&b.vk())
+        })
+    });
+    node.with(|w| {
+        let meta = w.slots.get(ROOMS_META_KEY).unwrap();
+        let modes = crate::rooms::modes::decode_modes(meta);
+        assert_eq!(modes[&b.vk()], NotificationMode::MentionsAndReplies);
+        // The web UI's own entry, order and unknown field are as it left them.
+        assert_eq!(modes[&a.vk()], NotificationMode::Muted);
+        assert_eq!(
+            decode_rooms_meta(meta).unwrap().room_order,
+            vec![b.vk(), a.vk()]
+        );
+        assert_eq!(meta_marker(meta), Some(11));
+        assert_eq!(w.overlaps, 0);
+    });
+    assert_eq!(
+        session.last_modes().get(&key(&b)),
+        Some(&NotificationMode::MentionsAndReplies)
+    );
+    drop(session);
+
+    // A new run (as after restarting the app) reads the pick back from the store.
+    let again = Running::start(&node, &dir, quick());
+    again.wait_rooms("the rooms are live", |r, _, s| {
+        r.len() == 2 && s == LinkStatus::Live
+    });
+    let modes = again.last_modes();
+    assert_eq!(
+        modes.get(&key(&b)),
+        Some(&NotificationMode::MentionsAndReplies)
+    );
+    assert_eq!(modes.get(&key(&a)), Some(&NotificationMode::Muted));
 }
 
 /// The web UI stores the meta between this app's read and its store: the store is refused, and
