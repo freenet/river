@@ -68,6 +68,19 @@ pub struct Reaction {
     pub by: Vec<MemberId>,
 }
 
+/// What a reply to a message carries besides its text: the target's id, its author's name and a
+/// preview of what it said. Built in one place (`LiveRoom::reply_wrap`) for both sending and
+/// the composer's size counter, so the counter measures what is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplyWrap {
+    pub id: river_core::room_state::message::MessageId,
+    pub author_name: String,
+    pub preview: String,
+}
+
+/// How many characters of the replied-to message a reply quotes.
+pub const REPLY_WRAP_CHARS: usize = 100;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplyTo {
     pub message: MessageId,
@@ -210,6 +223,10 @@ pub struct Room {
     /// removed you for inactivity, and only a message brings you back.
     pub nickname_block: Option<String>,
     pub details: Details,
+    /// For rooms read from the node: each message's reply wrapper, by key, exactly as sending
+    /// builds it. A key missing from it is a message the node no longer shows, which a reply
+    /// fails on. `None` for example rooms, which send nothing.
+    pub wraps: Option<std::collections::HashMap<String, ReplyWrap>>,
 }
 
 impl Room {
@@ -407,6 +424,20 @@ pub fn groups(messages: &[Message]) -> Vec<Group<'_>> {
 pub fn clock(time: u32) -> String {
     let m = time % MINUTES_PER_DAY;
     format!("{:02}:{:02}", m / 60, m % 60)
+}
+
+/// A message time in full, for its tooltip: "Thu, Nov 19, 2026 14:05", the web UI's
+/// `format_utc_as_full_datetime` without seconds (message time has minute resolution).
+/// `day_zero` is the date of day 0 in days since 1970-01-01.
+pub fn full_time(day_zero: i64, time: u32) -> String {
+    let day = day_zero + i64::from(time / MINUTES_PER_DAY);
+    let (y, m, d) = civil_from_days(day);
+    format!(
+        "{}, {} {d:02}, {y} {}",
+        &WEEKDAYS[day.rem_euclid(7) as usize][..3],
+        &MONTHS[m as usize - 1][..3],
+        clock(time)
+    )
 }
 
 /// Days since 1970-01-01 for a calendar date (Howard Hinnant's `days_from_civil`).
@@ -666,6 +697,7 @@ mod tests {
             nickname_limit: 50,
             own_nickname: None,
             nickname_block: None,
+            wraps: None,
             details: Details::default(),
         };
         let id = room.send("hi", 100);

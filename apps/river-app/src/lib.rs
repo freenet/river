@@ -45,6 +45,9 @@ pub struct RiverApp {
     /// Whether the window has focus. False until the first focus event, so a window that never
     /// reports one errs toward notifying.
     focused: bool,
+    /// Whether a focus event has arrived. Until one has, the title treats the window as
+    /// focused, so a focused window never shows an unread prefix it should not.
+    focus_known: bool,
     /// Messages that arrived in the open room while the window was not focused. The room counts
     /// them as read the moment they land, so the title adds them back until the person returns.
     missed: (String, usize),
@@ -102,6 +105,7 @@ impl RiverApp {
             logo: None,
             notifier: Box::new(notify::Silent),
             focused: false,
+            focus_known: false,
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
@@ -133,6 +137,7 @@ impl RiverApp {
             logo: None,
             notifier: Box::new(notify::Silent),
             focused: false,
+            focus_known: false,
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
@@ -149,6 +154,7 @@ impl RiverApp {
     /// The window gained or lost focus.
     pub fn focus_changed(&mut self, focused: bool) {
         self.focused = focused;
+        self.focus_known = true;
         if focused {
             self.missed = Default::default();
             self.drop_read_held();
@@ -232,6 +238,16 @@ impl RiverApp {
         self.show(admitted, now);
     }
 
+    /// The window title: the open room, and the unread count while the window is in the
+    /// background (an unknown focus counts as focused).
+    pub(crate) fn window_title(&self, unread: usize) -> String {
+        notify::window_title(
+            unread,
+            self.chat.room().map(|r| r.name.as_str()),
+            self.focused || !self.focus_known,
+        )
+    }
+
     /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
     /// the start of every frame, so it sees every change however it came about.
     fn sync_unread(&mut self, tx: &mut Tx) {
@@ -244,7 +260,7 @@ impl RiverApp {
             tx.wake_after(wait);
         }
         let unread = self.unread();
-        tx.set_title(notify::window_title(unread));
+        tx.set_title(self.window_title(unread));
         if self.reported_unread != Some(unread) {
             self.reported_unread = Some(unread);
             self.notifier.set_unread(unread);
@@ -437,6 +453,28 @@ pub const SCENES: &[Scene] = &[
             .composer
             .replace_text("Sounds good, I'll bring the slides on Thursday");
         s.chat.composer.focused = true;
+    }),
+    // The byte counter, from 80% of the room's limit (example rooms take 1000 bytes), and the
+    // refusal over it.
+    ("chat-near-limit", |s| {
+        connect(s);
+        s.chat
+            .composer
+            .replace_text("Sounds good, I'll bring the slides. ".repeat(23));
+        s.chat.composer.focused = true;
+    }),
+    ("chat-over-limit", |s| {
+        connect(s);
+        s.chat
+            .composer
+            .replace_text("Sounds good, I'll bring the slides. ".repeat(29));
+        s.chat.composer.focused = true;
+    }),
+    // Scrolled away from the newest message, so Latest shows. (The scene states it: the
+    // history reports where it stands only once it is drawn.)
+    ("chat-latest", |s| {
+        connect(s);
+        s.chat.at_bottom = false;
     }),
     ("chat-empty-room", |s| {
         connect(s);
@@ -798,6 +836,9 @@ pub fn spec() -> AppSpec<RiverApp> {
             s.sync_unread(tx);
             false
         }),
+        // Keys no focused control took, or any key while nothing has focus: Escape abandons a
+        // reply or an edit even when the composer is not focused.
+        on_key: Some(|s, ev, _| ev.key == rune::Key::Escape && s.chat.escape()),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
 }

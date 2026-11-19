@@ -20,6 +20,7 @@ fn render(state: RiverApp, size: (f32, f32)) -> Runtime<RiverApp> {
         scale: 1.0,
     };
     let mut rt = Runtime::new(state, view, size, env);
+    rt.on_key = crate::spec().on_key;
     rt.frame(0.0);
     rt.frame(1.0 / 60.0);
     rt
@@ -3504,4 +3505,399 @@ fn duplicates_are_judged_over_every_match_not_only_the_first_eight() {
         p.candidates[7].duplicate,
         "Aaa7 shares its name with a member past the eighth"
     );
+}
+
+fn help_of(rt: &Runtime<RiverApp>, key: &str) -> Option<String> {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no {key}"))
+        .help
+}
+
+#[test]
+fn up_in_an_empty_composer_edits_your_last_message() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let mine = message_of(&rt, true);
+    let text = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .message_by_key(&mine)
+        .unwrap()
+        .text
+        .clone();
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Up);
+    assert_eq!(rt.state.chat.composer.text, text);
+    assert!(rt.find("editing").is_some());
+}
+
+#[test]
+fn up_does_nothing_with_text_typed_or_while_replying() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("hi".into()));
+    key(&mut rt, Key::Up);
+    assert!(rt.find("editing").is_none());
+    assert_eq!(rt.state.chat.composer.text, "hi");
+    rt.state.chat.composer.replace_text("");
+    let theirs = message_of(&rt, false);
+    rt.state.chat.start_reply(&theirs);
+    rt.frame(0.5);
+    key(&mut rt, Key::Up);
+    assert!(rt.find("editing").is_none());
+    assert!(rt.find("replying").is_some());
+}
+
+#[test]
+fn up_with_no_message_of_yours_does_nothing() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, &format!("room-{EMPTY_ROOM}"));
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Up);
+    assert!(rt.find("editing").is_none());
+}
+
+#[test]
+fn escape_cancels_an_edit_and_a_reply() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let mine = message_of(&rt, true);
+    rt.state.chat.composer.replace_text("my draft");
+    hover_press(&mut rt, &format!("edit-{mine}"));
+    assert!(rt.find("editing").is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("editing").is_none());
+    assert_eq!(rt.state.chat.composer.text, "my draft");
+
+    let theirs = message_of(&rt, false);
+    hover_press(&mut rt, &format!("reply-{theirs}"));
+    assert!(rt.find("replying").is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("replying").is_none());
+}
+
+fn type_bytes(rt: &mut Runtime<RiverApp>, n: usize) {
+    let text = "a".repeat(n);
+    rt.update(|s, _| s.chat.composer.replace_text(&text));
+    rt.frame(0.5);
+}
+
+/// Type 'a's until the draft measures exactly `target` encoded bytes. Fails if the size steps
+/// over `target` (it would then not be the size the test claims to check).
+fn fit(rt: &mut Runtime<RiverApp>, target: usize) {
+    let size_of = |rt: &mut Runtime<RiverApp>, n: usize| {
+        rt.state.chat.composer.replace_text("a".repeat(n));
+        rt.state.chat.draft_size().unwrap().0
+    };
+    let mut n = 0;
+    while size_of(rt, n) < target {
+        n += 1;
+    }
+    assert_eq!(size_of(rt, n), target, "the size steps over {target}");
+    type_bytes(rt, n);
+    assert_eq!(rt.state.chat.draft_size().unwrap().0, target);
+}
+
+#[test]
+fn the_byte_counter_shows_from_eighty_percent_and_blocks_sending_over_the_limit() {
+    let mut rt = node_rooms(|_| {});
+    assert_eq!(rt.state.chat.draft_size().unwrap().1, 1000);
+    fit(&mut rt, 100);
+    assert!(rt.find("byte-counter").is_none(), "far from the limit");
+    fit(&mut rt, 800);
+    assert!(
+        rt.find("byte-counter").is_none(),
+        "exactly 80% is not past it"
+    );
+    fit(&mut rt, 801);
+    assert!(
+        texts(&rt).contains(&"801/1000".to_owned()),
+        "{:?}",
+        texts(&rt)
+    );
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Enter);
+    assert_eq!(sent(&mut rt).len(), 1, "near the limit still sends");
+
+    // Over the limit: said in full, and refused with the draft kept.
+    rt.update(|s, _| s.chat.composer.replace_text("a".repeat(1000)));
+    rt.frame(0.5);
+    let size = rt.state.chat.draft_size().unwrap().0;
+    assert!(size > 1000, "{size}");
+    assert!(shows(
+        &rt,
+        &format!("Message too long \u{2014} {size}/1000 bytes")
+    ));
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Enter);
+    assert!(sent(&mut rt).is_empty(), "over the limit is refused");
+    assert_eq!(rt.state.chat.composer.text.len(), 1000, "the draft is kept");
+    press(&mut rt, "send");
+    assert!(sent(&mut rt).is_empty(), "the Send button too");
+
+    fit(&mut rt, 1000);
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Enter);
+    assert_eq!(sent(&mut rt).len(), 1, "exactly at the limit sends");
+}
+
+#[test]
+fn the_byte_counter_counts_utf8_bytes_and_replies_carry_overhead() {
+    let mut rt = node_rooms(|_| {});
+    let plain = |rt: &Runtime<RiverApp>| rt.state.chat.draft_size().unwrap().0;
+    rt.state.chat.composer.replace_text("a");
+    let one = plain(&rt);
+    rt.state.chat.composer.replace_text("\u{20ac}");
+    assert_eq!(plain(&rt), one + 2, "a euro sign is three bytes");
+    let theirs = message_of(&rt, false);
+    rt.state.chat.start_reply(&theirs);
+    assert!(
+        plain(&rt) > one + 2,
+        "a reply embeds who and what it answers"
+    );
+}
+
+#[test]
+fn a_message_time_shows_the_full_date_on_hover() {
+    let rt = render(connected(), WINDOW_SIZE);
+    let room = rt.state.chat.room().unwrap();
+    let first = &room.messages[0];
+    let help = help_of(&rt, &format!("time-{}", first.key)).unwrap();
+    assert_eq!(
+        help,
+        super::model::full_time(rt.state.chat.day_zero, first.time)
+    );
+    assert!(
+        help.contains("2026") && help.contains(&super::model::clock(first.time)),
+        "{help}"
+    );
+    // A continuation row's gutter time says it too.
+    let cont = room
+        .messages
+        .windows(2)
+        .find(|w| w[0].author == w[1].author && w[0].time / 1440 == w[1].time / 1440)
+        .map(|w| w[1].key.clone())
+        .unwrap();
+    assert!(help_of(&rt, &format!("time-{cont}")).is_some());
+}
+
+#[test]
+fn the_full_time_is_the_web_uis_format() {
+    // 2026-11-19 is a Thursday.
+    let day = super::model::days_from_civil(2026, 11, 19);
+    assert_eq!(
+        super::model::full_time(day, 14 * 60 + 5),
+        "Thu, Nov 19, 2026 14:05"
+    );
+    assert_eq!(
+        super::model::full_time(day, 1440 + 9),
+        "Fri, Nov 20, 2026 00:09"
+    );
+    assert_eq!(super::model::full_time(day, 0), "Thu, Nov 19, 2026 00:00");
+}
+
+#[test]
+fn hovering_a_reaction_names_who_reacted() {
+    let rt = node_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let me = room.me;
+        let other = room.members.iter().find(|m| m.id != me).unwrap().id;
+        let last = room.messages.len() - 1;
+        room.messages[last].reactions = vec![
+            super::Reaction {
+                emoji: "🎉".into(),
+                by: vec![other, me],
+            },
+            super::Reaction {
+                emoji: "👍".into(),
+                by: vec![other],
+            },
+        ];
+    });
+    let room = rt.state.chat.room().unwrap();
+    let me = room.nickname(room.me).to_owned();
+    let other = room
+        .members
+        .iter()
+        .find(|m| m.id != room.me)
+        .unwrap()
+        .nickname
+        .clone();
+    let target = room.last_message().unwrap().key.clone();
+    assert_eq!(
+        help_of(&rt, &format!("reaction-{target}-🎉")).unwrap(),
+        format!("{other}, {me} (click to remove)")
+    );
+    assert_eq!(
+        help_of(&rt, &format!("reaction-{target}-👍")).unwrap(),
+        other
+    );
+}
+
+#[test]
+fn latest_shows_when_scrolled_away_and_jumps_to_the_end() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    assert!(rt.find("latest").is_none(), "at the newest message");
+    let (x, y) = rt.find("history-frame").unwrap();
+    rt.wheel(x, y, 2000.0);
+    for i in 0..10 {
+        rt.frame(1.0 + f64::from(i) * 0.05);
+    }
+    assert!(rt.find("latest").is_some(), "scrolled up");
+    press(&mut rt, "latest");
+    for i in 0..60 {
+        rt.frame(3.0 + f64::from(i) * 0.05);
+    }
+    assert!(rt.find("latest").is_none(), "back at the end");
+}
+
+#[test]
+fn the_apps_title_has_the_room_and_a_count_only_once_known_to_be_unfocused() {
+    let mut s = connected();
+    s.chat.select(EMPTY_ROOM);
+    let name = s.chat.room().unwrap().name.clone();
+    // No focus event yet: treated as focused, so no prefix on a window that has focus.
+    assert_eq!(s.window_title(4), format!("River - {name}"));
+    s.focus_changed(false);
+    assert_eq!(s.window_title(4), format!("(4) River - {name}"));
+    assert_eq!(s.window_title(0), format!("River - {name}"));
+    s.focus_changed(true);
+    assert_eq!(s.window_title(4), format!("River - {name}"));
+}
+
+/// Mark the open room's newest message of mine as on its way, failed, or unreadable.
+fn spoil_newest_of_mine(rt: &mut Runtime<RiverApp>, how: &str) {
+    rt.update(|s, _| {
+        let how = how.to_owned();
+        s.chat.edit_rooms(move |rooms| {
+            let room = &mut rooms[0];
+            let me = room.me;
+            let m = room
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.author == me)
+                .unwrap();
+            match how.as_str() {
+                "pending" => {
+                    m.pending = Some(super::model::Pending {
+                        entry: 1,
+                        failed: None,
+                        retry: false,
+                    })
+                }
+                "failed" => {
+                    m.pending = Some(super::model::Pending {
+                        entry: 1,
+                        failed: Some("no".into()),
+                        retry: true,
+                    })
+                }
+                _ => m.source.clear(),
+            }
+        })
+    });
+    rt.frame(0.5);
+}
+
+#[test]
+fn up_refuses_when_your_newest_message_cannot_be_edited_and_does_not_pick_an_older_one() {
+    for how in ["pending", "failed", "unreadable"] {
+        let mut rt = node_rooms(|_| {});
+        // An older message of mine that could be edited.
+        let room = rt.state.chat.room().unwrap();
+        let mine = room.messages.iter().filter(|m| m.author == room.me).count();
+        assert!(mine >= 2, "the example room has older messages of mine");
+        spoil_newest_of_mine(&mut rt, how);
+        press(&mut rt, "composer-field");
+        key(&mut rt, Key::Up);
+        assert!(rt.find("editing").is_none(), "{how}");
+        assert_eq!(rt.state.chat.composer.text, "", "{how}");
+        assert!(!rt.state.chat.edit_last(), "{how}");
+    }
+}
+
+#[test]
+fn the_composers_keys_run_in_order_escape_closes_the_picker_before_the_reply() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let theirs = message_of(&rt, false);
+    hover_press(&mut rt, &format!("reply-{theirs}"));
+    rt.update(|s, _| s.chat.emoji_open = true);
+    rt.frame(0.5);
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Escape);
+    assert!(!rt.state.chat.emoji_open, "the picker closes first");
+    assert!(rt.find("replying").is_some(), "and the reply stays");
+    key(&mut rt, Key::Escape);
+    assert!(
+        rt.find("replying").is_none(),
+        "the next Escape abandons the reply"
+    );
+    // Up comes after Escape and only acts on an empty composer.
+    key(&mut rt, Key::Up);
+    assert!(rt.find("editing").is_some());
+}
+
+#[test]
+fn escape_cancels_a_reply_when_the_composer_does_not_have_focus() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let theirs = message_of(&rt, false);
+    hover_press(&mut rt, &format!("reply-{theirs}"));
+    assert!(rt.find("replying").is_some());
+    assert!(
+        rt.state.chat.composer.focused,
+        "a reply focuses the composer"
+    );
+    // Focus moves off the composer, onto a control elsewhere in the conversation.
+    press(&mut rt, "emoji");
+    press(&mut rt, "emoji");
+    rt.update(|s, _| s.chat.composer.focused = false);
+    rt.frame(0.5);
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("replying").is_none());
+}
+
+#[test]
+fn a_blocked_send_says_why_and_a_room_without_a_limit_blocks_nothing() {
+    let mut rt = node_rooms(|_| {});
+    rt.update(|s, _| s.chat.composer.replace_text("a".repeat(1000)));
+    rt.frame(0.5);
+    assert_eq!(
+        help_of(&rt, "send").as_deref(),
+        Some("Message exceeds the 1000 byte limit")
+    );
+    let mut rt = node_rooms(|rooms| rooms[0].details.limits.max_message_size = 0);
+    rt.update(|s, _| s.chat.composer.replace_text("a".repeat(5000)));
+    rt.frame(0.5);
+    assert!(rt.state.chat.draft_size().is_none() && !rt.state.chat.over_limit());
+    assert!(rt.find("byte-counter").is_none());
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Enter);
+    assert_eq!(sent(&mut rt).len(), 1, "no known limit, nothing to refuse");
+}
+
+#[test]
+fn the_mention_popup_gets_escape_and_up_before_the_reply_edit_and_picker_handlers() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let theirs = message_of(&rt, false);
+    hover_press(&mut rt, &format!("reply-{theirs}"));
+    type_text(&mut rt, "@");
+    assert!(rt.state.chat.mention_popup().is_some());
+    rt.update(|s, _| s.chat.emoji_open = true);
+    rt.frame(0.5);
+    key(&mut rt, Key::Escape);
+    assert!(
+        rt.state.chat.mention_popup().is_none(),
+        "the popup took Escape"
+    );
+    assert!(rt.find("replying").is_some(), "the reply is still there");
+    assert!(rt.state.chat.emoji_open, "and so is the picker");
+    // Up moves within the popup; it does not start an edit (the composer is not empty).
+    rt.state.chat.composer.replace_text("");
+    key(&mut rt, Key::Escape);
+    assert!(!rt.state.chat.emoji_open, "then the picker");
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("replying").is_none(), "then the reply");
 }

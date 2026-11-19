@@ -34,6 +34,11 @@ const COMPOSER_MAX_LINES: usize = 8;
 pub(super) fn conversation(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
     col()
         .key("conversation")
+        // Escape abandons a reply or an edit wherever focus is in the conversation, not only
+        // in the composer (a reply started with the mouse leaves focus on the message). Inner
+        // handlers (the composer, the emoji panel) run first. Dialogs and menus live in the
+        // overlay layer, outside this subtree, and take their own Escape.
+        .on_key(|s: &mut RiverApp, ev, _| ev.key == rune::Key::Escape && s.chat.cancel_compose())
         .grow(1.0)
         .min_w(0.0)
         .h_full()
@@ -214,14 +219,47 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     }
     // Keyed by room, so each room's viewport is its own: a room opens at its newest message
     // instead of at the offset the previous room was scrolled to.
-    col()
-        .key(format!("history-scroll-{}", room.key))
+    let scroll_key = format!("history-scroll-{}", room.key);
+    let mut frame = col()
+        .key("history-frame")
         .grow(1.0)
         .min_h(0.0)
         .w_full()
-        .child(items.selection_group(true))
-        .scroll(ScrollSpec { stick_bottom: true })
-        .scroll_edge_fade(40.0)
+        .child(
+            col()
+                .key(scroll_key.clone())
+                .grow(1.0)
+                .min_h(0.0)
+                .w_full()
+                .child(items.selection_group(true))
+                .scroll(ScrollSpec { stick_bottom: true })
+                .scroll_edge_fade(40.0)
+                .on_at_bottom(|s: &mut RiverApp, at| s.chat.at_bottom = at),
+        );
+    // Latest: the web UI's round button in the corner, while the newest message is off screen.
+    if !chat.at_bottom {
+        frame = frame.child(
+            row()
+                .key("latest")
+                .role("button")
+                .label("Scroll to latest message")
+                .help("Latest")
+                .size(40.0, 40.0)
+                .radius(20.0)
+                .center()
+                .fill(p.surface)
+                .border(1.0, p.line)
+                .shadow(8.0, 24.0, p.shadow)
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .pin(None, None, Some(16.0), Some(16.0))
+                .on_press_tx(move |_: &mut RiverApp, tx: &mut rune::Tx| {
+                    tx.scroll_to_bottom(scroll_key.clone())
+                })
+                .child(icon(&icons::CHEVRON_DOWN, 18.0).color(p.text_muted)),
+        );
+    }
+    frame
 }
 
 fn day_divider(day: u32, text: String, p: &Palette) -> El {
@@ -308,7 +346,11 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
     if author.is_some_and(|m| m.role == Role::Owner) {
         name_row = name_row.child(tag("OWNER", p));
     }
-    name_row = name_row.child(label(model::clock(first.time), st::SMALL, p.text_muted));
+    name_row = name_row.child(
+        label(model::clock(first.time), st::SMALL, p.text_muted)
+            .key(format!("time-{}", first.key))
+            .help(model::full_time(chat.day_zero, first.time)),
+    );
     // Both go in the first row only.
     let (mut face, mut name_row) = (Some(face), Some(name_row));
     let mut rows = col()
@@ -337,6 +379,8 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
             (
                 row().w(GUTTER).justify_center().pt(4.0).child(
                     label(model::clock(m.time), st::GUTTER_TIME, p.text_muted)
+                        .key(format!("time-{}", m.key))
+                        .help(model::full_time(chat.day_zero, m.time))
                         .group_opacity(0.0, 1.0),
                 ),
                 col().grow(1.0).min_w(0.0).child(message_el(room, m, p, k)),
@@ -608,7 +652,17 @@ fn message_el(room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
         let mut pills = row().key("reactions").gap(5.0).pt(2.0).flex_wrap();
         for r in &m.reactions {
             let mine = r.by.contains(&room.me);
-            let mut pill = row();
+            // Who reacted, as the web UI's chip tooltip.
+            let names =
+                r.by.iter()
+                    .map(|id| room.nickname(*id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            let mut pill = row().help(if mine {
+                format!("{names} (click to remove)")
+            } else {
+                names
+            });
             if can_react {
                 let (key, e) = (m.key.clone(), r.emoji.clone());
                 pill = pill
@@ -716,9 +770,41 @@ fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> Option<El> {
     Some(body)
 }
 
+/// The composer's keys, in this order, each consuming the key when it acts:
+///
+/// 1. The @mention popup (`mention_key`, #914), whenever it is open. It comes first: Esc, Up
+///    and Enter belong to the popup while it is open.
+/// 2. Escape: closes the emoji picker, and only then abandons a reply or an edit.
+/// 3. Up in an empty composer: edits your last message.
+/// 4. Ctrl+arrows and Ctrl+Backspace/Delete by word (`keys::word_keys`).
+pub(super) fn composer_key(s: &mut RiverApp, ev: &rune::KeyEvent) -> bool {
+    // 1.
+    s.chat.mention_sync();
+    if s.chat.mention_key(ev) {
+        return true;
+    }
+    // 2.
+    if ev.key == rune::Key::Escape {
+        if s.chat.emoji_open {
+            s.chat.emoji_open = false;
+            return true;
+        }
+        if s.chat.cancel_compose() {
+            return true;
+        }
+    }
+    // 3.
+    if ev.key == rune::Key::Up && s.chat.composer.text.is_empty() && s.chat.edit_last() {
+        return true;
+    }
+    // 4.
+    keys::word_keys(&mut s.chat.composer, ev)
+}
+
 fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     let can_send = room.send_block.is_none();
-    let has_text = can_send && !chat.composer.text.trim().is_empty();
+    let over = chat.over_limit();
+    let has_text = can_send && !over && !chat.composer.text.trim().is_empty();
     let placeholder = match &room.send_block {
         None => format!("Message {}", room.name),
         Some(reason) => reason.clone(),
@@ -735,18 +821,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .disabled(!can_send);
     if can_send {
         input = input
-            .on_input_key(|s: &mut RiverApp, ev, _| {
-                // Escape closes the emoji picker, whichever of the two has the focus.
-                s.chat.mention_sync();
-                if s.chat.mention_key(ev) {
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.chat.emoji_open {
-                    s.chat.emoji_open = false;
-                    return true;
-                }
-                keys::word_keys(&mut s.chat.composer, ev)
-            })
+            .on_input_key(|s: &mut RiverApp, ev, _| composer_key(s, ev))
             .on_edit(|s: &mut RiverApp| &mut s.chat.composer)
             .on_submit(|s: &mut RiverApp, _| {
                 s.chat.send();
@@ -778,8 +853,14 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
             s.chat.send();
         })
         .child(icon(&icons::SEND, 20.0).color(if has_text { p.accent } else { p.text_muted }));
-    if !can_send {
+    if !can_send || over {
         send = send.disabled(true).opacity(0.45);
+    }
+    if can_send
+        && over
+        && let Some((_, max)) = chat.draft_size()
+    {
+        send = send.help(format!("Message exceeds the {max} byte limit"));
     }
     let emoji = {
         let open = chat.emoji_open;
@@ -832,7 +913,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     if chat.emoji_open && can_send {
         column = column.child(emoji_panel(chat, p));
     }
-    column.child(
+    column = column.child(
         row()
             .key("composer-box")
             .w_full()
@@ -855,7 +936,30 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
             .child(emoji)
             .child(field)
             .child(send),
-    )
+    );
+    // The byte counter, as the web UI's: from 80% of the room's limit, and in the danger colour
+    // with the reason once over it.
+    if can_send
+        && let Some((bytes, max)) = chat.draft_size()
+        && bytes > max / 5 * 4
+    {
+        column = column.child(if bytes > max {
+            label(
+                format!("Message too long \u{2014} {bytes}/{max} bytes"),
+                st::SMALL,
+                p.danger,
+            )
+            .key("byte-counter")
+            .self_end()
+            .pr(4.0)
+        } else {
+            label(format!("{bytes}/{max}"), st::SMALL, p.text_muted)
+                .key("byte-counter")
+                .self_end()
+                .pr(4.0)
+        });
+    }
+    column
 }
 
 /// The composer's emoji picker: the web UI's categories as a row of tabs, and the chosen

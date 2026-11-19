@@ -180,6 +180,7 @@ fn town_square() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        wraps: None,
         details: Details::default(),
     }
 }
@@ -230,6 +231,7 @@ fn design_crew() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        wraps: None,
         details: Details::default(),
     }
 }
@@ -270,6 +272,7 @@ fn rust_help() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        wraps: None,
         details: Details::default(),
     }
 }
@@ -299,6 +302,7 @@ fn family() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        wraps: None,
         details: Details::default(),
     }
 }
@@ -318,6 +322,7 @@ fn book_club() -> Room {
         nickname_limit: 50,
         own_nickname: None,
         nickname_block: None,
+        wraps: None,
         details: Details::default(),
     }
 }

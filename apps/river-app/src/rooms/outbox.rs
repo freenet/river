@@ -100,11 +100,7 @@ use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1,
 use river_core::room_state::privacy::SealedBytes;
 
 use super::room::{LiveRoom, message_key};
-use crate::chat::model::{Notice, Pending, Room};
-
-/// How many characters of the replied-to message's shown text a reply carries, as the web
-/// UI's `reply_preview` takes 100 (of its markdown-stripped text).
-const REPLY_PREVIEW_CHARS: usize = 100;
+use crate::chat::model::{Notice, Pending, ReplyWrap, Room};
 
 /// Something the user did in a room, sent from the chat screen to the background work.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -941,7 +937,7 @@ fn config_privacy_matches(room: &LiveRoom, config: &AuthorizedConfigurationV1) -
 enum Intent {
     Text {
         text: String,
-        reply: Option<ReplyTarget>,
+        reply: Option<ReplyWrap>,
     },
     Actions {
         label: &'static str,
@@ -971,13 +967,6 @@ impl std::fmt::Debug for Intent {
             Intent::Config(edit) => f.debug_tuple("Config").field(edit).finish(),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-struct ReplyTarget {
-    id: MessageId,
-    author_name: String,
-    preview: String,
 }
 
 impl Intent {
@@ -1592,15 +1581,7 @@ impl Outbox {
                 ))?;
                 Ok(Intent::Text {
                     text,
-                    reply: Some(ReplyTarget {
-                        id: m.id(),
-                        author_name: room.member_name(m.message.author),
-                        preview: room
-                            .shown_text(m)
-                            .chars()
-                            .take(REPLY_PREVIEW_CHARS)
-                            .collect(),
-                    }),
+                    reply: Some(room.reply_wrap(m)),
                 })
             }
             Action::Edit { target, text } => Ok(Intent::Actions {

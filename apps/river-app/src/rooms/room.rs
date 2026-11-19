@@ -178,6 +178,20 @@ impl LiveRoom {
         }
     }
 
+    /// What a reply to `m` carries: its id, its author's name and the start of what it says.
+    /// Used both to build a reply and to measure a draft, so the two cannot differ.
+    pub fn reply_wrap(&self, m: &AuthorizedMessageV1) -> model::ReplyWrap {
+        model::ReplyWrap {
+            id: m.id(),
+            author_name: self.member_name(m.message.author),
+            preview: self
+                .shown_text(m)
+                .chars()
+                .take(model::REPLY_WRAP_CHARS)
+                .collect(),
+        }
+    }
+
     /// A member's name as the conversation shows it.
     pub fn member_name(&self, id: RiverMemberId) -> String {
         let me = self
@@ -520,6 +534,12 @@ impl LiveRoom {
             own_nickname: None,
             nickname_block: None,
             details: self.details(),
+            wraps: Some(
+                shown
+                    .iter()
+                    .map(|m| (message_key(&m.id()), self.reply_wrap(m)))
+                    .collect(),
+            ),
         }
     }
 

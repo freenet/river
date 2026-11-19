@@ -440,11 +440,18 @@ fn one(a: Arrival, previews: bool) -> Notification {
     }
 }
 
-/// The window title: `(3) River` while 3 messages are unread.
-pub fn window_title(unread: usize) -> String {
+/// The window title, as the web UI's document title: `River - <room>` with a room open,
+/// `River` without one, and `(3) ` in front while the window is in the background with 3
+/// messages unread.
+pub fn window_title(unread: usize, room: Option<&str>, focused: bool) -> String {
+    let base = match room {
+        Some(name) => format!("River - {name}"),
+        None => "River".to_owned(),
+    };
     match unread {
-        0 => "River".to_owned(),
-        n => format!("({n}) River"),
+        0 => base,
+        _ if focused => base,
+        n => format!("({n}) {base}"),
     }
 }
 
@@ -875,8 +882,12 @@ mod tests {
 
     #[test]
     fn the_title_counts_unread_and_the_notifier_hears_changes() {
-        assert_eq!(window_title(0), "River");
-        assert_eq!(window_title(7), "(7) River");
+        assert_eq!(window_title(0, None, false), "River");
+        assert_eq!(window_title(7, None, false), "(7) River");
+        assert_eq!(window_title(7, None, true), "River");
+        assert_eq!(window_title(0, Some("Rust"), false), "River - Rust");
+        assert_eq!(window_title(7, Some("Rust"), false), "(7) River - Rust");
+        assert_eq!(window_title(7, Some("Rust"), true), "River - Rust");
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
