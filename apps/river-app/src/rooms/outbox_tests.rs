@@ -1447,3 +1447,840 @@ fn the_view_says_who_invited_whom_and_gives_each_members_keys() {
         bs58::encode(f.me.verifying_key().as_bytes()).into_string()
     );
 }
+
+// Your own nickname ----------------------------------------------------------------------------
+
+fn nick(name: &str) -> Action {
+    Action::SetNickname {
+        nickname: name.into(),
+    }
+}
+
+/// The record the next update carries, which must be the only one.
+fn next_info(outbox: &mut Outbox, room: &LiveRoom) -> (ChatRoomStateV1Delta, AuthorizedMemberInfo) {
+    let delta = next(outbox, room, Instant::now()).expect("an update goes out");
+    assert!(delta.recent_messages.is_none(), "no message rides along");
+    let records = delta.member_info.clone().expect("a member_info record");
+    assert_eq!(records.len(), 1);
+    let info = records[0].clone();
+    (delta, info)
+}
+
+/// What the room contract itself makes of `delta` on a copy of `room`: its apply and then its
+/// whole-state verify.
+fn contract_takes(room: &LiveRoom, delta: ChatRoomStateV1Delta) -> ChatRoomStateV1 {
+    use freenet_scaffold::ComposableState;
+    let mut copy = room.clone();
+    copy.apply_delta(delta).expect("the room takes the delta");
+    let state = copy.stored.room_state.clone();
+    state
+        .verify(&state, &room.params())
+        .expect("the resulting state verifies");
+    state
+}
+
+fn shown_name(outbox: &Outbox, room: &LiveRoom) -> String {
+    let view = outbox.view(room, &minutes);
+    view.member(view.me).unwrap().nickname.clone()
+}
+
+#[test]
+fn a_public_nickname_is_my_signed_record_at_the_next_version_and_the_room_takes_it() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, nick("  Mia Two  ")));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert!(delta.members.is_none(), "a current member is not re-added");
+    assert_eq!(info.member_info.member_id, f.me_id());
+    // The room holds no record of mine (only the cached nickname), so this is the first.
+    assert_eq!(info.member_info.version, 1);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Mia Two".to_vec()),
+        "trimmed, and plain in a public room"
+    );
+    assert!(
+        info.verify_signature_with_key(&f.me.verifying_key())
+            .is_ok()
+    );
+    assert!(
+        info.verify_signature_with_key(&f.owner.verifying_key())
+            .is_err(),
+        "signed by me, not the owner"
+    );
+    let state = contract_takes(&room, delta);
+    assert_eq!(state.member_info.canonical(f.me_id()), Some(&info));
+
+    // On its way: shown at once, marked sending.
+    assert_eq!(shown_name(&outbox, &room), "Mia Two");
+    let view = outbox.view(&room, &minutes);
+    let own = view.own_nickname.clone().expect("marked");
+    assert_eq!(own.failed, None);
+    assert!(view.notices.is_empty());
+    // Not yet in the room itself.
+    assert_eq!(
+        room.view(&minutes)
+            .member(room.view(&minutes).me)
+            .unwrap()
+            .nickname,
+        "Mia"
+    );
+
+    // Taken: the room shows it, nothing is owed, and the record cached for rejoining follows.
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    assert_eq!(shown_name(&outbox, &room), "Mia Two");
+    assert!(outbox.view(&room, &minutes).own_nickname.is_none());
+    assert_eq!(room.stored.self_nickname.as_deref(), Some("Mia Two"));
+    assert_eq!(room.stored.self_member_info.as_ref(), Some(&info));
+}
+
+#[test]
+fn a_private_nickname_is_sealed_under_the_current_secret_and_never_plain() {
+    let f = Fixture::new();
+    let room = private_room(&f);
+    // The room already holds my record at version 0, so the next is 1.
+    let mut outbox = outbox();
+    assert!(outbox.command(&room, nick("Quiet Mia")));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.version, 1);
+    let SealedBytes::Private { secret_version, .. } = &info.member_info.preferred_nickname else {
+        panic!("a private room's nickname must be sealed");
+    };
+    assert_eq!(*secret_version, 0);
+    assert_eq!(
+        river_core::ecies::unseal_bytes(&info.member_info.preferred_nickname, Some(&SECRET))
+            .unwrap(),
+        b"Quiet Mia"
+    );
+    let state = contract_takes(&room, delta);
+    assert_eq!(state.member_info.canonical(f.me_id()), Some(&info));
+    assert_eq!(shown_name(&outbox, &room), "Quiet Mia");
+
+    // Under a newer current secret it is sealed under that one.
+    let mut newer = room.clone();
+    let v1 = [7u8; 32];
+    let mut state = newer.stored.room_state.clone();
+    add_secret(&f, &mut state, 1, &v1, &f.me);
+    newer.merge_state(&state).unwrap();
+    let mut fresh = Outbox::default();
+    assert!(fresh.command(&newer, nick("Newer Mia")));
+    let (_, info) = next_info(&mut fresh, &newer);
+    assert_eq!(
+        info.member_info.preferred_nickname.secret_version(),
+        Some(1)
+    );
+    assert_eq!(
+        river_core::ecies::unseal_bytes(&info.member_info.preferred_nickname, Some(&v1)).unwrap(),
+        b"Newer Mia"
+    );
+}
+
+#[test]
+fn a_waiting_nickname_is_sealed_again_under_a_newer_secret_keeping_its_version() {
+    let f = Fixture::new();
+    let mut room = private_room(&f);
+    let mut outbox = outbox();
+    sent(&mut outbox, &room, say("first"));
+    assert!(outbox.command(&room, nick("Waiting Mia")));
+    assert!(outbox.answered(&mut room, Ok(())));
+    let v1 = [7u8; 32];
+    let mut state = room.stored.room_state.clone();
+    add_secret(&f, &mut state, 1, &v1, &f.me);
+    room.merge_state(&state).unwrap();
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname.secret_version(),
+        Some(1)
+    );
+    assert_eq!(info.member_info.version, 1);
+}
+
+#[test]
+fn a_private_room_without_its_secret_refuses_rather_than_send_a_plain_nickname() {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    state.secrets.encrypted_secrets.clear();
+    let room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Leaky"));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    let view = outbox.view(&room, &minutes);
+    assert!(view.own_nickname.unwrap().failed.is_some());
+    assert_eq!(view.notices.len(), 1);
+    assert!(
+        view.notices[0]
+            .text
+            .starts_with("Your nickname couldn't be sent.")
+    );
+}
+
+#[test]
+fn a_nickname_the_room_would_not_take_is_refused_here_and_nothing_goes_out() {
+    let f = Fixture::new();
+    let state = with_config(&f, public_state(&f), |c| c.max_nickname_size = 8);
+    let room = LiveRoom::new(f.stored(state));
+    for (name, why) in [
+        ("", "can't be empty"),
+        ("   ", "can't be empty"),
+        ("123456789", "at most 8"),
+        ("eve\u{202e}", "can't contain emoji"),
+        ("zero\u{200b}width", "can't contain emoji"),
+        ("shield \u{1f6e1}", "can't contain emoji"),
+    ] {
+        let mut outbox = outbox();
+        outbox.command(&room, nick(name));
+        assert!(
+            next(&mut outbox, &room, Instant::now()).is_none(),
+            "{name:?} must not go out"
+        );
+        let view = outbox.view(&room, &minutes);
+        assert!(
+            view.notices[0].text.contains(why),
+            "{name:?}: {}",
+            view.notices[0].text
+        );
+        assert_eq!(
+            shown_name(&outbox, &room),
+            "Mia",
+            "{name:?} changes nothing"
+        );
+    }
+    // At the limit is fine, and the contract's own ceiling holds whatever the room says.
+    let mut outbox = outbox();
+    outbox.command(&room, nick("12345678"));
+    assert!(next(&mut outbox, &room, Instant::now()).is_some());
+    let state = with_config(&f, public_state(&f), |c| {
+        c.max_nickname_size = river_core::room_state::member_info::NICKNAME_CEILING + 500
+    });
+    let room = LiveRoom::new(f.stored(state));
+    let mut outbox = Outbox::default();
+    outbox.command(
+        &room,
+        nick(&"n".repeat(river_core::room_state::member_info::NICKNAME_CEILING + 1)),
+    );
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+}
+
+#[test]
+fn a_name_that_imitates_nobody_in_particular_is_the_users_to_choose() {
+    // The web UI's nickname field does not compare against other members (it warns readers
+    // instead), so neither does this: taking another member's name is allowed.
+    let f = Fixture::new();
+    let room = private_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Olive"));
+    let (delta, _) = next_info(&mut outbox, &room);
+    contract_takes(&room, delta);
+}
+
+#[test]
+fn only_a_member_can_set_a_nickname_and_is_told_why_if_not() {
+    let f = Fixture::new();
+    let mut state = public_state(&f);
+    state.members.members.clear();
+    state.recent_messages.messages.truncate(1);
+    let not_member = LiveRoom::new(f.stored(state));
+    let mut stored = f.stored(public_state(&f));
+    stored.self_sk = None;
+    stored.self_vk = Some(f.me.verifying_key());
+    let no_key = LiveRoom::new(stored);
+    for room in [&not_member, &no_key] {
+        let mut outbox = outbox();
+        outbox.command(room, nick("Intruder"));
+        assert!(next(&mut outbox, room, Instant::now()).is_none());
+        let view = outbox.view(room, &minutes);
+        assert!(view.send_block.is_some());
+        assert!(view.own_nickname.unwrap().failed.is_some());
+        assert_eq!(view.notices.len(), 1);
+    }
+
+    // The room itself refuses a record from a key that is no member's, whoever sends it.
+    let outsider = SigningKey::from_bytes(&[9; 32]);
+    let forged = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: f.me_id(),
+            version: 9,
+            preferred_nickname: SealedBytes::public(b"Forged".to_vec()),
+            deputies: Vec::new(),
+        },
+        &outsider,
+    );
+    let mut room = public_room(&f);
+    assert!(
+        room.apply_delta(ChatRoomStateV1Delta {
+            member_info: Some(vec![forged]),
+            ..Default::default()
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn a_banned_member_cannot_set_a_nickname() {
+    let f = Fixture::new();
+    let mut state = public_state(&f);
+    state.bans.0.push(ban(&f, f.me_id()));
+    let room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Banned Mia"));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert_eq!(
+        outbox.view(&room, &minutes).notices[0].text,
+        format!(
+            "Your nickname couldn't be sent. {}",
+            Blocked::Banned.reason()
+        )
+    );
+}
+
+#[test]
+fn a_member_the_room_removed_for_inactivity_is_told_to_send_a_message_first() {
+    // The room drops a member with no recent message as soon as it applies anything, taking
+    // a record sent with their re-adding along: the contract's own apply shows it.
+    let f = Fixture::new();
+    let mut stored = f.stored(pruned(&f, public_state(&f)));
+    stored.self_authorized_member = Some(admitted(&f));
+    let room = LiveRoom::new(stored);
+    let info = f.nickname(&f.me, "Lost");
+    let mut copy = room.clone();
+    copy.apply_delta(info_delta(&room, &info)).unwrap();
+    assert!(copy.stored.room_state.member_info.member_info.is_empty());
+    assert!(
+        copy.stored.room_state.members.members.is_empty(),
+        "the room drops the member again in the same apply"
+    );
+    assert!(
+        outbox_view_blocks(&room),
+        "and Save is refused before it is pressed"
+    );
+
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Back As"));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert_eq!(
+        outbox.view(&room, &minutes).notices[0].text,
+        format!("Your nickname couldn't be sent. {PRUNED}")
+    );
+    // After a message re-adds them, the nickname goes.
+    let mut room = room;
+    let messages = sent(&mut outbox, &room, say("back"));
+    assert_eq!(messages.len(), 1);
+    assert!(outbox.answered(&mut room, Ok(())));
+    let mut outbox = Outbox::default();
+    outbox.command(&room, nick("Back As"));
+    let (delta, _) = next_info(&mut outbox, &room);
+    contract_takes(&room, delta);
+}
+
+#[test]
+fn my_deputy_grants_survive_a_nickname_change() {
+    let f = Fixture::new();
+    let mut state = public_state(&f);
+    state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.me_id(),
+                version: 3,
+                preferred_nickname: SealedBytes::public(b"Mia".to_vec()),
+                deputies: vec![f.owner_id()],
+            },
+            &f.me,
+        ));
+    let room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Mia With Deputy"));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.version, 4);
+    assert_eq!(info.member_info.deputies, [f.owner_id()]);
+    contract_takes(&room, delta);
+}
+
+#[test]
+fn nicknames_in_a_row_go_out_in_order_at_rising_versions_and_a_newer_one_replaces_one_unsent() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("One"));
+    // One is out; two and three wait. Three replaces two, which was never sent.
+    let (_, one) = next_info(&mut outbox, &room);
+    outbox.command(&room, nick("Two"));
+    outbox.command(&room, nick("Three"));
+    assert!(
+        next(&mut outbox, &room, Instant::now()).is_none(),
+        "one at a time"
+    );
+    assert_eq!(shown_name(&outbox, &room), "Three");
+    assert!(outbox.answered(&mut room, Ok(())));
+    let (delta, three) = next_info(&mut outbox, &room);
+    assert!(three.member_info.version > one.member_info.version);
+    assert_eq!(
+        three.member_info.preferred_nickname,
+        SealedBytes::public(b"Three".to_vec())
+    );
+    let state = contract_takes(&room, delta);
+    assert_eq!(state.member_info.canonical(f.me_id()), Some(&three));
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    assert_eq!(shown_name(&outbox, &room), "Three");
+}
+
+#[test]
+fn a_nickname_goes_in_order_with_messages_written_around_it() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, say("before"));
+    outbox.command(&room, nick("Between"));
+    outbox.command(&room, say("after"));
+    let mut order = Vec::new();
+    while let Some(delta) = next(&mut outbox, &room, Instant::now()) {
+        order.push(match (&delta.recent_messages, &delta.member_info) {
+            (Some(m), None) => m[0].message.content.to_string_lossy(),
+            (None, Some(i)) => format!("nick v{}", i[0].member_info.version),
+            other => panic!("{other:?}"),
+        });
+        assert!(outbox.answered(&mut room, Ok(())));
+    }
+    assert_eq!(order.len(), 3);
+    assert!(order[0].contains("before"));
+    assert_eq!(order[1], "nick v1");
+    assert!(order[2].contains("after"));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_refused_nickname_stays_with_the_reason_and_retry_signs_it_again_discard_drops_it() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Try Me"));
+    let (_, first) = next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Err("no room".into())));
+    let view = outbox.view(&room, &minutes);
+    let own = view.own_nickname.clone().unwrap();
+    assert_eq!(own.failed.as_deref(), Some("Freenet refused it: no room"));
+    assert!(own.retry);
+    assert_eq!(
+        view.notices[0].text,
+        "Your nickname couldn't be sent. Freenet refused it: no room"
+    );
+    // A failed change has no effect to show.
+    assert_eq!(shown_name(&outbox, &room), "Mia");
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+
+    assert!(outbox.command(&room, Action::Retry { entry: own.entry }));
+    let (_, again) = next_info(&mut outbox, &room);
+    assert_eq!(
+        again.member_info.preferred_nickname,
+        first.member_info.preferred_nickname
+    );
+    assert!(outbox.answered(&mut room, Err("still no".into())));
+    let own = outbox.view(&room, &minutes).own_nickname.unwrap();
+    assert!(outbox.command(&room, Action::Discard { entry: own.entry }));
+    assert!(outbox.is_empty());
+    assert!(outbox.view(&room, &minutes).own_nickname.is_none());
+}
+
+#[test]
+fn a_nickname_the_network_brings_in_is_settled_and_an_unanswered_one_goes_again_unchanged() {
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Net"));
+    let (delta, info) = next_info(&mut outbox, &room);
+    // The connection drops: it goes again, as the same signed record.
+    outbox.requeue();
+    let (_, again) = next_info(&mut outbox, &room);
+    assert_eq!(again, info);
+    // The network brings it in (another connection of mine, or the node's earlier copy).
+    let mut other = room.clone();
+    other.apply_delta(delta).unwrap();
+    assert!(outbox.reconcile(&other));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_newer_record_from_elsewhere_settles_mine_instead_of_being_overwritten() {
+    // The web UI on another device published a later record while this was waiting.
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Mine"));
+    let elsewhere = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: f.me_id(),
+            version: 5,
+            preferred_nickname: SealedBytes::public(b"Elsewhere".to_vec()),
+            deputies: Vec::new(),
+        },
+        &f.me,
+    );
+    room.apply_delta(ChatRoomStateV1Delta {
+        member_info: Some(vec![elsewhere]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(outbox.reconcile(&room));
+    assert!(outbox.is_empty());
+    assert_eq!(shown_name(&outbox, &room), "Elsewhere");
+}
+
+fn outbox_view_blocks(room: &LiveRoom) -> bool {
+    Outbox::default()
+        .view(room, &minutes)
+        .nickname_block
+        .as_deref()
+        == Some(PRUNED)
+}
+
+/// A record of mine at `version` naming `name`, as another device would sign it.
+fn record(f: &Fixture, version: u32, name: &str) -> AuthorizedMemberInfo {
+    AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: f.me_id(),
+            version,
+            preferred_nickname: SealedBytes::public(name.as_bytes().to_vec()),
+            deputies: Vec::new(),
+        },
+        &f.me,
+    )
+}
+
+fn merge_info(room: &mut LiveRoom, info: AuthorizedMemberInfo) {
+    room.apply_delta(ChatRoomStateV1Delta {
+        member_info: Some(vec![info]),
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+// Review round: what a waiting nickname must never become ----------------------------------
+
+#[test]
+fn a_public_nickname_queued_before_the_room_turned_private_is_sealed_not_sent_plain() {
+    let f = Fixture::new();
+    let public = public_room(&f);
+    let private = private_room(&f);
+    // Queued, never sent.
+    let mut outbox = outbox();
+    outbox.command(&public, nick("Was Public"));
+    let (delta, info) = next_info(&mut outbox, &private);
+    assert!(matches!(
+        info.member_info.preferred_nickname,
+        SealedBytes::Private { .. }
+    ));
+    assert_eq!(
+        river_core::ecies::unseal_bytes(&info.member_info.preferred_nickname, Some(&SECRET))
+            .unwrap(),
+        b"Was Public"
+    );
+    contract_takes(&private, delta);
+
+    // Already sent once in the public room, sent again after the room turned private: a new
+    // sealed record at a higher version, not the plain one again.
+    let mut outbox = self::outbox();
+    outbox.command(&public, nick("Was Sent"));
+    let (_, plain) = next_info(&mut outbox, &public);
+    outbox.requeue();
+    let (_, again) = next_info(&mut outbox, &private);
+    assert!(matches!(
+        again.member_info.preferred_nickname,
+        SealedBytes::Private { .. }
+    ));
+    assert!(again.member_info.version > plain.member_info.version);
+}
+
+#[test]
+fn a_private_nickname_queued_before_the_room_turned_public_is_not_sent_sealed() {
+    let f = Fixture::new();
+    let private = private_room(&f);
+    let public = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&private, nick("Was Private"));
+    let (_, info) = next_info(&mut outbox, &public);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Was Private".to_vec())
+    );
+}
+
+#[test]
+fn an_equal_version_record_that_wins_on_the_digest_is_superseded_and_never_cached() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Mine"));
+    let (delta, mine) = next_info(&mut outbox, &room);
+    let version = mine.member_info.version;
+    // Another device signed a different record at the same version; find one the room ranks
+    // above mine (Ed25519 is deterministic, so this is fixed).
+    let other = (0..200)
+        .map(|i| record(&f, version, &format!("Other {i}")))
+        .find(|o| {
+            let mut t = room.clone();
+            merge_info(&mut t, o.clone());
+            t.apply_delta(delta.clone()).unwrap();
+            t.stored.room_state.member_info.canonical(f.me_id()) == Some(o)
+        })
+        .expect("some record outranks mine");
+    merge_info(&mut room, other.clone());
+    assert!(outbox.answered(&mut room, Ok(())));
+    // Not "saved": said, and the cache holds nothing of mine.
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices[0].text.contains("replaced this one"));
+    assert_eq!(room.stored.self_nickname.as_deref(), Some("Mia"));
+    assert_eq!(room.stored.self_member_info, None);
+    assert_eq!(
+        shown_name(&outbox, &room),
+        "Other 0".replace('0', &{
+            let i = (0..200)
+                .position(|i| record(&f, version, &format!("Other {i}")) == other)
+                .unwrap();
+            i.to_string()
+        })
+    );
+    // An Unconfirmed nickname can be dropped.
+    let own = view.own_nickname.unwrap();
+    assert!(outbox.command(&room, Action::Discard { entry: own.entry }));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_newer_record_that_arrives_before_sending_fails_it_as_superseded_not_as_banned() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Mine"));
+    merge_info(&mut room, record(&f, 5, "Newer"));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    let text = &outbox.view(&room, &minutes).notices[0].text;
+    assert!(text.contains("replaced this one"), "{text}");
+    assert!(!text.contains("banned"));
+}
+
+#[test]
+fn an_equal_version_record_that_won_settles_mine_on_reconcile() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Mine"));
+    let (delta, mine) = next_info(&mut outbox, &room);
+    let other = (0..200)
+        .map(|i| record(&f, mine.member_info.version, &format!("Race {i}")))
+        .find(|o| {
+            let mut t = room.clone();
+            merge_info(&mut t, o.clone());
+            t.apply_delta(delta.clone()).unwrap();
+            t.stored.room_state.member_info.canonical(f.me_id()) == Some(o)
+        })
+        .unwrap();
+    merge_info(&mut room, other);
+    assert!(outbox.reconcile(&room));
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn deputy_grants_revoked_elsewhere_are_not_brought_back_by_a_waiting_nickname() {
+    let f = Fixture::new();
+    let mut state = public_state(&f);
+    state
+        .member_info
+        .member_info
+        .push(AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: f.me_id(),
+                version: 3,
+                preferred_nickname: SealedBytes::public(b"Mia".to_vec()),
+                deputies: vec![f.owner_id()],
+            },
+            &f.me,
+        ));
+    let mut room = LiveRoom::new(f.stored(state));
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Waiting"));
+    // Another device revokes the grant, at a higher version, before this is sent.
+    merge_info(&mut room, record(&f, 6, "Mia"));
+    let (delta, info) = next_info(&mut outbox, &room);
+    assert!(
+        info.member_info.deputies.is_empty(),
+        "the revoked grant is not re-granted"
+    );
+    assert!(info.member_info.version > 6);
+    let state = contract_takes(&room, delta);
+    assert!(state.member_info.deputies_of(f.me_id()).is_empty());
+}
+
+#[test]
+fn no_version_left_fails_the_nickname_instead_of_wrapping() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    merge_info(&mut room, record(&f, u32::MAX, "Last"));
+    let mut outbox = outbox();
+    outbox.command(&room, nick("One More"));
+    assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    assert_eq!(
+        outbox.view(&room, &minutes).notices[0].text,
+        format!("Your nickname couldn't be sent. {NO_VERSION_LEFT}")
+    );
+}
+
+#[test]
+fn an_intent_never_prints_the_nickname() {
+    let shown = format!(
+        "{:?}",
+        Intent::Nickname {
+            nickname: "hunter2-secret".into()
+        }
+    );
+    assert!(!shown.contains("hunter2"));
+}
+
+#[test]
+fn the_cached_record_decides_the_version_when_the_room_is_behind() {
+    // Another connection of mine already published version 7; the room copy here has older.
+    let f = Fixture::new();
+    let mut stored = f.stored(public_state(&f));
+    stored.self_member_info = Some(record(&f, 7, "Cached"));
+    let room = LiveRoom::new(stored);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Next"));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.version, 8);
+}
+
+#[test]
+fn a_sent_private_nickname_is_resent_as_is_after_a_rotation_and_a_retry_signs_higher() {
+    let f = Fixture::new();
+    let mut room = private_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Rotating"));
+    let (_, first) = next_info(&mut outbox, &room);
+    assert_eq!(
+        first.member_info.preferred_nickname.secret_version(),
+        Some(0)
+    );
+    // The secret rotates; the connection drops. The record the node may hold goes again
+    // unchanged, not sealed under the new secret.
+    let v1 = [7u8; 32];
+    let mut state = room.stored.room_state.clone();
+    add_secret(&f, &mut state, 1, &v1, &f.me);
+    room.merge_state(&state).unwrap();
+    outbox.requeue();
+    let (_, again) = next_info(&mut outbox, &room);
+    assert_eq!(again, first);
+    // Refused: a retry signs it again, higher, under the current secret.
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    let own = outbox.view(&room, &minutes).own_nickname.unwrap();
+    assert!(outbox.command(&room, Action::Retry { entry: own.entry }));
+    let (_, retried) = next_info(&mut outbox, &room);
+    assert!(retried.member_info.version > first.member_info.version);
+    assert_eq!(
+        retried.member_info.preferred_nickname.secret_version(),
+        Some(1)
+    );
+}
+
+#[test]
+fn a_private_nickname_at_the_limit_is_sealed_and_the_room_takes_it() {
+    let f = Fixture::new();
+    for limit in [
+        16usize,
+        river_core::room_state::member_info::NICKNAME_CEILING,
+    ] {
+        let state = with_config(&f, f.private_state(), |c| c.max_nickname_size = limit);
+        let room = LiveRoom::new(f.stored(state));
+        let mut outbox = Outbox::default();
+        outbox.command(&room, nick(&"n".repeat(limit)));
+        let (delta, info) = next_info(&mut outbox, &room);
+        assert_eq!(info.member_info.preferred_nickname.declared_len(), limit);
+        let state = contract_takes(&room, delta);
+        assert_eq!(
+            state.member_info.canonical(f.me_id()),
+            Some(&info),
+            "limit {limit}"
+        );
+        // One more byte is refused here.
+        let mut outbox = Outbox::default();
+        outbox.command(&room, nick(&"n".repeat(limit + 1)));
+        assert!(next(&mut outbox, &room, Instant::now()).is_none());
+    }
+}
+
+#[test]
+fn the_dialog_follows_a_real_outbox_view() {
+    use crate::chat::{Chat, LinkStatus, Source};
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Via Outbox"));
+    let view = outbox.view(&room, &minutes);
+    let uid = view.member(view.me).unwrap().uid.clone();
+    let mut chat = Chat::new(Source::Node(LinkStatus::Live), vec![view], 0, 0, 0);
+    chat.open_member(&uid);
+    // Sending: the dialog's state is the outbox's, and a second change waits.
+    assert_eq!(
+        chat.room().unwrap().own_nickname.as_ref().unwrap().failed,
+        None
+    );
+    chat.nickname.replace_text("Another");
+    chat.submit_nickname();
+    assert!(chat.outgoing.is_empty());
+    // Refused: the same view says why and a new change goes.
+    let mut room = room;
+    next(&mut outbox, &room, Instant::now()).unwrap();
+    assert!(outbox.answered(&mut room, Err("nope".into())));
+    let view = outbox.view(&room, &minutes);
+    chat.set_rooms(vec![view]);
+    let own = chat.room().unwrap().own_nickname.clone().unwrap();
+    assert_eq!(own.failed.as_deref(), Some("Freenet refused it: nope"));
+    chat.submit_nickname();
+    assert_eq!(chat.outgoing.len(), 1);
+}
+
+#[test]
+fn naming_yourself_what_you_already_are_is_the_dialogs_no_op_not_the_outboxs() {
+    // The dialog closes without sending when the name is unchanged (the web UI's own rule);
+    // the outbox below it takes whatever it is given and publishes a new version.
+    let f = Fixture::new();
+    let room = private_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Mia"));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(info.member_info.version, 1);
+}
+
+#[test]
+fn names_read_the_same_here_as_in_the_browser() {
+    use crate::chat::visual_fold::{contains_hidden_chars, sanitize_display_name};
+    // (name, the web's input check refuses it, what every client shows)
+    let cases: &[(&str, bool, &str)] = &[
+        ("Bo\u{200D}b", false, "Bob"),
+        ("\u{3164}", true, "Unnamed"),
+        ("\u{2800}", true, "Unnamed"),
+        ("a\u{2028}b", true, "a b"),
+        ("\u{1f6e1}", true, "Unnamed"),
+        ("Ian\u{E0100}", true, "Ian"),
+        ("\u{8fbb}\u{E0100}", false, "\u{8fbb}\u{E0100}"),
+        (
+            "\u{5c71}\u{7530}\u{3000}\u{592a}\u{90ce}",
+            false,
+            "\u{5c71}\u{7530}\u{3000}\u{592a}\u{90ce}",
+        ),
+        ("Plain Name", false, "Plain Name"),
+    ];
+    for (name, refused, shown) in cases {
+        assert_eq!(contains_hidden_chars(name), *refused, "{name:?}");
+        assert_eq!(sanitize_display_name(name), *shown, "{name:?}");
+    }
+    // A name set by another client shows sanitised in a room read here.
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    merge_info(&mut room, record(&f, 2, "Bo\u{200D}b \u{1f6e1}"));
+    assert_eq!(shown_name(&Outbox::default(), &room), "Bob");
+    merge_info(&mut room, record(&f, 3, "\u{1f6e1}"));
+    assert_eq!(shown_name(&Outbox::default(), &room), "Unnamed");
+}

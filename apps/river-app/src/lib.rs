@@ -339,6 +339,32 @@ impl RiverApp {
     }
 }
 
+/// Your own member info dialog in the first example room, shown as a room from the node (so
+/// saving sends a command), after `edit` set the field and the delivery state.
+fn nickname_scene(s: &mut RiverApp, edit: fn(&mut Chat, &mut chat::model::Room)) {
+    connect(s);
+    let mut rooms = chat::example::data().rooms;
+    let uid = {
+        let room = &rooms[0];
+        room.member(room.me)
+            .map(|m| m.uid.clone())
+            .unwrap_or_default()
+    };
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    s.chat
+        .show_node_rooms(rooms.clone(), None, chat::LinkStatus::Live, 29_000_000);
+    s.chat.open_member(&uid);
+    edit(&mut s.chat, &mut rooms[0]);
+    let (own, block) = (
+        rooms[0].own_nickname.clone(),
+        rooms[0].nickname_block.clone(),
+    );
+    s.chat.edit_rooms(|r| {
+        r[0].own_nickname = own;
+        r[0].nickname_block = block;
+    });
+}
+
 /// A named state for `--snap` and `--list-scenes`: a name and how it changes the initial state.
 pub type Scene = (&'static str, fn(&mut RiverApp));
 
@@ -494,6 +520,46 @@ pub const SCENES: &[Scene] = &[
             room.members.push(m);
         });
         s.chat.open_member("90");
+    }),
+    // Your own member info dialog, which edits your nickname: as it opens, with the new
+    // nickname being typed, with one the room would refuse, on its way to the node, and after
+    // the node refused it.
+    ("chat-nickname-idle", |s| nickname_scene(s, |_, _| {})),
+    ("chat-nickname-editing", |s| {
+        nickname_scene(s, |chat, _| chat.nickname.replace_text("Sam"))
+    }),
+    ("chat-nickname-error", |s| {
+        nickname_scene(s, |chat, _| {
+            chat.nickname
+                .replace_text("Sam Rivers-Hollingsworth the Third of Exeter, Esquire")
+        })
+    }),
+    ("chat-nickname-pending", |s| {
+        nickname_scene(s, |chat, room| {
+            chat.nickname.replace_text("Sam");
+            room.own_nickname = Some(chat::model::Pending {
+                entry: 1,
+                failed: None,
+                retry: false,
+            });
+        })
+    }),
+    ("chat-nickname-failed", |s| {
+        nickname_scene(s, |chat, room| {
+            chat.nickname.replace_text("Sam");
+            room.own_nickname = Some(chat::model::Pending {
+                entry: 1,
+                failed: Some("Freenet refused it: the room is full.".into()),
+                retry: true,
+            });
+        })
+    }),
+    // Your own dialog when the room would not take a change: said before Save, which is off.
+    ("chat-nickname-blocked", |s| {
+        nickname_scene(s, |chat, room| {
+            chat.nickname.replace_text("Sam");
+            room.nickname_block = Some(rooms::outbox::PRUNED_MESSAGE.into());
+        })
     }),
     ("chat-description-open", |s| {
         connect(s);

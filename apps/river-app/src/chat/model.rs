@@ -139,6 +139,14 @@ pub struct Room {
     pub send_block: Option<String>,
     /// Edits, deletions and reactions of yours that could not be sent.
     pub notices: Vec<Notice>,
+    /// The longest nickname, in bytes, the room takes (its `max_nickname_size`, held to the
+    /// contract's ceiling). Example rooms use the room's default.
+    pub nickname_limit: usize,
+    /// A change of your own nickname that the node has not taken yet, or that failed.
+    pub own_nickname: Option<Pending>,
+    /// Why your nickname can't be changed now even though you can write, if it can't: the room
+    /// removed you for inactivity, and only a message brings you back.
+    pub nickname_block: Option<String>,
 }
 
 impl Room {
@@ -566,6 +574,9 @@ mod tests {
             unread: 0,
             send_block: None,
             notices: Vec::new(),
+            nickname_limit: 50,
+            own_nickname: None,
+            nickname_block: None,
         };
         let id = room.send("hi", 100);
         assert_eq!(id, 8);

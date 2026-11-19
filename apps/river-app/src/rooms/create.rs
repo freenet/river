@@ -94,6 +94,11 @@ pub fn contract_key(owner: &VerifyingKey) -> ContractKey {
 /// A one-line name a user typed is refused if it holds characters that draw nothing or
 /// reorder text, as the web UI's dialogs refuse them (`contains_hidden_chars`).
 fn hidden_char_refusal(what: &str, s: &str) -> Option<String> {
+    if what == "nickname" {
+        // A nickname is held to the web UI's own check, with its message.
+        return crate::chat::visual_fold::contains_hidden_chars(s)
+            .then(|| crate::chat::visual_fold::EMOJI_REJECTION_MESSAGE.to_owned());
+    }
     s.chars()
         .any(super::room::is_hidden)
         .then(|| format!("The {what} has characters that don't show. Type it again."))

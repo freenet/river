@@ -54,7 +54,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
     if let Some(uid) = &chat.member_modal {
-        super::member_modal::member_modal(room, uid, &k, &mut layer);
+        super::member_modal::member_modal(chat, room, uid, &k, &mut layer);
     }
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);

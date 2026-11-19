@@ -192,6 +192,10 @@ pub struct Chat {
     pub description_open: bool,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
+    /// What is typed in the nickname field of your own member info dialog.
+    pub nickname: TextEdit,
+    /// Why the nickname typed was refused when Save was pressed with nothing in it.
+    pub nickname_error: Option<String>,
     /// Today's day number in message time (whose day 0 is `day_zero`).
     pub today: u32,
     /// The date of message time's day 0, in days since 1970-01-01, for the day headings.
@@ -260,6 +264,8 @@ impl Chat {
             emoji_category: 0,
             description_open: false,
             member_modal: None,
+            nickname: TextEdit::new(""),
+            nickname_error: None,
             today,
             day_zero,
             now,
@@ -737,13 +743,117 @@ impl Chat {
 
     /// Open the info dialog of the member with `uid` in the open room.
     pub fn open_member(&mut self, uid: &str) {
-        if self.room().is_some_and(|r| r.member_by_uid(uid).is_some()) {
-            self.member_modal = Some(uid.to_owned());
-        }
+        let Some(member) = self.room().and_then(|r| r.member_by_uid(uid)) else {
+            return;
+        };
+        // Your own dialog edits your nickname, starting from the one you chose; with none
+        // chosen (the shown name is a stand-in) the field starts empty and ready to type.
+        let mut edit = TextEdit::new(if member.claimed { &member.nickname } else { "" });
+        edit.focused = member.id == self.room().map_or(0, |r| r.me);
+        self.nickname = edit;
+        self.nickname_error = None;
+        self.member_modal = Some(uid.to_owned());
     }
 
     pub fn close_member(&mut self) {
         self.member_modal = None;
+        self.nickname_error = None;
+    }
+
+    /// Whether the open member dialog is yours.
+    pub fn member_modal_is_me(&self) -> bool {
+        self.room().is_some_and(|r| {
+            self.member_modal
+                .as_deref()
+                .and_then(|uid| r.member_by_uid(uid))
+                .is_some_and(|m| m.id == r.me)
+        })
+    }
+
+    /// Why the nickname typed can't be saved, as the field is typed in: too long for the room,
+    /// or characters that don't show. Nothing typed is not a problem yet, only on Save.
+    pub fn nickname_problem(&self) -> Option<String> {
+        let typed = self.nickname.text.trim();
+        let limit = self.room()?.nickname_limit;
+        if typed.is_empty() {
+            return None;
+        }
+        crate::rooms::outbox::nickname_refusal_in(typed, limit)
+    }
+
+    /// Save the nickname typed as yours. What can't be used is said in the dialog, which stays
+    /// open; the same name closes it; otherwise the change goes to the node (rooms from the
+    /// node), and the dialog shows it on its way, or changes it in memory (example rooms).
+    pub fn submit_nickname(&mut self) {
+        if !self.member_modal_is_me() {
+            return;
+        }
+        let Some(room) = self.room() else {
+            return;
+        };
+        // The dialog says why, and Save is disabled.
+        if room.send_block.is_some() || room.nickname_block.is_some() {
+            return;
+        }
+        // One change at a time: wait for the node to take or refuse the last.
+        if room
+            .own_nickname
+            .as_ref()
+            .is_some_and(|p| p.failed.is_none())
+        {
+            return;
+        }
+        let typed = self.nickname.text.trim().to_owned();
+        let refusal = crate::rooms::outbox::nickname_refusal_in(&typed, room.nickname_limit);
+        let key = room.key.clone();
+        let me = room.me;
+        let same = room
+            .member(me)
+            .is_some_and(|m| m.claimed && m.nickname == typed);
+        if refusal.is_some() {
+            self.nickname_error = refusal;
+            return;
+        }
+        self.nickname_error = None;
+        if same {
+            self.close_member();
+            return;
+        }
+        match self.source {
+            Source::Example => {
+                if let Some(m) = self
+                    .room_mut()
+                    .and_then(|r| r.members.iter_mut().find(|m| m.id == me))
+                {
+                    m.nickname = typed;
+                    m.claimed = true;
+                }
+                self.close_member();
+            }
+            Source::Node(_) => self.emit(key, Action::SetNickname { nickname: typed }),
+        }
+    }
+
+    /// Try the nickname change that failed again.
+    pub fn retry_nickname(&mut self) {
+        if let Some(entry) = self
+            .room()
+            .and_then(|r| r.own_nickname.as_ref())
+            .map(|p| p.entry)
+        {
+            self.retry(entry);
+        }
+    }
+
+    /// Drop the nickname change that failed.
+    pub fn discard_nickname(&mut self) {
+        if let Some(entry) = self
+            .room()
+            .and_then(|r| r.own_nickname.as_ref())
+            .map(|p| p.entry)
+        {
+            self.discard(entry);
+        }
     }
 
     pub fn close_dialog(&mut self) {

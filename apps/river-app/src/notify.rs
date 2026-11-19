@@ -545,6 +545,21 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_member_notifies_under_the_new_name() {
+        let (mut s, rec, rooms) = live();
+        let m = from_other(&rooms[0], "n1", "supper is ready");
+        let mut renamed = rooms.clone();
+        renamed[0]
+            .members
+            .iter_mut()
+            .find(|x| x.id == m.author)
+            .unwrap()
+            .nickname = "Renamed Rae".into();
+        deliver(&mut s, with(&renamed, 0, vec![m]));
+        assert_eq!(shown(&rec)[0].body, "Renamed Rae: supper is ready");
+    }
+
+    #[test]
     fn the_first_rooms_and_the_catch_up_notify_nothing() {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));

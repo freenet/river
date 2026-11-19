@@ -34,6 +34,16 @@
 //!   the room itself allows (it admits any version it has a record of).
 //!   A message written as an identity the room no longer uses is never sent under the new one.
 //!
+//! - **Your nickname.** A new signed `member_info` record (`Action::SetNickname`), as the web UI's
+//!   `NicknameField` builds it: sealed under the room's current secret in a private room (a
+//!   private room with no secret here refuses, freenet/river#299), signed with your key, at one
+//!   above the higher of the room's record and the cached one (and above any nickname still
+//!   waiting), with your deputy grants carried over (#410). It rides the same queue, in order
+//!   with messages. A newer change replaces one never sent. A member the room removed for
+//!   inactivity is told to send a message first: the room drops them again in the same apply,
+//!   along with a record sent with their re-adding. The web UI does not compare the name with
+//!   other members' (it warns readers), and neither does this.
+//!
 //! Where this differs: the web UI marks a room to sync and never hears whether the node took
 //! the update. Here one update per room is out at a time, and its answer decides: an
 //! `UpdateResponse` means sent (if the room then holds the messages), an update error means
@@ -113,6 +123,11 @@ pub enum Action {
     },
     Discard {
         entry: u64,
+    },
+    /// Change your own nickname in the room: a new signed `member_info` record at the next
+    /// version, sealed under the room's current secret in a private room.
+    SetNickname {
+        nickname: String,
     },
     /// Make an invitation to the room, for its link to be copied ([`super::create`]).
     Invite,
@@ -324,8 +339,170 @@ pub(super) fn delta(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> ChatRo
     }
 }
 
+/// Why a nickname can't be changed while the room has removed you for inactivity.
+pub const PRUNED_MESSAGE: &str = PRUNED;
+
+pub(crate) const PRUNED: &str = "The room removed you after a long time without a message, and \
+     only a message brings you back. Send one, then change your nickname.";
+
+/// What an entry labels itself as when it is about your nickname.
+const NICKNAME_LABEL: &str = "Your nickname";
+
+/// The update that publishes `info`, your own `member_info` record, in `room`. Like the web
+/// UI's nickname field it carries the rejoin's `members` delta, but that does not keep a pruned
+/// member: the room drops them again in the same apply, and their record with them (pinned by
+/// `a_member_the_room_removed_for_inactivity_is_told_to_send_a_message_first`). So
+/// [`build_info`] refuses a pruned member rather than build a record that cannot hold. The
+/// rejoin's own stored record is not sent: this one replaces it.
+pub(super) fn info_delta(room: &LiveRoom, info: &AuthorizedMemberInfo) -> ChatRoomStateV1Delta {
+    ChatRoomStateV1Delta {
+        members: rejoin(room).0,
+        member_info: Some(vec![info.clone()]),
+        ..Default::default()
+    }
+}
+
+/// Why `nickname` can't be set as yours in `room`, if it can't: what the web UI's nickname
+/// field refuses (empty, characters that don't show, over the room's `max_nickname_size`).
+pub fn nickname_refusal_in(nickname: &str, max_nickname_size: usize) -> Option<String> {
+    if nickname.trim().is_empty() {
+        return Some("Nickname can't be empty.".into());
+    }
+    // The web UI's own check and its message, copied verbatim (`chat::visual_fold`).
+    if crate::chat::visual_fold::contains_hidden_chars(nickname) {
+        return Some(crate::chat::visual_fold::EMOJI_REJECTION_MESSAGE.into());
+    }
+    let config = river_core::room_state::configuration::Configuration {
+        max_nickname_size,
+        ..Default::default()
+    };
+    river_core::room_state::member_info::nickname_refusal(nickname.len(), &config)
+}
+
+/// Build and sign your `member_info` record for `nickname` at `version`, as the web UI's
+/// nickname field does: the nickname sealed under the room's CURRENT secret in a private room
+/// (never plain: a private room with no secret here refuses, freenet/river#299), signed with
+/// your key, and your deputy grants carried over from the room's canonical record, since
+/// republishing replaces the whole record (#410).
+fn build_info(
+    room: &LiveRoom,
+    nickname: &str,
+    version: u32,
+) -> Result<(VerifyingKey, AuthorizedMemberInfo), String> {
+    participation(room).map_err(|b| b.reason().to_owned())?;
+    let sk = room
+        .stored
+        .self_sk
+        .as_ref()
+        .ok_or_else(|| Blocked::NoKey.reason().to_owned())?;
+    // The room removes a member with no recent message as soon as it applies anything, so a
+    // record sent with the re-adding would be dropped with the member. A message re-adds them
+    // for good, and a nickname after it holds.
+    if rejoin(room).0.is_some() {
+        return Err(PRUNED.into());
+    }
+    let max = room
+        .stored
+        .room_state
+        .configuration
+        .configuration
+        .max_nickname_size;
+    if let Some(why) = nickname_refusal_in(nickname, max) {
+        return Err(why);
+    }
+    let preferred_nickname = if room.is_private() {
+        let (secret, v) = room
+            .current_secret()
+            .ok_or_else(|| Blocked::NoSecret.reason().to_owned())?;
+        seal_bytes(nickname.as_bytes(), &secret, v)
+    } else {
+        SealedBytes::public(nickname.as_bytes().to_vec())
+    };
+    let me = MemberId::from(&sk.verifying_key());
+    let deputies = held_deputies(room, me);
+    let info = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: me,
+            version,
+            preferred_nickname,
+            deputies,
+        },
+        sk,
+    );
+    Ok((sk.verifying_key(), info))
+}
+
+/// The version of your `member_info` record the room (or the record cached for rejoining)
+/// already holds, or 0.
+fn held_info_version(room: &LiveRoom) -> u32 {
+    let Some(vk) = room.stored.self_verifying_key() else {
+        return 0;
+    };
+    let me = MemberId::from(&vk);
+    let in_state = room
+        .stored
+        .room_state
+        .member_info
+        .canonical(me)
+        .map_or(0, |i| i.member_info.version);
+    let cached = room
+        .stored
+        .self_member_info
+        .as_ref()
+        .filter(|i| i.member_info.member_id == me)
+        .map_or(0, |i| i.member_info.version);
+    in_state.max(cached)
+}
+
+/// Where `info` stands in `room`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InfoState {
+    /// The room's canonical record for the member is this one.
+    Ours,
+    /// The canonical record is another: a later version, or the same version that wins on the
+    /// signature digest (`member_info_rank`), as when another device renamed at the same time.
+    Superseded,
+    /// The room holds nothing as new as this (it was not taken, or the member is gone).
+    Absent,
+}
+
+fn info_state(room: &LiveRoom, info: &AuthorizedMemberInfo) -> InfoState {
+    match room
+        .stored
+        .room_state
+        .member_info
+        .canonical(info.member_info.member_id)
+    {
+        Some(c) if c.signature == info.signature => InfoState::Ours,
+        Some(c) if c.member_info.version >= info.member_info.version => InfoState::Superseded,
+        _ => InfoState::Absent,
+    }
+}
+
+/// Whether a record's sealing is the room's kind now: sealed in a private room, plain in a
+/// public one. A record made while the room was the other kind must be signed again.
+fn privacy_matches(room: &LiveRoom, info: &AuthorizedMemberInfo) -> bool {
+    matches!(
+        (&info.member_info.preferred_nickname, room.is_private()),
+        (SealedBytes::Public { .. }, false) | (SealedBytes::Private { .. }, true)
+    )
+}
+
+/// The deputy grants the room holds for you now.
+fn held_deputies(room: &LiveRoom, me: MemberId) -> Vec<MemberId> {
+    room.stored
+        .room_state
+        .member_info
+        .canonical(me)
+        .map(|i| i.member_info.deputies.clone())
+        .unwrap_or_default()
+}
+
+/// What a message is stamped with. Tests set it.
+pub(super) type Clock = Box<dyn Fn() -> SystemTime + Send>;
+
 /// What the user wrote or did, kept so it can be built again (on Retry, or sealed again).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Intent {
     Text {
         text: String,
@@ -335,6 +512,27 @@ enum Intent {
         label: &'static str,
         actions: Vec<ActionContentV1>,
     },
+    /// Your own nickname, as the user typed it (trimmed).
+    Nickname { nickname: String },
+}
+
+/// As derived, except a nickname is not printed.
+impl std::fmt::Debug for Intent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Intent::Text { text, reply } => f
+                .debug_struct("Text")
+                .field("text", text)
+                .field("reply", reply)
+                .finish(),
+            Intent::Actions { label, actions } => f
+                .debug_struct("Actions")
+                .field("label", label)
+                .field("actions", actions)
+                .finish(),
+            Intent::Nickname { .. } => f.write_str("Nickname(<hidden>)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +548,7 @@ impl Intent {
             Intent::Text { reply: None, .. } => "Your message",
             Intent::Text { reply: Some(_), .. } => "Your reply",
             Intent::Actions { label, .. } => label,
+            Intent::Nickname { .. } => NICKNAME_LABEL,
         }
     }
 
@@ -378,6 +577,8 @@ impl Intent {
                 .iter()
                 .map(|a| (CONTENT_TYPE_ACTION, ACTION_CONTENT_VERSION, a.encode()))
                 .collect(),
+            // Not a message: built by `build_info`.
+            Intent::Nickname { .. } => Vec::new(),
         }
     }
 }
@@ -482,6 +683,10 @@ pub(super) const KEY_NOT_HERE: &str =
     "The room's copy on this computer doesn't have the key it was sealed with yet.";
 pub(super) const CAPPED: &str = "The room keeps only its newest messages, and this was not among \
      them. If this computer's clock is behind, its messages look older than they are.";
+pub(super) const NO_VERSION_LEFT: &str =
+    "Your nickname has been changed as many times as the room can count.";
+pub(super) const SUPERSEDED: &str =
+    "A newer change to your nickname, made elsewhere, replaced this one.";
 pub(super) const REMOVED: &str = "The room didn't take it. You may have been removed or banned.";
 /// How many times an update the node never answers is sent again on a new connection before
 /// it is left unconfirmed: each time costs every room a reconnect.
@@ -534,6 +739,8 @@ struct Entry {
     author: Option<VerifyingKey>,
     time: SystemTime,
     messages: Vec<AuthorizedMessageV1>,
+    /// For a nickname change: the signed record to publish (and `messages` is empty).
+    info: Option<AuthorizedMemberInfo>,
     status: Status,
     /// These messages went to the node at least once. From then on they are only ever sent
     /// again as they are, never rebuilt: the node may have taken them, and a rebuilt message
@@ -551,10 +758,58 @@ impl Entry {
     /// Sealed under a secret version newer than `current`: building it again now would seal
     /// it backwards (the web UI's `sealed_at_or_below` refuses that).
     fn sealed_above(&self, current: Option<u32>) -> bool {
+        self.secret_versions()
+            .any(|v| current.is_none_or(|c| v > c))
+    }
+
+    /// The secret versions what it carries is sealed under.
+    fn secret_versions(&self) -> impl Iterator<Item = u32> + '_ {
         self.messages
             .iter()
             .filter_map(|m| m.message.content.secret_version())
-            .any(|v| current.is_none_or(|c| v > c))
+            .chain(
+                self.info
+                    .iter()
+                    .filter_map(|i| i.member_info.preferred_nickname.secret_version()),
+            )
+    }
+
+    /// The update that publishes it.
+    fn delta(&self, room: &LiveRoom) -> ChatRoomStateV1Delta {
+        match &self.info {
+            Some(info) => info_delta(room, info),
+            None => delta(room, &self.messages),
+        }
+    }
+
+    /// `room` with it applied, or why the room would not take it.
+    fn applied(&self, room: &LiveRoom) -> Result<LiveRoom, String> {
+        let Some(info) = &self.info else {
+            return applied(room, &self.messages);
+        };
+        let mut next = room.clone();
+        next.apply_delta(info_delta(room, info))
+            .map_err(|e| format!("The room refused it: {e}"))?;
+        match info_state(&next, info) {
+            InfoState::Ours => Ok(next),
+            InfoState::Superseded => Err(SUPERSEDED.into()),
+            InfoState::Absent => Err(REMOVED.into()),
+        }
+    }
+
+    /// Whether `room` holds it.
+    fn held_in(&self, room: &LiveRoom) -> bool {
+        // A nickname the room replaced is settled too: there is nothing more to send.
+        held(room, &self.messages)
+            && self
+                .info
+                .as_ref()
+                .is_none_or(|i| info_state(room, i) != InfoState::Absent)
+    }
+
+    /// Whether it carries anything to publish.
+    fn has_payload(&self) -> bool {
+        !self.messages.is_empty() || self.info.is_some()
     }
 
     /// Whether Retry can do anything for it.
@@ -571,10 +826,7 @@ impl Entry {
         let Some(current) = current else {
             return false;
         };
-        self.messages
-            .iter()
-            .filter_map(|m| m.message.content.secret_version())
-            .any(|v| v < current)
+        self.secret_versions().any(|v| v < current)
     }
 
     /// Why it is shown as not sent, if it is.
@@ -586,9 +838,6 @@ impl Entry {
         }
     }
 }
-
-/// What a message is stamped with. Tests set it.
-pub(super) type Clock = Box<dyn Fn() -> SystemTime + Send>;
 
 /// What the user sent that the node has not taken yet. It outlives a connection, and a
 /// session: the link keeps it while the session is stopped on something that needs the user.
@@ -642,9 +891,33 @@ impl Outbox {
         self.entries.is_empty()
     }
 
+    /// The version a new record of yours takes: above what the room holds and above every
+    /// nickname still waiting, so ones written in a row are published in order.
+    /// `None` when no version is left to sign at.
+    fn fresh_info_version(&self, room: &LiveRoom, exclude: u64) -> Option<u32> {
+        self.entries
+            .iter()
+            .filter(|e| e.room == room.stored.owner_vk && e.id != exclude)
+            .filter_map(|e| e.info.as_ref())
+            .map(|i| i.member_info.version)
+            .fold(held_info_version(room), u32::max)
+            .checked_add(1)
+    }
+
     fn add(&mut self, room: &LiveRoom, label: &'static str, intent: Option<Intent>) -> u64 {
         self.next += 1;
         let id = self.next;
+        let fresh = self.fresh_info_version(room, id);
+        if matches!(intent, Some(Intent::Nickname { .. })) {
+            // A newer nickname replaces one never sent (queued, or refused): sending both
+            // would let a retry of the older one come back later at a higher version.
+            self.entries.retain(|e| {
+                !(e.room == room.stored.owner_vk
+                    && e.info.is_some()
+                    && !e.sent
+                    && matches!(e.status, Status::Queued | Status::Failed(_)))
+            });
+        }
         let mut entry = Entry {
             id,
             room: room.stored.owner_vk,
@@ -654,11 +927,12 @@ impl Outbox {
             author: room.stored.self_verifying_key(),
             time: (self.clock)(),
             messages: Vec::new(),
+            info: None,
             status: Status::Queued,
             sent: false,
             forced: 0,
         };
-        rebuild(&mut entry, room);
+        rebuild(&mut entry, room, fresh);
         self.entries.push(entry);
         id
     }
@@ -706,6 +980,19 @@ impl Outbox {
             }
             Ok(m.id())
         };
+        if let Action::SetNickname { nickname } = &action {
+            let nickname = nickname.trim().to_owned();
+            let max = room
+                .stored
+                .room_state
+                .configuration
+                .configuration
+                .max_nickname_size;
+            return match nickname_refusal_in(&nickname, max) {
+                Some(why) => Err((NICKNAME_LABEL, why)),
+                None => Ok(Intent::Nickname { nickname }),
+            };
+        }
         let empty = match &action {
             Action::Send { text, .. } => text.trim().is_empty().then_some("Your message"),
             Action::Edit { text, .. } => text.trim().is_empty().then_some("Your edit"),
@@ -779,6 +1066,7 @@ impl Outbox {
             // the session takes them before they get here.
             Action::Retry { .. }
             | Action::Discard { .. }
+            | Action::SetNickname { .. }
             | Action::Invite
             | Action::CreateRoom { .. }
             | Action::Join { .. }
@@ -788,6 +1076,7 @@ impl Outbox {
     }
 
     fn retry(&mut self, id: u64, room: &LiveRoom) -> bool {
+        let fresh = self.fresh_info_version(room, id);
         let current = room.current_secret().map(|(_, v)| v);
         let Some(entry) = self
             .entries
@@ -819,7 +1108,20 @@ impl Outbox {
                 entry.time = (self.clock)();
                 entry.status = Status::Queued;
                 entry.sent = false;
-                rebuild(entry, room);
+                // A refused nickname is signed again at a fresh version, never one it already
+                // had: the node may have kept the refused record's version for another.
+                let above_old = entry
+                    .info
+                    .as_ref()
+                    .and_then(|i| i.member_info.version.checked_add(1));
+                let had = entry.info.is_some();
+                entry.info = None;
+                let fresh = match (fresh, above_old) {
+                    (Some(f), Some(o)) => Some(f.max(o)),
+                    (_, None) if had => None,
+                    (f, _) => f,
+                };
+                rebuild(entry, room, fresh);
             }
         }
         true
@@ -839,6 +1141,7 @@ impl Outbox {
         }
         let current = room.current_secret().map(|(_, v)| v);
         let me = room.stored.self_verifying_key();
+        let fresh = self.fresh_info_version(room, 0);
         for entry in self.entries.iter_mut() {
             if entry.room != vk || entry.status != Status::Queued {
                 continue;
@@ -848,6 +1151,25 @@ impl Outbox {
                 *changed = true;
                 continue;
             }
+            // A nickname signed for what the room was is signed again for what it is: a record
+            // made while the room was public must never go out plain into a room that has
+            // since turned private, and the deputy grants it carries must be the ones the room
+            // holds now (one revoked elsewhere would come back). It is a new record, at a
+            // fresh version above what the room holds.
+            if let Some(info) = &entry.info {
+                let me = info.member_info.member_id;
+                let stale = !privacy_matches(room, info)
+                    || (!entry.sent && held_deputies(room, me) != info.member_info.deputies);
+                if stale {
+                    entry.info = None;
+                    entry.sent = false;
+                    rebuild(entry, room, fresh);
+                    *changed = true;
+                    if entry.status != Status::Queued {
+                        continue;
+                    }
+                }
+            }
             if !entry.sent {
                 if let Err(blocked) = participation(room) {
                     entry.status = Status::Failed(blocked.reason().into());
@@ -856,13 +1178,13 @@ impl Outbox {
                 }
                 if entry.sealed_before(current) {
                     // Sealed again under the room's current secret, keeping its time.
-                    rebuild(entry, room);
+                    rebuild(entry, room, None);
                     *changed = true;
                     if entry.status != Status::Queued {
                         continue;
                     }
                 }
-                if let Err(e) = applied(room, &entry.messages) {
+                if let Err(e) = entry.applied(room) {
                     entry.status = Status::Failed(e);
                     *changed = true;
                     continue;
@@ -874,7 +1196,7 @@ impl Outbox {
             };
             entry.sent = true;
             self.owed.entry(vk).or_default().push_back((entry.id, now));
-            return Some(delta(room, &entry.messages));
+            return Some(entry.delta(room));
         }
         None
     }
@@ -916,15 +1238,35 @@ impl Outbox {
         match result {
             Ok(()) => {
                 let messages = self.entries[i].messages.clone();
-                match room.apply_delta(delta(room, &messages)) {
-                    Ok(()) if held(room, &messages) => {
+                let entry = self.entries[i].clone();
+                let applied = room.apply_delta(entry.delta(room));
+                let state = entry.info.as_ref().map(|info| info_state(room, info));
+                match applied {
+                    Ok(()) if state == Some(InfoState::Superseded) => {
+                        // Taken, but another record of yours won: never the cache.
+                        self.entries[i].status = Status::Unconfirmed(SUPERSEDED.into());
+                    }
+                    Ok(()) if entry.held_in(room) => {
+                        // Keep what is cached for re-adding us in step with the edit, as the
+                        // web UI's `record_self_nickname_edit` does, but only when this record
+                        // is the room's.
+                        if let (Some(info), Some(Intent::Nickname { nickname })) =
+                            (&entry.info, &entry.intent)
+                        {
+                            room.stored.self_member_info = Some(info.clone());
+                            room.stored.self_nickname = Some(nickname.clone());
+                        }
                         self.entries.remove(i);
                     }
                     // Taken by the node, so never built or sent again from here.
                     Ok(()) => {
                         self.entries[i].status = Status::Unconfirmed(format!(
                             "Freenet took it, but the room here doesn't show it. {}",
-                            why_not_kept(room, &messages)
+                            if entry.info.is_some() {
+                                REMOVED.to_owned()
+                            } else {
+                                why_not_kept(room, &messages)
+                            }
                         ));
                     }
                     Err(e) => {
@@ -1023,9 +1365,8 @@ impl Outbox {
     /// whatever their status. True when any were.
     pub fn reconcile(&mut self, room: &LiveRoom) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|e| {
-            e.room != room.stored.owner_vk || e.messages.is_empty() || !held(room, &e.messages)
-        });
+        self.entries
+            .retain(|e| e.room != room.stored.owner_vk || !e.has_payload() || !e.held_in(room));
         self.entries.len() != before
     }
 
@@ -1037,10 +1378,19 @@ impl Outbox {
 
     /// `room` with what is on its way applied, which entries show as rows (by message key),
     /// and the troubles with no row to show them on.
-    fn overlay(&self, room: &LiveRoom) -> (LiveRoom, HashMap<String, Pending>, Vec<Notice>) {
+    fn overlay(
+        &self,
+        room: &LiveRoom,
+    ) -> (
+        LiveRoom,
+        HashMap<String, Pending>,
+        Vec<Notice>,
+        Option<Pending>,
+    ) {
         let mut shown = room.clone();
         let mut rows = HashMap::new();
         let mut notices = Vec::new();
+        let mut own_nickname = None;
         for e in self
             .entries
             .iter()
@@ -1051,14 +1401,22 @@ impl Outbox {
             // unconfirmed may yet land, so its effect shows (and the next reaction counts it).
             let show = e.is_text() || !matches!(e.status, Status::Failed(_));
             let on_screen = show
-                && !e.messages.is_empty()
-                && match applied(&shown, &e.messages) {
+                && e.has_payload()
+                && match e.applied(&shown) {
                     Ok(next) => {
                         shown = next;
                         true
                     }
                     Err(_) => false,
                 };
+            if e.info.is_some() || matches!(e.intent, Some(Intent::Nickname { .. })) {
+                // The newest nickname change is the one the dialog shows.
+                own_nickname = Some(Pending {
+                    entry: e.id,
+                    failed: trouble.clone(),
+                    retry: e.retryable(),
+                });
+            }
             if on_screen && e.is_text() {
                 for m in &e.messages {
                     rows.insert(
@@ -1082,23 +1440,25 @@ impl Outbox {
                 });
             }
         }
-        (shown, rows, notices)
+        (shown, rows, notices, own_nickname)
     }
 
     /// The chat screen's view of `room`, with what is on its way shown as if sent and marked.
     pub fn view(&self, room: &LiveRoom, minutes: &dyn Fn(SystemTime) -> u32) -> Room {
         let mut view = if self.entries.iter().any(|e| e.room == room.stored.owner_vk) {
-            let (shown, rows, notices) = self.overlay(room);
+            let (shown, rows, notices, own_nickname) = self.overlay(room);
             let mut view = shown.view(minutes);
             for m in &mut view.messages {
                 m.pending = rows.get(&m.key).cloned();
             }
             view.notices = notices;
+            view.own_nickname = own_nickname;
             view
         } else {
             room.view(minutes)
         };
         view.send_block = participation(room).err().map(|b| b.reason().to_owned());
+        view.nickname_block = rejoin(room).0.is_some().then(|| PRUNED.to_owned());
         view
     }
 }
@@ -1106,10 +1466,37 @@ impl Outbox {
 /// Build `entry` again against `room`: at its time, under the room's current secret. Fails
 /// it when it cannot be built, or when the room's identity is no longer the one it was
 /// written as.
-fn rebuild(entry: &mut Entry, room: &LiveRoom) {
+fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>) {
     let Some(intent) = &entry.intent else {
         return;
     };
+    if let Intent::Nickname { nickname } = intent {
+        // Sealed again keeps the version it had; a new one takes `fresh_version`.
+        let Some(version) = entry
+            .info
+            .as_ref()
+            .map(|i| i.member_info.version)
+            .or(fresh_version)
+        else {
+            entry.status = Status::Failed(NO_VERSION_LEFT.into());
+            return;
+        };
+        match build_info(room, nickname, version) {
+            Ok((author, info)) => {
+                if entry.author.is_some_and(|a| a != author) {
+                    entry.status = Status::Failed(IDENTITY_CHANGED.into());
+                    return;
+                }
+                entry.author = Some(author);
+                entry.info = Some(info);
+                if let Err(e) = entry.applied(room) {
+                    entry.status = Status::Failed(e);
+                }
+            }
+            Err(e) => entry.status = Status::Failed(e),
+        }
+        return;
+    }
     match build(room, intent, entry.time) {
         Ok((author, messages)) => {
             if entry.author.is_some_and(|a| a != author) {
@@ -1118,7 +1505,7 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom) {
             }
             entry.author = Some(author);
             entry.messages = messages;
-            if let Err(e) = applied(room, &entry.messages) {
+            if let Err(e) = entry.applied(room) {
                 entry.status = Status::Failed(e);
             }
         }

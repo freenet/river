@@ -499,6 +499,13 @@ impl LiveRoom {
             unread,
             send_block: None,
             notices: Vec::new(),
+            nickname_limit: state
+                .configuration
+                .configuration
+                .max_nickname_size
+                .min(river_core::room_state::member_info::NICKNAME_CEILING),
+            own_nickname: None,
+            nickname_block: None,
         }
     }
 
@@ -525,7 +532,7 @@ impl LiveRoom {
             .member_info
             .canonical(id)
             .and_then(|i| self.unseal(&i.member_info.preferred_nickname))
-            .is_some_and(|n| !clean(&n).is_empty())
+            .is_some_and(|n| !shown_nickname(&n).is_empty())
     }
 
     fn nickname(&self, id: RiverMemberId, me: Option<RiverMemberId>) -> String {
@@ -541,7 +548,7 @@ impl LiveRoom {
             None if Some(id) == me => self.stored.self_nickname.clone().unwrap_or_default(),
             None => String::new(),
         };
-        let name = clean(&name);
+        let name = shown_nickname(&name);
         if name.is_empty() {
             format!("Member {id}")
         } else {
@@ -641,6 +648,21 @@ fn clean_multiline(s: &str) -> String {
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// A nickname as every River client shows it: the web UI's `sanitize_display_name` (copied
+/// verbatim in `chat::visual_fold`), so a name with invisible characters reads the same here as
+/// in the browser. Empty when there is nothing to show (nothing, or only whitespace and
+/// characters that draw nothing), for the stand-in "Member <id>"; the web UI shows "Unnamed"
+/// for a name made only of emoji, and so does this.
+fn shown_nickname(raw: &str) -> String {
+    use crate::chat::visual_fold::{UNNAMED, sanitize_display_name};
+    let shown = sanitize_display_name(raw);
+    if shown == UNNAMED && clean(raw).is_empty() {
+        String::new()
+    } else {
+        shown
+    }
 }
 
 /// A time as the chat's message time: minutes since 1970-01-01 in the local time zone.
