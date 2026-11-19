@@ -3,9 +3,9 @@
 //! they came to be in the room, and a warning when their name imitates the owner's.
 //!
 //! What it leaves out is what this app cannot do or know yet: sending a direct message, sharing
-//! an invite by one, banning, deputizing, and
-//! editing your own nickname (all moderation and profile commands). The first three are shown
-//! dimmed with the app's "not available yet" tooltip, not faked.
+//! an invite by one, banning and deputizing (moderation commands). Those are shown dimmed with
+//! the app's "not available yet" tooltip, not faked. Your own dialog edits your nickname
+//! (`nickname_editor`), as the web UI's `NicknameField` does.
 //!
 //! PARITY-GAPS: deputies. The view model carries no deputy grants, so there is no Deputy tag or
 //! "Deputized by" line, and only the owner's name is protected from imitation (the web UI also
@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 
 use rune::{El, col, el, icon, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit};
+use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextInput};
 
+use super::Chat;
 use super::conversation::avatar;
 use super::icons;
 use super::model::{Member, MemberId, Role, Room};
@@ -128,7 +129,124 @@ fn field(
         )
 }
 
-pub(super) fn member_modal(room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>) {
+/// Your own nickname, editable as the web UI's `NicknameField` is, but with Save and Cancel
+/// (and Enter to save). That is a deliberate divergence from the web UI, which saves when the
+/// field loses focus or on Enter: a change that signs and publishes room state should be an
+/// explicit act here, not a side effect of tabbing away. What is refused is said under the
+/// field, and a change on its way, or that failed, is shown with Retry and Discard. When the
+/// room would not take a change (you can't write there, or it removed you for inactivity) that
+/// is said before Save, which is then disabled.
+fn nickname_editor(room: &Room, m: &Member, chat: &Chat, p: &Palette, k: &Kit) -> El {
+    let pending = room.own_nickname.as_ref();
+    let sending = pending.is_some_and(|n| n.failed.is_none());
+    let problem = chat.nickname_problem().or_else(|| {
+        chat.nickname_error
+            .clone()
+            .filter(|_| chat.nickname.text.trim().is_empty())
+    });
+    let mut editor = col().key("member-nickname-edit").w_full().gap(8.0).child(
+        TextInput::new(&chat.nickname)
+            .label("Nickname".to_owned())
+            .placeholder("Your nickname in this room".to_owned())
+            .width(None)
+            .on_edit(|s: &mut RiverApp| &mut s.chat.nickname)
+            .on_key(|s: &mut RiverApp, ev, _| super::keys::word_keys(&mut s.chat.nickname, ev))
+            .on_submit(|s: &mut RiverApp, _| s.chat.submit_nickname())
+            .build(k)
+            .key("member-nickname-input")
+            .w_full(),
+    );
+    if !m.claimed && pending.is_none() {
+        editor = editor.child(
+            label(
+                "You haven't chosen a nickname in this room yet, so others see you as a number.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("member-nickname-unset"),
+        );
+    }
+    if let Some(problem) = problem {
+        editor = editor.child(
+            label(problem, st::SMALL, p.danger)
+                .wrap()
+                .w_full()
+                .key("member-nickname-error"),
+        );
+    }
+    let block = room.send_block.as_ref().or(room.nickname_block.as_ref());
+    if let Some(block) = block {
+        editor = editor.child(
+            label(block.clone(), st::SMALL, p.text_muted)
+                .wrap()
+                .w_full()
+                .key("member-nickname-blocked"),
+        );
+    }
+    if let Some(n) = pending {
+        let mut status = row()
+            .key("member-nickname-status")
+            .w_full()
+            .gap(8.0)
+            .center_y();
+        match &n.failed {
+            None => {
+                status = status.child(label("Sending\u{2026}", st::SMALL, p.text_muted));
+            }
+            Some(why) => {
+                status = status.child(
+                    label(why.clone(), st::SMALL, p.danger)
+                        .wrap()
+                        .shrink()
+                        .min_w(0.0),
+                );
+                if n.retry {
+                    status = status.child(
+                        Button::new("Retry")
+                            .variant(ButtonVariant::Ghost)
+                            .on_press(|s: &mut RiverApp| s.chat.retry_nickname())
+                            .build(k)
+                            .key("nickname-retry"),
+                    );
+                }
+                status = status.child(
+                    Button::new("Discard")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut RiverApp| s.chat.discard_nickname())
+                        .build(k)
+                        .key("nickname-discard"),
+                );
+            }
+        }
+        editor = editor.child(status);
+    }
+    let mut save = Button::new("Save")
+        .variant(ButtonVariant::Contrast)
+        .on_press(|s: &mut RiverApp| s.chat.submit_nickname())
+        .build(k)
+        .key("nickname-save");
+    if sending || block.is_some() {
+        save = save.disabled(true).opacity(0.45);
+    }
+    editor.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .justify_end()
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.close_member())
+                    .build(k)
+                    .key("nickname-cancel"),
+            )
+            .child(save),
+    )
+}
+
+pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
     let Some(m) = room.member_by_uid(uid) else {
         return;
@@ -204,6 +322,9 @@ pub(super) fn member_modal(room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>)
                 ),
         );
     body = body.child(tags);
+    if is_me {
+        body = body.child(nickname_editor(room, m, chat, &p, k));
+    }
     if let Some(owner) = imitated {
         body = body.child(
             col()

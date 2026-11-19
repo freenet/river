@@ -10,6 +10,7 @@ use super::conversation::{avatar, conversation, picker_overlay};
 use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
+use super::visual_fold;
 use super::{Chat, DialogKind, InviteState, LinkStatus, Source};
 use crate::RiverApp;
 use crate::rooms::work::{WorkState, WorkView};
@@ -54,7 +55,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
     if let Some(uid) = &chat.member_modal {
-        super::member_modal::member_modal(room, uid, &k, &mut layer);
+        super::member_modal::member_modal(chat, room, uid, &k, &mut layer);
     }
     screen = screen.child(conversation(chat, room, narrow, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);
@@ -797,6 +798,11 @@ fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
                 .truncate()
                 .shrink(),
         );
+    // The web UI shows every member whose name is nothing but symbols as "Unnamed", the same
+    // for each; the Member ID in their dialog is what tells them apart, so it is offered here.
+    if m.nickname == visual_fold::UNNAMED {
+        r = r.help(format!("Member ID {}", m.uid));
+    }
     if m.id == room.me {
         r = r.child(label("you", st::SMALL, p.text_muted));
     }

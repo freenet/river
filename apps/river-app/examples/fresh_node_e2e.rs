@@ -4,8 +4,9 @@
 //! work ([`Link`]) asks for a grant (approved here as the user would approve it on the page),
 //! registers the chat delegate, and reads an empty room list. Then the app on node A creates a
 //! room and makes an invitation, the app on node B joins from it, and each sends a message the
-//! other receives. Last, each node's chat delegate is asked directly (on a connection of its own
-//! with the app's grant) for the room's signing key, and must hold the key of that app's own
+//! other receives; each then changes its own nickname and the other sees it everywhere. Last,
+//! each node's chat delegate is asked directly (on a connection of its own with the app's
+//! grant) for the room's signing key, and must hold the key of that app's own
 //! member: the app's background key sweep puts it there.
 //!
 //! Then a newer River. On node A, pointer records signed by a throwaway key are PUT, first
@@ -471,6 +472,54 @@ fn newer_river(
 }
 
 /// A fresh store: registered (not missing), with no rooms.
+/// `bob` (a member) and then `alice` (the owner) change their own nickname in `room`, and each
+/// other's app shows the new name everywhere the room names a member, with nothing left
+/// waiting on the changer's own screen. The names are `<name>` plus a suffix, so reruns in the
+/// same room do not match an earlier run's.
+fn rename_both_ways(
+    alice: &mut App,
+    bob: &mut App,
+    room: &str,
+    key: &str,
+    bob_was: &str,
+    alice_was: &str,
+) {
+    let renamed = |app: &App, who: &str, name: &str| {
+        app.room(room).is_some_and(|r| {
+            r.members.iter().any(|m| m.nickname == name)
+                && !r.members.iter().any(|m| m.nickname == who)
+                && r.messages.iter().all(|m| r.nickname(m.author) != who)
+        })
+    };
+    let settled = |app: &App| app.room(room).is_some_and(|r| r.own_nickname.is_none());
+    let bob_now = format!("{bob_was} Two");
+    let alice_now = format!("{alice_was} Prime");
+    bob.send(
+        key,
+        Action::SetNickname {
+            nickname: format!("  {bob_now}  "),
+        },
+    );
+    alice.until("the other app sees Bob's new nickname everywhere", |app| {
+        renamed(app, bob_was, &bob_now)
+    });
+    bob.until("Bob's app shows its new nickname, settled", |app| {
+        renamed(app, bob_was, &bob_now) && settled(app)
+    });
+    alice.send(
+        key,
+        Action::SetNickname {
+            nickname: alice_now.clone(),
+        },
+    );
+    bob.until("the other app sees the owner's new nickname", |app| {
+        renamed(app, alice_was, &alice_now)
+    });
+    alice.until("the owner's app shows its new nickname, settled", |app| {
+        renamed(app, alice_was, &alice_now) && settled(app)
+    });
+}
+
 fn ready_and_empty(app: &App) -> bool {
     app.access == Some(Access::Ready) && app.rooms.is_empty() && !app.issues.store_missing
 }
@@ -563,6 +612,70 @@ fn main() {
         app.room(ROOM)
             .is_some_and(|r| r.members.iter().any(|m| m.nickname == "Bob"))
     });
+    // Changing your own nickname: a signed update the other node's app sees, for the joiner (a
+    // member's record, signed by their own key) and for the creator (the owner's, which the
+    // room checks against the owner's key).
+    rename_both_ways(&mut alice, &mut bob, ROOM, &key, "Bob", "Alice");
+    // A nickname over the room's limit (50 bytes) is refused by the app and said, and is
+    // never signed: what the app shows is checked, not how long a wait stayed quiet.
+    bob.send(
+        &key,
+        Action::SetNickname {
+            nickname: "n".repeat(51),
+        },
+    );
+    bob.until("node B says the 51-byte nickname was refused", |app| {
+        app.room(ROOM).is_some_and(|r| {
+            r.notices
+                .iter()
+                .any(|n| n.text.contains("this room allows at most 50"))
+        })
+    });
+    let refused = bob.room(ROOM).unwrap().notices[0].entry;
+    bob.send(&key, Action::Discard { entry: refused });
+    bob.until("the refusal is dismissed", |app| {
+        app.room(ROOM).is_some_and(|r| r.notices.is_empty())
+    });
+
+    // The same in a private room, where the nickname is sealed under the room's secret: the
+    // other app must open it with the secret it was invited with.
+    const PRIVATE: &str = "Fresh node private room";
+    alice.send(
+        "",
+        Action::CreateRoom {
+            name: PRIVATE.into(),
+            nickname: "Alice".into(),
+            private: true,
+        },
+    );
+    alice.until("the private room is created and shown", |app| {
+        app.room(PRIVATE).is_some()
+    });
+    let pkey = alice.room(PRIVATE).unwrap().key.clone();
+    alice.invites.clear();
+    alice.send(&pkey, Action::Invite);
+    alice.until("an invitation to the private room is made", |app| {
+        !app.invites.is_empty()
+    });
+    let plink = match alice.invites.pop().unwrap() {
+        (room, Ok(link)) if room == pkey => link,
+        other => panic!("no invitation: {:?}", other.1.map(|_| "<link>")),
+    };
+    bob.send(
+        "",
+        Action::Join {
+            code: InviteCode(plink),
+            nickname: "Bob".into(),
+        },
+    );
+    bob.until("the private room is joined and readable", |app| {
+        app.room(PRIVATE).is_some_and(|r| r.send_block.is_none())
+    });
+    alice.until("node A sees Bob in the private room", |app| {
+        app.room(PRIVATE)
+            .is_some_and(|r| r.members.iter().any(|m| m.nickname == "Bob"))
+    });
+    rename_both_ways(&mut alice, &mut bob, PRIVATE, &pkey, "Bob", "Alice");
     // Each app's own key is in its node's delegate for the room, asked of the delegate itself:
     // the creator's is the owner's, the joiner's is the invitee's own, and they differ.
     let owner = expect_signing_key("A", &alice.authority, &dir_a, &key);

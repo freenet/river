@@ -174,6 +174,9 @@ fn town_square() -> Room {
         unread: 0,
         send_block: None,
         notices: Vec::new(),
+        nickname_limit: 50,
+        own_nickname: None,
+        nickname_block: None,
     }
 }
 
@@ -220,6 +223,9 @@ fn design_crew() -> Room {
         unread: 2,
         send_block: None,
         notices: Vec::new(),
+        nickname_limit: 50,
+        own_nickname: None,
+        nickname_block: None,
     }
 }
 
@@ -256,6 +262,9 @@ fn rust_help() -> Room {
         unread: 2,
         send_block: None,
         notices: Vec::new(),
+        nickname_limit: 50,
+        own_nickname: None,
+        nickname_block: None,
     }
 }
 
@@ -281,6 +290,9 @@ fn family() -> Room {
         unread: 0,
         send_block: None,
         notices: Vec::new(),
+        nickname_limit: 50,
+        own_nickname: None,
+        nickname_block: None,
     }
 }
 
@@ -296,6 +308,9 @@ fn book_club() -> Room {
         unread: 0,
         send_block: None,
         notices: Vec::new(),
+        nickname_limit: 50,
+        own_nickname: None,
+        nickname_block: None,
     }
 }
 

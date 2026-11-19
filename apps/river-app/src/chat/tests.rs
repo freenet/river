@@ -1748,3 +1748,316 @@ fn following_the_inviter_keeps_the_keyboard_inside_the_dialog() {
         );
     }
 }
+
+// Editing your own nickname -----------------------------------------------------------------
+
+/// The node's rooms, with your own member info dialog open, opened by pressing your row.
+fn own_dialog(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
+    let mut rt = node_rooms(edit);
+    let me = rt.state.chat.room().map(|r| r.me).unwrap();
+    press(&mut rt, &format!("member-{me}"));
+    settle(&mut rt);
+    rt
+}
+
+/// Draw again after the test changed the state directly (the app does it through events).
+fn redraw(rt: &mut Runtime<RiverApp>) {
+    // A press on the dialog's own text changes nothing but draws again.
+    press(rt, "member-name");
+    settle(rt);
+}
+
+fn type_nickname(rt: &mut Runtime<RiverApp>, text: &str) {
+    rt.state.chat.nickname.replace_text(text);
+    redraw(rt);
+}
+
+#[test]
+fn your_own_dialog_has_an_editable_nickname_with_save_and_cancel() {
+    let rt = own_dialog(|_| {});
+
+    for part in ["member-nickname-input", "nickname-save", "nickname-cancel"] {
+        assert!(rt.find(part).is_some(), "no {part}");
+    }
+    assert_eq!(rt.state.chat.nickname.text, "Sam Rivers");
+    assert!(rt.state.chat.nickname.focused);
+    assert!(!shows(&rt, "Sending"));
+}
+
+#[test]
+fn someone_elses_dialog_has_no_nickname_field() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Jonas");
+    assert!(rt.find("member-nickname-input").is_none());
+    assert!(rt.find("nickname-save").is_none());
+    // And saving cannot reach their record from there.
+    rt.state.chat.submit_nickname();
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn saving_sends_the_trimmed_nickname_and_the_dialog_waits_for_the_node() {
+    let mut rt = own_dialog(|_| {});
+    type_nickname(&mut rt, "  Sam the Second  ");
+    press(&mut rt, "nickname-save");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::SetNickname {
+            nickname: "Sam the Second".into()
+        }]
+    );
+    assert!(
+        rt.state.chat.member_modal.is_some(),
+        "stays to show its state"
+    );
+
+    // The background work reports it on its way: Sending, and Save waits for it.
+    rt.state.chat.edit_rooms(|r| {
+        r[0].own_nickname = Some(super::model::Pending {
+            entry: 4,
+            failed: None,
+            retry: false,
+        })
+    });
+    redraw(&mut rt);
+    assert!(shows(&rt, "Sending"));
+    press(&mut rt, "nickname-save");
+    assert!(sent(&mut rt).is_empty(), "one change at a time");
+}
+
+#[test]
+fn enter_in_the_field_saves() {
+    let mut rt = own_dialog(|_| {});
+    type_nickname(&mut rt, "Enter Sam");
+    press(&mut rt, "member-nickname-input");
+    key(&mut rt, Key::Enter);
+    assert_eq!(
+        sent(&mut rt),
+        [Action::SetNickname {
+            nickname: "Enter Sam".into()
+        }]
+    );
+}
+
+#[test]
+fn a_failed_change_says_why_and_offers_retry_and_discard() {
+    let mut rt = own_dialog(|r| {
+        r[0].own_nickname = Some(super::model::Pending {
+            entry: 7,
+            failed: Some("Not saved. Freenet refused it: no room".into()),
+            retry: true,
+        })
+    });
+    assert!(shows(&rt, "Not saved. Freenet refused it: no room"));
+    press(&mut rt, "nickname-retry");
+    press(&mut rt, "nickname-discard");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::Retry { entry: 7 }, Action::Discard { entry: 7 }]
+    );
+    // A failed change does not stop a new one from being saved.
+    type_nickname(&mut rt, "Again");
+    press(&mut rt, "nickname-save");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::SetNickname {
+            nickname: "Again".into()
+        }]
+    );
+}
+
+#[test]
+fn what_the_room_would_refuse_is_said_in_the_dialog_and_not_sent() {
+    let mut rt = own_dialog(|r| r[0].nickname_limit = 12);
+    // Empty: said when saving.
+    type_nickname(&mut rt, "   ");
+    press(&mut rt, "nickname-save");
+    assert!(shows(&rt, "Nickname can't be empty."));
+    // Too long: said as it is typed, with the room's limit.
+    type_nickname(&mut rt, "0123456789abc");
+    assert!(shows(
+        &rt,
+        "Nickname is 13 bytes; this room allows at most 12."
+    ));
+    press(&mut rt, "nickname-save");
+    // Characters that don't show.
+    type_nickname(&mut rt, "eve\u{202e}");
+    assert!(shows(&rt, "Nicknames can't contain emoji"));
+    press(&mut rt, "nickname-save");
+    assert!(sent(&mut rt).is_empty());
+    assert!(
+        rt.state.chat.member_modal.is_some(),
+        "the dialog stays open"
+    );
+    // Fixed, it saves and the message goes.
+    type_nickname(&mut rt, "ok");
+    assert!(!shows(&rt, "characters that don't show"));
+    press(&mut rt, "nickname-save");
+    assert_eq!(sent(&mut rt).len(), 1);
+}
+
+#[test]
+fn the_same_nickname_closes_the_dialog_and_sends_nothing() {
+    let mut rt = own_dialog(|_| {});
+    press(&mut rt, "nickname-save");
+    assert!(sent(&mut rt).is_empty());
+    assert!(rt.state.chat.member_modal.is_none());
+}
+
+#[test]
+fn cancel_closes_the_dialog_and_sends_nothing() {
+    let mut rt = own_dialog(|_| {});
+    type_nickname(&mut rt, "Never Sent");
+    press(&mut rt, "nickname-cancel");
+    assert!(sent(&mut rt).is_empty());
+    assert!(rt.state.chat.member_modal.is_none());
+    // Reopened, it starts from the real nickname, not the abandoned one.
+    let me = {
+        let room = rt.state.chat.room().unwrap();
+        room.member(room.me).unwrap().uid.clone()
+    };
+    rt.state.chat.open_member(&me);
+    assert_eq!(rt.state.chat.nickname.text, "Sam Rivers");
+}
+
+#[test]
+fn without_a_nickname_the_field_starts_empty_and_says_so() {
+    let mut rt = own_dialog(|r| {
+        let room = &mut r[0];
+        let me = room.me;
+        let m = room.members.iter_mut().find(|m| m.id == me).unwrap();
+        m.nickname = format!("Member {me}");
+        m.claimed = false;
+    });
+    assert_eq!(rt.state.chat.nickname.text, "");
+    assert!(rt.find("member-nickname-unset").is_some());
+    // The stand-in name is not a nickname to keep: saving nothing is refused.
+    press(&mut rt, "nickname-save");
+    assert!(shows(&rt, "Nickname can't be empty."));
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn a_room_you_cannot_write_in_says_why_before_save_and_sends_nothing() {
+    for (block, mutate) in [
+        (
+            "You have been banned from sending messages in this room.",
+            (|r: &mut super::Room| {
+                r.send_block =
+                    Some("You have been banned from sending messages in this room.".into())
+            }) as fn(&mut super::Room),
+        ),
+        (
+            crate::rooms::outbox::PRUNED_MESSAGE,
+            |r: &mut super::Room| {
+                r.nickname_block = Some(crate::rooms::outbox::PRUNED_MESSAGE.into())
+            },
+        ),
+    ] {
+        let mut rt = own_dialog(|r| mutate(&mut r[0]));
+        assert!(shows(&rt, block), "the reason is shown before Save");
+        let save = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("nickname-save"))
+            .unwrap();
+        assert!(save.opacity < 0.9, "Save is drawn disabled");
+        type_nickname(&mut rt, "Nope");
+        press(&mut rt, "nickname-save");
+        rt.state.chat.submit_nickname();
+        assert!(sent(&mut rt).is_empty(), "nothing is sent: {block}");
+    }
+}
+
+#[test]
+fn in_the_example_rooms_the_change_is_made_in_memory() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    open_member(&mut rt, "Sam Rivers");
+    type_nickname(&mut rt, "Sam R.");
+    press(&mut rt, "nickname-save");
+    assert!(rt.state.chat.member_modal.is_none());
+    let room = rt.state.chat.room().unwrap();
+    assert_eq!(room.nickname(room.me), "Sam R.");
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn a_nickname_change_updates_the_members_list_and_messages() {
+    // What the view shows once the room holds the new name: the same member, new name,
+    // everywhere it is drawn.
+    let mut rt = own_dialog(|_| {});
+    rt.state.chat.edit_rooms(|r| {
+        let me = r[0].me;
+        r[0].members
+            .iter_mut()
+            .find(|m| m.id == me)
+            .unwrap()
+            .nickname = "Brand New".into();
+    });
+    press(&mut rt, "nickname-cancel");
+    rt.frame(0.7);
+    assert!(
+        texts(&rt)
+            .iter()
+            .filter(|t| t.as_str() == "Brand New")
+            .count()
+            >= 2
+    );
+    assert!(!shows(&rt, "Sam Rivers"));
+}
+
+#[test]
+fn a_rename_shows_in_the_room_list_preview() {
+    let mut rt = node_rooms(|r| {
+        let room = &mut r[0];
+        let who = room.last_message().unwrap().author;
+        room.members
+            .iter_mut()
+            .find(|m| m.id == who)
+            .unwrap()
+            .nickname = "Renamed Rae".into();
+    });
+    settle(&mut rt);
+    assert!(shows(&rt, "Renamed Rae: "), "{:?}", texts(&rt));
+}
+
+#[test]
+fn the_same_name_with_other_spacing_is_the_same_name() {
+    let mut rt = own_dialog(|r| {
+        let room = &mut r[0];
+        let me = room.me;
+        room.members
+            .iter_mut()
+            .find(|m| m.id == me)
+            .unwrap()
+            .nickname = "Bob Smith".into();
+    });
+    assert_eq!(rt.state.chat.nickname.text, "Bob Smith");
+    type_nickname(&mut rt, "  Bob   Smith ");
+    press(&mut rt, "nickname-save");
+    assert!(sent(&mut rt).is_empty());
+    assert!(rt.state.chat.member_modal.is_none());
+}
+
+#[test]
+fn members_whose_names_are_only_symbols_are_all_unnamed_with_their_id_to_tell_them_apart() {
+    // As the web UI: every such member is "Unnamed" in the list; the Member ID in the dialog
+    // (and here, the row's hint) is what distinguishes them.
+    let rt = node_rooms(|r| {
+        let room = &mut r[0];
+        for m in room.members.iter_mut().filter(|m| m.id != room.me).take(2) {
+            m.nickname = super::visual_fold::UNNAMED.to_owned();
+        }
+    });
+    let hinted: Vec<_> = rt
+        .elements()
+        .into_iter()
+        .filter(|e| {
+            e.help
+                .as_deref()
+                .is_some_and(|h| h.starts_with("Member ID "))
+        })
+        .collect();
+    assert_eq!(hinted.len(), 2);
+    assert_ne!(hinted[0].help, hinted[1].help);
+}

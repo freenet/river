@@ -1511,6 +1511,199 @@ pub fn folds_to_generated_handle(name: &str) -> bool {
     false
 }
 
+//@@ display_name.rs
+/// Rendered in place of a nickname that is empty once sanitised (e.g. the
+/// nickname was nothing but emoji). Distinct from `"Unknown"`, which callers
+/// already use for "no `member_info` record at all", so the two cases stay
+/// distinguishable in the UI.
+pub const UNNAMED: &str = "Unnamed";
+
+//@@ display_name.rs
+/// Shown next to a nickname `<input>` whose contents would not survive
+/// [`sanitize_display_name`]. One wording, used by every nickname input, so a
+/// user gets the same explanation wherever they hit it.
+pub const EMOJI_REJECTION_MESSAGE: &str = "Nicknames can't contain emoji";
+
+//@@ display_name.rs
+/// Whether `c` is an Ideographic Variation Selector (VS17..VS256).
+///
+/// These sit inside plane 14's Default_Ignorable range but are the one part of
+/// it that is NOT invisible: they SELECT A GLYPH. Japanese family names are
+/// routinely spelled with one — `辻` has the variant `辻󠄀` (U+8FBB U+E0100), and
+/// `邊`/`邉`, `﨑`, `髙` work the same way — and any font with an IVS table
+/// (Source Han, Noto CJK) renders the selected form. Stripping them blanket-
+/// wise rewrote real names, and because [`contains_hidden_chars`] gates the
+/// nickname `<input>`, it also told those users their own name "can't contain
+/// emoji" and refused to save it.
+///
+/// So they are judged in context instead, exactly like `U+200C`/`U+200D`: kept
+/// where they can be doing the work they exist for, dropped everywhere else.
+fn is_variation_selector_supplement(c: char) -> bool {
+    matches!(u32::from(c), 0xE0100..=0xE01EF)
+}
+
+//@@ display_name.rs
+/// The ideographs a variation selector may legitimately follow. These are the
+/// blocks the Ideographic Variation Database actually registers sequences for;
+/// after anything else a selector is invisible filler.
+fn is_ideograph(c: char) -> bool {
+    matches!(u32::from(c),
+        // CJK Unified Ideographs Extension A, and the main block.
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF
+        // CJK Compatibility Ideographs (where `﨑` lives).
+        | 0xF900..=0xFAFF
+        // Extensions B onwards, plus the compatibility supplement.
+        | 0x20000..=0x323AF
+    )
+}
+
+//@@ display_name.rs
+/// Whether the variation selector at `chars[i]` can be selecting a glyph, i.e.
+/// it directly follows an ideograph.
+///
+/// Anywhere else it renders as nothing and clones the surrounding name, so it
+/// is dropped for the same reason an orphaned joiner is. `"Ian\u{E0100}"` is a
+/// clone of `"Ian"`; `"辻\u{E0100}"` is a person's name.
+fn selects_an_ideograph_variant(chars: &[char], i: usize) -> bool {
+    i > 0 && chars.get(i - 1).copied().is_some_and(is_ideograph)
+}
+
+//@@ display_name.rs
+/// Whether `s` contains anything [`sanitize_display_name`] would remove.
+///
+/// Drives the nickname `<input>`'s "Nicknames can't contain emoji" message —
+/// UX only. Never rely on this for safety: the render-time strip is the
+/// boundary, because `riverctl` never runs this code.
+///
+/// Position-sensitive for the same characters [`sanitize_display_name`] judges
+/// in context, so it cannot reject a name the sanitiser would have kept: a
+/// variation selector after an ideograph is a legitimate Japanese name and is
+/// NOT flagged, while the same selector after `n` is invisible filler and is.
+pub fn contains_hidden_chars(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    chars.iter().enumerate().any(|(i, c)| {
+        if is_variation_selector_supplement(*c) {
+            return !selects_an_ideograph_variant(&chars, i);
+        }
+        is_display_hidden(*c)
+    })
+}
+
+//@@ display_name.rs
+/// Strip everything [`is_display_hidden`] rejects and tidy the result.
+///
+/// Removing a character can leave a double space (`"Alice 🛡 Smith"`), so
+/// internal whitespace runs are collapsed to one space and the result is
+/// trimmed. A name that is empty afterwards becomes [`UNNAMED`] rather than a
+/// blank author line.
+///
+/// A removed character that was itself whitespace (a newline, a paragraph
+/// separator) becomes a space rather than vanishing, so `"Alice\nBob"` stays
+/// two words instead of collapsing to `"AliceBob"`. Zero-width characters are
+/// not whitespace, so `"A\u{200B}lice"` correctly rejoins as `"Alice"`.
+///
+/// Only runs of ASCII space are collapsed, and only interior ones. Non-ASCII
+/// spaces are left alone: U+3000 IDEOGRAPHIC SPACE is the conventional
+/// separator between a Japanese surname and given name (`山田　太郎`), and
+/// normalising it to `' '` would quietly rewrite a real name.
+pub fn sanitize_display_name(raw: &str) -> String {
+    // 1. Remove the hidden characters. A hidden character that was itself
+    //    whitespace becomes a space so words don't run together.
+    //
+    //    A variation selector is judged here rather than by the blanket strip,
+    //    because whether it is a Japanese name or invisible filler depends on
+    //    what precedes it. Same decision, same inputs as
+    //    [`contains_hidden_chars`], so the input check and the render strip
+    //    cannot disagree about a given name.
+    let raw_chars: Vec<char> = raw.chars().collect();
+    let stripped: Vec<char> = raw_chars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| {
+            if is_variation_selector_supplement(c) {
+                return selects_an_ideograph_variant(&raw_chars, i).then_some(c);
+            }
+            match (is_display_hidden(c), c.is_whitespace()) {
+                (true, true) => Some(' '),
+                (true, false) => None,
+                (false, _) => Some(c),
+            }
+        })
+        .collect();
+
+    // 2. Keep a joiner only where it can be doing orthographic work, which is
+    //    between two NON-ASCII letters (Persian `علی‌رضا`, Sinhala `සූර්‍ය`,
+    //    Malayalam chillu — which is consonant + virama + ZWJ and legitimately
+    //    ENDS a name, so a trailing joiner after a non-ASCII letter is kept
+    //    too). Everywhere else it is dropped, which covers two cases:
+    //
+    //    * Orphans left by step 1: `"Bob 👮🏽‍♀️"` strips down to `"Bob ‍"`.
+    //    * The clone attack `"Bo\u{200D}b"`, which renders exactly like
+    //      `"Bob"` in any Latin font. Latin script never needs a joiner, so
+    //      requiring a non-ASCII neighbour costs nothing and closes it.
+    //
+    //    A joiner between two non-ASCII letters is still kept, so a CJK name
+    //    can still be cloned this way. That is the residual documented in the
+    //    module header, and it is the same shape as the homoglyph problem.
+    let is_joiner = |c: char| c == '\u{200C}' || c == '\u{200D}';
+    let joins_letters =
+        |c: Option<&char>| c.is_some_and(|c| !c.is_ascii() && !c.is_whitespace() && !is_joiner(*c));
+    let kept: Vec<char> = stripped
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            !is_joiner(**c)
+                || (*i > 0
+                    && joins_letters(stripped.get(i - 1))
+                    // A joiner is legitimate at the end of a WORD, not just at
+                    // the end of the string: Malayalam legacy chillu is
+                    // consonant + virama + ZWJ, so `"മോഹന\u{0D4D}\u{200D} കുമാർ"`
+                    // (Mohan Kumar) carries one mid-name, and word-final ZWNJ
+                    // does the same in Persian and Kurdish. Requiring
+                    // end-of-string dropped it and degraded the chillu `ൻ` to
+                    // `ന്`, showing a chandrakkala that is not part of the name.
+                    // So: no next character, a non-ASCII letter, or whitespace.
+                    //
+                    // This does not widen the Latin clone surface — the
+                    // PRECEDING character must still be a non-ASCII letter, so
+                    // `"Bo\u{200D}b"` stays closed. It does add word-final
+                    // positions to the non-ASCII residual already documented in
+                    // the module header (an interior joiner in a CJK name), so
+                    // no new capability, just more places for the same one.
+                    && stripped
+                        .get(i + 1)
+                        .is_none_or(|n| joins_letters(Some(n)) || n.is_whitespace()))
+        })
+        .map(|(_, c)| *c)
+        .collect();
+
+    // 3. Normalise the spaces that are visually IDENTICAL to U+0020 (NBSP and
+    //    friends) down to it, then collapse runs. Normalising loses nothing a
+    //    reader can see, and it closes the `"Alice\u{00A0}Smith"` clone of
+    //    `"Alice Smith"`. U+3000 IDEOGRAPHIC SPACE is deliberately NOT in this
+    //    set: it renders double-width, it is visibly different, and it is the
+    //    conventional separator in a Japanese name (`山田　太郎`).
+    let looks_like_a_plain_space =
+        |c: char| matches!(u32::from(c), 0x00A0 | 0x2000..=0x200A | 0x202F | 0x205F);
+    let mut collapsed = String::with_capacity(kept.len());
+    let mut last_was_space = false;
+    for c in kept {
+        let c = if looks_like_a_plain_space(c) { ' ' } else { c };
+        let is_space = c == ' ';
+        if !(is_space && last_was_space) {
+            collapsed.push(c);
+        }
+        last_was_space = is_space;
+    }
+
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        UNNAMED.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
