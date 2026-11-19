@@ -4617,6 +4617,24 @@ fn a_settled_rename_survives_a_store_read_and_a_newer_stored_one_wins() {
         shown(&rooms, &a).stored.self_nickname.as_deref(),
         Some("From The Web")
     );
+    // A record of someone else's, at any version, is not ours to cache.
+    let mut foreign = a.stored();
+    let other = SigningKey::from_bytes(&[55; 32]);
+    foreign.self_member_info = Some(AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: MemberId::from(&other.verifying_key()),
+            version: 99,
+            preferred_nickname: SealedBytes::public(b"Stranger".to_vec()),
+            deputies: Vec::new(),
+        },
+        &other,
+    ));
+    foreign.self_nickname = Some("Stranger".into());
+    rooms.replace(loaded(vec![foreign]));
+    assert_eq!(
+        shown(&rooms, &a).stored.self_nickname.as_deref(),
+        Some("From The Web")
+    );
     // An older stored one is not.
     let mut old = a.stored();
     old.self_member_info = Some(record(2, "Old"));

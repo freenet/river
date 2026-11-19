@@ -1338,7 +1338,20 @@ impl Outbox {
                 }
             }
             Err(reason) => {
-                self.entries[i].status = Status::Failed(format!("Freenet refused it: {reason}"));
+                // A nickname refused while a newer one of yours exists is simply replaced:
+                // a Retry would sign it above the newer and put the old name back.
+                let (vk, id) = (self.entries[i].room, self.entries[i].id);
+                let replaced = self.entries[i].label == NICKNAME_LABEL
+                    && self
+                        .entries
+                        .iter()
+                        .any(|e| e.room == vk && e.label == NICKNAME_LABEL && e.id > id);
+                if replaced {
+                    self.entries.remove(i);
+                } else {
+                    self.entries[i].status =
+                        Status::Failed(format!("Freenet refused it: {reason}"));
+                }
             }
         }
         true

@@ -1922,6 +1922,8 @@ fn same_room(kept: &StoredRoom, slot: &StoredRoom) -> bool {
         && kept.invitation_secrets == slot.invitation_secrets
 }
 
+use river_core::room_state::member::MemberId as SelfId;
+
 /// The record of yours cached for re-adding you, and the nickname beside it. This app writes
 /// them in memory when a nickname of yours settles and never into the store; the web UI writes
 /// them into the store. A read keeps whichever is newer by the record's version: the stored
@@ -1929,7 +1931,21 @@ fn same_room(kept: &StoredRoom, slot: &StoredRoom) -> bool {
 /// has not caught up with. Not a reason to take the stored room whole: that would drop the
 /// write, and rebuild the room on every read after a rename.
 fn newer_self_cache(kept: &mut StoredRoom, slot: &StoredRoom) {
-    let version = |r: &StoredRoom| r.self_member_info.as_ref().map(|i| i.member_info.version);
+    // Only a record of ours counts, as when the version to sign is chosen.
+    let me = |r: &StoredRoom| r.self_verifying_key().map(|vk| SelfId::from(&vk));
+    let version = |r: &StoredRoom| {
+        r.self_member_info
+            .as_ref()
+            .filter(|i| Some(i.member_info.member_id) == me(r))
+            .map(|i| i.member_info.version)
+    };
+    if slot
+        .self_member_info
+        .as_ref()
+        .is_some_and(|i| Some(i.member_info.member_id) != me(slot))
+    {
+        return;
+    }
     let adopt = match (version(kept), version(slot)) {
         (Some(ours), Some(theirs)) => theirs > ours,
         (Some(_), None) => false,

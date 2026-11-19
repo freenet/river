@@ -2510,3 +2510,27 @@ fn a_refused_nickname_is_replaced_by_a_newer_one_and_cannot_come_back() {
         SealedBytes::public(b"Newer".to_vec())
     );
 }
+
+#[test]
+fn an_older_nickname_refused_after_a_newer_one_was_written_is_gone_and_cannot_come_back() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Older"));
+    next_info(&mut outbox, &room);
+    // Not late: still out, so it is kept when the newer is written.
+    outbox.command(&room, nick("Newer"));
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices.is_empty(), "{:?}", view.notices);
+    assert!(view.own_nickname.is_none_or(|p| !p.retry));
+    // Only the newer goes out, and is held.
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Newer".to_vec())
+    );
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    assert_eq!(shown_name(&outbox, &room), "Newer");
+}
