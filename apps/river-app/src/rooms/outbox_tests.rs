@@ -2426,3 +2426,87 @@ fn a_member_just_joined_or_with_a_removed_inviter_is_told_neutrally() {
     assert!(!PRUNED.contains("removed you"));
     assert!(PRUNED.contains("doesn't list you as a member"));
 }
+
+#[test]
+fn my_own_newer_nickname_is_not_reported_as_made_elsewhere() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Older"));
+    let (_, older) = next_info(&mut outbox, &room);
+    // Unanswered for a long time, so still out and still owed.
+    assert!(outbox.expire(
+        Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(5)
+    ));
+    outbox.command(&room, nick("Newer"));
+    // The newer one is the room's canonical record (it went out on another connection, or the
+    // network echoed it).
+    let newer = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: f.me_id(),
+            version: older.member_info.version + 1,
+            preferred_nickname: SealedBytes::public(b"Newer".to_vec()),
+            deputies: Vec::new(),
+        },
+        &f.me,
+    );
+    merge_info(&mut room, newer);
+    outbox.requeue();
+    // Older is sent again first; before it is answered the network brings the newer in.
+    assert!(outbox.reconcile(&mut room));
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices.is_empty(), "{:?}", view.notices);
+    assert!(view.own_nickname.is_none());
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_newer_nickname_settling_by_the_nodes_answer_drops_an_older_one_still_owed() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Older"));
+    next_info(&mut outbox, &room);
+    assert!(outbox.expire(
+        Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(5)
+    ));
+    outbox.command(&room, nick("Newer"));
+    // A new connection owes nothing: the newer goes first only if the older is not queued, so
+    // the older is answered (taken), then the newer.
+    outbox.requeue();
+    next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Ok(())));
+    next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Ok(())));
+    assert!(outbox.is_empty());
+    assert!(outbox.view(&room, &minutes).notices.is_empty());
+    assert_eq!(shown_name(&outbox, &room), "Newer");
+}
+
+#[test]
+fn a_refused_nickname_is_replaced_by_a_newer_one_and_cannot_come_back() {
+    let f = Fixture::new();
+    let mut room = public_room(&f);
+    let mut outbox = outbox();
+    outbox.command(&room, nick("Refused"));
+    next_info(&mut outbox, &room);
+    assert!(outbox.answered(&mut room, Err("no".into())));
+    let refused = outbox.view(&room, &minutes).own_nickname.unwrap();
+    assert!(refused.retry, "it was sent, and refused");
+    outbox.command(&room, nick("Newer"));
+    let view = outbox.view(&room, &minutes);
+    assert!(view.notices.is_empty());
+    assert!(!outbox.command(
+        &room,
+        Action::Retry {
+            entry: refused.entry
+        }
+    ));
+    let (_, info) = next_info(&mut outbox, &room);
+    assert_eq!(
+        info.member_info.preferred_nickname,
+        SealedBytes::public(b"Newer".to_vec())
+    );
+}

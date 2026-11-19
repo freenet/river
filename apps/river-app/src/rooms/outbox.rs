@@ -383,9 +383,8 @@ pub(super) fn delta(room: &LiveRoom, messages: &[AuthorizedMessageV1]) -> ChatRo
 /// inactivity, or not yet shown as joined. Which of those it is cannot be told from here.
 pub const PRUNED_MESSAGE: &str = PRUNED;
 
-pub(crate) const PRUNED: &str = "The room doesn't list you as a member right now (it removes \
-     members who haven't written for a long time). Send a message to be added back, then \
-     change your nickname.";
+pub(crate) const PRUNED: &str = "The room doesn't list you as a member yet. Send a message \
+     first, then change your nickname.";
 
 /// What an entry labels itself as when it is about your nickname.
 const NICKNAME_LABEL: &str = "Your nickname";
@@ -964,13 +963,14 @@ impl Outbox {
         let id = self.next;
         let fresh = self.fresh_info_version(room, id);
         if matches!(intent, Some(Intent::Nickname { .. })) {
-            // A newer nickname replaces one never sent (queued, or refused): sending both
-            // would let a retry of the older one come back later at a higher version.
+            // A newer nickname replaces every older one that is not on its way: waiting,
+            // refused, or taken but replaced. Keeping one would let its Retry bring the old
+            // name back at a higher version than this. One that is out keeps its turn: the
+            // node's answer for it is still owed.
             self.entries.retain(|e| {
                 !(e.room == room.stored.owner_vk
                     && e.label == NICKNAME_LABEL
-                    && !e.sent
-                    && matches!(e.status, Status::Queued | Status::Failed(_)))
+                    && !matches!(e.status, Status::InFlight { .. }))
             });
         }
         let mut entry = Entry {
@@ -1312,6 +1312,11 @@ impl Outbox {
                             room.stored.self_nickname = Some(nickname.clone());
                         }
                         self.entries.remove(i);
+                        // A newer change of yours is the room's now, so an older one still
+                        // waiting for its answer is explained by it.
+                        self.entries.retain(|e| {
+                            !(e.room == entry.room && e.label == NICKNAME_LABEL && e.id < entry.id)
+                        });
                     }
                     // Taken by the node, so never built or sent again from here.
                     Ok(()) => {
@@ -1427,12 +1432,22 @@ impl Outbox {
         let mut cache = None;
         let vk = room.stored.owner_vk;
         let mut keep = Vec::with_capacity(self.entries.len());
-        for mut e in std::mem::take(&mut self.entries) {
+        let entries = std::mem::take(&mut self.entries);
+        // The newest change of yours here: an older one is replaced by it, not by "elsewhere".
+        let newest_own = entries
+            .iter()
+            .filter(|e| e.room == vk && e.info.is_some())
+            .map(|e| e.id)
+            .max();
+        for mut e in entries {
             if e.room != vk || !e.has_payload() {
                 keep.push(e);
                 continue;
             }
             match e.info.as_ref().map(|i| info_state(room, i)) {
+                Some(InfoState::Superseded) if newest_own.is_some_and(|n| n > e.id) => {
+                    changed = true;
+                }
                 Some(InfoState::Superseded) => {
                     let already = matches!(&e.status, Status::Failed(w) | Status::Unconfirmed(w) if w == SUPERSEDED);
                     if !already {

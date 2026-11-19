@@ -1528,6 +1528,7 @@ impl Rooms {
             let room = match old.remove(&vk) {
                 Some(mut kept) if same_room(&kept.stored, &slot) => {
                     kept.stored.last_read_message_id = slot.last_read_message_id.clone();
+                    newer_self_cache(&mut kept.stored, &slot);
                     if let Err(e) = kept.merge_state(&slot.room_state) {
                         eprintln!("River: the stored copy of a room was not merged: {e}");
                         self.not_updated.insert(vk);
@@ -1919,7 +1920,26 @@ fn same_room(kept: &StoredRoom, slot: &StoredRoom) -> bool {
             == slot.self_sk.as_ref().map(|k| k.to_bytes())
         && kept.self_vk == slot.self_vk
         && kept.invitation_secrets == slot.invitation_secrets
-        && kept.self_nickname == slot.self_nickname
+}
+
+/// The record of yours cached for re-adding you, and the nickname beside it. This app writes
+/// them in memory when a nickname of yours settles and never into the store; the web UI writes
+/// them into the store. A read keeps whichever is newer by the record's version: the stored
+/// one when the web UI changed it since (its record is above ours), else ours, which the store
+/// has not caught up with. Not a reason to take the stored room whole: that would drop the
+/// write, and rebuild the room on every read after a rename.
+fn newer_self_cache(kept: &mut StoredRoom, slot: &StoredRoom) {
+    let version = |r: &StoredRoom| r.self_member_info.as_ref().map(|i| i.member_info.version);
+    let adopt = match (version(kept), version(slot)) {
+        (Some(ours), Some(theirs)) => theirs > ours,
+        (Some(_), None) => false,
+        // Nothing of ours: whatever the store holds, as before.
+        (None, _) => true,
+    };
+    if adopt {
+        kept.self_member_info = slot.self_member_info.clone();
+        kept.self_nickname = slot.self_nickname.clone();
+    }
 }
 
 /// The web UI's room order (`Rooms::ordered_room_keys`): the stored order first, then the

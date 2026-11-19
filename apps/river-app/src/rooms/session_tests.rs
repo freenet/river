@@ -4565,3 +4565,65 @@ fn a_newer_record_during_a_slow_first_read_stops_the_registration() {
     assert_eq!(writes_taken(&node), (0, 0, 0, 0, 0));
     assert!(node.with(|w| w.unregistered));
 }
+
+/// A rename settled in memory is not undone, and does not make the next read rebuild the room:
+/// the cache it writes (`self_member_info`, `self_nickname`) is ours until the store has a
+/// newer one.
+#[test]
+fn a_settled_rename_survives_a_store_read_and_a_newer_stored_one_wins() {
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use river_core::room_state::privacy::SealedBytes;
+    let mut rooms = Rooms::default();
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    rooms.replace(loaded(vec![a.stored()]));
+    let record = |version: u32, name: &str| {
+        AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo {
+                member_id: MemberId::from(&a.owner.verifying_key()),
+                version,
+                preferred_nickname: SealedBytes::public(name.as_bytes().to_vec()),
+                deputies: Vec::new(),
+            },
+            &a.owner,
+        )
+    };
+    // The rename settled here.
+    {
+        let kept = rooms.list.first_mut().unwrap();
+        kept.stored.self_member_info = Some(record(6, "Renamed"));
+        kept.stored.self_nickname = Some("Renamed".into());
+    }
+    // The store, which has not caught up, is read again: the room is kept, with the rename.
+    assert!(rooms.replace(loaded(vec![a.stored()])).is_empty());
+    let kept = shown(&rooms, &a);
+    assert_eq!(kept.stored.self_nickname.as_deref(), Some("Renamed"));
+    assert_eq!(
+        kept.stored
+            .self_member_info
+            .as_ref()
+            .unwrap()
+            .member_info
+            .version,
+        6
+    );
+
+    // The web UI renamed since: its record is newer, so the store's is taken.
+    let mut web = a.stored();
+    web.self_member_info = Some(record(9, "From The Web"));
+    web.self_nickname = Some("From The Web".into());
+    assert!(rooms.replace(loaded(vec![web])).is_empty());
+    assert_eq!(
+        shown(&rooms, &a).stored.self_nickname.as_deref(),
+        Some("From The Web")
+    );
+    // An older stored one is not.
+    let mut old = a.stored();
+    old.self_member_info = Some(record(2, "Old"));
+    old.self_nickname = Some("Old".into());
+    rooms.replace(loaded(vec![old]));
+    assert_eq!(
+        shown(&rooms, &a).stored.self_nickname.as_deref(),
+        Some("From The Web")
+    );
+}
