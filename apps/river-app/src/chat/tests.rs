@@ -977,3 +977,171 @@ fn a_message_that_stops_being_cheap_after_its_line_breaks_is_plain_text() {
     });
     assert!(shows(&rt, "](https://evil.example/)"), "{:?}", texts(&rt));
 }
+
+#[test]
+fn dragging_over_a_message_selects_it_and_copy_takes_the_text() {
+    let board = rune::clipboard::memory();
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.use_clipboard(&board);
+    rt.frame(0.1);
+    let room = rt.state.chat.room().unwrap();
+    let m = room
+        .messages
+        .iter()
+        .find(|m| m.text.contains("Updated, and the room list"))
+        .unwrap();
+    let key_name = format!("md-{}", m.key);
+    let el = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key_name.as_str()))
+        .unwrap_or_else(|| panic!("no {key_name}"));
+    let (x0, y0) = (el.rect[0] + 1.0, el.rect[1] + 8.0);
+    let (x1, y1) = (el.rect[0] + el.rect[2] - 1.0, el.rect[1] + el.rect[3] - 4.0);
+    rt.pointer_down(x0, y0);
+    rt.pointer_move((x0 + x1) / 2.0, y1);
+    rt.pointer_move(x1, y1);
+    rt.pointer_up(x1, y1);
+    rt.frame(0.2);
+    rt.key(KeyEvent {
+        key: Key::Command('c'),
+        mods: rune::Mods {
+            cmd: true,
+            ctrl: !cfg!(target_os = "macos"),
+            ..rune::Mods::default()
+        },
+    });
+    rt.frame(0.3);
+    assert_eq!(
+        board.text().as_deref().map(String::as_str),
+        Some("Updated, and the room list loads noticeably faster for me.")
+    );
+}
+
+#[test]
+fn a_message_with_links_and_chips_can_be_selected() {
+    let board = rune::clipboard::memory();
+    let mut state = connected();
+    let scene = SCENES
+        .iter()
+        .find(|(n, _)| *n == "chat-markdown")
+        .unwrap()
+        .1;
+    scene(&mut state);
+    let mut rt = render(state, WINDOW_SIZE);
+    rt.use_clipboard(&board);
+    rt.frame(0.1);
+    let el = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("md-md-sample-0"))
+        .expect("the sample message");
+    eprintln!("rect {:?}", el.rect);
+    let (x0, y0) = (el.rect[0] + 1.0, el.rect[1] + 8.0);
+    let (x1, y1) = (el.rect[0] + el.rect[2] - 1.0, el.rect[1] + el.rect[3] - 4.0);
+    rt.pointer_down(x0, y0);
+    rt.pointer_move((x0 + x1) / 2.0, y1);
+    rt.pointer_move(x1, y1);
+    rt.pointer_up(x1, y1);
+    rt.frame(0.2);
+    rt.key(KeyEvent {
+        key: Key::Command('c'),
+        mods: rune::Mods {
+            cmd: true,
+            ctrl: !cfg!(target_os = "macos"),
+            ..rune::Mods::default()
+        },
+    });
+    rt.frame(0.3);
+    let got = board.text().map(|s| s.to_string()).unwrap_or_default();
+    eprintln!("copied: {got:?}");
+    assert!(
+        got.contains("Release notes") && got.contains("freenet.org"),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn dragging_across_messages_selects_across_them() {
+    let board = rune::clipboard::memory();
+    let mut rt = render(connected(), WINDOW_SIZE);
+    rt.use_clipboard(&board);
+    rt.frame(0.1);
+    let find = |rt: &Runtime<RiverApp>, text: &str| {
+        let room = rt.state.chat.room().unwrap();
+        let m = room
+            .messages
+            .iter()
+            .find(|m| m.text.contains(text))
+            .unwrap();
+        let k = format!("md-{}", m.key);
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(k.as_str()))
+            .unwrap()
+            .rect
+    };
+    let a = find(&rt, "Updated, and the room list");
+    let b = find(&rt, "Small thing I noticed");
+    rt.pointer_down(a[0] + 2.0, a[1] + 8.0);
+    rt.pointer_move(b[0] + 50.0, b[1] + 8.0);
+    rt.pointer_move(b[0] + b[2] - 2.0, b[1] + b[3] - 4.0);
+    rt.pointer_up(b[0] + b[2] - 2.0, b[1] + b[3] - 4.0);
+    rt.frame(0.2);
+    rt.key(KeyEvent {
+        key: Key::Command('c'),
+        mods: rune::Mods {
+            cmd: true,
+            ctrl: !cfg!(target_os = "macos"),
+            ..rune::Mods::default()
+        },
+    });
+    rt.frame(0.3);
+    let got = board.text().map(|s| s.to_string()).unwrap_or_default();
+    eprintln!("copied: {got:?}");
+    assert!(
+        got.contains("Updated, and the room list") && got.contains("Small thing I noticed"),
+        "{got:?}"
+    );
+}
+
+/// What winit gives off macOS for Ctrl+<key>: rune's `cmd` and `ctrl` both set.
+#[cfg(not(target_os = "macos"))]
+fn ctrl(rt: &mut Runtime<RiverApp>, key: Key, shift: bool) {
+    rt.key(KeyEvent {
+        key,
+        mods: rune::Mods {
+            shift,
+            cmd: true,
+            ctrl: true,
+            ..rune::Mods::default()
+        },
+    });
+    rt.frame(0.3);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("one two three".into()));
+    ctrl(&mut rt, Key::Left, false);
+    key(&mut rt, Key::Text("X".into()));
+    assert_eq!(rt.state.chat.composer.text, "one two Xthree");
+    ctrl(&mut rt, Key::Left, false);
+    ctrl(&mut rt, Key::Left, false);
+    ctrl(&mut rt, Key::Left, false);
+    key(&mut rt, Key::Text("Y".into()));
+    assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
+    ctrl(&mut rt, Key::Right, false);
+    key(&mut rt, Key::Text("Z".into()));
+    assert_eq!(rt.state.chat.composer.text, "YoneZ two Xthree");
+    // Ctrl+Backspace deletes the word before the caret, not the line before it.
+    ctrl(&mut rt, Key::Backspace, false);
+    assert_eq!(rt.state.chat.composer.text, " two Xthree");
+    // Ctrl+Shift+Right selects by word.
+    ctrl(&mut rt, Key::Right, true);
+    key(&mut rt, Key::Text("!".into()));
+    assert_eq!(rt.state.chat.composer.text, "! Xthree");
+}

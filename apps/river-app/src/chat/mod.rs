@@ -12,6 +12,7 @@
 mod conversation;
 pub mod example;
 mod icons;
+mod keys;
 mod links;
 mod markdown;
 pub mod model;

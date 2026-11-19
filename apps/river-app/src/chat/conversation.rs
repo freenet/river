@@ -5,6 +5,7 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use rune_kit::Kit;
 
 use super::icons;
+use super::keys;
 use super::links;
 use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
@@ -169,7 +170,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .grow(1.0)
         .min_h(0.0)
         .w_full()
-        .child(items)
+        .child(items.selection_group(true))
         .scroll(ScrollSpec { stick_bottom: true })
         .scroll_edge_fade(40.0)
 }
@@ -617,7 +618,12 @@ fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> Option<El> {
         p,
         k,
     )?;
-    let mut body = col().w_full().max_w(BODY_MAX_W).child(rendered);
+    // The history is one selection group, so a drag from one message into another selects
+    // across them as in a browser; the message's own group would end the selection at its edge.
+    let mut body = col()
+        .w_full()
+        .max_w(BODY_MAX_W)
+        .child(rendered.selection_group(false));
     if m.edited {
         body = body.child(label("(edited)", st::SMALL, p.text_muted));
     }
@@ -643,6 +649,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .disabled(!can_send);
     if can_send {
         input = input
+            .on_input_key(|s: &mut RiverApp, ev, _| keys::word_keys(&mut s.chat.composer, ev))
             .on_edit(|s: &mut RiverApp| &mut s.chat.composer)
             .on_submit(|s: &mut RiverApp, _| {
                 s.chat.send();
