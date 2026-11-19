@@ -1306,6 +1306,7 @@ fn the_reaction_picker_stays_in_the_window_and_off_its_own_toolbar() {
             && bar[1] < pk[1] + pk[3];
         assert!(!overlap, "{size:?} picker {pk:?} covers toolbar {bar:?}");
     }
+}
 
 // The member info dialog ----------------------------------------------------------------------
 
