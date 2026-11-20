@@ -130,6 +130,10 @@ mod tests {
     /// than on variable names, so a rename cannot silently disarm it.
     const GUARDED_MEMO_SITES: &[(&str, &str)] = &[
         (
+            "connection_activity.rs",
+            include_str!("../components/connection_activity.rs"),
+        ),
+        (
             "conversation.rs message_groups",
             include_str!("../components/conversation.rs"),
         ),
@@ -310,8 +314,8 @@ mod tests {
 
     #[test]
     fn every_fallible_memo_anchors_before_its_first_try_read_and_nudges() {
-        // 12 across the 8 files; conversation.rs alone has 4, member_info_modal.rs 2.
-        assert_fallible_hooks_are_guarded(GUARDED_MEMO_SITES, "use_memo(", "freenet/river#555", 12);
+        // 13 across the 9 files; conversation.rs alone has 4, member_info_modal.rs 2.
+        assert_fallible_hooks_are_guarded(GUARDED_MEMO_SITES, "use_memo(", "freenet/river#555", 13);
     }
 
     #[test]

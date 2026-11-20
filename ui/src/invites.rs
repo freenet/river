@@ -21,6 +21,12 @@ impl PendingInvites {
             map: HashMap::new(),
         }
     }
+    pub(crate) fn any_in_progress(&self) -> bool {
+        self.map.values().any(|join| match join.status {
+            PendingRoomStatus::PendingSubscription | PendingRoomStatus::Subscribing => true,
+            PendingRoomStatus::Subscribed | PendingRoomStatus::Error(_) => false,
+        })
+    }
     /*
         /// Adds a new pending room join request
         pub fn add(&mut self, owner_key: VerifyingKey, join_info: PendingRoomJoin) {
@@ -91,4 +97,49 @@ pub enum PendingRoomStatus {
     Subscribed,
     /// Error occurred during subscription or retrieval
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use river_core::room_state::member::{Member, MemberId};
+
+    #[test]
+    fn pill_join_activity_ends_on_subscription_or_error() {
+        use PendingRoomStatus::*;
+
+        let mut invites = PendingInvites::new();
+        assert!(!invites.any_in_progress());
+        let owner = SigningKey::from_bytes(&[1; 32]);
+        let invitee = SigningKey::from_bytes(&[2; 32]);
+        let room = owner.verifying_key();
+        invites.map.insert(
+            room,
+            PendingRoomJoin {
+                authorized_member: AuthorizedMember::new(
+                    Member {
+                        owner_member_id: MemberId::from(&room),
+                        invited_by: MemberId::from(&room),
+                        member_vk: invitee.verifying_key(),
+                    },
+                    &owner,
+                ),
+                invitee_signing_key: invitee,
+                preferred_nickname: "Guest".into(),
+                status: PendingSubscription,
+                subscribing_since: None,
+                retry_count: 0,
+                room_secrets: vec![],
+            },
+        );
+        for (phase, pending) in [
+            (PendingSubscription, true),
+            (Subscribing, true),
+            (Subscribed, false),
+            (Error("join failed".into()), false),
+        ] {
+            invites.map.get_mut(&room).unwrap().status = phase;
+            assert_eq!(invites.any_in_progress(), pending);
+        }
+    }
 }

@@ -15,5 +15,7 @@ test("a no-sync build opens no node socket and starts Disconnected", { tag: "@ch
   await page.waitForTimeout(1_500);
 
   expect(sockets, "no-sync build opened a node WebSocket").toEqual([]);
-  await expect(page.locator('[data-testid="connection-status-indicator"]:visible')).toContainText("Disconnected");
+  const pill = page.locator('[data-testid="connection-status-indicator"]:visible');
+  await expect(pill).toContainText("Disconnected");
+  await expect(pill).toHaveAttribute("aria-busy", "false");
 });
