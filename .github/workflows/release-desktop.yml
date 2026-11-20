@@ -158,6 +158,17 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --release --locked -p river-desktop
+      # A real release (a tag) that cannot verify updates can never be updated: fail when the
+      # update key is still the placeholder. Dry runs and pull requests build without the key
+      # and skip this. The key comes from the repository variable RIVER_UPDATE_PUBKEY_HEX,
+      # passed to the Build step as the environment variable of the same name.
+      - name: Check the build has an update key
+        if: github.ref_type == 'tag'
+        run: |
+          if ! target/release/river --update-status; then
+            echo "::error::This build has the placeholder update key, so it could never update itself. Add to the Build step: env: RIVER_UPDATE_PUBKEY_HEX set from the repository variable named RIVER_UPDATE_PUBKEY_HEX (the public key from update_tool keygen; it is not a secret)."
+            exit 1
+          fi
       - name: Validate river.desktop
         run: desktop-file-validate desktop/packaging/linux/river.desktop
       - name: Package
@@ -195,6 +206,17 @@ jobs:
         run: |
           cargo build --release --locked -p river-desktop --target aarch64-apple-darwin
           cargo build --release --locked -p river-desktop --target x86_64-apple-darwin
+      # A real release (a tag) that cannot verify updates can never be updated: fail when the
+      # update key is still the placeholder. Dry runs and pull requests build without the key
+      # and skip this. The key comes from the repository variable RIVER_UPDATE_PUBKEY_HEX,
+      # passed to the Build step as the environment variable of the same name.
+      - name: Check the build has an update key
+        if: github.ref_type == 'tag'
+        run: |
+          if ! target/aarch64-apple-darwin/release/river --update-status; then
+            echo "::error::This build has the placeholder update key, so it could never update itself. Add to the Build step: env: RIVER_UPDATE_PUBKEY_HEX set from the repository variable named RIVER_UPDATE_PUBKEY_HEX (the public key from update_tool keygen; it is not a secret)."
+            exit 1
+          fi
       - name: Assemble River.app (unsigned)
         run: |
           desktop/packaging/package-macos.sh \
@@ -238,6 +260,17 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --release --locked -p river-desktop
+      # A real release (a tag) that cannot verify updates can never be updated: fail when the
+      # update key is still the placeholder. Dry runs and pull requests build without the key
+      # and skip this. The key comes from the repository variable RIVER_UPDATE_PUBKEY_HEX,
+      # passed to the Build step as the environment variable of the same name.
+      - name: Check the build has an update key
+        if: github.ref_type == 'tag'
+        run: |
+          if ! target/release/river --update-status; then
+            echo "::error::This build has the placeholder update key, so it could never update itself. Add to the Build step: env: RIVER_UPDATE_PUBKEY_HEX set from the repository variable named RIVER_UPDATE_PUBKEY_HEX (the public key from update_tool keygen; it is not a secret)."
+            exit 1
+          fi
       # Checks the version resource and the zip on pull requests too. A release
       # repeats this in sign-windows, on the signed exe.
       - name: Package (unsigned, for checking)

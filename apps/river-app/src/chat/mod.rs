@@ -38,6 +38,7 @@ mod share_link;
 pub(crate) mod style;
 #[cfg(test)]
 mod tests;
+mod update_view;
 mod view;
 pub(crate) mod visual_fold;
 
@@ -286,6 +287,8 @@ pub struct Chat {
     picked: HashMap<String, NotificationMode>,
     /// The room whose notification dialog is open.
     notify_dialog: Option<String>,
+    /// River's own updates and the settings dialog.
+    pub update: crate::update::UpdateUi,
 }
 
 impl Chat {
@@ -398,6 +401,7 @@ impl Chat {
             picked: HashMap::new(),
             notify_dialog: None,
             node: Default::default(),
+            update: Default::default(),
         };
         chat.set_rooms(rooms);
         chat
@@ -412,6 +416,66 @@ impl Chat {
             data.day_zero,
             data.now,
         )
+    }
+
+    /// Test support: mark the first message of room `room` as not yet taken by the node.
+    #[cfg(test)]
+    pub(crate) fn mark_first_message_pending_for_test(
+        &mut self,
+        room: &str,
+        pending: model::Pending,
+    ) {
+        if let Some(r) = self.rooms.iter_mut().find(|r| r.key == room)
+            && let Some(m) = r.messages.first_mut()
+        {
+            m.pending = Some(pending);
+        }
+    }
+
+    /// What quitting now would lose, in words, or `None`: messages (and other changes) still
+    /// being sent or not yet taken, rooms being created or joined, and text in the composer or
+    /// a saved draft. These live in memory only.
+    pub fn unsent_summary(&self) -> Option<String> {
+        let mut pending = self
+            .rooms
+            .iter()
+            .map(|r| {
+                r.messages.iter().filter(|m| m.pending.is_some()).count()
+                    + usize::from(r.own_nickname.is_some())
+                    + usize::from(r.details.rotation.is_some())
+            })
+            .sum::<usize>();
+        pending += self
+            .work
+            .iter()
+            .filter(|w| !matches!(w.state, WorkState::Done { .. }))
+            .count();
+        // Text in the composer or a draft, and text typed into a dialog or form that is open
+        // (a new room, an invite code, an identity token, a room's details, a nickname).
+        let form = &self.form;
+        let nickname_edit = self.member_modal.is_some()
+            && !self.nickname.text.trim().is_empty()
+            && self
+                .room()
+                .is_some_and(|r| r.nickname(r.me) != self.nickname.text.trim());
+        let text = !self.composer.text.trim().is_empty()
+            || self.drafts.values().any(|d| !d.text.trim().is_empty())
+            || (form.open.is_some()
+                && [&form.name, &form.nickname, &form.code, &form.token]
+                    .iter()
+                    .any(|t| !t.text.trim().is_empty()))
+            || self.details.as_ref().is_some_and(|d| d.has_edits())
+            || nickname_edit;
+        let mut parts = Vec::new();
+        match pending {
+            0 => {}
+            1 => parts.push("1 message or change is still being sent.".to_string()),
+            n => parts.push(format!("{n} messages or changes are still being sent.")),
+        }
+        if text {
+            parts.push("You have text you have not sent.".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     pub fn rooms(&self) -> &[Room] {

@@ -38,7 +38,9 @@ pub const MIN_INSTALL_VERSION: Version = Version(0, 2, 156);
 /// The oldest running Freenet node River works with. Raise it only when River needs something
 /// a newer node provides: nodes update over hours to days, and raising it ahead of that tells
 /// people with a working node that theirs is too old. Never above [`MIN_INSTALL_VERSION`].
-pub const MIN_NODE_VERSION: Version = Version(0, 2, 155);
+/// 0.2.156 is the first node that can grant an app permission to open the user's rooms, so
+/// an older one connects and then cannot be used; saying so at once is kinder.
+pub const MIN_NODE_VERSION: Version = Version(0, 2, 156);
 
 /// How often download progress reaches the UI.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);

@@ -183,6 +183,12 @@ jobs:
             test -s "snapshots/$scene.png"
           done
 
+      # River's self-update against a local server with a throwaway key: a current manifest
+      # is "up to date", and tampered, unsigned, wrongly signed and replayed manifests are
+      # refused with the installed binary unchanged (see the script's header).
+      - name: Self-update checks
+        run: scripts/update-ci.sh
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

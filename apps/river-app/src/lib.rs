@@ -11,6 +11,7 @@ mod node_ui_tests;
 pub mod notify;
 pub mod rooms;
 pub mod setup;
+pub mod update;
 
 /// Where the web UI's code, copied verbatim into `chat/visual_fold.rs`, finds its neighbours.
 mod util {
@@ -28,6 +29,9 @@ pub use chat::Chat;
 pub use node::{InstallStep, MANUAL_INSTALL_URL, NodeHost, NodeProbe};
 pub use rooms::{Access, RoomsUpdate};
 pub use setup::{Controller, Setup};
+pub use update::{
+    UpdateCheck, UpdateController, UpdateEvent, UpdateHost, UpdateInfo, UpdateStatus, UpdateSupport,
+};
 
 pub struct RiverApp {
     pub setup: Setup,
@@ -41,6 +45,11 @@ pub struct RiverApp {
     ctl: Option<Controller>,
     /// Reads the rooms from the node. `None` in headless snapshots and tests.
     link: Option<rooms::Link>,
+    /// Checks for, downloads and installs new versions of River. `None` in headless snapshots
+    /// and tests, and in shells without a self-update.
+    updates: Option<UpdateController>,
+    /// Where the "Update River automatically" choice is kept. In memory in tests.
+    update_prefs: rune::prefs::Prefs,
     /// River's logo, rasterized once by [`load_logo`]. `None` until then, and in tests, which
     /// draw an empty square in its place.
     logo: Option<Logo>,
@@ -70,6 +79,12 @@ pub struct RiverApp {
     /// the saved choice.
     pending_save: Option<NodeChoice>,
 }
+
+/// How often the running node's version is looked at, to notice that it updated itself.
+const NODE_VERSION_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The saved "Update River automatically" choice.
+pub const UPDATE_AUTO_PREF: &str = "update_automatically";
 
 /// The logo and the cache that keeps its pixels alive.
 struct Logo {
@@ -113,6 +128,8 @@ impl RiverApp {
             access: Access::Example,
             ctl: None,
             link: None,
+            updates: None,
+            update_prefs: rune::prefs::Prefs::memory(),
             logo: None,
             notifier: Box::new(notify::Silent),
             focused: false,
@@ -150,6 +167,7 @@ impl RiverApp {
         let waiting = startup.problem.is_some();
         if !waiting {
             ctl.check();
+            ctl.watch_version(NODE_VERSION_EVERY);
         }
         let mut chat = Chat::new(
             chat::Source::Node(chat::LinkStatus::Loading),
@@ -175,6 +193,8 @@ impl RiverApp {
             access: Access::Connecting,
             ctl: Some(ctl),
             link: Some(link),
+            updates: None,
+            update_prefs: rune::prefs::Prefs::memory(),
             logo: None,
             notifier: Box::new(notify::Silent),
             focused: false,
@@ -192,6 +212,89 @@ impl RiverApp {
     pub fn with_notifier(mut self, notifier: Box<dyn notify::Notifier>) -> Self {
         self.notifier = notifier;
         self
+    }
+
+    /// Keep River itself up to date through `updates`. "Update River automatically" is on
+    /// unless the person turned it off.
+    pub fn with_updates(mut self, updates: UpdateController) -> Self {
+        self.update_prefs = rune::prefs::Prefs::open("org.freenet.River");
+        let auto = self.update_prefs.get(UPDATE_AUTO_PREF).unwrap_or(true);
+        let host = updates.host().clone();
+        self.chat.update.version = host.version();
+        self.chat.update.support = host.support();
+        self.chat.update.auto = auto;
+        updates.set_auto(auto);
+        updates.startup();
+        updates.start_schedule();
+        self.updates = Some(updates);
+        self
+    }
+
+    /// Take word from the update controller.
+    pub fn apply_update(&mut self, event: UpdateEvent) {
+        match event {
+            UpdateEvent::Notice(text) => self.chat.update.notice = Some(text),
+            UpdateEvent::Status(status) => {
+                if let Some((title, body)) = self.chat.update.apply(status)
+                    && !self.focused
+                {
+                    // Not a room's notification: nothing to open when it is clicked.
+                    self.notifier.notify(notify::Notification {
+                        room_key: "river-update".into(),
+                        room_name: "River".into(),
+                        title,
+                        body,
+                        mention: false,
+                        count: 1,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Check for a newer River now (the Check now button).
+    pub(crate) fn check_for_update(&mut self) {
+        if let Some(u) = &self.updates {
+            u.check_now();
+        }
+    }
+
+    pub(crate) fn start_update_download(&mut self) {
+        if let Some(u) = &self.updates {
+            u.download();
+        }
+    }
+
+    /// Restart into the downloaded version, asking first when a restart would lose something:
+    /// the app exits without flushing, and messages waiting to be sent and text in the boxes
+    /// live only in memory. The default of the question is to wait.
+    pub(crate) fn restart_to_update(&mut self) {
+        match self.chat.unsent_summary() {
+            Some(what) => self.chat.update.confirm_restart = Some(what),
+            None => self.restart_now(),
+        }
+    }
+
+    /// Restart without asking.
+    pub(crate) fn restart_now(&mut self) {
+        self.chat.update.confirm_restart = None;
+        self.chat.update.restart_error = None;
+        if let Some(u) = &self.updates {
+            u.restart();
+        }
+    }
+
+    /// The "Update River automatically" choice, kept across runs.
+    pub(crate) fn set_auto_update(&mut self, auto: bool) {
+        self.chat.update.auto = auto;
+        if let Some(u) = &self.updates {
+            u.set_auto(auto);
+            if auto {
+                // Turning it on fetches what is already known to be available.
+                u.check_now();
+            }
+        }
+        let _ = self.update_prefs.set(UPDATE_AUTO_PREF, &auto);
     }
 
     /// The window gained or lost focus.
@@ -313,6 +416,26 @@ impl RiverApp {
     /// Take a new setup state. Reaching a node starts reading the rooms.
     pub fn set_setup(&mut self, setup: Setup) {
         let connected = matches!(setup, Setup::Connected { .. });
+        let was = match &self.setup {
+            Setup::Connected { version } => Some(version.clone()),
+            _ => None,
+        };
+        if let Setup::Connected { version } = &setup {
+            // The node updates itself. When its version changes under the open app, say so.
+            if let Some(old) = was.as_ref().filter(|old| *old != version) {
+                self.chat.update.node_note = Some(format!(
+                    "Freenet updated itself from {old} to {version} while River was open."
+                ));
+            }
+            self.chat.update.node_version = Some(version.clone());
+        }
+        // The first connection to the node is the proof that a just-installed version works.
+        if connected
+            && was.is_none()
+            && let Some(u) = &self.updates
+        {
+            u.host().confirm_started();
+        }
         self.setup = setup;
         // The node answered as Freenet: now the address is worth remembering.
         if connected
@@ -324,7 +447,12 @@ impl RiverApp {
             // Used for this run; chosen again next time.
             eprintln!("River: {e}");
         }
-        if connected && let Some(link) = &self.link {
+        // A change of the node's version is not a new connection: the rooms link already
+        // follows the node through its restart.
+        if connected
+            && was.is_none()
+            && let Some(link) = &self.link
+        {
             link.start();
         }
     }
@@ -354,7 +482,13 @@ impl RiverApp {
                 issues,
                 work,
             } => {
+                let was_stale = self.chat.issues.update_required;
                 self.chat.issues = issues;
+                // River moved on and this build stopped writing: look for the update now,
+                // rather than at the next scheduled check.
+                if !was_stale && self.chat.issues.update_required {
+                    self.check_for_update();
+                }
                 // Before the rooms, so what arrives in them is judged by their modes.
                 self.chat.apply_modes(modes, &settled);
                 let arrived = self
@@ -730,6 +864,99 @@ pub const SCENES: &[Scene] = &[
     }),
     // Connected: the chat screen, on example data.
     ("chat", connect),
+    ("chat-update-available", |s| {
+        connect(s);
+        update_scene(s, false, UpdateStatus::Available(example_update()));
+    }),
+    ("chat-update-downloading", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Downloading {
+                version: "0.2.0".into(),
+                received: 6_200_000,
+                total: 14_800_000,
+            },
+        );
+    }),
+    ("chat-update-ready", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            },
+        );
+    }),
+    ("chat-update-restart-confirm", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            },
+        );
+        s.chat.update.confirm_restart = Some(
+            "2 messages or changes are still being sent. You have text you have not sent.".into(),
+        );
+    }),
+    ("chat-update-restart-failed", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.staged = Some("0.2.0".into());
+        s.chat.update.restart_error = Some(
+            "River 0.2.0 did not start (the new River exited at once), so River went back to \
+             0.1.0."
+                .into(),
+        );
+    }),
+    ("chat-update-rolled-back", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::Idle);
+        s.chat.update.notice = Some(
+            "River 0.2.0 did not start (the new River exited at once), so River went back to \
+             0.1.0."
+                .into(),
+        );
+    }),
+    ("chat-settings", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.settings_open = true;
+    }),
+    ("chat-settings-ready", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            },
+        );
+        s.chat.update.settings_open = true;
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
+    }),
+    ("chat-settings-package-managed", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::Available(example_update()));
+        s.chat.update.support = UpdateSupport::External(
+            "River was installed by your package manager, which updates it.".into(),
+        );
+        s.chat.update.settings_open = true;
+    }),
+    ("chat-settings-update-failed", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Failed("the update manifest's signature is not valid".into()),
+        );
+        s.chat.update.settings_open = true;
+    }),
     ("chat-members-hidden", |s| {
         connect(s);
         s.chat.members_open = false;
@@ -1384,6 +1611,25 @@ pub const SCENES: &[Scene] = &[
         s.chat.issues.store_missing = true;
     }),
 ];
+
+fn example_update() -> UpdateInfo {
+    UpdateInfo {
+        version: "0.2.0".into(),
+        notes: "Faster start.".into(),
+        size: 14_800_000,
+        required: false,
+    }
+}
+
+/// An example of River's own update state, with the Freenet node at a version.
+fn update_scene(s: &mut RiverApp, auto: bool, status: UpdateStatus) {
+    let ui = &mut s.chat.update;
+    ui.support = UpdateSupport::Automatic;
+    ui.version = "0.1.0".into();
+    ui.auto = auto;
+    ui.status = status;
+    ui.node_version = Some("0.2.160".into());
+}
 
 fn connect(s: &mut RiverApp) {
     s.setup = Setup::Connected {

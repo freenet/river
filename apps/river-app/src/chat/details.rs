@@ -77,6 +77,17 @@ pub fn limit_values(l: &Limits) -> [usize; LIMIT_COUNT] {
 }
 
 impl DetailsForm {
+    /// Whether anything in the dialog has been typed over: what a restart would lose.
+    pub fn has_edits(&self) -> bool {
+        self.name.text != self.orig_name
+            || self.description.text != self.orig_description
+            || self
+                .limits
+                .iter()
+                .zip(self.orig_limits)
+                .any(|(typed, orig)| typed.text.trim() != orig.to_string())
+    }
+
     fn new(room: &Room) -> Self {
         let d = &room.details;
         let mut name = rune::TextEdit::new(&d.name_source);

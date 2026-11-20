@@ -52,6 +52,9 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     dialogs(chat, &k, &mut layer);
     super::identity::export_dialog(chat, &k, &mut layer);
     super::node_ui::node_dialog(chat, &k, &mut layer);
+    if chat.update.settings_open {
+        super::update_view::settings_dialog(&chat.update, &k, &mut layer);
+    }
     screen = screen.child(link_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
@@ -313,7 +316,15 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         .gap(10.0)
         .center_y()
         .child(mark)
-        .child(label("River", st::BRAND, p.text));
+        .child(label("River", st::BRAND, p.text))
+        .child(spacer())
+        .child(
+            icon_button("settings", "Settings", &icons::GEAR, p)
+                .help("Settings")
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(|s: &mut RiverApp| s.chat.update.settings_open = true),
+        );
     let heading = row()
         .pl(18.0)
         .pr(12.0)
@@ -363,6 +374,9 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         });
     for w in &chat.work {
         footer = footer.child(work_row(w, p, k));
+    }
+    if let Some(block) = super::update_view::update_block(&chat.update, p, k) {
+        footer = footer.child(block);
     }
     let footer = footer.child(source_status(chat, p, k));
     let column = col()
