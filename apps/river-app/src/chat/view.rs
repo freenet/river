@@ -55,6 +55,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     if chat.update.settings_open {
         super::update_view::settings_dialog(&chat.update, &k, &mut layer);
     }
+    super::switcher::switcher_dialog(chat, &k, &mut layer);
     screen = screen.child(link_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
