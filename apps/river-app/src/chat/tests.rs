@@ -1229,14 +1229,21 @@ fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
     assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
     ctrl(&mut rt, Key::Right, false);
     key(&mut rt, Key::Text("Z".into()));
-    assert_eq!(rt.state.chat.composer.text, "YoneZ two Xthree");
-    // Ctrl+Backspace deletes the word before the caret, not the line before it.
+    // Off macOS a word forward ends at the next word's start (Windows' Ctrl+Right, which Rune
+    // applies on Linux too since its 2026-11-12 word-boundary change); only macOS stops at the
+    // word's end, and this test does not run there. So Z lands before "two", not after "Yone".
+    assert_eq!(rt.state.chat.composer.text, "Yone Ztwo Xthree");
+    // Ctrl+Backspace deletes the word before the caret (here the "Z" typed at the start of
+    // "Ztwo"), not the line before it.
     ctrl(&mut rt, Key::Backspace, false);
-    assert_eq!(rt.state.chat.composer.text, " two Xthree");
-    // Ctrl+Shift+Right selects by word.
+    assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
+    // Again: the caret now sits at the start of "two", so the word before it is "Yone ".
+    ctrl(&mut rt, Key::Backspace, false);
+    assert_eq!(rt.state.chat.composer.text, "two Xthree");
+    // Ctrl+Shift+Right selects by word, up to the next word's start.
     ctrl(&mut rt, Key::Right, true);
     key(&mut rt, Key::Text("!".into()));
-    assert_eq!(rt.state.chat.composer.text, "! Xthree");
+    assert_eq!(rt.state.chat.composer.text, "!Xthree");
 }
 
 #[test]

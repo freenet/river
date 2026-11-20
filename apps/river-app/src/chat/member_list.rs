@@ -1132,9 +1132,17 @@ mod ui_tests {
         assert!(!composer_focused(&rt), "nothing restored under a dialog");
         // A dialog field has the keyboard; hiding the panel or narrowing does not change that.
         rt.update(|s, _| s.chat.nickname.focused = true);
-        press(&mut rt, "toggle-members");
+        // Hide the panel by state, not by a click on its toggle: with the dialog up the click
+        // lands on the dialog's backdrop and dismisses the dialog (before Rune's modal focus
+        // machine this test pressed the toggle, closed the dialog without noticing, and so
+        // never checked what it says it checks).
+        rt.update(|s, _| s.chat.toggle_members(false));
         rt.set_viewport(crate::NARROW_SCENE_SIZE, 1.0);
         settle(&mut rt);
+        assert!(
+            rt.state.chat.member_modal.is_some(),
+            "the dialog is still up"
+        );
         assert!(!composer_focused(&rt));
         assert!(
             rt.state.chat.nickname.focused,
