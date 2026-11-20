@@ -246,7 +246,7 @@ impl NodeSocket {
         let bytes = bincode::serialize(request).map_err(|e| SocketError::Failed(e.to_string()))?;
         self.ws
             .send(Message::Binary(bytes.into()))
-            .map_err(map_ws_error)
+            .map_err(|e| map_ws_error(e, false))
     }
 
     /// Ask the node to show it is still there. The pong, like any message, moves
@@ -254,7 +254,7 @@ impl NodeSocket {
     pub fn ping(&mut self) -> Result<(), SocketError> {
         self.ws
             .send(Message::Ping(Vec::new().into()))
-            .map_err(map_ws_error)
+            .map_err(|e| map_ws_error(e, false))
     }
 
     /// Whether anything at all has arrived on this connection.
@@ -293,7 +293,7 @@ impl NodeSocket {
     /// The next whole response.
     pub fn recv(&mut self) -> Result<HostResult, SocketError> {
         loop {
-            let message = self.ws.read().map_err(map_ws_error)?;
+            let message = self.ws.read().map_err(|e| map_ws_error(e, true))?;
             self.last_heard = Instant::now();
             self.heard_anything = true;
             let bytes = match message {
@@ -475,12 +475,73 @@ fn token_rejection(e: &ClientError) -> Option<SocketError> {
     })
 }
 
-fn map_ws_error(e: tungstenite::Error) -> SocketError {
+/// Windows' `ERROR_IO_PENDING` / `WSA_IO_PENDING` ("Overlapped I/O operation is in progress").
+/// Both names are 997 (`windows_sys.rs` in std has them as the same value). Rust's std does not
+/// map it to an `ErrorKind` (it is `Uncategorized`), unlike `WSAEWOULDBLOCK` (10035, `WouldBlock`)
+/// and `WSAETIMEDOUT` (10060, `TimedOut`).
+const IO_PENDING: i32 = 997;
+
+/// Whether an I/O error from a timed read means only that nothing has arrived yet. `pending` is
+/// the platform's raw code for "operation still pending", where there is one: on Windows a
+/// read with a short `SO_RCVTIMEO` has been seen to end with it instead of a timeout, which
+/// `read_idle(.., Some(997))` treats like one. Not on other platforms, where 997 is an unrelated
+/// errno. It is a parameter so a test can run the Windows rule anywhere.
+fn read_idle(e: &std::io::Error, pending: Option<i32>) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+        || (pending.is_some() && e.raw_os_error() == pending)
+}
+
+/// The platform's value for [`read_idle`].
+const PLATFORM_PENDING: Option<i32> = if cfg!(windows) {
+    Some(IO_PENDING)
+} else {
+    None
+};
+
+/// Say once per run that a socket call ended with the pending code, so a connection that
+/// drops or an idle read that is not an ordinary timeout shows up in a log.
+fn note_pending(reading: bool, e: &std::io::Error) {
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "River: a socket {} ended with os error {:?} ({e}); {}",
+            if reading { "read" } else { "write" },
+            e.raw_os_error(),
+            if reading {
+                "treated as nothing received yet (first time this run)"
+            } else {
+                "the connection is dropped and opened again (first time this run)"
+            }
+        );
+    }
+}
+
+/// `reading`: the error came from a timed read, where `Timeout` means "nothing yet, still
+/// usable". tungstenite keeps a half-read frame in its own buffers whatever error the read
+/// ended with (`FrameCodec::read_frame` returns the io error with `?` before touching the
+/// buffered bytes or the parsed header), so the next read carries on from it. A write that
+/// ends in an error leaves the frame half sent, so callers drop the connection on any write
+/// error, `Timeout` included.
+fn map_ws_error(e: tungstenite::Error, reading: bool) -> SocketError {
     match e {
+        tungstenite::Error::Io(io) if reading && read_idle(&io, PLATFORM_PENDING) => {
+            if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+                // An ordinary timeout.
+            } else {
+                note_pending(true, &io);
+            }
+            SocketError::Timeout
+        }
         tungstenite::Error::Io(io)
             if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
         {
             SocketError::Timeout
+        }
+        tungstenite::Error::Io(io)
+            if PLATFORM_PENDING.is_some() && io.raw_os_error() == PLATFORM_PENDING =>
+        {
+            note_pending(reading, &io);
+            SocketError::Failed(format!("IO error: {io}"))
         }
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
             SocketError::Closed {
@@ -1077,5 +1138,130 @@ mod tests {
         // Nothing accepting is still an error, and no address is too.
         assert!(connect_any(vec![dead].into_iter(), Duration::from_secs(2)).is_err());
         assert!(connect_any(Vec::new().into_iter(), Duration::from_secs(2)).is_err());
+    }
+
+    fn io(code: i32) -> tungstenite::Error {
+        tungstenite::Error::Io(std::io::Error::from_raw_os_error(code))
+    }
+
+    /// The rule, with Windows' code given explicitly so it runs on every platform: a timeout kind
+    /// and the pending code are "nothing yet"; other errors, and the pending code where the
+    /// platform has none, are not.
+    #[test]
+    fn a_read_that_ends_pending_is_taken_for_nothing_yet_only_where_the_code_means_it() {
+        let pending = std::io::Error::from_raw_os_error(IO_PENDING);
+        assert!(read_idle(&pending, Some(IO_PENDING)));
+        assert!(!read_idle(&pending, None));
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            let e = std::io::Error::from(kind);
+            assert!(read_idle(&e, None), "{kind:?}");
+            assert!(read_idle(&e, Some(IO_PENDING)), "{kind:?}");
+        }
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+            assert!(
+                !read_idle(&std::io::Error::from(kind), Some(IO_PENDING)),
+                "{kind:?}"
+            );
+        }
+        assert!(!read_idle(
+            &std::io::Error::from_raw_os_error(10054),
+            Some(IO_PENDING)
+        ));
+        assert_eq!(IO_PENDING, 997);
+    }
+
+    /// What the socket does with 997 here: on Windows a timed read goes on (`Timeout`) and a
+    /// write fails; elsewhere 997 is an unrelated errno and both fail.
+    #[test]
+    fn the_pending_code_maps_by_platform() {
+        let read = map_ws_error(io(IO_PENDING), true);
+        let write = map_ws_error(io(IO_PENDING), false);
+        if cfg!(windows) {
+            assert_eq!(read, SocketError::Timeout);
+        } else {
+            assert!(matches!(read, SocketError::Failed(_)), "{read:?}");
+        }
+        assert!(matches!(write, SocketError::Failed(_)), "{write:?}");
+        // Ordinary timeouts are unchanged: a read goes on; a write is reported as before.
+        let timed_out = || tungstenite::Error::Io(std::io::ErrorKind::TimedOut.into());
+        assert_eq!(map_ws_error(timed_out(), true), SocketError::Timeout);
+        assert_eq!(map_ws_error(timed_out(), false), SocketError::Timeout);
+    }
+
+    /// Windows only: the real codes. 10035 and 10060 already map to `WouldBlock` and `TimedOut`
+    /// in std; 997 is the one that does not.
+    #[cfg(windows)]
+    #[test]
+    fn windows_codes_for_nothing_yet() {
+        assert_eq!(
+            std::io::Error::from_raw_os_error(10035).kind(),
+            ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            std::io::Error::from_raw_os_error(10060).kind(),
+            ErrorKind::TimedOut
+        );
+        assert_eq!(map_ws_error(io(10035), true), SocketError::Timeout);
+        assert_eq!(map_ws_error(io(10060), true), SocketError::Timeout);
+        assert_eq!(map_ws_error(io(997), true), SocketError::Timeout);
+        assert!(matches!(
+            map_ws_error(io(997), false),
+            SocketError::Failed(_)
+        ));
+    }
+
+    /// The claim `map_ws_error` relies on: a read that ends in an error halfway through a frame,
+    /// whatever the error, leaves tungstenite's buffered bytes and parsed header alone, so the
+    /// next read returns the whole message. The error here is the pending code on any platform.
+    #[test]
+    fn a_frame_half_read_when_the_read_failed_is_finished_by_the_next_read() {
+        use std::io::{Read, Write};
+        struct Script {
+            steps: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+        }
+        impl Read for Script {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.steps.pop_front() {
+                    Some(Ok(bytes)) => {
+                        buf[..bytes.len()].copy_from_slice(&bytes);
+                        Ok(bytes.len())
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(std::io::ErrorKind::WouldBlock.into()),
+                }
+            }
+        }
+        impl Write for Script {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let payload = b"the whole message";
+        let mut frame = vec![0x82, payload.len() as u8];
+        frame.extend_from_slice(payload);
+        let (head, tail) = frame.split_at(6);
+        let mut ws = tungstenite::WebSocket::from_raw_socket(
+            Script {
+                steps: [
+                    Ok(head.to_vec()),
+                    Err(std::io::Error::from_raw_os_error(IO_PENDING)),
+                    Ok(tail.to_vec()),
+                ]
+                .into(),
+            },
+            tungstenite::protocol::Role::Client,
+            None,
+        );
+        let first = ws.read().unwrap_err();
+        assert!(
+            matches!(&first, tungstenite::Error::Io(e) if e.raw_os_error() == Some(IO_PENDING))
+        );
+        match ws.read().unwrap() {
+            Message::Binary(b) => assert_eq!(&b[..], payload),
+            other => panic!("{other:?}"),
+        }
     }
 }
