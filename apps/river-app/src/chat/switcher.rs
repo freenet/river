@@ -227,6 +227,7 @@ impl Chat {
             || self.node.form.is_some()
             || self.update.settings_open
             || self.background.as_ref().is_some_and(|b| b.open)
+            || self.dnd.open
             || self.link_menu.is_some()
             || self.overview
     }

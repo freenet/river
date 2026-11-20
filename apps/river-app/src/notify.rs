@@ -86,6 +86,10 @@ pub struct Arrival {
     pub count: usize,
     /// Whether the message shown mentions you.
     pub mention: bool,
+    /// How many of the `count` messages mention you or reply to you ([`Room::is_for_me`]).
+    /// Do not disturb's "allow mentions through" goes by this, not by `mention`, which is only
+    /// about the message shown (titles, cooldowns).
+    pub for_me_count: usize,
     /// The key of the message shown.
     pub message_key: String,
     /// The author of the message shown.
@@ -95,6 +99,20 @@ pub struct Arrival {
     /// Set by the chat for the first live update after a catch-up: its messages count as unread
     /// while the window is away but are not shown as notifications.
     pub quiet: bool,
+}
+
+impl Arrival {
+    /// How much the message shown matters when arrivals are merged: a mention, then a reply
+    /// to you, then anything else. The same order [`arrivals`] picks the message shown by.
+    fn rank(&self) -> u8 {
+        if self.mention {
+            2
+        } else if self.for_me_count > 0 {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 /// `text` for a notification: hidden and control characters (including the ones that reverse
@@ -158,6 +176,7 @@ pub fn arrivals(
             .iter()
             .rev()
             .find(|m| m.md.contains(&chip))
+            .or_else(|| fresh.iter().rev().find(|m| room.is_for_me(m)))
             .unwrap_or(newest);
         out.push(Arrival {
             room_key: room.key.clone(),
@@ -165,6 +184,7 @@ pub fn arrivals(
             private: room.private,
             count: fresh.len(),
             mention: shown.md.contains(&chip),
+            for_me_count: fresh.iter().filter(|m| room.is_for_me(m)).count(),
             message_key: shown.key.clone(),
             author: tidy(room.nickname(shown.author), AUTHOR_CHARS),
             text: tidy(&shown.text, BODY_CHARS),
@@ -198,7 +218,8 @@ impl RoomClock {
         match self.held.as_mut() {
             Some(h) => {
                 h.count += a.count;
-                if a.mention || !h.mention {
+                h.for_me_count += a.for_me_count;
+                if a.rank() >= h.rank() {
                     h.message_key = a.message_key;
                     h.text = a.text;
                     h.author = a.author;
@@ -323,9 +344,12 @@ impl Limiter {
             clock.prev_last = clock.last;
             clock.last = Some(now);
             if let Some(h) = clock.held.take() {
+                // Before folding the counts in: the rank is of the message shown by each side.
+                let take = h.rank() > a.rank();
                 a.count += h.count;
-                if h.mention && !a.mention {
-                    a.mention = true;
+                a.for_me_count += h.for_me_count;
+                a.mention |= h.mention;
+                if take {
                     a.message_key = h.message_key;
                     a.text = h.text;
                     a.author = h.author;
@@ -367,6 +391,15 @@ impl Limiter {
             if clock.held.is_some() && !keep(key) {
                 clock.held = None;
             }
+        }
+    }
+
+    /// Replace each held-back arrival by what `f` makes of it, dropping it when `f` gives
+    /// nothing. Used by do not disturb, so what it holds back is dropped before it can spend a
+    /// cooldown or a token.
+    pub fn filter_held(&mut self, mut f: impl FnMut(Arrival) -> Option<Arrival>) {
+        for clock in self.rooms.values_mut() {
+            clock.held = clock.held.take().and_then(&mut f);
         }
     }
 
@@ -676,6 +709,195 @@ mod tests {
         assert_eq!(n[0].body, "3 new messages");
     }
 
+    // Do not disturb ----------------------------------------------------------------------
+
+    fn dnd_on(s: &mut RiverApp) {
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.now = 12 * 60;
+        s.chat.dnd.settings.manual = true;
+    }
+
+    #[test]
+    fn do_not_disturb_shows_nothing_but_unread_still_counts_and_nothing_is_replayed() {
+        let (mut s, rec, rooms) = live();
+        dnd_on(&mut s);
+        let before = s.unread();
+        let m = from_other(&rooms[0], "n1", "supper is ready");
+        let held = with(&rooms, 0, vec![m]);
+        deliver(&mut s, held.clone());
+        assert!(shown(&rec).is_empty());
+        assert!(s.unread() > before, "unread still counts");
+        // Turned off, nothing held back comes out later, and the next message notifies.
+        s.chat.dnd.settings.manual = false;
+        s.flush_held(minute_later());
+        assert!(shown(&rec).is_empty(), "not replayed");
+        let again = with(&held, 0, vec![from_other(&rooms[0], "n2", "second")]);
+        deliver(&mut s, again);
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
+    #[test]
+    fn allow_mentions_lets_only_mentions_through_do_not_disturb() {
+        let (mut s, rec, rooms) = live();
+        dnd_on(&mut s);
+        let mut next = with(&rooms, 0, vec![mention_of_you(&rooms[0], "m")]);
+        next[1].messages.push(from_other(&rooms[1], "p", "plain"));
+        deliver(&mut s, next.clone());
+        assert!(shown(&rec).is_empty(), "off by default");
+        s.chat.dnd.settings.allow_mentions = true;
+        next[0].messages.push(mention_of_you(&rooms[0], "m2"));
+        next[1].messages.push(from_other(&rooms[1], "p2", "plain"));
+        deliver(&mut s, next);
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1);
+        assert!(n[0].mention);
+    }
+
+    #[test]
+    fn allow_mentions_lets_a_reply_to_you_through_and_counts_only_what_is_for_you() {
+        let (mut s, rec, rooms) = live();
+        dnd_on(&mut s);
+        s.chat.dnd.settings.allow_mentions = true;
+        let me = rooms[0].me;
+        // A reply alone.
+        let reply = reply_to(&rooms[0], "r1", me);
+        let one = with(&rooms, 0, vec![reply]);
+        deliver(&mut s, one.clone());
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1, "a reply to you passes");
+        assert!(!n[0].mention, "it is not a mention chip");
+        // A reply among plain messages, the plain ones newest: only the reply counts.
+        let mixed = with(
+            &one,
+            0,
+            vec![
+                reply_to(&rooms[0], "r2", me),
+                from_other(&rooms[0], "p1", "plain"),
+                from_other(&rooms[0], "p2", "plain"),
+            ],
+        );
+        deliver(&mut s, mixed);
+        let n = shown(&rec);
+        assert_eq!(n.len(), 2);
+        assert!(
+            !n[1].body.contains("new messages"),
+            "a count of one is a message"
+        );
+        assert_eq!(n[1].message_key, "r2", "the reply is the one shown");
+    }
+
+    #[test]
+    fn a_held_plain_batch_merged_with_a_mention_across_the_start_of_dnd_counts_only_the_mention() {
+        let (mut s, rec, rooms) = live();
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.now = 12 * 60;
+        s.chat.dnd.settings.allow_mentions = true;
+        // A plain message notifies, then a second is held by the room's cooldown.
+        let t0 = minute_later();
+        let a = with(&rooms, 1, vec![from_other(&rooms[1], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        let b = with(&a, 1, vec![from_other(&rooms[1], "b", "held")]);
+        deliver_at(&mut s, b.clone(), t0 + Duration::from_secs(1));
+        assert_eq!(shown(&rec).len(), 1);
+        // Do not disturb starts; a mention arrives and later the cooldown ends.
+        s.chat.dnd.settings.manual = true;
+        let c = with(&b, 1, vec![mention_of_you(&rooms[1], "m")]);
+        deliver_at(&mut s, c, t0 + Duration::from_secs(2));
+        s.flush_held(t0 + ROOM_COOLDOWN + Duration::from_secs(5));
+        let n = shown(&rec);
+        assert_eq!(n.len(), 2);
+        assert_eq!(
+            n[1].count, 1,
+            "the held plain message is not counted: {:?}",
+            n[1]
+        );
+        assert!(n[1].mention);
+    }
+
+    #[test]
+    fn a_held_reply_stays_the_message_shown_when_a_plain_arrival_meets_it_in_admit() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now();
+        let mut first = arrival(0, false);
+        first.for_me_count = 0;
+        // Let one through, then hold a reply by the cooldown.
+        assert_eq!(lim.admit(vec![first], t0 + SETTLE).len(), 1);
+        let mut reply = arrival(0, false);
+        reply.for_me_count = 1;
+        reply.message_key = "reply".into();
+        assert!(
+            lim.admit(vec![reply], t0 + SETTLE + Duration::from_secs(1))
+                .is_empty()
+        );
+        let mut plain = arrival(0, false);
+        plain.for_me_count = 0;
+        plain.message_key = "plain".into();
+        let out = lim.admit(
+            vec![plain],
+            t0 + SETTLE + ROOM_COOLDOWN + Duration::from_secs(2),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].message_key, "reply");
+        assert_eq!(out[0].for_me_count, 1);
+    }
+
+    #[test]
+    fn a_held_reply_stays_the_message_shown_when_plain_ones_are_held_after_it() {
+        let (mut s, rec, rooms) = live();
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.now = 12 * 60;
+        s.chat.dnd.settings.allow_mentions = true;
+        let me = rooms[0].me;
+        let t0 = minute_later();
+        let a = with(&rooms, 1, vec![from_other(&rooms[1], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        let b = with(&a, 1, vec![reply_to(&rooms[1], "rep", me)]);
+        deliver_at(&mut s, b.clone(), t0 + Duration::from_secs(1));
+        let c = with(&b, 1, vec![from_other(&rooms[1], "p", "plain")]);
+        deliver_at(&mut s, c, t0 + Duration::from_secs(2));
+        s.chat.dnd.settings.manual = true;
+        s.flush_held(t0 + ROOM_COOLDOWN + Duration::from_secs(5));
+        let n = shown(&rec);
+        assert_eq!(n.len(), 2, "{n:?}");
+        assert_eq!(n[1].count, 1);
+        assert_eq!(n[1].message_key, "rep");
+    }
+
+    #[test]
+    fn what_do_not_disturb_drops_does_not_spend_the_limiters_budget() {
+        let (mut s, rec, rooms) = live();
+        dnd_on(&mut s);
+        let t0 = minute_later();
+        let a = with(&rooms, 1, vec![from_other(&rooms[1], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        assert!(shown(&rec).is_empty());
+        // Off again straight away: no cooldown is running for the room.
+        s.chat.dnd.settings.manual = false;
+        let b = with(&a, 1, vec![from_other(&rooms[1], "b", "two")]);
+        deliver_at(&mut s, b, t0 + Duration::from_secs(1));
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
+    #[test]
+    fn a_schedule_holds_back_notifications_only_inside_its_window() {
+        let (mut s, rec, rooms) = live();
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.settings.schedule = Some(crate::chat::DndSchedule {
+            start: 22 * 60,
+            end: 7 * 60,
+        });
+        s.chat.dnd.now = 23 * 60;
+        let a = with(&rooms, 1, vec![from_other(&rooms[1], "n1", "late")]);
+        deliver(&mut s, a.clone());
+        assert!(shown(&rec).is_empty());
+        s.chat.dnd.now = 8 * 60;
+        deliver(
+            &mut s,
+            with(&a, 1, vec![from_other(&rooms[1], "n2", "morning")]),
+        );
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
     #[test]
     fn a_mention_of_you_is_flagged() {
         let (mut s, rec, rooms) = live();
@@ -753,6 +975,7 @@ mod tests {
             private: false,
             count: 2,
             mention,
+            for_me_count: usize::from(mention),
             message_key: format!("m{i}"),
             author: "A".into(),
             text: "t".into(),

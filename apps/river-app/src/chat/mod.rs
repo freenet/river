@@ -12,6 +12,7 @@
 mod background;
 mod conversation;
 mod details;
+pub mod dnd;
 mod emoji;
 pub mod example;
 mod icons;
@@ -47,6 +48,7 @@ mod view;
 pub(crate) mod visual_fold;
 
 pub use background::{BackgroundHost, BackgroundUi};
+pub use dnd::{DndUi, Schedule as DndSchedule, Settings as DndSettings};
 pub use quick_reply::{MAX_REPLY_CHARS, ReplyRefusal};
 use std::collections::{HashMap, HashSet};
 
@@ -281,6 +283,8 @@ pub struct Chat {
     pub export: Option<identity::ExportDialog>,
     /// "Background and startup", when the shell offers it ([`background`]).
     pub background: Option<background::BackgroundUi>,
+    /// Do not disturb: this device's switch and schedule ([`dnd`]).
+    pub dnd: dnd::DndUi,
     /// Whether the last status was not live, so the next live update is catch-up rather than
     /// news (see [`Chat::show_node_rooms`]).
     catching_up: bool,
@@ -414,6 +418,7 @@ impl Chat {
             invite: None,
             export: None,
             background: None,
+            dnd: Default::default(),
             catching_up: true,
             full_list: false,
             modes: HashMap::new(),
@@ -977,6 +982,7 @@ impl Chat {
             || self.notify_dialog.is_some()
             || self.switcher.is_some()
             || self.background.as_ref().is_some_and(|b| b.open)
+            || self.dnd.open
             || self.overview
             || self.link_menu.is_some()
             || self.members_overlay

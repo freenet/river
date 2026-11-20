@@ -68,6 +68,12 @@ pub struct RiverApp {
     missed: (String, usize),
     /// What holds notifications back: cooldowns, the per-minute cap, rooms still filling.
     limiter: notify::Limiter,
+    /// Whether do not disturb is kept in this device's preferences. Off in snapshots and tests,
+    /// which must not write the real ones.
+    dnd_persist: bool,
+    /// An update notice do not disturb held back, shown once it is off (and the window is not
+    /// in front, which counts as told).
+    pending_notice: Option<(String, String)>,
     /// Whether a private room's notification may show the message text. Off unless the
     /// `notification_previews` preference is set (there is no switch for it yet).
     private_previews: bool,
@@ -119,6 +125,64 @@ fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
     });
 }
 
+/// Save one preference into this app's preferences file (none: nothing is saved). The file is
+/// read again, merged with the key and written back atomically, so a key saved by another
+/// part of the app since startup is kept. If that read fails (a sharing violation, say) it
+/// writes nothing, because writing then would erase the other keys. (`Prefs::open`, used to
+/// find the path, has already moved a file that does not parse to `prefs.json.bad`, so a
+/// corrupt file is not met here.) There is no lock against another River process writing at
+/// the same moment. The crate has no `tracing`, so failures go to stderr as elsewhere in it.
+fn save_pref<T: serde::Serialize + ?Sized>(key: &str, value: &T) {
+    let Some(path) = rune::prefs::Prefs::open("org.freenet.River")
+        .path()
+        .map(std::path::Path::to_path_buf)
+    else {
+        return;
+    };
+    if let Err(e) = merge_pref(&path, key, value) {
+        eprintln!("River: couldn't save {key}: {e}");
+    }
+}
+
+fn merge_pref<T: serde::Serialize + ?Sized>(
+    path: &std::path::Path,
+    key: &str,
+    value: &T,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut map: serde_json::Map<String, serde_json::Value> = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{} is not readable as preferences: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => return Err(format!("couldn't read {}: {e}", path.display())),
+    };
+    map.insert(
+        key.to_owned(),
+        serde_json::to_value(value).map_err(|e| e.to_string())?,
+    );
+    let json = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tmp.push(format!(".{}.{seq}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let done = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&json)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
 impl RiverApp {
     /// A window with nothing running behind it, for snapshots and tests. It shows the example
     /// rooms.
@@ -138,6 +202,8 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
+            dnd_persist: false,
+            pending_notice: None,
             private_previews: false,
             node_generation: 0,
             pending_save: None,
@@ -177,6 +243,8 @@ impl RiverApp {
             0,
             0,
         );
+        chat.dnd
+            .load(prefs.get(chat::dnd::PREF).unwrap_or_default());
         chat.node.choice = node;
         chat.node.notice = startup.notice;
         chat.node.problem = startup.problem;
@@ -203,6 +271,8 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
+            dnd_persist: true,
+            pending_notice: None,
             private_previews: prefs.get("notification_previews").unwrap_or(false),
             node_generation: link_generation,
             pending_save: None,
@@ -236,20 +306,21 @@ impl RiverApp {
         match event {
             UpdateEvent::Notice(text) => self.chat.update.notice = Some(text),
             UpdateEvent::Status(status) => {
-                if let Some((title, body)) = self.chat.update.apply(status)
+                let notice = self.chat.update.apply(status);
+                if notice.is_some() {
+                    // A newer version replaces one held back.
+                    self.pending_notice = None;
+                }
+                if let Some((title, body)) = notice
                     && !self.focused
                 {
-                    // Not a room's notification: nothing to open when it is clicked.
-                    self.notifier.notify(notify::Notification {
-                        room_key: "river-update".into(),
-                        room_name: "River".into(),
-                        title,
-                        body,
-                        mention: false,
-                        count: 1,
-                        message_key: String::new(),
-                        actions: false,
-                    });
+                    if self.dnd_allows(false) {
+                        self.send_update_notice(title, body);
+                    } else {
+                        // `Ready` is sent once per download, so there may be no later status
+                        // to announce it: keep it until do not disturb is off.
+                        self.pending_notice = Some((title, body));
+                    }
                 }
             }
         }
@@ -297,7 +368,12 @@ impl RiverApp {
                 u.check_now();
             }
         }
-        let _ = self.update_prefs.set(UPDATE_AUTO_PREF, &auto);
+        if self.update_prefs.path().is_some() {
+            save_pref(UPDATE_AUTO_PREF, &auto);
+        } else {
+            // In memory (tests, no config directory): nothing on disk to protect.
+            let _ = self.update_prefs.set(UPDATE_AUTO_PREF, &auto);
+        }
     }
 
     /// Offer "Background and startup" in the room list, backed by `host` (the desktop shell's
@@ -313,6 +389,8 @@ impl RiverApp {
         self.focus_known = true;
         if focused {
             self.missed = Default::default();
+            // The update block in front counts as told.
+            self.pending_notice = None;
             self.drop_read_held();
         }
     }
@@ -343,6 +421,79 @@ impl RiverApp {
         });
     }
 
+    /// Not a room's notification: nothing to open when it is clicked.
+    fn send_update_notice(&mut self, title: String, body: String) {
+        self.notifier.notify(notify::Notification {
+            room_key: "river-update".into(),
+            room_name: "River".into(),
+            title,
+            body,
+            mention: false,
+            count: 1,
+            message_key: String::new(),
+            actions: false,
+        });
+    }
+
+    /// Show the update notice do not disturb held back, once, when it allows. A window in
+    /// front shows the update block itself, which counts as told.
+    fn flush_pending_notice(&mut self) {
+        if self.pending_notice.is_some()
+            && self.dnd_allows(false)
+            && let Some((title, body)) = self.pending_notice.take()
+            && !self.focused
+        {
+            self.send_update_notice(title, body);
+        }
+    }
+
+    /// Whether do not disturb lets a notification through (`mention`: it is about a message
+    /// that mentions you). Unread counts do not depend on this.
+    fn dnd_allows(&mut self, mention: bool) -> bool {
+        self.refresh_dnd_clock();
+        self.chat.dnd.settings.allows(mention, self.chat.dnd.now)
+    }
+
+    fn refresh_dnd_clock(&mut self) {
+        if !self.chat.dnd.pinned {
+            self.chat.dnd.now = chat::dnd::local_minute();
+        }
+    }
+
+    /// Keep do not disturb in step: the clock it is judged by, the times typed in its dialog,
+    /// the saved copy, and a wake-up while a schedule is set so the indicator changes on time.
+    fn sync_dnd(&mut self, tx: &mut Tx) {
+        self.refresh_dnd_clock();
+        self.flush_pending_notice();
+        self.chat.dnd.sync_inputs();
+        if let Some(settings) = self.chat.dnd.take_dirty()
+            && self.dnd_persist
+        {
+            save_pref(chat::dnd::PREF, &settings);
+        }
+        let d = &self.chat.dnd;
+        // The switch on means the schedule changes nothing, so nothing to wake for.
+        if d.settings.schedule.is_some() && !d.settings.manual && !d.pinned {
+            tx.wake_after(std::time::Duration::from_secs(30));
+        }
+    }
+
+    /// What do not disturb lets through of `a`, if anything. Run before the limiter, so what
+    /// is held back neither spends its budget nor comes back later.
+    fn dnd_filter(&mut self, a: notify::Arrival) -> Option<notify::Arrival> {
+        self.refresh_dnd_clock();
+        self.chat.dnd.settings.filter(a, self.chat.dnd.now)
+    }
+
+    /// Apply do not disturb to what the limiter is holding back from before it came on.
+    fn dnd_filter_held(&mut self) {
+        self.refresh_dnd_clock();
+        let (settings, now) = (self.chat.dnd.settings.clone(), self.chat.dnd.now);
+        if settings.active(now) {
+            self.limiter.filter_held(|a| settings.filter(a, now));
+        }
+    }
+
     /// Show what the limits let through.
     fn show(&mut self, admitted: Vec<notify::Arrival>, now: std::time::Instant) {
         for (n, from) in notify::compose_from(admitted, self.private_previews) {
@@ -355,6 +506,8 @@ impl RiverApp {
     /// Show held-back notifications whose cooldown has ended, for a room that went quiet.
     pub(crate) fn flush_held(&mut self, now: std::time::Instant) {
         self.drop_read_held();
+        self.flush_pending_notice();
+        self.dnd_filter_held();
         let due = self.limiter.admit(Vec::new(), now);
         self.show(due, now);
     }
@@ -385,11 +538,14 @@ impl RiverApp {
                 }
                 self.missed.1 += a.count;
             }
-            if !a.quiet {
+            if !a.quiet
+                && let Some(a) = self.dnd_filter(a)
+            {
                 shown.push(a);
             }
         }
         self.drop_read_held();
+        self.dnd_filter_held();
         let admitted = self.limiter.admit(shown, now);
         self.show(admitted, now);
     }
@@ -407,6 +563,7 @@ impl RiverApp {
     /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
     /// the start of every frame, so it sees every change however it came about.
     fn sync_unread(&mut self, tx: &mut Tx) {
+        self.sync_dnd(tx);
         if self.chat.apply_reveal(tx) {
             tx.wake_after(std::time::Duration::from_millis(30));
         }
@@ -789,6 +946,23 @@ fn background_scene(s: &mut RiverApp, tray: bool) {
         PreviewBackground { tray },
     )));
     s.chat.open_background();
+}
+
+/// The chat screen with a scheduled do not disturb, at 23:00 (inside the 22:00 to 07:00
+/// window), with its dialog open or, for `closed`, just the room list's indicator.
+fn dnd_scene(s: &mut RiverApp, closed: bool) {
+    identity_scene(s, |_| {});
+    let d = &mut s.chat.dnd;
+    d.pinned = true;
+    d.now = 23 * 60;
+    d.settings.schedule = Some(chat::DndSchedule {
+        start: 22 * 60,
+        end: 7 * 60,
+    });
+    d.settings.allow_mentions = !closed;
+    if !closed {
+        s.chat.open_dnd();
+    }
 }
 
 /// The chat screen for the identity scenes: the example rooms as rooms from the node, so the
@@ -1520,6 +1694,8 @@ pub const SCENES: &[Scene] = &[
         })
     }),
     ("chat-background", |s| background_scene(s, true)),
+    ("chat-dnd", |s| dnd_scene(s, false)),
+    ("chat-dnd-on", |s| dnd_scene(s, true)),
     ("chat-background-no-tray", |s| background_scene(s, false)),
     ("chat-import-id", |s| identity_scene(s, |c| c.open_import())),
     ("chat-import-id-pasted", |s| {
@@ -3250,6 +3426,45 @@ mod tests {
             invitation_secrets: Default::default(),
         };
         (export.to_armored_string(), owner.verifying_key())
+    }
+
+    #[test]
+    fn saving_one_preference_keeps_the_others_and_never_overwrites_an_unreadable_file() {
+        let dir = std::env::temp_dir().join(format!("river-prefs-test-{}", std::process::id()));
+        let path = dir.join("prefs.json");
+        merge_pref(&path, "a", &1).unwrap();
+        merge_pref(&path, "b", &true).unwrap();
+        let both: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(both, serde_json::json!({"a": 1, "b": true}));
+        std::fs::write(&path, "not json").unwrap();
+        assert!(merge_pref(&path, "c", &2).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_do_not_disturb_entry_opens_its_dialog_and_the_switch_shows_in_the_footer() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| {
+            s.chat.dnd.pinned = true;
+            s.chat.dnd.now = 12 * 60;
+        });
+        settle(&mut rt);
+        assert!(!rt.state.chat.dnd.active());
+        press(&mut rt, "dnd");
+        assert!(rt.find("dnd-dialog").is_some());
+        press(&mut rt, "dnd-switch");
+        assert!(rt.state.chat.dnd.active());
+        press(&mut rt, "dnd-schedule");
+        assert!(rt.find("dnd-start").is_some());
+        press(&mut rt, "dnd-close");
+        assert!(rt.find("dnd-dialog").is_none());
+        assert!(
+            rt.state.chat.dnd.settings.manual,
+            "kept after the dialog closes"
+        );
     }
 
     #[test]
