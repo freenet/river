@@ -12,8 +12,9 @@
 //! it.
 
 use rune::{El, Tx, col, el, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit};
+use rune_kit::{Button, ButtonVariant, Kit};
 
+use super::dialog_kit::DialogSpec;
 use super::model::{self, Message, Room};
 use super::style::{self as st, Palette};
 use super::view::label;
@@ -396,33 +397,26 @@ pub(super) fn overview_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     for r in &rows {
         list = list.child(overview_row(r, &p));
     }
-    let body = col()
-        .key("overview-body")
+    DialogSpec::new("overview", "Unread and mentions", |s: &mut RiverApp| {
+        s.chat.close_overview()
+    })
+    .body_key("overview-body")
+    .width(560.0)
+    .child(header)
+    .child(list.scroll(rune::ScrollSpec {
+        stick_bottom: false,
+    }))
+    .child(
+        label(
+            "Muted rooms are left out. Rooms set to mentions and replies only count just those.",
+            st::SMALL,
+            p.text_muted,
+        )
+        .wrap()
         .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(header)
-        .child(list.scroll(rune::ScrollSpec {
-            stick_bottom: false,
-        }))
-        .child(
-            label(
-                "Muted rooms are left out. Rooms set to mentions and replies only count just those.",
-                st::SMALL,
-                p.text_muted,
-            )
-            .wrap()
-            .w_full()
-            .key("overview-note"),
-        );
-    Dialog::new("overview", "Unread and mentions")
-        .width(560.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_overview())
-        .child(body)
-        .build(k, layer);
+        .key("overview-note"),
+    )
+    .build(k, layer);
 }
 
 #[cfg(test)]

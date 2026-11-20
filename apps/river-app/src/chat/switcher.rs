@@ -6,9 +6,10 @@
 //! window. [`Chat`] holds the open state and acts on a choice; `view.rs` draws it.
 
 use rune::{El, Key, KeyEvent, TextEdit, col, el, row};
-use rune_kit::{Dialog, Kit, TextInput};
+use rune_kit::{Kit, TextInput};
 
 use super::conversation::avatar;
+use super::dialog_kit::DialogSpec;
 use super::style::{self as st, Palette};
 use super::view::label;
 use super::{Chat, keys};
@@ -464,21 +465,14 @@ pub(super) fn switcher_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .pt(6.0),
         );
     }
-    let body = col()
-        .key("switcher-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(input)
-        .child(list);
-    Dialog::new("switcher", "Quick switcher")
-        .width(480.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_switcher())
-        .child(body)
-        .build(k, layer);
+    DialogSpec::new("switcher", "Quick switcher", |s: &mut RiverApp| {
+        s.chat.close_switcher()
+    })
+    .body_key("switcher-body")
+    .width(480.0)
+    .child(input)
+    .child(list)
+    .build(k, layer);
 }
 
 fn result_row(chat: &Chat, hit: &Hit, i: usize, selected: bool, p: &Palette) -> El {

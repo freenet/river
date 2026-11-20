@@ -12,6 +12,7 @@
 mod background;
 mod conversation;
 mod details;
+mod dialog_kit;
 pub mod dm_archive;
 pub mod dm_compose;
 pub mod dm_invite;
@@ -350,7 +351,7 @@ pub struct Chat {
     open_when_shown: Option<String>,
     /// The invitation asked for, by the room it was asked for in.
     pub invite: Option<(String, InviteState)>,
-    /// The "Export Identity" dialog, when open ([`identity`]).
+    /// The "Export identity" dialog, when open ([`identity`]).
     pub export: Option<identity::ExportDialog>,
     /// "Background and startup", when the shell offers it ([`background`]).
     pub background: Option<background::BackgroundUi>,

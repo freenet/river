@@ -1395,7 +1395,7 @@ fn clicking_a_member_opens_their_info() {
     open_member(&mut rt, "Jonas");
     assert!(rt.find("member-info-dialog").is_some());
     assert_eq!(rt.state.chat.member_modal, Some(uid_of(&rt, "Jonas")));
-    assert!(shows(&rt, "Member Info"));
+    assert!(shows(&rt, "Member info"));
     assert!(shows(&rt, "Jonas"));
     assert!(shows(&rt, "Member ID"));
     // Jonas was invited by the owner, whose name opens the owner's own dialog.
@@ -4783,7 +4783,7 @@ fn the_details_dialog_offers_leave_room_to_a_member_and_to_the_owner() {
     for room in ["town-square", OWNED] {
         let rt = details_open(room);
         assert!(rt.find("details-leave").is_some(), "{room}");
-        assert!(shows(&rt, "Leave Room"));
+        assert!(shows(&rt, "Leave room"));
         // Nothing is asked until it is pressed.
         assert!(rt.find("details-leave-confirm").is_none());
     }
@@ -4944,7 +4944,7 @@ fn ban_is_offered_where_the_room_offers_it_asks_first_and_sends_one_command() {
     );
     press(&mut rt, "member-ban");
     // The web UI's words, and nothing has been sent.
-    assert!(shows(&rt, "Confirm Ban"));
+    assert!(shows(&rt, "Confirm ban"));
     assert!(shows(&rt, "Are you sure you want to ban Jonas"));
     assert!(shows(&rt, "This action cannot be undone."));
     // Asking asks the room what the ban does; nothing is banned, and Confirm waits for the answer.
@@ -5689,4 +5689,351 @@ fn node_status_stacks_with_the_overview_and_escape_leaves_both_alone() {
     assert!(chat.other_dialog_open());
     chat.close_node_status();
     assert!(chat.overview, "closing the status leaves the overview");
+}
+
+// The shared dialog scaffold -------------------------------------------------------------------
+
+/// The dialogs built on the scaffold, as a scene opens them: the scene, the dialog's key, the
+/// dismiss button (Cancel, Back or Close) and the primary or danger button when it has one.
+const KIT_DIALOGS: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "chat-join-invite",
+        "join-room",
+        "form-cancel",
+        Some("form-submit"),
+    ),
+    (
+        "chat-export-id",
+        "export-identity",
+        "export-close",
+        Some("export-copy"),
+    ),
+    (
+        "chat-import-id",
+        "import-identity",
+        "form-cancel",
+        Some("form-submit"),
+    ),
+    (
+        "chat-import-id-replace",
+        "import-identity",
+        "import-identity-replace-cancel",
+        Some("import-identity-replace-confirm"),
+    ),
+    (
+        "chat-node-status",
+        "node-status",
+        "ns-close",
+        Some("ns-copy"),
+    ),
+    (
+        "chat-node-change",
+        "node",
+        "node-cancel",
+        Some("node-connect"),
+    ),
+    (
+        "chat-node-change-confirm-remote",
+        "node",
+        "node-back",
+        Some("node-confirm"),
+    ),
+    ("chat-dnd", "dnd", "dnd-close", None),
+    ("chat-background", "background", "background-close", None),
+    ("chat-shortcuts", "shortcuts", "shortcuts-close", None),
+    (
+        "chat-dm-purge-confirm",
+        "dm-purge",
+        "dm-purge-cancel",
+        Some("dm-purge-confirm"),
+    ),
+    (
+        "chat-dm-invite-picker",
+        "dm-invite-picker",
+        "dm-invite-cancel",
+        Some("dm-invite-send"),
+    ),
+    (
+        "chat-ban-confirm",
+        "member-info",
+        "member-ban-cancel",
+        Some("member-ban-confirm-yes"),
+    ),
+    (
+        "chat-deputize-confirm",
+        "member-info",
+        "member-deputy-cancel",
+        Some("member-deputy-confirm"),
+    ),
+    (
+        "chat-room-leave-member",
+        "room-details",
+        "details-leave-cancel",
+        Some("details-leave-confirm"),
+    ),
+    (
+        "chat-room-details-owner",
+        "room-details",
+        "details-cancel",
+        Some("details-save"),
+    ),
+];
+
+/// Dialogs with nothing to press: only the X and Escape close them.
+const KIT_DIALOGS_NO_FOOTER: &[(&str, &str)] = &[
+    ("chat-notification-modes", "notify"),
+    ("chat-overview", "overview"),
+    ("chat-switcher", "switcher"),
+    ("chat-settings", "settings"),
+];
+
+fn scene_runtime(scene: &str) -> Runtime<RiverApp> {
+    let (_, apply) = SCENES
+        .iter()
+        .find(|(name, _)| *name == scene)
+        .unwrap_or_else(|| panic!("no scene {scene}"));
+    let mut state = RiverApp::detached();
+    apply(&mut state);
+    render(state, scene_size(scene))
+}
+
+fn focused_key(rt: &Runtime<RiverApp>) -> Option<String> {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.focused)
+        .and_then(|e| e.key)
+}
+
+/// Tab until the element keyed `want` has the keyboard.
+fn tab_to(rt: &mut Runtime<RiverApp>, want: &str) -> bool {
+    for _ in 0..80 {
+        if focused_key(rt).as_deref() == Some(want) {
+            return true;
+        }
+        key(rt, Key::Tab);
+    }
+    focused_key(rt).as_deref() == Some(want)
+}
+
+#[test]
+fn escape_closes_every_scaffold_dialog() {
+    let all = KIT_DIALOGS
+        .iter()
+        .map(|(scene, dialog, ..)| (*scene, *dialog))
+        .chain(KIT_DIALOGS_NO_FOOTER.iter().copied());
+    for (scene, dialog) in all {
+        let mut rt = scene_runtime(scene);
+        let panel = format!("{dialog}-dialog");
+        assert!(rt.find(&panel).is_some(), "{scene} shows {panel}");
+        key(&mut rt, Key::Escape);
+        assert!(
+            rt.find(&panel).is_none(),
+            "Escape closes {panel} in {scene}"
+        );
+    }
+}
+
+#[test]
+fn every_scaffold_dialog_puts_dismiss_left_of_the_primary_button() {
+    for (scene, _, dismiss, primary) in KIT_DIALOGS {
+        let rt = scene_runtime(scene);
+        let (dx, dy) = rt
+            .find(dismiss)
+            .unwrap_or_else(|| panic!("{scene}: no {dismiss}"));
+        let Some(primary) = primary else { continue };
+        let (px, py) = rt
+            .find(primary)
+            .unwrap_or_else(|| panic!("{scene}: no {primary}"));
+        assert!(dx < px, "{scene}: {dismiss} is left of {primary}");
+        assert!((dy - py).abs() < 4.0, "{scene}: they share a row");
+    }
+}
+
+#[test]
+fn quit_river_is_apart_at_the_left_and_close_is_rightmost() {
+    let rt = scene_runtime("chat-background");
+    let (qx, _) = rt.find("background-quit").expect("Quit River");
+    let (cx, _) = rt.find("background-close").expect("Close");
+    let (bx, _) = rt.find("background-body").expect("the body");
+    assert!(qx < cx, "Quit River is left of Close");
+    assert!(qx < bx + 120.0, "Quit River sits at the left edge");
+}
+
+/// The dismiss button of every dialog is reachable with Tab, and pressing it closes the dialog.
+#[test]
+fn tab_reaches_each_dismiss_button_and_space_presses_it() {
+    for (scene, dialog, dismiss, _) in KIT_DIALOGS {
+        // Escape is tested above; a confirm inside a dialog only goes back a step.
+        if ["member-info", "room-details"].contains(dialog)
+            || ["chat-import-id-replace", "chat-node-change-confirm-remote"].contains(scene)
+        {
+            continue;
+        }
+        let mut rt = scene_runtime(scene);
+        assert!(tab_to(&mut rt, dismiss), "{scene}: Tab reaches {dismiss}");
+        key(&mut rt, Key::Text(" ".into()));
+        let panel = format!("{dialog}-dialog");
+        assert!(
+            rt.find(&panel).is_none(),
+            "{scene}: {dismiss} closes {panel}"
+        );
+    }
+}
+
+/// The primary action is in the Tab order and Space presses it, as every button.
+#[test]
+fn tab_reaches_the_primary_action_of_the_export_and_node_status_dialogs() {
+    let mut rt = scene_runtime("chat-export-id");
+    assert!(tab_to(&mut rt, "export-copy"));
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(rt.state.chat.export.as_ref().is_some_and(|e| e.copied));
+
+    let mut rt = scene_runtime("chat-node-status");
+    assert!(tab_to(&mut rt, "ns-copy"));
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(rt.state.chat.status.copied);
+
+    let mut rt = scene_runtime("chat-import-id");
+    assert!(tab_to(&mut rt, "form-submit"));
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(
+        rt.state.chat.form.error.is_some(),
+        "Import with nothing pasted says why"
+    );
+}
+
+#[test]
+fn the_danger_buttons_are_in_the_tab_order() {
+    for (scene, want) in [
+        ("chat-import-id-replace", "import-identity-replace-confirm"),
+        ("chat-dm-purge-confirm", "dm-purge-confirm"),
+        ("chat-room-leave-member", "details-leave-confirm"),
+        ("chat-ban-confirm", "member-ban-confirm-yes"),
+    ] {
+        let mut rt = scene_runtime(scene);
+        assert!(tab_to(&mut rt, want), "{scene}: Tab reaches {want}");
+    }
+}
+
+/// The Create room description is a wrapped line in the body, so a long one cannot run past
+/// the dialog's right edge (it did, in one line under the title).
+#[test]
+fn the_create_room_description_stays_inside_the_dialog() {
+    let mut rt = scene_runtime("chat-connection-live");
+    press(&mut rt, "create-room");
+    let rects = rt.elements();
+    let panel = rects
+        .iter()
+        .find(|e| e.key.as_deref() == Some("create-room-dialog"))
+        .expect("the dialog");
+    let sub = rects
+        .iter()
+        .find(|e| e.key.as_deref() == Some("dialog-subtitle"))
+        .expect("the subtitle");
+    assert!(
+        sub.rect[0] + sub.rect[2] <= panel.rect[0] + panel.rect[2] + 0.5,
+        "the subtitle {:?} ends inside the dialog {:?}",
+        sub.rect,
+        panel.rect
+    );
+}
+
+// Confirms start safe ---------------------------------------------------------------------------
+
+/// A confirm that has just opened: Return and Space on its first Tab stop must not fire the
+/// action it confirms, and the keyboard must not be on the danger button (the opener that had
+/// it has just left the tree). `probe` reads what the confirmed action would change.
+fn assert_confirm_starts_safe(
+    mut rt: Runtime<RiverApp>,
+    name: &str,
+    danger: &str,
+    probe: impl Fn(&mut Runtime<RiverApp>) -> String,
+) {
+    assert!(rt.find(danger).is_some(), "{name}: the confirm is showing");
+    assert_ne!(
+        focused_key(&rt).as_deref(),
+        Some(danger),
+        "{name}: focus starts on the danger button"
+    );
+    let before = probe(&mut rt);
+    key(&mut rt, Key::Enter);
+    assert_eq!(probe(&mut rt), before, "{name}: Return fired the action");
+    key(&mut rt, Key::Tab);
+    assert_ne!(
+        focused_key(&rt).as_deref(),
+        Some(danger),
+        "{name}: the first Tab stop is the danger button"
+    );
+    key(&mut rt, Key::Text(" ".into()));
+    assert_eq!(probe(&mut rt), before, "{name}: Space fired the action");
+}
+
+fn actions_probe(rt: &mut Runtime<RiverApp>) -> String {
+    format!("{:?}", sent_all(rt))
+}
+
+#[test]
+fn every_confirm_opens_with_the_danger_button_unfocused_and_unfired() {
+    // Ban.
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    let jonas = uid_of(&rt, "Jonas");
+    press(&mut rt, "member-ban");
+    answer_preview(&mut rt, &jonas, super::model::BanPreview::default());
+    let _ = sent_all(&mut rt);
+    assert_confirm_starts_safe(rt, "ban", "member-ban-confirm-yes", actions_probe);
+
+    // Leave room.
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    press(&mut rt, "details-leave");
+    let _ = sent_all(&mut rt);
+    assert_confirm_starts_safe(rt, "leave", "details-leave-confirm", actions_probe);
+
+    // Replace identity.
+    let mut rt = scene_runtime("chat-import-id-replace");
+    press(&mut rt, "import-identity-replace-cancel");
+    press(&mut rt, "form-submit");
+    let _ = sent_all(&mut rt);
+    assert_confirm_starts_safe(
+        rt,
+        "replace identity",
+        "import-identity-replace-confirm",
+        actions_probe,
+    );
+
+    // Delete their messages.
+    let mut rt = scene_runtime("chat-dm-purge");
+    press(&mut rt, "dm-purge");
+    let _ = sent_all(&mut rt);
+    assert_confirm_starts_safe(rt, "delete messages", "dm-purge-confirm", actions_probe);
+
+    // Change node (the confirm's primary is not red, but it replaces the rooms showing).
+    let mut rt = scene_runtime("chat-node-change");
+    rt.state.chat.node.form.as_mut().expect("the form").input =
+        rune::TextEdit::new("home.example.org:7509");
+    press(&mut rt, "node-connect");
+    assert_confirm_starts_safe(rt, "change node", "node-confirm", |rt| {
+        rt.state.chat.node.choice.address.to_string()
+    });
+}
+
+/// Return on a focused "Ban user" asks once: repeated Return does not stack a second ask, and
+/// the opener leaves the dialog once the confirmation shows.
+#[test]
+fn enter_on_ban_user_asks_once_and_the_opener_goes() {
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    assert!(tab_to(&mut rt, "member-ban"), "Tab reaches Ban user");
+    assert!(rt.state.chat.ban_confirm.is_none());
+    key(&mut rt, Key::Enter);
+    assert!(rt.state.chat.ban_confirm.is_some(), "Return asks");
+    assert!(rt.find("member-ban").is_none(), "the opener is gone");
+    for _ in 0..3 {
+        key(&mut rt, Key::Enter);
+    }
+    assert!(rt.state.chat.ban_confirm.is_some());
+    let previews = sent_all(&mut rt)
+        .into_iter()
+        .filter(|a| matches!(a, Action::PreviewBan { .. }))
+        .count();
+    assert_eq!(previews, 1, "the room is asked what the ban does once");
 }

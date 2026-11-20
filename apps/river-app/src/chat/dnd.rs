@@ -13,9 +13,10 @@
 //! a parameter; only [`local_minute`] reads the clock.
 
 use rune::{El, TextEdit};
-use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, TextInput};
+use rune_kit::{Checkbox, Kit, TextInput};
 use serde::{Deserialize, Serialize};
 
+use super::dialog_kit::{self as dk, DialogSpec};
 use super::style::{self as st};
 use super::view::label;
 use crate::RiverApp;
@@ -295,12 +296,11 @@ pub(super) fn dnd_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
         return;
     }
     let p = st::palette();
-    let mut body = rune::col()
-        .key("dnd-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0);
+    let mut body = DialogSpec::new("dnd", "Do not disturb", |s: &mut RiverApp| {
+        s.chat.close_dnd()
+    })
+    .body_key("dnd-body")
+    .width(420.0);
     body = body.child(
         Checkbox::new(d.settings.manual)
             .label("Do not disturb")
@@ -371,22 +371,10 @@ pub(super) fn dnd_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
         .w_full()
         .key("dnd-note"),
     );
-    body = body.child(
-        rune::row().w_full().justify_end().child(
-            Button::new("Close")
-                .variant(ButtonVariant::Ghost)
-                .on_press(|s: &mut RiverApp| s.chat.close_dnd())
-                .build(k)
-                .key("dnd-close"),
-        ),
-    );
-    Dialog::new("dnd", "Do not disturb")
-        .width(420.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_dnd())
-        .child(body)
-        .build(k, layer);
+    body.footer(dk::close_footer(k, "dnd-close", |s: &mut RiverApp| {
+        s.chat.close_dnd()
+    }))
+    .build(k, layer);
 }
 
 #[cfg(test)]

@@ -8,10 +8,11 @@
 //! person is changing from a node whose rooms are showing (the rooms and the identity River
 //! uses belong to the node). What the choice does is [`crate::RiverApp::apply_node`].
 
-use rune::{El, TextEdit, col, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextInput};
+use rune::{El, TextEdit, row};
+use rune_kit::{Button, ButtonVariant, Kit, TextInput};
 
 use super::Chat;
+use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, notice_text, notice_text_in};
 use super::style::{self as st, Palette};
 use super::view::label;
 use crate::RiverApp;
@@ -160,6 +161,9 @@ pub struct Screen {
     pub intro: String,
     pub content: Vec<El>,
     pub actions: Vec<El>,
+    /// An extra action that is not Cancel or the primary one (only in the dialog), which the
+    /// footer puts at the left edge.
+    pub leading: Vec<El>,
 }
 
 /// The form's screen. `connected` says rooms from a node are showing (a dialog over them, so
@@ -177,15 +181,20 @@ pub fn screen(chat: &Chat, connected: bool, k: &Kit) -> Option<Screen> {
     if let Some(address) = &form.confirm {
         let mut content = Vec::new();
         if !address.is_loopback() {
-            content.push(warning_box("node-warning", &remote_warning(address), &p));
+            content.push(notice_text(
+                NoticeKind::Warning,
+                "node-warning",
+                &remote_warning(address),
+            ));
         }
         if connected {
-            content.push(
-                label(change_note(address), st::BODY, p.text_secondary)
-                    .wrap()
-                    .w_full()
-                    .key("node-change-note"),
-            );
+            // It ends with what may be lost, so it is a warning at the body size.
+            content.push(notice_text_in(
+                NoticeKind::Warning,
+                "node-change-note",
+                &change_note(address),
+                st::BODY,
+            ));
         }
         let go = if connected {
             "Change node"
@@ -196,6 +205,7 @@ pub fn screen(chat: &Chat, connected: bool, k: &Kit) -> Option<Screen> {
             title: format!("Connect to {address}?"),
             intro: String::new(),
             content,
+            leading: Vec::new(),
             actions: vec![
                 Button::new("Back")
                     .variant(ButtonVariant::Ghost)
@@ -240,9 +250,9 @@ pub fn screen(chat: &Chat, connected: bool, k: &Kit) -> Option<Screen> {
         if connected { "Cancel" } else { "Back" },
         "node-cancel",
     )];
+    let mut leading = Vec::new();
     if connected && chat.node.choice.is_existing_node() {
-        actions.insert(
-            0,
+        leading.push(
             Button::new("Use Freenet on this computer")
                 .variant(ButtonVariant::Ghost)
                 .on_press(|s: &mut RiverApp| s.node_use_local())
@@ -282,18 +292,8 @@ pub fn screen(chat: &Chat, connected: bool, k: &Kit) -> Option<Screen> {
         intro: INTRO.into(),
         content,
         actions,
+        leading,
     })
-}
-
-fn warning_box(key: &str, text: &str, p: &Palette) -> El {
-    col()
-        .key(key.to_owned())
-        .w_full()
-        .padding(12.0)
-        .radius(8.0)
-        .fill(p.warning_bg)
-        .border(1.0, p.warning)
-        .child(label(text.to_owned(), st::SMALL, p.text).wrap().w_full())
 }
 
 /// The form as a dialog over the rooms, when open.
@@ -302,8 +302,9 @@ pub(super) fn node_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
         return;
     };
     let p = st::palette();
-    let mut body = col().key("node-form").w_full().px(16.0).pb(16.0).gap(12.0);
-    // In the body, where it wraps: a dialog's own description stays on one line.
+    let mut body = DialogSpec::new("node", screen.title, |s: &mut RiverApp| s.node_cancel())
+        .body_key("node-form")
+        .width(460.0);
     if !screen.intro.is_empty() {
         body = body.child(
             label(screen.intro, st::BODY, p.text_secondary)
@@ -312,38 +313,21 @@ pub(super) fn node_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 .key("node-intro"),
         );
     }
-    for c in screen.content {
-        body = body.child(c);
-    }
-    let mut buttons = row().w_full().gap(8.0).justify_end().flex_wrap();
-    for a in screen.actions {
-        buttons = buttons.child(a);
-    }
-    body = body.child(buttons);
-    Dialog::new("node", screen.title)
-        .width(460.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.node_cancel())
-        .child(body)
+    body.children(screen.content)
+        .footer(dk::footer(screen.leading, screen.actions))
         .build(k, layer);
 }
 
 /// The lines under the connection state about the node in use: why it can't be trusted with
 /// more than a tunnel, and anything the app had to say at start. Empty for the node on this
 /// computer.
-pub fn banners(node: &NodeUi, p: &Palette) -> Vec<El> {
+pub fn banners(node: &NodeUi, _p: &Palette) -> Vec<El> {
     let mut out = Vec::new();
     if let Some(n) = &node.notice {
-        out.push(
-            label(n.clone(), st::SMALL, p.text_secondary)
-                .wrap()
-                .w_full()
-                .key("node-notice"),
-        );
+        out.push(notice_text(NoticeKind::Info, "node-notice", n));
     }
     if let Some(w) = node.insecure() {
-        out.push(warning_box("node-insecure", &w, p));
+        out.push(notice_text(NoticeKind::Warning, "node-insecure", &w));
     }
     out
 }

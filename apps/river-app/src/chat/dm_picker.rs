@@ -20,9 +20,10 @@
 
 use std::time::Instant;
 
-use rune::{El, col, icon, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextInput};
+use rune::{El, icon, row};
+use rune_kit::{Kit, TextInput};
 
+use super::dialog_kit::{self as dk, DialogSpec};
 use super::icons;
 use super::model::Room;
 use super::style::{self as st, Palette};
@@ -295,12 +296,13 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     let block = chat.invite_picker_block();
     let waiting = open.sending.as_ref().is_some_and(|s| !s.silent);
     let silent = open.sending.as_ref().is_some_and(|s| s.silent);
-    let mut body = col()
-        .key("dm-invite-picker-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0);
+    let mut body = DialogSpec::new(
+        "dm-invite-picker",
+        format!("Invite {name} to another room"),
+        |s: &mut RiverApp| s.chat.close_invite_picker(),
+    )
+    .body_key("dm-invite-picker-body")
+    .width(460.0);
     if let Some(why) = &block {
         body = body.child(
             label(why.clone(), st::SMALL, p.danger)
@@ -412,37 +414,27 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .as_ref()
             .is_some_and(|t| candidates.iter().any(|r| &r.key == t))
         && chat.invite_note_refusal().is_none();
-    let mut send = Button::new("Send invitation")
-        .variant(ButtonVariant::Contrast)
-        .on_press(|s: &mut RiverApp| {
+    let mut send = dk::primary_button(
+        k,
+        "Send invitation",
+        "dm-invite-send",
+        |s: &mut RiverApp| {
             s.chat.invite_send();
-        })
-        .build(k)
-        .key("dm-invite-send");
+        },
+    );
     if !can_send {
         send = send.disabled(true).opacity(0.45);
     }
-    body = body.child(
-        row()
-            .w_full()
-            .gap(8.0)
-            .justify_end()
-            .child(
-                Button::new("Cancel")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.chat.close_invite_picker())
-                    .build(k)
-                    .key("dm-invite-cancel"),
-            )
-            .child(send),
-    );
-    Dialog::new("dm-invite-picker", format!("Invite {name} to another room"))
-        .width(460.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_invite_picker())
-        .child(body)
-        .build(k, layer);
+    body.footer(dk::footer(
+        Vec::new(),
+        vec![
+            dk::quiet_button(k, "Cancel", "dm-invite-cancel", |s: &mut RiverApp| {
+                s.chat.close_invite_picker()
+            }),
+            send,
+        ],
+    ))
+    .build(k, layer);
 }
 
 /// One room on offer: its name, a lock for a private room, and how many members it has.

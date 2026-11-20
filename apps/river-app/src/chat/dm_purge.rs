@@ -28,9 +28,10 @@
 use std::time::{Duration, Instant};
 
 use rune::{El, col, icon, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit};
+use rune_kit::{Button, ButtonVariant, Kit};
 
 use super::conversation::text_button;
+use super::dialog_kit::{self as dk, DialogSpec};
 use super::dm_model::DmPurge;
 use super::icons;
 use super::style::{self as st, Palette};
@@ -552,87 +553,70 @@ pub(super) fn confirm_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     } else {
         format!("the {n} messages")
     };
-    let body = col()
-        .key("dm-purge-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(
-            label(
-                format!(
-                    "This deletes {count} {name} sent you in this room. They are removed from \
-                     the room itself, so {name} no longer sees them in the conversation either, \
-                     and this cannot be undone."
-                ),
-                st::BODY,
-                p.text,
-            )
-            .key("dm-purge-what")
-            .wrap()
-            .w_full(),
+    let confirm_label = if n == 1 {
+        "Delete 1 message".to_owned()
+    } else {
+        format!("Delete {n} messages")
+    };
+    DialogSpec::new("dm-purge", "Delete their messages?", |s: &mut RiverApp| {
+        s.chat.dm_purge_cancel()
+    })
+    .subtitle(if room_name.is_empty() {
+        name.clone()
+    } else {
+        format!("{name}, in {room_name}")
+    })
+    .body_key("dm-purge-body")
+    .width(460.0)
+    .child(
+        label(
+            format!(
+                "This deletes {count} {name} sent you in this room. They are removed from \
+                 the room itself, so {name} no longer sees them in the conversation either, \
+                 and this cannot be undone."
+            ),
+            st::BODY,
+            p.text,
         )
-        .child(
-            label(
-                format!(
-                    "Messages you sent {name} are not deleted, and neither are any {name} \
-                     sends later."
-                ),
-                st::SMALL,
-                p.text_secondary,
-            )
-            .key("dm-purge-kept")
-            .wrap()
-            .w_full(),
+        .key("dm-purge-what")
+        .wrap()
+        .w_full(),
+    )
+    .child(
+        label(
+            format!(
+                "Messages you sent {name} are not deleted, and neither are any {name} \
+                 sends later."
+            ),
+            st::SMALL,
+            p.text_secondary,
         )
-        .child(
-            label(
-                "Each deleted message is recorded in the room so that it stays deleted. A \
-                 room records at most 1000 deleted messages for you. If another device signed \
-                 in as you has deleted messages recently, some messages can come back.",
-                st::SMALL,
-                p.text_muted,
-            )
-            .key("dm-purge-record")
-            .wrap()
-            .w_full(),
+        .key("dm-purge-kept")
+        .wrap()
+        .w_full(),
+    )
+    .child(
+        label(
+            "Each deleted message is recorded in the room so that it stays deleted. A \
+             room records at most 1000 deleted messages for you. If another device signed \
+             in as you has deleted messages recently, some messages can come back.",
+            st::SMALL,
+            p.text_muted,
         )
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .justify_end()
-                .child(
-                    Button::new("Cancel")
-                        .variant(ButtonVariant::Ghost)
-                        .on_press(|s: &mut RiverApp| s.chat.dm_purge_cancel())
-                        .build(k)
-                        .key("dm-purge-cancel"),
-                )
-                .child(
-                    Button::new(if n == 1 {
-                        "Delete 1 message".to_owned()
-                    } else {
-                        format!("Delete {n} messages")
-                    })
-                    .variant(ButtonVariant::Danger)
-                    .on_press(|s: &mut RiverApp| {
-                        s.chat.dm_purge_confirm();
-                    })
-                    .build(k)
-                    .key("dm-purge-confirm"),
-                ),
-        );
-    Dialog::new("dm-purge", "Delete their messages?")
-        .description(if room_name.is_empty() {
-            name
-        } else {
-            format!("{name}, in {room_name}")
-        })
-        .width(460.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.dm_purge_cancel())
-        .child(body)
-        .build(k, layer);
+        .key("dm-purge-record")
+        .wrap()
+        .w_full(),
+    )
+    .footer(dk::footer(
+        Vec::new(),
+        vec![
+            dk::quiet_button(k, "Cancel", "dm-purge-cancel", |s: &mut RiverApp| {
+                s.chat.dm_purge_cancel()
+            }),
+            dk::danger_button(k, confirm_label, "dm-purge-confirm", |s: &mut RiverApp| {
+                s.chat.dm_purge_confirm();
+            }),
+        ],
+    ))
+    .build(k, layer);
 }

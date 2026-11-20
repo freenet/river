@@ -2450,7 +2450,7 @@ pub const SCENES: &[Scene] = &[
         details_scene(s, chat::example::EMPTY_ROOM, |_, _| {});
         fill_room(s, chat::example::EMPTY_ROOM);
     }),
-    // Leave Room: the question as a member and as the owner sees it.
+    // Leave room: the question as a member and as the owner sees it.
     ("chat-room-leave-member", |s| {
         details_scene(s, "town-square", |chat, _| chat.ask_leave())
     }),

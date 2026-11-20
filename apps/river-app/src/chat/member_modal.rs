@@ -13,9 +13,10 @@
 use std::collections::HashMap;
 
 use rune::{El, col, el, icon, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, Kit, TextInput};
 
 use super::conversation::avatar;
+use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, copy_field, notice};
 use super::icons;
 use super::model::{Appointer, BanOffer, Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
@@ -124,51 +125,6 @@ fn chip(key: &str, text: &str, color: rune::Color, line: rune::Color) -> El {
 /// The verifying key is 44 characters: one size under the body text fits it on a line at the
 /// dialog's width, where the body size left a lone character on a second line.
 const KEY_TEXT: rune::tok::TextStyle = rune::tok::TextStyle::new(13.0, 400.0);
-
-pub(super) fn field(
-    key: &str,
-    name: &str,
-    value: &str,
-    copy_what: &'static str,
-    text: rune::tok::TextStyle,
-    p: &Palette,
-) -> El {
-    let copied = value.to_owned();
-    col()
-        .key(key.to_owned())
-        .w_full()
-        .gap(2.0)
-        .child(label(name.to_owned(), st::SMALL_STRONG, p.text_muted))
-        .child(
-            row()
-                .w_full()
-                .gap(6.0)
-                .child(
-                    label(value.to_owned(), text, p.text)
-                        .wrap_anywhere()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .key(format!("{key}-value")),
-                )
-                .child(
-                    row()
-                        .key(format!("{key}-copy"))
-                        .role("button")
-                        .label(copy_what)
-                        .help(copy_what)
-                        .size(24.0, 24.0)
-                        .radius(6.0)
-                        .center()
-                        .hover(p.surface_hover)
-                        .cursor(rune::Cursor::Pointer)
-                        .on_press_tx(move |_: &mut RiverApp, tx: &mut rune::Tx| {
-                            tx.copy(copied.clone())
-                        })
-                        .child(icon(&icons::COPY, 14.0).color(p.text_muted)),
-                ),
-        )
-}
 
 /// Your own nickname, editable as the web UI's `NicknameField` is, but with Save and Cancel
 /// (and Enter to save). That is a deliberate divergence from the web UI, which saves when the
@@ -397,38 +353,34 @@ fn deputy_block(
         } else {
             "Revoke this deputy?"
         };
-        return block
-            .padding(12.0)
-            .radius(8.0)
-            .fill(p.warning_bg)
-            .border(1.0, p.warning)
-            .child(label(title, st::ROOM_STRONG, p.text).key("member-deputy-title"))
-            .child(
+        return notice(
+            NoticeKind::Warning,
+            "member-deputy",
+            vec![
+                label(title, st::ROOM_STRONG, p.text).key("member-deputy-title"),
                 label(words, st::SMALL, p.text)
                     .wrap_anywhere()
                     .w_full()
                     .key("member-deputy-words"),
-            )
-            .child(
-                row()
-                    .w_full()
-                    .gap(8.0)
-                    .justify_end()
-                    .child(
-                        Button::new("Cancel")
-                            .variant(ButtonVariant::Ghost)
-                            .on_press(|s: &mut RiverApp| s.chat.cancel_deputy())
-                            .build(k)
-                            .key("member-deputy-cancel"),
-                    )
-                    .child(
-                        Button::new(if grant { "Deputize" } else { "Revoke deputy" })
-                            .variant(ButtonVariant::Contrast)
-                            .on_press(|s: &mut RiverApp| s.chat.confirm_deputy())
-                            .build(k)
-                            .key("member-deputy-confirm"),
-                    ),
-            );
+                dk::footer(
+                    Vec::new(),
+                    vec![
+                        dk::quiet_button(
+                            k,
+                            "Cancel",
+                            "member-deputy-cancel",
+                            |s: &mut RiverApp| s.chat.cancel_deputy(),
+                        ),
+                        dk::primary_button(
+                            k,
+                            if grant { "Deputize" } else { "Revoke deputy" },
+                            "member-deputy-confirm",
+                            |s: &mut RiverApp| s.chat.confirm_deputy(),
+                        ),
+                    ],
+                ),
+            ],
+        );
     }
     let mut button = Button::new(if grant { "Deputize" } else { "Revoke deputy" })
         .variant(ButtonVariant::Ghost)
@@ -523,14 +475,9 @@ fn ban_confirmation(
         .filter(|x| x.id != m.id && invited_through(by_id, x, m))
         .count();
     let mut block = col()
-        .key("member-ban-confirm")
         .w_full()
         .gap(8.0)
-        .padding(12.0)
-        .radius(8.0)
-        .fill(p.warning_bg)
-        .border(1.0, p.warning)
-        .child(label("Confirm Ban", st::ROOM_STRONG, p.text).key("member-ban-title"))
+        .child(label("Confirm ban", st::ROOM_STRONG, p.text).key("member-ban-title"))
         .child(
             label(
                 format!(
@@ -618,30 +565,31 @@ fn ban_confirmation(
             .key("member-ban-secret"),
         );
     }
-    block.child(
-        row()
-            .w_full()
-            .gap(8.0)
-            .justify_end()
-            .child(
-                Button::new("Cancel")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.chat.cancel_ban())
-                    .build(k)
-                    .key("member-ban-cancel"),
-            )
-            .child({
-                let mut yes = Button::new("Yes, Ban User")
-                    .variant(ButtonVariant::Danger)
-                    .on_press(|s: &mut RiverApp| s.chat.confirm_ban())
-                    .build(k)
-                    .key("member-ban-confirm-yes");
-                // Not until the room has said what the ban does, and never one it would drop.
-                if !chat.ban_ready() {
-                    yes = yes.disabled(true).opacity(0.45);
-                }
-                yes
-            }),
+    let mut yes = dk::danger_button(
+        k,
+        "Yes, ban user",
+        "member-ban-confirm-yes",
+        |s: &mut RiverApp| s.chat.confirm_ban(),
+    );
+    // Not until the room has said what the ban does, and never one it would drop.
+    if !chat.ban_ready() {
+        yes = yes.disabled(true).opacity(0.45);
+    }
+    notice(
+        NoticeKind::Danger,
+        "member-ban-confirm",
+        vec![
+            block,
+            dk::footer(
+                Vec::new(),
+                vec![
+                    dk::quiet_button(k, "Cancel", "member-ban-cancel", |s: &mut RiverApp| {
+                        s.chat.cancel_ban()
+                    }),
+                    yes,
+                ],
+            ),
+        ],
     )
 }
 
@@ -724,27 +672,21 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         ));
     }
 
-    let mut body = col()
-        .key("member-info")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(
-            row()
-                .w_full()
-                .gap(12.0)
-                .center_y()
-                .child(avatar(Some(m), m.id, 40.0))
-                .child(
-                    label(m.nickname.clone(), st::TITLE, p.text)
-                        .wrap_anywhere()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .key("member-name"),
-                ),
-        );
+    let mut body = col().key("member-info").w_full().gap(12.0).child(
+        row()
+            .w_full()
+            .gap(12.0)
+            .center_y()
+            .child(avatar(Some(m), m.id, 40.0))
+            .child(
+                label(m.nickname.clone(), st::TITLE, p.text)
+                    .wrap_anywhere()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0)
+                    .key("member-name"),
+            ),
+    );
     body = body.child(tags);
     if let Some(row) = deputized_by_row(room, m, &by_id, &p) {
         body = body.child(row);
@@ -753,44 +695,40 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         body = body.child(nickname_editor(room, m, chat, &p, k));
     }
     if let Some(Imitation { who: owner, text }) = imitated {
-        body = body.child(
-            col()
-                .key("member-impersonation")
-                .w_full()
-                .padding(12.0)
-                .gap(6.0)
-                .radius(8.0)
-                .fill(p.warning_bg)
-                .border(1.0, p.warning)
-                .child(label(text, st::SMALL, p.text).wrap_anywhere().w_full())
-                .child(
-                    row()
-                        .w_full()
-                        .gap(6.0)
-                        .center_y()
-                        .child(label("Resembles:", st::SMALL, p.text_muted))
-                        .child(
-                            label(owner.nickname.clone(), st::SMALL_STRONG, p.text)
-                                .truncate()
-                                .shrink()
-                                .min_w(0.0)
-                                .key("member-resembles"),
-                        ),
-                ),
-        );
+        body = body.child(notice(
+            NoticeKind::Warning,
+            "member-impersonation",
+            vec![
+                label(text, st::SMALL, p.text).wrap_anywhere().w_full(),
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .child(label("Resembles:", st::SMALL, p.text_muted))
+                    .child(
+                        label(owner.nickname.clone(), st::SMALL_STRONG, p.text)
+                            .truncate()
+                            .shrink()
+                            .min_w(0.0)
+                            .key("member-resembles"),
+                    ),
+            ],
+        ));
     }
-    body = body.child(field(
+    body = body.child(copy_field(
         "member-id",
         "Member ID",
+        None,
         &m.uid,
         "Copy member ID",
         st::BODY,
         &p,
     ));
     if !m.key.is_empty() {
-        body = body.child(field(
+        body = body.child(copy_field(
             "member-vk",
             "Verifying key",
+            None,
             &m.key,
             "Copy verifying key",
             KEY_TEXT,
@@ -860,13 +798,12 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             && matches!(room.ban_offers.get(uid), Some(BanOffer::Allowed))
             && chat.ban_confirm.is_none()
         {
-            actions = actions.child(
-                Button::new("Ban user")
-                    .variant(ButtonVariant::Danger)
-                    .on_press(|s: &mut RiverApp| s.chat.ask_ban())
-                    .build(k)
-                    .key("member-ban"),
-            );
+            actions = actions.child(dk::danger_outline_button(
+                k,
+                "Ban user",
+                "member-ban",
+                |s: &mut RiverApp| s.chat.ask_ban(),
+            ));
         }
     }
     body = body.child(el().w_full().h(1.0).fill(p.line)).child(actions);
@@ -905,11 +842,11 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         body = body.child(deputy_block(chat, room, m, offer, why_not, &p, k));
     }
 
-    Dialog::new("member-info", "Member Info")
-        .width(440.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_member())
-        .child(body)
-        .build(k, layer);
+    DialogSpec::new("member-info", "Member info", |s: &mut RiverApp| {
+        s.chat.close_member()
+    })
+    .body_key("member-info-body")
+    .width(440.0)
+    .child(body)
+    .build(k, layer);
 }
