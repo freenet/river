@@ -1152,7 +1152,7 @@ fn a_restart_lets_go_of_the_lock_so_the_next_update_can_start() {
 }
 
 #[test]
-fn a_launch_that_only_shows_the_other_river_still_confirms_for_the_updater_and_is_not_counted() {
+fn a_launch_that_only_shows_the_other_river_releases_the_updater_and_is_not_counted() {
     let ports = Ports::lock();
     let server = ports.serve(vec![]);
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
@@ -1186,11 +1186,13 @@ fn a_launch_that_only_shows_the_other_river_still_confirms_for_the_updater_and_i
     assert_eq!(starts(), 0, "a second launch is not an unconfirmed start");
     assert!(state::load(rig.data.path()).probation.is_some());
 
-    // Run by an updater: it is told this version started, which ends probation.
+    // Run by an updater: the waiting launcher is released, but probation stays for a start
+    // that really ran.
     let marker = rig.data.path().join("update/handshake-second");
     new.second_launch(Some(&marker));
     assert_eq!(fs::read_to_string(&marker).unwrap(), "0.2.0");
-    assert!(state::load(rig.data.path()).probation.is_none());
+    assert!(state::load(rig.data.path()).probation.is_some());
+    assert_eq!(starts(), 0);
 }
 
 /// `main` takes the instance lock before the updater counts the start, and the restart hands

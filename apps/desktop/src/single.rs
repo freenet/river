@@ -39,6 +39,9 @@ const MAX_CONNECTIONS: usize = 8;
 /// the lock a moment before it has written its port, and may be on its way out.
 const TRIES: u32 = 20;
 const TRY_WAIT: Duration = Duration::from_millis(100);
+/// How long a River that handed its lock over waits to take it back.
+const REACQUIRE_TRIES: u32 = 20;
+const REACQUIRE_WAIT: Duration = Duration::from_millis(250);
 
 /// What launching found.
 pub enum Start {
@@ -74,15 +77,20 @@ pub fn release_current() {
     }
 }
 
-/// Take the lock back after a replacement did not start. Logs when it cannot.
+/// Take the lock back after a replacement did not start, trying for a moment: the replacement
+/// may have left a process behind that is still letting go. Tells the user when it cannot.
 pub fn reacquire_current() {
     let guard = CURRENT.lock().unwrap_or_else(|p| p.into_inner()).upgrade();
-    if let Some(g) = guard {
-        match g.reacquire() {
-            Ok(true) => {}
-            Ok(false) => eprintln!("river: another River has taken the instance lock"),
-            Err(e) => eprintln!("river: couldn't take the instance lock back: {e}"),
-        }
+    if let Some(g) = guard
+        && !matches!(
+            g.reacquire_within(REACQUIRE_TRIES, REACQUIRE_WAIT),
+            Ok(true)
+        )
+    {
+        crate::tell_user(
+            "River could not take back its place as the only running River: another River \
+             may be running. Quit River from its tray icon or window and start it again.",
+        );
     }
 }
 
@@ -169,6 +177,21 @@ impl Guard {
         Ok(true)
     }
 
+    /// [`reacquire`](Self::reacquire), tried up to `tries` times with `wait` between.
+    pub fn reacquire_within(&self, tries: u32, wait: Duration) -> std::io::Result<bool> {
+        let mut last = Ok(false);
+        for attempt in 0..tries.max(1) {
+            if attempt > 0 {
+                std::thread::sleep(wait);
+            }
+            last = self.reacquire();
+            if matches!(last, Ok(true)) {
+                break;
+            }
+        }
+        last
+    }
+
     /// Answer requests to show the window, each on a thread of its own. `show` gets the
     /// activation token the second launch sent, if any.
     pub fn serve(
@@ -182,7 +205,13 @@ impl Guard {
         std::thread::Builder::new()
             .name("single-instance".into())
             .spawn(move || {
-                for stream in listener.incoming().flatten() {
+                for stream in listener.incoming() {
+                    // `incoming` never ends, so a persistent accept error (out of file
+                    // handles) would spin: pause briefly and go on.
+                    let Ok(stream) = stream else {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    };
                     if busy.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
                         busy.fetch_sub(1, Ordering::AcqRel);
                         continue;
@@ -407,6 +436,20 @@ mod tests {
         assert_eq!(next(&shown), Some("again".to_owned()));
         // Taking it back twice is harmless.
         assert!(guard.reacquire().unwrap());
+    }
+
+    #[test]
+    fn taking_the_lock_back_keeps_trying_and_reports_when_it_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = first_in(dir.path());
+        guard.release();
+        // Something else (a process the replacement left behind) holds the lock.
+        let holder = open_lock(dir.path()).unwrap();
+        holder.try_lock().unwrap();
+        assert!(!guard.reacquire_within(3, Duration::ZERO).unwrap());
+        // It lets go; the next attempt takes the lock back.
+        drop(holder);
+        assert!(guard.reacquire_within(3, Duration::ZERO).unwrap());
     }
 
     #[test]

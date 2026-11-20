@@ -36,6 +36,8 @@ enum Place {
         body: fn(&Path) -> String,
         /// Whether the system would run the file's text at login.
         on: fn(&str) -> bool,
+        /// The program the file starts.
+        target: fn(&str) -> Option<PathBuf>,
     },
     #[cfg(windows)]
     Registry,
@@ -68,7 +70,7 @@ impl LoginItem {
         match &self.place {
             Place::File { path, on, .. } => std::fs::read_to_string(path).is_ok_and(|t| on(&t)),
             #[cfg(windows)]
-            Place::Registry => registry::get(registry::VALUE).is_some(),
+            Place::Registry => registry::exists(registry::VALUE),
         }
     }
 
@@ -99,26 +101,78 @@ impl LoginItem {
         }
     }
 
-    /// Point an item that is on at the program running now. River moves (an update, a new
-    /// install folder), and an entry left at the old path would start nothing. An item that
-    /// is off, or already right, is left alone.
+    /// Repoint an item that is on when the program it names is gone (River moved: an update, a
+    /// new install folder). An item whose program still exists is never touched, so edits to
+    /// the entry stay, and two installed copies do not take turns rewriting it. One that is
+    /// off, or whose target cannot be read, is left alone.
     pub fn refresh(&self) {
         if !self.enabled() || check_exe(&self.exe).is_err() {
             return;
         }
-        let current = match &self.place {
-            Place::File { path, .. } => std::fs::read_to_string(path).ok(),
+        let target = match &self.place {
+            Place::File { path, target, .. } => {
+                std::fs::read_to_string(path).ok().and_then(|t| target(&t))
+            }
             #[cfg(windows)]
-            Place::Registry => registry::get(registry::VALUE),
+            Place::Registry => registry::get(registry::VALUE).and_then(|c| command_target(&c)),
         };
-        let wanted = match &self.place {
-            Place::File { body, .. } => body(&self.exe),
-            #[cfg(windows)]
-            Place::Registry => run_command(&self.exe),
-        };
-        if current.as_deref() != Some(wanted.as_str()) {
+        if target.is_some_and(|t| is_gone(&t)) {
             let _ = self.set(true);
         }
+    }
+}
+
+/// Whether the program a login item names can no longer start: it is not there, or it is a
+/// deleted or macOS-translocated copy.
+fn is_gone(target: &Path) -> bool {
+    check_exe(target).is_err() || !target.exists()
+}
+
+/// The program of a desktop entry's first `Exec` word, undoing [`exec_quoted`].
+fn entry_target(text: &str) -> Option<PathBuf> {
+    // Two layers, as written: the file's string escapes (`\\` is `\`), then the Exec quoting.
+    let exec = text.lines().find_map(|l| l.strip_prefix("Exec="))?.trim();
+    let exec = exec.replace("\\\\", "\\");
+    let (mut out, mut escaped) = (String::new(), false);
+    let mut chars = exec.strip_prefix('"')?.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            _ if escaped => {
+                escaped = false;
+                out.push(c);
+            }
+            '\\' => escaped = true,
+            '"' => return Some(PathBuf::from(out)),
+            '%' if chars.peek() == Some(&'%') => {
+                chars.next();
+                out.push('%');
+            }
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// The program of a LaunchAgent: the first string of `ProgramArguments`.
+fn plist_target(text: &str) -> Option<PathBuf> {
+    let after = &text[text.find("<key>ProgramArguments</key>")?..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(PathBuf::from(
+        after[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    ))
+}
+
+/// The program of a `Run` value: the quoted path, or the first word.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn command_target(command: &str) -> Option<PathBuf> {
+    let command = command.trim();
+    match command.strip_prefix('"') {
+        Some(rest) => Some(PathBuf::from(&rest[..rest.find('"')?])),
+        None => command.split(' ').next().map(PathBuf::from),
     }
 }
 
@@ -131,6 +185,9 @@ fn check_exe(exe: &Path) -> Result<(), String> {
             "River's program file was replaced while it runs. Restart River, then try again."
                 .into(),
         );
+    }
+    if text.contains("/AppTranslocation/") {
+        return Err("River is running from a temporary macOS location. Move it to Applications, then try again.".into());
     }
     if text.chars().any(char::is_control) {
         return Err("River's program path has characters a login item cannot hold.".into());
@@ -173,6 +230,7 @@ fn file_place(os: &str, config_home: &Path, home: &Path) -> Option<Place> {
                 .join(format!("{LABEL}.plist")),
             body: launch_agent,
             on: |_| true,
+            target: plist_target,
         }),
         "windows" => None,
         _ => Some(Place::File {
@@ -181,6 +239,7 @@ fn file_place(os: &str, config_home: &Path, home: &Path) -> Option<Place> {
                 .join(format!("{NAME}.desktop")),
             body: desktop_entry,
             on: entry_enabled,
+            target: entry_target,
         }),
     }
 }
@@ -294,7 +353,30 @@ mod registry {
         }
     }
 
-    /// The value's text, or `None` when there is none (or it is not a string).
+    /// Whether the value exists, whatever its type or length.
+    pub fn exists(name: &str) -> bool {
+        let Some(key) = open(KEY_QUERY_VALUE).ok() else {
+            return false;
+        };
+        let name = wide(name);
+        // SAFETY: `name` is NUL-terminated; null out pointers only ask whether it exists.
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: `key` was opened above and is closed once.
+        unsafe { RegCloseKey(key) };
+        status == ERROR_SUCCESS
+    }
+
+    /// The value's text, or `None` when there is none, it is not a plain string (an expand
+    /// string is not read: its variables would need expanding) or it is over-long.
     pub fn get(name: &str) -> Option<String> {
         let key = open(KEY_QUERY_VALUE).ok()?;
         let name = wide(name);
@@ -457,29 +539,62 @@ mod tests {
     }
 
     #[test]
-    fn an_item_that_is_on_follows_the_program_and_one_that_is_off_stays_off() {
+    fn a_login_item_is_repointed_only_when_its_program_is_gone() {
         let dir = tempfile::tempdir().unwrap();
+        let here = std::env::current_exe().unwrap();
         let mut item = item_in(dir.path(), "linux");
+        item.exe = here.clone();
         item.refresh();
         assert!(!item.enabled(), "refreshing never turns it on");
+        // On, naming a program that no longer exists: repointed at this one.
+        item.exe = dir.path().join("moved-away");
         item.set(true).unwrap();
-        #[allow(irrefutable_let_patterns)] // Windows has a second place.
-        let Place::File { path, .. } = &item.place else {
-            unreachable!()
-        };
-        let path = path.clone();
-        item.exe = PathBuf::from("/opt/River2/river");
+        item.exe = here.clone();
         item.refresh();
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("/opt/River2/river")
+        let path = dir.path().join("config/autostart/river.desktop");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(entry_target(&text), Some(here.clone()), "{text}");
+        // The program exists: the user's edits stay, and another copy does not rewrite it.
+        let edited = format!("{text}Name[de]=Fluss\nX-Mine=1\n");
+        std::fs::write(&path, &edited).unwrap();
+        item.exe = dir.path().join("another-copy");
+        item.refresh();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        // Switched off in the desktop's settings: left alone even with a missing program.
+        let off = "[Desktop Entry]\nHidden=true\nExec=\"/gone/river\"\n";
+        std::fs::write(&path, off).unwrap();
+        item.exe = here;
+        item.refresh();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), off);
+    }
+
+    #[test]
+    fn the_program_is_read_back_from_each_kind_of_entry() {
+        for exe in [
+            "/opt/River App/river",
+            "/a$b/r",
+            "/100%/r",
+            "/q\"x/r",
+            "/b\\r",
+        ] {
+            assert_eq!(
+                entry_target(&desktop_entry(Path::new(exe))),
+                Some(PathBuf::from(exe)),
+                "{exe}"
+            );
+        }
+        assert_eq!(
+            plist_target(&launch_agent(Path::new("/Apps/R&D <x>/River"))),
+            Some(PathBuf::from("/Apps/R&D <x>/River"))
         );
-        // Switched off in the desktop's settings: left alone.
-        std::fs::write(&path, "[Desktop Entry]\nHidden=true\nExec=old\n").unwrap();
-        item.refresh();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("Exec=old"));
-        assert!(!item.enabled());
+        assert_eq!(
+            command_target(&run_command(Path::new(
+                "C:\\Program Files\\River\\river.exe"
+            ))),
+            Some(PathBuf::from("C:\\Program Files\\River\\river.exe"))
+        );
+        assert!(is_gone(Path::new("/definitely/not/here")));
+        assert!(is_gone(Path::new("/x/AppTranslocation/y/river")));
     }
 
     #[test]

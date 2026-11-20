@@ -126,14 +126,12 @@ impl DesktopUpdate {
     }
 
     /// This launch found another River running and is about to leave (it has asked that one to
-    /// show its window). A launch an updater is waiting for (`handshake`) did start, so it says
-    /// so before it goes: the updater would otherwise read the early exit as a failed start
-    /// and roll the update back. It is not counted as an unconfirmed start either: `on_start`
-    /// is never called for it.
+    /// show its window). A launch an updater is waiting for (`handshake`) releases the updater
+    /// before it goes: the updater would otherwise read the early exit as a failed start and
+    /// roll the update back. That is all it does. Probation is left alone, since this binary
+    /// opened no window and reached no node, and `on_start` is never called for it.
     pub fn second_launch(&self, handshake: Option<&Path>) {
-        if handshake.is_some() {
-            self.updater.confirm_started(handshake);
-        }
+        self.updater.signal_started(handshake);
     }
 
     /// [`second_launch`](Self::second_launch) for this process.

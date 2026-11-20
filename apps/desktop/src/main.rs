@@ -87,9 +87,9 @@ fn main() {
                 Some(guard)
             }
             Ok(single::Start::Running { asked }) => {
-                // An updater waiting on this launch is told it started: it did, and leaving
-                // at once would read as a failed start.
-                if let Some(u) = &updater {
+                // An updater waiting on this launch is released: leaving at once would read as
+                // a failed start. Only when the running River was reached.
+                if asked && let Some(u) = &updater {
                     u.second_launch_here();
                 }
                 if !asked {
@@ -107,15 +107,8 @@ fn main() {
             }
         }
     });
-    // After the command line has been accepted and the instance check passed: a start that
-    // exits on a bad option, or only shows the other River, is not a failed update, so it is
-    // not counted (see `Updater::on_start`).
-    if let Some(u) = &updater {
-        u.on_start();
-    }
-    let on_exit = updater.clone();
-    let started = std::time::Instant::now();
-    settings.refresh_login();
+    let for_app = updater.clone();
+    let for_settings = settings.clone();
     let app = river_app::app(move |handle| {
         // The tray icon is made here on Windows and macOS: init runs on the thread that handles
         // the window system's events, which they need. A failure leaves the window up.
@@ -126,7 +119,7 @@ fn main() {
         // An updater waiting on this process (and probation after a swap) hears that this
         // version works once it has connected to the node (the app reports that itself) or,
         // failing that, after it has run for a while with its event loop turning.
-        let updates = updater.map(|u| {
+        let updates = for_app.map(|u| {
             let (confirm, window) = (u.clone(), handle.clone());
             std::thread::spawn(move || {
                 std::thread::sleep(update::CONFIRM_AFTER);
@@ -154,19 +147,14 @@ fn main() {
             startup,
         )
         .with_notifier(Box::new(notifier))
-        .with_background(settings);
+        .with_background(for_settings);
         match updates {
             Some(updates) => app.with_updates(updates),
             None => app,
         }
     });
     let handle = app.handle();
-    // Linux has no event-loop thread to respect, and whether the desktop has a tray decides how
-    // the app starts, so ask now.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let tray_expected = tray::start(&handle);
-    #[cfg(any(windows, target_os = "macos"))]
-    let tray_expected = true;
+    // Listening starts before anything slow, so a second launch is answered at once.
     if let Some(guard) = &instance {
         let show = handle.clone();
         let served = guard.serve(move |activation| match activation {
@@ -177,6 +165,21 @@ fn main() {
             say(&format!("couldn't listen for a second River: {e}"));
         }
     }
+    // After the command line has been accepted and the instance check passed: a start that
+    // exits on a bad option, or only shows the other River, is not a failed update, so it is
+    // not counted (see `Updater::on_start`).
+    if let Some(u) = &updater {
+        u.on_start();
+    }
+    let on_exit = updater.clone();
+    let started = std::time::Instant::now();
+    settings.refresh_login();
+    // Linux has no event-loop thread to respect, and whether the desktop has a tray decides how
+    // the app starts, so ask now.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let tray_expected = tray::start(&handle);
+    #[cfg(any(windows, target_os = "macos"))]
+    let tray_expected = true;
     // Closing the window hides it; `on_close` quits when there is no tray or the person asked
     // for closing to quit. Started at login, there is no window until the tray asks for one.
     let mut app = app.keep_running().on_close(background::on_close);
