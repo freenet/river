@@ -52,6 +52,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     dialogs(chat, &k, &mut layer);
     super::identity::export_dialog(chat, &k, &mut layer);
     super::background::background_dialog(chat, &k, &mut layer);
+    super::node_status::dialog(chat, &k, &mut layer);
     super::dnd::dnd_dialog(chat, &k, &mut layer);
     super::node_ui::node_dialog(chat, &k, &mut layer);
     if chat.update.settings_open {
@@ -585,7 +586,21 @@ fn source_status(chat: &Chat, p: &Palette, k: &Kit) -> El {
             .key("connection-pill")
             .gap(8.0)
             .center_y()
-            .help(pill.tip.clone())
+            .help(format!("{} Press for node status.", pill.tip))
+            .role("button")
+            .label("Node status")
+            .focusable(true)
+            .py(6.0)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.status.open())
+            // Space presses a focused control; Enter does too, as on a button.
+            .on_key(|s: &mut RiverApp, ev, _| {
+                let enter = ev.key == rune::Key::Enter;
+                if enter {
+                    s.chat.status.open();
+                }
+                enter
+            })
             .child(
                 el().key("connection-dot")
                     .size(7.0, 7.0)

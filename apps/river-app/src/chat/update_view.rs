@@ -262,11 +262,11 @@ fn river_section(ui: &UpdateUi, p: &Palette, k: &Kit) -> El {
     .child(buttons)
 }
 
-fn node_section(ui: &UpdateUi, p: &Palette) -> El {
+fn node_section(ui: &UpdateUi, p: &Palette, k: &Kit) -> El {
     let mut s = col().key("settings-freenet").w_full().gap(6.0).child(
         label(
             match &ui.node_version {
-                Some(v) => format!("Freenet {v}"),
+                Some(v) => format!("Freenet {}", super::node_status::safe_version(v)),
                 None => "Freenet: not connected".to_string(),
             },
             st::BODY,
@@ -293,7 +293,16 @@ fn node_section(ui: &UpdateUi, p: &Palette) -> El {
                 .key("settings-node-changed"),
         );
     }
-    s
+    s.child(
+        Button::new("Node status")
+            .variant(ButtonVariant::Ghost)
+            .on_press(|s: &mut RiverApp| {
+                s.chat.update.settings_open = false;
+                s.chat.status.open();
+            })
+            .build(k)
+            .key("settings-node-status"),
+    )
 }
 
 fn heading(s: &str, p: &Palette) -> El {
@@ -321,7 +330,7 @@ pub(super) fn settings_dialog(ui: &UpdateUi, k: &Kit, layer: &mut Vec<El>) {
                 .w_full()
                 .gap(8.0)
                 .child(heading("FREENET", &p))
-                .child(node_section(ui, &p)),
+                .child(node_section(ui, &p, k)),
         );
     if let Some(n) = &ui.notice {
         body = body.child(

@@ -143,6 +143,14 @@ impl NodeHost for DesktopHost {
         ))
     }
 
+    fn latest_version(&self) -> Option<String> {
+        Release::latest().ok().map(|r| r.version.to_string())
+    }
+
+    fn looks_up_latest(&self) -> bool {
+        true
+    }
+
     fn config_dir(&self) -> Option<std::path::PathBuf> {
         // The local (not roaming) config directory: on Windows a roaming profile would copy
         // the node's grant token to other machines, where it means nothing.

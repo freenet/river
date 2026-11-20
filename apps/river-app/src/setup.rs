@@ -14,6 +14,7 @@ use rune::AppHandle;
 
 use crate::RiverApp;
 use crate::address::{NodeChoice, NodeStore};
+use crate::chat::node_status::{Reach, StatusEvent};
 use crate::node::{InstallStep, NodeHost, NodeProbe};
 
 /// How long a freshly started node may take to answer before we call it a failure.
@@ -71,6 +72,37 @@ pub struct Controller {
     /// runs, however long after the person has moved to another node. A second install or start
     /// must not begin beside one nobody is watching any more.
     local_work: Arc<AtomicBool>,
+    /// Where the node status dialog's answers go (see [`Controller::probe_status`]). `None` for a
+    /// controller with no window to tell.
+    status_report: Option<Arc<dyn Fn(StatusEvent) + Send + Sync>>,
+}
+
+/// Reports a fallback event if the worker ends (a panic included) before it reports its answer.
+struct EndGuard {
+    report: Arc<dyn Fn(StatusEvent) + Send + Sync>,
+    fallback: Option<StatusEvent>,
+}
+
+impl EndGuard {
+    fn new(report: Arc<dyn Fn(StatusEvent) + Send + Sync>, fallback: StatusEvent) -> Self {
+        EndGuard {
+            report,
+            fallback: Some(fallback),
+        }
+    }
+
+    fn finish(&mut self, event: StatusEvent) {
+        self.fallback = None;
+        (self.report)(event);
+    }
+}
+
+impl Drop for EndGuard {
+    fn drop(&mut self) {
+        if let Some(event) = self.fallback.take() {
+            (self.report)(event);
+        }
+    }
 }
 
 /// Frees [`Controller::local_work`] when the worker that held it ends.
@@ -84,9 +116,17 @@ impl Drop for LocalWork {
 
 impl Controller {
     pub fn new(host: Arc<dyn NodeHost>, handle: AppHandle<RiverApp>) -> Self {
-        Controller::reporting_to(host, move |setup| {
+        let status = handle.clone();
+        let mut ctl = Controller::reporting_to(host, move |setup| {
             handle.update(move |s, _| s.set_setup(setup))
-        })
+        });
+        ctl.status_report = Some(Arc::new(move |event| {
+            status.update(move |s, _| {
+                let current = s.chat.node.choice.address.authority();
+                s.chat.status.apply(&current, event, Instant::now());
+            })
+        }));
+        ctl
     }
 
     /// A controller that hands each new [`Setup`] to `report` (from any thread).
@@ -103,6 +143,7 @@ impl Controller {
             epoch: Arc::new(AtomicU64::new(0)),
             my_epoch: 0,
             local_work: Arc::new(AtomicBool::new(false)),
+            status_report: None,
         }
     }
 
@@ -238,6 +279,62 @@ impl Controller {
                 }
             }
         });
+    }
+
+    /// Ask the node in use for its version once, for the node status dialog, and report what it
+    /// said. Unlike [`check`](Self::check) this never starts anything and does not change
+    /// [`Setup`]: a node that does not answer is shown in the dialog, not as a failed setup.
+    pub fn probe_status(&self) {
+        let Some(report) = self.status_report.clone() else {
+            return;
+        };
+        let fallback = report.clone();
+        let host = self.host.clone();
+        let node = self.node();
+        let started = thread::Builder::new().spawn(move || {
+            // If the probe panics, the dialog still hears that the question ended.
+            let mut guard = EndGuard::new(report, StatusEvent::Aborted);
+            let authority = node.address.authority();
+            let probe = if node.is_existing_node() {
+                host.probe_at(&authority)
+            } else {
+                host.probe()
+            };
+            let reach = match probe {
+                NodeProbe::Running { version } => Reach::Answered { version },
+                NodeProbe::Outdated { running, .. } => Reach::TooOld { running },
+                NodeProbe::Unreachable
+                | NodeProbe::InstalledNotRunning
+                | NodeProbe::NotInstalled => Reach::Silent,
+            };
+            guard.finish(StatusEvent::Reach { authority, reach });
+        });
+        if started.is_err() {
+            fallback(StatusEvent::Aborted);
+        }
+    }
+
+    /// Whether this shell looks up the latest Freenet release at all.
+    pub fn looks_up_latest(&self) -> bool {
+        self.host.looks_up_latest()
+    }
+
+    /// Look up the latest Freenet release, for the node status dialog. This contacts github.com,
+    /// so it is only called while the dialog is open.
+    pub fn fetch_latest(&self) {
+        let Some(report) = self.status_report.clone() else {
+            return;
+        };
+        let fallback = report.clone();
+        let host = self.host.clone();
+        let started = thread::Builder::new().spawn(move || {
+            let mut guard = EndGuard::new(report, StatusEvent::Latest(None));
+            let latest = host.latest_version();
+            guard.finish(StatusEvent::Latest(latest));
+        });
+        if started.is_err() {
+            fallback(StatusEvent::Latest(None));
+        }
     }
 
     /// Install Freenet, then start it if the installer didn't. Does nothing for a node the

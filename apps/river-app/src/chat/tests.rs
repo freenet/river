@@ -2423,8 +2423,18 @@ fn a_link_in_the_header_description_opens_the_page_not_the_dialog() {
 #[test]
 fn the_room_name_opens_the_details_from_the_keyboard() {
     let mut rt = render(connected(), WINDOW_SIZE);
-    // The name is the first thing Tab reaches; Space presses it, as it does any button.
-    key(&mut rt, Key::Tab);
+    // Tab reaches the name (after the connection dot in the room list); Space presses it, as
+    // it does any button.
+    for _ in 0..3 {
+        key(&mut rt, Key::Tab);
+        if rt
+            .elements()
+            .into_iter()
+            .any(|e| e.key.as_deref() == Some("room-title") && e.focused)
+        {
+            break;
+        }
+    }
     assert!(
         rt.elements()
             .into_iter()
@@ -5320,4 +5330,48 @@ fn reply_opens_the_room_with_the_composer_ready() {
     rt.state.open_room_to_reply(&other);
     assert_eq!(rt.state.chat.room().unwrap().key, other);
     assert!(rt.state.chat.composer.focused);
+}
+
+#[test]
+fn the_connection_dot_is_reachable_with_tab_and_enter() {
+    let mut s = connected();
+    s.chat.source = super::Source::Node(super::LinkStatus::Live);
+    let mut rt = render(s, WINDOW_SIZE);
+    assert!(!rt.state.chat.status.open);
+    let mut reached = false;
+    for _ in 0..80 {
+        key(&mut rt, Key::Tab);
+        if rt
+            .elements()
+            .into_iter()
+            .any(|e| e.focused && e.path.contains("connection-pill"))
+        {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab never reached the connection dot");
+    key(&mut rt, Key::Enter);
+    assert!(rt.state.chat.status.open, "Enter opens the node status");
+    assert!(rt.find("node-status-dialog").is_some());
+}
+
+#[test]
+fn node_status_stacks_with_the_overview_and_escape_leaves_both_alone() {
+    let mut chat = super::Chat::new(
+        super::Source::Node(super::LinkStatus::Live),
+        Vec::new(),
+        0,
+        0,
+        0,
+    );
+    chat.overview = true;
+    chat.status.open();
+    // A dialog is open: the window-level Escape does nothing, the dialog takes its own.
+    assert!(!chat.escape());
+    assert!(chat.overview);
+    // The switcher must not open over it.
+    assert!(chat.other_dialog_open());
+    chat.close_node_status();
+    assert!(chat.overview, "closing the status leaves the overview");
 }
