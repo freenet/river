@@ -123,13 +123,44 @@ pub fn try_load(data_dir: &Path) -> Result<State, String> {
     })
 }
 
+/// How long a caller waits behind one holder that makes no progress before it reports "busy".
+const LOCK_PATIENCE: Duration = Duration::from_secs(5);
+/// A bound on the whole wait, so a caller always ends even when other writers never stop.
+const LOCK_LIMIT: Duration = Duration::from_secs(60);
+
 /// Load, change and save the state while holding a lock file, so two Rivers (or two threads)
 /// cannot overwrite each other's change. A damaged file is an error, as in [`try_load`].
 pub fn modify<T>(data_dir: &Path, change: impl FnOnce(&mut State) -> T) -> Result<T, String> {
+    modify_within(data_dir, LOCK_PATIENCE, change)
+}
+
+/// What a waiter can see of the lock without touching it: when the lock file and the state file
+/// were last changed. It differs from one look to the next whenever another writer takes the
+/// lock, saves, or lets go.
+fn lock_progress(lock: &Path, state: &Path) -> [Option<std::time::SystemTime>; 2] {
+    let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+    [modified(lock), modified(state)]
+}
+
+/// [`modify`] with the patience given. The patience is how long the lock may stay with one
+/// holder that does nothing; it starts again whenever the lock changes hands or the state is
+/// saved, so waiting in a queue of working writers is not "busy" however long the queue is
+/// (an fsync and a rename on a Windows disk with a scanner can take tens of milliseconds, and
+/// the lock is not handed out in order). Only a holder that is stuck, or a lock left behind
+/// by a crash, ends the wait.
+fn modify_within<T>(
+    data_dir: &Path,
+    patience: Duration,
+    change: impl FnOnce(&mut State) -> T,
+) -> Result<T, String> {
     fs::create_dir_all(data_dir)
         .map_err(|e| format!("couldn't create {}: {e}", data_dir.display()))?;
     let lock = data_dir.join(format!("{STATE_FILE}.lock"));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let state_file = path(data_dir);
+    let started = std::time::Instant::now();
+    let mut deadline = started + patience;
+    let mut seen = lock_progress(&lock, &state_file);
+    let mut waits = 0u32;
     let _guard = loop {
         match fs::OpenOptions::new()
             .write(true)
@@ -150,12 +181,22 @@ pub fn modify<T>(data_dir: &Path, change: impl FnOnce(&mut State) -> T) -> Resul
                     .ok()
                     .and_then(|t| t.elapsed().ok())
                     .is_some_and(|age| age > Duration::from_secs(30));
+                let now = std::time::Instant::now();
+                let progress = lock_progress(&lock, &state_file);
+                if progress != seen {
+                    seen = progress;
+                    deadline = now + patience;
+                }
                 if stale {
                     let _ = fs::remove_file(&lock);
-                } else if std::time::Instant::now() >= deadline {
+                } else if now >= deadline || now >= started + LOCK_LIMIT {
                     return Err("the update notes are busy".into());
                 } else {
-                    std::thread::sleep(Duration::from_millis(10));
+                    // A little jitter, so waiters do not look at the lock in step.
+                    waits = waits.wrapping_add(1);
+                    let jitter =
+                        u64::from(now.elapsed().subsec_nanos() ^ waits.wrapping_mul(7919)) % 8;
+                    std::thread::sleep(Duration::from_millis(6 + jitter));
                 }
             }
             Err(e) => return Err(format!("couldn't lock the update notes: {e}")),
@@ -271,6 +312,43 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(load(dir.path()).highest_sequence, 80);
+    }
+
+    #[test]
+    fn a_long_queue_of_working_writers_is_not_busy() {
+        // Each change holds the lock for 60 ms and the patience is 150 ms, so a writer that
+        // is last of six waits about 300 ms. Waiting behind writers that keep finishing is not
+        // "busy"; before the patience restarted on progress, the last ones gave up.
+        let dir = tempfile::tempdir().unwrap();
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let d = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for _ in 0..3 {
+                        modify_within(&d, Duration::from_millis(150), |s| {
+                            std::thread::sleep(Duration::from_millis(60));
+                            s.highest_sequence += 1;
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(load(dir.path()).highest_sequence, 18);
+    }
+
+    #[test]
+    fn a_holder_that_does_nothing_is_reported_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(format!("{STATE_FILE}.lock")), b"").unwrap();
+        let began = std::time::Instant::now();
+        let r = modify_within(dir.path(), Duration::from_millis(200), |_| ());
+        assert_eq!(r.unwrap_err(), "the update notes are busy");
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(!path(dir.path()).exists(), "nothing was written");
     }
 
     #[test]
