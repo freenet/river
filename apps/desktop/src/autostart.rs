@@ -325,12 +325,37 @@ pub fn run_command(exe: &Path) -> String {
     format!("\"{}\" {BACKGROUND_FLAG}", exe.display())
 }
 
+/// How a registry call ended, kept apart from the Windows API so it is testable everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum RegStatus {
+    Ok,
+    /// The key or value is not there (`ERROR_FILE_NOT_FOUND`).
+    Missing,
+    Failed(u32),
+}
+
+/// Maps a Win32 registry status code. A missing key or value is its own outcome because
+/// `get` and `remove` treat it as "nothing there", while `set` creates the key.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_status(status: u32) -> RegStatus {
+    const ERROR_SUCCESS: u32 = 0;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    match status {
+        ERROR_SUCCESS => RegStatus::Ok,
+        ERROR_FILE_NOT_FOUND => RegStatus::Missing,
+        other => RegStatus::Failed(other),
+    }
+}
+
 #[cfg(windows)]
 mod registry {
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use super::{RegStatus, classify_status};
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey,
-        RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW,
     };
 
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -340,12 +365,41 @@ mod registry {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    fn open(access: u32) -> Result<HKEY, u32> {
+    /// Opens the `Run` key. `Ok(None)` means the key does not exist, which a profile may
+    /// lack; it is not an error for reading or removing.
+    fn open(access: u32) -> Result<Option<HKEY>, u32> {
         let subkey = wide(RUN_KEY);
         let mut key: HKEY = std::ptr::null_mut();
         // SAFETY: `subkey` is NUL-terminated and outlives the call; `key` is a valid out pointer.
         let status =
             unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key) };
+        match classify_status(status) {
+            RegStatus::Ok => Ok(Some(key)),
+            RegStatus::Missing => Ok(None),
+            RegStatus::Failed(e) => Err(e),
+        }
+    }
+
+    /// Opens the `Run` key for writing, creating it when the profile has none.
+    fn open_or_create() -> Result<HKEY, u32> {
+        let subkey = wide(RUN_KEY);
+        let mut key: HKEY = std::ptr::null_mut();
+        // SAFETY: `subkey` is NUL-terminated and outlives the call; the class, security
+        // attributes and disposition pointers are allowed to be null; `key` is a valid out
+        // pointer.
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE | KEY_QUERY_VALUE,
+                std::ptr::null(),
+                &mut key,
+                std::ptr::null_mut(),
+            )
+        };
         if status == ERROR_SUCCESS {
             Ok(key)
         } else {
@@ -355,7 +409,7 @@ mod registry {
 
     /// Whether the value exists, whatever its type or length.
     pub fn exists(name: &str) -> bool {
-        let Some(key) = open(KEY_QUERY_VALUE).ok() else {
+        let Ok(Some(key)) = open(KEY_QUERY_VALUE) else {
             return false;
         };
         let name = wide(name);
@@ -378,7 +432,7 @@ mod registry {
     /// The value's text, or `None` when there is none, it is not a plain string (an expand
     /// string is not read: its variables would need expanding) or it is over-long.
     pub fn get(name: &str) -> Option<String> {
-        let key = open(KEY_QUERY_VALUE).ok()?;
+        let key = open(KEY_QUERY_VALUE).ok()??;
         let name = wide(name);
         let mut kind = 0u32;
         let mut buf = [0u16; 2048];
@@ -407,8 +461,8 @@ mod registry {
     }
 
     pub fn set(name: &str, command: &str) -> Result<(), String> {
-        let key = open(KEY_SET_VALUE)
-            .map_err(|e| format!("couldn't open the Run key (registry error {e})"))?;
+        let key = open_or_create()
+            .map_err(|e| format!("couldn't open or create the Run key (registry error {e})"))?;
         let (name, value) = (wide(name), wide(command));
         // SAFETY: both strings are NUL-terminated and outlive the call; the length counts the
         // value's bytes including its terminator, as REG_SZ requires.
@@ -434,19 +488,22 @@ mod registry {
     }
 
     pub fn remove(name: &str) -> Result<(), String> {
-        let key = open(KEY_SET_VALUE)
-            .map_err(|e| format!("couldn't open the Run key (registry error {e})"))?;
+        let key = match open(KEY_SET_VALUE) {
+            Ok(Some(key)) => key,
+            // No Run key means no login item to remove.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(format!("couldn't open the Run key (registry error {e})")),
+        };
         let name = wide(name);
         // SAFETY: `name` is NUL-terminated and outlives the call.
         let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
         // SAFETY: `key` was opened above and is closed once.
         unsafe { RegCloseKey(key) };
-        if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
-            Ok(())
-        } else {
-            Err(format!(
-                "couldn't remove the login item (registry error {status})"
-            ))
+        match classify_status(status) {
+            RegStatus::Ok | RegStatus::Missing => Ok(()),
+            RegStatus::Failed(e) => Err(format!(
+                "couldn't remove the login item (registry error {e})"
+            )),
         }
     }
 
@@ -455,8 +512,10 @@ mod registry {
         use super::*;
 
         /// Writes, reads and removes a value of its own under the real `Run` key (no program
-        /// runs it: the name is not River's and the command is inert). Not run by the Linux
-        /// CI; it needs a Windows session.
+        /// runs it: the name is not River's and the command is inert). `set` creates the key
+        /// when the profile has none, so the test does not depend on it existing; the key
+        /// itself is never deleted, only this test's value. Not run by the Linux CI; it
+        /// needs a Windows session.
         #[test]
         fn a_run_value_is_written_read_and_removed() {
             let name = format!("RiverTest-{}", std::process::id());
@@ -476,6 +535,15 @@ mod registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_status_codes_map_to_ok_missing_or_failed() {
+        assert_eq!(classify_status(0), RegStatus::Ok);
+        // ERROR_FILE_NOT_FOUND: a missing Run key or value is "nothing there", not an error.
+        assert_eq!(classify_status(2), RegStatus::Missing);
+        // ERROR_ACCESS_DENIED stays an error.
+        assert_eq!(classify_status(5), RegStatus::Failed(5));
+    }
 
     fn item_in(dir: &Path, os: &str) -> LoginItem {
         LoginItem {
