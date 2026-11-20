@@ -638,6 +638,53 @@ fn a_ban_on_whoever_invited_you_bans_you_too_even_once_you_are_pruned() {
     assert_eq!(participation(&room), Err(Blocked::Banned));
 }
 
+/// Whether the view says the room no longer has you as a member (which the join dialog uses
+/// to tell "already a member" from "in your list but removed"): only for a ban or a member list
+/// without you; not for a missing key or secret, and not for someone pruned who can re-add
+/// themselves, whether or not they had posted.
+#[test]
+fn the_view_says_not_a_member_only_when_the_room_has_removed_or_banned_you() {
+    let f = Fixture::new();
+    let view_of = |room: &LiveRoom| Outbox::default().view(room, &minutes);
+
+    assert!(!view_of(&public_room(&f)).not_member);
+
+    let mut stored = f.stored(public_state(&f));
+    stored.self_sk = None;
+    stored.self_vk = Some(f.me.verifying_key());
+    assert!(!view_of(&LiveRoom::new(stored)).not_member, "no key here");
+
+    let mut state = f.private_state();
+    state.secrets.encrypted_secrets.clear();
+    let no_secret = view_of(&LiveRoom::new(f.stored(state)));
+    assert!(no_secret.send_block.is_some() && !no_secret.not_member);
+
+    let mut state = public_state(&f);
+    state.bans.0.push(ban(&f, f.me_id()));
+    assert!(
+        view_of(&LiveRoom::new(f.stored(state))).not_member,
+        "banned"
+    );
+
+    let mut state = public_state(&f);
+    state.members.members.clear();
+    state.recent_messages.messages.truncate(1);
+    assert!(
+        view_of(&LiveRoom::new(f.stored(state))).not_member,
+        "removed, with no way to re-add"
+    );
+
+    // Pruned for inactivity: able to re-add themselves, with or without messages still there.
+    let mut without_posts = f.stored(pruned(&f, public_state(&f)));
+    without_posts.self_authorized_member = Some(admitted(&f));
+    assert!(!view_of(&LiveRoom::new(without_posts)).not_member);
+    let mut state = public_state(&f);
+    state.members.members.clear();
+    let mut with_posts = f.stored(state);
+    with_posts.self_authorized_member = Some(admitted(&f));
+    assert!(!view_of(&LiveRoom::new(with_posts)).not_member);
+}
+
 // Rejoining -------------------------------------------------------------------------------------
 
 /// `state` with `me` pruned: not a member, and none of my messages left.

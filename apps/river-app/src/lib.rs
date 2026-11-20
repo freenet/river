@@ -993,6 +993,32 @@ fn scene_token() -> String {
     .to_armored_string()
 }
 
+/// An invite link for the scenes, from fixed throwaway keys: the room owned by seed 3, invited
+/// by its owner.
+fn scene_invite_link() -> String {
+    use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+    let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let invitee = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+    let owner_id = MemberId::from(&owner.verifying_key());
+    let invitation = river_core::invitation::Invitation {
+        room: owner.verifying_key(),
+        invitee: AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: invitee.verifying_key(),
+            },
+            &owner,
+        ),
+        invitee_signing_key: invitee,
+        room_secrets: Vec::new(),
+    };
+    format!(
+        "http://127.0.0.1:7509/v1/contract/web/river/?invitation={}",
+        invitation.to_encoded_string().unwrap_or_default()
+    )
+}
+
 /// A shell's answers for the "Background and startup" scenes: a tray, or none.
 struct PreviewBackground {
     tray: bool,
@@ -1940,6 +1966,45 @@ pub const SCENES: &[Scene] = &[
             c.open_import();
             c.form.token.replace_text(&token);
             c.submit_import();
+        })
+    }),
+    // Joining from an invitation: a pasted invite link for a room not joined (the nickname is
+    // filled in from the invitation), one for a room already joined, one that is no invite, and
+    // the message offered after making an invitation.
+    ("chat-join-invite", |s| {
+        identity_scene(s, |c| {
+            c.open_dialog(chat::DialogKind::Join);
+            c.form.code.replace_text(scene_invite_link());
+            c.join_code_edited();
+        })
+    }),
+    ("chat-join-already-member", |s| {
+        identity_scene(s, |c| {
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
+            let mut rooms = c.rooms().to_vec();
+            if let Some(r) = rooms.first_mut() {
+                r.key = bs58::encode(owner.to_bytes()).into_string();
+            }
+            c.set_rooms(rooms);
+            c.open_dialog(chat::DialogKind::Join);
+            c.form.code.replace_text(scene_invite_link());
+            c.join_code_edited();
+        })
+    }),
+    ("chat-join-invalid", |s| {
+        identity_scene(s, |c| {
+            c.open_dialog(chat::DialogKind::Join);
+            c.form
+                .code
+                .replace_text("https://example.org/?invitation=3mJr7AoUXx2Wqd");
+            c.join_code_edited();
+        })
+    }),
+    ("chat-invite-made", |s| {
+        identity_scene(s, |c| {
+            if let Some(key) = c.room().map(|r| r.key.clone()) {
+                c.invitation_made(key, Ok(scene_invite_link()));
+            }
         })
     }),
     // The room details dialog: as a member sees it (a public and a private room), as the owner
@@ -3640,6 +3705,469 @@ mod tests {
                 },
             }]
         );
+    }
+
+    /// An invite link into a room owned by seed `owner`, invited by the owner, and its code.
+    fn invite_link_for(owner: u8) -> (String, String) {
+        let plan = rooms::create::new_room(
+            ed25519_dalek::SigningKey::from_bytes(&[owner; 32]),
+            "Room",
+            "Olive",
+            false,
+        )
+        .unwrap();
+        let room = rooms::room::LiveRoom::new(rooms::work::stored(&plan.room));
+        let (_, link) = rooms::create::invitation(&room, "http://x/").unwrap();
+        let code = link.split_once("?invitation=").unwrap().1.to_owned();
+        (link, code)
+    }
+
+    /// Pasting an invitation offers the nickname its key gives, which a typed one is not
+    /// replaced by. Joining sends what was in the box, and the box (a bearer credential) goes
+    /// with the dialog.
+    #[test]
+    fn pasting_an_invitation_offers_a_generated_nickname_that_can_be_edited() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        let (link, code) = invite_link_for(9);
+        type_text(&mut rt, &link);
+        let invitee = rooms::create::decode_invitation(&link)
+            .unwrap()
+            .invitee
+            .member
+            .member_vk;
+        assert_eq!(
+            rt.state.chat.form.nickname.text,
+            chat::visual_fold::generate_default_nickname(&invitee)
+        );
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::New { .. }
+        ));
+        assert!(rt.find("join-note").is_some());
+        // Edited, then the code edited again: what was typed stays.
+        rt.update(|s, _| s.chat.form.nickname.replace_text("Bea"));
+        rt.update(|s, _| s.chat.join_code_edited());
+        assert_eq!(rt.state.chat.form.nickname.text, "Bea");
+        press(&mut rt, "form-submit");
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: String::new(),
+                action: rooms::Action::Join {
+                    code: rooms::InviteCode(code),
+                    nickname: "Bea".into(),
+                },
+            }]
+        );
+        assert!(rt.find("join-room-dialog").is_none());
+        assert!(
+            rt.state.chat.form.code.text.is_empty(),
+            "the paste box is cleared"
+        );
+    }
+
+    #[test]
+    fn an_offered_nickname_follows_the_invitation_pasted() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        let (a, _) = invite_link_for(9);
+        let (b, _) = invite_link_for(10);
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&a);
+            s.chat.join_code_edited();
+        });
+        let first = rt.state.chat.form.nickname.text.clone();
+        let b2 = b.clone();
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&b2);
+            s.chat.join_code_edited();
+        });
+        let invitee = rooms::create::decode_invitation(&b)
+            .unwrap()
+            .invitee
+            .member
+            .member_vk;
+        let second = rt.state.chat.form.nickname.text.clone();
+        assert_eq!(
+            second,
+            chat::visual_fold::generate_default_nickname(&invitee)
+        );
+        assert!(!first.is_empty() && !second.is_empty());
+    }
+
+    #[test]
+    fn an_invitation_to_a_room_already_joined_opens_that_room_and_joins_nothing() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let (link, _) = invite_link_for(11);
+        let owner = rooms::create::decode_invitation(&link).unwrap().room;
+        // The room is in the list, not the one open.
+        let key = bs58::encode(owner.to_bytes()).into_string();
+        rt.update({
+            let key = key.clone();
+            move |s, _| {
+                let mut rooms = s.chat.rooms().to_vec();
+                rooms[2].key = key;
+                rooms[2].name = "Garden".into();
+                s.chat.set_rooms(rooms);
+            }
+        });
+        assert_ne!(rt.state.chat.room().unwrap().key, key);
+        press(&mut rt, "enter-invite");
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&link);
+            s.chat.join_code_edited();
+        });
+        settle(&mut rt);
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::Member { .. }
+        ));
+        assert!(
+            rt.find("join-nickname").is_none(),
+            "no nickname is asked for"
+        );
+        press(&mut rt, "form-submit");
+        assert!(rt.find("join-room-dialog").is_none());
+        assert_eq!(rt.state.chat.room().unwrap().key, key, "the room is opened");
+        assert!(rt.state.chat.outgoing.is_empty(), "nothing is joined");
+    }
+
+    #[test]
+    fn the_join_dialog_says_what_is_wrong_with_a_paste_as_it_is_typed() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        type_text(&mut rt, "https://example.org/?invitation=3mJr7AoUXx2Wqd");
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::Refused(_)
+        ));
+        assert!(rt.find("join-note").is_some());
+        press(&mut rt, "form-submit");
+        assert!(rt.state.chat.outgoing.is_empty());
+        // The reason is said once, in the note the preview already shows.
+        assert!(rt.state.chat.form.error.is_some());
+        assert!(rt.find("form-error").is_none());
+        // A forged payload (names one room, grants another) is refused with its own message.
+        let (link, _) = invite_link_for(12);
+        let mut inv = rooms::create::decode_invitation(&link).unwrap();
+        inv.room = ed25519_dalek::SigningKey::from_bytes(&[13; 32]).verifying_key();
+        let forged = inv.to_encoded_string().unwrap();
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&forged);
+            s.chat.join_code_edited();
+        });
+        let chat::JoinPreview::Refused(why) = rt.state.chat.form.join.clone() else {
+            panic!("a forged invitation is refused");
+        };
+        assert!(why.contains("different room"), "{why}");
+    }
+
+    #[test]
+    fn the_join_preview_holds_no_part_of_the_invitation() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        let (link, code) = invite_link_for(14);
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&link);
+            s.chat.join_code_edited();
+        });
+        let shown = format!("{:?}", rt.state.chat.form.join);
+        assert!(!shown.contains(&code[..24]), "{shown}");
+    }
+
+    /// The web UI's invite message, built from its own source rather than from native's copy of
+    /// the text: the `format!` template in `invite_member_modal.rs`, with the room name and link
+    /// put in.
+    fn web_invite_message(name: &str, link: &str) -> String {
+        let src = include_str!("../../../ui/src/components/members/invite_member_modal.rs")
+            .replace("\r\n", "\n");
+        let start = src
+            .find("let default_msg = format!(")
+            .expect("the web template");
+        let end = src[start..]
+            .find("room_name, invite_url")
+            .expect("its arguments")
+            + start;
+        let mut template = String::new();
+        for line in src[start..end].lines().skip(1) {
+            let line = line.trim();
+            template.push_str(line.strip_suffix('\\').unwrap_or(line));
+        }
+        let template = template
+            .trim_start_matches('"')
+            .trim_end_matches([',', ' '])
+            .trim_end_matches('"')
+            .replace("\\\"", "\"")
+            .replace("\\n", "\n");
+        template.replacen("{}", name, 1).replacen("{}", link, 1)
+    }
+
+    #[test]
+    fn native_invite_message_is_the_web_uis() {
+        let web = web_invite_message("Town Square", "http://x/?invitation=abc");
+        assert!(web.starts_with("You've been invited to join the chat room \"Town Square\"!"));
+        assert_eq!(
+            rooms::create::invitation_message("Town Square", "http://x/?invitation=abc"),
+            web
+        );
+    }
+
+    #[test]
+    fn copy_message_and_copy_link_copy_what_they_say_and_do_nothing_before_an_invitation() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_sized(&board, (1280.0, 1600.0));
+        let open = rt.state.chat.room().unwrap().key.clone();
+        let name = rt.state.chat.room().unwrap().name.clone();
+        // Before any invitation there is no message and nothing to press.
+        assert_eq!(rt.state.chat.invite_message(), None);
+        assert!(rt.find("invite-copy-message").is_none());
+        press(&mut rt, "invite");
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Invite {
+                    room: open,
+                    link: Ok("http://x/?invitation=abc".into()),
+                },
+                tx,
+            )
+        });
+        settle(&mut rt);
+        // Making the invitation copied the link.
+        assert_eq!(
+            board.text().as_deref().map(String::as_str),
+            Some("http://x/?invitation=abc")
+        );
+        board.set_text("something else");
+        press(&mut rt, "invite-copy-message");
+        assert_eq!(
+            board.text().as_deref().map(String::as_str),
+            Some(web_invite_message(&name, "http://x/?invitation=abc").as_str())
+        );
+        press(&mut rt, "invite-copy");
+        assert_eq!(
+            board.text().as_deref().map(String::as_str),
+            Some("http://x/?invitation=abc")
+        );
+        // A failed invitation leaves no message to copy.
+        let open = rt.state.chat.room().unwrap().key.clone();
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Invite {
+                    room: open,
+                    link: Err("no key".into()),
+                },
+                tx,
+            )
+        });
+        settle(&mut rt);
+        assert_eq!(rt.state.chat.invite_message(), None);
+        assert!(rt.find("invite-copy-message").is_none());
+    }
+
+    /// Paste into the focused box as the runtime does for the paste shortcut: the clipboard's
+    /// text goes into the focused editor and its change hook runs.
+    fn paste(rt: &mut Runtime<RiverApp>, board: &rune::clipboard::MemoryClipboard, text: &str) {
+        board.set_text(text);
+        rt.paste(text);
+        settle(rt);
+    }
+
+    #[test]
+    fn pasting_with_the_chord_decides_the_invitation_and_offers_a_nickname() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        let (link, code) = invite_link_for(15);
+        paste(&mut rt, &board, &link);
+        assert!(
+            matches!(rt.state.chat.form.join, chat::JoinPreview::New { .. }),
+            "{:?}",
+            rt.state.chat.form.join
+        );
+        let invitee = rooms::create::decode_invitation(&link)
+            .unwrap()
+            .invitee
+            .member
+            .member_vk;
+        assert_eq!(
+            rt.state.chat.form.nickname.text,
+            chat::visual_fold::generate_default_nickname(&invitee)
+        );
+        press(&mut rt, "form-submit");
+        let [
+            rooms::Command {
+                action:
+                    rooms::Action::Join {
+                        code: sent,
+                        nickname,
+                    },
+                ..
+            },
+        ] = rt.state.chat.outgoing.as_slice()
+        else {
+            panic!("one join");
+        };
+        assert_eq!(sent.0, code);
+        assert_eq!(
+            nickname,
+            &chat::visual_fold::generate_default_nickname(&invitee)
+        );
+    }
+
+    #[test]
+    fn a_nickname_typed_before_a_paste_is_kept_through_pastes_of_other_invitations() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        // Type the nickname first: the code box is focused, so the nickname box is clicked.
+        press(&mut rt, "join-nickname");
+        type_text(&mut rt, "Bea");
+        assert_eq!(rt.state.chat.form.nickname.text, "Bea");
+        press(&mut rt, "invite-code");
+        let (a, _) = invite_link_for(16);
+        let (b, b_code) = invite_link_for(17);
+        paste(&mut rt, &board, &a);
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::New { .. }
+        ));
+        assert_eq!(rt.state.chat.form.nickname.text, "Bea");
+        // Replace the code with another invitation: the typed name still stays.
+        rt.update(|s, _| s.chat.form.code.replace_text(""));
+        paste(&mut rt, &board, &b);
+        assert_eq!(rt.state.chat.form.nickname.text, "Bea");
+        press(&mut rt, "form-submit");
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: String::new(),
+                action: rooms::Action::Join {
+                    code: rooms::InviteCode(b_code),
+                    nickname: "Bea".into(),
+                },
+            }]
+        );
+    }
+
+    /// The join dialog's preview of an invitation to the room keyed `key`, with room 2 of the
+    /// list made that room and given `edit`.
+    fn preview_with(key: &str, link: &str, edit: fn(&mut chat::model::Room)) -> chat::JoinPreview {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let (key, link) = (key.to_owned(), link.to_owned());
+        rt.update(move |s, _| {
+            let mut rooms = s.chat.rooms().to_vec();
+            rooms[2].key = key;
+            edit(&mut rooms[2]);
+            s.chat.set_rooms(rooms);
+            s.chat.open_dialog(chat::DialogKind::Join);
+            s.chat.form.code.replace_text(&link);
+            s.chat.join_code_edited();
+        });
+        rt.state.chat.form.join.clone()
+    }
+
+    #[test]
+    fn already_a_member_is_said_for_a_member_and_not_for_a_room_that_removed_you() {
+        let (link, _) = invite_link_for(18);
+        let owner = rooms::create::decode_invitation(&link).unwrap().room;
+        let key = bs58::encode(owner.to_bytes()).into_string();
+        let member = |p: chat::JoinPreview| matches!(p, chat::JoinPreview::Member { .. });
+        // A member, and every hold on sending that is not the room removing you: an update
+        // required or newer-River hold, no key or no secret yet (each sets `send_block` only).
+        assert!(member(preview_with(&key, &link, |_| {})));
+        assert!(member(preview_with(&key, &link, |r| {
+            r.send_block = Some(rooms::generation::UPDATE_REQUIRED_SEND.into());
+        })));
+        assert!(member(preview_with(&key, &link, |r| {
+            r.send_block = Some("This computer doesn't hold your key for this room.".into());
+        })));
+        assert!(member(preview_with(&key, &link, |r| {
+            r.send_block = Some("This private room's key hasn't reached this computer yet.".into());
+        })));
+        // Banned or removed (`not_member`; see the outbox test that sets it from the room).
+        assert!(matches!(
+            preview_with(&key, &link, |r| {
+                r.not_member = true;
+                r.send_block =
+                    Some("You have been banned from sending messages in this room.".into());
+            }),
+            chat::JoinPreview::Have { .. }
+        ));
+    }
+
+    #[test]
+    fn the_preview_follows_the_room_list_while_the_dialog_stays_open_over_the_same_code() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let (link, _) = invite_link_for(20);
+        let owner = rooms::create::decode_invitation(&link).unwrap().room;
+        let key = bs58::encode(owner.to_bytes()).into_string();
+        press(&mut rt, "enter-invite");
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&link);
+            s.chat.join_code_edited();
+        });
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::New { .. }
+        ));
+        // The room arrives: the same code now names a room you have.
+        let k = key.clone();
+        rt.update(move |s, _| {
+            let mut rooms = s.chat.rooms().to_vec();
+            rooms[2].key = k;
+            s.chat.set_rooms(rooms);
+        });
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::Member { .. }
+        ));
+        // It goes again (left in another window): a new room once more.
+        rt.update(move |s, _| {
+            let mut rooms = s.chat.rooms().to_vec();
+            rooms.retain(|r| r.key != key);
+            s.chat.set_rooms(rooms);
+        });
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::New { .. }
+        ));
+        // A list change with the dialog shut, or with no code in it, leaves the form alone.
+        rt.update(|s, _| s.chat.close_dialog());
+        let rooms = rt.state.chat.rooms().to_vec();
+        rt.update(move |s, _| s.chat.set_rooms(rooms));
+        assert_eq!(rt.state.chat.form.join, chat::JoinPreview::Empty);
+    }
+
+    #[test]
+    fn an_unchanged_code_is_not_decoded_again() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        let (link, _) = invite_link_for(19);
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&link);
+            s.chat.join_code_edited();
+            // A change the edit hook sees that is not a change of the code (surrounding space).
+            s.chat.form.join = chat::JoinPreview::Empty;
+            s.chat
+                .form
+                .code
+                .replace_text(format!("{} ", s.chat.form.code.text));
+            s.chat.join_code_edited();
+            assert_eq!(
+                s.chat.form.join,
+                chat::JoinPreview::Empty,
+                "not decoded again"
+            );
+        });
     }
 
     /// An identity token for a member (seed `member`) of the room owned by seed `owner`.

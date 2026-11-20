@@ -484,3 +484,120 @@ fn new_room_trims_what_was_typed() {
         SealedBytes::public(b"Ada".to_vec())
     );
 }
+
+// Pasted invitations --------------------------------------------------------------------------
+
+#[test]
+fn a_pasted_link_or_code_decodes_and_anything_else_is_refused_without_echoing_it() {
+    let owner = SigningKey::from_bytes(&[50; 32]);
+    let (_, inv) = public_room_and_invitation(&owner);
+    let code = inv.to_encoded_string().unwrap();
+    for pasted in [
+        code.clone(),
+        format!("  {code}\n"),
+        format!("{WEB_APP}?invitation={code}"),
+    ] {
+        assert!(decode_invitation(&pasted).unwrap() == inv, "{pasted}");
+    }
+    // Garbage that is not base58, is base58 but not an invitation, or is a valid prefix cut
+    // short: each is refused, none panics, none repeats the paste.
+    let half = &code[..code.len() / 2];
+    let secret = "SECRETSECRETSECRET";
+    for bad in [
+        "",
+        "   ",
+        "not a code!",
+        "3mJr7AoUXx2Wqd",
+        half,
+        &format!("{WEB_APP}?invitation={half}"),
+        &format!("0OIl{secret}"),
+        &format!("{WEB_APP}?invitation=%FF%FE{secret}"),
+    ] {
+        let why = decode_invitation(bad).unwrap_err();
+        assert!(!why.is_empty());
+        assert!(!why.contains(secret) && !why.contains("3mJr7"), "{why}");
+        if bad.trim().len() > 12 {
+            assert!(!why.contains(bad.trim()), "{why}");
+        }
+    }
+}
+
+#[test]
+fn a_paste_over_the_bound_is_refused_before_it_is_decoded() {
+    let long = "z".repeat(MAX_INVITE_PASTE_LEN + 1);
+    assert!(decode_invitation(&long).unwrap_err().contains("too long"));
+    // At the bound, with the character base58 decodes slowest ("1" decodes for free), it is
+    // decoded and refused for what it holds. Base58 decoding is quadratic, which is why the
+    // bound is small. No timing is asserted: the decode completes.
+    let at = "z".repeat(MAX_INVITE_PASTE_LEN);
+    assert!(!decode_invitation(&at).unwrap_err().contains("too long"));
+}
+
+/// The bound leaves room for a private room that has rotated its secret 100 times (about 9.9 KB
+/// as a code: each version's 32-byte secret costs about 90 characters).
+#[test]
+fn an_invitation_to_a_room_with_100_secret_versions_fits_the_bound() {
+    let owner = SigningKey::from_bytes(&[53; 32]);
+    let (_, mut inv) = public_room_and_invitation(&owner);
+    inv.room_secrets = (0..100u32).map(|v| (v, [0xF0 ^ v as u8; 32])).collect();
+    let code = inv.to_encoded_string().unwrap();
+    assert!(code.len() < MAX_INVITE_PASTE_LEN, "{}", code.len());
+    assert!(decode_invitation(&format!("{WEB_APP}?invitation={code}")).unwrap() == inv);
+}
+
+#[test]
+fn an_invitation_whose_membership_is_for_another_room_is_refused() {
+    let owner = SigningKey::from_bytes(&[51; 32]);
+    let (_, mut inv) = public_room_and_invitation(&owner);
+    // Names one room, grants membership in another.
+    inv.room = SigningKey::from_bytes(&[52; 32]).verifying_key();
+    let why = invitation_refusal(&inv).unwrap();
+    assert!(why.contains("different room"), "{why}");
+    assert!(decode_invitation(&inv.to_encoded_string().unwrap()).is_err());
+}
+
+#[test]
+fn the_invitation_message_is_the_web_uis_and_cleans_the_room_name() {
+    let msg = invitation_message("Book club", "http://x/?invitation=abc");
+    assert!(
+        msg.starts_with("You've been invited to join the chat room \"Book club\"!\n\nTo join:\n")
+    );
+    assert!(msg.contains("1. Install Freenet from https://freenet.org\n"));
+    assert!(msg.contains("2. Open this link:\nhttp://x/?invitation=abc\n\n"));
+    assert!(msg.contains("for you only"));
+    // The owner's text: no control, line-separator, bidi, zero-width or other format
+    // characters, bounded, and a stand-in when nothing is left.
+    let odd = invitation_message("A\nB\u{7}C", "l");
+    assert!(odd.contains("\"A BC\""), "{odd}");
+    for hostile in [
+        "Ro\u{202E}om",
+        "Ro\u{2066}o\u{2069}m",
+        "Ro\u{200B}o\u{FEFF}m",
+        "Ro\u{AD}o\u{2060}m\u{E0041}",
+    ] {
+        assert_eq!(plain_room_name(hostile), "Room", "{hostile:?}");
+        assert!(invitation_message(hostile, "l").contains("\"Room\""));
+    }
+    // The sidebar's own cleaning: line and paragraph separators and doubled spaces are single
+    // spaces, and the joiners some scripts need (ZWNJ, ZWJ) stay.
+    assert_eq!(
+        plain_room_name("Book\u{2028}club\u{2029}  night"),
+        "Book club night"
+    );
+    assert_eq!(plain_room_name("  a   b  "), "a b");
+    assert_eq!(
+        plain_room_name("\u{0645}\u{200C}\u{06CC}"),
+        "\u{0645}\u{200C}\u{06CC}"
+    );
+    assert_eq!(plain_room_name("a\u{200D}b"), "a\u{200D}b");
+    for hidden in ["\u{202E}\u{200B}", "\u{2028}", "   ", ""] {
+        assert_eq!(plain_room_name(hidden), "");
+        assert_eq!(room_name_or_standin(hidden), "this chat room");
+        assert!(invitation_message(hidden, "l").contains("\"this chat room\""));
+    }
+    // The cut is on a character, not a byte, and a name of nothing visible gets the stand-in.
+    assert_eq!(plain_room_name(&"\u{e9}".repeat(500)).chars().count(), 80);
+    assert!(invitation_message(&"x".repeat(500), "l").len() < 700);
+    assert!(invitation_message("  ", "l").contains("\"this chat room\""));
+    assert!(invitation_message("\u{202E}\u{200B}", "l").contains("\"this chat room\""));
+}

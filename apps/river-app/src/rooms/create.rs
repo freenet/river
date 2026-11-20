@@ -325,14 +325,97 @@ impl JoinRefusal {
 
 /// Why `invitation` can't be used at all: the key it gives the invitee is not the one its
 /// membership names, so joining with it would add someone else. The web UI leaves this to the
-/// room contract; here it is said before anything is stored.
+/// room contract; here it is said before anything is stored. This is a consistency check on the
+/// invitation's own fields, not a validity gate and not authentication: nothing here verifies the
+/// inviter's signature or that the inviter is a member, and the room contract still decides.
 pub fn invitation_refusal(invitation: &Invitation) -> Option<String> {
-    (invitation.invitee_signing_key.verifying_key() != invitation.invitee.member.member_vk).then(
-        || {
+    if invitation.invitee_signing_key.verifying_key() != invitation.invitee.member.member_vk {
+        return Some(
             "This invitation is damaged: the key it carries doesn't match the membership it grants."
-                .into()
-        },
+                .into(),
+        );
+    }
+    // The membership it grants must be in the room it names.
+    if invitation.invitee.member.owner_member_id != MemberId::from(&invitation.room) {
+        return Some(
+            "This invitation is damaged: the membership it grants is for a different room than \
+             the one it names."
+                .into(),
+        );
+    }
+    None
+}
+
+/// A room's name as the sidebar shows it ([`super::room`]'s `clean`: hidden characters dropped,
+/// every whitespace character, including line and paragraph separators, one space, runs
+/// collapsed), for a message or a sentence, cut at 80 characters (on a character). The owner
+/// chose the name. Empty when nothing visible is left: use [`room_name_or_standin`].
+pub fn plain_room_name(name: &str) -> String {
+    super::room::clean(name)
+        .chars()
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// [`plain_room_name`], or "this chat room" when nothing visible is left.
+pub fn room_name_or_standin(name: &str) -> String {
+    let plain = plain_room_name(name);
+    if plain.is_empty() {
+        "this chat room".to_owned()
+    } else {
+        plain
+    }
+}
+
+/// The message the web UI offers to copy for an invitation (`InviteMemberBody`'s `default_msg`
+/// in `invite_member_modal.rs`): the room's name, how to join, the link, and the warning that an
+/// invitation is for one person. The room name is the room owner's text, so control characters
+/// are dropped and a long one is cut.
+pub fn invitation_message(room_name: &str, link: &str) -> String {
+    let name = room_name_or_standin(room_name);
+    format!(
+        "You've been invited to join the chat room \"{name}\"!\n\n\
+         To join:\n\
+         1. Install Freenet from https://freenet.org\n\
+         2. Open this link:\n\
+         {link}\n\n\
+         IMPORTANT: This invitation is for you only \u{2014} do not share it with anyone else. \
+         It contains a unique identity key. If someone else uses this link, you will both \
+         share the same identity and neither will work correctly."
     )
+}
+
+/// The longest pasted invite code or link that is looked at. A real invitation is a few hundred
+/// bytes, and a private room's adds about 90 characters per secret version it has had, so a room
+/// that has rotated its secret 100 times needs about 9.9 KB; this leaves room for about 120.
+/// It is small because base58 decoding is quadratic in the length: the cost at 64 KiB was
+/// billions of steps per edit.
+pub const MAX_INVITE_PASTE_LEN: usize = 12 * 1024;
+
+/// The invitation a pasted invite code or link holds. An invitation is a bearer credential and
+/// what is pasted is untrusted, so the text is bounded first, no error repeats any of it, and a
+/// payload that does not decode or that contradicts itself is refused here.
+pub fn decode_invitation(pasted: &str) -> Result<Invitation, String> {
+    if pasted.len() > MAX_INVITE_PASTE_LEN {
+        return Err(
+            "That is too long to be an invite code (the limit is about 12 KB of pasted \
+             text, all of it counted; a private room with a very large number of secret \
+             versions may not fit)."
+                .into(),
+        );
+    }
+    let code = river_core::invitation::invitation_text_from_paste(pasted);
+    if code.is_empty() {
+        return Err("Paste an invite code.".into());
+    }
+    let invitation = Invitation::from_encoded_string(&code)
+        .map_err(|_| "That doesn't look like a valid invite code.".to_owned())?;
+    match invitation_refusal(&invitation) {
+        Some(why) => Err(why),
+        None => Ok(invitation),
+    }
 }
 
 /// Why `nickname` can't be used to join, before the room is read.

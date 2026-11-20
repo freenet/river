@@ -11,7 +11,7 @@ use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
 use super::visual_fold;
-use super::{Chat, DialogKind, InviteState, LinkStatus, Source};
+use super::{Chat, DialogKind, InviteState, JoinPreview, LinkStatus, Source};
 use crate::RiverApp;
 use crate::rooms::work::{WorkState, WorkView};
 
@@ -142,6 +142,30 @@ fn link_menu(chat: &Chat, k: &Kit, layer: &mut Vec<El>) -> El {
 
 type Get = fn(&mut RiverApp) -> &mut rune::TextEdit;
 
+/// The join dialog's invite code box. Each edit decides what the code is
+/// ([`Chat::join_code_edited`]). The word keys edit without the field's change hook, so the
+/// change is noticed there, as in the import dialog.
+fn join_code_field(chat: &Chat, k: &Kit) -> El {
+    TextInput::new(&chat.form.code)
+        .label("Invite code")
+        .placeholder("Invite code or link")
+        .width(None)
+        .on_edit(|s: &mut RiverApp| &mut s.chat.form.code)
+        .on_change(|s: &mut RiverApp, _| s.chat.join_code_edited())
+        .on_key(|s: &mut RiverApp, ev, _| {
+            let before = s.chat.form.code.text.clone();
+            let handled = super::keys::word_keys(&mut s.chat.form.code, ev);
+            if handled && s.chat.form.code.text != before {
+                s.chat.join_code_edited();
+            }
+            handled
+        })
+        .on_submit(|s: &mut RiverApp, _| s.chat.submit_join())
+        .build(k)
+        .key("invite-code")
+        .w_full()
+}
+
 /// The create and join dialogs, asking what the web UI's `CreateRoomModal` and
 /// `JoinWithCodeModal` ask: a name, a nickname and whether the room is private; or an invite
 /// code (or link) and a nickname.
@@ -211,24 +235,66 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 );
         }
         DialogKind::Join => {
-            body = body
-                .child(field(
-                    "invite-code",
-                    "Invite code",
-                    "Invite code or link",
-                    &chat.form.code,
-                    |s| &mut s.chat.form.code,
-                ))
-                .child(field(
+            body = body.child(join_code_field(chat, k));
+            let note = |s: String| {
+                text(s)
+                    .font(k.ty.ui)
+                    .color(st::palette().text_secondary)
+                    .wrap()
+                    .w_full()
+                    .key("join-note")
+            };
+            match &chat.form.join {
+                JoinPreview::Empty => {}
+                JoinPreview::Refused(why) => {
+                    body = body.child(
+                        text(why.clone())
+                            .font(k.ty.ui)
+                            .color(st::palette().danger)
+                            .wrap()
+                            .w_full()
+                            .key("join-note"),
+                    );
+                }
+                JoinPreview::New { room } => {
+                    // An invitation carries no room name, only the owner's key.
+                    let id: String = room.chars().take(8).collect();
+                    body = body.child(note(format!(
+                        "This invitation is for a new room, not one you have (room id {id}…). \
+                         Choose the nickname you will have there."
+                    )));
+                }
+                JoinPreview::Member { name, .. } => {
+                    body = body.child(note(format!(
+                        "You are already a member of “{}”. This invitation is not needed.",
+                        crate::rooms::create::room_name_or_standin(name)
+                    )));
+                }
+                JoinPreview::Have { name, .. } => {
+                    body = body.child(note(format!(
+                        "You already have “{}” in your list, but you are not a current member \
+                         of it. This invitation is not used for it; open the room to see why.",
+                        crate::rooms::create::room_name_or_standin(name)
+                    )));
+                }
+            }
+            if !matches!(
+                chat.form.join,
+                JoinPreview::Member { .. } | JoinPreview::Have { .. }
+            ) {
+                body = body.child(field(
                     "join-nickname",
                     "Your nickname",
                     "Your nickname in this room",
                     &chat.form.nickname,
                     |s| &mut s.chat.form.nickname,
                 ));
+            }
         }
     }
-    if let Some(error) = &chat.form.error {
+    // A refusal the preview already shows is not said twice.
+    let said = matches!(&chat.form.join, JoinPreview::Refused(why) if Some(why) == chat.form.error.as_ref());
+    if let Some(error) = chat.form.error.as_ref().filter(|_| !said) {
         body = body.child(
             text(error.clone())
                 .font(k.ty.ui)
@@ -251,11 +317,22 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                     .key("form-cancel"),
             )
             .child(
-                Button::new(submit_label)
-                    .variant(ButtonVariant::Contrast)
-                    .on_press(move |s: &mut RiverApp| submit(s))
-                    .build(k)
-                    .key("form-submit"),
+                Button::new(
+                    if kind == DialogKind::Join
+                        && matches!(
+                            chat.form.join,
+                            JoinPreview::Member { .. } | JoinPreview::Have { .. }
+                        )
+                    {
+                        "Open room"
+                    } else {
+                        submit_label
+                    },
+                )
+                .variant(ButtonVariant::Contrast)
+                .on_press(move |s: &mut RiverApp| submit(s))
+                .build(k)
+                .key("form-submit"),
             ),
     );
     Dialog::new(key, title)
@@ -907,13 +984,30 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
                         .key("invite-link"),
                 )
                 .child(
-                    Button::new("Copy again")
-                        .variant(ButtonVariant::Ghost)
-                        .on_press_tx(move |_: &mut RiverApp, tx: &mut rune::Tx| {
-                            tx.copy(link.clone())
-                        })
-                        .build(k)
-                        .key("invite-copy"),
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .child(
+                            Button::new("Copy link")
+                                .variant(ButtonVariant::Ghost)
+                                .on_press_tx({
+                                    let link = link.clone();
+                                    move |_: &mut RiverApp, tx: &mut rune::Tx| tx.copy(link.clone())
+                                })
+                                .build(k)
+                                .key("invite-copy"),
+                        )
+                        .child(
+                            Button::new("Copy message")
+                                .variant(ButtonVariant::Ghost)
+                                .on_press_tx(|s: &mut RiverApp, tx: &mut rune::Tx| {
+                                    if let Some(message) = s.chat.invite_message() {
+                                        tx.copy(message);
+                                    }
+                                })
+                                .build(k)
+                                .key("invite-copy-message"),
+                        ),
                 );
         }
         Some(InviteState::Failed(why)) => {

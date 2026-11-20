@@ -115,6 +115,48 @@ pub struct Form {
     pub replace: Option<identity::ReplaceConfirm>,
     /// Why what was entered can't be used, said in the dialog.
     pub error: Option<String>,
+    /// What the join dialog makes of the code typed in it.
+    pub join: JoinPreview,
+    /// The nickname the join dialog filled in from the invitation, to tell it from one typed.
+    pub generated_nickname: String,
+    /// A hash of the code last decoded, so an edit that leaves it as it was (the cursor moving,
+    /// a key that changed nothing) is not decoded again. Not the code, which is a credential.
+    /// It only saves work and is not security-relevant: a collision would skip one re-decode of
+    /// an edited code, and joining decodes the text again anyway.
+    pub decoded_hash: Option<u64>,
+    /// The room key of the invitation last decoded, so the preview can follow the room list.
+    pub decoded_room: Option<String>,
+}
+
+/// What the join dialog makes of the invite code or link typed in it. It holds nothing from the
+/// invitation but the room's address (which is public), never the key or secrets it carries.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum JoinPreview {
+    /// Nothing typed yet.
+    #[default]
+    Empty,
+    /// What was typed can't be used, and why.
+    Refused(String),
+    /// An invitation to a room this window does not show.
+    New {
+        /// The room owner's key, as rooms are keyed.
+        room: String,
+    },
+    /// An invitation to a room the user is a current member of.
+    Member {
+        /// The room's key.
+        room: String,
+        /// Its name.
+        name: String,
+    },
+    /// An invitation to a room that is in the list but the user is not a current member of
+    /// (removed, banned, or their key not known here). This invitation is not used for it.
+    Have {
+        /// The room's key.
+        room: String,
+        /// Its name.
+        name: String,
+    },
 }
 
 impl Default for Form {
@@ -128,6 +170,10 @@ impl Default for Form {
             token: TextEdit::new(""),
             replace: None,
             error: None,
+            join: JoinPreview::Empty,
+            generated_nickname: String::new(),
+            decoded_hash: None,
+            decoded_room: None,
         }
     }
 }
@@ -544,6 +590,13 @@ impl Chat {
     /// bytes, and losing typed text costs the user.
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
+        // A join dialog open over a code already decoded follows the list: a room that arrived,
+        // or went, changes what the invitation is.
+        if self.form.open == Some(DialogKind::Join)
+            && let Some(room) = self.form.decoded_room.clone()
+        {
+            self.form.join = self.join_preview_for(room);
+        }
         if self.rooms.is_empty() {
             self.emoji_open = false;
             self.member_modal = None;
@@ -1514,21 +1567,95 @@ impl Chat {
         );
     }
 
-    /// Join the room the pasted invite code or link invites to.
-    pub fn submit_join(&mut self) {
-        let code = river_core::invitation::invitation_text_from_paste(&self.form.code.text);
-        let nickname = self.form.nickname.text.trim().to_owned();
-        let refusal = if code.is_empty() {
-            Some("Paste an invite code.".to_owned())
-        } else if let Err(e) = river_core::invitation::Invitation::from_encoded_string(&code) {
-            Some(format!("That doesn't look like a valid invite code: {e}"))
-        } else {
-            crate::rooms::create::join_refusal(&nickname)
+    /// What the join dialog says of an invitation to the room keyed `room`, given the room list:
+    /// a room you are a current member of, a listed room you are not (banned, or no longer in
+    /// its member list), or a new one. Whether the room has you is the room's own answer
+    /// ([`Room::not_member`]); a hold on sending for another reason does not make it not yours.
+    fn join_preview_for(&self, room: String) -> JoinPreview {
+        match self.rooms.iter().find(|r| r.key == room) {
+            Some(known) if known.not_member => JoinPreview::Have {
+                name: known.name.clone(),
+                room,
+            },
+            Some(known) => JoinPreview::Member {
+                name: known.name.clone(),
+                room,
+            },
+            None => JoinPreview::New { room },
+        }
+    }
+
+    /// The code in the join dialog was edited: decide what it is, and offer the nickname the
+    /// invitation's key gives (as the web UI does), unless one was typed.
+    pub fn join_code_edited(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let text = self.form.code.text.trim();
+        if text.is_empty() {
+            self.form.join = JoinPreview::Empty;
+            self.form.decoded_hash = None;
+            self.form.decoded_room = None;
+            self.form.error = None;
+            return;
+        }
+        // Decoding costs more the longer the paste: do it once per distinct text.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let hash = hasher.finish();
+        if self.form.decoded_hash == Some(hash) {
+            return;
+        }
+        self.form.decoded_hash = Some(hash);
+        self.form.decoded_room = None;
+        self.form.error = None;
+        let invitation = match crate::rooms::create::decode_invitation(&self.form.code.text) {
+            Ok(i) => i,
+            Err(why) => {
+                self.form.join = JoinPreview::Refused(why);
+                return;
+            }
         };
-        if let Some(why) = refusal {
+        let room = bs58::encode(invitation.room.to_bytes()).into_string();
+        self.form.decoded_room = Some(room.clone());
+        if self.rooms.iter().any(|r| r.key == room) {
+            self.form.join = self.join_preview_for(room);
+            return;
+        }
+        let generated =
+            visual_fold::generate_default_nickname(&invitation.invitee.member.member_vk);
+        let untouched = self.form.nickname.text.trim().is_empty()
+            || self.form.nickname.text == self.form.generated_nickname;
+        if untouched {
+            self.form.nickname.replace_text(&generated);
+            self.form.generated_nickname = generated;
+        }
+        self.form.join = JoinPreview::New { room };
+    }
+
+    /// Join the room the pasted invite code or link invites to; or, for a room the user is in
+    /// already, open it.
+    pub fn submit_join(&mut self) {
+        let invitation = match crate::rooms::create::decode_invitation(&self.form.code.text) {
+            Ok(i) => i,
+            Err(why) => {
+                self.form.error = Some(why);
+                return;
+            }
+        };
+        let room = bs58::encode(invitation.room.to_bytes()).into_string();
+        // A room in the list is opened, not joined again, whether or not this computer's key is
+        // a current member of it: the invitation is not used over a room this app already has.
+        if self.rooms.iter().any(|r| r.key == room) {
+            self.close_dialog();
+            self.select(&room);
+            return;
+        }
+        let nickname = self.form.nickname.text.trim().to_owned();
+        if let Some(why) = crate::rooms::create::join_refusal(&nickname) {
             self.form.error = Some(why);
             return;
         }
+        let code = river_core::invitation::invitation_text_from_paste(&self.form.code.text);
+        // The paste box held a credential: it is emptied with the rest of the form.
         self.close_dialog();
         self.emit(
             String::new(),
@@ -1588,6 +1715,16 @@ impl Chat {
             },
         ));
         copied
+    }
+
+    /// The message to send with the open room's invitation, if one was made there: the web UI's
+    /// ([`crate::rooms::create::invitation_message`]), naming the room.
+    pub fn invite_message(&self) -> Option<String> {
+        let InviteState::Copied(link) = self.open_invite()? else {
+            return None;
+        };
+        let name = self.room().map(|r| r.name.as_str()).unwrap_or_default();
+        Some(crate::rooms::create::invitation_message(name, link))
     }
 
     /// The invitation for the open room, if one was asked for there.

@@ -579,6 +579,7 @@ impl LiveRoom {
             me: me_id,
             unread,
             send_block: None,
+            not_member: false,
             notices: Vec::new(),
             nickname_limit: state
                 .configuration
@@ -782,7 +783,7 @@ pub(crate) fn is_hidden(c: char) -> bool {
 }
 
 /// A one-line name: hidden characters dropped, whitespace runs collapsed, trimmed.
-fn clean(s: &str) -> String {
+pub(crate) fn clean(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| !is_hidden(*c))

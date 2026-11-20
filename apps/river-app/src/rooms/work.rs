@@ -96,7 +96,7 @@ use freenet_stdlib::client_api::{
 };
 use freenet_stdlib::prelude::{ContractInstanceId, StateDelta, UpdateData};
 use river_core::chat_delegate::{CasStoreResult, ChatDelegateResponseMsg};
-use river_core::invitation::{Invitation, invitation_text_from_paste};
+use river_core::invitation::Invitation;
 use river_core::room_state::ChatRoomStateV1;
 use river_core::room_state::identity::IdentityExport;
 use river_core::stored_rooms::{
@@ -496,32 +496,21 @@ impl Work {
     /// list already.
     pub fn join(&mut self, pasted: &str, nickname: &str, shown: &dyn Fn(&VerifyingKey) -> bool) {
         const WHAT: &str = "Joining a room";
-        let code = invitation_text_from_paste(pasted);
-        if code.is_empty() {
-            return self.refuse(WHAT, "Paste an invite code.".into());
-        }
-        let invitation = match Invitation::from_encoded_string(&code) {
+        let invitation = match create::decode_invitation(pasted) {
             Ok(i) => i,
-            Err(e) => {
-                return self.refuse(
-                    WHAT,
-                    format!("That doesn't look like a valid invite code: {e}"),
-                );
-            }
+            Err(why) => return self.refuse(WHAT, why),
         };
-        if let Some(why) =
-            create::join_refusal(nickname).or_else(|| create::invitation_refusal(&invitation))
-        {
+        if let Some(why) = create::join_refusal(nickname) {
             return self.refuse(WHAT, why);
         }
         if shown(&invitation.room) {
             // Joining writes the room into the store, and over a stored room only the web UI
-            // can write without losing what it keeps there.
+            // can write without losing what it keeps there. The window opens such a room
+            // instead of asking for this ([`crate::chat::Chat::submit_join`]); this is for an
+            // invitation that reaches here some other way.
             return self.refuse(
                 WHAT,
-                "You already have this room. To use this invitation instead, accept it in River \
-                 in your browser."
-                    .into(),
+                "You are already a member of this room, so this invitation was not used.".into(),
             );
         }
         // Another join of this room, working, finished, or failed with Try again: a second one

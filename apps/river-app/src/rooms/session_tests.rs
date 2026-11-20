@@ -5521,7 +5521,7 @@ fn a_message_queued_before_leaving_behind_another_task_is_not_sent() {
 }
 
 /// Leaving the last room, then accepting an invitation to it: the join is not refused as "you
-/// already have this room".
+/// are already a member".
 #[test]
 fn a_room_left_can_be_joined_again_at_once() {
     let node = fake_node(vec![]);

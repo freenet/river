@@ -5,7 +5,10 @@
 //! (their tests and impersonation checker need the web crate). `tests::copies_match_the_web_ui`
 //! fails when a copied item drifts from, or disappears out of, the web source. To update:
 //! re-copy the changed item. The `//@@` marker lines name each item's source file.
+
 #![allow(dead_code, clippy::all)]
+
+use ed25519_dalek::VerifyingKey;
 
 /// Whether two display names are a tier-1 (same skeleton) match: the web UI's own
 /// `folds_together`, copied below.
@@ -1427,6 +1430,31 @@ pub const LAST_NAMES: [&str; 100] = [
 ];
 
 //@@ nickname.rs
+/// Fold a byte slice into a stable index seed (simple polynomial hash).
+///
+/// Deliberately `u64` rather than `usize`: `usize` is 32-bit on the wasm32
+/// build that ships and 64-bit natively, so a `usize` accumulator would
+/// give the two different index values for the same key (and the native
+/// unit tests would not be testing what the browser actually produces).
+fn fold(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
+}
+
+/// Derive a deterministic default handle (e.g. "Cipher Daylight") from a
+/// member's verifying key. Pure function of the key — same key in, same
+/// handle out, every time.
+pub fn generate_default_nickname(vk: &VerifyingKey) -> String {
+    let bytes = vk.as_bytes();
+    // Use disjoint key halves for the two indices so the first and last
+    // word vary independently.
+    let first = FIRST_NAMES[(fold(&bytes[0..16]) % FIRST_NAMES.len() as u64) as usize];
+    let last = LAST_NAMES[(fold(&bytes[16..32]) % LAST_NAMES.len() as u64) as usize];
+    format!("{first} {last}")
+}
+
+//@@ nickname.rs
 /// The folded word pools backing [`folds_to_generated_handle`], built once.
 ///
 /// Indexed by fold: `[0]` is the visual fold, `[1]` the case-insensitive one,
@@ -1725,6 +1753,40 @@ mod tests {
         assert_eq!(visual_ascii("e\u{0301}\u{00E9}"), "ee");
     }
 
+    /// The handle offered to a joiner is the web UI's: two words from its pools, the same for
+    /// the same key, and one a room accepts as a nickname.
+    #[test]
+    fn the_default_nickname_is_a_pool_pair_a_room_accepts() {
+        for seed in 0..=255u8 {
+            let vk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key();
+            let name = generate_default_nickname(&vk);
+            assert_eq!(name, generate_default_nickname(&vk));
+            let (first, last) = name.split_once(' ').expect("two words");
+            assert!(FIRST_NAMES.contains(&first) && LAST_NAMES.contains(&last));
+            assert!(
+                crate::rooms::create::join_refusal(&name).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    /// One fixed key and its handle, worked out by hand from the web UI's pools: the first word
+    /// is picked by the fold of key bytes 0..16 and the last by bytes 16..32 (the swapped
+    /// pairing gives "Neon Albatross").
+    #[test]
+    fn a_fixed_key_gets_the_handle_the_web_ui_gives_it() {
+        let mut bytes = [0u8; 32];
+        for (i, pair) in "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+            .as_bytes()
+            .chunks(2)
+            .enumerate()
+        {
+            bytes[i] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        let vk = VerifyingKey::from_bytes(&bytes).unwrap();
+        assert_eq!(generate_default_nickname(&vk), "Titanium Pulse");
+    }
+
     /// Every item above is a verbatim copy of an item in the web UI's source; this fails when
     /// the web copy changes or moves, so the two cannot drift apart silently.
     #[test]
@@ -1767,6 +1829,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 21, "only {checked} items found");
+        assert!(checked >= 37, "only {checked} items found");
     }
 }
