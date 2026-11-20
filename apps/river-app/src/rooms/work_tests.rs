@@ -471,7 +471,7 @@ fn a_join_that_cant_start_says_why_at_once() {
         ("", "Bea", false, "Paste"),
         ("not a code!", "Bea", false, "valid invite code"),
         (link.as_str(), "", false, "nickname"),
-        (link.as_str(), "Bea", true, "already have"),
+        (link.as_str(), "Bea", true, "already a member"),
     ] {
         let mut w = Work::default();
         w.join(pasted, nick, &|_| shown);

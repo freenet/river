@@ -327,12 +327,72 @@ impl JoinRefusal {
 /// membership names, so joining with it would add someone else. The web UI leaves this to the
 /// room contract; here it is said before anything is stored.
 pub fn invitation_refusal(invitation: &Invitation) -> Option<String> {
-    (invitation.invitee_signing_key.verifying_key() != invitation.invitee.member.member_vk).then(
-        || {
+    if invitation.invitee_signing_key.verifying_key() != invitation.invitee.member.member_vk {
+        return Some(
             "This invitation is damaged: the key it carries doesn't match the membership it grants."
-                .into()
-        },
+                .into(),
+        );
+    }
+    // The membership it grants must be in the room it names.
+    if invitation.invitee.member.owner_member_id != MemberId::from(&invitation.room) {
+        return Some(
+            "This invitation is damaged: the membership it grants is for a different room than \
+             the one it names."
+                .into(),
+        );
+    }
+    None
+}
+
+/// The message the web UI offers to copy for an invitation (`InviteMemberBody`'s `default_msg`
+/// in `invite_member_modal.rs`): the room's name, how to join, the link, and the warning that an
+/// invitation is for one person. The room name is the room owner's text, so control characters
+/// are dropped and a long one is cut.
+pub fn invitation_message(room_name: &str, link: &str) -> String {
+    let name: String = room_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect();
+    let name = if name.trim().is_empty() {
+        "this chat room"
+    } else {
+        name.trim()
+    };
+    format!(
+        "You've been invited to join the chat room \"{name}\"!\n\n\
+         To join:\n\
+         1. Install Freenet from https://freenet.org\n\
+         2. Open this link:\n\
+         {link}\n\n\
+         IMPORTANT: This invitation is for you only \u{2014} do not share it with anyone else. \
+         It contains a unique identity key. If someone else uses this link, you will both \
+         share the same identity and neither will work correctly."
     )
+}
+
+/// The longest pasted invite code or link that is looked at. A real invitation is a few hundred
+/// bytes, and a private room's adds 32 bytes of secret per version it has had; this leaves room
+/// for thousands of versions and refuses a multi-megabyte paste before anything decodes it.
+pub const MAX_INVITE_PASTE_LEN: usize = 64 * 1024;
+
+/// The invitation a pasted invite code or link holds. An invitation is a bearer credential and
+/// what is pasted is untrusted, so the text is bounded first, no error repeats any of it, and a
+/// payload that does not decode or that contradicts itself is refused here.
+pub fn decode_invitation(pasted: &str) -> Result<Invitation, String> {
+    if pasted.len() > MAX_INVITE_PASTE_LEN {
+        return Err("That is too long to be an invite code.".into());
+    }
+    let code = river_core::invitation::invitation_text_from_paste(pasted);
+    if code.is_empty() {
+        return Err("Paste an invite code.".into());
+    }
+    let invitation = Invitation::from_encoded_string(&code)
+        .map_err(|_| "That doesn't look like a valid invite code.".to_owned())?;
+    match invitation_refusal(&invitation) {
+        Some(why) => Err(why),
+        None => Ok(invitation),
+    }
 }
 
 /// Why `nickname` can't be used to join, before the room is read.
