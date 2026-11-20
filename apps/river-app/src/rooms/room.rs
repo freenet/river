@@ -202,6 +202,28 @@ impl LiveRoom {
         self.nickname(id, me)
     }
 
+    /// The room's direct-message threads for this user, read-only (see [`super::dm`]).
+    /// `room_label` names the room an invitation is for when the caller has that room.
+    pub fn dm_threads(
+        &self,
+        cache: &super::dm_cache::OutboundCache,
+        room_label: &dyn Fn(&ed25519_dalek::VerifyingKey) -> Option<String>,
+    ) -> super::dm::Threads {
+        let name_of = |id: RiverMemberId| self.member_name(id);
+        super::dm::threads(&super::dm::Source {
+            room_key: &self.key(),
+            room_name: &self.name(),
+            owner: &self.stored.owner_vk,
+            members: &self.stored.room_state.members,
+            messages: &self.stored.room_state.direct_messages,
+            self_sk: self.stored.self_sk.as_ref(),
+            self_vk: self.stored.self_vk,
+            cache,
+            name_of: &name_of,
+            room_label,
+        })
+    }
+
     /// Every secret this member holds for the room, by version, ascending: what an invitation
     /// to a private room carries (the web UI's `collect_invitation_secrets`).
     pub fn secrets_by_version(&self) -> Vec<(u32, [u8; 32])> {

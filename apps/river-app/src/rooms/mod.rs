@@ -39,11 +39,19 @@
 //! It writes none of that once River has moved to a newer chat delegate or room contract than
 //! the one it carries ([`generation`]): it would be writing where the web UI no longer reads.
 //! It then only shows the rooms and asks the user to update it.
+//!
+//! It also reads, and never writes, the plaintext of the direct messages the user sent (the
+//! delegate's `outbound_dms` key, [`dm_cache`]), and builds direct-message threads from it and
+//! the rooms ([`dm`]).
 
 pub mod bans;
 pub mod create;
 pub mod delegate;
 pub mod deputies;
+pub mod dm;
+pub mod dm_cache;
+#[cfg(test)]
+mod dm_tests;
 pub mod generation;
 pub mod grant;
 pub mod identity;

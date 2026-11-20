@@ -84,6 +84,7 @@ use river_core::stored_rooms::{
 };
 
 use super::delegate::{self, Read};
+use super::dm_cache::{self, DmRead, OutboundCache};
 use super::generation::{
     CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_SEND, UPDATE_REQUIRED_WORK, Watch,
 };
@@ -1212,6 +1213,8 @@ struct Loaded {
     listed: usize,
     /// Stored rooms that could not be decoded.
     unreadable: usize,
+    /// What `outbound_dms` held (read only: see [`super::dm_cache`]).
+    dms: DmRead,
 }
 
 impl Loaded {
@@ -1223,6 +1226,7 @@ impl Loaded {
             store_missing: true,
             listed: 0,
             unreadable: 0,
+            dms: DmRead::NotListed,
         }
     }
 }
@@ -1230,9 +1234,14 @@ impl Loaded {
 /// Reading the stored rooms from the chat delegate, one answer at a time: list the keys, then
 /// get each room and the list's view preferences. Answers are matched by storage key, as the
 /// web UI matches them, so their order does not matter.
+/// The keys a read waits for: each is `None` until answered, then the answer's value.
+type Wanted = HashMap<Vec<u8>, Option<Option<Vec<u8>>>>;
+
 struct Loader {
     /// `None` until the key list has arrived.
-    wanted: Option<HashMap<Vec<u8>, Option<Vec<u8>>>>,
+    /// By storage key: `None` until the key's answer arrives, then the answer's value (itself
+    /// `None` for a key the delegate has no value for).
+    wanted: Option<Wanted>,
     rooms: Vec<VerifyingKey>,
 }
 
@@ -1257,13 +1266,16 @@ impl Loader {
         match (&mut self.wanted, answer) {
             (None, ChatDelegateResponseMsg::ListResponse { keys }) => {
                 let plan = plan(keys.iter().map(|k| k.as_bytes()));
-                let mut wanted: HashMap<Vec<u8>, Option<Vec<u8>>> = plan
+                let mut wanted: Wanted = plan
                     .rooms
                     .iter()
                     .map(|vk| (room_storage_key(vk), None))
                     .collect();
                 if plan.has_meta {
                     wanted.insert(ROOMS_META_KEY.to_vec(), None);
+                }
+                if plan.has_dms {
+                    wanted.insert(dm_cache::KEY.to_vec(), None);
                 }
                 self.rooms = plan.rooms;
                 let reads: Vec<Read> = wanted.keys().cloned().map(Read::Get).collect();
@@ -1277,7 +1289,7 @@ impl Loader {
                 if let Some(slot) = wanted.get_mut(key.as_bytes())
                     && slot.is_none()
                 {
-                    *slot = Some(value.unwrap_or_default());
+                    *slot = Some(value);
                 }
                 if wanted.values().all(Option::is_some) {
                     Step::Done(Box::new(self.finish()))
@@ -1292,7 +1304,7 @@ impl Loader {
     fn finish(&mut self) -> Loaded {
         let mut wanted = self.wanted.take().unwrap_or_default();
         let (meta, modes) = match wanted.remove(ROOMS_META_KEY) {
-            Some(Some(bytes)) if !bytes.is_empty() => (
+            Some(Some(Some(bytes))) if !bytes.is_empty() => (
                 decode_rooms_meta(&bytes).unwrap_or_else(|e| {
                     eprintln!("River: {e}");
                     StoredRoomsMeta::default()
@@ -1301,10 +1313,23 @@ impl Loader {
             ),
             _ => (StoredRoomsMeta::default(), HashMap::new()),
         };
+        // Listed but with no value, or a value that does not decode, is unreadable: only a key
+        // the list did not have is "not listed".
+        let dms = match wanted.remove(dm_cache::KEY) {
+            Some(Some(Some(bytes))) => match OutboundCache::from_bytes(&bytes) {
+                Ok(cache) => DmRead::Read(Box::new(cache)),
+                Err(e) => {
+                    eprintln!("River: {e}");
+                    DmRead::Unreadable
+                }
+            },
+            Some(_) => DmRead::Unreadable,
+            None => DmRead::NotListed,
+        };
         let mut slots = Vec::new();
         let mut unreadable = 0;
         for vk in &self.rooms {
-            let Some(Some(bytes)) = wanted.remove(&room_storage_key(vk)) else {
+            let Some(Some(Some(bytes))) = wanted.remove(&room_storage_key(vk)) else {
                 continue;
             };
             if bytes.is_empty() {
@@ -1327,6 +1352,7 @@ impl Loader {
             store_missing: false,
             listed: self.rooms.len(),
             unreadable,
+            dms,
         }
     }
 }
@@ -1479,17 +1505,20 @@ fn delegate_error(e: &ClientError) -> Result<(), SocketError> {
     )))
 }
 
-/// What a `ListResponse` says to read: the per-room keys, and whether `rooms_meta` exists.
+/// What a `ListResponse` says to read: the per-room keys, and whether `rooms_meta` and
+/// `outbound_dms` exist.
 #[derive(Debug, PartialEq)]
 struct Plan {
     rooms: Vec<VerifyingKey>,
     has_meta: bool,
+    has_dms: bool,
 }
 
 fn plan<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Plan {
     let mut plan = Plan {
         rooms: Vec::new(),
         has_meta: false,
+        has_dms: false,
     };
     for key in keys {
         if let Some(vk) = parse_room_storage_key(key) {
@@ -1498,6 +1527,8 @@ fn plan<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Plan {
             }
         } else if key == ROOMS_META_KEY {
             plan.has_meta = true;
+        } else if key == dm_cache::KEY {
+            plan.has_dms = true;
         }
     }
     plan
@@ -1527,6 +1558,10 @@ struct Rooms {
     /// What the user sent that the node has not taken yet, and the rooms being created or
     /// joined.
     outbox: Outbox,
+    /// The user's sent direct messages, as last read from the delegate. Read only: nothing
+    /// writes `outbound_dms` yet. The direct-message view reads it through
+    /// [`Rooms::dm_cache`].
+    dm_cache: OutboundCache,
     /// River's web app on the node, which invite links open.
     web_app: String,
     /// Invitations made since the last report, by room key.
@@ -1555,6 +1590,12 @@ struct Rooms {
 }
 
 impl Rooms {
+    /// The sent-message cache, hydrated by every read of the stored rooms.
+    #[allow(dead_code)] // Read by the direct-message view, a later change; tests read it now.
+    fn dm_cache(&self) -> &OutboundCache {
+        &self.dm_cache
+    }
+
     /// Take freshly read rooms, returning the room contracts that are new to the list.
     ///
     /// After the first read, a read that found no store, or no `room:` keys at all, keeps the
@@ -1565,7 +1606,15 @@ impl Rooms {
     /// slot's read position. If the stored slot now names a different contract or a
     /// different identity or secrets (the room was re-keyed, or rejoined), the stored slot is
     /// taken instead, with the old copy merged in when the contract is the same.
-    fn replace(&mut self, loaded: Loaded) -> Vec<ContractInstanceId> {
+    fn replace(&mut self, mut loaded: Loaded) -> Vec<ContractInstanceId> {
+        // A store that was not there says nothing about the sent messages in it. Otherwise the
+        // cache takes the read, but trusts "the key was not listed" only from a list that named
+        // rooms (the same distrust as the room list below: an empty list can be a failed read).
+        if !loaded.store_missing {
+            let authoritative = loaded.listed > 0;
+            self.dm_cache
+                .note_read(std::mem::take(&mut loaded.dms), authoritative);
+        }
         if self.loaded && (loaded.store_missing || loaded.listed == 0) && !self.list.is_empty() {
             eprintln!("River: the stored rooms read as empty; keeping the list shown");
             // Still recorded: a store that could not be set up again is not registered again
