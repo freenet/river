@@ -218,7 +218,7 @@ impl Switcher {
 
 impl Chat {
     /// Whether a dialog the switcher must not open over is showing.
-    fn other_dialog_open(&self) -> bool {
+    pub(super) fn other_dialog_open(&self) -> bool {
         self.form.open.is_some()
             || self.member_modal.is_some()
             || self.details.is_some()
@@ -228,6 +228,7 @@ impl Chat {
             || self.update.settings_open
             || self.background.as_ref().is_some_and(|b| b.open)
             || self.link_menu.is_some()
+            || self.overview
     }
 
     /// The chord arrived at `now` (see [`CHORD_QUIET`]): opens or closes the switcher unless it
