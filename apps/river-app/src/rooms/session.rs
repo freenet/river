@@ -77,6 +77,7 @@ use freenet_stdlib::client_api::{
 };
 use freenet_stdlib::prelude::{ContractInstanceId, StateDelta, UpdateData};
 use river_core::chat_delegate::{ChatDelegateResponseMsg, LIST_REFUSED_MARKER};
+use river_core::room_state::member::MemberId;
 use river_core::room_state::{ChatRoomStateV1, ChatRoomStateV1Delta};
 use river_core::stored_rooms::{
     ROOMS_META_KEY, StoredRoom, StoredRoomSlot, StoredRoomsMeta, decode_room_slot,
@@ -85,6 +86,8 @@ use river_core::stored_rooms::{
 
 use super::delegate::{self, Read};
 use super::dm_cache::{self, DmRead, OutboundCache};
+use super::dm_save::DmSaver;
+use super::dm_store::{DmOp, EntryKey};
 use super::generation::{
     CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_SEND, UPDATE_REQUIRED_WORK, Watch,
 };
@@ -98,6 +101,7 @@ use super::work::WorkView;
 pub use crate::chat::LinkStatus;
 use crate::chat::Room;
 use crate::chat::dm_model::DmSnapshot;
+use river_core::room_state::direct_messages::MAX_DM_MESSAGES_PER_PAIR;
 
 /// How the background work paces itself. Tests shrink these.
 #[derive(Clone, Debug)]
@@ -756,6 +760,8 @@ fn follow_on(
     // Whatever the signing key sweep had out went with the last connection: a failure of it.
     let key_pace = (pace.key_retry_first, pace.key_retry_max);
     rooms.keys.connection_lost(key_pace, Instant::now());
+    // A read that was out went with the connection: its stamp is not the next one's.
+    rooms.dm_read_began = None;
     if let Err(e) = socket.read_early(early_read) {
         return e;
     }
@@ -893,8 +899,13 @@ fn follow_on(
             .expire(pace.delegate_deadline, pace.update_wait, Instant::now())
         {
             rooms.report(status, report);
-            return SocketError::Failed("reconnecting to finish creating or joining a room".into());
+            return SocketError::Failed(if rooms.outbox.work.expired_dm() {
+                "reconnecting after saving sent messages went unanswered".into()
+            } else {
+                "reconnecting to finish creating or joining a room".into()
+            });
         }
+        rooms.dm_save_tick(writes, Instant::now());
         if writes {
             match rooms.send_updates(socket) {
                 Ok(failed) => changed |= failed,
@@ -904,13 +915,17 @@ fn follow_on(
         // The create or join under way sends its next request, unless the stored rooms are
         // being read: their answers and its are told apart by kind, but an error names neither.
         if writes
-            && let Some(request) = rooms
+            && let Some(mut request) = rooms
                 .outbox
                 .work
                 .next_request(reload.is_some() || rooms.keys.busy(), Instant::now())
-            && let Err(e) = socket.send(&request)
         {
-            return e;
+            let sent = socket.send(&request);
+            // A store of the sent-message key holds what the user wrote: not kept after it is out.
+            delegate::wipe_request(&mut request);
+            if let Err(e) = sent {
+                return e;
+            }
         }
         // Read the stored rooms again now and then, for rooms joined or left elsewhere.
         // A read that took too long has requests still out, whose answers or errors could come
@@ -940,6 +955,7 @@ fn follow_on(
                     return e;
                 }
             }
+            rooms.dm_read_began = Some(rooms.dm_cache.save_seq());
             reload = Some((loader, Instant::now()));
         }
         // The signing key sweep comes last, after a read has had its chance to start: it is the
@@ -1014,10 +1030,14 @@ fn follow_on(
                 subs.failed(instance_id, pace);
                 changed |= rooms.following(&instance_id, false);
             }
-            Some(Ok(other)) => {
-                for answer in delegate::answers(&other) {
+            Some(Ok(mut other)) => {
+                let answers = delegate::answers(&other);
+                delegate::wipe_response(&mut other);
+                for mut answer in answers {
                     if rooms.outbox.work.on_delegate(&answer) {
                         changed = true;
+                        // A save's read holds the stored sent messages.
+                        delegate::wipe_answers(std::slice::from_mut(&mut answer));
                         continue;
                     }
                     if rooms.keys.on_answer(&answer, key_pace, Instant::now()) {
@@ -1238,7 +1258,7 @@ struct Loaded {
     listed: usize,
     /// Stored rooms that could not be decoded.
     unreadable: usize,
-    /// What `outbound_dms` held (read only: see [`super::dm_cache`]).
+    /// What `outbound_dms` held (read here; written by [`super::dm_save`]).
     dms: DmRead,
 }
 
@@ -1629,10 +1649,14 @@ struct Rooms {
     /// What the user sent that the node has not taken yet, and the rooms being created or
     /// joined.
     outbox: Outbox,
-    /// The user's sent direct messages, as last read from the delegate. Read only: nothing
-    /// writes `outbound_dms` yet. The direct-message view reads it through
-    /// [`Rooms::dm_cache`].
+    /// The user's sent direct messages, as last read from the delegate, and the text of what
+    /// this app sent. The direct-message view reads it through [`Rooms::dm_cache`]; what this
+    /// app sent is saved to the delegate by [`Rooms::dm_save_tick`].
     dm_cache: OutboundCache,
+    /// The pacing of those saves ([`super::dm_save`]).
+    dm_saver: DmSaver,
+    /// The save count when the read now out began ([`OutboundCache::note_read_from`]).
+    dm_read_began: Option<u64>,
     /// The threads of each room built last time, so a report that changes nothing in a room's
     /// messages does not open them again ([`Rooms::dm_snapshot`]).
     dm_memo: HashMap<VerifyingKey, DmMemo>,
@@ -1690,13 +1714,19 @@ impl Rooms {
             dm_sent,
             network_seen,
             outbox,
+            complete,
             ..
         } = self;
         // The direct messages still in the outbox, by room. Their text is kept with them (it
         // outlives a session), and put in the cache so the row it becomes when the room holds
         // it keeps its text.
-        dm_cache
-            .keep_sent_rooms(|owner| list.iter().any(|r| r.stored.owner_vk.as_bytes() == owner));
+        // Only from a complete read of the rooms: a room that could not be read is missing from
+        // the list, and its unsaved text must survive until it is back (as the outbox's does).
+        if *complete {
+            dm_cache.keep_sent_rooms(|owner| {
+                list.iter().any(|r| r.stored.owner_vk.as_bytes() == owner)
+            });
+        }
         let pending: Vec<Vec<super::outbox::DmRow>> = list
             .iter()
             .map(|r| outbox.dm_rows(&r.stored.owner_vk))
@@ -1706,14 +1736,17 @@ impl Rooms {
                 let (owner, token) = (&room.stored.owner_vk, &row.token);
                 if let Some(text) = &row.text
                     && dm_cache.plaintext(owner, row.recipient, token).is_none()
-                {
-                    dm_cache.remember_sent(
+                    && dm_cache.remember_sent(
                         owner,
                         row.recipient,
                         *token,
                         row.sender,
                         row.timestamp,
                         text.as_str().to_owned(),
+                    )
+                {
+                    eprintln!(
+                        "River: too many sent direct messages are unsaved; the oldest text was dropped"
                     );
                 }
             }
@@ -1818,8 +1851,12 @@ impl Rooms {
         // rooms (the same distrust as the room list below: an empty list can be a failed read).
         if !loaded.store_missing {
             let authoritative = loaded.listed > 0;
+            let began = self
+                .dm_read_began
+                .take()
+                .unwrap_or_else(|| self.dm_cache.save_seq());
             self.dm_cache
-                .note_read(std::mem::take(&mut loaded.dms), authoritative);
+                .note_read_from(std::mem::take(&mut loaded.dms), authoritative, began);
         }
         if self.loaded && (loaded.store_missing || loaded.listed == 0) && !self.list.is_empty() {
             eprintln!("River: the stored rooms read as empty; keeping the list shown");
@@ -1959,6 +1996,13 @@ impl Rooms {
                     let did = self.outbox.command(room, command.action);
                     if did && let Some((owner, (recipient, token))) = discarded {
                         self.dm_cache.forget_sent(&owner, recipient, &token);
+                        // Only a message whose text was saved (or is being saved) has an entry
+                        // to remove, and only that entry.
+                        let key = (owner.to_bytes(), recipient, token);
+                        let was_saved = self.dm_cache.forget_saved(&owner, recipient, &token);
+                        if was_saved || self.dm_saver.is_being_added(&key) {
+                            self.dm_saver.owes_removal(key);
+                        }
                     }
                     changed |= did;
                 }
@@ -1999,14 +2043,17 @@ impl Rooms {
                 // the entry be done, before one. (The report also puts back what an outbox that
                 // outlived a session still holds.)
                 if let Some(sender) = queued.sender {
-                    self.dm_cache.remember_sent(
+                    if self.dm_cache.remember_sent(
                         &room.stored.owner_vk,
                         queued.recipient,
                         queued.token,
                         sender,
                         queued.timestamp,
                         text.to_owned(),
-                    );
+                    ) {
+                        eprintln!("River: too many sent direct messages are unsaved; the oldest text was dropped");
+                    }
+                    self.dm_saver.new_work();
                 }
             }),
             None if !self.complete => return None,
@@ -2019,6 +2066,141 @@ impl Rooms {
             result,
         });
         Some(())
+    }
+
+    /// Settle the sent-message writes that ended, and start the next one if one is due
+    /// ([`super::dm_save`] has the rules). `writes` is the connection's write gate.
+    fn dm_save_tick(&mut self, writes: bool, now: Instant) {
+        // The rooms an add may be written for, as of now.
+        self.outbox.work.set_dm_rooms(
+            self.list
+                .iter()
+                .map(|r| r.stored.owner_vk.to_bytes())
+                .collect(),
+        );
+        for end in self.outbox.work.take_dm_ends() {
+            self.dm_saver.ended(end.ok, now);
+            if end.ok {
+                self.dm_cache.note_saved(&end.added, &end.evicted);
+            } else {
+                // Said once, without a word of what was written.
+                eprintln!(
+                    "River: saving sent direct messages failed ({}), {} in a row",
+                    end.refusal.map_or("other", |r| r.kind()),
+                    self.dm_saver.failures()
+                );
+                if end.refusal == Some(super::dm_store::Refusal::Vanished) {
+                    // The key may be gone for good or only unread: read the stored rooms again,
+                    // whose list says which ([`OutboundCache::note_read`]).
+                    self.outbox.work.ask_reload();
+                }
+            }
+        }
+        if !writes
+            || self.update_required
+            || !self.loaded
+            || self.store_missing
+            || self.outbox.work.has_dm()
+            || !self.dm_cache.hydrated()
+            || !self.dm_saver.due(now)
+        {
+            return;
+        }
+        let mut ops = Vec::new();
+        let mut adding = Vec::new();
+        let mut stopped = Vec::new();
+        for (key, entry, resave) in self.dm_cache.unsaved() {
+            // A text for a room not in the list stays for later: the list may be partial (a
+            // stored room that could not be read), and nothing is written for it meanwhile.
+            if !self
+                .list
+                .iter()
+                .any(|r| r.stored.owner_vk.as_bytes() == &key.0)
+            {
+                continue;
+            }
+            if resave {
+                let window = self
+                    .dm_cache
+                    .newer_in_pair(&key, entry.sender, entry.timestamp);
+                match self.resave_wanted(&key, entry.sender) {
+                    // The room has not been read from the network yet: ask again later.
+                    None => continue,
+                    // Gone from the room, purged, not the user's now, or older than the
+                    // newest messages the pair keeps (the web UI evicted it by its own cap):
+                    // not put back. The text stays in memory.
+                    Some(false) => {
+                        stopped.push(key);
+                        continue;
+                    }
+                    Some(true) if window >= MAX_DM_MESSAGES_PER_PAIR => {
+                        stopped.push(key);
+                        continue;
+                    }
+                    Some(true) => {}
+                }
+            }
+            adding.push(key);
+            ops.push(DmOp::Add {
+                key,
+                sender: entry.sender,
+                timestamp: entry.timestamp,
+                text: entry.plaintext.clone(),
+            });
+        }
+        for key in stopped {
+            self.dm_cache.stop_resaving(&key);
+        }
+        // What is owed removing goes alone, and first: an add that is refused cannot hold it
+        // back. After it has failed a few times in a row the adds go first for a turn, and it
+        // goes alone also when there is nothing to add.
+        let removing: Vec<EntryKey> = self.dm_saver.removals().to_vec();
+        if !removing.is_empty() && (self.dm_saver.removals_first() || ops.is_empty()) {
+            let ops = removing
+                .iter()
+                .map(|key| DmOp::Remove { key: *key })
+                .collect();
+            if self.outbox.work.dm_save(ops, self.dm_cache.listed()) {
+                self.dm_saver.started(Vec::new(), removing);
+            }
+            return;
+        }
+        if self.outbox.work.dm_save(ops, self.dm_cache.listed()) {
+            self.dm_saver.started(adding, Vec::new());
+        }
+    }
+
+    /// Whether an entry the delegate lost should be saved again: the message is still in its
+    /// room, was sent by the user's identity there now, and its recipient has not purged it.
+    /// `None` until the room has been read from the network, which is what says the room's
+    /// messages are all here.
+    fn resave_wanted(&self, key: &EntryKey, sender: MemberId) -> Option<bool> {
+        let Some(room) = self
+            .list
+            .iter()
+            .find(|r| r.stored.owner_vk.as_bytes() == &key.0)
+        else {
+            return Some(false);
+        };
+        if !self.network_seen.contains(&room.stored.owner_vk) {
+            return None;
+        }
+        let me = room
+            .stored
+            .self_verifying_key()
+            .map(|vk| MemberId::from(&vk));
+        if me != Some(sender) {
+            return Some(false);
+        }
+        let dms = &room.stored.room_state.direct_messages;
+        let held = dms.messages.iter().any(|m| {
+            m.purge_token() == key.2 && m.message.sender == sender && m.message.recipient == key.1
+        });
+        let purged = dms
+            .purges
+            .iter()
+            .any(|p| p.recipient_id == key.1 && p.state.purged.contains(&key.2));
+        Some(held && !purged)
     }
 
     /// Take every room being left out of the list at once, with what was waiting to be sent to

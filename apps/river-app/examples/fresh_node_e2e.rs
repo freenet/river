@@ -45,7 +45,7 @@ use river_app::rooms::socket::NodeSocket;
 use river_app::rooms::token::{TokenStore, node_dir};
 use river_app::rooms::work::WorkState;
 use river_app::rooms::{Access, Action, Command, InviteCode, Issues, Link, RoomsUpdate};
-use river_core::chat_delegate::ChatDelegateResponseMsg;
+use river_core::chat_delegate::{ChatDelegateResponseMsg, OutboundDmStore};
 use river_core::stored_rooms::{
     ROOMS_META_KEY, StoredRoomSlot, StoredRoomsMeta, decode_room_slot, decode_rooms_meta,
     room_storage_key,
@@ -59,6 +59,8 @@ const STEP: Duration = Duration::from_secs(180);
 struct App {
     name: &'static str,
     authority: String,
+    /// Where the app keeps its grant token.
+    dir: PathBuf,
     link: Link,
     updates: Receiver<RoomsUpdate>,
     rooms: Vec<Room>,
@@ -95,6 +97,7 @@ impl App {
         App {
             name,
             authority: authority.to_owned(),
+            dir: dir.to_owned(),
             link,
             updates: rx,
             rooms: Vec::new(),
@@ -203,6 +206,108 @@ impl App {
     }
 }
 
+/// The sent direct messages the chat delegate of the node at `authority` holds under
+/// `outbound_dms`, asked on a connection of its own with the app's grant, as the web UI would
+/// read them: the texts, in the order stored, and how many archived threads the value holds.
+fn stored_sent_texts(authority: &str, dir: &Path) -> Result<(Vec<String>, usize), String> {
+    let token = TokenStore::in_dir(&node_dir(dir, authority, false))
+        .load()
+        .ok_or("the app has no grant token")?;
+    let mut socket = NodeSocket::connect(authority, &token, &Default::default())
+        .map_err(|e| format!("{e:?}"))?;
+    socket
+        .set_read_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("{e:?}"))?;
+    socket
+        .send(&delegate::request(&Read::Get(
+            river_app::rooms::dm_cache::KEY.to_vec(),
+        )))
+        .map_err(|e| format!("{e:?}"))?;
+    loop {
+        match socket.recv().map_err(|e| format!("{e:?}"))? {
+            Ok(response @ HostResponse::DelegateResponse { .. }) => {
+                if let Some(ChatDelegateResponseMsg::GetResponse { value, .. }) =
+                    delegate::answers(&response).pop()
+                {
+                    let Some(bytes) = value else {
+                        return Ok((Vec::new(), 0));
+                    };
+                    let store: OutboundDmStore = ciborium::de::from_reader(bytes.as_slice())
+                        .map_err(|e| format!("the sent messages do not decode: {e}"))?;
+                    return Ok((
+                        store.entries.into_iter().map(|e| e.plaintext).collect(),
+                        store.hidden_threads.len(),
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("the node answered with an error: {e}")),
+        }
+    }
+}
+
+/// The generation of the sent-message key in the delegate of the node at `authority`: it grows
+/// with every store, whoever makes it, so it says whether anything wrote.
+fn stored_sent_generation(authority: &str, dir: &Path) -> Result<u64, String> {
+    let token = TokenStore::in_dir(&node_dir(dir, authority, false))
+        .load()
+        .ok_or("the app has no grant token")?;
+    let mut socket = NodeSocket::connect(authority, &token, &Default::default())
+        .map_err(|e| format!("{e:?}"))?;
+    socket
+        .set_read_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("{e:?}"))?;
+    socket
+        .send(&delegate::versioned(&delegate::Versioned::Read(
+            river_app::rooms::dm_cache::KEY.to_vec(),
+        )))
+        .map_err(|e| format!("{e:?}"))?;
+    loop {
+        match socket.recv().map_err(|e| format!("{e:?}"))? {
+            Ok(response @ HostResponse::DelegateResponse { .. }) => {
+                if let Some(ChatDelegateResponseMsg::GetVersionedResponse { generation, .. }) =
+                    delegate::answers(&response).pop()
+                {
+                    return Ok(generation);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("the node answered with an error: {e}")),
+        }
+    }
+}
+
+/// Wait until the delegate on `authority` holds `text` as a sent direct message. Panics after
+/// [`STEP`] with what it last saw.
+fn wait_until_saved(name: &str, authority: &str, dir: &Path, text: &str) {
+    let deadline = Instant::now() + STEP;
+    loop {
+        let seen = stored_sent_texts(authority, dir);
+        if matches!(&seen, Ok((texts, _)) if texts.iter().any(|t| t == text)) {
+            println!("{name}: the delegate holds the sent text");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: the delegate never held the sent text (last: {:?})",
+            seen.map(|(t, h)| (t.len(), h))
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Restart the app's link as a quit and start would: its session ends, and the next one starts
+/// with nothing in memory (no sent text, no rooms) and reads everything again from the node.
+fn restart(app: &mut App) {
+    app.link.set_node(&app.authority, false);
+    app.link.start();
+    app.rooms.clear();
+    app.dms.clear();
+    app.access = None;
+    // Updates the old session had queued belong to it.
+    while app.updates.try_recv().is_ok() {}
+}
+
 /// Direct messages in `room` (key `key`), both ways: each app sends one to the other member, the
 /// other opens it with its own key and shows the text, and the sender's own thread shows what it
 /// sent (sealed to the other, so it comes from the sent-text kept in memory) with nothing pending.
@@ -295,6 +400,30 @@ fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
     }
     // The room's own conversation is untouched by direct messages.
     assert!(!alice.has_text(room, from_a) && !bob.has_text(room, from_b));
+
+    // The sent text is in each node's chat delegate, where the web UI reads it. Then A's app
+    // restarts: its memory is gone, and its own sent message reads as text from the delegate.
+    wait_until_saved("A", &alice.authority, &alice.dir, from_a);
+    wait_until_saved("B", &bob.authority, &bob.dir, from_b);
+    let (texts, hidden) = stored_sent_texts(&alice.authority, &alice.dir).expect("A's store");
+    assert_eq!((texts, hidden), (vec![from_a.to_owned()], 0));
+    let generation = stored_sent_generation(&alice.authority, &alice.dir).expect("A's generation");
+    assert!(generation > 0, "the key was stored");
+    restart(alice);
+    alice.until("A, restarted, reads its own sent message back", |app| {
+        app.dm_text(key, &bob_in_a, from_a, true) && app.dm_text(key, &bob_in_a, from_b, false)
+    });
+    println!("A: after a restart, its own sent direct message reads as its text");
+    // Reading it back wrote nothing: a few seconds of the app running (many of its ticks and a
+    // reread of its rooms) leave the key at the generation it had before the restart.
+    alice.drain(Duration::from_secs(4));
+    let (texts, _) = stored_sent_texts(&alice.authority, &alice.dir).expect("A's store");
+    assert_eq!(texts, vec![from_a.to_owned()]);
+    assert_eq!(
+        stored_sent_generation(&alice.authority, &alice.dir).expect("A's generation"),
+        generation,
+        "a store was made after the restart"
+    );
 }
 
 /// Allow the grant on its approval page, as the user would: read the page's nonce, wait out

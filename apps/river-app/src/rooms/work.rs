@@ -106,6 +106,8 @@ use river_core::stored_rooms::{
 
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
+use super::dm_cache;
+use super::dm_store::{self, DmOp, EntryKey};
 use super::identity::{self, IdentityToken, ImportWrite};
 use super::leave::{meta_without_room, tombstone_write};
 use super::modes::{NotificationMode, meta_with_mode};
@@ -172,6 +174,21 @@ pub enum WorkState {
     },
 }
 
+/// How a sent-message write ended ([`Work::take_dm_ends`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct DmEnd {
+    /// The store holds what the write asked for.
+    pub ok: bool,
+    /// The entries it was to add.
+    pub added: Vec<EntryKey>,
+    /// The entries it was to remove.
+    pub removed: Vec<EntryKey>,
+    /// Entries of the user it dropped to stay in bounds.
+    pub evicted: Vec<EntryKey>,
+    /// Why the merge refused, if it did.
+    pub refusal: Option<dm_store::Refusal>,
+}
+
 enum Kind {
     Create(Box<NewRoomPlan>),
     Join {
@@ -206,6 +223,14 @@ enum Kind {
         replace: bool,
         plan: Option<Box<NewRoom>>,
     },
+    /// Change the sent-message store (`outbound_dms`) by `ops`, merged into what it holds now
+    /// ([`super::dm_store`]). One step, `Meta`, on a different key. Never shown, not even when
+    /// it fails: the session retries it on its own ([`super::dm_save`]). `listed` says the
+    /// cache had read the key with a value.
+    DmSave {
+        ops: Vec<DmOp>,
+        listed: bool,
+    },
     /// Refused before it started; never works.
     Refused(String),
 }
@@ -226,12 +251,26 @@ enum Step {
 }
 
 /// Where a write (the `Slot` and `Meta` steps) stands.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Phase {
     /// Read the key and its generation.
     Read,
     /// Store these bytes if the key is still at this generation.
     Store { value: Vec<u8>, generation: u64 },
+}
+
+/// The bytes of a store can be what the user wrote, so only their length is printed.
+impl std::fmt::Debug for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Phase::Read => f.write_str("Read"),
+            Phase::Store { value, generation } => f
+                .debug_struct("Store")
+                .field("value", &format_args!("<{} bytes>", value.len()))
+                .field("generation", generation)
+                .finish(),
+        }
+    }
 }
 
 /// What a task has out on the connection.
@@ -244,6 +283,21 @@ enum Out {
     /// A GET, PUT or UPDATE of this room contract.
     Contract(ContractInstanceId),
 }
+
+/// A wait before the next request, for a write that was beaten to the key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Cool {
+    #[default]
+    No,
+    /// Work out when, at the next request.
+    Wanted,
+    Until(Instant),
+}
+
+/// The first wait after a write lost the compare-and-swap, and the most it doubles to. Another
+/// writer got in first, so asking again at once mostly meets the same writer.
+const CONFLICT_WAIT_FIRST: Duration = Duration::from_millis(25);
+const CONFLICT_WAIT_MAX: Duration = Duration::from_millis(400);
 
 struct Task {
     id: u64,
@@ -263,6 +317,16 @@ struct Task {
     /// Whether the node answered the last request with a refusal of it (the UPDATE was not
     /// taken, or the room is not there), rather than leaving its outcome unknown.
     refused: bool,
+    /// For a [`Kind::DmSave`]: the wait before it reads again after a conflict.
+    cool: Cool,
+    /// For a [`Kind::DmSave`] that ended well: the entries it dropped to stay in bounds.
+    dm_evicted: Vec<EntryKey>,
+    /// For a [`Kind::DmSave`]: the adds it left out because their room is not shown.
+    dm_dropped: Vec<EntryKey>,
+    /// For a [`Kind::DmSave`]: the rooms it may add for, as of the answer being decided.
+    dm_rooms: Vec<[u8; 32]>,
+    /// For a [`Kind::DmSave`] the merge refused: why.
+    dm_refusal: Option<dm_store::Refusal>,
 }
 
 impl Task {
@@ -279,6 +343,11 @@ impl Task {
             reload_asked: false,
             settled: false,
             refused: false,
+            cool: Cool::No,
+            dm_evicted: Vec::new(),
+            dm_dropped: Vec::new(),
+            dm_rooms: Vec::new(),
+            dm_refusal: None,
         }
     }
 
@@ -288,13 +357,18 @@ impl Task {
             Kind::Join { invitation, .. } => Some(invitation.room),
             Kind::Leave { room, .. } => Some(*room),
             Kind::Import { export, .. } => Some(export.room_owner),
-            Kind::Mode { .. } | Kind::Refused(_) => None,
+            Kind::Mode { .. } | Kind::DmSave { .. } | Kind::Refused(_) => None,
         }
     }
 
     /// Whether this only saves a notification mode.
     fn is_mode(&self) -> bool {
         matches!(self.kind, Kind::Mode { .. })
+    }
+
+    /// Whether this changes the sent-message store.
+    fn is_dm(&self) -> bool {
+        matches!(self.kind, Kind::DmSave { .. })
     }
 
     /// Whether this leaves a room.
@@ -307,7 +381,7 @@ impl Task {
         match &self.kind {
             Kind::Create(plan) => Some(&plan.room),
             Kind::Join { plan, .. } => plan.as_ref().map(|p| &p.room),
-            Kind::Leave { .. } | Kind::Mode { .. } | Kind::Refused(_) => None,
+            Kind::Leave { .. } | Kind::Mode { .. } | Kind::DmSave { .. } | Kind::Refused(_) => None,
             Kind::Import { plan, .. } => plan.as_deref(),
         }
     }
@@ -323,6 +397,7 @@ impl Task {
             Kind::Import { replace: true, .. } => "Replacing your ID in a room".to_owned(),
             Kind::Import { .. } => "Importing your ID".to_owned(),
             Kind::Mode { .. } => "Saving the notification setting".to_owned(),
+            Kind::DmSave { .. } => "Saving sent messages".to_owned(),
             Kind::Leave { name, .. } => format!("Leaving “{name}”"),
             Kind::Refused(what) => what.clone(),
         };
@@ -347,16 +422,25 @@ impl Task {
         }
     }
 
+    /// Forget the bytes a write was about to store: for a sent-message store they hold the
+    /// text of what the user wrote.
+    fn wipe(&mut self) {
+        if let Phase::Store { value, .. } = &mut self.phase {
+            zeroize::Zeroize::zeroize(value);
+        }
+        self.phase = Phase::Read;
+    }
+
     fn fail(&mut self, why: impl Into<String>, retry: bool) {
         self.out = None;
-        self.phase = Phase::Read;
+        self.wipe();
         self.failed = Some((why.into(), retry));
     }
 
     /// On to the next step.
     fn advance(&mut self) {
         self.out = None;
-        self.phase = Phase::Read;
+        self.wipe();
         self.conflicts = 0;
         self.step = match (&self.kind, self.step) {
             (Kind::Create(_), Step::Slot) => Step::Put,
@@ -388,6 +472,38 @@ impl Task {
     /// done), or why it can't. A refusal here does not change by trying again, so it is final.
     fn decide(&mut self, value: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
         let unexpected = || "Something unexpected went wrong.".to_owned();
+        if let Kind::DmSave { ops, listed } = &self.kind {
+            // An add for a room that is not shown (left meanwhile) is not written: its entry
+            // would be orphaned. It is only left out of this write: its text stays in the cache
+            // until a complete read of the rooms says the room is gone, so a room missing from a
+            // partial list is saved when it is back.
+            let rooms = &self.dm_rooms;
+            let (kept, dropped): (Vec<DmOp>, Vec<DmOp>) =
+                ops.iter().cloned().partition(|op| match op {
+                    DmOp::Add { key, .. } => rooms.contains(&key.0),
+                    DmOp::Remove { .. } => true,
+                });
+            let dropped: Vec<EntryKey> = dropped
+                .iter()
+                .filter_map(|op| match op {
+                    DmOp::Add { key, .. } => Some(*key),
+                    DmOp::Remove { .. } => None,
+                })
+                .collect();
+            let merged = dm_store::merge(value, *listed, &kept);
+            self.dm_dropped = dropped;
+            return match merged {
+                Ok(m) => {
+                    self.dm_evicted = m.evicted;
+                    self.dm_refusal = None;
+                    Ok(m.bytes)
+                }
+                Err(refusal) => {
+                    self.dm_refusal = Some(refusal);
+                    Err(refusal.to_string())
+                }
+            };
+        }
         if let Kind::Mode { room, mode } = &self.kind {
             return meta_with_mode(value, room, *mode).map_err(|e| {
                 format!(
@@ -466,6 +582,13 @@ pub struct Work {
     next_id: u64,
     /// A task finished since the stored rooms were last read: read them now.
     reload: bool,
+    /// The rooms (owner key bytes) the sent-message saves may add entries for: the rooms shown
+    /// now. An add for any other room is dropped before it is written.
+    dm_rooms: Vec<[u8; 32]>,
+    /// The last request that went unanswered was a sent-message save's.
+    expired_dm: bool,
+    /// A fixed point of the jitter's range (0 to 1) for tests; random otherwise.
+    jitter_unit: Option<f64>,
 }
 
 impl Work {
@@ -698,6 +821,77 @@ impl Work {
         out
     }
 
+    /// Change the sent-message store by `ops` (one write at a time: nothing is queued while
+    /// another is). False when one is already queued or working.
+    pub fn dm_save(&mut self, ops: Vec<DmOp>, listed: bool) -> bool {
+        if self.has_dm() || ops.is_empty() {
+            return false;
+        }
+        self.push(Kind::DmSave { ops, listed }, Step::Meta);
+        // Nothing here changes what the stored rooms say.
+        if let Some(t) = self.tasks.back_mut() {
+            t.reload_asked = true;
+        }
+        true
+    }
+
+    /// The rooms shown now: a sent-message save adds entries only for these.
+    pub fn set_dm_rooms(&mut self, rooms: Vec<[u8; 32]>) {
+        self.dm_rooms = rooms;
+    }
+
+    /// Ask for the stored rooms to be read again.
+    pub fn ask_reload(&mut self) {
+        self.reload = true;
+    }
+
+    /// Whether the request that last went unanswered was a sent-message save's.
+    pub fn expired_dm(&self) -> bool {
+        self.expired_dm
+    }
+
+    #[cfg(test)]
+    fn fix_jitter(&mut self, unit: f64) {
+        self.jitter_unit = Some(unit);
+    }
+
+    /// Whether a sent-message write is queued or working.
+    pub fn has_dm(&self) -> bool {
+        self.tasks.iter().any(Task::is_dm)
+    }
+
+    /// The sent-message writes that ended since the last call, each once. Their tasks go.
+    pub fn take_dm_ends(&mut self) -> Vec<DmEnd> {
+        let mut ends = Vec::new();
+        self.tasks.retain_mut(|t| {
+            if !t.is_dm() || t.running() {
+                return true;
+            }
+            let ok = t.failed.is_none();
+            let Kind::DmSave { ops, .. } = &t.kind else {
+                return true;
+            };
+            let (mut added, mut removed) = (Vec::new(), Vec::new());
+            for op in ops {
+                match op {
+                    // An add left out for a room that is gone is not one the store holds.
+                    DmOp::Add { key, .. } if t.dm_dropped.contains(key) => {}
+                    DmOp::Add { key, .. } => added.push(*key),
+                    DmOp::Remove { key } => removed.push(*key),
+                }
+            }
+            ends.push(DmEnd {
+                ok,
+                added,
+                removed,
+                evicted: std::mem::take(&mut t.dm_evicted),
+                refusal: t.dm_refusal.take(),
+            });
+            false
+        });
+        ends
+    }
+
     /// The imports that finished since the last call: the room, the imported identity, and the
     /// nickname the token carries, if any. Each is reported once.
     pub fn take_done_imports(&mut self) -> Vec<ImportDone> {
@@ -829,7 +1023,7 @@ impl Work {
     pub fn connection_lost(&mut self) {
         for t in &mut self.tasks {
             t.out = None;
-            t.phase = Phase::Read;
+            t.wipe();
         }
     }
 
@@ -839,9 +1033,26 @@ impl Work {
         if reading {
             return None;
         }
+        let unit = self.jitter_unit.unwrap_or_else(rand::random::<f64>);
         let t = self.active()?;
         if t.out.is_some() {
             return None;
+        }
+        match t.cool {
+            Cool::No => {}
+            // A write that lost the race waits a little, so the other writer can finish. The
+            // wait is spread by plus or minus a fifth, so writers that lost together do not
+            // meet again together.
+            Cool::Wanted => {
+                let wait = CONFLICT_WAIT_FIRST
+                    .saturating_mul(1u32 << t.conflicts.saturating_sub(1).min(8))
+                    .min(CONFLICT_WAIT_MAX)
+                    .mul_f64(0.8 + 0.4 * unit.clamp(0.0, 1.0));
+                t.cool = Cool::Until(now + wait);
+                return None;
+            }
+            Cool::Until(at) if now < at => return None,
+            Cool::Until(_) => t.cool = Cool::No,
         }
         let owner = t.owner();
         let (out, request) = match (t.step, &t.kind) {
@@ -860,6 +1071,8 @@ impl Work {
             (Step::Slot | Step::Meta, _) => {
                 let key = if t.step == Step::Slot {
                     room_storage_key(&owner?)
+                } else if t.is_dm() {
+                    dm_cache::KEY.to_vec()
                 } else {
                     ROOMS_META_KEY.to_vec()
                 };
@@ -908,12 +1121,16 @@ impl Work {
 
     /// A chat delegate answer. True when it was the working task's.
     pub fn on_delegate(&mut self, answer: &ChatDelegateResponseMsg) -> bool {
+        let rooms = self.dm_rooms.clone();
         let Some(t) = self.active() else {
             return false;
         };
         let Some((out, _)) = t.out.clone() else {
             return false;
         };
+        if t.is_dm() {
+            t.dm_rooms = rooms;
+        }
         match (&out, answer) {
             (
                 Out::Read(key),
@@ -942,8 +1159,11 @@ impl Work {
                     // Another writer stored first: read what it stored and work from that.
                     CasStoreResult::Conflict { .. } => {
                         t.out = None;
-                        t.phase = Phase::Read;
+                        t.wipe();
                         t.conflicts += 1;
+                        if t.is_dm() {
+                            t.cool = Cool::Wanted;
+                        }
                         if t.conflicts >= CAS_ATTEMPTS {
                             t.fail(
                                 "River's storage kept changing while the room was being saved.",
@@ -1133,12 +1353,17 @@ impl Work {
             return false;
         }
         t.out = None;
-        t.phase = Phase::Read;
+        t.wipe();
         t.reconnects += 1;
-        if t.reconnects > MAX_RECONNECTS {
+        // A save of sent messages may not cost the session more than one new connection: it is
+        // tried again later on its own pace.
+        let is_dm = t.is_dm();
+        let limit = if is_dm { 1 } else { MAX_RECONNECTS };
+        if t.reconnects > limit {
             t.fail("Freenet didn't answer.", true);
             self.note_done();
         }
+        self.expired_dm = is_dm;
         true
     }
 
@@ -1159,6 +1384,7 @@ impl Work {
         // A mode that was saved needs no row; one still working or failed does.
         self.tasks
             .iter()
+            .filter(|t| !t.is_dm())
             .filter(|t| !((t.is_mode() || t.is_leave()) && t.step == Step::Done))
             .map(Task::view)
             .collect()

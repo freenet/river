@@ -17,6 +17,7 @@ use freenet_stdlib::prelude::{
     DelegateWasmAPIVersion, InboundDelegateMsg, OutboundDelegateMsg, Parameters,
 };
 use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
+use zeroize::Zeroize;
 
 /// The chat delegate the web UI ships. Its key is a hash of these bytes, so it is the same
 /// delegate, and the same stored rooms, as the web UI's. A file read, not a crate dependency:
@@ -75,7 +76,7 @@ pub enum Versioned {
 }
 
 pub fn versioned(v: &Versioned) -> ClientRequest<'static> {
-    let msg = match v {
+    let mut msg = match v {
         Versioned::Read(key) => ChatDelegateRequestMsg::GetVersionedRequest {
             key: ChatDelegateKey::new(key.clone()),
         },
@@ -89,7 +90,56 @@ pub fn versioned(v: &Versioned) -> ClientRequest<'static> {
             expected_generation: *generation,
         },
     };
-    message(&msg)
+    let request = message(&msg);
+    // The copy of the value in the message is what the request was encoded from.
+    if let ChatDelegateRequestMsg::CasStoreRequest { value, .. } = &mut msg {
+        value.zeroize();
+    }
+    request
+}
+
+/// Zero the value a request carries, once it has been sent: a store of the sent-message key holds
+/// what the user wrote. Only the application message's payload is reachable.
+pub fn wipe_request(request: &mut ClientRequest<'_>) {
+    if let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) = request
+    {
+        for msg in inbound {
+            if let InboundDelegateMsg::ApplicationMessage(m) = msg {
+                m.payload.zeroize();
+            }
+        }
+    }
+}
+
+/// Zero what answers carry that can be a stored value: a read's value and the value a lost
+/// compare-and-swap returns.
+pub fn wipe_answers(answers: &mut [ChatDelegateResponseMsg]) {
+    for answer in answers {
+        match answer {
+            ChatDelegateResponseMsg::GetResponse { value: Some(v), .. }
+            | ChatDelegateResponseMsg::GetVersionedResponse { value: Some(v), .. }
+            | ChatDelegateResponseMsg::CasStoreResponse {
+                result:
+                    river_core::chat_delegate::CasStoreResult::Conflict {
+                        current_value: Some(v),
+                        ..
+                    },
+                ..
+            } => v.zeroize(),
+            _ => {}
+        }
+    }
+}
+
+/// Zero the payloads of the answers in a response, once they have been taken apart.
+pub fn wipe_response(response: &mut HostResponse) {
+    if let HostResponse::DelegateResponse { values, .. } = response {
+        for v in values {
+            if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                m.payload.zeroize();
+            }
+        }
+    }
 }
 
 /// `GetPublicKey` for a room: the public half of the signing key the delegate holds for it, if
@@ -156,6 +206,72 @@ mod tests {
         hasher.update(code_hash.as_bytes());
         let expected = hasher.finalize();
         assert_eq!(chat_delegate_key().bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn a_sent_store_and_the_answers_that_carried_a_value_can_be_zeroed() {
+        use river_core::chat_delegate::CasStoreResult;
+        let mut request = versioned(&Versioned::Store {
+            key: b"outbound_dms".to_vec(),
+            value: b"PLAINTEXT-SECRET".to_vec(),
+            generation: 3,
+        });
+        let payload = |r: &ClientRequest<'_>| {
+            let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) = r
+            else {
+                panic!("not a delegate request");
+            };
+            let [InboundDelegateMsg::ApplicationMessage(m)] = inbound.as_slice() else {
+                panic!("one message");
+            };
+            m.payload.clone()
+        };
+        let has = |bytes: &[u8]| bytes.windows(16).any(|w| w == b"PLAINTEXT-SECRET");
+        assert!(has(&payload(&request)), "it carries the value until wiped");
+        wipe_request(&mut request);
+        let after = payload(&request);
+        assert!(!has(&after));
+        assert!(after.iter().all(|b| *b == 0));
+
+        let key = ChatDelegateKey::new(b"outbound_dms".to_vec());
+        let mut answers = vec![
+            ChatDelegateResponseMsg::GetVersionedResponse {
+                key: key.clone(),
+                value: Some(b"PLAINTEXT-SECRET".to_vec()),
+                generation: 1,
+            },
+            ChatDelegateResponseMsg::GetResponse {
+                key: key.clone(),
+                value: Some(b"PLAINTEXT-SECRET".to_vec()),
+            },
+            ChatDelegateResponseMsg::CasStoreResponse {
+                key,
+                result: CasStoreResult::Conflict {
+                    current_generation: 2,
+                    current_value: Some(b"PLAINTEXT-SECRET".to_vec()),
+                },
+            },
+        ];
+        wipe_answers(&mut answers);
+        let shown = format!("{answers:?}");
+        assert!(!shown.contains("80, 76, 65") && !shown.contains("PLAINTEXT"));
+        for a in &answers {
+            match a {
+                ChatDelegateResponseMsg::GetVersionedResponse { value: Some(v), .. }
+                | ChatDelegateResponseMsg::GetResponse { value: Some(v), .. } => {
+                    assert!(v.iter().all(|b| *b == 0))
+                }
+                ChatDelegateResponseMsg::CasStoreResponse {
+                    result:
+                        CasStoreResult::Conflict {
+                            current_value: Some(v),
+                            ..
+                        },
+                    ..
+                } => assert!(v.iter().all(|b| *b == 0)),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
     #[test]

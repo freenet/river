@@ -22,12 +22,13 @@
 //!   cleanup after an apply can sweep it). A send is queued only if its signature is in the
 //!   copy afterwards ([`landed`]); otherwise the user is told and keeps their text.
 //!
-//! **Do not ship this without the change that saves sent text to `outbound_dms`.** A sent DM
-//! is sealed to its recipient, so the sender can read it back only from the plaintext kept for
-//! it. Until that is saved to the chat delegate, the text lives in memory for the run: after a
-//! restart your own sent messages read "sent - ciphertext only", and that copy is gone for
-//! good. A message still waiting in the outbox when the app quits is lost too (the outbox is not
-//! saved), as a room message is. A release must carry both changes.
+//! **The sent text is saved to the chat delegate** ([`super::dm_save`]). A sent DM is sealed to
+//! its recipient, so the sender can read it back only from the plaintext kept for it; it is kept
+//! in memory while the message is queued and written to `outbound_dms` as soon as it is, so after
+//! a restart your own sent messages still read as text, here and in the web UI. If that save
+//! fails the text stays in memory and the save is tried again later; until it works, a restart
+//! loses it. A message still waiting in the outbox when the app quits is lost too (the outbox is
+//! not saved), as a room message is; its saved text stays in the store, unread.
 //!
 //! The message is composed once. ECIES seals with fresh randomness, so composing the same text
 //! again gives a different message, and the node may already hold the first: a resend is always

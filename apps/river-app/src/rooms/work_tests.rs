@@ -1917,3 +1917,424 @@ mod importing {
         let _ = room_slot;
     }
 }
+
+// Saving sent messages ---------------------------------------------------------------------------
+
+mod dm_saves {
+    use super::*;
+    use crate::rooms::dm_cache::Plaintext;
+    use river_core::chat_delegate::{HiddenDmThreadEntry, OutboundDmEntry, OutboundDmStore};
+    use river_core::room_state::direct_messages::PurgeToken;
+    use river_core::room_state::member::MemberId;
+
+    const KEY: &[u8] = b"outbound_dms";
+
+    fn vk(n: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[n; 32]).verifying_key()
+    }
+
+    fn key(room: u8, recipient: u8, token: u8) -> EntryKey {
+        (
+            vk(room).to_bytes(),
+            MemberId::from(&vk(recipient)),
+            PurgeToken([token; 16]),
+        )
+    }
+
+    fn entry(room: u8, recipient: u8, token: u8, text: &str) -> OutboundDmEntry {
+        let (room_owner_vk, recipient, purge_token) = key(room, recipient, token);
+        OutboundDmEntry {
+            room_owner_vk,
+            sender: MemberId::from(&vk(99)),
+            recipient,
+            purge_token,
+            timestamp: 100 + u64::from(token),
+            plaintext: text.to_owned(),
+        }
+    }
+
+    /// Start a save, with room 1 shown.
+    fn save(w: &mut Work, ops: Vec<DmOp>, listed: bool) -> bool {
+        w.set_dm_rooms(vec![vk(1).to_bytes()]);
+        w.dm_save(ops, listed)
+    }
+
+    fn add(room: u8, recipient: u8, token: u8, text: &str) -> DmOp {
+        let e = entry(room, recipient, token, text);
+        DmOp::Add {
+            key: key(room, recipient, token),
+            sender: e.sender,
+            timestamp: e.timestamp,
+            text: Plaintext::new(text.to_owned()),
+        }
+    }
+
+    fn blob(entries: Vec<OutboundDmEntry>) -> Vec<u8> {
+        let store = OutboundDmStore {
+            entries,
+            hidden_threads: vec![HiddenDmThreadEntry {
+                room_owner_vk: vk(1).to_bytes(),
+                peer: MemberId::from(&vk(2)),
+                hidden_at_ts: 77,
+            }],
+        };
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&store, &mut out).unwrap();
+        out
+    }
+
+    fn read(bytes: &[u8]) -> OutboundDmStore {
+        ciborium::de::from_reader(bytes).unwrap()
+    }
+
+    /// The next request at `now`, which must be a versioned read of the store.
+    fn read_at(w: &mut Work, now: Instant) {
+        match delegate_msg(&w.next_request(false, now).expect("a request")) {
+            Some(ChatDelegateRequestMsg::GetVersionedRequest { key }) => {
+                assert_eq!(key.as_bytes(), KEY)
+            }
+            other => panic!("expected a versioned read, got {other:?}"),
+        }
+    }
+
+    fn store_at(w: &mut Work, now: Instant, generation: u64) -> Vec<u8> {
+        match delegate_msg(&w.next_request(false, now).expect("a request")) {
+            Some(ChatDelegateRequestMsg::CasStoreRequest {
+                key,
+                value,
+                expected_generation,
+            }) => {
+                assert_eq!(key.as_bytes(), KEY);
+                assert_eq!(expected_generation, generation);
+                value
+            }
+            other => panic!("expected a CAS store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_save_reads_the_key_merges_into_what_is_there_and_stores_at_that_generation() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "native")], true));
+        // Nothing of it is shown, working or not.
+        assert!(w.views().is_empty());
+        assert!(w.has_dm());
+        assert!(w.busy());
+
+        read_at(&mut w, now);
+        let web = blob(vec![entry(1, 2, 1, "web one"), entry(1, 3, 2, "web two")]);
+        assert!(w.on_delegate(&read_answer(KEY, Some(web.clone()), 6)));
+        let value = store_at(&mut w, now, 6);
+        let store = read(&value);
+        assert_eq!(store.entries.len(), 3);
+        assert_eq!(store.entries[2], entry(1, 4, 9, "native"));
+        assert_eq!(store.hidden_threads.len(), 1, "the archive list is kept");
+
+        assert!(w.on_delegate(&store_answer(KEY, CasStoreResult::Stored { generation: 7 })));
+        assert!(!w.busy());
+        let ends = w.take_dm_ends();
+        assert_eq!(
+            ends,
+            vec![DmEnd {
+                ok: true,
+                added: vec![key(1, 4, 9)],
+                removed: vec![],
+                evicted: vec![],
+                refusal: None,
+            }]
+        );
+        assert!(!w.has_dm(), "taken once, and the task is gone");
+        assert!(w.take_dm_ends().is_empty());
+        assert!(w.views().is_empty());
+    }
+
+    #[test]
+    fn a_conflict_waits_then_reads_again_and_merges_into_what_the_other_writer_stored() {
+        let mut w = Work::default();
+        w.fix_jitter(0.5);
+        let t0 = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "native")], false));
+        read_at(&mut w, t0);
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        let first = store_at(&mut w, t0, 0);
+        assert_eq!(read(&first).entries.len(), 1);
+
+        // A web tab stored first.
+        let web = blob(vec![entry(1, 2, 1, "web one")]);
+        let conflict = CasStoreResult::Conflict {
+            current_generation: 1,
+            current_value: Some(web.clone()),
+        };
+        assert!(w.on_delegate(&store_answer(KEY, conflict)));
+        // It waits before asking again, by the clock it is given.
+        assert!(w.next_request(false, t0).is_none());
+        assert!(
+            w.next_request(false, t0 + Duration::from_millis(10))
+                .is_none()
+        );
+        let t1 = t0 + Duration::from_millis(60);
+        read_at(&mut w, t1);
+        assert!(w.on_delegate(&read_answer(KEY, Some(web), 1)));
+        let second = store_at(&mut w, t1, 1);
+        let store = read(&second);
+        assert_eq!(store.entries.len(), 2, "the web UI's entry is kept");
+        assert_eq!(store.entries[0], entry(1, 2, 1, "web one"));
+        assert_eq!(store.entries[1], entry(1, 4, 9, "native"));
+        assert_eq!(store.hidden_threads.len(), 1);
+        assert!(w.on_delegate(&store_answer(KEY, CasStoreResult::Stored { generation: 2 })));
+        assert!(w.take_dm_ends()[0].ok);
+    }
+
+    #[test]
+    fn the_wait_after_a_conflict_doubles_to_a_most_and_the_attempts_are_bounded() {
+        let mut w = Work::default();
+        w.fix_jitter(0.5);
+        let mut now = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "native")], false));
+        let mut waits = Vec::new();
+        for n in 0..CAS_ATTEMPTS {
+            // The wait for this conflict, found by asking until it lets a request through.
+            let asked = now;
+            let mut waited = Duration::ZERO;
+            while w.next_request(false, now).is_none() {
+                now += Duration::from_millis(5);
+                waited = now - asked;
+                assert!(
+                    waited < Duration::from_secs(2),
+                    "attempt {n} never went out"
+                );
+            }
+            waits.push(waited);
+            // That was the read; answer it and the store, which conflicts.
+            assert!(w.on_delegate(&read_answer(KEY, None, u64::from(n))));
+            assert!(w.next_request(false, now).is_some());
+            let conflict = CasStoreResult::Conflict {
+                current_generation: u64::from(n) + 1,
+                current_value: None,
+            };
+            assert!(w.on_delegate(&store_answer(KEY, conflict)));
+        }
+        assert!(!w.busy(), "failed after the web UI's number of attempts");
+        let ends = w.take_dm_ends();
+        assert!(!ends[0].ok);
+        assert!(w.views().is_empty(), "and nothing is shown");
+        // The first attempt had no wait; later ones wait longer, up to a most.
+        assert_eq!(waits[0], Duration::ZERO);
+        assert!(waits.windows(2).all(|p| p[0] <= p[1]), "{waits:?}");
+        assert!(waits[3] > waits[1], "{waits:?}");
+        assert!(waits.iter().all(|w| *w <= Duration::from_millis(405)));
+        assert!(waits[CAS_ATTEMPTS as usize - 1] >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_read_or_has_vanished_is_not_written_over() {
+        for (listed, value) in [
+            (true, Some(b"not cbor at all".to_vec())),
+            (true, Some(Vec::new())),
+            (true, None),
+        ] {
+            let mut w = Work::default();
+            let now = Instant::now();
+            assert!(save(&mut w, vec![add(1, 4, 9, "native")], listed));
+            read_at(&mut w, now);
+            assert!(w.on_delegate(&read_answer(KEY, value, 3)));
+            // No store request ever follows.
+            assert!(w.next_request(false, now).is_none());
+            assert!(!w.busy());
+            let ends = w.take_dm_ends();
+            assert_eq!(ends.len(), 1);
+            assert!(!ends[0].ok);
+        }
+    }
+
+    #[test]
+    fn a_store_that_already_holds_the_entry_writes_nothing_and_counts_as_saved() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "native")], true));
+        read_at(&mut w, now);
+        let held = blob(vec![entry(1, 4, 9, "native")]);
+        assert!(w.on_delegate(&read_answer(KEY, Some(held), 2)));
+        assert!(w.next_request(false, now).is_none(), "no store request");
+        let ends = w.take_dm_ends();
+        assert!(ends[0].ok);
+        assert_eq!(ends[0].added, vec![key(1, 4, 9)]);
+    }
+
+    #[test]
+    fn a_save_is_one_at_a_time_and_halts_with_the_rest_when_river_has_moved_on() {
+        let mut w = Work::default();
+        assert!(save(&mut w, vec![add(1, 4, 9, "a")], true));
+        assert!(
+            !save(&mut w, vec![add(1, 4, 10, "b")], true),
+            "one at a time"
+        );
+        assert!(!save(&mut w, vec![], true), "nothing to do is not a task");
+        assert!(w.halt("update"));
+        assert!(!w.busy());
+        assert!(!w.take_dm_ends()[0].ok);
+        assert!(w.views().is_empty());
+    }
+
+    #[test]
+    fn a_save_that_lost_its_connection_reads_again_and_never_stores_blind() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "native")], false));
+        read_at(&mut w, now);
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        let _ = store_at(&mut w, now, 0);
+        // The answer never came: the connection dropped. The next one starts at the read.
+        w.connection_lost();
+        read_at(&mut w, now);
+        // The store did land, as it turns out: the entry is there, so nothing is written again.
+        let landed = blob(vec![entry(1, 4, 9, "native")]);
+        assert!(w.on_delegate(&read_answer(KEY, Some(landed), 1)));
+        assert!(w.next_request(false, now).is_none());
+        assert!(w.take_dm_ends()[0].ok);
+    }
+
+    #[test]
+    fn a_refused_store_is_a_failed_save_and_shows_nothing() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "native")], false));
+        read_at(&mut w, now);
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        let _ = store_at(&mut w, now, 0);
+        assert!(w.on_delegate(&store_answer(KEY, CasStoreResult::Failed("disk".into()))));
+        assert!(w.views().is_empty());
+        let ends = w.take_dm_ends();
+        assert!(!ends[0].ok);
+        assert_eq!(
+            ends[0].added,
+            vec![key(1, 4, 9)],
+            "so it can be tried again"
+        );
+    }
+
+    #[test]
+    fn the_wait_after_a_conflict_is_spread_by_a_fifth_either_way() {
+        let wait_for = |unit: f64| {
+            let mut w = Work::default();
+            w.fix_jitter(unit);
+            let t0 = Instant::now();
+            assert!(save(&mut w, vec![add(1, 4, 9, "native")], false));
+            read_at(&mut w, t0);
+            assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+            let _ = store_at(&mut w, t0, 0);
+            let conflict = CasStoreResult::Conflict {
+                current_generation: 1,
+                current_value: None,
+            };
+            assert!(w.on_delegate(&store_answer(KEY, conflict)));
+            assert!(w.next_request(false, t0).is_none());
+            // The first wait is 25 ms before jitter: find where it ends.
+            (0..400u64)
+                .find(|ms| {
+                    w.next_request(false, t0 + Duration::from_millis(*ms))
+                        .is_some()
+                })
+                .expect("it ends")
+        };
+        assert_eq!(wait_for(0.5), 25);
+        assert_eq!(wait_for(0.0), 20);
+        assert_eq!(wait_for(1.0), 30);
+    }
+
+    #[test]
+    fn an_add_for_a_room_that_is_no_longer_shown_is_not_written_and_not_counted_saved() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        let ops = vec![add(1, 4, 9, "left"), add(2, 4, 10, "kept")];
+        w.set_dm_rooms(vec![vk(1).to_bytes(), vk(2).to_bytes()]);
+        assert!(w.dm_save(ops, false));
+        read_at(&mut w, now);
+        // Room 1 is left while the read is out.
+        w.set_dm_rooms(vec![vk(2).to_bytes()]);
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        let value = store_at(&mut w, now, 0);
+        let store = read(&value);
+        assert_eq!(store.entries, vec![entry(2, 4, 10, "kept")]);
+        assert!(w.on_delegate(&store_answer(KEY, CasStoreResult::Stored { generation: 1 })));
+        let ends = w.take_dm_ends();
+        assert_eq!(ends[0].added, vec![key(2, 4, 10)]);
+
+        // With every room gone, nothing is stored at all.
+        let mut w = Work::default();
+        w.set_dm_rooms(vec![vk(1).to_bytes()]);
+        assert!(w.dm_save(vec![add(1, 4, 9, "left")], false));
+        read_at(&mut w, now);
+        w.set_dm_rooms(Vec::new());
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        assert!(w.next_request(false, now).is_none());
+        assert!(w.take_dm_ends()[0].added.is_empty());
+        // And with no room ever named, an add is refused the same way.
+        let mut w = Work::default();
+        assert!(w.dm_save(vec![add(1, 4, 9, "unknown")], false));
+        read_at(&mut w, now);
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        assert!(w.next_request(false, now).is_none());
+    }
+
+    #[test]
+    fn a_removal_is_made_whether_or_not_its_room_is_shown() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        let held = blob(vec![entry(1, 4, 9, "gone")]);
+        assert!(w.dm_save(vec![DmOp::Remove { key: key(1, 4, 9) }], true));
+        read_at(&mut w, now);
+        assert!(w.on_delegate(&read_answer(KEY, Some(held), 3)));
+        assert!(read(&store_at(&mut w, now, 3)).entries.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_is_named_and_a_save_that_goes_unanswered_costs_one_connection_at_most() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "x")], true));
+        read_at(&mut w, now);
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        let ends = w.take_dm_ends();
+        assert_eq!(ends[0].refusal, Some(dm_store::Refusal::Vanished));
+
+        // No answer: one new connection, then the save fails (and is tried later by its saver).
+        let mut w = Work::default();
+        assert!(save(&mut w, vec![add(1, 4, 9, "x")], false));
+        read_at(&mut w, now);
+        let late = now + Duration::from_secs(60);
+        let wait = Duration::from_secs(10);
+        assert!(w.expire(wait, wait, late));
+        assert!(w.expired_dm());
+        assert!(w.busy(), "once");
+        read_at(&mut w, late);
+        assert!(w.expire(wait, wait, late + Duration::from_secs(60)));
+        assert!(!w.busy(), "failed after one more connection");
+        assert!(!w.take_dm_ends()[0].ok);
+
+        // Another task's expiry is not a save's.
+        let mut w = Work::default();
+        w.create("Book club", "Ada", false);
+        let _ = next(&mut w);
+        assert!(w.expire(wait, wait, now + Duration::from_secs(60)));
+        assert!(!w.expired_dm());
+    }
+
+    #[test]
+    fn a_save_prints_only_the_length_of_what_it_is_about_to_store() {
+        let mut w = Work::default();
+        let now = Instant::now();
+        assert!(save(&mut w, vec![add(1, 4, 9, "PLAINTEXT-SECRET")], false));
+        read_at(&mut w, now);
+        assert!(w.on_delegate(&read_answer(KEY, None, 0)));
+        let phase = &w.tasks[0].phase;
+        let shown = format!("{phase:?}");
+        assert!(shown.contains("bytes"), "{shown}");
+        assert!(!shown.contains("PLAINTEXT") && !shown.contains("112"));
+        // Once the write ends the bytes are gone.
+        let _ = store_at(&mut w, now, 0);
+        assert!(w.on_delegate(&store_answer(KEY, CasStoreResult::Stored { generation: 1 })));
+        assert_eq!(w.tasks[0].phase, Phase::Read);
+    }
+}
