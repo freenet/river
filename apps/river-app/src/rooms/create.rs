@@ -346,19 +346,27 @@ pub fn invitation_refusal(invitation: &Invitation) -> Option<String> {
     None
 }
 
-/// A room's name as plain text to put in a message or a sentence: the owner chose it, so control
-/// characters, line and paragraph separators, bidi overrides and isolates, and zero-width and
-/// other format characters are dropped, and it is cut at 80 characters (on a character).
+/// A room's name as the sidebar shows it ([`super::room`]'s `clean`: hidden characters dropped,
+/// every whitespace character, including line and paragraph separators, one space, runs
+/// collapsed), for a message or a sentence, cut at 80 characters (on a character). The owner
+/// chose the name. Empty when nothing visible is left: use [`room_name_or_standin`].
 pub fn plain_room_name(name: &str) -> String {
-    name.chars()
-        .filter(|&c| {
-            !crate::chat::visual_fold::is_format_or_control(c)
-                && !matches!(c, '\u{200C}' | '\u{200D}' | '\u{2028}' | '\u{2029}')
-        })
+    super::room::clean(name)
+        .chars()
         .take(80)
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// [`plain_room_name`], or "this chat room" when nothing visible is left.
+pub fn room_name_or_standin(name: &str) -> String {
+    let plain = plain_room_name(name);
+    if plain.is_empty() {
+        "this chat room".to_owned()
+    } else {
+        plain
+    }
 }
 
 /// The message the web UI offers to copy for an invitation (`InviteMemberBody`'s `default_msg`
@@ -366,12 +374,7 @@ pub fn plain_room_name(name: &str) -> String {
 /// invitation is for one person. The room name is the room owner's text, so control characters
 /// are dropped and a long one is cut.
 pub fn invitation_message(room_name: &str, link: &str) -> String {
-    let name = plain_room_name(room_name);
-    let name = if name.is_empty() {
-        "this chat room"
-    } else {
-        name.as_str()
-    };
+    let name = room_name_or_standin(room_name);
     format!(
         "You've been invited to join the chat room \"{name}\"!\n\n\
          To join:\n\
@@ -396,7 +399,12 @@ pub const MAX_INVITE_PASTE_LEN: usize = 12 * 1024;
 /// payload that does not decode or that contradicts itself is refused here.
 pub fn decode_invitation(pasted: &str) -> Result<Invitation, String> {
     if pasted.len() > MAX_INVITE_PASTE_LEN {
-        return Err("That is too long to be an invite code.".into());
+        return Err(
+            "That is too long to be an invite code (the limit is about 12 KB of pasted \
+             text, all of it counted; a private room with a very large number of secret \
+             versions may not fit)."
+                .into(),
+        );
     }
     let code = river_core::invitation::invitation_text_from_paste(pasted);
     if code.is_empty() {

@@ -4055,37 +4055,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_room_in_the_list_that_you_are_not_a_member_of_is_not_called_not_needed() {
+    /// The join dialog's preview of an invitation to the room keyed `key`, with room 2 of the
+    /// list made that room and given `edit`.
+    fn preview_with(key: &str, link: &str, edit: fn(&mut chat::model::Room)) -> chat::JoinPreview {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
+        let (key, link) = (key.to_owned(), link.to_owned());
+        rt.update(move |s, _| {
+            let mut rooms = s.chat.rooms().to_vec();
+            rooms[2].key = key;
+            edit(&mut rooms[2]);
+            s.chat.set_rooms(rooms);
+            s.chat.open_dialog(chat::DialogKind::Join);
+            s.chat.form.code.replace_text(&link);
+            s.chat.join_code_edited();
+        });
+        rt.state.chat.form.join.clone()
+    }
+
+    #[test]
+    fn already_a_member_is_said_for_a_member_and_not_for_a_room_that_removed_you() {
         let (link, _) = invite_link_for(18);
         let owner = rooms::create::decode_invitation(&link).unwrap().room;
         let key = bs58::encode(owner.to_bytes()).into_string();
-        for (blocked, expect_member) in [(None, true), (Some("Removed".to_owned()), false)] {
-            let key = key.clone();
-            let link = link.clone();
-            rt.update(move |s, _| {
-                let mut rooms = s.chat.rooms().to_vec();
-                rooms[2].key = key;
-                rooms[2].send_block = blocked;
-                s.chat.set_rooms(rooms);
-                s.chat.open_dialog(chat::DialogKind::Join);
-                s.chat.form.code.replace_text(&link);
-                s.chat.join_code_edited();
-            });
-            assert_eq!(
-                matches!(rt.state.chat.form.join, chat::JoinPreview::Member { .. }),
-                expect_member,
-                "{:?}",
-                rt.state.chat.form.join
-            );
-            assert!(matches!(
-                rt.state.chat.form.join,
-                chat::JoinPreview::Member { .. } | chat::JoinPreview::Have { .. }
-            ));
-            rt.update(|s, _| s.chat.close_dialog());
-        }
+        let member = |p: chat::JoinPreview| matches!(p, chat::JoinPreview::Member { .. });
+        // A member, and every hold on sending that is not the room removing you: an update
+        // required or newer-River hold, no key or no secret yet (each sets `send_block` only).
+        assert!(member(preview_with(&key, &link, |_| {})));
+        assert!(member(preview_with(&key, &link, |r| {
+            r.send_block = Some(rooms::generation::UPDATE_REQUIRED_SEND.into());
+        })));
+        assert!(member(preview_with(&key, &link, |r| {
+            r.send_block = Some("This computer doesn't hold your key for this room.".into());
+        })));
+        assert!(member(preview_with(&key, &link, |r| {
+            r.send_block = Some("This private room's key hasn't reached this computer yet.".into());
+        })));
+        // Banned or removed (`not_member`; see the outbox test that sets it from the room).
+        assert!(matches!(
+            preview_with(&key, &link, |r| {
+                r.not_member = true;
+                r.send_block =
+                    Some("You have been banned from sending messages in this room.".into());
+            }),
+            chat::JoinPreview::Have { .. }
+        ));
+    }
+
+    #[test]
+    fn the_preview_follows_the_room_list_while_the_dialog_stays_open_over_the_same_code() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let (link, _) = invite_link_for(20);
+        let owner = rooms::create::decode_invitation(&link).unwrap().room;
+        let key = bs58::encode(owner.to_bytes()).into_string();
+        press(&mut rt, "enter-invite");
+        rt.update(move |s, _| {
+            s.chat.form.code.replace_text(&link);
+            s.chat.join_code_edited();
+        });
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::New { .. }
+        ));
+        // The room arrives: the same code now names a room you have.
+        let k = key.clone();
+        rt.update(move |s, _| {
+            let mut rooms = s.chat.rooms().to_vec();
+            rooms[2].key = k;
+            s.chat.set_rooms(rooms);
+        });
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::Member { .. }
+        ));
+        // It goes again (left in another window): a new room once more.
+        rt.update(move |s, _| {
+            let mut rooms = s.chat.rooms().to_vec();
+            rooms.retain(|r| r.key != key);
+            s.chat.set_rooms(rooms);
+        });
+        assert!(matches!(
+            rt.state.chat.form.join,
+            chat::JoinPreview::New { .. }
+        ));
+        // A list change with the dialog shut, or with no code in it, leaves the form alone.
+        rt.update(|s, _| s.chat.close_dialog());
+        let rooms = rt.state.chat.rooms().to_vec();
+        rt.update(move |s, _| s.chat.set_rooms(rooms));
+        assert_eq!(rt.state.chat.form.join, chat::JoinPreview::Empty);
     }
 
     #[test]

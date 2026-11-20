@@ -267,14 +267,14 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 JoinPreview::Member { name, .. } => {
                     body = body.child(note(format!(
                         "You are already a member of “{}”. This invitation is not needed.",
-                        crate::rooms::create::plain_room_name(name)
+                        crate::rooms::create::room_name_or_standin(name)
                     )));
                 }
                 JoinPreview::Have { name, .. } => {
                     body = body.child(note(format!(
                         "You already have “{}” in your list, but you are not a current member \
                          of it. This invitation is not used for it; open the room to see why.",
-                        crate::rooms::create::plain_room_name(name)
+                        crate::rooms::create::room_name_or_standin(name)
                     )));
                 }
             }

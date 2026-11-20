@@ -3164,6 +3164,10 @@ impl Outbox {
         view.ban_preview
             .retain(|uid, _| listed.contains(uid.as_str()));
         view.send_block = participation(room).err().map(|b| b.reason().to_owned());
+        view.not_member = matches!(
+            participation(room),
+            Err(Blocked::Banned | Blocked::NotMember)
+        );
         view.nickname_block = rejoin(room).0.is_some().then(|| PRUNED.to_owned());
         // A change to your deputies is a change to your record: the room must take it, and it
         // must have a nickname to carry over.

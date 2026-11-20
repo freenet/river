@@ -321,6 +321,10 @@ pub struct Room {
     pub unread: usize,
     /// Why you can't send here, if you can't: the composer says it instead of taking text.
     pub send_block: Option<String>,
+    /// Whether the room no longer has you as a member: banned from it, or not in its member
+    /// list. False for every other reason you can't send (no key here, no secret yet, a hold
+    /// for an update): those are still your room. Decided from the same check as `send_block`.
+    pub not_member: bool,
     /// Edits, deletions and reactions of yours that could not be sent.
     pub notices: Vec<Notice>,
     /// The longest nickname, in bytes, the room takes (its `max_nickname_size`, held to the
@@ -819,6 +823,7 @@ mod tests {
             me: 1,
             unread: 0,
             send_block: None,
+            not_member: false,
             notices: Vec::new(),
             nickname_limit: 50,
             own_nickname: None,

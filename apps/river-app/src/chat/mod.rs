@@ -120,7 +120,11 @@ pub struct Form {
     pub generated_nickname: String,
     /// A hash of the code last decoded, so an edit that leaves it as it was (the cursor moving,
     /// a key that changed nothing) is not decoded again. Not the code, which is a credential.
+    /// It only saves work and is not security-relevant: a collision would skip one re-decode of
+    /// an edited code, and joining decodes the text again anyway.
     pub decoded_hash: Option<u64>,
+    /// The room key of the invitation last decoded, so the preview can follow the room list.
+    pub decoded_room: Option<String>,
 }
 
 /// What the join dialog makes of the invite code or link typed in it. It holds nothing from the
@@ -168,6 +172,7 @@ impl Default for Form {
             join: JoinPreview::Empty,
             generated_nickname: String::new(),
             decoded_hash: None,
+            decoded_room: None,
         }
     }
 }
@@ -584,6 +589,13 @@ impl Chat {
     /// bytes, and losing typed text costs the user.
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
+        // A join dialog open over a code already decoded follows the list: a room that arrived,
+        // or went, changes what the invitation is.
+        if self.form.open == Some(DialogKind::Join)
+            && let Some(room) = self.form.decoded_room.clone()
+        {
+            self.form.join = self.join_preview_for(room);
+        }
         if self.rooms.is_empty() {
             self.emoji_open = false;
             self.member_modal = None;
@@ -1554,6 +1566,24 @@ impl Chat {
         );
     }
 
+    /// What the join dialog says of an invitation to the room keyed `room`, given the room list:
+    /// a room you are a current member of, a listed room you are not (banned, or no longer in
+    /// its member list), or a new one. Whether the room has you is the room's own answer
+    /// ([`Room::not_member`]); a hold on sending for another reason does not make it not yours.
+    fn join_preview_for(&self, room: String) -> JoinPreview {
+        match self.rooms.iter().find(|r| r.key == room) {
+            Some(known) if known.not_member => JoinPreview::Have {
+                name: known.name.clone(),
+                room,
+            },
+            Some(known) => JoinPreview::Member {
+                name: known.name.clone(),
+                room,
+            },
+            None => JoinPreview::New { room },
+        }
+    }
+
     /// The code in the join dialog was edited: decide what it is, and offer the nickname the
     /// invitation's key gives (as the web UI does), unless one was typed.
     pub fn join_code_edited(&mut self) {
@@ -1562,6 +1592,7 @@ impl Chat {
         if text.is_empty() {
             self.form.join = JoinPreview::Empty;
             self.form.decoded_hash = None;
+            self.form.decoded_room = None;
             self.form.error = None;
             return;
         }
@@ -1573,6 +1604,7 @@ impl Chat {
             return;
         }
         self.form.decoded_hash = Some(hash);
+        self.form.decoded_room = None;
         self.form.error = None;
         let invitation = match crate::rooms::create::decode_invitation(&self.form.code.text) {
             Ok(i) => i,
@@ -1582,17 +1614,9 @@ impl Chat {
             }
         };
         let room = bs58::encode(invitation.room.to_bytes()).into_string();
-        if let Some(known) = self.rooms.iter().find(|r| r.key == room) {
-            let name = known.name.clone();
-            // A current member: this computer's key is in the room's member list and nothing
-            // says the room has removed it. Anything else is only a room in the list.
-            let member =
-                known.send_block.is_none() && known.members.iter().any(|m| m.id == known.me);
-            self.form.join = if member {
-                JoinPreview::Member { name, room }
-            } else {
-                JoinPreview::Have { name, room }
-            };
+        self.form.decoded_room = Some(room.clone());
+        if self.rooms.iter().any(|r| r.key == room) {
+            self.form.join = self.join_preview_for(room);
             return;
         }
         let generated =

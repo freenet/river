@@ -568,21 +568,32 @@ fn the_invitation_message_is_the_web_uis_and_cleans_the_room_name() {
     // The owner's text: no control, line-separator, bidi, zero-width or other format
     // characters, bounded, and a stand-in when nothing is left.
     let odd = invitation_message("A\nB\u{7}C", "l");
-    assert!(odd.contains("\"ABC\""), "{odd}");
+    assert!(odd.contains("\"A BC\""), "{odd}");
     for hostile in [
         "Ro\u{202E}om",
         "Ro\u{2066}o\u{2069}m",
-        "Ro\u{200B}o\u{200D}\u{200C}m\u{FEFF}",
-        "Ro\u{2028}o\u{2029}m",
+        "Ro\u{200B}o\u{FEFF}m",
         "Ro\u{AD}o\u{2060}m\u{E0041}",
     ] {
-        let cleaned = plain_room_name(hostile);
-        assert!(
-            cleaned.chars().all(|c| c.is_ascii_alphabetic()),
-            "{cleaned:?}"
-        );
-        assert_eq!(cleaned, "Room", "{hostile:?}");
+        assert_eq!(plain_room_name(hostile), "Room", "{hostile:?}");
         assert!(invitation_message(hostile, "l").contains("\"Room\""));
+    }
+    // The sidebar's own cleaning: line and paragraph separators and doubled spaces are single
+    // spaces, and the joiners some scripts need (ZWNJ, ZWJ) stay.
+    assert_eq!(
+        plain_room_name("Book\u{2028}club\u{2029}  night"),
+        "Book club night"
+    );
+    assert_eq!(plain_room_name("  a   b  "), "a b");
+    assert_eq!(
+        plain_room_name("\u{0645}\u{200C}\u{06CC}"),
+        "\u{0645}\u{200C}\u{06CC}"
+    );
+    assert_eq!(plain_room_name("a\u{200D}b"), "a\u{200D}b");
+    for hidden in ["\u{202E}\u{200B}", "\u{2028}", "   ", ""] {
+        assert_eq!(plain_room_name(hidden), "");
+        assert_eq!(room_name_or_standin(hidden), "this chat room");
+        assert!(invitation_message(hidden, "l").contains("\"this chat room\""));
     }
     // The cut is on a character, not a byte, and a name of nothing visible gets the stand-in.
     assert_eq!(plain_room_name(&"\u{e9}".repeat(500)).chars().count(), 80);
