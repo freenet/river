@@ -42,6 +42,7 @@ if (!['restart', 'rejoin'].includes(scenario)) {
 }
 const width = opt('width', 1280);
 const DEADLINE = { connect: 20_000, reconnect: 30_000, send: 15_000 };
+const PILL_GAP_SAMPLES = 3;
 
 const node = (...args) => execFileSync(join(here, 'node.sh'), args, { cwd: repo, encoding: 'utf8' }).trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -67,10 +68,13 @@ page.on('request', (r) => {
 const pillGaps = [];
 const wsEvents = [];
 page.on('console', (m) => {
-  if (m.text().startsWith('PILL-GAP ')) pillGaps.push(m.text().slice(9));
+  if (m.text().startsWith('PILL-GAP ')) {
+    const sample = m.text().slice(9);
+    if (pillGaps.length < PILL_GAP_SAMPLES && !pillGaps.includes(sample)) pillGaps.push(sample);
+  }
   if (m.text().startsWith('WS ')) wsEvents.push({ at: Date.now(), what: m.text().slice(3) });
 });
-await page.addInitScript(() => {
+await page.addInitScript((limit) => {
   if (!location.search.includes('__sandbox=1')) return;
   // What River's sockets are told, as the gateway page relays it.
   window.addEventListener('message', (e) => {
@@ -79,7 +83,9 @@ await page.addInitScript(() => {
       console.log(`WS ${m.type}${m.type === 'close' ? ` ${m.code}` : ''}`);
     }
   });
+  const gapSamples = [];
   const tick = () => {
+    if (gapSamples.length >= limit) return;
     for (const p of document.querySelectorAll('[data-testid="connection-status-indicator"]')) {
       if (!p.getClientRects().length) continue;
       const slot = p.querySelector('[data-testid="connection-activity-dots"]');
@@ -96,17 +102,21 @@ await page.addInitScript(() => {
       const push = label.getBoundingClientRect().left - dot.getBoundingClientRect().right - 8;
       if (push >= 8 && shown === 0 && Number(getComputedStyle(slot).opacity) > 0.2) {
         const last = slot.querySelector('.small-dots > span:last-child')?.getBoundingClientRect();
-        console.log(
-          `PILL-GAP label pushed ${push.toFixed(1)}px, no dot shown (${label.textContent}; ` +
-            `clip ${clip ? `${clip.left.toFixed(1)}-${clip.right.toFixed(1)}` : 'none'}, ` +
-            `last dot ${last ? `${last.left.toFixed(1)}-${last.right.toFixed(1)}` : 'none'})`,
-        );
+        const sample =
+          `label pushed ${push.toFixed(1)}px, no dot shown (${label.textContent}; ` +
+          `clip ${clip ? `${clip.left.toFixed(1)}-${clip.right.toFixed(1)}` : 'none'}, ` +
+          `last dot ${last ? `${last.left.toFixed(1)}-${last.right.toFixed(1)}` : 'none'})`;
+        if (!gapSamples.includes(sample)) {
+          gapSamples.push(sample);
+          console.log(`PILL-GAP ${sample}`);
+          if (gapSamples.length >= limit) return;
+        }
       }
     }
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
-});
+}, PILL_GAP_SAMPLES);
 
 // Command sockets, as the gateway page opens them for River.
 const sockets = [];
@@ -244,7 +254,7 @@ if (reconnectedAfter !== null && frameNow) {
   const finalCount = await frameNow.evaluate((d) => [...document.querySelectorAll('[data-testid="message-body"]')].filter((e) => e.textContent.includes(d)).length, draft).catch(() => -1);
   check('draft sent exactly once', !sent.error && finalCount === 1, sent.error ?? `${finalCount} shown`);
 }
-check('pill never slides over an empty slot', pillGaps.length === 0, [...new Set(pillGaps)].slice(0, 3).join('; '));
+check('pill never slides over an empty slot', pillGaps.length === 0, pillGaps.join('; '));
 await browser.close();
 
 console.log(`\n${scenario} (width ${width}), node: ${node('status')}`);

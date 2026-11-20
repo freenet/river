@@ -625,7 +625,9 @@ pub fn install_test_hooks() {
     set_hook(
         "refuseOutstandingList",
         Closure::<dyn FnMut()>::new(|| {
-            crate::components::app::chat_delegate::test_refuse_outstanding_list();
+            let _ = crate::components::app::chat_delegate::on_current_list_refused(
+                river_core::chat_delegate::LIST_REFUSED_MARKER,
+            );
         })
         .into_js_value(),
     );

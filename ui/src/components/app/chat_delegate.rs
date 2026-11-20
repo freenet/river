@@ -1199,18 +1199,6 @@ pub(crate) fn test_begin_listed_load() {
     LIST_OUTSTANDING.store(attempt.wrapping_add(1), Ordering::Relaxed);
 }
 
-/// Test hook (example-data + no-sync builds only): the current delegate
-/// refuses the outstanding listing. A no-op unless one is outstanding, like
-/// the real error path.
-#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-pub(crate) fn test_refuse_outstanding_list() {
-    let text = format!(
-        "test refusal {}",
-        river_core::chat_delegate::LIST_REFUSED_MARKER
-    );
-    let _ = on_current_list_refused(&text);
-}
-
 /// What a current-delegate "missing" answer does to load attempt `attempt`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MissingAction {
@@ -1356,24 +1344,14 @@ mod tests {
         ));
     }
 
-    /// PR 940 review: a reconnect re-enters `Loading` without clearing the
-    /// cached rooms, and the empty-map helper writes `LoadFailed` only for an
-    /// empty map. A refused listing (or a delegate still missing after it was
-    /// registered) must leave `Loading` either way, or the pill reads "Loading
-    /// your rooms" until the 60 s backstop.
+    /// A delegate still missing after this attempt registered it must leave
+    /// `Loading` even when cached rooms are showing. The empty-map helper
+    /// writes `LoadFailed` only for an empty map, so a reconnect that kept its
+    /// rooms would otherwise hold the pill on "Loading your rooms" until the
+    /// 60 s backstop.
     #[test]
-    fn a_refused_listing_settles_even_with_cached_rooms() {
+    fn missing_delegate_after_registration_settles_even_with_cached_rooms() {
         let production = chat_delegate_production();
-        let refused = fn_body(&production, "pub(crate) fn on_current_list_refused(");
-        assert!(
-            refused.contains("set_load_state_if_current(attempt, RoomsLoadState::LoadFailed)"),
-            "a refused listing must leave Loading even when cached rooms are showing"
-        );
-        assert!(
-            !refused.contains("resolve_load_failed_if_empty"),
-            "the empty-map helper would leave Loading in place"
-        );
-
         let missing = fn_body(&production, "pub(crate) fn on_current_delegate_missing(");
         let fail_at = missing
             .find("MissingAction::FailLoad => {")

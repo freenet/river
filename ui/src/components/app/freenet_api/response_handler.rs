@@ -831,6 +831,21 @@ const _: () = assert!(
 // `slice::chunks(0)` panics; pin the wave size as a valid chunk at compile time.
 const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
 
+/// Test hook (example-data + no-sync builds only): the current delegate
+/// answers the outstanding listing (`beginListedLoad`) with only the
+/// `rooms_data` blob, and the room load runs as it would for that answer.
+/// Without a node the versioned blob read then fails: the read-error path of
+/// [`migrate_current_blob_to_per_room`]. Writes no load state of its own.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn test_deliver_stored_rooms_blob_listing() {
+    note_current_list_response();
+    if claim_list_load() {
+        crate::util::safe_spawn_local(load_rooms_per_room(vec![ChatDelegateKey::new(
+            ROOMS_STORAGE_KEY.to_vec(),
+        )]));
+    }
+}
+
 /// Per-room room load (freenet/river#345 / #65). Reconstructs the in-memory
 /// `Rooms` from the current delegate's `room:<vk>` slot keys (+ `rooms_meta`)
 /// discovered by a `ListRequest`, then hands the assembled value to the shared
@@ -860,21 +875,6 @@ const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
 /// The per-room slot GETs are fanned out CONCURRENTLY in waves of
 /// [`ROOM_LOAD_CONCURRENCY`] (freenet/river#417) to collapse N serial delegate
 /// round-trips into ~ceil(N / ROOM_LOAD_CONCURRENCY).
-/// Test hook (example-data + no-sync builds only): the current delegate
-/// answers the outstanding listing (`beginListedLoad`) with only the
-/// `rooms_data` blob, and the room load runs as it would for that answer.
-/// Without a node the versioned blob read then fails: the read-error path of
-/// [`migrate_current_blob_to_per_room`]. Writes no load state of its own.
-#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-pub(crate) fn test_deliver_stored_rooms_blob_listing() {
-    note_current_list_response();
-    if claim_list_load() {
-        crate::util::safe_spawn_local(load_rooms_per_room(vec![ChatDelegateKey::new(
-            ROOMS_STORAGE_KEY.to_vec(),
-        )]));
-    }
-}
-
 async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
     // Progress-tracked termination (freenet/river#397 review 6): this awaited
     // worker holds a guard for its whole lifetime, so on EVERY exit path the

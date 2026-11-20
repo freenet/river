@@ -8,9 +8,6 @@ use crate::components::app::freenet_api::{
 };
 use crate::components::app::sync_info::SYNC_INFO;
 use crate::components::app::{PENDING_INVITES, ROOMS};
-use crate::components::room_list::{
-    restoring_more_rooms, room_list_display_state, RoomListDisplay,
-};
 use crate::util::signal_guard;
 use dioxus::prelude::*;
 use std::{cell::Cell, rc::Rc};
@@ -70,12 +67,12 @@ impl RoomActivity {
 
 /// A restoring walk counts on its own, even when the current delegate listed
 /// no rooms: the rail's "Restoring more rooms" note needs a room to sit under,
-/// but the pill is the only sign that rooms may still arrive.
+/// but the pill is the only sign that rooms may still arrive. A migration
+/// counts while that list is still empty, and while a worker is still running
+/// after rooms have appeared. Once those workers settle, cached rooms are idle.
 fn loading_rooms(state: RoomsLoadState, room_count: usize, workers: bool, walk: bool) -> bool {
-    state == RoomsLoadState::Loading
-        || room_list_display_state(state, room_count) == RoomListDisplay::Migrating
-        || walk
-        || restoring_more_rooms(state, workers, room_count, false)
+    walk || state == RoomsLoadState::Loading
+        || (state == RoomsLoadState::Migrating && (room_count == 0 || workers))
 }
 
 /// Use the same socket snapshot as the label. Room updates that leave these
