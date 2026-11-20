@@ -14,7 +14,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -123,42 +123,125 @@ pub fn try_load(data_dir: &Path) -> Result<State, String> {
     })
 }
 
-/// Load, change and save the state while holding a lock file, so two Rivers (or two threads)
+/// How long a caller waits behind a holder that makes no progress before it reports "busy".
+const LOCK_PATIENCE: Duration = Duration::from_secs(5);
+/// A bound on the whole wait, so a caller always ends even when other writers never stop.
+const LOCK_LIMIT: Duration = Duration::from_secs(60);
+/// How often a waiter looks at the lock again (plus up to the same again, at random).
+const LOCK_POLL: Duration = Duration::from_millis(6);
+
+/// How long [`modify`] waits for the lock.
+#[derive(Clone, Copy)]
+struct Wait {
+    patience: Duration,
+    poll: Duration,
+}
+
+/// Load, change and save the state while holding the lock, so two Rivers (or two threads)
 /// cannot overwrite each other's change. A damaged file is an error, as in [`try_load`].
+///
+/// The lock is an operating-system advisory lock on `update-state.json.lock`, a file that is
+/// created once and never deleted. The system drops the lock when its holder exits or crashes,
+/// so there is no stale lock to detect and remove, and nothing a guard can delete that belongs
+/// to the next holder. (An earlier scheme created and deleted the lock file; a waiter that took
+/// a lock for stale could delete a new holder's lock, and two writers then overlapped and one
+/// change was lost, which for the highest accepted sequence lowers the anti-rollback floor.)
+/// Locks conflict between two handles in one process as well as between processes, on Unix
+/// (`flock`) and on Windows (`LockFileEx`). A network or FUSE filesystem may not give real
+/// exclusion: most refuse the lock with an error, which fails closed, but a few accept it
+/// without excluding anyone.
 pub fn modify<T>(data_dir: &Path, change: impl FnOnce(&mut State) -> T) -> Result<T, String> {
+    modify_waiting(
+        data_dir,
+        Wait {
+            patience: LOCK_PATIENCE,
+            poll: LOCK_POLL,
+        },
+        change,
+    )
+}
+
+fn lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(format!("{STATE_FILE}.lock"))
+}
+
+/// Open (creating once) the lock file. A file made by another user (a River run as root once)
+/// cannot be opened for writing; locking needs only read access (`flock` works on a read-only
+/// descriptor, `LockFileEx` needs read or write access), so that is tried next.
+fn open_lock(data_dir: &Path) -> Result<fs::File, String> {
+    let lock = lock_path(data_dir);
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    match options.open(&lock) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => fs::File::open(&lock),
+        other => other,
+    }
+    .map_err(|e| {
+        format!(
+            "couldn't open the update notes lock {}: {e}",
+            lock.display()
+        )
+    })
+}
+
+fn busy(data_dir: &Path) -> String {
+    format!(
+        "the update notes are busy: another River, or an update, may be using them. Wait a \
+         moment and try again. If it stays busy, a River or updater process ({}) is still \
+         running or is hung; close it.",
+        lock_path(data_dir).display()
+    )
+}
+
+/// A number that differs between calls and processes, for spreading out waiters.
+fn jitter_nanos() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// [`modify`] with the wait given. The patience is how long the lock may stay with a holder
+/// that does nothing; it starts again whenever the state file's modification time changes
+/// (another writer saved), so waiting behind a queue of working writers is not "busy" however
+/// long the queue is (an fsync and a rename on a Windows disk with a scanner can take tens of
+/// milliseconds, and the lock is not handed out in order). A holder that is stuck ends the wait
+/// as "busy", and nothing is changed.
+fn modify_waiting<T>(
+    data_dir: &Path,
+    wait: Wait,
+    change: impl FnOnce(&mut State) -> T,
+) -> Result<T, String> {
     fs::create_dir_all(data_dir)
         .map_err(|e| format!("couldn't create {}: {e}", data_dir.display()))?;
-    let lock = data_dir.join(format!("{STATE_FILE}.lock"));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let lock_file = open_lock(data_dir)?;
+    let state_file = path(data_dir);
+    let modified = || fs::metadata(&state_file).and_then(|m| m.modified()).ok();
+    let started = Instant::now();
+    let mut deadline = started + wait.patience;
+    let mut seen = modified();
     let _guard = loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(_) => break LockGuard(lock.clone()),
-            // Windows answers "permission denied" for a lock file that another thread has just
-            // deleted and that is not gone yet, so that is "busy" too.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                let stale = fs::metadata(&lock)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age > Duration::from_secs(30));
-                if stale {
-                    let _ = fs::remove_file(&lock);
-                } else if std::time::Instant::now() >= deadline {
-                    return Err("the update notes are busy".into());
-                } else {
-                    std::thread::sleep(Duration::from_millis(10));
+        match lock_file.try_lock() {
+            Ok(()) => break LockGuard(&lock_file),
+            Err(fs::TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                let latest = modified();
+                if latest != seen {
+                    seen = latest;
+                    deadline = now + wait.patience;
                 }
+                if now >= deadline || now >= started + LOCK_LIMIT {
+                    return Err(busy(data_dir));
+                }
+                let poll = wait.poll.as_nanos() as u64;
+                std::thread::sleep(Duration::from_nanos(poll + jitter_nanos() % poll.max(1)));
             }
-            Err(e) => return Err(format!("couldn't lock the update notes: {e}")),
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(format!(
+                    "couldn't lock the update notes {}: {e}",
+                    lock_path(data_dir).display()
+                ));
+            }
         }
     };
     let mut state = try_load(data_dir)?;
@@ -170,11 +253,12 @@ pub fn modify<T>(data_dir: &Path, change: impl FnOnce(&mut State) -> T) -> Resul
     Ok(out)
 }
 
-struct LockGuard(PathBuf);
+/// Holds the lock until dropped. It lets go of the lock and leaves the file where it is.
+struct LockGuard<'a>(&'a fs::File);
 
-impl Drop for LockGuard {
+impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -271,6 +355,218 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(load(dir.path()).highest_sequence, 80);
+    }
+
+    const FAST: Wait = Wait {
+        patience: Duration::from_secs(30),
+        poll: Duration::from_millis(2),
+    };
+
+    /// Handles to the lock file in one process conflict, which is what makes the thread
+    /// tests above contend as processes do.
+    #[test]
+    fn two_handles_in_one_process_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || fs::File::create(lock_path(dir.path())).unwrap();
+        let (a, b) = (open(), open());
+        a.try_lock().unwrap();
+        assert!(matches!(b.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        a.unlock().unwrap();
+        b.try_lock().unwrap();
+    }
+
+    #[test]
+    fn a_holder_that_does_nothing_is_reported_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = fs::File::create(lock_path(dir.path())).unwrap();
+        holder.try_lock().unwrap();
+        let wait = Wait {
+            patience: Duration::from_millis(100),
+            poll: Duration::from_millis(2),
+        };
+        let r = modify_waiting(dir.path(), wait, |s| s.highest_sequence = 9);
+        let e = r.unwrap_err();
+        assert!(e.starts_with("the update notes are busy"), "{e}");
+        assert!(e.contains(STATE_FILE), "it says where the lock is: {e}");
+        assert!(!path(dir.path()).exists(), "nothing was written");
+    }
+
+    /// A holder that keeps saving is making progress, so the waiter's patience restarts. The
+    /// holder here outlasts the patience, and sets the state file's time
+    /// itself so the test does not depend on the disk's clock granularity.
+    #[test]
+    fn a_holder_that_keeps_saving_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = fs::File::create(lock_path(dir.path())).unwrap();
+        holder.try_lock().unwrap();
+        let state = path(dir.path());
+        fs::write(&state, b"{}").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let f = fs::OpenOptions::new().write(true).open(&state).unwrap();
+                let base = std::time::SystemTime::now();
+                for i in 1..=25u64 {
+                    tx.send(()).unwrap();
+                    f.set_modified(base + Duration::from_secs(i)).unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                holder.unlock().unwrap();
+            })
+        };
+        rx.recv().unwrap();
+        let wait = Wait {
+            patience: Duration::from_secs(2),
+            poll: Duration::from_millis(5),
+        };
+        // About 2.5 s of holding against 2 s of patience: it passes only because it restarts.
+        modify_waiting(dir.path(), wait, |s| s.highest_sequence = 5).unwrap();
+        h.join().unwrap();
+        assert_eq!(load(dir.path()).highest_sequence, 5);
+    }
+
+    /// A lock file that cannot be opened for writing (made by another user) still locks.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_lock_file_still_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_path(dir.path());
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).unwrap();
+        modify_waiting(dir.path(), FAST, |s| s.highest_sequence = 4).unwrap();
+        assert_eq!(load(dir.path()).highest_sequence, 4);
+    }
+
+    /// How long a test waits for another process before it fails.
+    const CHILD_WAIT: Duration = Duration::from_secs(20);
+
+    fn wait_for(file: &Path, what: &str) {
+        let end = Instant::now() + CHILD_WAIT;
+        while !file.exists() {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The test binary run again as a child process, for the tests below. It does nothing
+    /// unless the parent set the environment, and it never lives longer than 30 s.
+    #[test]
+    fn child_process() {
+        let (Ok(dir), Ok(mode)) = (
+            std::env::var("RIVER_STATE_TEST_DIR"),
+            std::env::var("RIVER_STATE_TEST_MODE"),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        fs::write(dir.join(format!("started-{}", std::process::id())), b"").unwrap();
+        match mode.as_str() {
+            "count" => {
+                wait_for(&dir.join("go"), "the go file");
+                for _ in 0..25 {
+                    modify_waiting(&dir, FAST, |s| s.highest_sequence += 1).unwrap();
+                }
+            }
+            "hold" => {
+                let f = fs::File::create(lock_path(&dir)).unwrap();
+                f.try_lock().unwrap();
+                fs::write(dir.join("held"), b"").unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            other => panic!("unknown mode {other}"),
+        }
+    }
+
+    /// A child process that is killed and reaped when it goes out of scope, so a failed
+    /// assertion leaves nothing running (on Windows it would keep the lock file open).
+    struct Child(std::process::Child);
+
+    impl Child {
+        fn start(dir: &Path, mode: &str) -> Child {
+            let c = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::state::tests::child_process",
+                    "--nocapture",
+                ])
+                .env("RIVER_STATE_TEST_DIR", dir)
+                .env("RIVER_STATE_TEST_MODE", mode)
+                .spawn()
+                .unwrap();
+            let id = c.id();
+            let mut c = Child(c);
+            // A child that exits without having started ran no test: the filter matched none.
+            let marker = dir.join(format!("started-{id}"));
+            let end = Instant::now() + CHILD_WAIT;
+            while !marker.exists() {
+                if let Some(status) = c.0.try_wait().unwrap() {
+                    panic!("the child exited ({status}) without starting: is the test name right?");
+                }
+                assert!(
+                    Instant::now() < end,
+                    "timed out waiting for the child to start"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            c
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Four processes and four threads, released together, each add 25: none is lost.
+    #[test]
+    fn processes_and_threads_together_lose_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut children: Vec<_> = (0..4).map(|_| Child::start(dir.path(), "count")).collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (d, b) = (dir.path().to_path_buf(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    for _ in 0..25 {
+                        modify_waiting(&d, FAST, |s| s.highest_sequence += 1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        fs::write(dir.path().join("go"), b"").unwrap();
+        for t in threads {
+            t.join().unwrap();
+        }
+        for c in &mut children {
+            assert!(c.0.wait().unwrap().success());
+        }
+        assert_eq!(load(dir.path()).highest_sequence, 200);
+    }
+
+    /// A holder that dies without letting go does not block anyone: no 30 s stale rule, no
+    /// manual clean-up. While it is alive, another process is refused.
+    #[test]
+    fn a_killed_holder_does_not_block_the_next_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut holder = Child::start(dir.path(), "hold");
+        wait_for(&dir.path().join("held"), "the holder");
+        let wait = Wait {
+            patience: Duration::from_millis(100),
+            poll: Duration::from_millis(2),
+        };
+        assert!(modify_waiting(dir.path(), wait, |_| ()).is_err());
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        let began = Instant::now();
+        modify_waiting(dir.path(), FAST, |s| s.highest_sequence = 3).unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert_eq!(load(dir.path()).highest_sequence, 3);
     }
 
     #[test]
