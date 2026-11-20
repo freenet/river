@@ -59,10 +59,15 @@ pub struct MemberItem<'a> {
 /// for this one box). An accent typed as a single precomposed character ("é") does not match
 /// the same letter in decomposed form, and a plain "e" does not match a precomposed "é".
 fn fold(s: &str) -> Vec<char> {
-    s.chars()
-        .flat_map(char::to_lowercase)
+    s.chars().flat_map(fold_char).collect()
+}
+
+/// One character as [`fold`] compares it: lowercased (which may give several characters) and
+/// with combining marks dropped (which gives none). Shared with message search, which has to
+/// know which original character each folded one came from.
+pub(super) fn fold_char(c: char) -> impl Iterator<Item = char> {
+    c.to_lowercase()
         .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
-        .collect()
 }
 
 /// The fewest characters a query needs before a fuzzy (in-order, gaps allowed) match counts.
@@ -219,6 +224,12 @@ impl Switcher {
 impl Chat {
     /// Whether a dialog the switcher must not open over is showing.
     pub(super) fn other_dialog_open(&self) -> bool {
+        self.modal_dialog_open() || self.link_menu.is_some()
+    }
+
+    /// Whether a dialog is showing, as opposed to a small popup such as the link menu. What
+    /// closes the search panel: a popup opened from the history does not.
+    pub(super) fn modal_dialog_open(&self) -> bool {
         self.form.open.is_some()
             || self.member_modal.is_some()
             || self.details.is_some()
@@ -228,7 +239,6 @@ impl Chat {
             || self.update.settings_open
             || self.background.as_ref().is_some_and(|b| b.open)
             || self.dnd.open
-            || self.link_menu.is_some()
             || self.overview
     }
 
@@ -263,6 +273,7 @@ impl Chat {
         self.emoji_open = false;
         self.picker = None;
         self.members_overlay = false;
+        self.drop_search();
         // The box takes the keyboard: the composer must not keep it, or typed text would go to
         // both.
         self.composer.focused = false;

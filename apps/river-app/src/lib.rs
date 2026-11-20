@@ -564,7 +564,13 @@ impl RiverApp {
     /// the start of every frame, so it sees every change however it came about.
     fn sync_unread(&mut self, tx: &mut Tx) {
         self.sync_dnd(tx);
-        if self.chat.apply_reveal(tx) {
+        // Both run every frame, so neither is short-circuited away.
+        self.chat.close_search_under_dialog();
+        let (revealing, flashing) = (
+            self.chat.apply_reveal(tx),
+            self.chat.tick_flash(std::time::Instant::now()),
+        );
+        if revealing || flashing {
             tx.wake_after(std::time::Duration::from_millis(30));
         }
         if !matches!(self.chat.source, chat::Source::Node(_)) {
@@ -1077,6 +1083,34 @@ fn overview_scene(s: &mut RiverApp, caught_up: bool) {
         s.chat.mark_all_read();
     }
     s.chat.toggle_overview();
+}
+
+/// The search panel open on the open room with `query` typed, after `extra` more messages that
+/// all contain "release" have been added to it.
+fn search_scene(s: &mut RiverApp, query: &str, extra: usize) {
+    connect(s);
+    if extra > 0 {
+        s.chat.edit_rooms(|rooms| {
+            let Some(r) = rooms.iter_mut().find(|r| r.key == "town-square") else {
+                return;
+            };
+            let template = r.messages.last().expect("a message").clone();
+            for i in 0..extra {
+                let mut m = template.clone();
+                m.key = format!("extra-{i}");
+                m.id += i as u32 + 1;
+                m.time += i as u32 + 1;
+                m.text = format!("Release candidate {i} is ready for testing, please try it.");
+                m.md = m.text.clone();
+                m.reactions.clear();
+                r.messages.push(m);
+            }
+        });
+    }
+    s.chat.search_chord();
+    if let Some(search) = s.chat.search.as_mut() {
+        search.query.replace_text(query);
+    }
 }
 
 /// A named state for `--snap` and `--list-scenes`: a name and how it changes the initial state.
@@ -1633,6 +1667,11 @@ pub const SCENES: &[Scene] = &[
             .query
             .replace_text("zzzz");
     }),
+    // Message search (Ctrl+F): the messages of the open room that contain the query, the
+    // matches drawn bold; a query nothing matches says so; a long list is cut and says so.
+    ("chat-search", |s| search_scene(s, "the", 0)),
+    ("chat-search-empty", |s| search_scene(s, "zzzz", 0)),
+    ("chat-search-many", |s| search_scene(s, "release", 130)),
     // The bell in the conversation header opens a room's notification dialog: its three modes,
     // the current one checked. The name says what changes between the variants.
     ("chat-notification-modes", |s| {
@@ -1956,6 +1995,9 @@ pub fn spec() -> AppSpec<RiverApp> {
         // reply or an edit even when the composer is not focused.
         on_key: Some(|s, ev, tx| {
             if chat::switcher::is_chord(ev) && s.chat.switcher_chord(std::time::Instant::now()) {
+                return true;
+            }
+            if chat::search::is_chord(ev) && s.chat.search_chord() {
                 return true;
             }
             // Ctrl+Q (Cmd+Q on a Mac) quits where the window's close button only hides it to
@@ -2780,6 +2822,13 @@ mod tests {
 
     /// The node's rooms, in a window wide enough for the members panel, on a test clipboard.
     fn node_rooms(board: &rune::clipboard::MemoryClipboard) -> Runtime<RiverApp> {
+        node_rooms_sized(board, (1280.0, 800.0))
+    }
+
+    fn node_rooms_sized(
+        board: &rune::clipboard::MemoryClipboard,
+        size: (f32, f32),
+    ) -> Runtime<RiverApp> {
         let mut state = RiverApp::detached();
         state.setup = Setup::Connected {
             version: "0.2.156".into(),
@@ -2788,7 +2837,7 @@ mod tests {
         let mut rt = Runtime::new(
             state,
             view,
-            (1280.0, 800.0),
+            size,
             Env {
                 system_dark: true,
                 scale: 1.0,
@@ -4250,5 +4299,315 @@ mod tests {
         }
         let (_, later) = rt.find(&msg).expect("still drawn");
         assert!((y - later).abs() < 1.0, "it moved from {y} to {later}");
+    }
+
+    // Message search (Ctrl+F).
+
+    /// The open room with 60 more messages after its own, and one "needle" among the oldest.
+    fn long_searchable_room(board: &rune::clipboard::MemoryClipboard) -> Runtime<RiverApp> {
+        long_searchable_room_sized(board, (1280.0, 800.0))
+    }
+
+    fn long_searchable_room_sized(
+        board: &rune::clipboard::MemoryClipboard,
+        size: (f32, f32),
+    ) -> Runtime<RiverApp> {
+        let mut rt = node_rooms_sized(board, size);
+        rt.on_key = spec().on_key;
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                let r = &mut rooms[0];
+                let template = r.messages.last().expect("a message").clone();
+                let base = r.messages.len();
+                for i in 0..60usize {
+                    let mut m = template.clone();
+                    m.key = format!("long-{i}");
+                    m.id = (base + i + 1) as u32;
+                    m.time += i as u32 + 1;
+                    m.text = format!("filler line number {i}");
+                    m.md = m.text.clone();
+                    m.reactions.clear();
+                    if i == 3 {
+                        m.text = "find the NEEDLE here".into();
+                        m.md = "find the **needle** here".into();
+                    }
+                    r.messages.push(m);
+                }
+            });
+        });
+        settle(&mut rt);
+        rt
+    }
+
+    fn type_query(rt: &mut Runtime<RiverApp>, q: &'static str) {
+        rt.update(move |s, _| {
+            s.chat
+                .search
+                .as_mut()
+                .expect("the panel is open")
+                .query
+                .replace_text(q);
+            s.chat.search_edited();
+        });
+        settle(rt);
+    }
+
+    #[test]
+    fn the_search_chord_opens_the_panel_from_the_composer_and_a_repeat_never_closes_it() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.update(|s, _| s.chat.composer.focused = true);
+        settle(&mut rt);
+        rt.key(chord('f'));
+        settle(&mut rt);
+        assert!(rt.state.chat.search.is_some(), "Ctrl+F opened it");
+        assert!(rt.find("search-panel").is_some());
+        assert!(!rt.state.chat.composer.focused, "the box has the keyboard");
+        // A held key repeats the chord: the panel stays, however many arrive.
+        for _ in 0..4 {
+            rt.key(chord('f'));
+            settle(&mut rt);
+        }
+        assert!(
+            rt.state.chat.search.is_some(),
+            "a repeat does not toggle it"
+        );
+        rt.key(bare(rune::Key::Escape));
+        settle(&mut rt);
+        assert!(rt.state.chat.search.is_none(), "Escape closes it");
+        assert!(
+            rt.state.chat.composer.focused,
+            "the composer has the keyboard again"
+        );
+        assert!(rt.find("search-panel").is_none());
+    }
+
+    #[test]
+    fn the_search_does_not_open_over_a_dialog_or_the_switcher_and_they_close_it() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.update(|s, _| {
+            s.chat.open_details();
+            assert!(!s.chat.search_chord(), "not over the details dialog");
+            s.chat.details = None;
+            assert!(s.chat.search_chord());
+            // Opening the switcher takes the panel's place.
+            assert!(s.chat.toggle_switcher());
+            assert!(s.chat.search.is_none());
+            assert!(!s.chat.search_chord(), "not over the switcher");
+            s.chat.close_switcher();
+            assert!(s.chat.search_chord());
+            // Another room's search is not this room's.
+            s.chat.open_room("design-crew");
+            assert!(s.chat.search.is_none());
+        });
+    }
+
+    #[test]
+    fn typing_lists_matches_and_the_arrows_and_enter_jump_to_the_highlighted_one() {
+        let board = rune::clipboard::memory();
+        let mut rt = long_searchable_room(&board);
+        rt.key(chord('f'));
+        settle(&mut rt);
+        type_query(&mut rt, "line number 5");
+        // "line number 5", "line number 50" to "59": newest first.
+        let found = rt.state.chat.search_results();
+        assert_eq!(found.total, 11);
+        assert_eq!(found.hits[0].key, "long-59");
+        assert!(rt.find("search-row-0").is_some());
+        rt.key(bare(rune::Key::Down));
+        settle(&mut rt);
+        let hits = rt.state.chat.search_results().hits.clone();
+        assert_eq!(rt.state.chat.search_selected(&hits), 1);
+        rt.key(bare(rune::Key::Up));
+        rt.key(bare(rune::Key::Up));
+        settle(&mut rt);
+        assert_eq!(rt.state.chat.search_selected(&hits), 10, "Up wraps round");
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert_eq!(
+            rt.state.chat.pending_reveal().map(|r| r.message.as_str()),
+            Some("long-5"),
+            "Enter jumps to the highlighted (oldest) match"
+        );
+        assert!(
+            rt.state.chat.search.is_some(),
+            "the panel stays for the next match"
+        );
+    }
+
+    #[test]
+    fn a_match_that_is_edited_or_deleted_is_searched_as_it_is_now() {
+        let board = rune::clipboard::memory();
+        let mut rt = long_searchable_room(&board);
+        rt.key(chord('f'));
+        settle(&mut rt);
+        type_query(&mut rt, "needle");
+        assert_eq!(rt.state.chat.search_results().total, 1);
+        // The markup is not searched, and what an edit replaced is gone.
+        type_query(&mut rt, "**");
+        assert_eq!(rt.state.chat.search_results().total, 0);
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                let m = rooms[0]
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.key == "long-3")
+                    .expect("message");
+                m.text = "now it says haystack".into();
+                m.md = m.text.clone();
+                m.edited = true;
+            });
+        });
+        type_query(&mut rt, "needle");
+        assert_eq!(
+            rt.state.chat.search_results().total,
+            0,
+            "the old text is gone"
+        );
+        type_query(&mut rt, "haystack");
+        assert_eq!(rt.state.chat.search_results().total, 1);
+        rt.update(|s, _| {
+            s.chat
+                .edit_rooms(|rooms| rooms[0].messages.retain(|m| m.key != "long-3"))
+        });
+        type_query(&mut rt, "haystack");
+        assert_eq!(
+            rt.state.chat.search_results().total,
+            0,
+            "a deleted message is not found"
+        );
+    }
+
+    /// A click on a result scrolls a message far from the bottom into view and leaves it
+    /// there, and marks it until the frames count it out.
+    #[test]
+    fn a_jump_to_a_far_match_scrolls_it_into_view_and_marks_it_for_a_moment() {
+        let board = rune::clipboard::memory();
+        let mut rt = long_searchable_room(&board);
+        rt.key(chord('f'));
+        settle(&mut rt);
+        type_query(&mut rt, "needle");
+        let msg = "msg-long-3".to_owned();
+        let (view, _) = rt
+            .presented("history-scroll-town-square")
+            .expect("the history is drawn");
+        let inside = move |y: f32| y > view[1] && y < view[1] + view[3];
+        let before = rt.find(&msg).map(|(_, y)| y);
+        assert!(
+            before.is_none_or(|y| !inside(y)),
+            "the match starts off screen: {before:?}"
+        );
+        press(&mut rt, "search-row-0");
+        assert_eq!(rt.state.chat.flashing(), Some("long-3"));
+        for _ in 0..10 {
+            let mut again = false;
+            rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+            settle(&mut rt);
+            if !again {
+                break;
+            }
+        }
+        let (_, y) = rt.find(&msg).expect("the match is drawn");
+        assert!(
+            (80.0..680.0).contains(&y),
+            "scrolled into the viewport: y = {y}"
+        );
+        for _ in 0..5 {
+            settle(&mut rt);
+        }
+        let (_, later) = rt.find(&msg).expect("still drawn");
+        assert!((y - later).abs() < 1.0, "it moved from {y} to {later}");
+        // The mark ends by the clock it is given: still there before its time, gone after.
+        let t0 = std::time::Instant::now();
+        rt.update(move |s, _| {
+            s.chat.search_jump("long-3", t0);
+            assert!(s.chat.tick_flash(t0 + chat::search::FLASH_FOR / 2));
+            assert!(!s.chat.tick_flash(t0 + chat::search::FLASH_FOR));
+        });
+        assert_eq!(rt.state.chat.flashing(), None, "the mark fades");
+    }
+
+    /// At the smallest window the panel gives up rows so the history stays readable, and a
+    /// jump still shows the match.
+    #[test]
+    fn at_the_minimum_window_size_the_history_keeps_room_and_the_jump_is_visible() {
+        let board = rune::clipboard::memory();
+        let mut rt = long_searchable_room_sized(&board, (640.0, 480.0));
+        rt.key(chord('f'));
+        settle(&mut rt);
+        type_query(&mut rt, "line number");
+        let (view, _) = rt
+            .presented("history-scroll-town-square")
+            .expect("the history is drawn");
+        assert!(
+            view[3] >= 100.0,
+            "the history keeps room to read: {}",
+            view[3]
+        );
+        press(&mut rt, "search-row-0");
+        for _ in 0..10 {
+            let mut again = false;
+            rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+            settle(&mut rt);
+            if !again {
+                break;
+            }
+        }
+        let (view, _) = rt
+            .presented("history-scroll-town-square")
+            .expect("the history is drawn");
+        let (_, y) = rt.find("msg-long-59").expect("the match is drawn");
+        assert!(
+            y >= view[1] && y <= view[1] + view[3],
+            "visible: {y} in {view:?}"
+        );
+    }
+
+    /// With the composer grown to eight lines the history still keeps its minimum, wide or
+    /// narrow, and a jump still shows the match.
+    fn history_keeps_room_with_a_tall_draft(size: (f32, f32)) {
+        let board = rune::clipboard::memory();
+        let mut rt = long_searchable_room_sized(&board, size);
+        rt.key(chord('f'));
+        settle(&mut rt);
+        type_query(&mut rt, "line number");
+        rt.update(|s, _| s.chat.composer.replace_text(["draft line"; 8].join("\n")));
+        for _ in 0..4 {
+            settle(&mut rt);
+        }
+        let (view, _) = rt
+            .presented("history-scroll-town-square")
+            .expect("the history is drawn");
+        assert!(
+            view[3] >= chat::search::HISTORY_MIN_H - 1.0,
+            "{size:?}: the history keeps room to read: {}",
+            view[3]
+        );
+        rt.update(|s, _| s.chat.search_jump("msg-none", std::time::Instant::now()));
+        rt.update(|s, _| s.chat.search_jump("long-59", std::time::Instant::now()));
+        for _ in 0..10 {
+            let mut again = false;
+            rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+            settle(&mut rt);
+            if !again {
+                break;
+            }
+        }
+        let (_, y) = rt.find("msg-long-59").expect("the match is drawn");
+        assert!(
+            y >= view[1] && y <= view[1] + view[3],
+            "visible: {y} in {view:?}"
+        );
+    }
+
+    #[test]
+    fn a_tall_draft_at_the_minimum_window_leaves_the_history_its_room() {
+        history_keeps_room_with_a_tall_draft((640.0, 480.0));
+    }
+
+    #[test]
+    fn a_tall_draft_in_the_narrow_layout_leaves_the_history_its_room() {
+        history_keeps_room_with_a_tall_draft(NARROW_SCENE_SIZE);
     }
 }

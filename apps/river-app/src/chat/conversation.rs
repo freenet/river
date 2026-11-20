@@ -31,8 +31,16 @@ const COLUMN_MAX_W: f32 = GUTTER + BODY_MAX_W + 24.0;
 /// The most lines the composer grows to before it scrolls.
 const COMPOSER_MAX_LINES: usize = 8;
 
-pub(super) fn conversation(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
-    col()
+pub(super) fn conversation(
+    chat: &Chat,
+    room: &Room,
+    narrow: bool,
+    win_h: f32,
+    field_h: f32,
+    p: &Palette,
+    k: &Kit,
+) -> El {
+    let mut c = col()
         .key("conversation")
         // Escape abandons a reply or an edit wherever focus is in the conversation, not only
         // in the composer (a reply started with the mouse leaves focus on the message). Inner
@@ -43,8 +51,12 @@ pub(super) fn conversation(chat: &Chat, room: &Room, narrow: bool, p: &Palette, 
         .min_w(0.0)
         .h_full()
         .child(header(chat, room, narrow, p, k))
-        .child(hline(p))
-        .child(history(chat, room, p, k))
+        .child(hline(p));
+    // Between the header and the history, which gives up the room.
+    if let Some(panel) = super::search::search_panel(chat, win_h, field_h, p, k) {
+        c = c.child(panel).child(hline(p));
+    }
+    c.child(history(chat, room, p, k))
         .child(composer(chat, room, p, k))
 }
 
@@ -406,6 +418,7 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
                 col().grow(1.0).min_w(0.0).child(message_el(room, m, p, k)),
             )
         };
+        let flashing = chat.flashing() == Some(m.key.as_str());
         let mut line = row()
             .key(format!("row-{}", m.key))
             .w_full()
@@ -418,6 +431,10 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
             .hover(if mine { p.own_row_hover } else { p.row_hover })
             .child(gutter)
             .child(content);
+        if flashing {
+            // Just jumped to from the search panel: marked until it fades out.
+            line = line.fill(p.accent_soft);
+        }
         if let Some(bar) = actions(chat, room, m, p) {
             line = line.child(bar);
         }

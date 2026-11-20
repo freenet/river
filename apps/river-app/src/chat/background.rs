@@ -327,4 +327,17 @@ mod tests {
         chat.toggle_start_at_login();
         assert!(chat.background.is_none());
     }
+
+    #[test]
+    fn the_search_panel_does_not_stay_open_under_this_dialog() {
+        let mut chat = chat_with(Fake::new(true));
+        chat.set_rooms(crate::chat::example::data().rooms);
+        assert!(chat.search_chord());
+        chat.open_background();
+        assert!(
+            !chat.search_chord(),
+            "the chord is refused while it is open"
+        );
+        assert!(chat.search.is_none(), "and the panel is gone");
+    }
 }

@@ -132,6 +132,17 @@ pub struct Reveal {
     wait: u8,
 }
 
+impl Reveal {
+    /// A scroll to `message` in `room` that needs no wait: the room is already laid out.
+    pub fn at_once(room: &str, message: &str) -> Self {
+        Reveal {
+            room: room.to_owned(),
+            message: message.to_owned(),
+            wait: 0,
+        }
+    }
+}
+
 impl Chat {
     /// The overview's rows now.
     pub fn overview_rows(&self) -> Vec<OverviewRow> {
@@ -156,6 +167,7 @@ impl Chat {
         self.emoji_open = false;
         self.picker = None;
         self.members_overlay = false;
+        self.drop_search();
         self.composer.focused = false;
         self.overview = true;
         true

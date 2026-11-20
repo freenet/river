@@ -34,6 +34,7 @@ pub(crate) mod node_ui;
 mod notify_dialog;
 pub mod overview;
 mod quick_reply;
+pub mod search;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
 #[path = "../../../../ui/src/util/share_link.rs"]
@@ -303,6 +304,10 @@ pub struct Chat {
     pub update: crate::update::UpdateUi,
     /// The quick switcher (Ctrl+K), when open ([`switcher`]).
     pub switcher: Option<switcher::Switcher>,
+    /// The message search panel (Ctrl+F), when open ([`search`]).
+    pub search: Option<search::Search>,
+    /// A message marked for a moment after a jump from the search panel.
+    flash: Option<search::Flash>,
     /// Whether the unread and mentions overview is open ([`overview`]).
     pub overview: bool,
     /// A message to scroll to once the room it is in is on screen.
@@ -425,6 +430,8 @@ impl Chat {
             picked: HashMap::new(),
             notify_dialog: None,
             switcher: None,
+            search: None,
+            flash: None,
             overview: false,
             reveal: None,
             reply_notices: Default::default(),
@@ -715,6 +722,8 @@ impl Chat {
         self.clear_ban_confirm();
         self.notify_dialog = None;
         self.details = None;
+        // The search lists the room it was opened in.
+        self.drop_search();
         if self.selected.is_empty() {
             // Nothing was open, so what the composer holds belongs to no room yet: keep it,
             // unless it is empty and this room has a draft.
@@ -989,6 +998,10 @@ impl Chat {
             || self.picker.is_some();
         if covered {
             return false;
+        }
+        if self.search.is_some() {
+            self.close_search();
+            return true;
         }
         if self.emoji_open {
             self.emoji_open = false;
