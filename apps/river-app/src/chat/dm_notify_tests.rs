@@ -1043,6 +1043,94 @@ fn leaving_for_another_thread_also_merges_what_a_reply_left() {
     assert_eq!(w.s.chat.dm.compose.draft(&w.room, &w.peer), Some("second"));
 }
 
+/// A thread open, a reply refused into its stash (a first reply still waits), and `then` done.
+fn stashed_world() -> World {
+    let mut w = world_with_previews();
+    let t = w.target();
+    assert!(w.s.chat.open_dm(&w.room, &w.peer));
+    w.s.chat.dm_write("typing");
+    assert_eq!(w.s.reply_from_notification(&t, "first"), Ok(()));
+    assert_eq!(
+        w.s.reply_from_notification(&t, "second"),
+        Err(ReplyRefusal::Blocked)
+    );
+    w
+}
+
+#[test]
+fn choosing_another_room_merges_the_stash_into_the_threads_draft() {
+    let mut w = stashed_world();
+    let other = example::data().rooms[1].key.clone();
+    w.s.chat.select(&other);
+    assert!(!w.s.chat.dm.is_open());
+    assert_eq!(
+        w.s.chat.dm.compose.draft(&w.room, &w.peer),
+        Some("typing\nsecond")
+    );
+}
+
+#[test]
+fn a_thread_that_goes_away_under_the_user_merges_its_stash_too() {
+    let mut w = stashed_world();
+    // The peer leaves the room and the thread has no messages: nothing is left to show it as.
+    let mut rooms = rooms_with_sentinels();
+    let peer = w.peer.clone();
+    rooms[0].members.retain(|m| m.full_id.to_string() != peer);
+    w.s.chat
+        .show_node_rooms(rooms, None, LinkStatus::Live, 1001);
+    w.s.chat
+        .apply_dms_at(snap(&[&w.room.clone()], vec![]), w.secs);
+    assert!(!w.s.chat.dm.is_open(), "closed by the settle");
+    assert_eq!(
+        w.s.chat.dm.compose.draft(&w.room, &w.peer),
+        Some("typing\nsecond")
+    );
+}
+
+#[test]
+fn a_stash_that_does_not_fit_the_draft_is_kept_not_dropped() {
+    let mut w = stashed_world();
+    let key = (w.room.clone(), w.peer.clone());
+    // The user fills the box to the brim after the reply was stashed.
+    let max = super::quick_reply::MAX_DRAFT_CHARS;
+    w.s.chat.dm_write(&"x".repeat(max));
+    w.s.chat.close_dm();
+    assert_eq!(
+        w.s.chat.dm.compose.draft(&w.room, &w.peer).map(str::len),
+        Some(max)
+    );
+    assert_eq!(
+        w.s.chat.dm.compose.stash.get(&key).map(String::as_str),
+        Some("second"),
+        "still aside, tried again at the next leave"
+    );
+    // Room is made, and the next leave merges it.
+    assert!(w.s.chat.open_dm(&w.room, &w.peer));
+    w.s.chat.dm_write("short");
+    w.s.chat.close_dm();
+    assert_eq!(
+        w.s.chat.dm.compose.draft(&w.room, &w.peer),
+        Some("short\nsecond")
+    );
+}
+
+#[test]
+fn a_reply_is_refused_at_once_when_stash_and_live_draft_together_would_not_fit() {
+    let mut w = world_with_previews();
+    let t = w.target();
+    assert!(w.s.chat.open_dm(&w.room, &w.peer));
+    let max = super::quick_reply::MAX_DRAFT_CHARS;
+    w.s.chat.dm_write(&"x".repeat(max - 3));
+    assert_eq!(w.s.reply_from_notification(&t, "first"), Ok(()));
+    assert_eq!(
+        w.s.reply_from_notification(&t, "second"),
+        Err(ReplyRefusal::Blocked)
+    );
+    let line = w.s.chat.dm.compose.refusal_for(&w.room, &w.peer).unwrap();
+    assert!(line.contains("draft is full"), "{line}");
+    assert!(w.s.chat.dm.compose.stash.is_empty());
+}
+
 #[test]
 fn a_refusal_from_the_background_work_keeps_the_reply_in_the_stash_or_the_draft() {
     // Thread not open: the draft.
@@ -1085,9 +1173,17 @@ fn an_identical_reply_after_an_unanswered_one_is_refused_instead_of_sent_twice()
     // A different text is a different message.
     assert_eq!(w.s.reply_from_notification(&t, "hello"), Ok(()));
     assert_eq!(w.commands().len(), 2);
-    // And the composer does not ask about a reply it never sent.
-    let key = (w.room.clone(), w.peer.clone());
-    assert!(!w.s.chat.dm.compose.needs_confirm(&key));
+    // The way out is the conversation, where the composer asks first, as for its own sends.
+    assert!(
+        w.s.chat
+            .dm_tick(Instant::now() + dm_compose::ANSWER_WAIT * 4)
+    );
+    assert!(w.s.chat.open_dm(&w.room, &w.peer));
+    w.s.chat.dm_write("hi");
+    assert!(w.s.chat.dm_needs_confirm());
+    assert!(!w.s.chat.dm_send(), "Enter does not send it again unasked");
+    assert!(w.s.chat.dm_send_again(), "the confirmed send goes");
+    assert_eq!(w.commands().len(), 3);
 }
 
 #[test]

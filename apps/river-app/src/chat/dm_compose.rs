@@ -97,7 +97,7 @@ pub struct DmCompose {
     /// their box is live and is never written to behind the user's back. Merged into the
     /// thread's draft when it is closed or left ([`Chat::merge_stash`]); for a thread that is not
     /// open the text goes to the draft at once.
-    stash: HashMap<(String, String), String>,
+    pub(super) stash: HashMap<(String, String), String>,
 }
 
 impl std::fmt::Debug for DmCompose {
@@ -157,9 +157,9 @@ impl DmCompose {
     /// screen asks first.
     pub(super) fn needs_confirm(&self, key: &(String, String)) -> bool {
         let text = self.drafts.get(key).map_or("", |d| d.text.as_str());
-        self.sends.iter().any(|s| {
-            s.silent && !s.notification && s.room == key.0 && s.peer == key.1 && s.sent == text
-        })
+        self.sends
+            .iter()
+            .any(|s| s.silent && s.room == key.0 && s.peer == key.1 && s.sent == text)
     }
 
     /// Whether the thread has a send, from anywhere, that was not answered in time and whose
@@ -506,7 +506,8 @@ impl Chat {
         } else if self.dm.compose.has_unanswered(&key, &text) {
             Some((
                 ReplyRefusal::Blocked,
-                "River has not answered for an identical message, which may still go out"
+                "River has not answered for an identical message, which may still go out. \
+                 Send it from the conversation if you still want it sent"
                     .to_owned(),
             ))
         } else {
@@ -559,7 +560,17 @@ impl Chat {
         }
         .unwrap_or("");
         let joined = appended(held, text);
-        if joined.chars().count() > MAX_DRAFT_CHARS {
+        // The stash is added to the live draft when the thread is left, so both count.
+        let live = if open {
+            self.dm
+                .compose
+                .drafts
+                .get(key)
+                .map_or(0, |d| d.text.chars().count())
+        } else {
+            0
+        };
+        if joined.chars().count() + live + usize::from(live > 0) > MAX_DRAFT_CHARS {
             return "It could not be kept: the draft is full.";
         }
         if open {
@@ -586,6 +597,10 @@ impl Chat {
         let joined = appended(&draft.text, &text);
         if joined.chars().count() <= MAX_DRAFT_CHARS {
             draft.replace_text(joined);
+        } else {
+            // No room in the draft: the text stays aside, and is tried again when the thread is
+            // next left. It is never dropped.
+            self.dm.compose.stash.insert(key.clone(), text);
         }
     }
 

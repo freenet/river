@@ -332,7 +332,7 @@ plaintext in the chat delegate.
   what a room held when met is seeded and never notifies), it is inbound from a current member,
   its SIGNED time is at most `MAX_NOTIFY_AGE_SECS` (1 hour) before now (older ones, from a stale
   first state or a long outage, count as unread but stay quiet; a time in the future counts as
-  recent, so a forger only ever gets one notification per token), the thread is not archived (a
+  recent, so a forger only ever gets one notification per token; clock skew applies: a sender whose clock is more than an hour behind never notifies the receiver, and a receiver whose clock is fast does the same, unread still counting), the thread is not archived (a
   message past the archive cutoff revives it and notifies), no deletion of that peer's messages is
   waiting, and the row opened. A row that cannot be opened (placeholder) is unread, never
   remembered as known, and notifies once it opens if still recent. `network_seen` is set by the
@@ -365,9 +365,9 @@ plaintext in the chat delegate.
   marking read). Click opens the thread; the reply field sends through the composer's checks
   (`Chat::send_dm_reply`) and NEVER touches the open thread's live box: a refused reply (and a
   later refusal from the background work) goes to a per-thread stash merged into the draft when
-  the thread is left (or at once for a thread that is not open); a send from a notification never
+  the thread is left by ANY path (Back, choosing a room, the room or peer going: `Chat::leave_dm` is the one place `dm.open` is cleared), or at once for a thread that is not open; text that does not fit the draft then stays in the stash, never dropped; a send from a notification never
   clears the box when it is answered, and an identical reply after an unanswered one is refused
-  rather than sent twice. Mark as read reads the thread up to the message shown. The window title
+  rather than sent twice (the thread's own box asks to confirm, as for its own sends). Mark as read reads the thread up to the message shown. The window title
   and tray count include DM unread, except for muted rooms and archived threads.
 - **Native app archive** (`apps/river-app`, `src/rooms/dm_archive.rs`, `src/chat/dm_archive.rs`):
   the same data and rules as the web UI, written by the same compare-and-swap as the sent text but

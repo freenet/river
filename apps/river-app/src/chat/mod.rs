@@ -815,7 +815,7 @@ impl Chat {
             self.read.insert(key.to_owned(), mark);
         }
         // Choosing a room shows its conversation, whatever thread was open.
-        self.dm.open = None;
+        self.leave_dm();
         if key == self.selected {
             return;
         }

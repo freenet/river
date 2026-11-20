@@ -298,7 +298,7 @@ pub struct Limiter {
     /// After a notification could not be queued, nothing is let through until then.
     paused_until: Option<Instant>,
     /// When direct-message notifications were let through, by room key (see [`DM_PER_ROOM`]).
-    dm_stamps: HashMap<String, Vec<Instant>>,
+    dm_stamps: HashMap<String, Vec<(Instant, String)>>,
 }
 
 /// How long to hold everything back after the shell could not take a notification.
@@ -359,7 +359,7 @@ impl Limiter {
             .dm_stamps
             .get(room)?
             .iter()
-            .copied()
+            .map(|(t, _)| *t)
             .filter(|t| now.saturating_duration_since(*t) < DM_CAP_WINDOW)
             .collect();
         if recent.len() < DM_PER_ROOM {
@@ -428,8 +428,8 @@ impl Limiter {
             clock.last = Some(now);
             if let Some((room, _)) = parse_dm_target(&a.room_key) {
                 let stamps = self.dm_stamps.entry(room.to_owned()).or_default();
-                stamps.retain(|t| now.saturating_duration_since(*t) < DM_CAP_WINDOW);
-                stamps.push(now);
+                stamps.retain(|(t, _)| now.saturating_duration_since(*t) < DM_CAP_WINDOW);
+                stamps.push((now, a.room_key.clone()));
             }
             if let Some(h) = clock.held.take() {
                 // Before folding the counts in: the rank is of the message shown by each side.
@@ -522,8 +522,10 @@ impl Limiter {
                 clock.last = clock.prev_last;
                 if let Some((room, _)) = parse_dm_target(&a.room_key)
                     && let Some(stamps) = self.dm_stamps.get_mut(room)
+                    && let Some(at) = stamps.iter().rposition(|(_, k)| *k == a.room_key)
                 {
-                    stamps.pop();
+                    // This thread's own stamp, not whichever thread of the room came last.
+                    stamps.remove(at);
                 }
                 clock.hold(a);
             }
@@ -2007,6 +2009,19 @@ mod tests {
         let out = lim.admit(Vec::new(), t0 + DM_CAP_WINDOW + Duration::from_secs(1));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].room_key, dm_target("r", "9"));
+    }
+
+    #[test]
+    fn a_refund_takes_back_the_stamp_of_its_own_thread_not_the_rooms_newest() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now() + SETTLE;
+        let a = dm("r", "1");
+        let b = dm("r", "2");
+        assert_eq!(lim.admit(vec![a.clone()], t0).len(), 1);
+        assert_eq!(lim.admit(vec![b], t0 + Duration::from_secs(1)).len(), 1);
+        lim.refund(vec![a], t0 + Duration::from_secs(2));
+        let kept: Vec<&str> = lim.dm_stamps["r"].iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(kept, [dm_target("r", "2")]);
     }
 
     #[test]

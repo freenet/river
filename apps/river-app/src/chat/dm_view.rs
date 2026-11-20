@@ -688,22 +688,32 @@ impl Chat {
     /// Close the open thread when there is nothing left to show it as: its room is gone, or its
     /// peer has no messages and is not a member of the room.
     pub(super) fn dm_settle(&mut self) {
+        // Before what waits for a room that is gone is dropped, so what a reply left for the
+        // open thread reaches its draft.
+        if let Some((room, uid)) = self.dm.open.clone() {
+            let known = self.rooms().iter().any(|r| {
+                r.key == room
+                    && (self.dm.thread(&room, &uid).is_some()
+                        || r.member_by_peer_key(&uid).is_some_and(|m| m.id != r.me))
+            });
+            if !known {
+                self.leave_dm();
+            }
+        }
         self.dm_forget_gone();
         // A confirmation belongs to the thread that was open when it was asked.
         let open = self.dm.open.clone();
         self.dm.purge.keep_confirm_for(open.as_ref());
-        let Some((room, uid)) = self.dm.open.clone() else {
-            return;
-        };
-        let known = self.rooms().iter().any(|r| {
-            r.key == room
-                && (self.dm.thread(&room, &uid).is_some()
-                    || r.member_by_peer_key(&uid).is_some_and(|m| m.id != r.me))
-        });
-        if !known {
-            self.dm.open = None;
-            self.dm.purge.keep_confirm_for(None);
-        }
+    }
+
+    /// Stop showing the open thread, whatever the reason (Back, another room chosen, the room or
+    /// the peer gone): the one place `dm.open` is cleared, so what a notification reply left in
+    /// the thread's stash always reaches its draft ([`Chat::merge_stash`]). Returns the thread.
+    pub(super) fn leave_dm(&mut self) -> Option<(String, String)> {
+        let closed = self.dm.open.take()?;
+        self.merge_stash(&closed);
+        self.dm.purge.keep_confirm_for(None);
+        Some(closed)
     }
 
     /// What waits for an answer for a room that is gone will not get one.
@@ -773,11 +783,9 @@ impl Chat {
 
     /// Back to the room that was open.
     pub fn close_dm(&mut self) {
-        let Some(closed) = self.dm.open.take() else {
+        let Some(closed) = self.leave_dm() else {
             return;
         };
-        self.dm.purge.keep_confirm_for(None);
-        self.merge_stash(&closed);
         // What was typed stays as the thread's draft; the box gives up the keyboard.
         if let Some(d) = self.dm.compose.drafts_mut().get_mut(&closed) {
             d.focused = false;

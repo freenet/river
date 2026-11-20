@@ -85,6 +85,9 @@ struct App {
     /// The window's own direct-message state, fed every snapshot as the app feeds it, and the
     /// new messages it found (what the app turns into notifications), oldest first.
     dm_ui: river_app::chat::dm_view::DmUi,
+    /// Rooms the snapshots listed as read from the network (met): what arrives in one afterwards
+    /// is news, so a test waits for it before it sends.
+    dm_met: std::collections::HashSet<String>,
     dm_news: Vec<river_app::chat::DmArrival>,
     access: Option<Access>,
 }
@@ -125,6 +128,7 @@ impl App {
             dm_purges: 0,
             dm_archived: Vec::new(),
             dm_ui: Default::default(),
+            dm_met: Default::default(),
             dm_news: Vec::new(),
             access: None,
         }
@@ -169,6 +173,7 @@ impl App {
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
                 RoomsUpdate::Export { room, token } => self.exports.push((room, token)),
                 RoomsUpdate::Dms(snapshot) => {
+                    self.dm_met.extend(snapshot.room_keys.iter().cloned());
                     self.dm_ui.apply(snapshot.clone());
                     self.dm_news.extend(self.dm_ui.take_arrivals());
                     self.dm_purges = snapshot.purges.len();
@@ -507,6 +512,14 @@ fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
         app.dm_results
             .iter()
             .any(|(t, r)| *t == 1 && r.as_ref().is_err_and(|e| e.contains("Write something")))
+    });
+    // B must have read the room from the network first: what is in a room when it is first read
+    // is seeded as seen, so a message sent before that is not news.
+    bob.until("node B has read the room from the network", |app| {
+        app.dm_met.contains(key)
+    });
+    alice.until("node A has read the room from the network", |app| {
+        app.dm_met.contains(key)
     });
     alice.send(
         key,
