@@ -192,6 +192,13 @@ impl Chat {
         }
     }
 
+    /// Wait at least one frame before the pending reveal scrolls.
+    pub(super) fn delay_reveal(&mut self) {
+        if let Some(r) = &mut self.reveal {
+            r.wait = r.wait.max(1);
+        }
+    }
+
     /// The message waiting to be scrolled to, if any.
     pub fn pending_reveal(&self) -> Option<&Reveal> {
         self.reveal.as_ref()

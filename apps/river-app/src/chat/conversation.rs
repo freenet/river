@@ -918,6 +918,26 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     for n in &room.notices {
         column = column.child(notice(n, p));
     }
+    for (key, said) in chat.reply_notices(&room.key) {
+        let key = key.to_owned();
+        column = column.child(
+            col()
+                .key("reply-notice")
+                .w_full()
+                .gap(4.0)
+                .px(12.0)
+                .py(8.0)
+                .radius(8.0)
+                .border(1.0, p.line_strong)
+                .child(label(said.to_owned(), st::SMALL, p.danger).wrap().w_full())
+                .child(text_button(
+                    "reply-notice-dismiss".to_owned(),
+                    "Dismiss",
+                    p.text_secondary,
+                    move |s| s.chat.dismiss_reply_notice(&key),
+                )),
+        );
+    }
     if let Some(reason) = &room.send_block {
         // Said in full, not only as the placeholder, which a long reason would not fit.
         column = column.child(

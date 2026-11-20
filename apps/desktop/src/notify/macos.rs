@@ -2,21 +2,18 @@
 //! identifier is `org.freenet.River`, see `packaging/macos/Info.plist`). Run outside the
 //! bundle (`cargo run`) there is no bundle identifier and nothing is shown.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use river_app::RiverApp;
 use river_app::notify::Notification;
 use rune::AppHandle;
 
-use super::Waiters;
+use super::{ACTION_MARK_READ, Waiters};
 
 pub struct Backend {
     state: State,
     waiters: Waiters,
-    /// A number for each notification: the platform replaces by room, and the waiter of a
-    /// replaced one is not known to end, so each gets its own.
-    next: AtomicU64,
 }
 
 enum State {
@@ -38,7 +35,6 @@ impl Backend {
         Backend {
             state: State::Unasked,
             waiters: Waiters::default(),
-            next: AtomicU64::new(0),
         }
     }
 
@@ -75,6 +71,10 @@ impl Backend {
         let mut note = notify_rust::Notification::new();
         // The same id replaces the room's earlier notification.
         note.summary(&n.title).body(&n.body).id(n.room_key.as_str());
+        if n.actions {
+            // The system's own reply field (typed text arrives as `Reply`), and a button.
+            note.reply("Reply").action(ACTION_MARK_READ, "Mark as read");
+        }
         let shown = match note.show() {
             Ok(shown) => shown,
             Err(e) => {
@@ -82,10 +82,24 @@ impl Backend {
                 return;
             }
         };
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        // The system replaces the room's earlier notification (same identifier), so they share
+        // an id here too: a click then acts once, on the message showing now.
+        let id = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            n.room_key.hash(&mut h);
+            h.finish()
+        };
+        let waiters = self.waiters.clone();
+        let room = n.room_key.clone();
         self.waiters
-            .spawn(n.room_key.clone(), id, handle.clone(), move |on| {
-                if let Err(e) = shown.wait_for_response(on) {
+            .spawn(n.room_key.clone(), n.message_key.clone(), id, handle.clone(), move |on| {
+                if let Err(e) = shown.wait_for_response(on)
+                    // The system keeps one response sender per identifier, so a notification
+                    // that replaced this one took it over and this wait ends: expected, and
+                    // the newer waiter hears the click.
+                    && !waiters.replaced(&room, id)
+                {
                     // Said once: a click on this notification will not be heard.
                     static SAID: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);

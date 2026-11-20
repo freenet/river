@@ -9,6 +9,7 @@ pub mod node;
 #[cfg(test)]
 mod node_ui_tests;
 pub mod notify;
+mod notify_actions;
 pub mod rooms;
 pub mod setup;
 pub mod update;
@@ -246,6 +247,8 @@ impl RiverApp {
                         body,
                         mention: false,
                         count: 1,
+                        message_key: String::new(),
+                        actions: false,
                     });
                 }
             }
@@ -1103,6 +1106,13 @@ pub const SCENES: &[Scene] = &[
     ("chat-connection-lost", |s| {
         connect(s);
         s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
+    }),
+    // A reply typed into a notification that could not be sent: said above the composer, and
+    // the text is kept in the room's draft.
+    ("chat-reply-not-sent", |s| {
+        connect(s);
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+        let _ = s.chat.send_reply("gone", "see you at six");
     }),
     // River has moved to a newer chat delegate or room contract than this build carries: the
     // rooms show, and nothing can be written.
