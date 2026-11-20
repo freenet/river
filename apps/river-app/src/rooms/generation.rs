@@ -115,6 +115,11 @@ pub const UPDATE_REQUIRED_SEND: &str = "A newer version of River is out. Update 
 pub const UPDATE_REQUIRED_PURGE: &str = "A newer version of River is out. Update this app to \
      delete messages here; until then it only shows your rooms.";
 
+/// What the thread says once River has moved on, about archiving a conversation: the change is
+/// saved with the other things River keeps, and this build saves nothing then.
+pub const UPDATE_REQUIRED_ARCHIVE: &str = "A newer version of River is out. Update this app to \
+     archive conversations; until then it only shows your rooms.";
+
 /// The two artifacts whose re-key strands this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Artifact {

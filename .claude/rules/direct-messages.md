@@ -324,6 +324,34 @@ plaintext in the chat delegate.
   message must add a new member (an invitee key the room holds already is refused), an
   invitation is size-bounded before it is decoded, and the note shown is cleaned of hidden and
   reordering characters.
+- **Native app archive** (`apps/river-app`, `src/rooms/dm_archive.rs`, `src/chat/dm_archive.rs`):
+  the same data and rules as the web UI, written by the same compare-and-swap as the sent text but
+  in writes of their own, with their own pacing (`DmOp::Archive`: add or raise an entry, remove
+  one, or remove one only if its cutoff is below a given time; it edits only the entries of the
+  one thread, keeping their other fields, and refuses on the text write's terms). Removals and
+  new entries go in separate writes, removals first, because taking an entry out is never refused
+  for size and a new one can be. Keyed by `(room owner key, peer's FULL member id)`, exactly what
+  the web UI stores. The two invariants above are ported with their tests (`archive_cutoff_*`,
+  the gate, the re-land case): the cutoff is the newest INBOUND time, the larger of the thread as
+  shown and the room as it is, never clamped; inbound sync drops the entry only through the gate,
+  as a conditional removal the write checks against the cutoff it finds (so a fresher archive
+  from another device is not destroyed). **Raw times:** the cutoff, the rail's comparison and the
+  gate use the time as the peer signed it (`DmThread::last_inbound_signed`), as the web UI does;
+  the clamped time native shows (2100, `MAX_SHOWN_SECS`) is for display and read positions only.
+  A peer who signs a far-future time keeps their thread archived until real time passes it: the
+  same accepted residual as the web UI's. **Own send:** a send unarchives the thread
+  unconditionally, but only when this app's copy of the list holds the thread or has not been
+  read yet. The web UI asks on every send; native declines that (it would cost a delegate read
+  per message), so a thread another device archived since the last read is not unarchived by a
+  send from here. To keep the gap small, a send into a thread the copy does not hold asks for ONE
+  re-read of the stored rooms at the next tick (at most one per 30 s), so the next send or the
+  gated sync sees it. The list is recomputed from the last read on every snapshot, so entries the
+  web UI writes show and ones it removes go. Not done: putting back an entry the web UI's blind
+  save overwrote (it cannot be told from a deliberate Un-archive there, and would fight it); the
+  thread shows again and archiving it again works. A change the user made shows at once and is
+  owed until a write ends well; if writes never work (a value this build cannot read, a value too
+  big for one more entry) it holds for the session and the failure is only logged, as the saved
+  text's is.
 - **CLI side**: persists the same `OutboundDmStore` shape into
   `outbound_dms.json` in the riverctl data dir (consistent with
   `rooms.json`'s plaintext-on-disk threat model).

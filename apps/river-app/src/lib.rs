@@ -1630,6 +1630,25 @@ pub const SCENES: &[Scene] = &[
     ("chat-dm-narrow", |s| {
         dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {})
     }),
+    // Archive: a thread archived (as the web UI can) with the fold-out closed and open, the
+    // moment after archiving one (the Undo line), and narrow. The row action and the header's
+    // are in the rail and thread scenes above.
+    ("chat-dm-archived", |s| dm_scene(s, None, archive_maya)),
+    ("chat-dm-archived-open", |s| {
+        dm_scene(s, None, archive_maya);
+        s.chat.dm_archived_toggle();
+    }),
+    ("chat-dm-archive-undo", |s| {
+        dm_scene(s, None, |_| {});
+        assert!(
+            s.chat
+                .dm_archive_at("town-square", "12", std::time::Instant::now())
+        );
+    }),
+    ("chat-dm-archived-narrow", |s| {
+        dm_scene(s, None, archive_maya);
+        s.chat.dm_archived_toggle();
+    }),
     // The thread's composer: empty, with text (several lines), over the cap, a send waiting for
     // its answer, a send the room refused, a room that does not let you send, and narrow.
     ("chat-dm-composer", |s| {
@@ -2570,6 +2589,20 @@ fn invite_picker_scene(s: &mut RiverApp, choose: bool, tweak: impl FnOnce(&mut C
         s.chat
             .invite_write("Thought you would enjoy this room. Say hi to everyone.");
     }
+}
+
+/// Archive the example thread with Maya, as the web UI would have: at her newest message.
+fn archive_maya(snapshot: &mut chat::dm_model::DmSnapshot) {
+    let t = snapshot
+        .threads
+        .iter()
+        .find(|t| t.peer_key == "12")
+        .expect("the example has Maya");
+    snapshot.archived.push(chat::dm_model::DmArchived {
+        room: t.room.clone(),
+        peer_key: t.peer_key.clone(),
+        hidden_at_ts: t.last_inbound_signed,
+    });
 }
 
 /// The example thread with Priya open, as a node's room (so the composer sends), then `tweak`.

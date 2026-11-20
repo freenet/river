@@ -7249,6 +7249,1133 @@ mod dm_saves {
         // The key is only written through the work queue's compare-and-swap.
         assert!(norm(include_str!("work.rs")).contains("dm_cache::KEY.to_vec()"));
     }
+
+    // Archiving a thread ------------------------------------------------------------------------
+
+    mod archiving {
+        use super::*;
+        use crate::rooms::dm_archive::{ArchiveOp, ThreadKey};
+        use river_core::room_state::direct_messages::{
+            MAX_DM_FUTURE_SKEW_SECS, compose_direct_message,
+        };
+
+        /// The session's code without its tests and its comments. Fails if the marker that ends
+        /// the code is not there, rather than reading the whole file.
+        fn session_code() -> String {
+            include_str!("session.rs")
+                .replace("\r\n", "\n")
+                .split_once("#[cfg(test)]\n#[path = \"session_tests.rs\"]")
+                .expect("the marker of the end of the code")
+                .0
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn archive_command(room: &str, peer: &str, row_inbound_ts: u64) -> Command {
+            Command {
+                room: room.to_owned(),
+                action: Action::ArchiveDm {
+                    peer: crate::rooms::dm::peer_from_key(peer).expect("a member key"),
+                    row_inbound_ts,
+                },
+            }
+        }
+
+        fn unarchive_command(room: &str, peer: &str) -> Command {
+            Command {
+                room: room.to_owned(),
+                action: Action::UnarchiveDm {
+                    peer: crate::rooms::dm::peer_from_key(peer).expect("a member key"),
+                },
+            }
+        }
+
+        fn ask(rooms: &mut Rooms, command: Command) -> bool {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(command).unwrap();
+            rooms.take_commands(&rx)
+        }
+
+        /// The room's one peer (its owner) writes to the user at `at`.
+        fn inbound(rooms: &mut Rooms, at: u64) {
+            let f = crate::rooms::room_tests::Fixture::new();
+            let owner = owner_of(rooms);
+            let me = rooms.list[0].stored.self_verifying_key().unwrap();
+            let m = compose_direct_message(&f.owner, &me, &owner, at, at, b"hi").unwrap();
+            rooms.list[0]
+                .stored
+                .room_state
+                .direct_messages
+                .messages
+                .push(m);
+        }
+
+        fn thread_of(rooms: &Rooms, peer: &str) -> ThreadKey {
+            (
+                owner_of(rooms).to_bytes(),
+                crate::rooms::dm::peer_from_key(peer).unwrap(),
+            )
+        }
+
+        /// The archive list the window would be sent now. A fresh snapshot is forced, so what
+        /// this reads is the state and not whether the last one was sent: that is
+        /// `the_window_is_sent_a_new_snapshot_when_the_archive_list_changes`.
+        fn archived(rooms: &mut Rooms) -> Vec<(String, u64)> {
+            rooms.dm_sent = None;
+            rooms
+                .dm_snapshot()
+                .expect("a forced snapshot")
+                .archived
+                .into_iter()
+                .map(|a| (a.peer_key, a.hidden_at_ts))
+                .collect()
+        }
+
+        /// The room's one peer's message to nobody in particular is not what this is: the USER
+        /// writes to the peer at `at`, in the room's own state, as a message the room holds.
+        fn outbound(rooms: &mut Rooms, at: u64) {
+            let f = crate::rooms::room_tests::Fixture::new();
+            let owner = owner_of(rooms);
+            let m = compose_direct_message(&f.me, &owner, &owner, at, at, b"mine").unwrap();
+            rooms.list[0]
+                .stored
+                .room_state
+                .direct_messages
+                .messages
+                .push(m);
+        }
+
+        /// The store as a newer web UI writes it, with archive entries of other threads and a
+        /// field this build does not know, read by the cache.
+        fn web_store(rooms: &mut Rooms, store: &mut Store, peers: &[(u8, u64)]) {
+            let owner = owner_of(rooms);
+            let mut web = web_copy(&owner);
+            web.hidden_threads = peers
+                .iter()
+                .map(|(p, ts)| HiddenDmThreadEntry {
+                    room_owner_vk: owner.to_bytes(),
+                    peer: MemberId::from(&vk(*p)),
+                    hidden_at_ts: *ts,
+                })
+                .collect();
+            store.web_writes(&web);
+            read_again(rooms, store);
+        }
+
+        #[test]
+        fn archiving_shows_at_once_at_the_peers_newest_time_of_the_row_or_the_room() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            inbound(&mut rooms, 100);
+            inbound(&mut rooms, 160);
+            // The window's row lags: it saw 100. The room has 160, which is the cutoff.
+            assert!(ask(&mut rooms, archive_command(&key, &peer, 100)));
+            assert_eq!(archived(&mut rooms), vec![(peer.clone(), 160)]);
+            // Nothing written yet: only owed.
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            // The row ahead of the room wins instead.
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            inbound(&mut rooms, 100);
+            ask(&mut rooms, archive_command(&key, &peer, 130));
+            assert_eq!(archived(&mut rooms), vec![(peer, 130)]);
+        }
+
+        #[test]
+        fn our_own_messages_never_set_the_cutoff() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            inbound(&mut rooms, 100);
+            send(&mut rooms, &key, &peer, "my reply, stamped by my clock");
+            ask(&mut rooms, archive_command(&key, &peer, 100));
+            // `send` unarchived nothing (it was not archived), and the cutoff is the peer's 100.
+            assert_eq!(archived(&mut rooms), vec![(peer, 100)]);
+        }
+
+        #[test]
+        fn an_archived_thread_is_written_to_the_store_keeping_everything_else() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            web_store(&mut rooms, &mut store, &[(61, 9)]);
+            inbound(&mut rooms, 100);
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.log, vec!["read", "store"]);
+            let out = store.store();
+            assert_eq!(texts(&out), vec!["from the web"], "the entries are kept");
+            let ours = HiddenDmThreadEntry {
+                room_owner_vk: owner_of(&rooms).to_bytes(),
+                peer: crate::rooms::dm::peer_from_key(&peer).unwrap(),
+                hidden_at_ts: 100,
+            };
+            assert_eq!(out.hidden_threads.len(), 2);
+            assert!(out.hidden_threads.contains(&ours));
+            // It is no longer owed, and the list shown is the same.
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            let shown = archived(&mut rooms);
+            assert!(shown.contains(&(peer, 100)));
+            // Nothing more is written while nothing changes.
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.log.len(), 2);
+        }
+
+        #[test]
+        fn sending_into_the_thread_just_archived_leaves_only_the_text_to_write() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            send(&mut rooms, &key, &peer, "reply");
+            // The send unarchives (it was archived in the same breath), so the net change is the
+            // text alone.
+            run(&mut rooms, &mut store, &mut now, true);
+            let out = store.store();
+            assert_eq!(texts(&out), vec!["reply"]);
+            assert!(out.hidden_threads.is_empty());
+        }
+
+        #[test]
+        fn nothing_is_written_while_the_gate_is_shut_or_the_value_unread_and_the_archive_still_shows()
+         {
+            let (mut rooms, _f, key, peer) = dm_rooms();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            assert!(!rooms.dm_cache().hydrated());
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.log.is_empty(), "never read: {:?}", store.log);
+            assert_eq!(
+                archived(&mut rooms),
+                vec![(peer.clone(), 0)],
+                "shown anyway"
+            );
+            // Read at last (nothing stored): it goes, but not while the write gate is shut or
+            // River has moved on.
+            rooms.dm_cache.note_read(DmRead::NotListed, true);
+            run(&mut rooms, &mut store, &mut now, false);
+            rooms.update_required = true;
+            run(&mut rooms, &mut store, &mut now, true);
+            rooms.update_required = false;
+            assert!(store.log.is_empty(), "{:?}", store.log);
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.stores(), 1);
+            assert_eq!(store.store().hidden_threads.len(), 1);
+        }
+
+        #[test]
+        fn a_value_this_app_cannot_read_is_not_written_over_and_the_archive_stays_owed() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            store.value = Some(b"\xa1\x67entries\x01".to_vec());
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.log, vec!["read"]);
+            assert_eq!(store.value.as_deref(), Some(&b"\xa1\x67entries\x01"[..]));
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            assert_eq!(archived(&mut rooms), vec![(peer, 0)]);
+            assert_eq!(rooms.archive_saver.failures(), 1);
+            assert_eq!(rooms.dm_saver.failures(), 0, "the text's pacing is its own");
+        }
+
+        #[test]
+        fn a_store_that_conflicts_is_read_again_and_the_web_uis_archive_survives() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            web_store(&mut rooms, &mut store, &[(61, 9)]);
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            // The web UI archives another thread and sends a text after we read and before our
+            // store is checked.
+            let owner = owner_of(&rooms);
+            let mut newer = web_copy(&owner);
+            newer.hidden_threads.push(HiddenDmThreadEntry {
+                room_owner_vk: owner.to_bytes(),
+                peer: MemberId::from(&vk(62)),
+                hidden_at_ts: 77,
+            });
+            store.before_cas = Some(Box::new(move |s| s.web_writes(&newer)));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.log, vec!["read", "store", "read", "store"]);
+            let out = store.store();
+            assert_eq!(out.hidden_threads.len(), 3, "{:?}", out.hidden_threads);
+            assert!(
+                out.hidden_threads
+                    .iter()
+                    .any(|h| h.peer == MemberId::from(&vk(62)) && h.hidden_at_ts == 77)
+            );
+            assert_eq!(texts(&out), vec!["from the web"]);
+        }
+
+        #[test]
+        fn a_failed_write_is_tried_again_after_a_wait_and_a_bounded_number_of_times() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            rooms.archive_saver =
+                DmSaver::with_waits(Duration::from_secs(10), Duration::from_secs(40));
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            store.refuse = true;
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.stores(), 1);
+            assert!(!rooms.archive_saver.due(now), "it waits");
+            assert_eq!(archived(&mut rooms), vec![(peer.clone(), 0)], "still shown");
+            // Later it goes again and works.
+            store.refuse = false;
+            now += Duration::from_secs(1_000);
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.store().hidden_threads.len(), 1);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            // A write that keeps failing stops after the bound.
+            store.refuse = true;
+            ask(&mut rooms, unarchive_command(&key, &peer));
+            for _ in 0..(MAX_FAILURES * 2) {
+                now += Duration::from_secs(1_000);
+                run(&mut rooms, &mut store, &mut now, true);
+            }
+            assert_eq!(rooms.archive_saver.failures(), MAX_FAILURES);
+            assert_eq!(
+                rooms.dm_cache().archive_owed().len(),
+                1,
+                "kept for the session"
+            );
+        }
+
+        #[test]
+        fn the_last_thing_the_user_did_to_a_thread_is_what_is_written() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            ask(&mut rooms, archive_command(&key, &peer, 5));
+            ask(&mut rooms, unarchive_command(&key, &peer));
+            ask(&mut rooms, archive_command(&key, &peer, 8));
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1, "one per thread");
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.store().hidden_threads[0].hidden_at_ts, 8);
+            // And Un-archive removes it from the store, whatever the cutoff.
+            ask(&mut rooms, unarchive_command(&key, &peer));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.store().hidden_threads.is_empty());
+            assert!(archived(&mut rooms).is_empty());
+        }
+
+        #[test]
+        fn sending_into_an_archived_thread_unarchives_it_unconditionally() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            inbound(&mut rooms, 100);
+            ask(&mut rooms, archive_command(&key, &peer, 100));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.store().hidden_threads.len(), 1);
+            // The peer's newest is still 100, at the cutoff: a gated unhide would do nothing.
+            send(&mut rooms, &key, &peer, "hello again");
+            assert!(archived(&mut rooms).is_empty(), "shown unarchived at once");
+            run(&mut rooms, &mut store, &mut now, true);
+            let out = store.store();
+            assert!(out.hidden_threads.is_empty());
+            assert_eq!(texts(&out), vec!["hello again"]);
+        }
+
+        #[test]
+        fn sending_into_a_thread_that_is_not_archived_writes_no_archive_change() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            send(&mut rooms, &key, &peer, "plain");
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            run(&mut rooms, &mut store, &mut now, true);
+            // Only the text's own write: a read and a store.
+            assert_eq!(store.log, vec!["read", "store"]);
+        }
+
+        #[test]
+        fn sending_before_the_archive_list_is_read_still_removes_a_stored_archive() {
+            let (mut rooms, _f, key, peer) = dm_rooms();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            // Not read yet: the thread may be archived in the delegate.
+            assert!(!rooms.dm_cache().hydrated());
+            send(&mut rooms, &key, &peer, "early");
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            // The delegate has the archive, from the web UI.
+            let owner = owner_of(&rooms);
+            let mut web = web_copy(&owner);
+            web.hidden_threads[0].peer = crate::rooms::dm::peer_from_key(&peer).unwrap();
+            store.web_writes(&web);
+            read_again(&mut rooms, &store);
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.store().hidden_threads.is_empty());
+        }
+
+        #[test]
+        fn what_the_web_ui_archived_shows_and_what_it_unarchived_does_not() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let mut store = Store::default();
+            let member = MemberId::from(&vk(61));
+            web_store(&mut rooms, &mut store, &[(61, 9)]);
+            let shown = archived(&mut rooms);
+            assert_eq!(shown, vec![(crate::rooms::dm::peer_key(member), 9)]);
+            // The web UI unarchives (its save drops the entry): the next read does too.
+            web_store(&mut rooms, &mut store, &[]);
+            assert!(archived(&mut rooms).is_empty());
+            let _ = peer;
+        }
+
+        /// The documented limit: the web UI's blind save can put back an older list, which
+        /// unarchives what this app had archived. It is not fought.
+        #[test]
+        fn a_blind_save_by_the_web_ui_unarchives_and_is_not_fought() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(archived(&mut rooms).len(), 1);
+            let stores = store.stores();
+            // A tab that hydrated before saves its older copy over the value.
+            web_store(&mut rooms, &mut store, &[]);
+            assert!(
+                archived(&mut rooms).is_empty(),
+                "the rail shows the thread again"
+            );
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.stores(), stores, "and nothing is written back");
+        }
+
+        #[test]
+        fn a_read_that_began_before_the_archive_was_saved_does_not_drop_what_is_owed() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let mut store = Store::default();
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            // A re-read of the delegate lands while the write has not gone yet.
+            web_store(&mut rooms, &mut store, &[]);
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            assert_eq!(archived(&mut rooms), vec![(peer, 0)]);
+        }
+
+        #[test]
+        fn a_command_for_a_room_not_read_yet_waits_and_one_for_a_gone_room_is_dropped() {
+            let (mut rooms, _f, key, peer) = dm_rooms();
+            let room = rooms.list.remove(0);
+            rooms.complete = false;
+            assert!(!ask(&mut rooms, archive_command(&key, &peer, 0)));
+            assert_eq!(rooms.outbox.waiting.len(), 1);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            rooms.list.push(room);
+            rooms.complete = true;
+            let (_tx, rx) = std::sync::mpsc::channel();
+            assert!(rooms.take_commands(&rx));
+            assert!(rooms.outbox.waiting.is_empty());
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            // The room is gone and the rooms were all read: nothing is owed for it.
+            let (mut rooms, _f, key, peer) = dm_rooms();
+            rooms.list.clear();
+            assert!(ask(&mut rooms, archive_command(&key, &peer, 0)));
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+        }
+
+        // The inbound-sync gate ---------------------------------------------------------------
+
+        const NOW: u64 = 1_700_000_000;
+
+        fn archived_in_store(rooms: &mut Rooms, store: &mut Store, peer: &str, cutoff: u64) {
+            let owner = owner_of(rooms);
+            let mut web = web_copy(&owner);
+            web.hidden_threads = vec![HiddenDmThreadEntry {
+                room_owner_vk: owner.to_bytes(),
+                peer: crate::rooms::dm::peer_from_key(peer).unwrap(),
+                hidden_at_ts: cutoff,
+            }];
+            store.web_writes(&web);
+            read_again(rooms, store);
+        }
+
+        #[test]
+        fn a_message_past_the_cutoff_drops_the_stored_entry() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            archived_in_store(&mut rooms, &mut store, &peer, 100);
+            inbound(&mut rooms, 100);
+            // At the cutoff: the thread's newest is the message that was archived.
+            rooms.archive_revival(NOW);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.log.is_empty());
+            // Strictly past it: the entry goes, through a write that checks the cutoff it finds.
+            inbound(&mut rooms, 101);
+            rooms.archive_revival(NOW);
+            assert_eq!(
+                rooms.dm_cache().archive_owed(),
+                &[ArchiveOp::UnhideIfPast {
+                    thread: thread_of(&rooms, &peer),
+                    past: 101
+                }]
+            );
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.store().hidden_threads.is_empty());
+            assert_eq!(texts(&store.store()), vec!["from the web"]);
+        }
+
+        #[test]
+        fn re_landed_old_messages_leave_the_archive_alone() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            archived_in_store(&mut rooms, &mut store, &peer, 1_000);
+            // The sweep took the pair's messages and the peer offered them again: original times.
+            for at in [800, 1_000] {
+                inbound(&mut rooms, at);
+                rooms.archive_revival(NOW);
+            }
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.log.is_empty(), "no write: {:?}", store.log);
+            // And with no messages at all (swept) the entry stays.
+            rooms.list[0]
+                .stored
+                .room_state
+                .direct_messages
+                .messages
+                .clear();
+            rooms.archive_revival(NOW);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            assert_eq!(archived(&mut rooms).len(), 1);
+        }
+
+        #[test]
+        fn a_forged_future_time_is_bounded_by_the_gate_and_cannot_escalate() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, _now) = (Store::default(), Instant::now());
+            // The cutoff is already as high as a bounded stamp can reach.
+            let high = NOW + MAX_DM_FUTURE_SKEW_SECS;
+            archived_in_store(&mut rooms, &mut store, &peer, high);
+            inbound(&mut rooms, u64::MAX / 2);
+            rooms.archive_revival(NOW);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            // A first forgery over an ordinary cutoff still revives it (accepted, documented).
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            archived_in_store(&mut rooms, &mut store, &peer, 100);
+            inbound(&mut rooms, u64::MAX / 2);
+            rooms.archive_revival(NOW);
+            assert_eq!(
+                rooms.dm_cache().archive_owed(),
+                &[ArchiveOp::UnhideIfPast {
+                    thread: thread_of(&rooms, &peer),
+                    past: NOW + MAX_DM_FUTURE_SKEW_SECS
+                }]
+            );
+        }
+
+        #[test]
+        fn a_stored_entry_with_a_change_owed_is_left_to_the_users_change_and_revived_after_it() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            archived_in_store(&mut rooms, &mut store, &peer, 100);
+            inbound(&mut rooms, 150);
+            ask(&mut rooms, archive_command(&key, &peer, 150));
+            // A message past the user's own cutoff lands before the write has gone: the owed
+            // change is the user's and stays (the gate would otherwise replace it).
+            inbound(&mut rooms, 200);
+            rooms.archive_revival(NOW);
+            let hide = ArchiveOp::Hide {
+                thread: thread_of(&rooms, &peer),
+                hidden_at_ts: 150,
+            };
+            assert_eq!(rooms.dm_cache().archive_owed(), &[hide]);
+            // The write goes, and the entry it leaves is then dropped by the gate: the thread
+            // converges on the rail, with nothing lost.
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.store().hidden_threads[0].hidden_at_ts, 150);
+            rooms.archive_revival(NOW);
+            assert_eq!(
+                rooms.dm_cache().archive_owed(),
+                &[ArchiveOp::UnhideIfPast {
+                    thread: thread_of(&rooms, &peer),
+                    past: 200
+                }]
+            );
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.store().hidden_threads.is_empty());
+        }
+
+        #[test]
+        fn the_gate_checks_the_cutoff_a_concurrent_device_stored() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            archived_in_store(&mut rooms, &mut store, &peer, 100);
+            inbound(&mut rooms, 150);
+            rooms.archive_revival(NOW);
+            // Before the write, another device archived again at a cutoff past the message.
+            let owner = owner_of(&rooms);
+            let mut newer = web_copy(&owner);
+            newer.hidden_threads = vec![HiddenDmThreadEntry {
+                room_owner_vk: owner.to_bytes(),
+                peer: crate::rooms::dm::peer_from_key(&peer).unwrap(),
+                hidden_at_ts: 400,
+            }];
+            store.before_cas = Some(Box::new(move |s| s.web_writes(&newer)));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.store().hidden_threads[0].hidden_at_ts, 400, "kept");
+        }
+
+        #[test]
+        fn our_own_later_message_in_the_room_never_sets_the_cutoff() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            inbound(&mut rooms, 100);
+            // The user's own message, stamped by their clock long after the peer's, is in the
+            // room's state as the room holds it.
+            outbound(&mut rooms, 90_000);
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            assert_eq!(archived(&mut rooms), vec![(peer, 100)]);
+        }
+
+        #[test]
+        fn a_far_future_stamp_is_the_cutoff_as_signed_and_keeps_the_thread_archived() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let forged = u64::MAX / 2;
+            inbound(&mut rooms, forged);
+            // The window's row carries the time as signed (`last_inbound_signed`), the clamped
+            // time is for display only.
+            ask(&mut rooms, archive_command(&key, &peer, forged));
+            assert_eq!(archived(&mut rooms), vec![(peer.clone(), forged)]);
+            let t = rooms.list[0].dm_threads(rooms.dm_cache(), &|_| None);
+            assert_eq!(t.threads[0].last_inbound_signed, forged);
+            assert!(t.threads[0].last_inbound_ts < forged, "shown clamped");
+            assert!(crate::rooms::dm_archive::is_hidden(
+                Some(forged),
+                t.threads[0].last_inbound_signed
+            ));
+            // The web UI's gate cannot drop it either.
+            assert!(!crate::rooms::dm_archive::should_unhide_for_inbound(
+                Some(forged),
+                u64::MAX,
+                NOW
+            ));
+        }
+
+        #[test]
+        fn a_change_for_a_thread_the_store_already_matches_is_done_and_clears() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            // The store holds nothing about the thread (the web UI took the entry out): the
+            // unarchive finds nothing to remove, stores nothing and is done, not a failure.
+            web_store(&mut rooms, &mut store, &[]);
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            ask(&mut rooms, unarchive_command(&key, &peer));
+            let stores = store.stores();
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.stores(), stores, "nothing to store");
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            assert_eq!(rooms.dm_saver.failures(), 0);
+            assert!(!rooms.outbox.work.has_dm());
+        }
+
+        #[test]
+        fn the_window_is_sent_a_new_snapshot_when_the_archive_list_changes() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            inbound(&mut rooms, 100);
+            let first = rooms.dm_snapshot().expect("the first report");
+            assert!(first.archived.is_empty());
+            assert!(rooms.dm_snapshot().is_none(), "nothing changed");
+            // The user archives: a new snapshot with it.
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            let archived_now = rooms.dm_snapshot().expect("an archive is a change");
+            assert_eq!(archived_now.archived.len(), 1);
+            assert!(rooms.dm_snapshot().is_none());
+            // The write ends: the list is as shown, so nothing new to say.
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(
+                rooms.dm_snapshot().is_none(),
+                "what was shown is what was saved"
+            );
+            // The web UI's blind save takes it away, and a read sees that: a new snapshot.
+            web_store(&mut rooms, &mut store, &[]);
+            let gone = rooms.dm_snapshot().expect("a read that changed the list");
+            assert!(gone.archived.is_empty());
+        }
+
+        #[test]
+        fn a_sweep_and_re_land_that_keep_the_count_but_raise_the_newest_stamp_are_looked_at() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            archived_in_store(&mut rooms, &mut store, &peer, 100);
+            inbound(&mut rooms, 100);
+            rooms.archive_revival(NOW);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            // The count is the same, the one message is newer.
+            rooms.list[0].stored.room_state.direct_messages.messages[0]
+                .message
+                .timestamp = 150;
+            rooms.archive_revival(NOW);
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.store().hidden_threads.is_empty());
+        }
+
+        /// A second room with the same peer: a copy of the room under another owner key (what
+        /// these tests need is only that the two are told apart by it).
+        fn with_second_room(rooms: &mut Rooms) -> (String, VerifyingKey) {
+            let mut other = rooms.list[0].stored.clone();
+            other.owner_vk = SigningKey::from_bytes(&[9; 32]).verifying_key();
+            let owner = other.owner_vk;
+            let room = LiveRoom::new(other);
+            let key = room.key();
+            rooms.list.push(room);
+            (key, owner)
+        }
+
+        #[test]
+        fn archiving_and_reviving_are_scoped_to_the_room_and_read_that_rooms_messages() {
+            let (mut rooms, _f, key_a, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            let (key_b, owner_b) = with_second_room(&mut rooms);
+            // The peer wrote in room A at 100 and in room B at 500.
+            inbound(&mut rooms, 100);
+            let f = crate::rooms::room_tests::Fixture::new();
+            let me = rooms.list[0].stored.self_verifying_key().unwrap();
+            let m = compose_direct_message(&f.owner, &me, &owner_b, 500, 500, b"b").unwrap();
+            rooms.list[1].stored.room_state.direct_messages.messages = vec![m];
+
+            // Archive in A: the cutoff is A's 100, and B's thread is not archived.
+            ask(&mut rooms, archive_command(&key_a, &peer, 0));
+            let snap = rooms.dm_snapshot().expect("a change");
+            let listed: Vec<(&str, u64)> = snap
+                .archived
+                .iter()
+                .map(|a| (a.room.as_str(), a.hidden_at_ts))
+                .collect();
+            assert_eq!(listed, vec![(key_a.as_str(), 100)]);
+            run(&mut rooms, &mut store, &mut now, true);
+            let stored = store.store().hidden_threads;
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].room_owner_vk, owner_of(&rooms).to_bytes());
+
+            // An entry for B at 300 (B's peer wrote at 500, past it) is dropped, A's stays.
+            let mut web = web_copy(&owner_of(&rooms));
+            web.hidden_threads = vec![
+                stored[0].clone(),
+                HiddenDmThreadEntry {
+                    room_owner_vk: owner_b.to_bytes(),
+                    peer: stored[0].peer,
+                    hidden_at_ts: 300,
+                },
+            ];
+            store.web_writes(&web);
+            read_again(&mut rooms, &store);
+            rooms.archive_revival(NOW);
+            run(&mut rooms, &mut store, &mut now, true);
+            let left = store.store().hidden_threads;
+            assert_eq!(left.len(), 1);
+            assert_eq!(
+                left[0].room_owner_vk,
+                owner_of(&rooms).to_bytes(),
+                "A stays"
+            );
+            let _ = key_b;
+        }
+
+        #[test]
+        fn an_entry_for_a_room_that_is_not_listed_is_not_sent_to_the_window() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let mut store = Store::default();
+            let gone = SigningKey::from_bytes(&[8; 32]).verifying_key();
+            let mut web = web_copy(&owner_of(&rooms));
+            web.hidden_threads = vec![HiddenDmThreadEntry {
+                room_owner_vk: gone.to_bytes(),
+                peer: crate::rooms::dm::peer_from_key(&peer).unwrap(),
+                hidden_at_ts: 5,
+            }];
+            store.web_writes(&web);
+            read_again(&mut rooms, &store);
+            assert!(archived(&mut rooms).is_empty());
+            // And it is left in the store, for the room's other devices.
+            assert_eq!(store.store().hidden_threads.len(), 1);
+        }
+
+        #[test]
+        fn the_loop_revives_before_it_saves() {
+            let body = session_code();
+            let revive = body
+                .find("rooms.archive_revival(unix_secs());")
+                .expect("the loop revives archived threads");
+            let save = body
+                .find("rooms.dm_save_tick(writes, Instant::now());")
+                .expect("the loop saves");
+            assert!(revive < save, "the entry is owed before the save is built");
+        }
+
+        #[test]
+        fn a_store_that_keeps_refusing_archive_changes_does_not_hold_back_the_text() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            web_store(&mut rooms, &mut store, &[]);
+            // The value now holds an archive entry this build cannot read (a newer web UI's).
+            let mut blob = Vec::new();
+            let bad = ciborium::Value::Map(vec![
+                (
+                    ciborium::Value::Text("entries".into()),
+                    ciborium::Value::Array(vec![]),
+                ),
+                (
+                    ciborium::Value::Text("hidden_threads".into()),
+                    ciborium::Value::Array(vec![ciborium::Value::from(1u32)]),
+                ),
+            ]);
+            ciborium::ser::into_writer(&bad, &mut blob).unwrap();
+            store.value = Some(blob.clone());
+            store.generation += 1;
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            send(&mut rooms, &key, &peer, "still goes");
+            run(&mut rooms, &mut store, &mut now, true);
+            // The text went in, over a list it did not touch; the archive change was refused,
+            // alone, and counted against its own pacing.
+            assert!(
+                store
+                    .value
+                    .as_deref()
+                    .is_some_and(|v| v != blob.as_slice() && v.len() > blob.len())
+            );
+            assert_eq!(rooms.dm_saver.failures(), 0);
+            assert_eq!(rooms.archive_saver.failures(), 1);
+            assert!(!rooms.archive_saver.due(now));
+            assert!(rooms.dm_saver.due(now), "the text's own pacing is not held");
+            // One change per thread: the send's unarchive replaced the archive. Still owed.
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+        }
+
+        #[test]
+        fn an_archive_change_found_already_made_asks_for_the_stored_rooms_to_be_read_again() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            // Another device already archived it, at a higher cutoff than this app asks for.
+            archived_in_store(&mut rooms, &mut store, &peer, 900);
+            rooms.dm_cache.note_read(
+                DmRead::Read(Box::new(
+                    OutboundCache::from_bytes(&{
+                        let mut out = Vec::new();
+                        ciborium::ser::into_writer(&OutboundDmStore::default(), &mut out).unwrap();
+                        out
+                    })
+                    .unwrap(),
+                )),
+                true,
+            );
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            assert!(!rooms.outbox.work.reload_pending());
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.stores(), 0, "nothing to store");
+            assert!(
+                rooms.outbox.work.reload_pending(),
+                "this copy was out of date"
+            );
+        }
+
+        #[test]
+        fn an_archive_with_no_signing_key_here_uses_the_threads_own_row() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            inbound(&mut rooms, 100);
+            rooms.list[0].stored.self_sk = None;
+            rooms.list[0].stored.self_vk = None;
+            ask(&mut rooms, archive_command(&key, &peer, 7));
+            assert_eq!(archived(&mut rooms), vec![(peer, 7)]);
+        }
+
+        #[test]
+        fn a_new_entry_that_does_not_fit_does_not_hold_back_an_unarchive() {
+            use crate::rooms::dm_store::MAX_WRITE_BYTES;
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            let owner = owner_of(&rooms);
+            let enc = |s: &OutboundDmStore| {
+                let mut out = Vec::new();
+                ciborium::ser::into_writer(s, &mut out).unwrap();
+                out
+            };
+            let mut web = web_copy(&owner);
+            let x_peer = web.hidden_threads[0].peer;
+            let without = {
+                let mut w = web.clone();
+                w.hidden_threads.clear();
+                enc(&w).len()
+            };
+            let x_size = enc(&web).len() - without;
+            // Pad the sent text so that the value is over the bound with the entry and one byte
+            // under it without: one new entry cannot fit, and taking the old one out always can.
+            let target = MAX_WRITE_BYTES - 1 + x_size;
+            web.entries[0].plaintext = "x".repeat(100_000);
+            let at = enc(&web).len();
+            web.entries[0].plaintext = "x".repeat(100_000 + target - at);
+            assert_eq!(enc(&web).len(), target);
+            store.web_writes(&web);
+            read_again(&mut rooms, &store);
+            let x_key = crate::rooms::dm::peer_key(x_peer);
+            ask(&mut rooms, unarchive_command(&key, &x_key));
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            run(&mut rooms, &mut store, &mut now, true);
+            // The Un-archive was written, alone and first.
+            assert!(store.store().hidden_threads.is_empty(), "the entry is gone");
+            // The new entry did not fit: refused, still owed, on the archive pacing only.
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            assert_eq!(rooms.archive_saver.failures(), 1);
+            assert_eq!(rooms.dm_saver.failures(), 0);
+        }
+
+        #[test]
+        fn thousands_of_archived_entries_still_revive_the_right_threads() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            let owner = owner_of(&rooms);
+            let me_peer = crate::rooms::dm::peer_from_key(&peer).unwrap();
+            let mut web = web_copy(&owner);
+            web.hidden_threads = (0..4000u64)
+                .map(|n| HiddenDmThreadEntry {
+                    room_owner_vk: owner.to_bytes(),
+                    peer: MemberId(freenet_scaffold::util::FastHash(n as i64 + 1_000_000)),
+                    hidden_at_ts: 500,
+                })
+                .collect();
+            web.hidden_threads.push(HiddenDmThreadEntry {
+                room_owner_vk: owner.to_bytes(),
+                peer: me_peer,
+                hidden_at_ts: 100,
+            });
+            store.web_writes(&web);
+            read_again(&mut rooms, &store);
+            assert_eq!(rooms.dm_cache().archived().len(), 4001);
+            inbound(&mut rooms, 150);
+            rooms.archive_revival(NOW);
+            // Only the thread with a message past its cutoff is dropped.
+            assert_eq!(
+                rooms.dm_cache().archive_owed(),
+                &[ArchiveOp::UnhideIfPast {
+                    thread: thread_of(&rooms, &peer),
+                    past: 150
+                }]
+            );
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.store().hidden_threads.len(), 4000);
+        }
+
+        #[test]
+        fn a_pair_at_its_cap_revives_when_a_new_message_evicts_an_old_one() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            for at in 1..=100u64 {
+                inbound(&mut rooms, at);
+            }
+            archived_in_store(&mut rooms, &mut store, &peer, 100);
+            rooms.archive_revival(NOW);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            // The contract keeps 100 a pair: the newest replaces the oldest, the count stays.
+            let msgs = &mut rooms.list[0].stored.room_state.direct_messages.messages;
+            msgs.remove(0);
+            inbound(&mut rooms, 101);
+            assert_eq!(
+                rooms.list[0]
+                    .stored
+                    .room_state
+                    .direct_messages
+                    .messages
+                    .len(),
+                100
+            );
+            rooms.archive_revival(NOW);
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(store.store().hidden_threads.is_empty());
+        }
+
+        #[test]
+        fn a_send_into_a_thread_this_copy_does_not_hold_queues_no_unhide_and_asks_for_one_reread() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            web_store(&mut rooms, &mut store, &[]);
+            assert!(rooms.dm_cache().hydrated());
+            send(&mut rooms, &key, &peer, "hello");
+            assert!(
+                rooms.dm_cache().archive_owed().is_empty(),
+                "the declined behaviour"
+            );
+            assert!(!rooms.outbox.work.reload_pending());
+            rooms.dm_save_tick(true, now);
+            assert!(rooms.outbox.work.take_reload(), "one re-read is asked for");
+            // And not again at once, however many sends: at most one in the window.
+            send(&mut rooms, &key, &peer, "again");
+            rooms.dm_save_tick(true, now);
+            assert!(!rooms.outbox.work.reload_pending());
+            now += super::super::REREAD_EVERY;
+            rooms.dm_save_tick(true, now);
+            assert!(rooms.outbox.work.take_reload());
+            rooms.dm_save_tick(true, now);
+            assert!(!rooms.outbox.work.reload_pending());
+        }
+
+        #[test]
+        fn a_conditional_removal_the_store_skipped_is_not_applied_to_the_copy() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            archived_in_store(&mut rooms, &mut store, &peer, 100);
+            inbound(&mut rooms, 150);
+            rooms.archive_revival(NOW);
+            // Another device raised the cutoff past the message before the write.
+            let owner = owner_of(&rooms);
+            let mut newer = web_copy(&owner);
+            newer.hidden_threads = vec![HiddenDmThreadEntry {
+                room_owner_vk: owner.to_bytes(),
+                peer: crate::rooms::dm::peer_from_key(&peer).unwrap(),
+                hidden_at_ts: 400,
+            }];
+            store.before_cas = Some(Box::new(move |s| s.web_writes(&newer)));
+            run(&mut rooms, &mut store, &mut now, true);
+            // The store kept the entry; this copy still holds it (at the cutoff it knew), and
+            // the revival does not repeat the same removal.
+            assert!(
+                rooms.outbox.work.reload_pending(),
+                "read again to see what it holds"
+            );
+            assert_eq!(rooms.dm_cache().archived().len(), 1);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            // The same stale copy does not ask for the same removal again.
+            rooms.archive_revival(NOW);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+            // A read shows what the store holds (400, past the message): nothing to revive.
+            read_again(&mut rooms, &store);
+            rooms.archive_revival(NOW);
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+        }
+
+        #[test]
+        fn a_write_whose_only_change_was_left_out_is_booked_to_the_archive_pacing() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            web_store(&mut rooms, &mut store, &[]);
+            let gone = SigningKey::from_bytes(&[8; 32]).verifying_key();
+            rooms.dm_cache.archive(ArchiveOp::Hide {
+                thread: (
+                    gone.to_bytes(),
+                    crate::rooms::dm::peer_from_key(&peer).unwrap(),
+                ),
+                hidden_at_ts: 5,
+            });
+            // The text saver has failures of its own, and a wait.
+            rooms.dm_saver.ended(false, now);
+            assert_eq!(rooms.dm_saver.failures(), 1);
+            assert!(!rooms.dm_saver.due(now));
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(
+                rooms.dm_cache().archive_owed().is_empty(),
+                "left out, no longer owed"
+            );
+            assert_eq!(rooms.dm_saver.failures(), 1, "the text saver is untouched");
+            assert!(!rooms.dm_saver.due(now));
+            assert_eq!(rooms.archive_saver.failures(), 0);
+            assert!(
+                store.store().hidden_threads.is_empty(),
+                "nothing written for it"
+            );
+            assert_eq!(store.stores(), 0);
+        }
+
+        #[test]
+        fn a_new_entry_for_a_room_missing_from_a_partial_list_waits_for_a_complete_read() {
+            let (mut rooms, _f, _key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            web_store(&mut rooms, &mut store, &[]);
+            let missing = SigningKey::from_bytes(&[8; 32]).verifying_key();
+            rooms.dm_cache.archive(ArchiveOp::Hide {
+                thread: (
+                    missing.to_bytes(),
+                    crate::rooms::dm::peer_from_key(&peer).unwrap(),
+                ),
+                hidden_at_ts: 5,
+            });
+            rooms.complete = false;
+            let reads = store.log.len();
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(
+                store.log.len(),
+                reads,
+                "no write while the list may be partial"
+            );
+            assert_eq!(rooms.dm_cache().archive_owed().len(), 1);
+            rooms.complete = true;
+            run(&mut rooms, &mut store, &mut now, true);
+            assert!(
+                rooms.dm_cache().archive_owed().is_empty(),
+                "now it is known to be gone"
+            );
+        }
+
+        #[test]
+        fn the_reread_after_a_send_is_not_used_up_by_a_tick_that_cannot_run_it() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, now) = (Store::default(), Instant::now());
+            web_store(&mut rooms, &mut store, &[]);
+            send(&mut rooms, &key, &peer, "hello");
+            rooms.dm_save_tick(false, now);
+            rooms.update_required = true;
+            rooms.dm_save_tick(true, now);
+            rooms.update_required = false;
+            assert!(
+                !rooms.outbox.work.reload_pending(),
+                "nothing asked while it cannot run"
+            );
+            rooms.dm_save_tick(true, now);
+            assert!(rooms.outbox.work.take_reload(), "asked once it can");
+        }
+
+        // Privacy and the shape of the code --------------------------------------------------
+
+        #[test]
+        fn the_archive_code_names_no_peer_and_prints_nothing_of_a_thread() {
+            let code_only = |src: &str| -> String {
+                src.replace("\r\n", "\n")
+                    .split_once("#[cfg(test)]\n#[path")
+                    .expect("the marker of the end of the code")
+                    .0
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            for file in [
+                code_only(include_str!("dm_archive.rs")),
+                code_only(include_str!("dm_store.rs")),
+            ] {
+                for line in file.lines() {
+                    assert!(
+                        !line.contains("println!")
+                            && !line.contains("dbg!")
+                            && !line.contains("tracing::"),
+                        "{line}"
+                    );
+                }
+            }
+            let body = session_code();
+            for name in ["fn archive_dm", "fn archive_revival"] {
+                let f = body.split(name).nth(1).expect("the function");
+                let f = f.split("\n    }\n").next().unwrap();
+                // At most one fixed message, with no format argument: nothing of a thread.
+                for line in f.lines().filter(|l| l.contains("println!")) {
+                    assert!(!line.contains('{') && !line.contains(','), "{name}: {line}");
+                }
+                assert!(!f.contains("dbg!") && !f.contains("peer_key"), "{name}");
+            }
+        }
+
+        #[test]
+        fn an_owed_removal_and_an_archive_change_go_in_their_own_writes_removal_first() {
+            let (mut rooms, _f, key, peer) = rooms_hydrated();
+            let (mut store, mut now) = (Store::default(), Instant::now());
+            let owner = owner_of(&rooms);
+            web_store(&mut rooms, &mut store, &[]);
+            let entry = web_copy(&owner).entries[0].clone();
+            let k: EntryKey = (owner.to_bytes(), entry.recipient, entry.purge_token);
+            rooms.dm_saver.owes_removal(k);
+            ask(&mut rooms, archive_command(&key, &peer, 0));
+            // The removal goes alone and first; the archive change is the next write, so a store
+            // that refuses one cannot refuse the other.
+            rooms.dm_save_tick(true, now);
+            assert!(rooms.outbox.work.has_dm());
+            run(&mut rooms, &mut store, &mut now, true);
+            assert_eq!(store.stores(), 2, "{:?}", store.log);
+            let out = store.store();
+            assert!(out.entries.is_empty(), "the removal was made");
+            assert_eq!(out.hidden_threads.len(), 1, "and the archive");
+            assert!(rooms.dm_saver.removals().is_empty());
+            assert!(rooms.dm_cache().archive_owed().is_empty());
+        }
+    }
 }
 
 // Deleting their messages ---------------------------------------------------------------------

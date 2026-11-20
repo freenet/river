@@ -80,6 +80,8 @@ struct App {
     dm_invite_results: Vec<(u64, Result<(), String>)>,
     /// Deletions the rooms do not hold yet, as last reported.
     dm_purges: usize,
+    /// The archive list as last reported.
+    dm_archived: Vec<river_app::chat::dm_model::DmArchived>,
     access: Option<Access>,
 }
 
@@ -117,6 +119,7 @@ impl App {
             dm_purge_results: Vec::new(),
             dm_invite_results: Vec::new(),
             dm_purges: 0,
+            dm_archived: Vec::new(),
             access: None,
         }
     }
@@ -161,6 +164,7 @@ impl App {
                 RoomsUpdate::Export { room, token } => self.exports.push((room, token)),
                 RoomsUpdate::Dms(snapshot) => {
                     self.dm_purges = snapshot.purges.len();
+                    self.dm_archived = snapshot.archived;
                     self.dms = snapshot.threads;
                 }
                 RoomsUpdate::DmPurge { ticket, result, .. } => {
@@ -224,10 +228,9 @@ impl App {
     }
 }
 
-/// The sent direct messages the chat delegate of the node at `authority` holds under
-/// `outbound_dms`, asked on a connection of its own with the app's grant, as the web UI would
-/// read them: the texts, in the order stored, and how many archived threads the value holds.
-fn stored_sent_texts(authority: &str, dir: &Path) -> Result<(Vec<String>, usize), String> {
+/// The `outbound_dms` value the chat delegate of the node at `authority` holds, asked on a
+/// connection of its own with the app's grant, as the web UI would read it.
+fn stored_store(authority: &str, dir: &Path) -> Result<OutboundDmStore, String> {
     let token = TokenStore::in_dir(&node_dir(dir, authority, false))
         .load()
         .ok_or("the app has no grant token")?;
@@ -248,20 +251,26 @@ fn stored_sent_texts(authority: &str, dir: &Path) -> Result<(Vec<String>, usize)
                     delegate::answers(&response).pop()
                 {
                     let Some(bytes) = value else {
-                        return Ok((Vec::new(), 0));
+                        return Ok(OutboundDmStore::default());
                     };
-                    let store: OutboundDmStore = ciborium::de::from_reader(bytes.as_slice())
-                        .map_err(|e| format!("the sent messages do not decode: {e}"))?;
-                    return Ok((
-                        store.entries.into_iter().map(|e| e.plaintext).collect(),
-                        store.hidden_threads.len(),
-                    ));
+                    return ciborium::de::from_reader(bytes.as_slice())
+                        .map_err(|e| format!("the sent messages do not decode: {e}"));
                 }
             }
             Ok(_) => {}
             Err(e) => return Err(format!("the node answered with an error: {e}")),
         }
     }
+}
+
+/// The sent direct messages the chat delegate of the node at `authority` holds under
+/// `outbound_dms`: the texts, in the order stored, and how many archived threads the value holds.
+fn stored_sent_texts(authority: &str, dir: &Path) -> Result<(Vec<String>, usize), String> {
+    let store = stored_store(authority, dir)?;
+    Ok((
+        store.entries.into_iter().map(|e| e.plaintext).collect(),
+        store.hidden_threads.len(),
+    ))
 }
 
 /// The generation of the sent-message key in the delegate of the node at `authority`: it grows
@@ -321,6 +330,7 @@ fn restart(app: &mut App) {
     app.link.start();
     app.rooms.clear();
     app.dms.clear();
+    app.dm_archived.clear();
     app.access = None;
     // Updates the old session had queued belong to it.
     while app.updates.try_recv().is_ok() {}
@@ -762,6 +772,181 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
         let (a_authority, a_dir) = (alice.authority.clone(), alice.dir.clone());
         leave_room(alice, &a_authority, &a_dir, name, &target, Some(room));
     }
+}
+
+/// Archive, as the screen does: A archives its thread with B, the delegate holds the entry (the
+/// web UI's own shape, keyed by B's full member id) with the sent texts kept, the thread stays
+/// archived across a restart, a new message from B brings it back and the entry is dropped from
+/// the delegate (the gate), and sending into an archived thread unarchives it. Runs after
+/// [`delete_their_messages`]: A's thread holds B's one message.
+fn archive_thread(alice: &mut App, bob: &mut App, room: &str, key: &str) {
+    use river_app::rooms::dm::peer_key;
+    use river_app::rooms::dm_archive::is_hidden;
+    let id_in = |app: &App, name: &str| {
+        let full = app
+            .room(room)
+            .and_then(|r| r.members.iter().find(|m| m.nickname == name))
+            .map(|m| m.full_id)
+            .unwrap_or_else(|| panic!("{name} is not a member in {}'s view", app.name));
+        river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(full))
+    };
+    let (bob_id, alice_id) = (id_in(alice, "Bob"), id_in(bob, "Alice"));
+    let (bob_in_a, alice_in_b) = (peer_key(bob_id), peer_key(alice_id));
+    let held = |app: &App| {
+        app.dm_archived
+            .iter()
+            .find(|a| a.room == key && a.peer_key == bob_in_a)
+            .map(|a| a.hidden_at_ts)
+    };
+    let stored = |app: &App| {
+        stored_store(&app.authority, &app.dir)
+            .expect("the store")
+            .hidden_threads
+    };
+    let texts_before = stored_sent_texts(&alice.authority, &alice.dir)
+        .expect("A's store")
+        .0;
+    let newest = alice
+        .thread(key, &bob_in_a)
+        .expect("a thread")
+        .last_inbound_signed;
+    assert!(newest > 0, "B wrote to A");
+    assert_eq!(held(alice), None);
+
+    // A archives the thread: it is archived on screen, and the delegate holds the entry in the
+    // web UI's shape: A's room and B's full id, at B's newest message.
+    alice.send(
+        key,
+        Action::ArchiveDm {
+            peer: bob_id,
+            row_inbound_ts: newest,
+        },
+    );
+    alice.until("A's archive list holds B's thread", |app| {
+        held(app) == Some(newest)
+    });
+    let deadline = Instant::now() + STEP;
+    loop {
+        let list = stored(alice);
+        if list.len() == 1 {
+            let h = &list[0];
+            assert_eq!(h.peer, bob_id, "keyed by the full member id");
+            assert_eq!(h.hidden_at_ts, newest);
+            assert_eq!(
+                bs58::encode(h.room_owner_vk).into_string(),
+                key,
+                "keyed by the room's owner"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the delegate never held the entry"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        stored_sent_texts(&alice.authority, &alice.dir)
+            .expect("A's store")
+            .0,
+        texts_before,
+        "the sent texts are kept"
+    );
+    println!("A: the archive is in the delegate, with the sent texts kept");
+
+    // A restarts: the archive is read back, and the thread is off A's rail (the peer has not
+    // written past the cutoff).
+    restart(alice);
+    alice.until("A, restarted, reads the archive back", |app| {
+        held(app) == Some(newest) && app.thread(key, &bob_in_a).is_some()
+    });
+    assert!(is_hidden(
+        held(alice),
+        alice.thread(key, &bob_in_a).unwrap().last_inbound_signed
+    ));
+    println!("A: after a restart the thread is still archived");
+
+    // B writes again, strictly later: the thread is back on A's rail, and A's app drops the
+    // entry from the delegate.
+    // Times are whole seconds: wait until the clock is past the cutoff, so B's message is stamped
+    // strictly later (the gap is checked on the message below, not assumed).
+    let clock_deadline = Instant::now() + STEP;
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs()
+        <= newest
+    {
+        assert!(
+            Instant::now() < clock_deadline,
+            "the clock never passed the cutoff {newest}: B's message could not be stamped later"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let again = "DM from B after the archive";
+    bob.send(
+        key,
+        Action::SendDm {
+            peer: alice_id,
+            text: again.into(),
+            ticket: 90,
+        },
+    );
+    bob.until("B's second direct message is queued", |app| {
+        app.dm_results.iter().any(|(t, r)| *t == 90 && r.is_ok())
+    });
+    alice.until("A receives B's new message", |app| {
+        app.dm_text(key, &bob_in_a, again, false)
+    });
+    let latest = alice.thread(key, &bob_in_a).unwrap().last_inbound_signed;
+    assert!(latest > newest, "B's message is stamped past the cutoff");
+    assert!(
+        !is_hidden(Some(newest), latest),
+        "a newer message from B brings the thread back"
+    );
+    let deadline = Instant::now() + STEP;
+    while !stored(alice).is_empty() {
+        assert!(Instant::now() < deadline, "the entry was never dropped");
+        alice.drain(Duration::from_millis(500));
+    }
+    alice.until("A's archive list no longer holds it", |app| {
+        held(app).is_none()
+    });
+    println!("A: a newer message from B brought the thread back and dropped the entry");
+
+    // Archive again, then send into the thread: sending unarchives it, on the same write path.
+    let newest = alice.thread(key, &bob_in_a).unwrap().last_inbound_signed;
+    alice.send(
+        key,
+        Action::ArchiveDm {
+            peer: bob_id,
+            row_inbound_ts: newest,
+        },
+    );
+    alice.until("A archives it again", |app| held(app) == Some(newest));
+    let reply = "A replies into an archived thread";
+    alice.send(
+        key,
+        Action::SendDm {
+            peer: bob_id,
+            text: reply.into(),
+            ticket: 91,
+        },
+    );
+    alice.until("A's reply is queued", |app| {
+        app.dm_results.iter().any(|(t, r)| *t == 91 && r.is_ok())
+    });
+    alice.until("sending unarchived the thread", |app| held(app).is_none());
+    let deadline = Instant::now() + STEP;
+    while !stored(alice).is_empty() {
+        assert!(Instant::now() < deadline, "the entry was never removed");
+        alice.drain(Duration::from_millis(500));
+    }
+    wait_until_saved("A", &alice.authority, &alice.dir, reply);
+    bob.until("B receives A's reply", |app| {
+        app.dm_text(key, &alice_in_b, reply, false)
+    });
+    println!("A: sending into an archived thread unarchived it");
 }
 
 /// Allow the grant on its approval page, as the user would: read the page's nonce, wait out
@@ -2019,6 +2204,7 @@ fn main() {
     direct_messages(&mut alice, &mut bob, ROOM, &key);
     delete_their_messages(&mut alice, &mut bob, ROOM, &key);
     invitations_in_direct_messages(&mut alice, &mut bob, ROOM, &key);
+    archive_thread(&mut alice, &mut bob, ROOM, &key);
     rename_both_ways(&mut alice, &mut bob, ROOM, &key, "Bob", "Alice");
     deputize_and_revoke(&mut alice, &mut bob, ROOM, &key);
     // A nickname over the room's limit (50 bytes) is refused by the app and said, and is

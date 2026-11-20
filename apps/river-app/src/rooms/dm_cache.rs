@@ -80,6 +80,8 @@ use river_core::room_state::direct_messages::PurgeToken;
 use river_core::room_state::member::MemberId;
 use zeroize::Zeroize;
 
+use super::dm_archive::{ArchiveOp, ThreadKey};
+
 pub use river_core::chat_delegate::OUTBOUND_DMS_STORAGE_KEY as KEY;
 
 /// The tag byte of the delegate's generation envelope.
@@ -101,6 +103,10 @@ pub use super::dm_store::EntryKey;
 /// saved its own copy over it). Past this the entry is left out, so a writer that keeps
 /// overwriting is not fought forever.
 pub const MAX_RESAVES: u8 = 3;
+
+/// The most saved archive changes kept for a read that began before they were saved
+/// ([`OutboundCache::note_archive_saved`]).
+pub const MAX_RECENT_ARCHIVE: usize = 64;
 
 /// A sent message's text. `Debug` does not print it, and drop wipes it.
 #[derive(Clone, PartialEq, Eq)]
@@ -191,6 +197,22 @@ pub struct OutboundCache {
     /// The last read that decoded found the key with a value. A later read of nothing is then
     /// a value that went missing, which a write must not paper over.
     listed: bool,
+    /// Archive changes the user made that the delegate does not hold yet, at most one per
+    /// thread (the newest wins), oldest first. Shown over `hidden` at once, kept across reads
+    /// (a read made before the write ended does not have them), and dropped when a write that
+    /// carried them ends well.
+    archive_owed: Vec<ArchiveOp>,
+    /// Archive changes a write saved, each with the save count it ended at, kept until a read
+    /// that began after it (one that began before may not hold them: a stale read must not put
+    /// an archive back or take one away). Bounded by [`MAX_RECENT_ARCHIVE`].
+    archive_recent: Vec<(u64, ArchiveOp)>,
+    /// Threads whose conditional removal the store skipped (it holds a higher cutoff than this
+    /// copy): not looked at for revival until the next read shows what the store holds, so the
+    /// same removal is not asked for again against a stale copy.
+    revival_held: std::collections::HashSet<ThreadKey>,
+    /// Bumped whenever [`OutboundCache::archived`] changes, so a view built from it can tell
+    /// without the thread rebuild that `epoch` causes.
+    archive_rev: u64,
 }
 
 impl fmt::Debug for OutboundCache {
@@ -198,6 +220,7 @@ impl fmt::Debug for OutboundCache {
         f.debug_struct("OutboundCache")
             .field("entries", &self.entries.len())
             .field("hidden_threads", &self.hidden.len())
+            .field("archive_owed", &self.archive_owed.len())
             .field("sent_this_session", &self.local.len())
             .field("saved_this_session", &self.saved.len())
             .field("hydrated", &self.hydrated)
@@ -258,6 +281,10 @@ impl OutboundCache {
             resaves: HashMap::new(),
             save_seq: 0,
             listed: true,
+            archive_owed: Vec::new(),
+            archive_recent: Vec::new(),
+            revival_held: Default::default(),
+            archive_rev: 0,
         })
     }
 
@@ -285,15 +312,41 @@ impl OutboundCache {
         let epoch = self.epoch.wrapping_add(1);
         match read {
             DmRead::Read(fresh) => {
+                let before = self.archived();
                 let local = std::mem::take(&mut self.local);
                 let saved = std::mem::take(&mut self.saved);
                 let resaves = std::mem::take(&mut self.resaves);
                 let save_seq = self.save_seq;
+                let archive_owed = std::mem::take(&mut self.archive_owed);
+                let archive_recent = std::mem::take(&mut self.archive_recent);
+                let archive_rev = self.archive_rev;
                 *self = *fresh;
+                // A read shows what the store holds: nothing is held back from revival now.
+                self.revival_held.clear();
                 self.local = local;
                 self.saved = saved;
                 self.resaves = resaves;
                 self.save_seq = save_seq;
+                self.archive_owed = archive_owed;
+                self.archive_recent = archive_recent;
+                self.archive_rev = archive_rev;
+                // A read that began before an archive write ended may not hold what it saved:
+                // those are laid over it again. One that began after holds them, and they go.
+                let late: Vec<ArchiveOp> = self
+                    .archive_recent
+                    .iter()
+                    .filter(|(seq, _)| *seq > began_at)
+                    .map(|(_, op)| *op)
+                    .collect();
+                for op in &late {
+                    super::dm_archive::apply(&mut self.hidden, op);
+                }
+                self.archive_recent.retain(|(seq, _)| *seq > began_at);
+                // What the delegate holds now may differ (another device archived, or its blind
+                // save put an older list back): the view changes, and the rail with it.
+                if self.archived() != before {
+                    self.archive_rev = self.archive_rev.wrapping_add(1);
+                }
                 // What the delegate now holds is no longer only local: it is saved, whichever
                 // of the read and the end of the save came first.
                 let confirmed: Vec<EntryKey> = self
@@ -616,9 +669,113 @@ impl OutboundCache {
             .map(|e| e.plaintext.as_str())
     }
 
-    /// The archive list, as stored.
+    /// The archive list, as stored (as last read, and as this app's own writes since changed
+    /// it). What the user asked for and the delegate does not hold yet is not in it: see
+    /// [`OutboundCache::archived`].
     pub fn hidden_threads(&self) -> &[HiddenDmThreadEntry] {
         &self.hidden
+    }
+
+    /// The archive list as the user should see it: [`OutboundCache::hidden_threads`] with the
+    /// changes still owed applied, one cutoff per thread (the largest, as the web UI keeps for a
+    /// value that holds a thread twice), in a fixed order. **Recomputed on every call, from the
+    /// last read**, so the list is the delegate's, not a copy of what this app once wrote: an
+    /// entry the web UI added shows, and one it removed does not.
+    pub fn archived(&self) -> Vec<(ThreadKey, u64)> {
+        let mut list = self.hidden.clone();
+        for op in &self.archive_owed {
+            super::dm_archive::apply(&mut list, op);
+        }
+        let mut by_thread: HashMap<ThreadKey, u64> = HashMap::with_capacity(list.len());
+        for h in &list {
+            let ts = by_thread.entry((h.room_owner_vk, h.peer)).or_insert(0);
+            *ts = (*ts).max(h.hidden_at_ts);
+        }
+        let mut out: Vec<(ThreadKey, u64)> = by_thread.into_iter().collect();
+        out.sort_by_key(|((room, peer), _)| (*room, peer.0.0));
+        out
+    }
+
+    /// The cutoff the thread is archived at, as [`OutboundCache::archived`] holds it.
+    pub fn archived_at(&self, thread: &ThreadKey) -> Option<u64> {
+        let mut list = self.hidden.clone();
+        for op in &self.archive_owed {
+            super::dm_archive::apply(&mut list, op);
+        }
+        super::dm_archive::stored_cutoff(&list, thread)
+    }
+
+    /// The user archived or unarchived a thread. It shows at once, and is owed to the delegate
+    /// ([`OutboundCache::archive_owed`]). A later change to the same thread replaces this one
+    /// (the last thing the user did is what stays). Bounded: one op per thread, and the list
+    /// cannot outgrow the threads the user has.
+    pub fn archive(&mut self, op: ArchiveOp) {
+        let before = self.archived();
+        let thread = op.thread();
+        // The user acts on it again: revival may look at it afresh.
+        self.revival_held.remove(&thread);
+        self.archive_owed.retain(|o| o.thread() != thread);
+        self.archive_owed.push(op);
+        if self.archived() != before {
+            self.archive_rev = self.archive_rev.wrapping_add(1);
+        }
+    }
+
+    /// The archive changes the delegate does not hold yet, for the next write.
+    pub fn archive_owed(&self) -> &[ArchiveOp] {
+        &self.archive_owed
+    }
+
+    /// A write that carried `done` ended well: the delegate holds them. They leave the owed list
+    /// (only the same ones: a newer change to a thread stays owed) and are applied to the list as
+    /// stored, so the view does not change under the user.
+    ///
+    /// `skipped` are the ones among `done` that found the store already as asked or at a higher
+    /// cutoff. A skipped conditional removal is not applied to the list (the store still holds an
+    /// entry this copy then lacks); the read that follows shows what it holds. The others are
+    /// applied: they leave the store as the copy now has it, or higher.
+    pub fn note_archive_saved(&mut self, done: &[ArchiveOp], skipped: &[ArchiveOp]) {
+        let before = self.archived();
+        // A save ended: a read that began earlier says nothing about it ([`Self::note_read_from`]).
+        self.save_seq = self.save_seq.wrapping_add(1);
+        for op in done {
+            if self.archive_owed.contains(op) {
+                self.archive_owed.retain(|o| o != op);
+            }
+            if matches!(op, ArchiveOp::UnhideIfPast { .. }) && skipped.contains(op) {
+                self.revival_held.insert(op.thread());
+                continue;
+            }
+            super::dm_archive::apply(&mut self.hidden, op);
+            self.archive_recent.push((self.save_seq, *op));
+        }
+        if self.archive_recent.len() > MAX_RECENT_ARCHIVE {
+            let extra = self.archive_recent.len() - MAX_RECENT_ARCHIVE;
+            self.archive_recent.drain(..extra);
+        }
+        if self.archived() != before {
+            self.archive_rev = self.archive_rev.wrapping_add(1);
+        }
+    }
+
+    /// A write left these out because their room is not shown: nothing was written for them, and
+    /// they are not owed any more (and not applied: the room is gone).
+    pub fn note_archive_dropped(&mut self, dropped: &[ArchiveOp]) {
+        let before = self.archived();
+        self.archive_owed.retain(|o| !dropped.contains(o));
+        if self.archived() != before {
+            self.archive_rev = self.archive_rev.wrapping_add(1);
+        }
+    }
+
+    /// Whether revival leaves this thread alone until the next read ([`Self::note_archive_saved`]).
+    pub fn revival_held(&self, thread: &ThreadKey) -> bool {
+        self.revival_held.contains(thread)
+    }
+
+    /// Changes whenever [`OutboundCache::archived`] does.
+    pub fn archive_rev(&self) -> u64 {
+        self.archive_rev
     }
 
     /// Add an entry, for tests that build a cache without the delegate.
@@ -1413,6 +1570,239 @@ mod tests {
         let shown = format!("{cache:?}");
         assert!(!shown.contains("TOP-SECRET"));
         assert!(shown.contains("saved_this_session: 1"));
+    }
+
+    // The archive list ------------------------------------------------------------------------
+
+    fn thread(room: u8, peer: u8) -> ThreadKey {
+        (vk(room).to_bytes(), id(peer))
+    }
+
+    fn read_hidden(list: &[(u8, u8, u64)]) -> OutboundCache {
+        let store = OutboundDmStore {
+            entries: vec![],
+            hidden_threads: list
+                .iter()
+                .map(|(r, p, ts)| HiddenDmThreadEntry {
+                    room_owner_vk: vk(*r).to_bytes(),
+                    peer: id(*p),
+                    hidden_at_ts: *ts,
+                })
+                .collect(),
+        };
+        OutboundCache::from_bytes(&encode(&store)).unwrap()
+    }
+
+    #[test]
+    fn the_archive_list_is_what_the_delegate_holds_with_the_users_changes_over_it() {
+        let mut cache = read_hidden(&[(1, 2, 100), (1, 3, 200)]);
+        assert_eq!(
+            cache.archived(),
+            vec![(thread(1, 2), 100), (thread(1, 3), 200)]
+        );
+        let rev = cache.archive_rev();
+        // An archive shows at once, an unarchive too.
+        cache.archive(ArchiveOp::Hide {
+            thread: thread(1, 4),
+            hidden_at_ts: 300,
+        });
+        cache.archive(ArchiveOp::Unhide {
+            thread: thread(1, 2),
+        });
+        assert_eq!(
+            cache.archived(),
+            vec![(thread(1, 3), 200), (thread(1, 4), 300)]
+        );
+        assert_ne!(cache.archive_rev(), rev);
+        // The stored list is untouched until a write ends.
+        assert_eq!(cache.hidden_threads().len(), 2);
+        assert_eq!(cache.archived_at(&thread(1, 4)), Some(300));
+        assert_eq!(cache.archived_at(&thread(2, 4)), None);
+    }
+
+    #[test]
+    fn one_change_is_owed_per_thread_and_the_last_wins() {
+        let mut cache = read_hidden(&[]);
+        for ts in [5, 6, 7] {
+            cache.archive(ArchiveOp::Hide {
+                thread: thread(1, 2),
+                hidden_at_ts: ts,
+            });
+        }
+        cache.archive(ArchiveOp::Unhide {
+            thread: thread(1, 2),
+        });
+        cache.archive(ArchiveOp::Hide {
+            thread: thread(1, 3),
+            hidden_at_ts: 1,
+        });
+        assert_eq!(cache.archive_owed().len(), 2);
+        assert_eq!(cache.archived(), vec![(thread(1, 3), 1)]);
+    }
+
+    #[test]
+    fn a_read_replaces_the_list_and_keeps_what_is_still_owed() {
+        let mut cache = read_hidden(&[(1, 2, 100)]);
+        cache.archive(ArchiveOp::Hide {
+            thread: thread(1, 4),
+            hidden_at_ts: 300,
+        });
+        let rev = cache.archive_rev();
+        // The web UI archived another thread and unarchived the first: a read shows exactly
+        // that, plus what this app still owes.
+        cache.note_read(DmRead::Read(Box::new(read_hidden(&[(1, 3, 50)]))), true);
+        assert_eq!(
+            cache.archived(),
+            vec![(thread(1, 3), 50), (thread(1, 4), 300)]
+        );
+        assert_ne!(cache.archive_rev(), rev, "the view changed");
+        // A read that changes nothing in the view does not bump the revision.
+        let rev = cache.archive_rev();
+        cache.note_read(DmRead::Read(Box::new(read_hidden(&[(1, 3, 50)]))), true);
+        assert_eq!(cache.archive_rev(), rev);
+        // An unreadable one or a key not listed leaves the list as it was.
+        cache.note_read(DmRead::Unreadable, true);
+        cache.note_read(DmRead::NotListed, true);
+        assert_eq!(cache.archived().len(), 2);
+    }
+
+    #[test]
+    fn a_write_that_ended_well_moves_its_changes_into_the_list_and_leaves_newer_ones_owed() {
+        let mut cache = read_hidden(&[]);
+        let first = ArchiveOp::Hide {
+            thread: thread(1, 2),
+            hidden_at_ts: 100,
+        };
+        cache.archive(first);
+        let shown = cache.archived();
+        // The user changes the same thread while that write is out.
+        let second = ArchiveOp::Hide {
+            thread: thread(1, 2),
+            hidden_at_ts: 150,
+        };
+        cache.archive(second);
+        cache.note_archive_saved(&[first], &[]);
+        assert_eq!(
+            cache.archive_owed(),
+            &[second],
+            "the newer change stays owed"
+        );
+        assert_eq!(cache.archived(), vec![(thread(1, 2), 150)]);
+        cache.note_archive_saved(&[second], &[]);
+        assert!(cache.archive_owed().is_empty());
+        assert_eq!(cache.hidden_threads().len(), 1);
+        assert_eq!(cache.hidden_threads()[0].hidden_at_ts, 150);
+        assert_ne!(shown, cache.archived());
+    }
+
+    #[test]
+    fn a_read_that_began_before_an_archive_write_ended_does_not_undo_it() {
+        let mut cache = read_hidden(&[]);
+        let began = cache.save_seq();
+        // The user archives; the write ends; and only then does the read that began before it
+        // return, without the entry (it was built from the value as it was).
+        let hide = ArchiveOp::Hide {
+            thread: thread(1, 2),
+            hidden_at_ts: 100,
+        };
+        cache.archive(hide);
+        cache.note_archive_saved(&[hide], &[]);
+        assert_eq!(cache.archived(), vec![(thread(1, 2), 100)]);
+        cache.note_read_from(DmRead::Read(Box::new(read_hidden(&[]))), true, began);
+        assert_eq!(
+            cache.archived(),
+            vec![(thread(1, 2), 100)],
+            "a stale read does not unarchive what was just saved"
+        );
+        // A read that began after the write holds it, or the web UI took it away: believed.
+        let began = cache.save_seq();
+        cache.note_read_from(DmRead::Read(Box::new(read_hidden(&[]))), true, began);
+        assert!(cache.archived().is_empty());
+        // And it is not laid over again.
+        let began = cache.save_seq();
+        cache.note_read_from(DmRead::Read(Box::new(read_hidden(&[]))), true, began);
+        assert!(cache.archived().is_empty());
+    }
+
+    #[test]
+    fn a_stale_read_does_not_bring_back_an_entry_that_was_just_removed() {
+        let mut cache = read_hidden(&[(1, 2, 100)]);
+        let began = cache.save_seq();
+        let unhide = ArchiveOp::Unhide {
+            thread: thread(1, 2),
+        };
+        cache.archive(unhide);
+        cache.note_archive_saved(&[unhide], &[]);
+        assert!(cache.archived().is_empty());
+        cache.note_read_from(
+            DmRead::Read(Box::new(read_hidden(&[(1, 2, 100)]))),
+            true,
+            began,
+        );
+        assert!(cache.archived().is_empty());
+    }
+
+    #[test]
+    fn the_saved_changes_kept_for_a_stale_read_are_bounded() {
+        let mut cache = read_hidden(&[]);
+        for n in 0..(MAX_RECENT_ARCHIVE as u8 + 10) {
+            let op = ArchiveOp::Hide {
+                thread: thread(1, n),
+                hidden_at_ts: 1,
+            };
+            cache.archive(op);
+            cache.note_archive_saved(&[op], &[]);
+        }
+        assert!(cache.archive_recent.len() <= MAX_RECENT_ARCHIVE);
+    }
+
+    #[test]
+    fn dropping_an_owed_entry_changes_the_view_and_its_revision() {
+        let mut cache = read_hidden(&[]);
+        let hide = ArchiveOp::Hide {
+            thread: thread(1, 2),
+            hidden_at_ts: 5,
+        };
+        cache.archive(hide);
+        let rev = cache.archive_rev();
+        cache.note_archive_dropped(&[hide]);
+        assert!(cache.archived().is_empty());
+        assert_ne!(cache.archive_rev(), rev, "the window is told");
+    }
+
+    #[test]
+    fn archiving_again_lets_revival_look_at_a_held_thread_afresh() {
+        let mut cache = read_hidden(&[(1, 2, 100)]);
+        let op = ArchiveOp::UnhideIfPast {
+            thread: thread(1, 2),
+            past: 150,
+        };
+        cache.archive(op);
+        cache.note_archive_saved(&[op], &[op]);
+        assert!(cache.revival_held(&thread(1, 2)));
+        cache.archive(ArchiveOp::Hide {
+            thread: thread(1, 2),
+            hidden_at_ts: 200,
+        });
+        assert!(!cache.revival_held(&thread(1, 2)));
+    }
+
+    #[test]
+    fn a_thread_the_delegate_holds_twice_shows_once_at_its_largest_cutoff() {
+        let cache = read_hidden(&[(1, 2, 100), (1, 2, 300), (1, 2, 200)]);
+        assert_eq!(cache.archived(), vec![(thread(1, 2), 300)]);
+    }
+
+    #[test]
+    fn the_archive_list_is_never_printed() {
+        let mut cache = read_hidden(&[(1, 2, 100)]);
+        cache.archive(ArchiveOp::Unhide {
+            thread: thread(1, 2),
+        });
+        let shown = format!("{cache:?}");
+        assert!(shown.contains("hidden_threads: 1"));
+        assert!(shown.contains("archive_owed: 1"));
+        assert!(!shown.contains("hidden_at_ts"));
     }
 
     /// The key is the one the web UI reads and the delegate's index holds.

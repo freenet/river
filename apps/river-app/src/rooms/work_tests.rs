@@ -2083,6 +2083,9 @@ mod dm_saves {
                 ok: true,
                 added: vec![key(1, 4, 9)],
                 removed: vec![],
+                archived: vec![],
+                archive_skipped: vec![],
+                archive_dropped: vec![],
                 evicted: vec![],
                 refusal: None,
             }]
@@ -2090,6 +2093,44 @@ mod dm_saves {
         assert!(!w.has_dm(), "taken once, and the task is gone");
         assert!(w.take_dm_ends().is_empty());
         assert!(w.views().is_empty());
+    }
+
+    #[test]
+    fn a_new_archive_entry_for_a_room_not_shown_is_left_out_but_one_taken_out_is_made() {
+        use crate::rooms::dm_archive::ArchiveOp;
+        let mut w = Work::default();
+        let now = Instant::now();
+        let peer = MemberId::from(&vk(2));
+        let hide = |room: u8| {
+            DmOp::Archive(ArchiveOp::Hide {
+                thread: (vk(room).to_bytes(), peer),
+                hidden_at_ts: 500,
+            })
+        };
+        let unhide = DmOp::Archive(ArchiveOp::Unhide {
+            thread: (vk(1).to_bytes(), peer),
+        });
+        // Room 1 is shown, room 5 is gone.
+        assert!(save(&mut w, vec![hide(1), hide(5), unhide], true));
+        read_at(&mut w, now);
+        assert!(w.on_delegate(&read_answer(KEY, Some(blob(vec![])), 3)));
+        let store = read(&store_at(&mut w, now, 3));
+        // The blob held (room 1, peer, 77): hide(1) at 500 raised it, then unhide removed it;
+        // nothing was added for room 5.
+        assert!(
+            store.hidden_threads.is_empty(),
+            "{:?}",
+            store.hidden_threads
+        );
+        assert!(w.on_delegate(&store_answer(KEY, CasStoreResult::Stored { generation: 4 })));
+        let ends = w.take_dm_ends();
+        assert!(ends[0].ok);
+        assert_eq!(ends[0].archived.len(), 2, "the two that were written");
+        assert_eq!(
+            ends[0].archive_dropped.len(),
+            1,
+            "the one for room 5 is not written"
+        );
     }
 
     #[test]

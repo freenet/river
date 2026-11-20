@@ -12,6 +12,7 @@
 mod background;
 mod conversation;
 mod details;
+pub mod dm_archive;
 pub mod dm_compose;
 pub mod dm_invite;
 pub mod dm_model;
@@ -30,6 +31,8 @@ pub mod identity_texts {
         Secret,
     };
 }
+#[cfg(test)]
+mod dm_archive_tests;
 #[cfg(test)]
 mod dm_view_tests;
 mod keys;

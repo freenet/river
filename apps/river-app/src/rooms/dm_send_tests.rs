@@ -917,6 +917,7 @@ fn thread_of(
         peer_is_member: true,
         last_ts: messages.last().map_or(0, |m| m.timestamp),
         last_inbound_ts: 0,
+        last_inbound_signed: 0,
         messages,
     })
 }

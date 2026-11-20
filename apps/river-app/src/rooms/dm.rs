@@ -231,6 +231,7 @@ pub fn threads(src: &Source<'_>) -> Threads {
             messages: rows.iter().map(|r| message(src, peer, r)).collect(),
             last_ts: shown_secs(last_ts),
             last_inbound_ts: shown_secs(last_inbound_ts),
+            last_inbound_signed: last_inbound_ts,
         })
         .collect();
     Threads {

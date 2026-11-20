@@ -121,6 +121,9 @@ pub struct DmUi {
     pub(super) purge: super::dm_purge::DmPurgeUi,
     /// Invitations: Accept on a card and the "Share an invite" dialog ([`super::dm_invite`]).
     pub(super) invite: super::dm_invite::DmInviteUi,
+    /// Archiving threads: the fold-out, the Undo line, and what shows before a snapshot holds it
+    /// ([`super::dm_archive`]).
+    pub(super) archive: super::dm_archive::DmArchiveUi,
     /// Deletions the background work took, whose messages the room still held at the last
     /// snapshot: `(room key, peer, message keys)`. The read position forgets a key once the
     /// thread no longer has it ([`DmUi::forget_deleted`]), so the badge does not count messages
@@ -175,11 +178,13 @@ impl DmUi {
             .count()
     }
 
-    /// Unread messages across all threads: what the rail's badges add up to.
+    /// Unread messages across the threads on the rail: what its badges add up to. An archived
+    /// thread is off the rail and does not count until its peer writes again.
     pub fn unread_total(&self) -> usize {
         self.snapshot
             .threads
             .iter()
+            .filter(|t| !self.archive.is_hidden(t))
             .map(|t| self.unread_of(t))
             .sum()
     }
@@ -231,6 +236,7 @@ impl DmUi {
                 seen.retain(|k| present.contains(k.as_str()));
             }
         }
+        self.archive.reconcile(&snapshot);
         self.snapshot = snapshot;
         self.forget_deleted();
         self.rebuild();
@@ -298,13 +304,18 @@ impl DmUi {
         true
     }
 
-    fn rebuild(&mut self) {
+    pub(super) fn rebuild(&mut self) {
         self.rebuilds += 1;
         let hydrated = self.snapshot.hydrated;
+        self.archive.refresh(&self.snapshot);
         let mut previews = std::mem::take(&mut self.previews);
         let mut kept = HashMap::new();
         let mut rows = Vec::with_capacity(self.snapshot.threads.len());
         for t in &self.snapshot.threads {
+            // An archived thread is off the rail until its peer writes again.
+            if self.archive.is_hidden(t) {
+                continue;
+            }
             let id = (t.room.clone(), t.peer_key.clone());
             let p = match previews.remove(&id) {
                 Some(p) if std::sync::Arc::ptr_eq(&p.thread, t) && p.hydrated == hydrated => p,
@@ -481,6 +492,9 @@ impl Chat {
             .forget_rooms(|r| keys.iter().any(|k| k == r));
         self.dm.purge.forget_rooms(|r| keys.iter().any(|k| k == r));
         self.dm.invite.forget_rooms(|r| keys.iter().any(|k| k == r));
+        self.dm
+            .archive
+            .forget_rooms(|r| keys.iter().any(|k| k == r));
     }
 
     /// Open the conversation with the member `uid` of the room keyed `room`, in the main pane.
@@ -574,7 +588,7 @@ impl Chat {
 /// The rail's "Direct messages" section: nothing when there are no threads.
 pub(super) fn rail(chat: &Chat, p: &Palette) -> Vec<El> {
     let dm = &chat.dm;
-    if dm.rows.is_empty() {
+    if !super::dm_archive::section_shown(dm, dm.rows.len()) {
         return Vec::new();
     }
     let mut out = vec![
@@ -588,9 +602,10 @@ pub(super) fn rail(chat: &Chat, p: &Palette) -> Vec<El> {
             .child(label("Direct messages", st::SECTION, p.text_muted))
             .child(rune::spacer()),
     ];
+    out.extend(super::dm_archive::undo_line(chat, p));
     for r in dm.rows.iter().take(RAIL_MAX) {
         let selected = dm.open_key() == Some((r.room.as_str(), r.peer_key.as_str()));
-        out.push(rail_row(r, selected, p));
+        out.push(rail_row(r, selected, chat.dm_archive_block(), p));
     }
     if dm.rows.len() > RAIL_MAX {
         out.push(
@@ -604,10 +619,11 @@ pub(super) fn rail(chat: &Chat, p: &Palette) -> Vec<El> {
             .py(4.0),
         );
     }
+    out.extend(super::dm_archive::fold_out(chat, p));
     out
 }
 
-fn rail_row(r: &RailRow, selected: bool, p: &Palette) -> El {
+fn rail_row(r: &RailRow, selected: bool, blocked: Option<&'static str>, p: &Palette) -> El {
     // The badge is the count `DmUi::unread_total` adds up, selected or not.
     let unread = r.unread > 0;
     let strong = unread || selected;
@@ -667,6 +683,13 @@ fn rail_row(r: &RailRow, selected: bool, p: &Palette) -> El {
                 .child(label(r.unread.to_string(), st::BADGE, p.accent)),
         );
     }
+    out = out.child(super::dm_archive::row_button(
+        &r.room,
+        &r.peer_key,
+        &r.peer_name,
+        blocked,
+        p,
+    ));
     if selected {
         out.fill(p.surface)
     } else {
@@ -791,6 +814,7 @@ fn header(chat: &Chat, shown: &Shown<'_>, narrow: bool, p: &Palette, k: &Kit) ->
                         .shrink(),
                 ),
         )
+        .child(super::dm_archive::header_action(chat, narrow, p, k))
         .child(super::dm_purge::header_action(
             chat,
             narrow,

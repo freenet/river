@@ -308,6 +308,7 @@ pub fn with_pending(
                     peer_is_member: peer_vk(room, row.recipient).is_some(),
                     last_ts: m.timestamp,
                     last_inbound_ts: 0,
+                    last_inbound_signed: 0,
                     messages: vec![m],
                 }));
             }

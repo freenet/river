@@ -57,6 +57,13 @@
 //! stored copy could not be read is missing from the list for a while, and its unsaved text waits
 //! for it. After [`REMOVAL_TURNS`] failed removal writes in a row the adds go first for a turn.
 //!
+//! **Archive changes** ([`super::dm_archive`]) are written by the same read-merge-compare-and-swap
+//! but never in the same write as sent text or removals, and have a [`DmSaver`] of their own in the
+//! session (`archive_saver`): a store that keeps refusing them (an archive entry this build cannot
+//! read, a value too big for one more entry) must not refuse a sent text or a removal along with
+//! them, nor delay them by its backoff. The text goes first when both are due. A write that finds
+//! nothing to change stores nothing and is done.
+//!
 //! **Size.** A write is a whole value on the connection that also carries the user's rooms, so
 //! it is bounded at [`super::dm_store::MAX_WRITE_BYTES`] (4 MiB; see there for the limits of the
 //! node's client API, 100 MiB, and of the delegate, none) and a save that goes unanswered costs

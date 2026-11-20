@@ -258,6 +258,19 @@ pub enum Action {
         token: PurgeToken,
         ticket: u64,
     },
+    /// Archive the thread with `peer` in the command's room ([`super::dm_archive`]).
+    /// `row_inbound_ts` is the newest time of a message `peer` sent the user in the thread as the
+    /// window shows it, 0 when they sent none; the cutoff is that or the room's own newest,
+    /// whichever is larger. Not answered: the thread is archived on screen at once and saved
+    /// like the sent text is.
+    ArchiveDm {
+        peer: MemberId,
+        row_inbound_ts: u64,
+    },
+    /// Take the thread with `peer` out of the archive, whatever its cutoff (the user asked).
+    UnarchiveDm {
+        peer: MemberId,
+    },
 }
 
 impl std::fmt::Debug for Action {
@@ -357,6 +370,14 @@ impl std::fmt::Debug for Action {
                 .field("peer", &super::dm::peer_key(*peer))
                 .field("token", &"<hidden>")
                 .field("ticket", ticket)
+                .finish(),
+            Action::ArchiveDm { peer, .. } => f
+                .debug_struct("ArchiveDm")
+                .field("peer", &super::dm::peer_key(*peer))
+                .finish_non_exhaustive(),
+            Action::UnarchiveDm { peer } => f
+                .debug_struct("UnarchiveDm")
+                .field("peer", &super::dm::peer_key(*peer))
                 .finish(),
         }
     }
@@ -2845,7 +2866,9 @@ impl Outbox {
             | Action::SendDm { .. }
             | Action::PurgeDm { .. }
             | Action::SendInviteDm { .. }
-            | Action::AcceptInviteDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
+            | Action::AcceptInviteDm { .. }
+            | Action::ArchiveDm { .. }
+            | Action::UnarchiveDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 
