@@ -43,6 +43,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         // overlay, so close it then: otherwise it would come back, and take focus from the
         // composer, the next time the window narrows.
         .on_layout(|s: &mut RiverApp, r: [f32; 4]| {
+            s.chat.narrow = r[2] < NARROW_WIDTH;
             if r[2] >= NARROW_WIDTH {
                 s.chat.members_overlay = false;
             }
@@ -885,20 +886,21 @@ fn no_rooms(chat: &Chat, p: &Palette) -> El {
 // Members -------------------------------------------------------------------------------------
 
 fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El {
-    // A stand-in for the web UI's order, which is you first and then the invite tree from the
-    // owner down. These view models carry no invite tree yet, so after you come the owner and
-    // then everyone else by name.
-    let mut sorted: Vec<&Member> = room.members.iter().collect();
-    sorted.sort_by_key(|m| {
-        (
-            m.id != room.me,
-            m.role != Role::Owner,
-            m.nickname.to_lowercase(),
-        )
-    });
+    // The web UI's order: you first, then the invite tree from the owner down with deputies
+    // under who appointed them, narrowed by the search box (see `member_list`).
+    let rows = chat.member_rows();
+    let searching = chat.member_search.open;
     let mut list = col().key("member-list").gap(2.0).px(8.0).pt(8.0);
-    for m in sorted {
-        list = list.child(member_row(room, m, p));
+    for &i in rows.iter() {
+        list = list.child(member_row(room, &room.members[i], p));
+    }
+    if rows.is_empty() && searching && !chat.member_search.query.text.trim().is_empty() {
+        list = list.child(
+            label("No matching members", st::SMALL, p.text_muted)
+                .key("member-search-empty")
+                .px(8.0)
+                .py(6.0),
+        );
     }
     let mut header = row()
         .h(HEADER_H)
@@ -911,10 +913,32 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
             room.members.len().to_string(),
             st::SMALL,
             p.text_muted,
-        ));
+        ))
+        .child(spacer())
+        .child(
+            icon_button(
+                "member-search-toggle",
+                if searching {
+                    "Close member search"
+                } else {
+                    "Search members"
+                },
+                &rune_kit::glyphs::SEARCH,
+                p,
+            )
+            .expanded(searching)
+            .fill(if searching {
+                p.surface_hover
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.toggle_member_search()),
+        );
     if overlay {
         // Over the conversation the panel covers the header's toggle, so it closes itself.
-        header = header.child(spacer()).child(
+        header = header.child(
             icon_button(
                 "close-members",
                 "Close members",
@@ -1029,6 +1053,7 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
             .fill(p.rail)
             .child(header)
             .child(hline(p))
+            .children(member_search_box(chat, p, k))
             .child(
                 list.scroll(ScrollSpec {
                     stick_bottom: false,
@@ -1037,6 +1062,52 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
                 .min_h(0.0),
             )
             .child(footer),
+    )
+}
+
+/// The members box under the header, while open: the field and a button that clears it.
+fn member_search_box(chat: &Chat, p: &Palette, k: &Kit) -> Option<El> {
+    let s = &chat.member_search;
+    if !s.open {
+        return None;
+    }
+    let input = TextInput::new(&s.query)
+        .placeholder("Search members")
+        .width(None)
+        .on_edit(|s: &mut RiverApp| &mut s.chat.member_search.query)
+        .on_key(|s: &mut RiverApp, ev, _| {
+            if ev.key == rune::Key::Escape {
+                return s.chat.escape();
+            }
+            super::keys::word_keys(&mut s.chat.member_search.query, ev)
+        })
+        .build(k)
+        .key("member-search-input")
+        .grow(1.0)
+        .min_w(0.0);
+    let mut line = row().w_full().gap(6.0).center_y().child(input);
+    if !s.query.text.is_empty() {
+        line = line.child(
+            icon_button(
+                "member-search-clear",
+                "Clear member search",
+                &rune_kit::glyphs::CLOSE,
+                p,
+            )
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.clear_member_query()),
+        );
+    }
+    Some(
+        col()
+            .key("member-search")
+            .role("search")
+            .label("Search members")
+            .w_full()
+            .px(8.0)
+            .py(8.0)
+            .child(line),
     )
 }
 

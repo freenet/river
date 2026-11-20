@@ -16,6 +16,18 @@ pub(crate) fn names_fold_together(a: &str, b: &str) -> bool {
     folds_together(a, b)
 }
 
+/// `s` as a plain-text search compares it: combining marks dropped, precomposed Latin letters
+/// reduced to their unaccented base (the NFD-then-drop-marks step below), then lowercased. Unlike
+/// the skeleton folds this keeps look-alike letters apart (`l` is not `I`), so a typed query
+/// does not match unrelated names.
+pub(crate) fn search_fold(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !is_combining_mark(c))
+        .map(|c| strip_latin_accent(c).unwrap_or(c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Whether `name` folds to one of the handles River generates for a member with no nickname,
 /// which the web UI never protects (`folds_to_generated_handle`, copied below).
 pub(crate) fn names_fold_to_generated_handle(name: &str) -> bool {

@@ -242,7 +242,7 @@ impl Chat {
         };
         self.composer.set_selection(p.anchor, self.composer.focus);
         self.composer.insert(e.glyph);
-        self.composer.focused = true;
+        self.focus_composer();
         self.shortcode.off = None;
     }
 
