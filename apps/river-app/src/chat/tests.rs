@@ -520,6 +520,14 @@ fn node_rooms(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
 }
 
 fn sent(rt: &mut Runtime<RiverApp>) -> Vec<Action> {
+    sent_all(rt)
+        .into_iter()
+        .filter(|a| !matches!(a, Action::PreviewBan { .. }))
+        .collect()
+}
+
+/// Everything the screen asked for, including what a ban confirmation asks the room.
+fn sent_all(rt: &mut Runtime<RiverApp>) -> Vec<Action> {
     std::mem::take(&mut rt.state.chat.outgoing)
         .into_iter()
         .map(|c| c.action)
@@ -1474,12 +1482,8 @@ fn what_needs_commands_this_app_lacks_is_shown_unavailable() {
     });
     let mut rt = render(state, WINDOW_SIZE);
     open_member(&mut rt, "Jonas");
-    let e = rt
-        .elements()
-        .into_iter()
-        .find(|e| e.key.as_deref() == Some("member-ban"))
-        .expect("no member-ban");
-    assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET));
+    // The room offers no Ban here (example rooms carry no authority), so none is shown.
+    assert!(rt.find("member-ban").is_none());
     // Deputize is real: it works, so it does not say it is not available yet.
     let e = rt
         .elements()
@@ -4432,6 +4436,17 @@ fn details_open(room: &str) -> Runtime<RiverApp> {
     rt
 }
 
+/// An owner's room where the viewer is offered Ban for Jonas.
+fn ban_offered(offer: super::model::BanOffer) -> Runtime<RiverApp> {
+    let mut rt = as_owner(|_| {});
+    let jonas = uid_of(&rt, "Jonas");
+    rt.state.chat.edit_rooms(|r| {
+        r[0].ban_offers.insert(jonas, offer);
+    });
+    dialog_of(&mut rt, "Jonas");
+    rt
+}
+
 #[test]
 fn the_details_dialog_offers_leave_room_to_a_member_and_to_the_owner() {
     for room in ["town-square", OWNED] {
@@ -4572,4 +4587,382 @@ fn leaving_an_example_room_just_removes_it() {
     assert!(s.chat.outgoing.is_empty(), "nothing goes to a node");
     assert!(s.chat.rooms().iter().all(|r| r.key != "town-square"));
     assert!(s.chat.room().is_some());
+}
+
+/// The room answers what banning `uid` does to its other bans.
+fn answer_preview(rt: &mut Runtime<RiverApp>, uid: &str, p: super::model::BanPreview) {
+    rt.state.chat.edit_rooms(|r| {
+        r[0].ban_preview.insert(uid.to_owned(), p);
+    });
+    redraw(rt);
+}
+
+#[test]
+fn ban_is_offered_where_the_room_offers_it_asks_first_and_sends_one_command() {
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    assert!(rt.find("member-ban").is_some());
+    assert!(!dimmed(&rt, "member-ban"));
+    assert_ne!(
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("member-ban"))
+            .unwrap()
+            .help
+            .as_deref(),
+        Some(super::view::NOT_YET)
+    );
+    press(&mut rt, "member-ban");
+    // The web UI's words, and nothing has been sent.
+    assert!(shows(&rt, "Confirm Ban"));
+    assert!(shows(&rt, "Are you sure you want to ban Jonas"));
+    assert!(shows(&rt, "This action cannot be undone."));
+    // Asking asks the room what the ban does; nothing is banned, and Confirm waits for the answer.
+    let jonas = uid_of(&rt, "Jonas");
+    assert_eq!(
+        sent_all(&mut rt),
+        [Action::PreviewBan {
+            target: jonas.clone()
+        }]
+    );
+    assert!(dimmed(&rt, "member-ban-confirm-yes"));
+    press(&mut rt, "member-ban-confirm-yes");
+    assert!(sent(&mut rt).is_empty(), "not before the room has answered");
+    answer_preview(&mut rt, &jonas, super::model::BanPreview::default());
+    assert!(!dimmed(&rt, "member-ban-confirm-yes"));
+    // Cancel backs out.
+    press(&mut rt, "member-ban-cancel");
+    assert!(rt.find("member-ban-confirm").is_none());
+    assert!(sent(&mut rt).is_empty());
+    press(&mut rt, "member-ban");
+    sent(&mut rt);
+    answer_preview(&mut rt, &jonas, super::model::BanPreview::default());
+    press(&mut rt, "member-ban-confirm-yes");
+    assert_eq!(sent(&mut rt), [Action::Ban { target: jonas }]);
+    // The dialog closes, as the web UI's does.
+    assert!(rt.state.chat.member_modal.is_none());
+    assert!(rt.state.chat.ban_confirm.is_none());
+}
+
+#[test]
+fn a_private_room_ban_says_the_secret_changes() {
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    rt.state.chat.edit_rooms(|r| r[0].private = true);
+    redraw(&mut rt);
+    press(&mut rt, "member-ban");
+    assert!(shows(&rt, "also changes the room's secret"));
+}
+
+#[test]
+fn a_ban_that_is_withheld_says_why_and_offers_no_button() {
+    let rt = ban_offered(super::model::BanOffer::Withheld("Not from here.".into()));
+    assert!(rt.find("member-ban").is_none());
+    assert!(shows(&rt, "Not from here."));
+}
+
+#[test]
+fn no_offer_means_no_button_and_nothing_said() {
+    let mut rt = as_owner(|_| {});
+    dialog_of(&mut rt, "Jonas");
+    assert!(rt.find("member-ban").is_none());
+    assert!(rt.find("member-ban-withheld").is_none());
+}
+
+#[test]
+fn a_ban_confirmation_does_not_outlive_its_dialog_or_its_offer() {
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    assert!(rt.state.chat.ban_confirm.is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.state.chat.ban_confirm.is_none());
+    dialog_of(&mut rt, "Jonas");
+    assert!(rt.find("member-ban-confirm").is_none());
+    // The room stopped offering it (the member left, or authority changed): nothing is sent.
+    press(&mut rt, "member-ban");
+    sent(&mut rt);
+    rt.state.chat.edit_rooms(|r| r[0].ban_offers.clear());
+    rt.state.chat.confirm_ban();
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn the_confirmation_says_how_many_invitees_go_with_the_member() {
+    let mut rt = as_owner(|_| {});
+    let jonas = uid_of(&rt, "Jonas");
+    rt.state.chat.edit_rooms(|r| {
+        r[0].ban_offers
+            .insert(jonas.clone(), super::model::BanOffer::Allowed);
+        let jid = r[0].member_by_uid(&jonas).unwrap().id;
+        for m in &mut r[0].members {
+            m.invited_by = None;
+        }
+        let other = r[0]
+            .members
+            .iter()
+            .position(|m| m.id != jid && m.id != r[0].me)
+            .unwrap();
+        r[0].members[other].invited_by = Some(jid);
+    });
+    dialog_of(&mut rt, "Jonas");
+    press(&mut rt, "member-ban");
+    assert!(shows(&rt, "also removes 1 member they invited"));
+}
+
+#[test]
+fn the_owner_of_a_private_room_can_rotate_its_secret_and_nobody_else() {
+    // Sam owns Design Crew (private).
+    let mut rt = render(from_node(PRIVATE_ROOM), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("details-rotate").is_some());
+    assert!(!dimmed(&rt, "details-rotate"));
+    press(&mut rt, "details-rotate");
+    assert_eq!(sent(&mut rt), [Action::RotateSecret]);
+    // One at a time: with one on its way the button does nothing more.
+    rt.state.chat.edit_rooms(|r| {
+        for room in r.iter_mut().filter(|r| r.key == PRIVATE_ROOM) {
+            room.details.rotation = Some(super::model::Pending {
+                entry: 1,
+                failed: None,
+                retry: false,
+            });
+        }
+    });
+    press(&mut rt, "details-secret");
+    assert!(dimmed(&rt, "details-rotate"));
+    press(&mut rt, "details-rotate");
+    assert!(sent(&mut rt).is_empty());
+    assert!(shows(&rt, "Rotating the secret"));
+    // Failed: why, Retry and Discard.
+    rt.state.chat.edit_rooms(|r| {
+        for room in r.iter_mut().filter(|r| r.key == PRIVATE_ROOM) {
+            room.details.rotation = Some(super::model::Pending {
+                entry: 7,
+                failed: Some("Not saved. Freenet refused it: no".into()),
+                retry: true,
+            });
+        }
+    });
+    press(&mut rt, "details-secret");
+    assert!(shows(&rt, "Not saved. Freenet refused it: no"));
+    press(&mut rt, "rotation-retry");
+    press(&mut rt, "rotation-discard");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::Retry { entry: 7 }, Action::Discard { entry: 7 }]
+    );
+}
+
+#[test]
+fn rotate_is_absent_for_members_and_public_rooms_and_dimmed_without_the_key() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("details-rotate").is_none());
+    let mut rt = node_rooms(|rooms| {
+        for r in rooms.iter_mut().filter(|r| r.key == PRIVATE_ROOM) {
+            r.details.rotate = super::model::RotateOffer::No;
+        }
+    });
+    rt.update(|s, _| s.chat.select(PRIVATE_ROOM));
+    settle(&mut rt);
+    press(&mut rt, "room-title");
+    assert!(rt.find("details-rotate").is_none());
+    let mut rt = node_rooms(|rooms| {
+        for r in rooms.iter_mut().filter(|r| r.key == PRIVATE_ROOM) {
+            r.details.rotate = super::model::RotateOffer::Blocked("no key".into());
+        }
+    });
+    rt.update(|s, _| s.chat.select(PRIVATE_ROOM));
+    settle(&mut rt);
+    press(&mut rt, "room-title");
+    assert!(dimmed(&rt, "details-rotate"));
+    press(&mut rt, "details-rotate");
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn the_confirmation_says_whose_ban_the_room_would_lift_and_refuses_one_it_would_drop() {
+    let mut rt = as_owner(|_| {});
+    let jonas = uid_of(&rt, "Jonas");
+    rt.state.chat.edit_rooms(|r| {
+        r[0].ban_offers
+            .insert(jonas.clone(), super::model::BanOffer::Allowed);
+        r[0].details.limits.max_user_bans = 3;
+    });
+    dialog_of(&mut rt, "Jonas");
+    press(&mut rt, "member-ban");
+    assert!(shows(&rt, "Checking what this ban does"));
+    answer_preview(
+        &mut rt,
+        &jonas,
+        super::model::BanPreview {
+            lifts: vec!["Maya".into()],
+            refused: false,
+        },
+    );
+    assert!(shows(
+        &rt,
+        "This will lift the ban on Maya because the room keeps at most 3 bans."
+    ));
+    // The ban is still allowed.
+    sent(&mut rt);
+    press(&mut rt, "member-ban-confirm-yes");
+    assert_eq!(sent(&mut rt).len(), 1);
+    // One the room would not keep is said and cannot be confirmed.
+    dialog_of(&mut rt, "Jonas");
+    rt.state.chat.edit_rooms(|r| {
+        r[0].ban_offers
+            .insert(jonas.clone(), super::model::BanOffer::Allowed);
+    });
+    press(&mut rt, "member-ban");
+    sent(&mut rt);
+    answer_preview(
+        &mut rt,
+        &jonas,
+        super::model::BanPreview {
+            lifts: Vec::new(),
+            refused: true,
+        },
+    );
+    assert!(shows(&rt, "it would not keep this ban"));
+    assert!(dimmed(&rt, "member-ban-confirm-yes"));
+    press(&mut rt, "member-ban-confirm-yes");
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn a_preview_that_changes_before_confirming_cannot_be_confirmed_by_a_double_press() {
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    let jonas = uid_of(&rt, "Jonas");
+    press(&mut rt, "member-ban");
+    sent(&mut rt);
+    answer_preview(&mut rt, &jonas, super::model::BanPreview::default());
+    // The room's bans change: now this ban would lift someone's.
+    answer_preview(
+        &mut rt,
+        &jonas,
+        super::model::BanPreview {
+            lifts: vec!["Maya".into()],
+            refused: false,
+        },
+    );
+    assert!(shows(&rt, "This changed while you were looking"));
+    assert!(shows(&rt, "lift the ban on Maya"));
+    let since = rt.state.chat.ban_changed.expect("flagged");
+    // A double click, or a held key, within the reading time sends nothing.
+    for ms in [0, 30, 120, 399] {
+        rt.state
+            .chat
+            .confirm_ban_at(since + std::time::Duration::from_millis(ms));
+    }
+    assert!(sent(&mut rt).is_empty(), "shown again, not sent");
+    assert!(rt.state.chat.ban_confirm.is_some());
+    // A press after the new text has been on screen long enough confirms it.
+    rt.state
+        .chat
+        .confirm_ban_at(since + std::time::Duration::from_millis(450));
+    assert_eq!(sent(&mut rt), [Action::Ban { target: jonas }]);
+}
+
+#[test]
+fn closing_a_ban_confirmation_tells_the_room_to_stop_working_out_its_effect() {
+    // Cancel.
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    sent_all(&mut rt);
+    press(&mut rt, "member-ban-cancel");
+    assert_eq!(
+        sent_all(&mut rt),
+        [Action::PreviewBan {
+            target: String::new()
+        }]
+    );
+    // Closing the dialog, switching room, and leaving each do the same.
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    sent_all(&mut rt);
+    rt.state.chat.close_member();
+    assert!(
+        sent_all(&mut rt)
+            .iter()
+            .any(|a| matches!(a, Action::PreviewBan { target } if target.is_empty()))
+    );
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    sent_all(&mut rt);
+    rt.update(|s, _| s.chat.select(PRIVATE_ROOM));
+    assert!(
+        sent_all(&mut rt)
+            .iter()
+            .any(|a| matches!(a, Action::PreviewBan { target } if target.is_empty()))
+    );
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    sent_all(&mut rt);
+    rt.state.chat.set_rooms(Vec::new());
+    assert!(
+        sent_all(&mut rt)
+            .iter()
+            .any(|a| matches!(a, Action::PreviewBan { target } if target.is_empty()))
+    );
+}
+
+#[test]
+fn a_ban_confirmation_is_cleared_whenever_the_dialog_goes() {
+    // Changing room, opening the details, and the room losing the member each close the
+    // dialog; none may leave a confirmation to come back with the next dialog.
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    assert!(rt.state.chat.ban_confirm.is_some());
+    rt.state.chat.open_details();
+    assert!(rt.state.chat.member_modal.is_none());
+    assert!(rt.state.chat.ban_confirm.is_none());
+
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    rt.update(|s, _| s.chat.select(PRIVATE_ROOM));
+    assert!(rt.state.chat.ban_confirm.is_none());
+
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    let jonas = uid_of(&rt, "Jonas");
+    rt.state
+        .chat
+        .edit_rooms(|r| r[0].members.retain(|m| m.uid != jonas));
+    assert!(rt.state.chat.member_modal.is_none());
+    assert!(rt.state.chat.ban_confirm.is_none());
+
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    rt.state.chat.set_rooms(Vec::new());
+    assert!(rt.state.chat.ban_confirm.is_none());
+}
+
+#[test]
+fn rotate_sits_beside_leave_and_does_nothing_while_leaving_is_being_confirmed() {
+    let mut rt = render(from_node(PRIVATE_ROOM), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    assert!(rt.find("details-rotate").is_some());
+    assert!(rt.find("details-leave").is_some());
+    press(&mut rt, "details-leave");
+    assert!(dimmed(&rt, "details-rotate"));
+    press(&mut rt, "details-rotate");
+    assert!(sent(&mut rt).is_empty());
+    rt.state.chat.rotate_secret();
+    assert!(sent(&mut rt).is_empty());
+}
+
+#[test]
+fn a_ban_dialog_open_when_the_room_is_left_goes_with_it() {
+    let mut rt = ban_offered(super::model::BanOffer::Allowed);
+    press(&mut rt, "member-ban");
+    sent(&mut rt);
+    assert!(rt.state.chat.ban_confirm.is_some());
+    // The list no longer has the room (left, here or in another window).
+    let key = rt.state.chat.room().unwrap().key.clone();
+    rt.state
+        .chat
+        .edit_rooms(|r| r.retain(|room| room.key != key));
+    assert!(rt.state.chat.member_modal.is_none());
+    assert!(rt.state.chat.ban_confirm.is_none());
+    rt.state.chat.confirm_ban();
+    assert!(sent(&mut rt).is_empty());
 }

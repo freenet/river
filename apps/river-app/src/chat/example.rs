@@ -7,7 +7,7 @@
 
 use super::model::{
     self, Appointer, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role,
-    Room, Usage,
+    Room, RotateOffer, Usage,
 };
 
 pub struct ExampleData {
@@ -201,6 +201,8 @@ fn town_square() -> Room {
         deputy_changes: Vec::new(),
         deputy_block: None,
         deputy_grant_block: None,
+        ban_offers: Default::default(),
+        ban_preview: Default::default(),
         deputies_full: false,
         wraps: None,
         details: Details::default(),
@@ -256,6 +258,8 @@ fn design_crew() -> Room {
         deputy_changes: Vec::new(),
         deputy_block: None,
         deputy_grant_block: None,
+        ban_offers: Default::default(),
+        ban_preview: Default::default(),
         deputies_full: false,
         wraps: None,
         details: Details::default(),
@@ -301,6 +305,8 @@ fn rust_help() -> Room {
         deputy_changes: Vec::new(),
         deputy_block: None,
         deputy_grant_block: None,
+        ban_offers: Default::default(),
+        ban_preview: Default::default(),
         deputies_full: false,
         wraps: None,
         details: Details::default(),
@@ -335,6 +341,8 @@ fn family() -> Room {
         deputy_changes: Vec::new(),
         deputy_block: None,
         deputy_grant_block: None,
+        ban_offers: Default::default(),
+        ban_preview: Default::default(),
         deputies_full: false,
         wraps: None,
         details: Details::default(),
@@ -359,6 +367,8 @@ fn book_club() -> Room {
         deputy_changes: Vec::new(),
         deputy_block: None,
         deputy_grant_block: None,
+        ban_offers: Default::default(),
+        ban_preview: Default::default(),
         deputies_full: false,
         wraps: None,
         details: Details::default(),
@@ -398,6 +408,12 @@ fn with_details(mut room: Room) -> Room {
         description_source: room.description.clone(),
         editable: if owner { Editable::Yes } else { Editable::No },
         pending: None,
+        rotate: if owner && room.private {
+            RotateOffer::Allowed
+        } else {
+            RotateOffer::No
+        },
+        rotation: None,
     };
     room
 }

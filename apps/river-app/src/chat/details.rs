@@ -14,17 +14,17 @@
 //! - "Leave Room" is at the foot of the dialog for the owner and for members, as in the web UI,
 //!   with the same confirmation wording plus a line saying the room's saved signing key goes
 //!   too. Leaving is [`Action::LeaveRoom`] ([`crate::rooms::leave`]).
+//! - The owner of a private room has "Rotate" beside the secret version, as in the web UI
+//!   ([`Action::RotateSecret`], [`crate::rooms::bans`]).
 //!
-//! PARITY-GAPS: the private room's "Rotate" (secret rotation) is in the web UI's dialog too;
-//! this app has no such command yet, so the dialog has no such button. Privacy is shown, never
-//! changed: the web UI cannot change it either.
+//! Privacy is shown, never changed: the web UI cannot change it either.
 
 use rune::{El, TextEdit, col, el, icon, row};
 use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextArea, TextInput};
 
 use super::icons;
 use super::markdown;
-use super::model::{Details, Editable, Limits, Role, Room};
+use super::model::{Details, Editable, Limits, Role, Room, RotateOffer};
 use super::style::{self as st, Palette};
 use super::view::label;
 use super::{Chat, Mode, Source};
@@ -105,6 +105,7 @@ impl Chat {
             return;
         };
         self.member_modal = None;
+        self.clear_ban_confirm();
         self.details = Some(form);
     }
 
@@ -140,6 +141,7 @@ impl Chat {
         }
         self.details = None;
         self.member_modal = None;
+        self.clear_ban_confirm();
         self.notify_dialog = None;
         self.invite = self.invite.take().filter(|(room, _)| *room != key);
         self.mode = Mode::Write;
@@ -320,6 +322,56 @@ impl Chat {
                 }
                 self.emit(key, Action::SetRoomDetails { edit });
             }
+        }
+    }
+
+    /// Rotate the room's secret (the owner of a private room, from the details dialog). Nothing
+    /// goes when it is not offered or one is already on its way. Example rooms move their
+    /// version in memory.
+    pub fn rotate_secret(&mut self) {
+        let Some(room) = self.room() else {
+            return;
+        };
+        // Not while Leave Room is being confirmed: the room is about to go.
+        if self.details.as_ref().is_some_and(|f| f.leaving)
+            || room.details.rotate != RotateOffer::Allowed
+            || room
+                .details
+                .rotation
+                .as_ref()
+                .is_some_and(|r| r.failed.is_none())
+        {
+            return;
+        }
+        let key = room.key.clone();
+        match self.source {
+            Source::Example => {
+                if let Some(r) = self.room_mut() {
+                    r.details.secret_version += 1;
+                }
+            }
+            Source::Node(_) => self.emit(key, Action::RotateSecret),
+        }
+    }
+
+    /// Try the rotation that failed again, or drop it.
+    pub fn retry_rotation(&mut self) {
+        if let Some(entry) = self
+            .room()
+            .and_then(|r| r.details.rotation.as_ref())
+            .map(|p| p.entry)
+        {
+            self.retry(entry);
+        }
+    }
+
+    pub fn discard_rotation(&mut self) {
+        if let Some(entry) = self
+            .room()
+            .and_then(|r| r.details.rotation.as_ref())
+            .map(|p| p.entry)
+        {
+            self.discard(entry);
         }
     }
 
@@ -562,6 +614,50 @@ fn status(room: &Room, p: &Palette, k: &Kit) -> Option<El> {
                     .on_press(|s: &mut RiverApp| s.chat.discard_details())
                     .build(k)
                     .key("details-discard"),
+            );
+        }
+    }
+    Some(status)
+}
+
+/// A rotation of the secret on its way or failed, in the dialog's words for it.
+fn rotation_status(room: &Room, p: &Palette, k: &Kit) -> Option<El> {
+    let pending = room.details.rotation.as_ref()?;
+    let mut status = row()
+        .key("details-rotation-status")
+        .w_full()
+        .gap(8.0)
+        .center_y();
+    match &pending.failed {
+        None => {
+            status = status.child(label(
+                "Rotating the secret\u{2026}",
+                st::SMALL,
+                p.text_muted,
+            ));
+        }
+        Some(why) => {
+            status = status.child(
+                label(why.clone(), st::SMALL, p.danger)
+                    .wrap()
+                    .shrink()
+                    .min_w(0.0),
+            );
+            if pending.retry {
+                status = status.child(
+                    Button::new("Retry")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut RiverApp| s.chat.retry_rotation())
+                        .build(k)
+                        .key("rotation-retry"),
+                );
+            }
+            status = status.child(
+                Button::new("Discard")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.discard_rotation())
+                    .build(k)
+                    .key("rotation-discard"),
             );
         }
     }
@@ -901,14 +997,31 @@ pub(super) fn details_modal(
         );
     }
     if room.private {
-        extra.push(
-            captioned(
-                "Secret Version".into(),
-                label(d.secret_version.to_string(), st::BODY, p.text),
-                &p,
-            )
-            .key("details-secret"),
-        );
+        // The web UI's Rotate sits beside the version, for the owner only.
+        let mut version = row().w_full().gap(8.0).center_y().child(label(
+            d.secret_version.to_string(),
+            st::BODY,
+            p.text,
+        ));
+        let busy = d.rotation.as_ref().is_some_and(|r| r.failed.is_none());
+        match &d.rotate {
+            RotateOffer::No => {}
+            offer => {
+                let mut rotate = Button::new("Rotate")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.rotate_secret())
+                    .build(k)
+                    .key("details-rotate");
+                if busy || form.leaving || matches!(offer, RotateOffer::Blocked(_)) {
+                    rotate = rotate.disabled(true).opacity(0.45);
+                }
+                version = version.child(rotate.help(
+                    "Rotate room secret now (e.g., after suspecting a leak). Banning a member \
+                     rotates it too.",
+                ));
+            }
+        }
+        extra.push(captioned("Secret Version".into(), version, &p).key("details-secret"));
     }
     // Three columns where the window is wide, two in a narrow one.
     let cols = if narrow { 2 } else { 3 };
@@ -957,6 +1070,9 @@ pub(super) fn details_modal(
         }
     }
     if let Some(status) = status(room, &p, k) {
+        footer = footer.child(status);
+    }
+    if let Some(status) = rotation_status(room, &p, k) {
         footer = footer.child(status);
     }
     if form.leaving {

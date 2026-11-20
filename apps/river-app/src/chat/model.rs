@@ -177,6 +177,23 @@ pub struct DeputyChange {
     pub pending: Pending,
 }
 
+/// What a ban would do to the room's other bans (the room keeps a fixed number of them).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BanPreview {
+    /// Members whose existing ban the room would lift to keep this one, by name.
+    pub lifts: Vec<String>,
+    /// The room would not keep this ban itself: it is full of bans that outrank it.
+    pub refused: bool,
+}
+
+/// Whether the viewer is offered Ban for one member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BanOffer {
+    Allowed,
+    /// The viewer holds the authority but may not use it here, and why.
+    Withheld(String),
+}
+
 /// Something you did that could not be sent and has no message row to say so on (an edit, a
 /// deletion, a reaction).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,6 +277,21 @@ pub struct Details {
     pub editable: Editable,
     /// An edit of the room's details that is on its way or failed.
     pub pending: Option<Pending>,
+    /// Whether the viewer can rotate the room's secret (the web UI's Rotate button).
+    pub rotate: RotateOffer,
+    /// A rotation of the secret that is on its way or failed.
+    pub rotation: Option<Pending>,
+}
+
+/// Whether the viewer is offered the secret's Rotate button.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RotateOffer {
+    /// Not the owner of a private room: no button.
+    #[default]
+    No,
+    Allowed,
+    /// The owner, who can't from here, and why (shown dimmed).
+    Blocked(String),
 }
 
 /// Whether the viewer can edit the room's details.
@@ -308,6 +340,12 @@ pub struct Room {
     /// Why nobody more can be made a deputy now, though one can be revoked: no nickname or
     /// record to build the change on.
     pub deputy_grant_block: Option<String>,
+    /// Which members the viewer is offered Ban for, by `Member::uid`, or told why not (the web
+    /// UI's `ban_gate`). A member with no entry is one the viewer has no ban authority over.
+    pub ban_offers: std::collections::HashMap<String, BanOffer>,
+    /// What banning one member would do to the room's other bans, for the member the viewer
+    /// asked about (by `Member::uid`); empty until asked ([`crate::rooms::Action::PreviewBan`]).
+    pub ban_preview: std::collections::HashMap<String, BanPreview>,
     /// Whether you already have the most deputies a member can have, so nobody more can be added.
     pub deputies_full: bool,
     pub details: Details,
@@ -788,6 +826,8 @@ mod tests {
             deputy_changes: Vec::new(),
             deputy_block: None,
             deputy_grant_block: None,
+            ban_offers: Default::default(),
+            ban_preview: Default::default(),
             deputies_full: false,
             wraps: None,
             details: Details::default(),

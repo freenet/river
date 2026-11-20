@@ -205,6 +205,14 @@ pub struct Chat {
     /// In the open member dialog: the deputy change being confirmed, by member (`Member::uid`)
     /// and whether it makes them a deputy (`true`) or ends that.
     pub deputy_confirm: Option<(String, bool)>,
+    /// In the open member dialog: the member (`Member::uid`) whose ban is being confirmed.
+    pub ban_confirm: Option<String>,
+    /// What the open ban confirmation last showed about the room's other bans, and whether it
+    /// has changed since the person last saw it (the next Confirm then only shows the new text).
+    pub ban_seen: Option<model::BanPreview>,
+    pub ban_changed: Option<std::time::Instant>,
+    /// The room the open ban confirmation asked its question of.
+    ban_room: Option<String>,
     /// What is typed in the nickname field of your own member info dialog.
     pub nickname: TextEdit,
     /// Why the nickname typed was refused when Save was pressed with nothing in it.
@@ -340,6 +348,10 @@ impl Chat {
             at_bottom: true,
             member_modal: None,
             deputy_confirm: None,
+            ban_confirm: None,
+            ban_seen: None,
+            ban_changed: None,
+            ban_room: None,
             nickname: TextEdit::new(""),
             nickname_error: None,
             details: None,
@@ -395,6 +407,7 @@ impl Chat {
         if self.rooms.is_empty() {
             self.emoji_open = false;
             self.member_modal = None;
+            self.clear_ban_confirm();
             self.details = None;
             // An empty list is often a reload on its way to the full one: keep the open room's
             // text as its draft, remember which room it was, and open nothing.
@@ -424,6 +437,7 @@ impl Chat {
             && !self.room().is_some_and(|r| r.member_by_uid(uid).is_some())
         {
             self.member_modal = None;
+            self.clear_ban_confirm();
         }
         if let Some(room) = &self.notify_dialog
             && !self.rooms.iter().any(|r| &r.key == room)
@@ -431,6 +445,7 @@ impl Chat {
             self.notify_dialog = None;
         }
         self.settle_details();
+        self.settle_ban_confirm();
     }
 
     /// Show the user's rooms as read from the node, replacing what is shown. `open` is the room
@@ -572,6 +587,7 @@ impl Chat {
         self.at_bottom = true;
         // A member's dialog, and the details dialog, belong to the room they were opened in.
         self.member_modal = None;
+        self.clear_ban_confirm();
         self.notify_dialog = None;
         self.details = None;
         if self.selected.is_empty() {
@@ -967,14 +983,155 @@ impl Chat {
         self.nickname = edit;
         self.nickname_error = None;
         self.deputy_confirm = None;
+        self.clear_ban_confirm();
         self.details = None;
         self.member_modal = Some(uid.to_owned());
     }
 
     pub fn close_member(&mut self) {
         self.member_modal = None;
+        self.clear_ban_confirm();
         self.nickname_error = None;
         self.deputy_confirm = None;
+    }
+
+    /// Whether the open member dialog offers Ban for its member (the room's own gate).
+    pub fn ban_allowed(&self) -> bool {
+        let Some(uid) = self.member_modal.as_deref() else {
+            return false;
+        };
+        self.room().is_some_and(|r| {
+            r.member_by_uid(uid).is_some_and(|m| m.id != r.me)
+                && r.ban_offers.get(uid) == Some(&model::BanOffer::Allowed)
+        })
+    }
+
+    /// Ask to confirm banning the member in the open dialog. A room from the node is asked what
+    /// the ban would do to its other bans (the room keeps a fixed number), and the confirmation
+    /// waits for the answer.
+    pub fn ask_ban(&mut self) {
+        if !self.ban_allowed() {
+            return;
+        }
+        self.ban_confirm = self.member_modal.clone();
+        self.ban_seen = None;
+        self.ban_changed = None;
+        self.ban_room = self.room().map(|r| r.key.clone());
+        if let (Some(uid), Some(key), Source::Node(_)) = (
+            self.ban_confirm.clone(),
+            self.ban_room.clone(),
+            &self.source,
+        ) {
+            self.emit(key, Action::PreviewBan { target: uid });
+        }
+        self.settle_ban_confirm();
+    }
+
+    /// Close the ban confirmation, and tell the room it no longer needs to work out what the
+    /// ban would do.
+    pub(super) fn clear_ban_confirm(&mut self) {
+        let was_open = self.ban_confirm.take().is_some();
+        self.ban_seen = None;
+        self.ban_changed = None;
+        if let (true, Some(key), Source::Node(_)) = (was_open, self.ban_room.take(), &self.source) {
+            self.emit(
+                key,
+                Action::PreviewBan {
+                    target: String::new(),
+                },
+            );
+        }
+    }
+
+    pub fn cancel_ban(&mut self) {
+        self.clear_ban_confirm();
+    }
+
+    /// What the open confirmation knows of the ban's effect on the other bans: `None` until a
+    /// room from the node has answered; example rooms have nothing to ask.
+    pub fn ban_preview(&self) -> Option<&model::BanPreview> {
+        let uid = self.ban_confirm.as_deref()?;
+        self.room()?.ban_preview.get(uid)
+    }
+
+    /// Whether Confirm can be pressed: the answer is in (or there is nothing to ask) and the
+    /// room would keep the ban.
+    pub fn ban_ready(&self) -> bool {
+        match (&self.source, self.ban_preview()) {
+            (Source::Example, _) => true,
+            (_, Some(p)) => !p.refused,
+            (_, None) => false,
+        }
+    }
+
+    /// After the rooms changed: if what the ban would do to the other bans is not what the
+    /// person was shown, say so before anything is sent.
+    pub(super) fn settle_ban_confirm(&mut self) {
+        self.settle_ban_confirm_at(std::time::Instant::now());
+    }
+
+    /// [`Chat::settle_ban_confirm`] at `now`.
+    pub fn settle_ban_confirm_at(&mut self, now_at: std::time::Instant) {
+        if self.ban_confirm.is_none() {
+            self.ban_seen = None;
+            self.ban_changed = None;
+            return;
+        }
+        let now = self.ban_preview().cloned();
+        if self.ban_seen.is_some() && now != self.ban_seen {
+            self.ban_changed = Some(now_at);
+        }
+        if now.is_some() {
+            self.ban_seen = now;
+        }
+    }
+
+    /// The confirmed ban goes to the node (rooms from the node), or is made in memory (example
+    /// rooms), and the dialog closes, as the web UI's does. Nothing goes if the dialog no longer
+    /// offers it. A ban that fails is said above the composer, with Retry and Discard.
+    pub fn confirm_ban(&mut self) {
+        self.confirm_ban_at(std::time::Instant::now());
+    }
+
+    /// How long changed text is on screen before a Confirm counts: a double click or a held key
+    /// must not confirm what the person has not had time to read.
+    pub const BAN_READ_TIME: std::time::Duration = std::time::Duration::from_millis(400);
+
+    /// [`Chat::confirm_ban`] at `now`.
+    pub fn confirm_ban_at(&mut self, now: std::time::Instant) {
+        let Some(uid) = self.ban_confirm.clone() else {
+            return;
+        };
+        if self.member_modal.as_deref() != Some(uid.as_str())
+            || !self.ban_allowed()
+            || !self.ban_ready()
+        {
+            if self.member_modal.as_deref() != Some(uid.as_str()) {
+                self.clear_ban_confirm();
+            }
+            return;
+        }
+        // What the ban does to the other bans is not what the person was shown: the new text
+        // is shown, and a press before it has been on screen for [`Chat::BAN_READ_TIME`] is
+        // ignored instead of sending.
+        if let Some(since) = self.ban_changed
+            && now.saturating_duration_since(since) < Chat::BAN_READ_TIME
+        {
+            return;
+        }
+        self.clear_ban_confirm();
+        let Some(key) = self.room().map(|r| r.key.clone()) else {
+            return;
+        };
+        match self.source {
+            Source::Example => {
+                if let Some(r) = self.room_mut() {
+                    r.members.retain(|m| m.uid != uid);
+                }
+            }
+            Source::Node(_) => self.emit(key, Action::Ban { target: uid }),
+        }
+        self.close_member();
     }
 
     /// What the open member dialog offers about making this member your deputy, and what stops

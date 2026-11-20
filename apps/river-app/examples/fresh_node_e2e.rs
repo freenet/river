@@ -628,6 +628,231 @@ fn deputize_and_revoke(alice: &mut App, bob: &mut App, room: &str, key: &str) {
     );
 }
 
+/// A member the example plays itself, with no app: she joins by an invitation and reads a room
+/// from a node with her own key. Used for a member who stays when another is banned.
+struct Carol {
+    authority: String,
+    dir: PathBuf,
+    owner: VerifyingKey,
+    sk: ed25519_dalek::SigningKey,
+}
+
+impl Carol {
+    fn socket(authority: &str, dir: &Path) -> NodeSocket {
+        let token = TokenStore::in_dir(dir).load().expect("a grant token");
+        let mut socket =
+            NodeSocket::connect(authority, &token, &Default::default()).expect("a connection");
+        socket
+            .set_read_timeout(Duration::from_secs(10))
+            .expect("a timeout");
+        socket
+    }
+
+    /// The room's state as `authority` holds it.
+    fn state(&self) -> river_core::room_state::ChatRoomStateV1 {
+        use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse};
+        let key = river_app::rooms::create::contract_key(&self.owner);
+        let mut socket = Carol::socket(&self.authority, &self.dir);
+        socket
+            .send(&ClientRequest::ContractOp(ContractRequest::Get {
+                key: *key.id(),
+                return_contract_code: false,
+                subscribe: false,
+                blocking_subscribe: false,
+            }))
+            .expect("a GET");
+        loop {
+            match socket.recv().expect("an answer") {
+                Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                    state, ..
+                })) => {
+                    return ciborium::de::from_reader(state.as_ref()).expect("a room state");
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the node refused the GET: {e}"),
+            }
+        }
+    }
+
+    /// Join `link`'s room as "Carol" and wait for the node to take it.
+    fn join(authority: &str, dir: &Path, link: &str) -> Carol {
+        use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+        use freenet_stdlib::prelude::{StateDelta, UpdateData};
+        let code = river_core::invitation::invitation_text_from_paste(link);
+        let invitation =
+            river_core::invitation::Invitation::from_encoded_string(&code).expect("an invitation");
+        let carol = Carol {
+            authority: authority.to_owned(),
+            dir: dir.to_owned(),
+            owner: invitation.room,
+            sk: invitation.invitee_signing_key.clone(),
+        };
+        let key = river_app::rooms::create::contract_key(&carol.owner);
+        let plan = river_app::rooms::create::join(
+            &invitation,
+            "Carol",
+            &carol.state(),
+            key,
+            std::time::SystemTime::now(),
+        )
+        .unwrap_or_else(|e| panic!("Carol cannot join: {}", e.why));
+        let delta = plan.delta.expect("Carol is new to the room");
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&delta, &mut bytes).expect("a delta");
+        let mut socket = Carol::socket(authority, dir);
+        socket
+            .send(&ClientRequest::ContractOp(ContractRequest::Update {
+                key,
+                data: UpdateData::Delta(StateDelta::from(bytes)),
+            }))
+            .expect("an UPDATE");
+        loop {
+            match socket.recv().expect("an answer") {
+                Ok(HostResponse::ContractResponse(
+                    freenet_stdlib::client_api::ContractResponse::UpdateResponse { .. },
+                )) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the node refused Carol's join: {e}"),
+            }
+        }
+        println!("D: Carol joined");
+        carol
+    }
+
+    /// Whether Carol, with her own key and what node B holds, can read the owner's message
+    /// `text` in the room.
+    fn reads(&self, text: &str) -> bool {
+        use river_core::ecies::{
+            decrypt_with_symmetric_key, try_decrypt_secret_from_member_blob_raw,
+        };
+        use river_core::room_state::content::TextContentV1;
+        use river_core::room_state::message::RoomMessageBody;
+        let state = self.state();
+        let me = river_core::room_state::member::MemberId::from(&self.sk.verifying_key());
+        let wanted = TextContentV1::new(text.to_owned()).encode();
+        let mut secrets = std::collections::HashMap::new();
+        for b in &state.secrets.encrypted_secrets {
+            if b.secret.member_id != me {
+                continue;
+            }
+            if let Ok(s) = try_decrypt_secret_from_member_blob_raw(
+                &b.secret.ciphertext,
+                &b.secret.nonce,
+                &b.secret.sender_ephemeral_public_key,
+                &self.sk,
+            ) {
+                secrets.insert(b.secret.secret_version, s);
+            }
+        }
+        state
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| match &m.message.content {
+                RoomMessageBody::Private {
+                    ciphertext,
+                    nonce,
+                    secret_version,
+                    ..
+                } => secrets
+                    .get(secret_version)
+                    .and_then(|s| decrypt_with_symmetric_key(s, ciphertext, nonce).ok())
+                    .is_some_and(|plain| plain == wanted),
+                _ => false,
+            })
+    }
+}
+
+/// The owner on node A bans Bob. Node A drops Bob and everyone he invited; the ban is one update
+/// (in a private room it carries the rotated secret). Node B's app is then blocked from the
+/// room as banned and, in a private room, never reads what the owner writes afterwards: the
+/// room moved to secret version 1, which Bob was not given.
+fn ban_and_lock_out(
+    alice: &mut App,
+    bob: &mut App,
+    carol: Option<&Carol>,
+    room: &str,
+    key: &str,
+    private: bool,
+) {
+    let is_bob = |n: &str| n == "Bob Two" || n == "Bob";
+    let uid = alice
+        .room(room)
+        .and_then(|r| r.members.iter().find(|m| is_bob(&m.nickname)))
+        .map(|m| m.uid.clone())
+        .expect("Bob is a member on node A");
+    let version = |app: &App| app.room(room).map(|r| r.details.secret_version);
+    let before = version(alice).unwrap();
+    alice.send(key, Action::Ban { target: uid });
+    alice.until(
+        "node A no longer lists Bob, and nothing is left unsent",
+        |app| {
+            app.room(room).is_some_and(|r| {
+                !r.members.iter().any(|m| is_bob(&m.nickname))
+                    && r.notices.is_empty()
+                    && r.details.usage.bans == 1
+            })
+        },
+    );
+    if private {
+        alice.until("node A's room moved to the next secret version", |app| {
+            version(app) == Some(before + 1)
+        });
+    }
+    bob.until("node B's app is blocked as banned", |app| {
+        app.room(room)
+            .and_then(|r| r.send_block.clone())
+            .is_some_and(|b| b.contains("banned"))
+    });
+    // Bob's app has the post-ban state (the new secret version's record) before the owner writes,
+    // so what it holds afterwards is only what came after.
+    if private {
+        bob.until("Bob's app has the post-ban state", |app| {
+            version(app) == Some(before + 1)
+        });
+    }
+    let bob_messages_before = bob.room(room).map_or(0, |r| r.messages.len());
+    // What the owner writes after the ban. In a private room Carol, a member who stays, reads it
+    // through the node (the rotation gave her the new secret) and can write too; Bob, whose node
+    // has the same post-ban state, has no readable copy of it.
+    let after = format!("After the ban in {room}");
+    alice.send(
+        key,
+        Action::Send {
+            text: after.clone(),
+            reply_to: None,
+        },
+    );
+    alice.until("the owner sees their own message", |app| {
+        app.has_text(room, &after)
+    });
+    if let Some(carol) = carol {
+        // Carol, a member who stays, reads it from node B with the secret the rotation gave her.
+        let deadline = Instant::now() + STEP;
+        while !carol.reads(&after) {
+            assert!(
+                Instant::now() < deadline,
+                "Carol never read the message sealed under the new secret"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        println!("D: Carol reads the message sealed under the new secret");
+    }
+    if private {
+        // Not reading it is Bob lacking the secret, not Bob not having received it: wait until
+        // Bob's app holds one more message than it did before the owner wrote (it shows as one
+        // it cannot read), and only then look for the text.
+        bob.until("Bob's app holds the new message too", |app| {
+            app.room(room)
+                .is_some_and(|r| r.messages.len() > bob_messages_before)
+        });
+        assert!(
+            !bob.has_text(room, &after),
+            "the banned member read a message sealed after the ban"
+        );
+    }
+}
+
 /// A room's notification mode is stored in the chat delegate beside the room list (the web UI's
 /// `rooms_meta`): set in one app, it is read back by an app started afterwards, as after the app
 /// is restarted, and picking it did not lose the room or the open room the create stored.
@@ -983,6 +1208,91 @@ fn main() {
     });
     rename_both_ways(&mut alice, &mut bob, PRIVATE, &pkey, "Bob", "Alice");
     deputize_and_revoke(&mut alice, &mut bob, PRIVATE, &pkey);
+    // Carol, a third member who stays when Bob is banned. There is no third node to run an app
+    // on (an app's rooms live in its node's delegate, so a second app on node B would be Bob),
+    // so the example plays her itself: it joins with an invitation and reads the room from
+    // node B with her own key.
+    alice.invites.clear();
+    alice.send(&pkey, Action::Invite);
+    alice.until("an invitation for Carol is made", |app| {
+        !app.invites.is_empty()
+    });
+    let clink = match alice.invites.pop().unwrap() {
+        (room, Ok(link)) if room == pkey => link,
+        other => panic!("no invitation: {:?}", other.1.map(|_| "<link>")),
+    };
+    let carol = Carol::join(b, &dir_b, &clink);
+    alice.until("node A sees Carol in the private room", |app| {
+        app.room(PRIVATE)
+            .is_some_and(|r| r.members.iter().any(|m| m.nickname == "Carol"))
+    });
+    // A ban of Bob in the private room: the owner's app bans and rotates the secret in one
+    // update. (Last in this room: Bob is not a member of it afterwards.)
+    bob.send(
+        &pkey,
+        Action::Send {
+            text: "Bob speaks before the ban".into(),
+            reply_to: None,
+        },
+    );
+    alice.until("the owner reads Bob's message", |app| {
+        app.has_text(PRIVATE, "Bob speaks before the ban")
+    });
+    ban_and_lock_out(&mut alice, &mut bob, Some(&carol), PRIVATE, &pkey, true);
+    // The owner's Rotate: the next secret version, with nothing left unsent.
+    let before = alice.room(PRIVATE).unwrap().details.secret_version;
+    alice.send(&pkey, Action::RotateSecret);
+    alice.until("node A's private room moved to the rotated secret", |app| {
+        app.room(PRIVATE).is_some_and(|r| {
+            r.details.secret_version == before + 1
+                && r.details.rotation.is_none()
+                && r.notices.is_empty()
+        })
+    });
+    // The same in a public room of its own.
+    const BAN_ROOM: &str = "Fresh node ban room";
+    alice.send(
+        "",
+        Action::CreateRoom {
+            name: BAN_ROOM.into(),
+            nickname: "Alice".into(),
+            private: false,
+        },
+    );
+    alice.until("the ban room is created", |app| {
+        app.room(BAN_ROOM).is_some()
+    });
+    let bkey = alice.room(BAN_ROOM).unwrap().key.clone();
+    alice.invites.clear();
+    alice.send(&bkey, Action::Invite);
+    alice.until("an invitation to the ban room is made", |app| {
+        !app.invites.is_empty()
+    });
+    let blink = match alice.invites.pop().unwrap() {
+        (room, Ok(link)) if room == bkey => link,
+        other => panic!("no invitation: {:?}", other.1.map(|_| "<link>")),
+    };
+    bob.send(
+        "",
+        Action::Join {
+            code: InviteCode(blink),
+            nickname: "Bob".into(),
+        },
+    );
+    bob.until("the ban room is joined", |app| {
+        app.room(BAN_ROOM).is_some_and(|r| r.send_block.is_none())
+    });
+    bob.send(
+        &bkey,
+        Action::Send {
+            text: "Bob speaks in the ban room".into(),
+            reply_to: None,
+        },
+    );
+    alice.until("the owner reads Bob in the ban room", |app| {
+        app.has_text(BAN_ROOM, "Bob speaks in the ban room")
+    });
+    ban_and_lock_out(&mut alice, &mut bob, None, BAN_ROOM, &bkey, false);
     // Each app's own key is in its node's delegate for the room, asked of the delegate itself:
     // the creator's is the owner's, the joiner's is the invitee's own, and they differ.
     let owner = expect_signing_key("A", &alice.authority, &dir_a, &key);
@@ -995,6 +1305,9 @@ fn main() {
     // A member leaves, then the owner leaves: each room is gone for good in its own app.
     leave_room(&mut bob, b, &dir_b, PRIVATE, &pkey, Some(ROOM));
     leave_room(&mut alice, a, &dir_a, PRIVATE, &pkey, Some(ROOM));
+    // The banned member still holds the ban room; leaving it is allowed, so the last-room step
+    // below still ends with an empty list.
+    leave_room(&mut bob, b, &dir_b, BAN_ROOM, &bkey, Some(ROOM));
 
     newer_river(a, &dir, &dir_a, ROOM, &key, &mut bob);
     // Nothing the outdated app was asked to write reached the room: the app on node B, which
