@@ -32,7 +32,7 @@ use super::overview::Reveal;
 use super::style::{self as st, Palette};
 use super::switcher::{fold_char, window};
 use super::view::label;
-use super::{Chat, keys, markdown};
+use super::{Chat, markdown};
 use crate::RiverApp;
 
 /// The longest query used, in characters. A longer one (a paste) is cut, which also bounds the
@@ -555,19 +555,7 @@ pub(super) fn search_panel(
                 s.chat.search_chord();
                 return true;
             }
-            if s.chat.search_key(ev) {
-                return true;
-            }
-            // Word keys edit without the field's change hook, so they reset the highlight here.
-            let edited = s
-                .chat
-                .search
-                .as_mut()
-                .is_some_and(|s| keys::word_keys(&mut s.query, ev));
-            if edited {
-                s.chat.search_edited();
-            }
-            edited
+            s.chat.search_key(ev)
         })
         .on_submit(|s: &mut RiverApp, _| s.chat.search_jump_selected(Instant::now()))
         .build(k)

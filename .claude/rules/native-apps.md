@@ -26,7 +26,7 @@ cargo run -p river-desktop -- --snap out.png --scene chat-narrow --size 820x720
 
 The window opens at 1280x800 and shrinks to 640x480. Every screen, setup included, uses one dark palette (`apps/river-app/src/chat/style.rs`); there is no light theme yet. A scene cannot set the window size, so the `*narrow*` scenes need `--size 820x720` to render as CI renders them (`scene_size` in `apps/river-app/src/lib.rs`, checked against `apps.yml` by a test).
 
-Linux builds need `libxkbcommon-dev` and `libwayland-dev`. Headless renders without a GPU need a software Vulkan driver: install `mesa-vulkan-drivers` and point `VK_ICD_FILENAMES` at its `lvp_icd*.json`.
+Linux builds need `libxkbcommon-dev` and `libwayland-dev`. At run time Rune also `dlopen`s `libfontconfig.so.1` for system fonts (`libfontconfig1`; no build package needed): without it the app starts and draws (checked by hiding the library in a mount namespace), with fewer fallback fonts. The Linux tarball README names it. Headless renders without a GPU need a software Vulkan driver: install `mesa-vulkan-drivers` and point `VK_ICD_FILENAMES` at its `lvp_icd*.json`.
 
 ## How river-app reads rooms
 
@@ -84,5 +84,22 @@ It compiles in three `ui/` files with `include_bytes!`. An edit to any of them r
 A test checks that its `freenet-stdlib` (the client API's wire format) is the version river-core resolves to in the root `Cargo.lock`.
 
 `apps/Cargo.toml` and `apps/Cargo.lock` cannot change a contract or delegate key. The WASM is built from the root workspace with the root `Cargo.lock`, and the apps' lockfile is never consulted there, even though `apps/river-app` depends on `river-core` by path (see the note in `apps/Cargo.toml`). Every client-only feature it enables must stay off for the room-contract and chat-delegate builds.
+
+## How to bump Rune
+
+Rune is pre-release, git-only and moves about 70 commits a day. `apps/Cargo.toml` pins one rev of its `dev` branch (never rewritten, so a revert is one line) in `rune`, `rune-kit` and six `[patch.crates-io]` entries. One bump per PR, never mixed with other work.
+
+When: when a feature we need lands, otherwise about monthly. Waiting a quarter means reading about 2,000 changelog entries.
+
+1. Pick the new rev: `git ls-remote https://github.com/anomalyco/rune dev`. Record the old and new in the PR body. Check the old rev is an ancestor of the new (`git merge-base --is-ancestor`).
+2. Read what changed since the pin. Get a checkout of Rune first: `git clone https://github.com/anomalyco/rune` (or build once so it is under `~/.cargo/git/checkouts/rune-*/`). `changelog/unreleased/` is where entries live; `CHANGELOG.md` is folded rarely. List new entries with `git diff --name-status <old> <new> -- changelog | grep ^A` and grep them for `dialog`, `modal`, `focus`, `scroll`, `ime`, `text`, `word`, `chord`, `windows`, `tray`, `a11y`. "Breaking", "no longer" and "replaces" mean a compile or behaviour change.
+3. Change every rev in `apps/Cargo.toml` together. Re-read the `[patch.crates-io]` table in Rune's own `Cargo.toml` at the new rev: add, drop or rename entries to match (a crate Rune uses as a path dependency, such as `tiny-skia-path`, is not patched). `rune_revs_agree_in_apps_cargo_toml` fails if the revs differ, are not 40 hex digits, or an entry is not a `git =` entry. Then regenerate the lock WITHOUT `--locked`: `cd apps && cargo metadata --format-version 1 >/dev/null` (this is what regenerated the lock for the eff95e80 bump), commit `apps/Cargo.lock`, and only then check `cargo metadata --locked` from a fresh clone of the branch and once with an empty `CARGO_HOME`.
+4. Look at what the lock changed: `git diff apps/Cargo.lock | grep '^[+-]name'`. List crates added and removed, note which have build scripts (`cargo metadata` shows `custom-build` targets) and whether any crypto or network crate changed version. Check for new system libraries: `ldd target/debug/river` and `strings target/debug/river | grep '\.so\.'` (Rune `dlopen`s some, such as libfontconfig). Add any to the tarball README and the Linux paragraph above.
+5. Fix compile errors on Linux and with `--target x86_64-pc-windows-gnu`; read the macOS `cfg` code by hand, since nova cannot build it.
+6. Run `cargo test -p river-app -p river-desktop`, clippy with `-D warnings` on both targets, `cargo fmt`, and `apps/scripts/fresh-node-e2e.sh`. The `rune_bump` tests in `chat/tests.rs` pin what the app does through Rune features (word motion per platform, IME with popups, undo, focus after dialogs, the Ctrl+Shift direction chord): a changed line means Rune changed, so read its changelog before editing the expectation.
+7. Before touching a failing test, run it on the old pin to confirm it passed there, then decide whether Rune or River is right from the changelog entry and what a user expects. Update the test with an explanation or fix River's code; never weaken the assertion.
+8. Pixel ratchet: `apps/scripts/scene-fingerprints.sh check` on the machine that made `scene-fingerprints.json` (not CI), then `update` in the bump PR if the pixels moved and say so.
+9. Scene diff: render every scene (`river --list-scenes`; `--snap out.png --scene NAME --scale 1`, `--size 820x720` for `*narrow*`) with a binary built at the old pin and one at the new, compare pixel by pixel, and look at the differing scenes before and after. Look specifically at the field fill and the focus ring of a dialog input, and measure the ring's contrast against the field and the dialog (at least 3:1). Describe what moved in the PR. Whole-screen 1 px shifts and glyph anti-aliasing changes are expected; a missing, overlapping or clipped element is not.
+10. Open the PR as a draft, run the full review (UI plus dependency change), and merge it alone. Features that use the new rev come in later PRs.
 
 Releasing: `.claude/rules/desktop-release.md`.

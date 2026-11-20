@@ -314,16 +314,6 @@ pub(super) fn import_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .wrap_anywhere()
             .on_edit(|s: &mut RiverApp| &mut s.chat.form.token)
             .on_change(|s: &mut RiverApp, _| s.chat.import_token_edited())
-            .on_key(|s: &mut RiverApp, ev, _| {
-                // The word keys edit without the field's change hook, so the change is
-                // noticed here: a warning raised for the text before it no longer applies.
-                let before = s.chat.form.token.text.clone();
-                let handled = super::keys::word_keys(&mut s.chat.form.token, ev);
-                if handled && s.chat.form.token.text != before {
-                    s.chat.import_token_edited();
-                }
-                handled
-            })
             .build(k)
             .key("import-token")
             .w_full(),

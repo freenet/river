@@ -65,7 +65,9 @@ To add River to your applications menu:
 ~/.local/bin must be on your PATH for the menu entry to start it.
 
 River needs libxkbcommon and libwayland-client (installed on most desktops) and a
-GPU driver with Vulkan support.
+GPU driver with Vulkan support. It also loads libfontconfig.so.1 (package libfontconfig1
+on Debian and Ubuntu, fontconfig on Fedora and Arch) to find your system fonts; without it
+River still starts, with fewer fonts to fall back on.
 
 Source: https://github.com/freenet/river
 EOF
