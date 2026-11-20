@@ -69,6 +69,12 @@ pub trait NodeHost: Send + Sync + 'static {
         None
     }
 
+    /// Whether [`latest_version`](NodeHost::latest_version) looks anything up. When it does
+    /// not, the node status dialog says nothing about the latest release.
+    fn looks_up_latest(&self) -> bool {
+        false
+    }
+
     /// A directory private to this user where River keeps its settings, including the
     /// permission the node grants it to open the user's rooms. `None` keeps that permission
     /// for this run only, so it is asked for again next time.

@@ -45,8 +45,11 @@ pub const MAX_ERRORS: usize = 5;
 pub const MAX_DETAIL: usize = 300;
 
 /// What the dialog says next to the latest release, because looking it up contacts GitHub.
-pub const LATEST_DISCLOSURE: &str =
-    "Checks github.com for the newest Freenet release when this opens.";
+pub const LATEST_DISCLOSURE: &str = "Checks github.com for the newest Freenet release when this \
+     opens, at most every 6 hours once it succeeds.";
+
+/// How long a release lookup is kept before the next opening asks again.
+pub const LATEST_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// How the connection stands, in the words the dialog uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +252,11 @@ pub struct NodeStatusUi {
     /// The last version a node answered with, and its address.
     seen: Option<(String, String)>,
     pub latest: Latest,
+    /// When `latest` was found.
+    latest_at: Option<Instant>,
+    /// Whether this shell looks the latest release up at all. When it does not, the dialog
+    /// says nothing about it.
+    pub latest_enabled: bool,
     /// Rooms River has, and (once the link is live) how many it is following. `None` until the
     /// rooms are loaded.
     pub rooms: Option<(usize, Option<usize>)>,
@@ -270,6 +278,8 @@ impl Default for NodeStatusUi {
             reach: None,
             seen: None,
             latest: Latest::Unknown,
+            latest_at: None,
+            latest_enabled: true,
             rooms: None,
             errors: Vec::new(),
             copied: false,
@@ -282,12 +292,20 @@ impl Default for NodeStatusUi {
 
 impl NodeStatusUi {
     pub fn open(&mut self) {
+        self.open_at(Instant::now());
+    }
+
+    pub fn open_at(&mut self, now: Instant) {
         self.open = true;
         self.copied = false;
-        // Ask again at once: what the dialog shows should be current when it appears, and a
-        // failed release lookup gets another try.
+        // Ask again at once: what the dialog shows should be current when it appears, a
+        // failed release lookup gets another try, and an old one is looked up again.
         self.next_refresh = None;
-        if self.latest == Latest::Unavailable {
+        let stale = self
+            .latest_at
+            .is_some_and(|t| now.duration_since(t) >= LATEST_MAX_AGE);
+        if self.latest == Latest::Unavailable || (stale && matches!(self.latest, Latest::Known(_)))
+        {
             self.latest = Latest::Unknown;
         }
     }
@@ -309,7 +327,7 @@ impl NodeStatusUi {
     /// Whether the latest release should be looked up (when the dialog is open and it has not
     /// been asked for since it opened).
     pub fn wants_latest(&self) -> bool {
-        self.open && self.latest == Latest::Unknown
+        self.open && self.latest_enabled && self.latest == Latest::Unknown
     }
 
     pub fn latest_started(&mut self) {
@@ -340,6 +358,7 @@ impl NodeStatusUi {
                 self.next_refresh = Some(now + REFRESH_EVERY);
             }
             StatusEvent::Latest(version) => {
+                self.latest_at = version.is_some().then_some(now);
                 self.latest = match version {
                     Some(v) => Latest::Known(v),
                     None => Latest::Unavailable,
@@ -510,6 +529,7 @@ const SECRET_WORDS: &[&str] = &[
     "passwd",
     "pwd",
     "pass",
+    "passphrase",
     "secret",
     "auth",
     "authorization",
@@ -523,8 +543,22 @@ const SECRET_WORDS: &[&str] = &[
     "cookie",
 ];
 
-/// Whether `word` names a secret: it, or one of its `_`, `-` or camelCase parts, is a
-/// whole secret word. `author`, `keyboard` and `monkey` are not.
+/// Secret names that other words are glued onto: `authtoken`, `privatekey`.
+const SECRET_SUFFIXES: &[&str] = &[
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "passphrase",
+    "apikey",
+    "privatekey",
+    "secretkey",
+    "accesskey",
+];
+
+/// Whether `word` names a secret: it, or one of its `_`, `-` or camelCase parts (a trailing
+/// number ignored), is a secret word or ends in a glued one. `author`, `keyboard` and
+/// `monkey` are not.
 fn names_secret(word: &str) -> bool {
     let mut parts: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -542,7 +576,19 @@ fn names_secret(word: &str) -> bool {
         cur.push(c.to_ascii_lowercase());
     }
     parts.push(cur);
-    parts.iter().any(|p| SECRET_WORDS.contains(&p.as_str()))
+    parts.iter().any(|p| {
+        let p = p.trim_end_matches(|c: char| c.is_ascii_digit());
+        !p.is_empty()
+            && (SECRET_WORDS.contains(&p) || SECRET_SUFFIXES.iter().any(|s| p.ends_with(s)))
+    })
+}
+
+/// Secret names whose value may follow after a space or `is`: `password hunter2`.
+fn takes_bare_value(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "password" | "passwd" | "passphrase" | "pwd" | "secret"
+    )
 }
 
 /// A long run of token characters holding both letters and digits: what an opaque credential
@@ -556,7 +602,7 @@ fn looks_opaque(word: &str) -> bool {
         && word.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-/// Characters that end a URL or a value.
+/// Characters that end a value.
 fn ends_value(c: char) -> bool {
     c.is_whitespace()
         || matches!(
@@ -574,9 +620,18 @@ fn plain_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
 }
 
+/// A URL's host: what follows the last `@` of the whole run up to whitespace (a password may
+/// hold any punctuation), cut at the path, query or fragment.
+fn url_host(host_src: &str) -> &str {
+    host_src
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .unwrap_or_default()
+}
+
 /// Cut every URL in `text` to `scheme://host:port`. Credentials (everything up to the last
-/// `@`), the path, the query and the fragment go; a URL whose host does not look like one
-/// becomes `[url]`.
+/// `@` before the next whitespace), the path, the query and the fragment go; a URL whose host
+/// does not look like one becomes `[url]`.
 fn cut_urls(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -588,11 +643,21 @@ fn cut_urls(text: &str) -> String {
         out.push_str(&rest[..scheme_at]);
         let scheme = &before[scheme_at..];
         let after = &rest[at + 3..];
-        let end = after.find(ends_value_in_url).unwrap_or(after.len());
-        let run = &after[..end];
-        let host = run.rsplit_once('@').map_or(run, |(_, h)| h);
-        let host = host.split(['/', '\\', '?', '#']).next().unwrap_or_default();
-        let trimmed = host.trim_end_matches(['.', ':', '!']);
+        let ws = after.find(char::is_whitespace).unwrap_or(after.len());
+        // With an `@` anywhere in the run, everything before the last one is credentials,
+        // whatever punctuation it holds.
+        let (host_src, end) = match after[..ws].rsplit_once('@') {
+            Some((_, host)) => (host, ws),
+            None => {
+                let e = after
+                    .find(|c: char| {
+                        c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+                    })
+                    .unwrap_or(after.len());
+                (&after[..e], e)
+            }
+        };
+        let trimmed = url_host(host_src).trim_end_matches(['.', ':', '!']);
         if plain_host(trimmed) {
             out.push_str(&format!("{scheme}://{trimmed}"));
         } else {
@@ -604,43 +669,108 @@ fn cut_urls(text: &str) -> String {
     out
 }
 
-/// A URL ends at whitespace or a closing quote or bracket (a comma may be inside a password).
-fn ends_value_in_url(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+/// `user:pass@host:port` with no scheme: reduced to the host.
+fn cut_userinfo(text: &str) -> String {
+    text.split_whitespace()
+        .map(|word| match word.rsplit_once('@') {
+            Some((user, host)) if user.contains(':') && !word.contains("://") => {
+                let host = url_host(host).trim_end_matches(['.', ',', ';', ':', '!']);
+                if plain_host(host) {
+                    host.to_owned()
+                } else {
+                    REMOVED.to_owned()
+                }
+            }
+            _ => word.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Reduce a path to its file name, so a user name in a home directory never shows.
+/// Where a home directory starts, in any case: after the marker comes the user's name.
+const HOME_MARKERS: &[&str] = &[
+    "/home/",
+    "/users/",
+    "\\users\\",
+    "/documents and settings/",
+    "\\documents and settings\\",
+];
+
+/// Replace `<home marker><user name>` with `~`. The name runs to the next separator when one
+/// follows within three words (names have spaces: `/home/Alice Smith/x`), else to a space.
+fn strip_homes(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut pos = 0;
+    while let Some((at, len)) = HOME_MARKERS
+        .iter()
+        .filter_map(|m| lower[pos..].find(m).map(|i| (pos + i, m.len())))
+        .min_by_key(|(i, _)| *i)
+    {
+        out.push_str(&text[pos..at]);
+        let start = at + len;
+        let tail = &text[start..];
+        let end = match tail.find(['/', '\\']) {
+            Some(s) if tail[..s].split(' ').count() <= 3 => s,
+            _ => tail.find(' ').unwrap_or(tail.len()),
+        };
+        out.push('~');
+        pos = start + end;
+    }
+    out.push_str(&text[pos..]);
+    out
+}
+
+/// Where a path starts inside `word`: at its start or after punctuation that may precede one
+/// (`key=/x`, `file:/x`, `Path("/x")`).
+fn path_start(word: &str) -> Option<usize> {
+    let mut prev: Option<char> = None;
+    for (i, c) in word.char_indices() {
+        let after_prefix =
+            prev.is_none_or(|p| matches!(p, '=' | ':' | '(' | '"' | '\'' | '[' | '<' | '{' | ','));
+        if after_prefix {
+            let rest = &word[i..];
+            let b = rest.as_bytes();
+            let drive = b.len() >= 3
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && matches!(b[2], b'\\' | b'/');
+            if rest.starts_with('/')
+                || rest.starts_with("\\\\")
+                || drive
+                || (rest.starts_with('~') && rest.contains(['/', '\\']))
+            {
+                return Some(i);
+            }
+        }
+        prev = Some(c);
+    }
+    None
+}
+
+/// Reduce each path in `text` to its file name, so no directory name (a user's, most often)
+/// shows.
 fn basename_words(text: &str) -> String {
-    let is_drive = |w: &str| {
-        let b = w.as_bytes();
-        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
-    };
     text.split_whitespace()
         .map(|word| {
-            let lead = word
-                .find(|c: char| !matches!(c, '(' | '"' | '\'' | '[' | '<' | '=' | '{'))
-                .unwrap_or(word.len());
-            let (prefix, body) = word.split_at(lead);
-            let is_path = body.starts_with('/')
-                || body.starts_with("~/")
-                || body.starts_with("\\\\")
-                || is_drive(body)
-                || body.contains('\\');
-            if !is_path {
-                return word.to_owned();
+            // `~alice` alone names a home directory.
+            if let Some(name) = word.strip_prefix('~')
+                && name.starts_with(|c: char| c.is_ascii_alphabetic())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return "~".to_owned();
             }
+            let start = path_start(word).or_else(|| word.contains('\\').then_some(0));
+            let Some(start) = start else {
+                return word.to_owned();
+            };
+            let (prefix, body) = word.split_at(start);
             let parts: Vec<&str> = body
                 .split(['/', '\\'])
                 .filter(|part| !part.is_empty())
                 .collect();
-            let rest = match parts.first() {
-                Some(p) if p.ends_with(':') => &parts[1..],
-                _ => &parts[..],
-            };
-            // A home directory is named after the person: show it as `~`.
-            let is_home = rest.len() == 2
-                && (rest[0].eq_ignore_ascii_case("home") || rest[0].eq_ignore_ascii_case("users"));
-            let name = if is_home {
+            // `\\server\share\user`: a share named after the person.
+            let name = if body.starts_with("\\\\") && parts.len() <= 3 {
                 "~"
             } else {
                 parts.last().copied().unwrap_or("")
@@ -651,8 +781,33 @@ fn basename_words(text: &str) -> String {
         .join(" ")
 }
 
+fn starts_with_ci(c: &[char], i: usize, pat: &str) -> bool {
+    pat.chars()
+        .enumerate()
+        .all(|(k, p)| c.get(i + k).is_some_and(|x| x.eq_ignore_ascii_case(&p)))
+}
+
+/// The length of a separator (`=`, `:` or an encoding of one) at `i`.
+fn sep_len(c: &[char], i: usize) -> Option<usize> {
+    for (pat, len) in [
+        ("%253d", 5),
+        ("%253a", 5),
+        ("\\u003d", 6),
+        ("\\u003a", 6),
+        ("%3d", 3),
+        ("%3a", 3),
+    ] {
+        if starts_with_ci(c, i, pat) {
+            return Some(len);
+        }
+    }
+    matches!(c.get(i), Some('=' | ':')).then_some(1)
+}
+
 /// Remove the value after a secret's name: `name=value`, `name: value`, `name = value`,
-/// `"name":"value"`, `name%3Dvalue`, `Authorization: Basic value` and `Bearer value`.
+/// `"name":"value"`, `name%3Dvalue` (also double-encoded and `=`), `Bearer value`,
+/// `password value`, `password is value`, `Authorization: Basic value` and
+/// `Authorization: Digest` followed by the rest of the line.
 fn redact_pairs(text: &str) -> String {
     let c: Vec<char> = text.chars().collect();
     let mut out = String::new();
@@ -677,19 +832,21 @@ fn redact_pairs(text: &str) -> String {
         };
         out.extend(&c[i..value_at]);
         let mut end = value_end(&c, value_at);
-        // `Basic xxx`, `Bearer xxx`: the scheme is followed by the credential.
         let first: String = c[value_at..end].iter().collect();
-        if matches!(
-            first.to_ascii_lowercase().as_str(),
-            "basic" | "bearer" | "digest" | "negotiate" | "token"
-        ) {
-            let mut j = end;
-            while j < c.len() && c[j] == ' ' {
-                j += 1;
+        match first.to_ascii_lowercase().as_str() {
+            // `Digest a="b", c="d"`: the rest of the line is the credential.
+            "digest" => end = c.len(),
+            // `Basic xxx`, `Bearer xxx`: the scheme is followed by the credential.
+            "basic" | "bearer" | "negotiate" | "token" => {
+                let mut j = end;
+                while j < c.len() && c[j] == ' ' {
+                    j += 1;
+                }
+                if j > end && j < c.len() && !ends_value(c[j]) {
+                    end = value_end(&c, j);
+                }
             }
-            if j > end && j < c.len() && !ends_value(c[j]) {
-                end = value_end(&c, j);
-            }
+            _ => {}
         }
         out.push_str(REMOVED);
         i = end;
@@ -706,21 +863,24 @@ fn value_start(c: &[char], mut i: usize, word: &str) -> Option<usize> {
     while i < c.len() && c[i] == ' ' {
         i += 1;
     }
-    let url_encoded = |i: usize| {
-        (i + 2 < c.len() && c[i] == '%')
-            .then(|| (c[i + 1] == '3' && matches!(c[i + 2], 'D' | 'd' | 'A' | 'a')).then_some(3))
-            .flatten()
-    };
-    let colon = i < c.len() && c[i] == ':';
-    if i < c.len() && (c[i] == '=' || colon) {
-        if colon && c.get(i + 1) == Some(&'/') && c.get(i + 2) == Some(&'/') {
+    if let Some(n) = sep_len(c, i) {
+        if c[i] == ':' && c.get(i + 1) == Some(&'/') && c.get(i + 2) == Some(&'/') {
             return None;
         }
-        i += 1;
-    } else if let Some(n) = url_encoded(i) {
         i += n;
     } else if word.eq_ignore_ascii_case("bearer") && i > at {
         // `Bearer value`: a space is the separator.
+    } else if takes_bare_value(word) && i > at {
+        // `password hunter2`, `the password is hunter2`.
+        for filler in ["is ", "was "] {
+            if starts_with_ci(c, i, filler) {
+                i += filler.len();
+                while i < c.len() && c[i] == ' ' {
+                    i += 1;
+                }
+                break;
+            }
+        }
     } else {
         return None;
     }
@@ -740,21 +900,48 @@ fn value_end(c: &[char], mut i: usize) -> usize {
     i
 }
 
-/// Control characters and the characters that reorder or hide text (bidi controls, zero-width
-/// marks, the byte-order mark).
+/// Control characters and the characters that reorder, hide or alter text: bidi controls,
+/// zero-width marks, the byte-order mark, soft hyphens, line and paragraph separators, the
+/// Mongolian vowel separator, variation selectors and the tag block.
 fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
         )
+}
+
+/// A version as the diagnostics and the dialog may print it: only if it is made of
+/// `[0-9A-Za-z.+-]`, at most 40 characters, and parses as a Freenet version. A node controls
+/// what it reports, so anything else is "unrecognised".
+pub fn safe_version(v: &str) -> String {
+    let t = v.trim();
+    if t.chars().count() <= 40
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+        && parse_version(t).is_some()
+    {
+        t.to_owned()
+    } else {
+        "unrecognised".to_owned()
+    }
 }
 
 /// Make free text fit for the dialog: bounded, one line, no control or bidi characters, URLs
 /// cut to host and port, paths cut to their file name, secrets after secret-looking names
-/// removed, long opaque strings removed. A second line of defence: nothing sanitised here is
-/// ever copied (see the module docs).
+/// removed, long opaque strings removed. A second line of defence for the DIALOG only:
+/// nothing sanitised here is ever copied (see the module docs), and it is a list of known
+/// shapes, not a guarantee.
 pub fn sanitize(text: &str) -> String {
     // Bound the work first: the input may be megabytes.
     let bounded: String = text
@@ -763,7 +950,9 @@ pub fn sanitize(text: &str) -> String {
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| !is_unsafe_char(*c))
         .collect();
-    let cut = redact_pairs(&basename_words(&cut_urls(&bounded)));
+    let cut = basename_words(&redact_pairs(&strip_homes(&cut_userinfo(&cut_urls(
+        &bounded,
+    )))));
     let words: Vec<String> = cut
         .split_whitespace()
         .map(|w| {
@@ -866,7 +1055,7 @@ pub fn format_diagnostics(d: &Diagnostics) -> String {
         "Includes: versions, OS, the node's host and port, connection state, counts, error \
          categories. Leaves out: room names and keys, messages, credentials, error text.\n",
     );
-    s.push_str(&format!("River: {}\n", sanitize(&d.river_version)));
+    s.push_str(&format!("River: {}\n", safe_version(&d.river_version)));
     s.push_str(&format!("OS: {} {}\n", sanitize(&d.os), sanitize(&d.arch)));
     s.push_str(&format!(
         "Node host and port (identifying if remote): {} ({})\n",
@@ -880,12 +1069,12 @@ pub fn format_diagnostics(d: &Diagnostics) -> String {
     s.push_str(&format!("Connection: {}\n", d.connection.text()));
     s.push_str(&format!(
         "Node version: {} ({needs}{answering}; River needs {} or newer)\n",
-        or_unknown(node.map(sanitize).as_deref()),
-        sanitize(&d.minimum_version)
+        or_unknown(node.map(safe_version).as_deref()),
+        safe_version(&d.minimum_version)
     ));
     s.push_str(&format!(
         "Latest Freenet release: {}\n",
-        or_unknown(d.latest_version.as_deref().map(sanitize).as_deref())
+        or_unknown(d.latest_version.as_deref().map(safe_version).as_deref())
     ));
     s.push_str(&format!("Connected peers: {}\n", count(d.peers)));
     s.push_str(&format!(
@@ -909,7 +1098,7 @@ impl Diagnostics {
     pub fn of(chat: &super::Chat) -> Diagnostics {
         let st = &chat.status;
         Diagnostics {
-            river_version: chat.update.version.clone(),
+            river_version: safe_version(&chat.update.version),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             node_address: st.address.clone(),
@@ -917,11 +1106,11 @@ impl Diagnostics {
             connection: st.connection,
             node_version: st
                 .node_version(chat.update.node_version.as_deref())
-                .map(str::to_owned),
+                .map(safe_version),
             node_answering: st.answering(),
             minimum_version: GRANT_NODE_VERSION.to_owned(),
             latest_version: match &st.latest {
-                Latest::Known(v) => Some(v.clone()),
+                Latest::Known(v) => Some(safe_version(v)),
                 _ => None,
             },
             // The node can report its connected peers, but River does not ask.
@@ -1011,13 +1200,13 @@ pub fn lines(chat: &super::Chat) -> Vec<Line> {
     });
     let (value, mut tone, mut note) = match (node, meets_minimum(node, GRANT_NODE_VERSION)) {
         (Some(v), Needs::TooOld) => (
-            v.to_owned(),
+            safe_version(v),
             Tone::Bad,
             Some(format!(
                 "Older than River needs ({GRANT_NODE_VERSION}). Update Freenet."
             )),
         ),
-        (Some(v), _) => (v.to_owned(), Tone::Plain, None),
+        (Some(v), _) => (safe_version(v), Tone::Plain, None),
         (None, _) => ("unknown".to_owned(), Tone::Muted, None),
     };
     if st.answering() == Some(false) {
@@ -1060,7 +1249,7 @@ pub fn lines(chat: &super::Chat) -> Vec<Line> {
             Some("The latest release could not be looked up.".to_owned()),
         ),
         Latest::Known(v) => (
-            v.clone(),
+            safe_version(v),
             Tone::Plain,
             match against_latest(node, latest) {
                 Recency::Behind if st.remote => Some("A newer Freenet is out.".to_owned()),
@@ -1072,20 +1261,22 @@ pub fn lines(chat: &super::Chat) -> Vec<Line> {
             },
         ),
     };
-    out.push(Line {
-        key: "ns-latest",
-        name: "Latest Freenet",
-        value,
-        tone,
-        note: Some(match recency {
-            Some(r) => format!("{r} {LATEST_DISCLOSURE}"),
-            None => LATEST_DISCLOSURE.to_owned(),
-        }),
-    });
+    if st.latest_enabled {
+        out.push(Line {
+            key: "ns-latest",
+            name: "Latest Freenet",
+            value,
+            tone,
+            note: Some(match recency {
+                Some(r) => format!("{r} {LATEST_DISCLOSURE}"),
+                None => LATEST_DISCLOSURE.to_owned(),
+            }),
+        });
+    }
     out.push(Line {
         key: "ns-river",
         name: "River",
-        value: chat.update.version.clone(),
+        value: safe_version(&chat.update.version),
         tone: Tone::Plain,
         note: None,
     });
@@ -1329,6 +1520,42 @@ mod tests {
             "grant AbCdEf0123456789AbCdEf0123456789xyz was refused",
             "AbCdEf0123456789",
         ),
+        ("key=/home/alice/x.txt", "alice"),
+        ("file:/home/alice/x.txt", "alice"),
+        ("Path(\"/home/alice/x.txt\")", "alice"),
+        ("~alice/x.txt", "alice"),
+        ("see ~alice now", "alice"),
+        ("/mnt/c/Users/alice/x.txt", "alice"),
+        ("/var/home/alice/x.txt", "alice"),
+        ("C:\\Documents and Settings\\alice\\x.txt", "alice"),
+        ("\\\\?\\C:\\Users\\alice\\x.txt", "alice"),
+        ("\\\\srv\\share\\alice", "alice"),
+        ("/home/Alice Smith/x.txt", "Smith"),
+        ("/home/Alice Smith/x.txt", "Alice"),
+        ("alice:hunter2@node.example:7509", "hunter2"),
+        ("alice:hunter2@node.example:7509", "alice"),
+        ("ws://bob:p)ss@host:7509/x", "p)ss"),
+        ("ws://bob:p)ss@host:7509/x", "bob"),
+        ("authtoken=abc123", "abc123"),
+        ("accesstoken: abc123", "abc123"),
+        ("privatekey=abc123", "abc123"),
+        ("secretkey=abc123", "abc123"),
+        ("passphrase=abc123", "abc123"),
+        ("token2=abc123", "abc123"),
+        ("password1=abc123", "abc123"),
+        ("password hunter2", "hunter2"),
+        ("the password is hunter2", "hunter2"),
+        ("the password was hunter2 today", "hunter2"),
+        ("token%253Dabc123", "abc123"),
+        ("token\\u003dabc123", "abc123"),
+        (
+            "Authorization: Digest username=\"bob\", response=\"cafe1234\"",
+            "cafe1234",
+        ),
+        (
+            "Authorization: Digest username=\"bob\", response=\"cafe1234\"",
+            "bob",
+        ),
     ];
 
     #[test]
@@ -1339,30 +1566,114 @@ mod tests {
         }
     }
 
+    /// The clipboard text for a node status holding one error with the raw, unsanitised
+    /// `detail`, built directly so nothing the sanitiser does can help.
+    fn clipboard_with_raw_detail(detail: &str) -> String {
+        let mut chat = super::super::Chat::new(Source::Example, Vec::new(), 0, 0, 0);
+        let authority = chat.status.address.clone();
+        chat.status.errors.push(ErrorNote {
+            at: 1_700_000_000,
+            kind: ErrorKind::Refused,
+            authority,
+            detail: detail.to_owned(),
+        });
+        format_diagnostics(&Diagnostics::of(&chat))
+    }
+
     #[test]
     fn secrets_in_errors_never_reach_the_diagnostics_at_all() {
         // Free text is not copied, however it is written, so a shape the sanitiser misses
-        // still stays out of the clipboard.
-        let mut ui = NodeStatusUi::default();
-        let at = ui.address.clone();
-        for (text, _) in SECRETS {
-            ui.note(ErrorKind::Refused, &at, 1_700_000_000, text);
+        // still stays out of the clipboard. Each shape gets its own fresh state.
+        for (text, secret) in SECRETS {
+            let copied = clipboard_with_raw_detail(text);
+            assert!(!copied.contains(secret), "{secret} in {copied}");
+            assert!(!copied.contains(text), "{text} in {copied}");
+            assert!(copied.contains("refused by the node"), "{copied}");
         }
-        ui.note(
-            ErrorKind::SetupFailed,
-            &at,
-            1_700_000_001,
-            "totally-novel-shape: zzSECRETzz",
-        );
+        let copied = clipboard_with_raw_detail("totally-novel-shape: zzSECRETzz");
+        assert!(!copied.contains("zzSECRETzz"), "{copied}");
+    }
+
+    /// Versions a hostile node could report: invisible and reordering characters, tag and
+    /// variation characters, line separators, a long string, look-alike digits.
+    fn hostile_versions() -> Vec<String> {
+        vec![
+            "0.2.158\u{202e}".into(),
+            "0.2.158\u{e0041}\u{e0042}".into(),
+            "0.2\u{200b}.158".into(),
+            "0.2.158\u{fe0f}".into(),
+            "0.2.158\u{2028}Connection: Connected".into(),
+            "0.2.158\u{00ad}".into(),
+            "0.2.158\u{180e}".into(),
+            "0.2.158\nOS: Plan9".into(),
+            "\u{ff10}.\u{ff12}.\u{ff11}".into(),
+            "9".repeat(10_000),
+            "0.2.158 ".repeat(10),
+        ]
+    }
+
+    #[test]
+    fn a_hostile_version_never_reaches_the_clipboard_or_the_dialog() {
+        for hostile in hostile_versions() {
+            let mut chat = super::super::Chat::new(Source::Example, Vec::new(), 0, 0, 0);
+            chat.update.node_version = Some(hostile.clone());
+            chat.update.version = hostile.clone();
+            chat.status.latest = Latest::Known(hostile.clone());
+            let copied = format_diagnostics(&Diagnostics::of(&chat));
+            let mut shown: Vec<String> = lines(&chat).into_iter().map(|l| l.value).collect();
+            shown.push(copied.clone());
+            for text in shown {
+                for c in text.chars() {
+                    assert!(
+                        c.is_ascii() && (!c.is_control() || c == '\n'),
+                        "{c:?} from {hostile:?} in {text}"
+                    );
+                }
+            }
+            assert!(copied.contains("Node version: unrecognised"), "{copied}");
+            assert!(
+                copied.contains("Latest Freenet release: unrecognised"),
+                "{copied}"
+            );
+            assert!(copied.contains("River: unrecognised"), "{copied}");
+            // Nothing from the hostile string made a new line.
+            assert!(!copied.contains("Plan9"), "{copied}");
+            assert!(!copied.contains("\nConnection: Connected"), "{copied}");
+        }
+        for fine in ["0.2.158", "0.2.158-rc.1", "0.2.158+build5"] {
+            assert_eq!(safe_version(fine), fine);
+        }
+    }
+
+    #[test]
+    fn invisible_characters_are_dropped_from_the_dialog_line() {
+        let s = sanitize("a\u{e0041}b\u{fe0f}c\u{180e}d\u{00ad}e\u{2028}f\u{2029}g\u{202e}h");
+        assert_eq!(s, "abcde f gh");
+    }
+
+    #[test]
+    fn a_shell_that_never_looks_up_the_release_says_nothing_about_it() {
         let mut chat = super::super::Chat::new(Source::Example, Vec::new(), 0, 0, 0);
-        chat.status = ui;
-        let text = format_diagnostics(&Diagnostics::of(&chat));
-        for (_, secret) in SECRETS {
-            assert!(!text.contains(secret), "{secret} in {text}");
-        }
-        assert!(!text.contains("zzSECRETzz"), "{text}");
-        assert!(text.contains("refused by the node"), "{text}");
-        assert!(text.contains("setup failed"), "{text}");
+        assert!(lines(&chat).iter().any(|l| l.key == "ns-latest"));
+        chat.status.latest_enabled = false;
+        assert!(lines(&chat).iter().all(|l| l.key != "ns-latest"));
+        chat.status.open();
+        assert!(!chat.status.wants_latest(), "no lookup is requested");
+    }
+
+    #[test]
+    fn an_old_release_lookup_is_asked_again_when_the_dialog_reopens() {
+        let t0 = Instant::now();
+        let mut ui = NodeStatusUi::default();
+        ui.open_at(t0);
+        ui.latest_started();
+        ui.apply("x", StatusEvent::Latest(Some("0.2.160".into())), t0);
+        ui.close();
+        ui.open_at(t0 + LATEST_MAX_AGE - Duration::from_secs(1));
+        assert!(!ui.wants_latest(), "fresh enough");
+        ui.close();
+        ui.open_at(t0 + LATEST_MAX_AGE);
+        assert!(ui.wants_latest(), "old enough to ask again");
     }
 
     #[test]

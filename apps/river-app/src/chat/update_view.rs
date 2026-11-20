@@ -266,7 +266,7 @@ fn node_section(ui: &UpdateUi, p: &Palette, k: &Kit) -> El {
     let mut s = col().key("settings-freenet").w_full().gap(6.0).child(
         label(
             match &ui.node_version {
-                Some(v) => format!("Freenet {v}"),
+                Some(v) => format!("Freenet {}", super::node_status::safe_version(v)),
                 None => "Freenet: not connected".to_string(),
             },
             st::BODY,

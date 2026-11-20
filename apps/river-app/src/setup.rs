@@ -288,9 +288,10 @@ impl Controller {
         let Some(report) = self.status_report.clone() else {
             return;
         };
+        let fallback = report.clone();
         let host = self.host.clone();
         let node = self.node();
-        thread::spawn(move || {
+        let started = thread::Builder::new().spawn(move || {
             // If the probe panics, the dialog still hears that the question ended.
             let mut guard = EndGuard::new(report, StatusEvent::Aborted);
             let authority = node.address.authority();
@@ -308,6 +309,14 @@ impl Controller {
             };
             guard.finish(StatusEvent::Reach { authority, reach });
         });
+        if started.is_err() {
+            fallback(StatusEvent::Aborted);
+        }
+    }
+
+    /// Whether this shell looks up the latest Freenet release at all.
+    pub fn looks_up_latest(&self) -> bool {
+        self.host.looks_up_latest()
     }
 
     /// Look up the latest Freenet release, for the node status dialog. This contacts github.com,
@@ -316,12 +325,16 @@ impl Controller {
         let Some(report) = self.status_report.clone() else {
             return;
         };
+        let fallback = report.clone();
         let host = self.host.clone();
-        thread::spawn(move || {
+        let started = thread::Builder::new().spawn(move || {
             let mut guard = EndGuard::new(report, StatusEvent::Latest(None));
             let latest = host.latest_version();
             guard.finish(StatusEvent::Latest(latest));
         });
+        if started.is_err() {
+            fallback(StatusEvent::Latest(None));
+        }
     }
 
     /// Install Freenet, then start it if the installer didn't. Does nothing for a node the

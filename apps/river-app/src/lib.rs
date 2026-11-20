@@ -613,6 +613,7 @@ impl RiverApp {
         status.remote = !self.chat.node.choice.address.is_loopback();
         status.rooms = rooms;
         if let Some(ctl) = &self.ctl {
+            status.latest_enabled = ctl.looks_up_latest();
             if status.should_refresh(std::time::Instant::now()) {
                 status.refresh_started();
                 ctl.probe_status();
