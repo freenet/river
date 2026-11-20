@@ -2515,9 +2515,11 @@ fn a_member_sees_what_matters_first_and_the_rest_is_folded_away() {
     // The owner by name, the member count and the message size in plain words.
     assert!(shows(&rt, "Maya Chen"));
     assert!(!shows(&rt, "Room Owner"));
-    assert!(shows(&rt, "6 of 200 members"));
+    assert!(shows(&rt, "6 of 200 members (not counting the owner)"));
     assert!(shows(&rt, "Up to 1000 bytes each"));
-    // No "Description" label over the description, and no jargon labels.
+    // No "Description" label over the description (the fold is closed, so the byte limit's
+    // own row is not there to be mistaken for one), and no jargon labels.
+    assert!(!rt.state.chat.details.as_ref().unwrap().limits_open);
     assert!(!shows(&rt, "Description"));
     for jargon in ["Max Recent Messages", "Max User Bans", "Max Nickname Size"] {
         assert!(!shows(&rt, jargon), "{jargon}");
@@ -2561,6 +2563,7 @@ fn the_limits_fold_lists_the_rest_in_plain_words() {
     assert!(shows(&rt, "Messages kept"));
     assert!(shows(&rt, "Latest 100 (11 held now)"));
     assert!(shows(&rt, "Ban list"));
+    assert!(shows(&rt, "Description length"));
     assert!(shows(&rt, "Nickname"));
     assert!(shows(&rt, "Up to 50 bytes"));
     assert!(shows(&rt, "Up to 100 bytes"));
@@ -2605,9 +2608,14 @@ fn a_full_room_and_a_full_ban_list_are_said_up_front() {
     redraw_now(&mut rt);
     assert!(rt.find("details-room-full").is_some());
     assert!(rt.find("details-bans-full").is_some());
+    assert!(shows(
+        &rt,
+        "Someone joining may cause the most recently invited member"
+    ));
+    assert!(!shows(&rt, "no new members can join"));
     // With the fold still closed.
     assert!(rt.find("details-limits-fold-body").is_none());
-    assert!(shows(&rt, "200 of 200 members"));
+    assert!(shows(&rt, "200 of 200 members (not counting the owner)"));
 }
 
 #[test]
@@ -2622,6 +2630,8 @@ fn the_owner_is_told_when_the_room_or_its_ban_list_is_full() {
     assert!(rt.find("details-room-full").is_some());
     assert!(rt.find("details-bans-full").is_some());
     assert!(shows(&rt, "so it is full"));
+    assert!(shows(&rt, "Adding a ban may drop an older one"));
+    assert!(shows(&rt, "most recently invited member"));
 }
 
 #[test]
@@ -2666,6 +2676,135 @@ fn leave_room_is_set_apart_below_a_rule_and_still_asks_first() {
         press(&mut rt, "details-leave-cancel");
         assert!(rt.find("details-leave").is_some());
     }
+}
+
+/// How many times the leave question has been asked, counted by its own state.
+fn leave_asked(rt: &Runtime<RiverApp>) -> bool {
+    rt.state.chat.details.as_ref().is_some_and(|f| f.leaving)
+}
+
+#[test]
+fn enter_on_leave_room_asks_once_and_a_fold_toggle_never_does() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    // A fold toggle with the keyboard (Enter and Space) never opens the leave question.
+    press(&mut rt, "details-technical-toggle");
+    key(&mut rt, Key::Enter);
+    key(&mut rt, Key::Text(" ".into()));
+    key(&mut rt, Key::Enter);
+    assert!(!leave_asked(&rt));
+    assert!(rt.find("details-leave-ask").is_none());
+    // Enter on the focused Leave Room asks, once: a second Enter would be the confirm button
+    // only if it had focus, and it has not.
+    press(&mut rt, "details-leave");
+    assert!(leave_asked(&rt));
+    assert!(rt.find("details-leave-ask").is_some());
+    assert!(rt.find("details-leave").is_none());
+    assert!(rt.state.chat.details.is_some(), "the room is not left yet");
+}
+
+#[test]
+fn enter_on_the_focused_leave_button_opens_the_question_exactly_once() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    // Focus it without activating it: Tab until it has the keyboard.
+    for _ in 0..80 {
+        if rt
+            .elements()
+            .iter()
+            .any(|e| e.focused && e.key.as_deref() == Some("details-leave"))
+        {
+            break;
+        }
+        key(&mut rt, Key::Tab);
+    }
+    assert!(
+        rt.elements()
+            .iter()
+            .any(|e| e.focused && e.key.as_deref() == Some("details-leave")),
+        "Tab reaches Leave Room"
+    );
+    assert!(!leave_asked(&rt));
+    key(&mut rt, Key::Enter);
+    assert!(leave_asked(&rt));
+    assert!(rt.state.chat.details.is_some());
+    // The question toggled once, not twice: it is still showing.
+    assert!(rt.find("details-leave-ask").is_some());
+}
+
+#[test]
+fn enter_in_the_name_and_a_limit_field_saves_and_never_reaches_leave() {
+    // The name field.
+    let mut state = connected();
+    state.chat.select(OWNED);
+    let mut rt = render(state, WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    type_into(&mut rt, "details-name-input", "Reading Circle");
+    key(&mut rt, Key::Enter);
+    assert!(!leave_asked(&rt));
+    assert!(rt.find("room-details-dialog").is_none(), "Enter saved it");
+    assert_eq!(rt.state.chat.room().unwrap().name, "Reading Circle");
+    // A limit field.
+    let mut state = connected();
+    state.chat.select(OWNED);
+    let mut rt = render(state, WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    press(&mut rt, "details-limit-0");
+    rt.state.chat.details.as_mut().unwrap().limits[0].replace_text("12");
+    redraw_now(&mut rt);
+    key(&mut rt, Key::Enter);
+    assert!(!leave_asked(&rt));
+    assert!(rt.find("room-details-dialog").is_none(), "Enter saved it");
+    assert_eq!(rt.state.chat.room().unwrap().details.limits.max_members, 12);
+}
+
+#[test]
+fn escape_closes_the_dialog_with_a_fold_open() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    press(&mut rt, "details-limits-fold-toggle");
+    press(&mut rt, "details-technical-toggle");
+    assert!(rt.find("details-limits-fold-body").is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("room-details-dialog").is_none());
+    assert!(rt.state.chat.details.is_none());
+}
+
+#[test]
+fn the_owner_link_opens_the_owner_dialog_once_from_the_keyboard() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    press(&mut rt, "room-title");
+    for _ in 0..80 {
+        if rt
+            .elements()
+            .iter()
+            .any(|e| e.focused && e.key.as_deref() == Some("details-owner-open"))
+        {
+            break;
+        }
+        key(&mut rt, Key::Tab);
+    }
+    key(&mut rt, Key::Enter);
+    assert!(rt.find("room-details-dialog").is_none());
+    assert!(
+        rt.find("member-info-dialog").is_some(),
+        "the owner's dialog is open"
+    );
+    assert!(rt.state.chat.details.is_none());
+}
+
+#[test]
+fn a_room_without_its_owner_in_the_member_list_still_has_an_owner_row() {
+    let mut rt = render(from_node("town-square"), WINDOW_SIZE);
+    rt.state.chat.edit_rooms(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == "town-square").unwrap();
+        r.members.retain(|m| m.role != super::model::Role::Owner);
+    });
+    press(&mut rt, "room-title");
+    assert!(rt.find("details-owner").is_some());
+    assert!(rt.find("details-owner-open").is_none());
+    assert!(rt.find("details-owner-unknown").is_some());
+    assert!(shows(&rt, "townsqua"));
 }
 
 #[test]
@@ -3202,7 +3341,7 @@ fn the_dialog_shows_how_much_of_a_limit_is_used() {
     });
     press(&mut rt, "room-title");
     assert!(shows(&rt, "61 held now"));
-    assert!(shows(&rt, "4 in force now"));
+    assert!(shows(&rt, "4 on the list now"));
 }
 
 #[test]

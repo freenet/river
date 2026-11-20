@@ -753,11 +753,14 @@ fn bans_full(d: &Details) -> bool {
 /// against it. The member count does not include the owner.
 fn limit_help(i: usize, d: &Details) -> String {
     match i {
-        0 => format!("People the room can hold. {} now.", d.usage.members),
+        0 => format!(
+            "People the room can hold, not counting the owner. {} now.",
+            d.usage.members
+        ),
         1 => format!("Recent messages kept. {} held now.", d.usage.messages),
         2 => "Largest message, in bytes.".into(),
         3 => format!(
-            "Bans the list can hold. {} in force now{}.",
+            "Bans the list can hold. {} on the list now{}.",
             d.usage.bans,
             if bans_full(d) { ", so it is full" } else { "" }
         ),
@@ -1006,7 +1009,7 @@ fn limit_rows(d: &Details, p: &Palette) -> Vec<El> {
         ),
         fact(
             "details-limit-row-6",
-            "Description",
+            "Description length",
             value(6, format!("Up to {} bytes", l.max_room_description)),
             p,
         ),
@@ -1043,7 +1046,7 @@ fn limit_fields(room: &Room, form: &DetailsForm, narrow: bool, p: &Palette, k: &
     if room_full(d) {
         out = out.child(
             label(
-                "The room is full, so new members will be rejected.",
+                "The room is at its member limit. Someone joining may cause the most recently invited member to be removed.",
                 st::SMALL,
                 p.warning_text,
             )
@@ -1055,7 +1058,7 @@ fn limit_fields(room: &Room, form: &DetailsForm, narrow: bool, p: &Palette, k: &
     if bans_full(d) {
         out = out.child(
             label(
-                "The ban list is full, so a new ban may not take effect.",
+                "The ban list is full. Adding a ban may drop an older one, and that person could come back.",
                 st::SMALL,
                 p.warning_text,
             )
@@ -1065,40 +1068,68 @@ fn limit_fields(room: &Room, form: &DetailsForm, narrow: bool, p: &Palette, k: &
         );
     }
     out.child(group_heading("Size limits (bytes)", p))
+        .child(
+            label(
+                "Bytes, not characters: an accented letter takes 2 and an emoji up to 4.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("details-bytes-note"),
+        )
         .child(grid(vec![field(2), field(4), field(5), field(6)], cols_b))
 }
 
-/// The room's owner, by name, as a link to their member dialog.
-fn owner_link(room: &Room, editable: bool, p: &Palette) -> Option<El> {
-    let owner = room.members.iter().find(|m| m.role == Role::Owner)?;
+/// The room's owner, by name, as a link to their member dialog. A room whose member list does
+/// not have the owner (it can happen before the first sync) still shows the row, with the short
+/// form of the owner's key and no link.
+fn owner_link(room: &Room, editable: bool, p: &Palette) -> El {
+    let Some(owner) = room.members.iter().find(|m| m.role == Role::Owner) else {
+        let key = &room.details.owner_key;
+        let short: String = key.chars().take(8).collect();
+        let text = if short.is_empty() {
+            "Unknown".to_owned()
+        } else {
+            format!("{short}\u{2026}")
+        };
+        return label(text, st::BODY, p.text)
+            .key("details-owner-unknown")
+            .h(if editable { 24.0 } else { 20.0 });
+    };
     let uid = owner.uid.clone();
-    Some(
-        row()
-            .key("details-owner-open")
-            .role("button")
-            .label(format!("Member info: {}", owner.nickname))
-            .focusable(true)
-            .cursor(rune::Cursor::Pointer)
-            .h(if editable { 24.0 } else { 20.0 })
-            .center_y()
-            .on_press({
-                let uid = uid.clone();
-                move |s: &mut RiverApp| s.chat.open_owner_from_details(&uid)
-            })
-            .on_key(move |s: &mut RiverApp, ev, _| {
-                let enter = ev.key == rune::Key::Enter;
-                if enter {
-                    s.chat.open_owner_from_details(&uid);
-                }
-                enter
-            })
-            .child(
-                label(owner.nickname.clone(), st::BODY, p.accent)
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0),
-            ),
-    )
+    row()
+        .key("details-owner-open")
+        .role("button")
+        .label(format!("Member info: {}", owner.nickname))
+        .focusable(true)
+        .cursor(rune::Cursor::Pointer)
+        .hover(p.surface_hover)
+        .radius(4.0)
+        .on_press({
+            let uid = uid.clone();
+            move |s: &mut RiverApp| s.chat.open_owner_from_details(&uid)
+        })
+        .on_key(move |s: &mut RiverApp, ev, _| {
+            let enter = ev.key == rune::Key::Enter;
+            if enter {
+                s.chat.open_owner_from_details(&uid);
+            }
+            enter
+        })
+        .child(
+            col()
+                .shrink()
+                .min_w(0.0)
+                .child(
+                    label(owner.nickname.clone(), st::BODY, p.accent)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                )
+                // Underlined, as links are elsewhere.
+                .child(el().w_full().h(1.0).fill(p.accent_line)),
+        )
 }
 
 /// A private room's secret version, with Rotate for the owner.
@@ -1297,19 +1328,25 @@ pub(super) fn details_modal(
 
     // Who owns the room, by name, and a private room's secret version.
     let mut facts = col().key("details-facts").w_full().gap(8.0);
-    if let Some(link) = owner_link(room, editable, &p) {
-        facts = facts.child(fact("details-owner", "Owner", link, &p));
-    }
+    facts = facts.child(fact(
+        "details-owner",
+        "Owner",
+        owner_link(room, editable, &p),
+        &p,
+    ));
     if !editable {
         // What matters to a member: how full the room is and how big a message may be.
         let mut members = col().gap(2.0).child(fact_text(
             "details-limit-0",
-            format!("{} members", of(d.usage.members, d.limits.max_members)),
+            format!(
+                "{} members (not counting the owner)",
+                of(d.usage.members, d.limits.max_members)
+            ),
             &p,
         ));
         if room_full(d) {
             members = members.child(
-                label("Full: no new members can join.", st::SMALL, p.warning_text)
+                label("The room is at its member limit. Someone joining may cause the most recently invited member to be removed.", st::SMALL, p.warning_text)
                     .wrap()
                     .w_full()
                     .key("details-room-full"),
@@ -1331,7 +1368,7 @@ pub(super) fn details_modal(
                 "details-bans",
                 "Bans",
                 label(
-                    "The ban list is full, so a new ban may not take effect.",
+                    "The ban list is full. Adding a ban may drop an older one, and that person could come back.",
                     st::SMALL,
                     p.warning_text,
                 )
