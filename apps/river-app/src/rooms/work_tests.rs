@@ -2,6 +2,7 @@ use super::*;
 use crate::rooms::create::invitation;
 use crate::rooms::room::LiveRoom;
 use crate::rooms::room_tests::Fixture;
+use crate::rooms::work::wiped;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{InboundDelegateMsg, StateSummary, WrappedState};
@@ -402,6 +403,7 @@ fn joining_reads_the_room_stores_it_over_a_tombstone_then_sends_the_join() {
     owner_side.room_state = state0.clone();
     let (inv, link) = invitation(&LiveRoom::new(owner_side), "http://x/").unwrap();
     let mut w = Work::default();
+    wiped::take();
     w.join(&link, "Bea", &|_| false);
     let owner = f.owner.verifying_key();
     assert!(w.holds(&owner));
@@ -459,7 +461,15 @@ fn joining_reads_the_room_stores_it_over_a_tombstone_then_sends_the_join() {
     ));
     assert!(matches!(state(&w), WorkState::Done { .. }));
     assert!(!w.holds(&owner));
+    // Done: the invitation and the plan (the invitee's key and the room's secrets) were wiped
+    // when the join finished, and the line still names the room.
     assert!(w.views()[0].what.contains("Secret garden"));
+    assert!(w.join_credentials_wiped());
+    let (invitation_secrets, plan_secrets) = wiped::take();
+    assert!(
+        invitation_secrets > 0 && plan_secrets > 0,
+        "{invitation_secrets} {plan_secrets}"
+    );
 }
 
 #[test]
@@ -2422,29 +2432,105 @@ fn only_a_join_names_its_room_so_a_leave_does_not_look_like_one() {
     assert_eq!(w.views()[0].room, None);
 }
 
+/// A private room's state with an owner-side copy that can make an invitation for it.
+fn private_join() -> (Fixture, river_core::room_state::ChatRoomStateV1, Invitation) {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    let mut owner_side = f.stored(state.clone());
+    owner_side.self_sk = Some(f.owner.clone());
+    crate::rooms::room_tests::add_secret(
+        &f,
+        &mut state,
+        0,
+        &crate::rooms::room_tests::SECRET,
+        &f.owner,
+    );
+    owner_side.room_state = state.clone();
+    let (inv, _) = invitation(&LiveRoom::new(owner_side), "http://x/").unwrap();
+    (f, state, inv)
+}
+
 #[test]
-fn a_nickname_made_for_the_user_is_cut_to_what_the_room_allows() {
+fn a_refused_plan_and_a_dropped_task_are_wiped_too() {
+    // A join from a message for a key the room holds: the plan made for it (with the room's
+    // secrets and the invitee's key) is refused, and is wiped with the invitation.
+    let (f, mut state, inv) = private_join();
+    state.members.members.push(inv.invitee.clone());
+    let mut w = Work::default();
+    wiped::take();
+    w.join_invitation(inv, "Bea", true, &|_| false).unwrap();
+    next(&mut w);
+    get_answer(
+        &mut w,
+        crate::rooms::create::contract_key(&f.owner.verifying_key()),
+        &state,
+    );
+    assert!(
+        w.views()
+            .iter()
+            .any(|v| matches!(v.state, WorkState::Failed { retry: false, .. }))
+    );
+    assert!(w.join_credentials_wiped());
+    let (invitation_secrets, plan_secrets) = wiped::take();
+    assert!(invitation_secrets > 0, "the invitation's secrets");
+    assert!(plan_secrets > 0, "the refused plan's secrets");
+
+    // Dropping a task that holds an invitation wipes it. (The dropped value cannot be looked at;
+    // the count is what shows the secrets were reached.)
+    let (_, _, inv) = private_join();
+    let mut w = Work::default();
+    w.join_invitation(inv, "Bea", false, &|_| false).unwrap();
+    wiped::take();
+    drop(w);
+    assert!(wiped::take().0 > 0);
+}
+
+#[test]
+fn a_generated_nickname_is_cut_to_the_rooms_limit_and_the_cut_is_what_is_joined_with() {
     use river_core::room_state::configuration::AuthorizedConfigurationV1;
-    for (only_new, failed) in [(true, false), (false, true)] {
+    let run = |nickname: &str, limit: usize, only_new: bool| {
         let mut w = Work::default();
         let (inv, owner_sk) = an_invitation();
-        let owner = owner_sk.verifying_key();
-        w.join_invitation(inv, "Cipher Daylight \u{e9}\u{e9}\u{e9}", only_new, &|_| {
-            false
-        })
-        .unwrap();
+        w.join_invitation(inv, nickname, only_new, &|_| false)
+            .unwrap();
         next(&mut w);
         let plan =
             crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
         let mut state = plan.room.room_state;
         let mut config = state.configuration.configuration.clone();
-        config.max_nickname_size = 7;
+        config.max_nickname_size = limit;
         state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
-        get_answer(&mut w, crate::rooms::create::contract_key(&owner), &state);
-        let failed_now = w
-            .views()
-            .iter()
-            .any(|v| matches!(v.state, WorkState::Failed { .. }));
-        assert_eq!(failed_now, failed, "only_new = {only_new}");
-    }
+        get_answer(
+            &mut w,
+            crate::rooms::create::contract_key(&owner_sk.verifying_key()),
+            &state,
+        );
+        let joined = match &w.tasks[0].kind {
+            Kind::Join { plan: Some(p), .. } => p.room.self_nickname.clone(),
+            _ => None,
+        };
+        let failed = w.views().into_iter().find_map(|v| match v.state {
+            WorkState::Failed { why, retry } => Some((why, retry)),
+            _ => None,
+        });
+        (joined, failed)
+    };
+    // Cut on a character boundary, trailing space dropped.
+    let (joined, failed) = run("Cipher Daylight \u{e9}\u{e9}\u{e9}", 7, true);
+    assert_eq!((joined.as_deref(), failed), (Some("Cipher"), None));
+    // A typed nickname is refused when too long, not changed.
+    let (joined, failed) = run("Cipher Daylight", 7, false);
+    assert!(
+        joined.is_none()
+            && failed.is_some_and(|(w, _)| w.contains("too long") || w.contains("at most"))
+    );
+    // A first character wider than the limit leaves nothing, and a limit under the fixed
+    // fallback's length is said, for good.
+    let (joined, failed) = run("\u{e9}Bea", 1, true);
+    assert!(joined.is_none());
+    let (why, retry) = failed.expect("refused");
+    assert!(
+        why.contains("nickname limit is too small") && !retry,
+        "{why}"
+    );
 }

@@ -21,8 +21,9 @@
 //! private room, the room's secrets. It exists in the clear only in the sealed envelope on the
 //! wire and in memory: while sending (until the message is composed), and while accepting, in the
 //! join task that holds it until the join ends (all its retries and its failed states that can be
-//! tried again, [`super::work`]; the task wipes it when the join finishes, fails for good or is
-//! put away). It is never logged, never printed (nothing in this module derives or writes a
+//! tried again, [`super::work`]; the task wipes it, and the plan made from it, when the join
+//! finishes or fails for good, and `Task`'s `Drop` wipes it when the task is put away or the
+//! session ends). It is never logged, never printed (nothing in this module derives or writes a
 //! `Debug` of one, and the words of every refusal are fixed ones), never saved, and the buffers
 //! and secrets it was in are wiped when done with. Not covered: copies the allocator freed
 //! while a buffer grew (the CBOR encoding), and the operating system's own paging.

@@ -603,3 +603,31 @@ fn the_invitation_message_is_the_web_uis_and_cleans_the_room_name() {
     assert!(invitation_message("  ", "l").contains("\"this chat room\""));
     assert!(invitation_message("\u{202E}\u{200B}", "l").contains("\"this chat room\""));
 }
+
+#[test]
+fn a_generated_nickname_is_cut_to_the_limit_with_a_fixed_fallback() {
+    let cfg = |n: usize| Configuration {
+        max_nickname_size: n,
+        ..Configuration::default()
+    };
+    assert_eq!(
+        fit_nickname("Cipher Daylight", &cfg(50)).as_deref(),
+        Some("Cipher Daylight")
+    );
+    assert_eq!(
+        fit_nickname("Cipher Daylight", &cfg(7)).as_deref(),
+        Some("Cipher")
+    );
+    // Never inside a character: a 2-byte character at a 3-byte limit leaves one.
+    assert_eq!(
+        fit_nickname("\u{e9}\u{e9}", &cfg(3)).as_deref(),
+        Some("\u{e9}")
+    );
+    // Nothing left: "Member" when it fits, else nothing.
+    assert_eq!(fit_nickname("\u{e9}x", &cfg(1)), None);
+    assert_eq!(
+        fit_nickname("       Bea", &cfg(6)).as_deref(),
+        Some("Member")
+    );
+    assert_eq!(fit_nickname("x", &cfg(0)), None);
+}

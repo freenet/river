@@ -581,11 +581,14 @@ fn work_that_is_not_a_join_of_the_room_does_not_make_the_card_say_joining() {
     assert_eq!(state_of(&rt, &uid), CardState::New);
 }
 
+/// The card's label is the sender's claim. When it is the name of a room the user has, the card
+/// is the "already a member" (or "no longer a member") card, which says the room is the user's
+/// own, so the label is never what decides anything; a room the user does not have is shown by
+/// its short key as the sender's claim.
 #[test]
-fn the_label_is_the_senders_claim_and_says_so_when_it_is_a_room_you_have() {
+fn a_label_that_is_a_room_you_have_comes_with_the_members_card() {
     let (mut rt, _) = with_cards(None);
     assert!(shows(&rt, "Room:"));
-    assert!(!shows(&rt, "Claims to be for:"));
     let mut rooms = rt.state.chat.rooms().to_vec();
     let mut have = rooms[0].clone();
     have.key = INVITED.to_owned();
@@ -593,5 +596,6 @@ fn the_label_is_the_senders_claim_and_says_so_when_it_is_a_room_you_have() {
     rooms.push(have);
     rt.update(move |s, _| s.chat.set_rooms(rooms));
     rt.frame(0.2);
-    assert!(shows(&rt, "Claims to be for:"));
+    assert!(shows(&rt, "You are already a member of Chess Club."));
+    assert!(rt.find(&accept_key()).is_none());
 }

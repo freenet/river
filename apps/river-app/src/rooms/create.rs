@@ -434,8 +434,10 @@ pub fn decode_invitation(pasted: &str) -> Result<Invitation, String> {
 }
 
 /// `nickname` cut, on a character boundary, to the longest the room takes. Only for a nickname
-/// made for the user: a typed one is refused when too long, not changed.
-pub fn fit_nickname(nickname: &str, config: &Configuration) -> String {
+/// made for the user: a typed one is refused when too long, not changed. When nothing is left (the
+/// first character is wider than the limit) the fixed "Member" is used if it fits, as `riverctl`
+/// does; `None` when even that is over the limit.
+pub fn fit_nickname(nickname: &str, config: &Configuration) -> Option<String> {
     let limit = config
         .max_nickname_size
         .min(river_core::room_state::member_info::NICKNAME_CEILING);
@@ -443,8 +445,15 @@ pub fn fit_nickname(nickname: &str, config: &Configuration) -> String {
     while !nickname.is_char_boundary(end) {
         end -= 1;
     }
-    nickname[..end].trim_end().to_owned()
+    let cut = nickname[..end].trim_end();
+    if !cut.is_empty() {
+        return Some(cut.to_owned());
+    }
+    (FALLBACK_NICKNAME.len() <= limit).then(|| FALLBACK_NICKNAME.to_owned())
 }
+
+/// The nickname used when a generated one does not fit at all.
+const FALLBACK_NICKNAME: &str = "Member";
 
 /// Why `nickname` can't be used to join, before the room is read.
 pub fn join_refusal(nickname: &str) -> Option<String> {

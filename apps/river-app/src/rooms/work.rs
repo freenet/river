@@ -334,6 +334,34 @@ struct Task {
     dm_rooms: Vec<[u8; 32]>,
     /// For a [`Kind::DmSave`] the merge refused: why.
     dm_refusal: Option<dm_store::Refusal>,
+    /// For a finished join: the room's name, kept for the line that says it is done after the
+    /// plan (which holds the invitee's key and the room's secrets) has been wiped.
+    done_name: Option<String>,
+}
+
+/// For tests: how many non-zero secrets of an invitation and of a join plan were wiped on this
+/// thread, so a test can see that a copy was reached (a dropped value cannot be looked at).
+#[cfg(test)]
+pub(crate) mod wiped {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn note(invitation: bool, secret: &[u8; 32]) {
+        if *secret != [0; 32] {
+            COUNTS.with(|c| {
+                let (i, p) = c.get();
+                c.set(if invitation { (i + 1, p) } else { (i, p + 1) });
+            });
+        }
+    }
+
+    /// (invitation secrets, plan secrets) wiped since the last call, and reset.
+    pub(crate) fn take() -> (usize, usize) {
+        COUNTS.with(|c| c.replace((0, 0)))
+    }
 }
 
 impl Kind {
@@ -345,6 +373,8 @@ impl Kind {
         if let Kind::Join { plan, .. } = self {
             if let Some(p) = plan.as_mut() {
                 for secret in p.room.invitation_secrets.values_mut() {
+                    #[cfg(test)]
+                    wiped::note(false, secret);
                     zeroize::Zeroize::zeroize(secret);
                 }
             }
@@ -357,6 +387,8 @@ impl Kind {
     fn wipe_invitation(&mut self) {
         if let Kind::Join { invitation, .. } = self {
             for (_, secret) in &mut invitation.room_secrets {
+                #[cfg(test)]
+                wiped::note(true, secret);
                 zeroize::Zeroize::zeroize(secret);
             }
             invitation.room_secrets.clear();
@@ -392,6 +424,7 @@ impl Task {
             dm_dropped: Vec::new(),
             dm_rooms: Vec::new(),
             dm_refusal: None,
+            done_name: None,
         }
     }
 
@@ -433,6 +466,10 @@ impl Task {
     fn view(&self) -> WorkView {
         let what = match &self.kind {
             Kind::Create(plan) => format!("Creating “{}”", plan.name()),
+            Kind::Join { .. } if self.done_name.is_some() => format!(
+                "Joining “{}”",
+                self.done_name.as_deref().unwrap_or_default()
+            ),
             Kind::Join { plan: Some(p), .. } => format!(
                 "Joining “{}”",
                 super::room::LiveRoom::new(stored(&p.room)).name()
@@ -519,9 +556,13 @@ impl Task {
             (_, Step::Meta) => Step::Done,
             (_, step) => step,
         };
-        // A finished join has no use for the invitation (the room it stored is the plan's).
+        // A finished join has no use for the invitation or the plan: nothing reads them after the
+        // last write but the line that names the room, which keeps the name.
         if self.step == Step::Done {
-            self.kind.wipe_invitation();
+            if let Kind::Join { plan: Some(p), .. } = &self.kind {
+                self.done_name = Some(super::room::LiveRoom::new(stored(&p.room)).name());
+            }
+            self.kind.wipe_credential();
         }
     }
 
@@ -1294,17 +1335,29 @@ impl Work {
                             let nick = if *only_new {
                                 create::fit_nickname(nickname, &state.configuration.configuration)
                             } else {
-                                nickname.clone()
+                                Some(nickname.clone())
                             };
-                            match create::join(invitation, &nick, &state, key, SystemTime::now())
-                            {
-                                Ok(p) if *only_new && !p.adds_member() => t.fail(
-                                    "This invitation is for someone who is a member of the room already, so it is not used.",
+                            let Some(nick) = nick else {
+                                t.fail(
+                                    "This room's nickname limit is too small for a generated nickname, so the invitation is not used.",
                                     false,
-                                ),
+                                );
+                                return true;
+                            };
+                            match create::join(invitation, &nick, &state, key, SystemTime::now()) {
                                 Ok(p) => {
+                                    // Kept in the task before it is judged, so a plan that is
+                                    // refused is wiped with the task's credential.
+                                    let rejected = *only_new && !p.adds_member();
                                     *plan = Some(Box::new(p));
-                                    t.advance();
+                                    if rejected {
+                                        t.fail(
+                                            "This invitation is for someone who is a member of the room already, so it is not used.",
+                                            false,
+                                        );
+                                    } else {
+                                        t.advance();
+                                    }
                                 }
                                 Err(r) => t.fail(r.why, r.retry),
                             }

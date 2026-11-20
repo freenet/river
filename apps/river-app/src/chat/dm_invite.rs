@@ -315,21 +315,10 @@ pub(super) fn card(
                 .child(label(title.to_owned(), st::NAME, p.text)),
         );
     if let Some(room) = room_label {
-        // The label is the sender's claim: when it is the name of a room the user has, the
-        // card says it only claims to be for that room, so a deceptive one cannot pass as it.
-        let claimed = received.is_some_and(|(_, t)| chat.rooms().iter().any(|r| r.key == t));
         c = c.child(
             row()
                 .gap(6.0)
-                .child(label(
-                    if claimed {
-                        "Claims to be for:"
-                    } else {
-                        "Room:"
-                    },
-                    st::SMALL,
-                    p.text_muted,
-                ))
+                .child(label("Room:", st::SMALL, p.text_muted))
                 .child(
                     label(room.to_owned(), st::SMALL_STRONG, p.text)
                         .key(format!("dm-invite-room-{key}"))
