@@ -363,6 +363,8 @@ impl Chat {
         if self.other_dialog_open() || self.switcher.is_some() || self.room().is_none() {
             return false;
         }
+        // The panel searches the room, which a direct-message thread covers: go back to it.
+        self.close_dm();
         if self.search.is_some() {
             // The one search that holds the keyboard: not both boxes at once.
             let from_members = self.dismiss_member_search();
@@ -395,6 +397,7 @@ impl Chat {
         if let Some(s) = self.search.take()
             && s.restore_composer
             && self.actionable().is_some()
+            && !self.dm.is_open()
         {
             self.composer.focused = true;
         }

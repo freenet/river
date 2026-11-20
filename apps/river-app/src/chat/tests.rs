@@ -414,11 +414,12 @@ fn narrow_scenes_are_named_narrow() {
         // A narrow window never puts the members panel beside the conversation.
         let beside = rt.find("members").is_some() && rt.find("members-overlay").is_none();
         let is_narrow = name.contains("narrow");
-        // Only a chat screen with a room open has a members panel.
+        // Only a chat screen with a room's conversation in front has a members panel: not one
+        // with a direct-message thread open.
         let room_open = matches!(
             rt.state.access,
             crate::Access::Example | crate::Access::Ready
-        ) && rt.state.chat.room().is_some();
+        ) && rt.state.chat.visible_room().is_some();
         assert_eq!(
             beside,
             !is_narrow && room_open && rt.state.chat.members_open,
@@ -1465,7 +1466,7 @@ fn the_owner_and_you_are_tagged() {
 }
 
 #[test]
-fn what_needs_commands_this_app_lacks_is_shown_unavailable() {
+fn the_members_dialog_offers_message_and_leaves_moderation_to_the_rooms_own_gate() {
     let mut rt = render(connected(), WINDOW_SIZE);
     open_member(&mut rt, "Jonas");
     let e = rt
@@ -1473,7 +1474,8 @@ fn what_needs_commands_this_app_lacks_is_shown_unavailable() {
         .into_iter()
         .find(|e| e.key.as_deref() == Some("member-dm"))
         .expect("no member-dm");
-    assert_eq!(e.help.as_deref(), Some(super::view::NOT_YET));
+    // The Message button opens a read-only conversation, so it is not shown unavailable.
+    assert_ne!(e.help.as_deref(), Some(super::view::NOT_YET));
     // The web dialog has no Mention button; mentions come from the composer.
     assert!(rt.find("member-mention").is_none());
     // Sam did not invite Jonas, so Sam has no say over him.

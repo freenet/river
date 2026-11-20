@@ -274,7 +274,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     frame
 }
 
-fn day_divider(day: u32, text: String, p: &Palette) -> El {
+pub(super) fn day_divider(day: u32, text: String, p: &Palette) -> El {
     row()
         .key(format!("day-{day}"))
         .w_full()
@@ -735,7 +735,7 @@ fn message_el(room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
 }
 
 /// A message's text, with any web links in it styled and pressable.
-fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
+pub(super) fn message_body(m: &Message, p: &Palette, k: &Kit) -> El {
     // Markdown that cannot be made safe to draw (`None`) falls back to the plain text.
     if !m.md.is_empty()
         && markdown::is_cheap(&m.md)

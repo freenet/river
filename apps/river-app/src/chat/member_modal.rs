@@ -2,8 +2,8 @@
 //! `MemberInfoModal` (`ui/src/components/members/member_info_modal.rs`): who the member is, how
 //! they came to be in the room, and a warning when their name imitates the owner's.
 //!
-//! What it leaves out is sending a direct message and sharing an invite by one, shown dimmed with
-//! the app's "not available yet" tooltip, not faked. Your own dialog edits your nickname
+//! Its Message button opens the conversation with the member (read only for now). What it leaves
+//! out is sharing an invite by direct message, which the web UI offers too. Your own dialog edits your nickname
 //! (`nickname_editor`), as the web UI's `NicknameField` does. Deputize and Revoke deputy
 //! (`deputy_block`) work as the web UI's `DeputyButton` does, with a confirmation first. Ban
 //! (`ban_confirmation`) is offered as the web UI's `ban_gate` decides it, with a confirmation;
@@ -19,7 +19,7 @@ use super::conversation::avatar;
 use super::icons;
 use super::model::{Appointer, BanOffer, Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
-use super::view::{label, not_yet};
+use super::view::label;
 use super::{Chat, Source};
 use crate::RiverApp;
 
@@ -823,15 +823,19 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             .child(invited_by),
     );
 
-    // Direct messages need commands this app does not send yet: shown, not faked.
     let mut actions = row().key("member-actions").w_full().gap(8.0).flex_wrap();
     if !is_me {
-        actions = actions.child(not_yet(
-            Button::new("DM")
+        // Opens the conversation, which is read only for now.
+        let (room_key, peer) = (room.key.clone(), uid.to_owned());
+        actions = actions.child(
+            Button::new("Message")
                 .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut RiverApp| {
+                    s.chat.open_dm(&room_key, &peer);
+                })
                 .build(k)
                 .key("member-dm"),
-        ));
+        );
         if matches!(room.ban_offers.get(uid), Some(BanOffer::Allowed)) && chat.ban_confirm.is_none()
         {
             actions = actions.child(

@@ -13,6 +13,7 @@ mod background;
 mod conversation;
 mod details;
 pub mod dm_model;
+pub mod dm_view;
 pub mod dnd;
 mod emoji;
 pub mod example;
@@ -25,6 +26,8 @@ pub mod identity_texts {
         Secret,
     };
 }
+#[cfg(test)]
+mod dm_view_tests;
 mod keys;
 mod links;
 pub(crate) mod markdown;
@@ -381,6 +384,9 @@ pub struct Chat {
     pub zoom: zoom::Zoom,
     /// Whether the keyboard shortcuts page is open ([`shortcuts`]).
     pub shortcuts_open: bool,
+    /// Direct messages: the rail's threads, the open thread and what has been read
+    /// ([`dm_view`]).
+    pub dm: dm_view::DmUi,
 }
 
 impl Chat {
@@ -493,6 +499,7 @@ impl Chat {
             shortcode: Default::default(),
             zoom: Default::default(),
             shortcuts_open: false,
+            dm: Default::default(),
             catching_up: true,
             full_list: false,
             modes: HashMap::new(),
@@ -605,6 +612,7 @@ impl Chat {
         {
             self.form.join = self.join_preview_for(room);
         }
+        self.dm_settle();
         if self.rooms.is_empty() {
             self.emoji_open = false;
             self.member_modal = None;
@@ -707,14 +715,17 @@ impl Chat {
             self.select(&key);
         }
         // The open room is being read, so nothing in it is unread (a window that is away
-        // counts what it missed itself, see `RiverApp::unread`).
-        if let Some(room) = self.room_mut() {
-            room.unread = 0;
-        }
-        if let Some(room) = self.room()
-            && let Some(mark) = ReadMark::of(room)
-        {
-            self.read.insert(room.key.clone(), mark);
+        // counts what it missed itself, see `RiverApp::unread`). Not while a direct-message
+        // thread covers it.
+        if !self.dm.is_open() {
+            if let Some(room) = self.room_mut() {
+                room.unread = 0;
+            }
+            if let Some(room) = self.room()
+                && let Some(mark) = ReadMark::of(room)
+            {
+                self.read.insert(room.key.clone(), mark);
+            }
         }
         arrived
     }
@@ -787,6 +798,8 @@ impl Chat {
         if let Some(mark) = ReadMark::of(room) {
             self.read.insert(key.to_owned(), mark);
         }
+        // Choosing a room shows its conversation, whatever thread was open.
+        self.dm.open = None;
         if key == self.selected {
             return;
         }
@@ -1008,6 +1021,10 @@ impl Chat {
 
     /// Edit your message keyed `target` in the composer.
     pub fn start_edit(&mut self, target: &str) {
+        // Not while a direct-message thread covers the room: its composer is not on screen.
+        if self.dm.is_open() {
+            return;
+        }
         // As written, so the edit keeps the message's mentions.
         let Some(text) = self
             .own_sent(target)
@@ -1087,6 +1104,11 @@ impl Chat {
         }
         if covered_by_other || self.members_overlay {
             return false;
+        }
+        // Back from a direct-message thread to the room.
+        if self.dm.is_open() {
+            self.close_dm();
+            return true;
         }
         if self.search.is_some() {
             self.close_search();

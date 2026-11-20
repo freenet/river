@@ -69,6 +69,11 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
+    // A direct-message thread takes the conversation's place and the members panel's.
+    if chat.dm.is_open() {
+        screen = screen.child(super::dm_view::thread_pane(chat, narrow, &p, &k));
+        return rune_kit::root(screen, layer);
+    }
     let win_h = cx.layout_with("chat", |r| r[3]).unwrap_or(800.0);
     // The composer's field grows with the draft, and the search panel gives way to it.
     let field_h = cx.layout_with("composer-field", |r| r[3]).unwrap_or(24.0);
@@ -467,9 +472,11 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         list = list.child(super::overview::entry(chat, p));
     }
     for room in chat.rooms() {
-        let selected = chat.room().is_some_and(|r| r.key == room.key);
+        // While a direct-message thread is open, no room is the one in front.
+        let selected = chat.visible_room().is_some_and(|r| r.key == room.key);
         list = list.child(room_row(room, chat.unread_of(room), selected, width, p));
     }
+    list = list.children(super::dm_view::rail(chat, p));
     let enter = outlined("enter-invite", "Enter invite code", &icons::INVITE, 34.0, p);
     let import = outlined("import-id", "Import ID", &icons::IMPORT, 34.0, p);
     let mut footer = col()

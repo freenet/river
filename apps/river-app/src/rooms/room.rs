@@ -209,8 +209,18 @@ impl LiveRoom {
         cache: &super::dm_cache::OutboundCache,
         room_label: &dyn Fn(&ed25519_dalek::VerifyingKey) -> Option<String>,
     ) -> super::dm::Threads {
+        self.with_dm_source(cache, room_label, super::dm::threads)
+    }
+
+    /// Run `f` on what [`super::dm::threads`] reads from this room.
+    fn with_dm_source<R>(
+        &self,
+        cache: &super::dm_cache::OutboundCache,
+        room_label: &dyn Fn(&ed25519_dalek::VerifyingKey) -> Option<String>,
+        f: impl FnOnce(&super::dm::Source<'_>) -> R,
+    ) -> R {
         let name_of = |id: RiverMemberId| self.member_name(id);
-        super::dm::threads(&super::dm::Source {
+        f(&super::dm::Source {
             room_key: &self.key(),
             room_name: &self.name(),
             owner: &self.stored.owner_vk,
@@ -222,6 +232,53 @@ impl LiveRoom {
             name_of: &name_of,
             room_label,
         })
+    }
+
+    /// What decides whether the threads built last time are still the threads to show
+    /// ([`super::dm::DmKey`]). `all_room_names` is the name of every room the caller can label
+    /// an invitation with: together with the nicknames of this room's peers it is the `names`
+    /// value the key documents.
+    pub fn dm_key(
+        &self,
+        cache: &super::dm_cache::OutboundCache,
+        room_label: &dyn Fn(&ed25519_dalek::VerifyingKey) -> Option<String>,
+        all_room_names: &[String],
+    ) -> super::dm::DmKey {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        for name in all_room_names {
+            name.hash(&mut h);
+        }
+        // The peers the user has messages with, in a fixed order: `name_of` is only asked for
+        // them. The owner is one of them when they wrote to the user.
+        if let Some(me) = self.stored.self_verifying_key() {
+            let me = RiverMemberId::from(&me);
+            let mut peers: Vec<RiverMemberId> = self
+                .stored
+                .room_state
+                .direct_messages
+                .messages
+                .iter()
+                .filter_map(|m| {
+                    let (s, r) = (m.message.sender, m.message.recipient);
+                    if s == me {
+                        Some(r)
+                    } else if r == me {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            peers.sort_by_key(|p| p.0.0);
+            peers.dedup();
+            for peer in peers {
+                peer.0.0.hash(&mut h);
+                self.member_name(peer).hash(&mut h);
+            }
+        }
+        let names = h.finish();
+        self.with_dm_source(cache, room_label, |src| super::dm::DmKey::of(src, names))
     }
 
     /// Every secret this member holds for the room, by version, ascending: what an invitation
@@ -824,11 +881,18 @@ fn shown_nickname(raw: &str) -> String {
 /// message time can hold (the year 10136) show as the last minute it can.
 /// (`chrono`'s `From<SystemTime>` panics outside its own range, so it is not used.)
 pub fn local_minutes(t: SystemTime) -> u32 {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => local_minutes_of_secs(d.as_secs()),
+        Err(_) => 0,
+    }
+}
+
+/// [`local_minutes`] for unix seconds that did not come from a `SystemTime`, such as a direct
+/// message's signed timestamp. Adding such a number to the epoch as a `SystemTime` panics when
+/// it overflows (a `u64::MAX` does on Linux), so convert it here instead. Never panics.
+pub fn local_minutes_of_secs(secs: u64) -> u32 {
     use chrono::{Offset, TimeZone};
-    let secs: i64 = match t.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => return 0,
-    };
+    let secs: i64 = i64::try_from(secs).unwrap_or(i64::MAX);
     let max_secs = i64::from(u32::MAX) * 60;
     let secs = secs.min(max_secs);
     let offset = chrono::DateTime::from_timestamp(secs, 0)

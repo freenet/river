@@ -442,3 +442,152 @@ pub fn data() -> ExampleData {
 pub const PRIVATE_ROOM: &str = "design-crew";
 /// The key of the example's room with no messages.
 pub const EMPTY_ROOM: &str = "book-club";
+
+// Direct messages ------------------------------------------------------------------------------
+
+/// Unix seconds for `h:m` UTC on example day `day`, from the example's own calendar.
+fn dm_secs(day: u32, h: u32, m: u32) -> u64 {
+    let day0 = model::days_from_civil(2026, 11, 6) - i64::from(TODAY);
+    ((day0 + i64::from(day)) as u64) * 86_400 + u64::from(h * 3600 + m * 60)
+}
+
+fn dm_message(
+    key: &str,
+    outgoing: bool,
+    at: u64,
+    body: super::dm_model::DmBody,
+) -> super::dm_model::DmMessage {
+    super::dm_model::DmMessage {
+        key: key.into(),
+        outgoing,
+        timestamp: at,
+        body,
+    }
+}
+
+fn dm_thread(
+    room: &str,
+    room_name: &str,
+    peer: MemberId,
+    peer_name: &str,
+    messages: Vec<super::dm_model::DmMessage>,
+) -> super::dm_model::DmThread {
+    let last_ts = messages.iter().map(|m| m.timestamp).max().unwrap_or(0);
+    let last_inbound_ts = messages
+        .iter()
+        .filter(|m| !m.outgoing)
+        .map(|m| m.timestamp)
+        .max()
+        .unwrap_or(0);
+    super::dm_model::DmThread {
+        room: room.into(),
+        room_name: room_name.into(),
+        peer_uid: peer.to_string(),
+        peer: river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(
+            i64::from(peer),
+        )),
+        peer_name: peer_name.into(),
+        peer_is_member: true,
+        messages,
+        last_ts,
+        last_inbound_ts,
+    }
+}
+
+/// Example direct messages: three conversations in two rooms, with markdown, an invitation and
+/// a message the user sent.
+pub fn dm_snapshot() -> super::dm_model::DmSnapshot {
+    use super::dm_model::DmBody::{Invite, Placeholder, SentInvite, Text};
+    use super::dm_model::Placeholder as Why;
+    let priya = dm_thread(
+        "town-square",
+        "Town Square",
+        PRIYA,
+        "Priya Raman",
+        vec![
+            dm_message(
+                "p1",
+                false,
+                dm_secs(2, 16, 5),
+                Text("Did you see the **new** release notes?".into()),
+            ),
+            dm_message(
+                "p2",
+                true,
+                dm_secs(2, 16, 9),
+                Text("Not yet, send me the link.".into()),
+            ),
+            dm_message(
+                "p3",
+                false,
+                dm_secs(TODAY, 9, 40),
+                Text(
+                    "Here: https://freenet.org/ and the `river` notes.\n\n- fast\n- private".into(),
+                ),
+            ),
+            dm_message(
+                "p4",
+                false,
+                dm_secs(TODAY, 9, 41),
+                Text("Let me know what you think.".into()),
+            ),
+            dm_message(
+                "p5",
+                true,
+                dm_secs(TODAY, 9, 50),
+                Placeholder(Why::CiphertextOnly),
+            ),
+        ],
+    );
+    let kwame = dm_thread(
+        "design-crew",
+        "Design Crew",
+        KWAME,
+        "Kwame Mensah",
+        vec![
+            dm_message(
+                "k1",
+                false,
+                dm_secs(TODAY, 8, 30),
+                Invite {
+                    room_label: "Rust Help".into(),
+                    note: Some("Come and help us review the **parser** patch.".into()),
+                },
+            ),
+            dm_message(
+                "k2",
+                true,
+                dm_secs(TODAY, 8, 45),
+                SentInvite {
+                    note: Some("Welcome to the crew".into()),
+                },
+            ),
+        ],
+    );
+    let maya = dm_thread(
+        "town-square",
+        "Town Square",
+        MAYA,
+        "Maya Chen",
+        vec![dm_message(
+            "m1",
+            false,
+            dm_secs(1, 11, 0),
+            Placeholder(Why::CannotDecrypt),
+        )],
+    );
+    super::dm_model::DmSnapshot {
+        threads: [priya, kwame, maya].map(std::sync::Arc::new).to_vec(),
+        room_keys: dm_room_keys(),
+        truncated: Vec::new(),
+        hydrated: true,
+    }
+}
+
+/// The key of the thread the example opens: Priya in the Town Square.
+pub const DM_PEER: &str = "27";
+
+/// The keys of the example rooms.
+pub fn dm_room_keys() -> Vec<String> {
+    data().rooms.into_iter().map(|r| r.key).collect()
+}

@@ -97,6 +97,7 @@ use super::token::TokenStore;
 use super::work::WorkView;
 pub use crate::chat::LinkStatus;
 use crate::chat::Room;
+use crate::chat::dm_model::DmSnapshot;
 
 /// How the background work paces itself. Tests shrink these.
 #[derive(Clone, Debug)]
@@ -270,6 +271,9 @@ pub enum RoomsUpdate {
         /// Rooms being created or joined, and those that failed.
         work: Vec<WorkView>,
     },
+    /// The direct-message threads of every room, sent after `Rooms` whenever they changed.
+    /// Read only.
+    Dms(DmSnapshot),
     /// The connection's state changed while rooms are shown.
     Status(LinkStatus),
     /// The invitation the user asked for in the room keyed `room`: its link, or why there is
@@ -310,6 +314,7 @@ impl std::fmt::Debug for RoomsUpdate {
                 .field("issues", issues)
                 .field("work", work)
                 .finish(),
+            RoomsUpdate::Dms(d) => f.debug_tuple("Dms").field(d).finish(),
             RoomsUpdate::Status(s) => f.debug_tuple("Status").field(s).finish(),
             RoomsUpdate::Invite { room, link } => f
                 .debug_struct("Invite")
@@ -1534,6 +1539,19 @@ fn plan<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Plan {
     plan
 }
 
+/// A room's threads as last built, with the key they were built under. The one copy of their
+/// decrypted text in the background work: the window's snapshot shares it.
+struct DmMemo {
+    key: super::dm::DmKey,
+    threads: Vec<std::sync::Arc<crate::chat::dm_model::DmThread>>,
+    truncated: bool,
+    /// How many times the room's threads were built, for tests.
+    builds: usize,
+}
+
+/// What the window was last sent as direct-message threads ([`Rooms::dm_sent`]).
+type DmSent = (Vec<(VerifyingKey, super::dm::DmKey)>, bool, Vec<String>);
+
 /// The rooms being shown, with what is needed to keep them current.
 #[derive(Default)]
 struct Rooms {
@@ -1562,6 +1580,13 @@ struct Rooms {
     /// writes `outbound_dms` yet. The direct-message view reads it through
     /// [`Rooms::dm_cache`].
     dm_cache: OutboundCache,
+    /// The threads of each room built last time, so a report that changes nothing in a room's
+    /// messages does not open them again ([`Rooms::dm_snapshot`]).
+    dm_memo: HashMap<VerifyingKey, DmMemo>,
+    /// What the window was last sent as direct-message threads: each room's key and the key its
+    /// threads were built under, whether the sent-text cache had been read, and which rooms were listed. A report sends
+    /// the threads again only when this changes.
+    dm_sent: Option<DmSent>,
     /// River's web app on the node, which invite links open.
     web_app: String,
     /// Invitations made since the last report, by room key.
@@ -1591,9 +1616,92 @@ struct Rooms {
 
 impl Rooms {
     /// The sent-message cache, hydrated by every read of the stored rooms.
-    #[allow(dead_code)] // Read by the direct-message view, a later change; tests read it now.
+    #[cfg(test)]
     fn dm_cache(&self) -> &OutboundCache {
         &self.dm_cache
+    }
+
+    /// The direct-message threads of every room, when they differ from what the window was last
+    /// sent. Read only. A room with no direct messages has no threads and costs nothing here.
+    ///
+    /// The threads of a room are rebuilt only when their key changes
+    /// ([`LiveRoom::dm_key`]): this runs at every report, and the key is much cheaper than
+    /// verifying and opening up to a thousand messages.
+    fn dm_snapshot(&mut self) -> Option<DmSnapshot> {
+        let Rooms {
+            list,
+            dm_cache,
+            dm_memo,
+            dm_sent,
+            network_seen,
+            ..
+        } = self;
+        let all_names: Vec<String> = list.iter().map(LiveRoom::name).collect();
+        let label = |vk: &VerifyingKey| {
+            list.iter()
+                .find(|r| &r.stored.owner_vk == vk)
+                .map(LiveRoom::name)
+        };
+        let with_dms: Vec<&LiveRoom> = list
+            .iter()
+            .filter(|r| !r.stored.room_state.direct_messages.messages.is_empty())
+            .collect();
+        let keys: Vec<(VerifyingKey, super::dm::DmKey)> = with_dms
+            .iter()
+            .map(|r| (r.stored.owner_vk, r.dm_key(dm_cache, &label, &all_names)))
+            .collect();
+        // The loaded rooms are in it too, by key: a room met for the first time has its messages
+        // seeded as seen, so a changed list (even one of the same size) is a change here.
+        // Rooms whose state has come from the network, not a stub of a room just joined.
+        let room_keys: Vec<String> = list
+            .iter()
+            .filter(|r| network_seen.contains(&r.stored.owner_vk))
+            .map(LiveRoom::key)
+            .collect();
+        let fingerprint = (keys.clone(), dm_cache.hydrated(), room_keys.clone());
+        if dm_sent.as_ref() == Some(&fingerprint) {
+            return None;
+        }
+        dm_memo.retain(|vk, _| keys.iter().any(|(k, _)| k == vk));
+        let mut snapshot = DmSnapshot {
+            hydrated: dm_cache.hydrated(),
+            room_keys,
+            ..DmSnapshot::default()
+        };
+        for (room, (vk, key)) in with_dms.iter().zip(&keys) {
+            let memo = dm_memo.entry(*vk);
+            let memo = match memo {
+                std::collections::hash_map::Entry::Occupied(e) if e.get().key == *key => {
+                    e.into_mut()
+                }
+                entry => {
+                    let built = room.dm_threads(dm_cache, &label);
+                    let builds = match &entry {
+                        std::collections::hash_map::Entry::Occupied(e) => e.get().builds + 1,
+                        std::collections::hash_map::Entry::Vacant(_) => 1,
+                    };
+                    let value = DmMemo {
+                        key: *key,
+                        truncated: built.truncated,
+                        threads: built.threads.into_iter().map(std::sync::Arc::new).collect(),
+                        builds,
+                    };
+                    match entry {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            e.insert(value);
+                            e.into_mut()
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => e.insert(value),
+                    }
+                }
+            };
+            if memo.truncated {
+                snapshot.truncated.push(room.key());
+            }
+            snapshot.threads.extend(memo.threads.iter().cloned());
+        }
+        *dm_sent = Some(fingerprint);
+        Some(snapshot)
     }
 
     /// Take freshly read rooms, returning the room contracts that are new to the list.
@@ -2205,6 +2313,9 @@ impl Rooms {
             issues: self.issues(),
             work: self.outbox.work.views(),
         });
+        if let Some(dms) = self.dm_snapshot() {
+            report(RoomsUpdate::Dms(dms));
+        }
         for (room, link) in std::mem::take(&mut self.invites) {
             report(RoomsUpdate::Invite { room, link });
         }

@@ -412,7 +412,7 @@ impl RiverApp {
     /// window is focused, or any other room with nothing unread.
     fn drop_read_held(&mut self) {
         let (chat, focused) = (&self.chat, self.focused);
-        let open = chat.room().map(|r| r.key.as_str());
+        let open = chat.visible_room().map(|r| r.key.as_str());
         self.limiter.retain_held(|k| {
             // A room muted since its notification was held back has nothing to show.
             if chat.mode_of(k) == rooms::modes::NotificationMode::Muted {
@@ -534,7 +534,8 @@ impl RiverApp {
     fn notify_arrivals(&mut self, arrived: Vec<notify::Arrival>, now: std::time::Instant) {
         self.limiter
             .observe(self.chat.rooms(), now, self.chat.list_is_full());
-        let open = self.chat.room().map(|r| r.key.clone());
+        // A direct-message thread covers the open room: its messages are not being read.
+        let open = self.chat.visible_room().map(|r| r.key.clone());
         let mut shown = Vec::new();
         for a in arrived {
             // What fills a room that just appeared is history: not news, not unread.
@@ -578,6 +579,9 @@ impl RiverApp {
     fn sync_unread(&mut self, tx: &mut Tx) {
         self.sync_node_status(tx);
         self.sync_dnd(tx);
+        // An unknown focus counts as focused, as the title does: a window that never reports it
+        // must still let a thread be read.
+        self.chat.dm_sync(self.focused || !self.focus_known);
         // Both run every frame, so neither is short-circuited away.
         self.chat.close_search_under_dialog();
         self.chat.close_member_search_if_hidden();
@@ -744,6 +748,7 @@ impl RiverApp {
                 // hidden, and the title and count must still follow.
                 self.sync_unread(tx);
             }
+            RoomsUpdate::Dms(dms) => self.chat.apply_dms(dms),
             RoomsUpdate::Status(status) => {
                 let at = self.chat.node.choice.address.authority();
                 self.chat
@@ -1509,6 +1514,31 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat.select(chat::example::EMPTY_ROOM);
     }),
+    // Direct messages: the rail with threads (unread ones first), a thread, an empty one, an
+    // invitation, the sent-text cache not read yet, and a thread that hit this app's bounds.
+    ("chat-dm-rail", |s| dm_scene(s, None, |_| {})),
+    ("chat-dm-thread", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {})
+    }),
+    ("chat-dm-invite", |s| {
+        dm_scene(s, Some(("design-crew", "19")), |_| {})
+    }),
+    ("chat-dm-empty", |s| {
+        dm_scene(s, Some(("town-square", "30")), |_| {})
+    }),
+    ("chat-dm-not-hydrated", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |d| {
+            d.hydrated = false
+        })
+    }),
+    ("chat-dm-truncated", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |d| {
+            d.truncated.push("town-square".into())
+        })
+    }),
+    ("chat-dm-narrow", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {})
+    }),
     // Scenes named `*narrow*` are rendered at a narrow size (`--size 820x720`, see
     // `.github/workflows/apps.yml`): the layout follows the window's width, which a scene
     // cannot set. At the default size they look like the wide layout.
@@ -2234,6 +2264,27 @@ fn update_scene(s: &mut RiverApp, auto: bool, status: UpdateStatus) {
     ui.auto = auto;
     ui.status = status;
     ui.node_version = Some("0.2.160".into());
+}
+
+/// The example rooms with direct messages: the rooms arrive first, and the messages after, so
+/// they are unread; `open` opens a thread.
+fn dm_scene(
+    s: &mut RiverApp,
+    open: Option<(&str, &str)>,
+    tweak: impl FnOnce(&mut chat::dm_model::DmSnapshot),
+) {
+    connect(s);
+    s.chat.apply_dms(chat::dm_model::DmSnapshot {
+        room_keys: chat::example::dm_room_keys(),
+        hydrated: true,
+        ..Default::default()
+    });
+    let mut snapshot = chat::example::dm_snapshot();
+    tweak(&mut snapshot);
+    s.chat.apply_dms(snapshot);
+    if let Some((room, peer)) = open {
+        assert!(s.chat.open_dm(room, peer), "the example has {room}/{peer}");
+    }
 }
 
 fn connect(s: &mut RiverApp) {
