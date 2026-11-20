@@ -809,8 +809,8 @@ fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> Option<El> {
 
 /// The composer's keys, in this order, each consuming the key when it acts:
 ///
-/// 1. The @mention popup (`mention_key`, #914), whenever it is open. It comes first: Esc, Up
-///    and Enter belong to the popup while it is open.
+/// 1. The @mention popup (`mention_key`, #914), whenever it is open, then the `:shortcode:` popup
+///    (`shortcode_key`). They come first: Esc, Up and Enter belong to a popup while it is open.
 /// 2. Escape: closes the emoji picker, and only then abandons a reply or an edit.
 /// 3. Up in an empty composer: edits your last message.
 /// 4. Ctrl+arrows and Ctrl+Backspace/Delete by word (`keys::word_keys`).
@@ -818,6 +818,11 @@ pub(super) fn composer_key(s: &mut RiverApp, ev: &rune::KeyEvent) -> bool {
     // 1.
     s.chat.mention_sync();
     if s.chat.mention_key(ev) {
+        return true;
+    }
+    // The `:shortcode:` popup is the mention popup's sibling; the two never open together.
+    s.chat.shortcode_sync();
+    if s.chat.shortcode_key(ev) {
         return true;
     }
     // 2.

@@ -41,6 +41,8 @@ pub mod search;
 #[path = "../../../../ui/src/util/share_link.rs"]
 #[allow(dead_code)]
 mod share_link;
+pub mod shortcodes;
+pub mod shortcuts;
 pub(crate) mod style;
 pub mod switcher;
 #[cfg(test)]
@@ -48,6 +50,7 @@ mod tests;
 mod update_view;
 mod view;
 pub(crate) mod visual_fold;
+pub mod zoom;
 
 pub use background::{BackgroundHost, BackgroundUi};
 pub use dnd::{DndUi, Schedule as DndSchedule, Settings as DndSettings};
@@ -319,6 +322,12 @@ pub struct Chat {
     reply_notices: std::collections::BTreeMap<String, String>,
     /// When the switcher's chord last arrived, for [`switcher::chord_gate`].
     chord_at: Option<std::time::Instant>,
+    /// `:shortcode:` autocomplete in the composer ([`shortcodes`]).
+    shortcode: shortcodes::State,
+    /// The window's zoom level, kept per device ([`zoom`]).
+    pub zoom: zoom::Zoom,
+    /// Whether the keyboard shortcuts page is open ([`shortcuts`]).
+    pub shortcuts_open: bool,
 }
 
 impl Chat {
@@ -428,6 +437,9 @@ impl Chat {
             background: None,
             status: Default::default(),
             dnd: Default::default(),
+            shortcode: Default::default(),
+            zoom: Default::default(),
+            shortcuts_open: false,
             catching_up: true,
             full_list: false,
             modes: HashMap::new(),
@@ -998,6 +1010,7 @@ impl Chat {
             || self.status.open
             || self.dnd.open
             || self.overview
+            || self.shortcuts_open
             || self.link_menu.is_some()
             || self.members_overlay
             || self.picker.is_some();

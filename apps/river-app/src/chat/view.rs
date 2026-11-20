@@ -60,6 +60,10 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     }
     super::switcher::switcher_dialog(chat, &k, &mut layer);
     super::overview::overview_dialog(chat, &k, &mut layer);
+    if chat.shortcuts_open {
+        let win_h = cx.layout_with("chat", |r| r[3]).unwrap_or(800.0);
+        super::shortcuts::shortcuts_dialog(chat, win_h, &k, &mut layer);
+    }
     screen = screen.child(link_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
@@ -81,6 +85,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     screen = screen.child(conversation(chat, room, narrow, win_h, field_h, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);
     mention_overlay(chat, &k, &mut layer);
+    super::shortcodes::shortcode_overlay(chat, &k, &mut layer);
     if chat.members_shown(narrow) {
         let panel = members(chat, room, narrow, &p, &k);
         if narrow {
@@ -367,6 +372,8 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         .center_y()
         .child(label("Rooms", st::SECTION, p.text_muted))
         .child(spacer())
+        .children(super::zoom::badge(chat))
+        .child(super::shortcuts::entry(p))
         .child(if chat.can_change_rooms() {
             icon_button("create-room", "Create room", &icons::PLUS, p)
                 .help("Create room")

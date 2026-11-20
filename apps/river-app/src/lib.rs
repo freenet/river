@@ -5,6 +5,8 @@
 
 pub mod address;
 pub mod chat;
+#[cfg(test)]
+mod keys_ui_tests;
 pub mod node;
 #[cfg(test)]
 mod node_ui_tests;
@@ -245,6 +247,11 @@ impl RiverApp {
         );
         chat.dnd
             .load(prefs.get(chat::dnd::PREF).unwrap_or_default());
+        chat.zoom.load(
+            prefs
+                .get(chat::zoom::PREF)
+                .unwrap_or(i64::from(chat::zoom::DEFAULT)),
+        );
         chat.node.choice = node;
         chat.node.notice = startup.notice;
         chat.node.problem = startup.problem;
@@ -470,6 +477,12 @@ impl RiverApp {
             && self.dnd_persist
         {
             save_pref(chat::dnd::PREF, &settings);
+        }
+        self.chat.close_shortcuts_under_dialog();
+        if let Some(percent) = self.chat.zoom.take_dirty()
+            && self.dnd_persist
+        {
+            save_pref(chat::zoom::PREF, &percent);
         }
         let d = &self.chat.dnd;
         // The switch on means the schedule changes nothing, so nothing to wake for.
@@ -1383,6 +1396,32 @@ pub const SCENES: &[Scene] = &[
         s.chat.composer.replace_text("Thanks for the review @");
         s.chat.composer.focused = true;
     }),
+    // `:shortcode:` autocomplete: the emoji whose name contains what follows the colon.
+    ("chat-shortcode-popup", |s| {
+        connect(s);
+        s.chat.composer.replace_text("Great news :sm");
+        s.chat.composer.focused = true;
+    }),
+    // Zoom: 200% and 80% of the window, and 200% in the narrowest window the app allows
+    // (render that one with `--size 640x480`).
+    ("chat-zoom-200", |s| {
+        connect(s);
+        s.chat.zoom.load(200);
+    }),
+    ("chat-zoom-80", |s| {
+        connect(s);
+        s.chat.zoom.load(80);
+    }),
+    // The keyboard shortcuts page.
+    ("chat-shortcuts", |s| {
+        connect(s);
+        s.chat.open_shortcuts();
+    }),
+    ("chat-shortcuts-zoom-200", |s| {
+        connect(s);
+        s.chat.zoom.load(200);
+        s.chat.open_shortcuts();
+    }),
     ("chat-composing", |s| {
         connect(s);
         s.chat
@@ -2140,6 +2179,9 @@ pub fn spec() -> AppSpec<RiverApp> {
                 tx.quit();
                 return true;
             }
+            if s.chat.app_key(ev, tx) {
+                return true;
+            }
             ev.key == rune::Key::Escape && s.chat.escape()
         }),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
@@ -2154,6 +2196,10 @@ pub fn app(make: impl FnOnce(AppHandle<RiverApp>) -> RiverApp + 'static) -> rune
 }
 
 pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
+    chat::zoom::apply(&s.chat, cx, |cx| screen(s, cx))
+}
+
+fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
     // River is dark-only for now, like the chat screen; the setup screens match it.
     let palette = chat::style::palette();
     let k = Kit::neutral(true);
