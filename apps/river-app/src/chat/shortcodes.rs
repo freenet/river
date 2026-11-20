@@ -264,7 +264,8 @@ impl Chat {
             return false;
         }
         let c = &self.composer;
-        if !c.focused || c.anchor != c.focus || c.preedit().is_some() || self.actionable().is_none() {
+        if !c.focused || c.anchor != c.focus || c.preedit().is_some() || self.actionable().is_none()
+        {
             return false;
         }
         let Some((anchor, query)) = detect(&c.text, c.focus) else {
