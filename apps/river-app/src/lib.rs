@@ -126,11 +126,12 @@ fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
 }
 
 /// Save one preference into this app's preferences file (none: nothing is saved). The file is
-/// read ONCE, merged with the key and written back atomically, so a key saved by another
-/// part of the app since startup is kept. A file that exists but cannot be read or parsed (a
-/// sharing violation, say) is left alone: writing then would erase the other keys. There is
-/// no lock against another River process writing at the same moment. The crate has no
-/// `tracing`, so failures go to stderr as elsewhere in it.
+/// read again, merged with the key and written back atomically, so a key saved by another
+/// part of the app since startup is kept. If that read fails (a sharing violation, say) it
+/// writes nothing, because writing then would erase the other keys. (`Prefs::open`, used to
+/// find the path, has already moved a file that does not parse to `prefs.json.bad`, so a
+/// corrupt file is not met here.) There is no lock against another River process writing at
+/// the same moment. The crate has no `tracing`, so failures go to stderr as elsewhere in it.
 fn save_pref<T: serde::Serialize + ?Sized>(key: &str, value: &T) {
     let Some(path) = rune::prefs::Prefs::open("org.freenet.River")
         .path()
@@ -164,7 +165,9 @@ fn merge_pref<T: serde::Serialize + ?Sized>(
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
+    static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tmp.push(format!(".{}.{seq}.tmp", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
     let done = (|| {
         let mut f = std::fs::File::create(&tmp)?;
@@ -303,7 +306,12 @@ impl RiverApp {
         match event {
             UpdateEvent::Notice(text) => self.chat.update.notice = Some(text),
             UpdateEvent::Status(status) => {
-                if let Some((title, body)) = self.chat.update.apply(status)
+                let notice = self.chat.update.apply(status);
+                if notice.is_some() {
+                    // A newer version replaces one held back.
+                    self.pending_notice = None;
+                }
+                if let Some((title, body)) = notice
                     && !self.focused
                 {
                     if self.dnd_allows(false) {
@@ -381,6 +389,8 @@ impl RiverApp {
         self.focus_known = true;
         if focused {
             self.missed = Default::default();
+            // The update block in front counts as told.
+            self.pending_notice = None;
             self.drop_read_held();
         }
     }

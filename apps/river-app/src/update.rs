@@ -758,6 +758,31 @@ mod tests {
         assert_eq!(rec.0.borrow().len(), 1, "announced once");
     }
 
+    #[test]
+    fn a_held_update_notice_is_dropped_when_the_window_comes_forward_or_a_newer_one_replaces_it() {
+        let ready = |v: &str| UpdateEvent::Status(UpdateStatus::Ready { version: v.into() });
+        let rec = Recorder::default();
+        let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.settings.manual = true;
+        s.apply_update(ready("0.2.0"));
+        s.focus_changed(true);
+        s.focus_changed(false);
+        s.chat.dnd.settings.manual = false;
+        s.flush_held(std::time::Instant::now());
+        assert!(rec.0.borrow().is_empty(), "told by the window in front");
+        // Held, then a newer version arrives while the window is in front.
+        s.chat.dnd.settings.manual = true;
+        s.focus_changed(false);
+        s.apply_update(ready("0.3.0"));
+        s.focus_changed(true);
+        s.apply_update(ready("0.4.0"));
+        s.focus_changed(false);
+        s.chat.dnd.settings.manual = false;
+        s.flush_held(std::time::Instant::now());
+        assert!(rec.0.borrow().is_empty(), "no stale version shown");
+    }
+
     // The screen ---------------------------------------------------------------------------
 
     fn connected() -> RiverApp {

@@ -344,9 +344,10 @@ impl Limiter {
             clock.prev_last = clock.last;
             clock.last = Some(now);
             if let Some(h) = clock.held.take() {
+                // Before folding the counts in: the rank is of the message shown by each side.
+                let take = h.rank() > a.rank();
                 a.count += h.count;
                 a.for_me_count += h.for_me_count;
-                let take = h.rank() > a.rank();
                 a.mention |= h.mention;
                 if take {
                     a.message_key = h.message_key;
@@ -811,6 +812,33 @@ mod tests {
             n[1]
         );
         assert!(n[1].mention);
+    }
+
+    #[test]
+    fn a_held_reply_stays_the_message_shown_when_a_plain_arrival_meets_it_in_admit() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now();
+        let mut first = arrival(0, false);
+        first.for_me_count = 0;
+        // Let one through, then hold a reply by the cooldown.
+        assert_eq!(lim.admit(vec![first], t0 + SETTLE).len(), 1);
+        let mut reply = arrival(0, false);
+        reply.for_me_count = 1;
+        reply.message_key = "reply".into();
+        assert!(
+            lim.admit(vec![reply], t0 + SETTLE + Duration::from_secs(1))
+                .is_empty()
+        );
+        let mut plain = arrival(0, false);
+        plain.for_me_count = 0;
+        plain.message_key = "plain".into();
+        let out = lim.admit(
+            vec![plain],
+            t0 + SETTLE + ROOM_COOLDOWN + Duration::from_secs(2),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].message_key, "reply");
+        assert_eq!(out[0].for_me_count, 1);
     }
 
     #[test]

@@ -548,6 +548,20 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_dialog_while_times_are_pending_saves_them() {
+        let mut chat = crate::chat::Chat::example();
+        chat.dnd.settings.schedule = Some(DEFAULT_SCHEDULE);
+        chat.open_dnd();
+        chat.dnd.start.replace_text("20:15");
+        chat.dnd.start.focused = true;
+        chat.dnd.sync_inputs();
+        assert!(chat.dnd.take_dirty().is_none(), "still typing");
+        chat.close_dnd();
+        let saved = chat.dnd.take_dirty().expect("saved on close");
+        assert_eq!(saved.schedule.unwrap().start, at(20, 15));
+    }
+
+    #[test]
     fn settings_round_trip_and_tolerate_missing_fields() {
         let s = Settings {
             manual: true,
