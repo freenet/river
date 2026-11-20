@@ -85,4 +85,19 @@ A test checks that its `freenet-stdlib` (the client API's wire format) is the ve
 
 `apps/Cargo.toml` and `apps/Cargo.lock` cannot change a contract or delegate key. The WASM is built from the root workspace with the root `Cargo.lock`, and the apps' lockfile is never consulted there, even though `apps/river-app` depends on `river-core` by path (see the note in `apps/Cargo.toml`). Every client-only feature it enables must stay off for the room-contract and chat-delegate builds.
 
+## How to bump Rune
+
+Rune is pre-release, git-only and moves about 70 commits a day. `apps/Cargo.toml` pins one rev of its `dev` branch (never rewritten, so a revert is one line) in `rune`, `rune-kit` and six `[patch.crates-io]` entries. One bump per PR, never mixed with other work.
+
+When: when a feature we need lands, otherwise about monthly. Waiting a quarter means reading about 2,000 changelog entries.
+
+1. Pick the new rev: `git ls-remote https://github.com/anomalyco/rune dev`. Record the old and new in the PR body.
+2. Read what changed since the pin. `changelog/unreleased/` in the Rune checkout (under `~/.cargo/git/checkouts/rune-*/`) is where entries live; `CHANGELOG.md` is folded rarely. List new entries with `git diff --name-status <old> <new> -- changelog | grep ^A` and grep them for `dialog`, `modal`, `focus`, `scroll`, `ime`, `text`, `windows`, `tray`, `a11y`. "Breaking", "no longer" and "replaces" mean a compile or behaviour change.
+3. Change every rev in `apps/Cargo.toml` together. Re-read the `[patch.crates-io]` table in Rune's own `Cargo.toml` at the new rev: add, drop or rename entries to match (a crate Rune uses as a path dependency, such as `tiny-skia-path`, is not patched). `rune_revs_agree_in_apps_cargo_toml` fails if the revs differ. Run `cargo metadata --locked` from a fresh clone of the branch (and once with an empty `CARGO_HOME`) before pushing.
+4. Fix compile errors on Linux and with `--target x86_64-pc-windows-gnu`; read the macOS `cfg` code by hand, since nova cannot build it.
+5. Run `cargo test -p river-app -p river-desktop`, clippy with `-D warnings` on both targets, `cargo fmt`, and `apps/scripts/fresh-node-e2e.sh`.
+6. Before touching a failing test, run it on the old pin to confirm it passed there, then decide whether Rune or River is right from the changelog entry and what a user expects. Update the test with an explanation or fix River's code; never weaken the assertion.
+7. Scene diff: render every scene (`river --list-scenes`; `--snap out.png --scene NAME --scale 1`, `--size 820x720` for `*narrow*`) with a binary built at the old pin and one at the new, compare pixel by pixel, and look at the differing scenes before and after. Describe what moved in the PR. Whole-screen 1 px shifts and glyph anti-aliasing changes are expected; a missing, overlapping or clipped element is not.
+8. Open the PR as a draft, run the full review (UI plus dependency change), and merge it alone. Features that use the new rev come in later PRs.
+
 Releasing: `.claude/rules/desktop-release.md`.
