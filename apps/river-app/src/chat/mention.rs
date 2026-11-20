@@ -134,7 +134,7 @@ impl Chat {
     pub fn mention_popup(&self) -> Option<Popup> {
         let room = self.actionable()?;
         let c = &self.composer;
-        if !c.focused || c.anchor != c.focus || c.preedit.is_some() {
+        if !c.focused || c.anchor != c.focus || c.preedit().is_some() {
             return None;
         }
         let (anchor, query) = detect(&c.text, c.focus)?;

@@ -3477,6 +3477,47 @@ mod tests {
         assert!(w > px / 2 && h > px / 2 && w <= px && h <= px, "{w}x{h}");
     }
 
+    /// Rune is pinned by `rune`, `rune-kit` and six `[patch.crates-io]` entries, each naming a
+    /// rev. Cargo has no variable for it, so a bump that changes some and not others would
+    /// build Rune against vendored crates of another rev. Fail on any difference, and on a
+    /// patch block that lost an entry.
+    #[test]
+    fn rune_revs_agree_in_apps_cargo_toml() {
+        const MANIFEST: &str = include_str!("../../Cargo.toml");
+        let manifest = MANIFEST.replace("\r\n", "\n");
+        let revs: Vec<(&str, &str)> = manifest
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && l.contains("anomalyco/rune"))
+            .map(|l| {
+                let name = l.split('=').next().unwrap().trim();
+                let rev = l
+                    .split("rev = \"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or_else(|| panic!("{name} names no rev: {l}"));
+                (name, rev)
+            })
+            .collect();
+        let names: Vec<&str> = revs.iter().map(|(n, _)| *n).collect();
+        for want in [
+            "rune",
+            "rune-kit",
+            "winit",
+            "wgpu-hal",
+            "parley_engine",
+            "sctk-adwaita",
+            "accesskit_windows",
+            "accesskit_macos",
+        ] {
+            assert!(names.contains(&want), "{want} has no Rune entry: {names:?}");
+        }
+        let first = revs[0].1;
+        assert_eq!(first.len(), 40, "rev is a full commit id: {first}");
+        for (name, rev) in &revs {
+            assert_eq!(*rev, first, "{name} names a different Rune rev");
+        }
+    }
+
     /// CI renders the `*narrow*` scenes with a `--size` it spells out itself; it must be the
     /// size [`scene_size`] and the tests use.
     #[test]

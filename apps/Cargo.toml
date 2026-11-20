@@ -34,8 +34,8 @@ authors = ["Freenet Project"]
 [workspace.dependencies]
 # Rune is pre-release and git-only. Pin a rev of its `dev` branch (which is
 # never rewritten) and bump it deliberately, re-rendering the snapshots.
-rune = { git = "https://github.com/anomalyco/rune", rev = "7ead7d63fcf6f9dd9669385a8b90e2ae80015d7b" }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "7ead7d63fcf6f9dd9669385a8b90e2ae80015d7b" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
 river-app = { path = "river-app" }
 
 # The signature and hash crates are slow unoptimized, and the room tests verify
@@ -55,3 +55,19 @@ opt-level = 3
 [profile.release]
 strip = "debuginfo"
 lto = "thin"
+
+# Rune vendors patched copies of six crates and says "apps that build Rune patch it too":
+# a dependency's [patch] does not apply to the workspace that depends on it. (A seventh,
+# tiny-skia-path, is a path dependency inside Rune and needs nothing here.) Cargo finds
+# each package by name inside the Rune git repository, so these name the same rev as
+# `rune` above. EVERY BUMP OF `rune` MUST CHANGE ALL EIGHT REVS TOGETHER, and re-read the
+# `[patch.crates-io]` table in Rune's own Cargo.toml at the new rev in case a crate was
+# added or dropped. The source-scrape test `rune_revs_agree_in_apps_cargo_toml`
+# (river-app/src/lib.rs) fails if the revs differ.
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }

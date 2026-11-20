@@ -5308,12 +5308,12 @@ fn an_input_method_can_compose_into_the_composer() {
     let mut rt = render(connected(), WINDOW_SIZE);
     press(&mut rt, "composer-field");
     rt.ime(rune::Ime::Enabled);
-    rt.ime(rune::Ime::Preedit("かん".into(), Some((0, 6))));
+    rt.ime(rune::Ime::Preedit("かん".into(), Some((0, 6)), Vec::new()));
     assert_eq!(
         rt.state.chat.composer.text, "",
         "a pre-edit is not yet text"
     );
-    rt.ime(rune::Ime::Preedit(String::new(), None));
+    rt.ime(rune::Ime::Preedit(String::new(), None, Vec::new()));
     rt.ime(rune::Ime::Commit("漢字".into()));
     rt.frame(0.3);
     assert_eq!(rt.state.chat.composer.text, "漢字");
