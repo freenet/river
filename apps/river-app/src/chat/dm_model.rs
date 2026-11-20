@@ -152,6 +152,22 @@ pub struct DmSnapshot {
     /// The user's sent text has been read from River's storage. Until it has, a message the
     /// user sent has no text to show yet, which says nothing about the message.
     pub hydrated: bool,
+    /// Deletions of someone's messages that the room does not hold yet: on their way, or not
+    /// taken. One that the room holds is gone from here, and the messages with it.
+    pub purges: Vec<DmPurge>,
+}
+
+/// A deletion of the messages one person sent the user that the room does not hold yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DmPurge {
+    /// The room's key, as `Room::key` names it.
+    pub room: String,
+    /// The peer, as [`DmThread::peer_key`] names them.
+    pub peer_key: String,
+    /// How many messages it deletes.
+    pub count: usize,
+    /// Its place in the outbox, and why it was not taken, if it was not.
+    pub pending: Pending,
 }
 
 impl DmSnapshot {
@@ -167,6 +183,7 @@ impl fmt::Debug for DmSnapshot {
             .field("threads", &self.threads.len())
             .field("truncated", &self.truncated.len())
             .field("hydrated", &self.hydrated)
+            .field("purges", &self.purges.len())
             .finish()
     }
 }

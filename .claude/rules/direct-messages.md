@@ -308,8 +308,13 @@ plaintext in the chat delegate.
   the web UI's blind store from overwriting the blob; it notices when a read lacks an entry it
   saved and saves it again (3 times at most, only for a message still in the room, sent by the
   user's current identity, not purged, and inside its pair's newest 100). There is no
-  purge-based pruning; the user's own entries are evicted at the per-pair cap (and, past 4 MiB,
-  oldest first). See `.claude/rules/native-apps.md`.
+  purge-based pruning of absent messages; the user's own entries are evicted at the per-pair cap
+  (and, past 4 MiB, oldest first), and an entry whose token a recipient's purge envelope NAMES
+  (in a room read from the network) is removed, as the web UI does. "Delete their messages" is
+  `src/rooms/dm_purge.rs` (envelope by `advance_recipient_purges` from the room's current
+  envelope; NO own-purge healing in the native app: an envelope another device signed that our copy
+  had not seen can outrank ours and lift its tokens (copy lags the node; river#945), and the
+  confirmation says so) See `.claude/rules/native-apps.md`.
 - **CLI side**: persists the same `OutboundDmStore` shape into
   `outbound_dms.json` in the riverctl data dir (consistent with
   `rooms.json`'s plaintext-on-disk threat model).

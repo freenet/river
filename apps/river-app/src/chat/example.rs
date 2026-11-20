@@ -458,7 +458,9 @@ fn dm_message(
     body: super::dm_model::DmBody,
 ) -> super::dm_model::DmMessage {
     super::dm_model::DmMessage {
-        key: key.into(),
+        // The key of a real message is its purge token in hex, which a deletion names: the
+        // example's keys look like that, from a name each.
+        key: blake3::hash(key.as_bytes()).to_hex()[..32].to_string(),
         outgoing,
         timestamp: at,
         body,
@@ -582,6 +584,7 @@ pub fn dm_snapshot() -> super::dm_model::DmSnapshot {
         room_keys: dm_room_keys(),
         truncated: Vec::new(),
         hydrated: true,
+        purges: Vec::new(),
     }
 }
 

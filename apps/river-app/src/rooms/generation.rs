@@ -111,6 +111,10 @@ pub const UPDATE_REQUIRED_WORK: &str = "A newer version of River is out, and thi
 pub const UPDATE_REQUIRED_SEND: &str = "A newer version of River is out. Update this app to \
      send messages here; until then it only shows your rooms.";
 
+/// What the thread says once River has moved on, about deleting someone's messages.
+pub const UPDATE_REQUIRED_PURGE: &str = "A newer version of River is out. Update this app to \
+     delete messages here; until then it only shows your rooms.";
+
 /// The two artifacts whose re-key strands this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Artifact {

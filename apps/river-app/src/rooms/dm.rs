@@ -333,6 +333,19 @@ pub fn token_hex(token: &PurgeToken) -> String {
     token.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The purge token a message's key names: [`token_hex`] the other way. `None` for anything that is
+/// not 32 hex digits.
+pub fn token_from_hex(key: &str) -> Option<PurgeToken> {
+    if key.len() != 32 || !key.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&key[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(PurgeToken(out))
+}
+
 /// What decides whether the threads built last time are still the threads to show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmKey([u8; 32]);

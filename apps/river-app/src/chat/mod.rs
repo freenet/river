@@ -14,6 +14,7 @@ mod conversation;
 mod details;
 pub mod dm_compose;
 pub mod dm_model;
+pub mod dm_purge;
 pub mod dm_view;
 pub mod dnd;
 mod emoji;

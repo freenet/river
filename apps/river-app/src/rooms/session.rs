@@ -89,7 +89,8 @@ use super::dm_cache::{self, DmRead, OutboundCache};
 use super::dm_save::DmSaver;
 use super::dm_store::{DmOp, EntryKey};
 use super::generation::{
-    CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_SEND, UPDATE_REQUIRED_WORK, Watch,
+    CheckPace, UPDATE_REQUIRED, UPDATE_REQUIRED_PURGE, UPDATE_REQUIRED_SEND, UPDATE_REQUIRED_WORK,
+    Watch,
 };
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
 use super::modes::{NotificationMode, decode_modes};
@@ -286,6 +287,14 @@ pub enum RoomsUpdate {
         ticket: u64,
         result: Result<(), String>,
     },
+    /// What became of a deletion the user asked for ([`Action::PurgeDm`]): queued, or why not.
+    /// Said once per ticket. The words never name a message.
+    DmPurge {
+        room: String,
+        peer: String,
+        ticket: u64,
+        result: Result<(), String>,
+    },
     /// The connection's state changed while rooms are shown.
     Status(LinkStatus),
     /// The invitation the user asked for in the room keyed `room`: its link, or why there is
@@ -334,6 +343,18 @@ impl std::fmt::Debug for RoomsUpdate {
                 result,
             } => f
                 .debug_struct("DmSend")
+                .field("room", room)
+                .field("peer", peer)
+                .field("ticket", ticket)
+                .field("result", result)
+                .finish(),
+            RoomsUpdate::DmPurge {
+                room,
+                peer,
+                ticket,
+                result,
+            } => f
+                .debug_struct("DmPurge")
                 .field("room", room)
                 .field("peer", peer)
                 .field("ticket", ticket)
@@ -1606,14 +1627,33 @@ struct DmSendResult {
     result: Result<(), String>,
 }
 
-/// A digest of what a room's unsent direct messages show: which there are and how each stands.
-/// Zero for none.
-fn pending_digest(rows: &[super::outbox::DmRow]) -> u64 {
+/// What a deletion says when the room has not been read from the network yet.
+const NOT_LOADED_PURGE: &str = "River hasn't loaded this room's latest messages from Freenet \
+     yet, so it can't delete safely. Try again in a moment.";
+
+/// The answer to one [`Action::PurgeDm`].
+struct DmPurgeResult {
+    room: String,
+    peer: String,
+    ticket: u64,
+    result: Result<(), String>,
+}
+
+/// A digest of what a room's unsent direct messages and deletions show: which there are and how
+/// each stands. Zero for none.
+fn pending_digest(rows: &[super::outbox::DmRow], purges: &[super::outbox::PurgeRow]) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
-    if rows.is_empty() {
+    if rows.is_empty() && purges.is_empty() {
         return 0;
     }
     let mut h = DefaultHasher::new();
+    for p in purges {
+        p.peer.0.0.hash(&mut h);
+        p.count.hash(&mut h);
+        p.pending.entry.hash(&mut h);
+        p.pending.failed.hash(&mut h);
+        p.pending.retry.hash(&mut h);
+    }
     for r in rows {
         r.token.0.hash(&mut h);
         r.timestamp.hash(&mut h);
@@ -1666,6 +1706,10 @@ struct Rooms {
     dm_sent: Option<DmSent>,
     /// Answers to [`Action::SendDm`] not yet reported.
     dm_results: Vec<DmSendResult>,
+    /// Answers to [`Action::PurgeDm`] not yet reported.
+    dm_purge_results: Vec<DmPurgeResult>,
+    /// What [`Rooms::prune_purged_texts`] last ran on.
+    purge_pruned: Option<u64>,
     /// River's web app on the node, which invite links open.
     web_app: String,
     /// Invitations made since the last report, by room key.
@@ -1731,6 +1775,10 @@ impl Rooms {
             .iter()
             .map(|r| outbox.dm_rows(&r.stored.owner_vk))
             .collect();
+        let purging: Vec<Vec<super::outbox::PurgeRow>> = list
+            .iter()
+            .map(|r| outbox.purge_rows(&r.stored.owner_vk))
+            .collect();
         for (room, rows) in list.iter().zip(&pending) {
             for row in rows {
                 let (owner, token) = (&room.stored.owner_vk, &row.token);
@@ -1757,21 +1805,28 @@ impl Rooms {
                 .find(|r| &r.stored.owner_vk == vk)
                 .map(LiveRoom::name)
         };
-        let with_dms: Vec<(&LiveRoom, &[super::outbox::DmRow])> = list
+        let with_dms: Vec<(
+            &LiveRoom,
+            &[super::outbox::DmRow],
+            &[super::outbox::PurgeRow],
+        )> = list
             .iter()
             .zip(&pending)
-            .filter(|(r, rows)| {
-                !rows.is_empty() || !r.stored.room_state.direct_messages.messages.is_empty()
+            .zip(&purging)
+            .filter(|((r, rows), purges)| {
+                !rows.is_empty()
+                    || !purges.is_empty()
+                    || !r.stored.room_state.direct_messages.messages.is_empty()
             })
-            .map(|(r, rows)| (r, rows.as_slice()))
+            .map(|((r, rows), purges)| (r, rows.as_slice(), purges.as_slice()))
             .collect();
         let keys: Vec<(VerifyingKey, super::dm::DmKey, u64)> = with_dms
             .iter()
-            .map(|(r, rows)| {
+            .map(|(r, rows, purges)| {
                 (
                     r.stored.owner_vk,
                     r.dm_key(dm_cache, &label, &all_names),
-                    pending_digest(rows),
+                    pending_digest(rows, purges),
                 )
             })
             .collect();
@@ -1793,7 +1848,15 @@ impl Rooms {
             room_keys,
             ..DmSnapshot::default()
         };
-        for ((room, rows), (vk, key, _)) in with_dms.iter().zip(&keys) {
+        for ((room, rows, purges), (vk, key, _)) in with_dms.iter().zip(&keys) {
+            snapshot
+                .purges
+                .extend(purges.iter().map(|p| crate::chat::dm_model::DmPurge {
+                    room: room.key(),
+                    peer_key: super::dm::peer_key(p.peer),
+                    count: p.count,
+                    pending: p.pending.clone(),
+                }));
             let memo = dm_memo.entry(*vk);
             let memo = match memo {
                 std::collections::hash_map::Entry::Occupied(e) if e.get().key == *key => {
@@ -1973,6 +2036,14 @@ impl Rooms {
                 }
                 continue;
             }
+            if matches!(command.action, Action::PurgeDm { .. }) {
+                // Likewise: the confirmation waits for its answer.
+                match self.purge_dm(&command) {
+                    Some(()) => changed = true,
+                    None => self.outbox.waiting.push(command),
+                }
+                continue;
+            }
             match self.list.iter().find(|r| r.key() == command.room) {
                 Some(room) if command.action == Action::Invite => {
                     let link = super::create::invitation(room, &self.web_app).map(|(_, l)| l);
@@ -2068,6 +2139,41 @@ impl Rooms {
         Some(())
     }
 
+    /// Check, build and queue a deletion ([`Outbox::purge_dm`]) and say what became of it.
+    /// `None` when the rooms have not been read well enough to say the room is gone: it waits,
+    /// as any command does.
+    ///
+    /// It is refused for a room not yet read from the network: the envelope must list what the
+    /// room's current envelope lists, and a copy that only the store has read may lack a
+    /// deletion made from another device, which this one would then lift.
+    fn purge_dm(&mut self, command: &Command) -> Option<()> {
+        let Action::PurgeDm {
+            peer,
+            tokens,
+            ticket,
+        } = &command.action
+        else {
+            return Some(());
+        };
+        let result = match self.list.iter().find(|r| r.key() == command.room) {
+            // River has moved on: nothing is written ([`super::generation`]).
+            Some(_) if self.update_required => Err(UPDATE_REQUIRED_PURGE.to_owned()),
+            Some(room) if !self.network_seen.contains(&room.stored.owner_vk) => {
+                Err(NOT_LOADED_PURGE.to_owned())
+            }
+            Some(room) => self.outbox.purge_dm(room, *peer, tokens),
+            None if !self.complete => return None,
+            None => Err("This room is no longer here.".to_owned()),
+        };
+        self.dm_purge_results.push(DmPurgeResult {
+            room: command.room.clone(),
+            peer: super::dm::peer_key(*peer),
+            ticket: *ticket,
+            result,
+        });
+        Some(())
+    }
+
     /// Settle the sent-message writes that ended, and start the next one if one is due
     /// ([`super::dm_save`] has the rules). `writes` is the connection's write gate.
     fn dm_save_tick(&mut self, writes: bool, now: Instant) {
@@ -2096,6 +2202,7 @@ impl Rooms {
                 }
             }
         }
+        self.prune_purged_texts();
         if !writes
             || self.update_required
             || !self.loaded
@@ -2168,6 +2275,78 @@ impl Rooms {
         if self.outbox.work.dm_save(ops, self.dm_cache.listed()) {
             self.dm_saver.started(adding, Vec::new());
         }
+    }
+
+    /// Drop the sent text of every message its recipient deleted, and owe the store its removal
+    /// ([`OutboundCache::prune_named`]), as the web UI does when it sees the deletion
+    /// (`prune_outbound_dms_for_purges`). It acts only on a token a purge envelope in a room
+    /// read from the network names, for that recipient. A message merely missing from the room
+    /// is never a reason: a room read early has not caught up.
+    fn prune_purged_texts(&mut self) {
+        // Nothing to do unless a purge envelope or the cache changed since the last pass: this
+        // runs at every tick of the loop.
+        let before = self.purge_fingerprint();
+        if self.purge_pruned == Some(before) {
+            return;
+        }
+        let named: HashMap<
+            [u8; 32],
+            HashMap<MemberId, HashSet<river_core::room_state::direct_messages::PurgeToken>>,
+        > = self
+            .list
+            .iter()
+            .filter(|r| self.network_seen.contains(&r.stored.owner_vk))
+            .filter(|r| !r.stored.room_state.direct_messages.purges.is_empty())
+            .map(|r| {
+                let by_recipient = r
+                    .stored
+                    .room_state
+                    .direct_messages
+                    .purges
+                    .iter()
+                    .map(|p| (p.recipient_id, p.state.purged.iter().copied().collect()))
+                    .collect();
+                (r.stored.owner_vk.to_bytes(), by_recipient)
+            })
+            .collect();
+        if !named.is_empty() {
+            let pruned = self.dm_cache.prune_named(|k| {
+                named
+                    .get(&k.0)
+                    .and_then(|m| m.get(&k.1))
+                    .is_some_and(|tokens| tokens.contains(&k.2))
+            });
+            for (key, in_store) in pruned {
+                // Also what a write now working is adding, as a discard does: the write puts
+                // it in the store, so its removal follows.
+                if (in_store || self.dm_saver.is_being_added(&key))
+                    && !self.dm_saver.removals().contains(&key)
+                {
+                    self.dm_saver.owes_removal(key);
+                }
+            }
+        }
+        self.purge_pruned = Some(self.purge_fingerprint());
+    }
+
+    /// What [`Rooms::prune_purged_texts`] depends on: each room read from the network and the
+    /// rank and signature of each purge envelope it holds, and the cache's epoch.
+    fn purge_fingerprint(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.dm_cache.epoch().hash(&mut h);
+        for r in &self.list {
+            if !self.network_seen.contains(&r.stored.owner_vk) {
+                continue;
+            }
+            r.stored.owner_vk.as_bytes().hash(&mut h);
+            for p in &r.stored.room_state.direct_messages.purges {
+                p.recipient_id.0.0.hash(&mut h);
+                p.state.version.hash(&mut h);
+                p.recipient_signature.to_bytes().hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     /// Whether an entry the delegate lost should be saved again: the message is still in its
@@ -2659,6 +2838,14 @@ impl Rooms {
         // lets go of its text.
         for done in std::mem::take(&mut self.dm_results) {
             report(RoomsUpdate::DmSend {
+                room: done.room,
+                peer: done.peer,
+                ticket: done.ticket,
+                result: done.result,
+            });
+        }
+        for done in std::mem::take(&mut self.dm_purge_results) {
+            report(RoomsUpdate::DmPurge {
                 room: done.room,
                 peer: done.peer,
                 ticket: done.ticket,

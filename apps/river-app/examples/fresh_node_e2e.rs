@@ -74,6 +74,10 @@ struct App {
     dms: Vec<std::sync::Arc<river_app::chat::dm_model::DmThread>>,
     /// Answers to direct messages asked to be sent, by ticket.
     dm_results: Vec<(u64, Result<(), String>)>,
+    /// Answers to deletions of someone's messages asked for, by ticket.
+    dm_purge_results: Vec<(u64, Result<(), String>)>,
+    /// Deletions the rooms do not hold yet, as last reported.
+    dm_purges: usize,
     access: Option<Access>,
 }
 
@@ -108,6 +112,8 @@ impl App {
             exports: Vec::new(),
             dms: Vec::new(),
             dm_results: Vec::new(),
+            dm_purge_results: Vec::new(),
+            dm_purges: 0,
             access: None,
         }
     }
@@ -150,7 +156,13 @@ impl App {
                 }
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
                 RoomsUpdate::Export { room, token } => self.exports.push((room, token)),
-                RoomsUpdate::Dms(snapshot) => self.dms = snapshot.threads,
+                RoomsUpdate::Dms(snapshot) => {
+                    self.dm_purges = snapshot.purges.len();
+                    self.dms = snapshot.threads;
+                }
+                RoomsUpdate::DmPurge { ticket, result, .. } => {
+                    self.dm_purge_results.push((ticket, result))
+                }
                 RoomsUpdate::DmSend { ticket, result, .. } => {
                     self.dm_results.push((ticket, result))
                 }
@@ -308,6 +320,135 @@ fn restart(app: &mut App) {
     while app.updates.try_recv().is_ok() {}
 }
 
+/// What node A sends node B, with a multi-byte character, a second line and spaces at both ends.
+const FROM_A: &str = "  DM from A \u{1f44b}\nsecond line  ";
+const FROM_B: &str = "DM from B, with a \u{20ac} sign";
+
+/// Node B deletes node A's direct message in `room` (key `key`), after both have sent one
+/// ([`direct_messages`]). Only what A sent B can be deleted: a deletion naming B's own message is
+/// refused and queues nothing. Once the room holds the deletion, A's thread has lost its message
+/// too (it is gone from the room for everyone), what B sent A is untouched, A's saved copy of
+/// the text is removed from its chat delegate, and nothing comes back when A's app restarts.
+fn delete_their_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
+    use river_app::rooms::dm::{peer_key, token_from_hex};
+    let id_in = |app: &App, name: &str| {
+        let full = app
+            .room(room)
+            .and_then(|r| r.members.iter().find(|m| m.nickname == name))
+            .map(|m| m.full_id)
+            .unwrap_or_else(|| panic!("{name} is not a member in {}'s view", app.name));
+        river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(full))
+    };
+    let (bob_id, alice_id) = (id_in(alice, "Bob"), id_in(bob, "Alice"));
+    let (bob_in_a, alice_in_b) = (peer_key(bob_id), peer_key(alice_id));
+    let tokens_of = |app: &App, peer: &str, outgoing: bool| -> Vec<_> {
+        app.thread(key, peer)
+            .expect("a thread")
+            .messages
+            .iter()
+            .filter(|m| m.outgoing == outgoing)
+            .map(|m| token_from_hex(&m.key).expect("a message is keyed by its purge token"))
+            .collect()
+    };
+    let (theirs, own) = (
+        tokens_of(bob, &alice_in_b, false),
+        tokens_of(bob, &alice_in_b, true),
+    );
+    assert_eq!((theirs.len(), own.len()), (1, 1));
+
+    // What B sent cannot be deleted by B: refused, nothing queued, nothing changes.
+    bob.send(
+        key,
+        Action::PurgeDm {
+            peer: alice_id,
+            tokens: own,
+            ticket: 11,
+        },
+    );
+    bob.until("B's deletion of its own message is refused", |app| {
+        app.dm_purge_results.iter().any(|(t, r)| {
+            *t == 11
+                && r.as_ref()
+                    .is_err_and(|e| e.contains("no messages from them"))
+        })
+    });
+    assert_eq!(bob.dm_purges, 0);
+    assert!(bob.dm_text(key, &alice_in_b, FROM_B, true));
+
+    // What A sent B can: B asks, the room holds the deletion, and the message is gone from both
+    // threads while each side's own other message stays.
+    bob.send(
+        key,
+        Action::PurgeDm {
+            peer: alice_id,
+            tokens: theirs.clone(),
+            ticket: 12,
+        },
+    );
+    bob.until("B's deletion is queued", |app| {
+        app.dm_purge_results
+            .iter()
+            .any(|(t, r)| *t == 12 && r.is_ok())
+    });
+    bob.until("node B no longer shows node A's message", |app| {
+        !app.dm_text(key, &alice_in_b, FROM_A, false)
+            && app.dm_text(key, &alice_in_b, FROM_B, true)
+            && app.dm_purges == 0
+    });
+    alice.until("node A no longer shows its own deleted message", |app| {
+        app.thread(key, &bob_in_a)
+            .is_some_and(|t| t.messages.len() == 1 && app.dm_text(key, &bob_in_a, FROM_B, false))
+    });
+    println!("A and B: the deleted message is gone from both threads");
+
+    // A's saved copy of the deleted text is removed from its chat delegate, once A's app has seen
+    // the deletion; the text of the message it received is not A's to keep and was never there.
+    let deadline = Instant::now() + STEP;
+    loop {
+        let seen = stored_sent_texts(&alice.authority, &alice.dir);
+        if matches!(&seen, Ok((texts, _)) if texts.is_empty()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "A: the delegate still held the deleted text (last: {:?})",
+            seen.map(|(t, h)| (t.len(), h))
+        );
+        alice.drain(Duration::from_millis(500));
+    }
+    println!("A: the deleted message's text is removed from the delegate");
+
+    // Nothing of theirs is left to delete: A's original token names no message now.
+    bob.send(
+        key,
+        Action::PurgeDm {
+            peer: alice_id,
+            tokens: theirs,
+            ticket: 13,
+        },
+    );
+    bob.until("a second deletion finds nothing to delete", |app| {
+        app.dm_purge_results.iter().any(|(t, r)| {
+            *t == 13
+                && r.as_ref()
+                    .is_err_and(|e| e.contains("no messages from them"))
+        })
+    });
+
+    // A restarts: the deletion is in the room, so the message does not come back.
+    restart(alice);
+    alice.until(
+        "A, restarted, reads the room without the deleted message",
+        |app| {
+            app.dm_text(key, &bob_in_a, FROM_B, false)
+                && !app
+                    .thread(key, &bob_in_a)
+                    .is_some_and(|t| t.messages.iter().any(|m| m.outgoing))
+        },
+    );
+    println!("A: after a restart the deleted message stays deleted");
+}
+
 /// Direct messages in `room` (key `key`), both ways: each app sends one to the other member, the
 /// other opens it with its own key and shows the text, and the sender's own thread shows what it
 /// sent (sealed to the other, so it comes from the sent-text kept in memory) with nothing pending.
@@ -328,8 +469,7 @@ fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
         river_app::rooms::dm::peer_key(alice_id),
     );
     // Sent as written, with its spaces: the web UI sends the draft as typed.
-    let from_a = "  DM from A \u{1f44b}\nsecond line  ";
-    let from_b = "DM from B, with a \u{20ac} sign";
+    let (from_a, from_b) = (FROM_A, FROM_B);
     // A refused send says why, leaves nothing queued and sends nothing.
     alice.send(
         key,
@@ -1679,6 +1819,7 @@ fn main() {
     // member's record, signed by their own key) and for the creator (the owner's, which the
     // room checks against the owner's key).
     direct_messages(&mut alice, &mut bob, ROOM, &key);
+    delete_their_messages(&mut alice, &mut bob, ROOM, &key);
     rename_both_ways(&mut alice, &mut bob, ROOM, &key, "Bob", "Alice");
     deputize_and_revoke(&mut alice, &mut bob, ROOM, &key);
     // A nickname over the room's limit (50 bytes) is refused by the app and said, and is

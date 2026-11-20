@@ -104,6 +104,7 @@ impl Fixture {
             room_keys: vec![ROOM.to_owned()],
             truncated: Vec::new(),
             hydrated,
+            purges: Vec::new(),
         }
     }
 }
@@ -2194,6 +2195,557 @@ fn every_composer_scene_draws_its_content() {
         }
         for text in texts_wanted {
             assert!(shows(&rt, text), "{name}: {text:?} is on screen");
+        }
+    }
+}
+
+// Deleting their messages ------------------------------------------------------------------------
+
+mod purging {
+    use rune::{Env, Key, KeyEvent, Mods, Runtime};
+
+    use super::super::dm_model::{DmPurge, DmSnapshot};
+    use super::super::dm_purge::{self, Block};
+    use super::super::model::Pending;
+    use super::super::{LinkStatus, Source};
+    use super::{
+        Fixture, ME, PEER, ROOM, T0, app, at, conversation, esc, give, id, peer_key, press, shows,
+    };
+    use crate::rooms::dm::token_from_hex;
+    use crate::rooms::outbox::Action;
+    use crate::{RiverApp, SCENES, scene_size, view};
+
+    /// The app reading rooms from a node, with the conversation (two messages from the peer, one
+    /// from the user) given and its thread open.
+    fn open_thread() -> (Runtime<RiverApp>, Fixture) {
+        let mut rt = app();
+        rt.update(|s, _| s.chat.source = Source::Node(LinkStatus::Live));
+        let f = conversation();
+        give(&mut rt, f.snapshot(true));
+        let key = peer_key();
+        rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &key)));
+        rt.frame(0.1);
+        rt.frame(0.2);
+        (rt, f)
+    }
+
+    fn sent(rt: &Runtime<RiverApp>) -> Vec<(String, Action)> {
+        rt.state
+            .chat
+            .queued_commands()
+            .iter()
+            .map(|c| (c.room.clone(), c.action.clone()))
+            .collect()
+    }
+
+    fn purges(rt: &Runtime<RiverApp>) -> Vec<(String, Action)> {
+        sent(rt)
+            .into_iter()
+            .filter(|(_, a)| matches!(a, Action::PurgeDm { .. }))
+            .collect()
+    }
+
+    fn dimmed(rt: &Runtime<RiverApp>, key: &str) -> bool {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no element {key}"))
+            .opacity
+            < 0.9
+    }
+
+    fn help(rt: &Runtime<RiverApp>, key: &str) -> Option<String> {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .and_then(|e| e.help)
+    }
+
+    fn inbound_keys(f: &Fixture) -> Vec<String> {
+        f.snapshot(true).threads[0]
+            .messages
+            .iter()
+            .filter(|m| !m.outgoing)
+            .map(|m| m.key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_header_offers_it_where_they_wrote_and_not_for_what_you_sent() {
+        let (rt, f) = open_thread();
+        assert!(rt.find("dm-purge").is_some());
+        assert!(!dimmed(&rt, "dm-purge"));
+        assert_eq!(rt.state.chat.dm_purge_block(), None);
+        assert_eq!(inbound_keys(&f).len(), 2);
+
+        // A thread of only what the user sent offers nothing to delete, and says why.
+        let mut only_mine = Fixture::new();
+        only_mine.compose(ME, PEER, T0, b"my words only");
+        let mut rt = app();
+        rt.update(|s, _| s.chat.source = Source::Node(LinkStatus::Live));
+        give(&mut rt, only_mine.snapshot(true));
+        let key = peer_key();
+        rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &key)));
+        rt.frame(0.2);
+        assert_eq!(rt.state.chat.dm_purge_block(), Some(Block::Nothing));
+        assert!(dimmed(&rt, "dm-purge"));
+        assert!(
+            help(&rt, "dm-purge")
+                .unwrap()
+                .contains("no messages from Priya to delete")
+        );
+        // Pressing it does nothing.
+        press(&mut rt, "dm-purge");
+        assert!(rt.find("dm-purge-confirm").is_none());
+        assert!(!rt.state.chat.dm_purge_confirming());
+        assert!(!rt.state.chat.dm_purge_ask());
+    }
+
+    #[test]
+    fn it_asks_in_words_first_and_cancel_and_escape_delete_nothing() {
+        let (mut rt, _f) = open_thread();
+        press(&mut rt, "dm-purge");
+        assert!(rt.find("dm-purge-confirm").is_some());
+        assert_eq!(rt.state.chat.dm_purge_count(), Some(2));
+        // It says what it deletes, for whom, and what it leaves.
+        assert!(shows(&rt, "Delete their messages?"));
+        assert!(shows(
+            &rt,
+            "This deletes the 2 messages Priya sent you in this room."
+        ));
+        assert!(shows(&rt, "removed from the room itself"));
+        assert!(shows(&rt, "no longer sees them in the conversation either"));
+        assert!(shows(&rt, "cannot be undone"));
+        assert!(shows(&rt, "Messages you sent Priya are not deleted"));
+        assert!(shows(&rt, "at most 1000 deleted messages"));
+        assert!(shows(&rt, "Delete 2 messages"));
+
+        press(&mut rt, "dm-purge-cancel");
+        assert!(rt.find("dm-purge-confirm").is_none());
+        assert!(purges(&rt).is_empty());
+        // Escape closes the dialog first, not the thread.
+        press(&mut rt, "dm-purge");
+        assert!(rt.find("dm-purge-confirm").is_some());
+        esc(&mut rt);
+        assert!(rt.find("dm-purge-confirm").is_none());
+        assert!(rt.find("dm-thread").is_some(), "the thread stays");
+        assert!(purges(&rt).is_empty());
+        // The room's own shortcuts do not open over it.
+        press(&mut rt, "dm-purge");
+        assert!(rt.state.chat.modal_dialog_open());
+    }
+
+    #[test]
+    fn enter_and_space_cannot_confirm_a_deletion_from_the_moment_the_dialog_opens() {
+        let (mut rt, _f) = open_thread();
+        press(&mut rt, "dm-purge");
+        assert!(rt.find("dm-purge-confirm").is_some());
+        assert!(shows(&rt, "some messages can come back"));
+        for key in [Key::Enter, Key::Text(" ".into())] {
+            rt.key(KeyEvent {
+                key,
+                mods: Mods::default(),
+            });
+            rt.frame(0.3);
+        }
+        assert!(purges(&rt).is_empty(), "nothing was asked");
+        assert!(rt.state.chat.dm_purge_confirming() || rt.find("dm-purge-confirm").is_none());
+        // Whatever Enter did to the dialog, the dangerous button was never the one that took it.
+        let focused: Vec<_> = rt
+            .elements()
+            .into_iter()
+            .filter(|e| e.focused)
+            .filter_map(|e| e.key)
+            .collect();
+        assert!(
+            !focused.iter().any(|k| k == "dm-purge-confirm"),
+            "{focused:?}"
+        );
+    }
+
+    #[test]
+    fn confirming_names_exactly_what_was_counted_and_nothing_that_came_after() {
+        let (mut rt, f) = open_thread();
+        let counted = inbound_keys(&f);
+        press(&mut rt, "dm-purge");
+        // Another message from the peer arrives while the dialog is open.
+        let mut later = Fixture::new();
+        later.compose(PEER, ME, T0, b"first from the peer, with **bold**");
+        later.compose(ME, PEER, T0 + 60, b"my answer");
+        later.compose(PEER, ME, T0 + 3600, b"last from the peer");
+        later.compose(PEER, ME, T0 + 7200, b"arrived during the dialog");
+        give(&mut rt, later.snapshot(true));
+        assert!(rt.find("dm-purge-confirm").is_some());
+        assert_eq!(
+            rt.state.chat.dm_purge_count(),
+            Some(2),
+            "the count is what the user saw"
+        );
+        press(&mut rt, "dm-purge-confirm");
+
+        let commands = purges(&rt);
+        assert_eq!(commands.len(), 1);
+        let (
+            room,
+            Action::PurgeDm {
+                peer,
+                tokens,
+                ticket,
+            },
+        ) = commands[0].clone()
+        else {
+            unreachable!()
+        };
+        assert_eq!(room, ROOM);
+        assert_eq!(crate::rooms::dm::peer_key(peer), peer_key());
+        let mut want: Vec<_> = counted.iter().filter_map(|k| token_from_hex(k)).collect();
+        want.sort();
+        let mut got = tokens.clone();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "the two counted, not the one that arrived, not the user's own"
+        );
+        assert_eq!(tokens.len(), 2);
+        // The dialog is closed, and a second press of the action waits for the answer.
+        assert!(rt.find("dm-purge-confirm").is_none());
+        assert_eq!(rt.state.chat.dm_purge_block(), Some(Block::Under));
+        assert!(dimmed(&rt, "dm-purge"));
+        assert_eq!(rt.state.chat.dm_purge_waiting_ticket(), Some(ticket));
+        assert!(!rt.state.chat.dm_purge_ask());
+    }
+
+    #[test]
+    fn a_refusal_is_said_above_the_messages_and_the_next_ask_clears_it() {
+        let (mut rt, _f) = open_thread();
+        press(&mut rt, "dm-purge");
+        press(&mut rt, "dm-purge-confirm");
+        let ticket = rt.state.chat.dm_purge_waiting_ticket().unwrap();
+        let why = dm_purge_cap();
+        rt.update(move |s, _| s.chat.dm_purged(ROOM, &peer_key(), ticket, Err(why)));
+        rt.frame(0.2);
+        assert!(rt.find("dm-purge-error").is_some());
+        assert!(shows(&rt, "Not deleted. The room records at most 1000"));
+        // It is above the messages, in the notes.
+        assert!(at(&rt, "Not deleted") < at(&rt, "last from the peer"));
+        // The action is on again, and asking again clears the old refusal.
+        assert_eq!(rt.state.chat.dm_purge_block(), None);
+        press(&mut rt, "dm-purge");
+        press(&mut rt, "dm-purge-confirm");
+        assert!(rt.find("dm-purge-error").is_none());
+        assert_eq!(purges(&rt).len(), 2);
+    }
+
+    fn dm_purge_cap() -> String {
+        crate::rooms::dm_purge::Refusal::Cap {
+            held: 995,
+            adding: 12,
+        }
+        .text()
+    }
+
+    fn with_purge(rt: &mut Runtime<RiverApp>, f: &Fixture, p: Option<Pending>) {
+        let mut snapshot: DmSnapshot = f.snapshot(true);
+        if let Some(pending) = p {
+            snapshot.purges.push(DmPurge {
+                room: ROOM.into(),
+                peer_key: peer_key(),
+                count: 2,
+                pending,
+            });
+        }
+        give(rt, snapshot);
+    }
+
+    #[test]
+    fn a_deletion_on_its_way_says_so_and_one_not_taken_offers_retry_and_discard() {
+        let (mut rt, f) = open_thread();
+        with_purge(
+            &mut rt,
+            &f,
+            Some(Pending {
+                entry: 7,
+                failed: None,
+                retry: false,
+            }),
+        );
+        assert!(shows(&rt, "Deleting 2 messages\u{2026}"));
+        assert!(rt.find("dm-purge-retry-7").is_none());
+        assert_eq!(rt.state.chat.dm_purge_block(), Some(Block::Under));
+        assert!(dimmed(&rt, "dm-purge"));
+
+        with_purge(
+            &mut rt,
+            &f,
+            Some(Pending {
+                entry: 7,
+                failed: Some("Freenet refused it: no".into()),
+                retry: true,
+            }),
+        );
+        assert!(shows(&rt, "Not deleted. Freenet refused it: no"));
+        assert_eq!(rt.state.chat.dm_purge_block(), Some(Block::NotTaken));
+        assert!(
+            help(&rt, "dm-purge")
+                .unwrap()
+                .contains("Retry or discard it first")
+        );
+        press(&mut rt, "dm-purge-retry-7");
+        press(&mut rt, "dm-purge-discard-7");
+        let commands = sent(&rt);
+        assert_eq!(commands[0], (ROOM.to_owned(), Action::Retry { entry: 7 }));
+        assert_eq!(commands[1], (ROOM.to_owned(), Action::Discard { entry: 7 }));
+
+        // One that cannot be tried again offers only Discard and says what became of it.
+        with_purge(
+            &mut rt,
+            &f,
+            Some(Pending {
+                entry: 8,
+                failed: Some("There are no messages from them left to delete.".into()),
+                retry: false,
+            }),
+        );
+        assert!(rt.find("dm-purge-retry-8").is_none());
+        assert!(rt.find("dm-purge-discard-8").is_some());
+        // Once the room holds it, the line goes.
+        with_purge(&mut rt, &f, None);
+        assert!(rt.find("dm-purge-not-taken").is_none());
+        assert!(!shows(&rt, "Deleting 2 messages"));
+    }
+
+    #[test]
+    fn it_is_off_with_its_reason_when_the_room_will_not_take_it() {
+        // River has moved on.
+        let (mut rt, _f) = open_thread();
+        rt.update(|s, _| s.chat.issues.update_required = true);
+        rt.frame(0.2);
+        assert_eq!(rt.state.chat.dm_purge_block(), Some(Block::UpdateRequired));
+        assert!(dimmed(&rt, "dm-purge"));
+        assert!(shows(&rt, "Update this app to delete messages here"));
+        assert!(rt.find("dm-purge-off").is_some());
+        assert!(!rt.state.chat.dm_purge_ask());
+
+        // No key, banned, not a member: the room's words for it.
+        let (mut rt, _f) = open_thread();
+        let why = crate::rooms::outbox::Blocked::NoKey.reason();
+        let mut rooms = rt.state.chat.rooms().to_vec();
+        for r in &mut rooms {
+            r.send_block = Some(why.into());
+        }
+        rt.update(move |s, _| s.chat.set_rooms(rooms));
+        rt.frame(0.2);
+        assert_eq!(
+            rt.state.chat.dm_purge_block(),
+            Some(Block::Room(why.into()))
+        );
+        assert!(shows(&rt, why));
+        assert!(dimmed(&rt, "dm-purge"));
+
+        // A room not read from the network yet: the background work would refuse it.
+        let (mut rt, f) = open_thread();
+        let mut snapshot = f.snapshot(true);
+        snapshot.room_keys.clear();
+        give(&mut rt, snapshot);
+        assert_eq!(rt.state.chat.dm_purge_block(), Some(Block::NotLoaded));
+        assert!(shows(&rt, "Waiting for this room to load"));
+    }
+
+    #[test]
+    fn a_dialog_open_while_the_room_goes_is_closed_with_it_and_a_silent_ask_can_be_asked_again() {
+        let (mut rt, f) = open_thread();
+        press(&mut rt, "dm-purge");
+        assert!(rt.find("dm-purge-confirm").is_some());
+        rt.update(|s, _| s.chat.set_rooms(Vec::new()));
+        rt.frame(0.2);
+        assert!(!rt.state.chat.dm_purge_confirming());
+
+        // An ask nobody answered says so after the wait, and may be asked again.
+        let (mut rt, _) = (open_thread().0, f);
+        press(&mut rt, "dm-purge");
+        let t0 = std::time::Instant::now();
+        rt.update(move |s, _| assert!(s.chat.dm_purge_confirm_at(t0)));
+        assert!(!rt.state.chat.dm_purge_ask());
+        rt.update(move |s, _| {
+            assert!(s.chat.dm_tick(t0 + dm_purge::ANSWER_WAIT));
+        });
+        rt.frame(0.2);
+        assert!(shows(&rt, "River has not answered yet"));
+        assert_eq!(rt.state.chat.dm_purge_block(), None);
+        assert!(!dimmed(&rt, "dm-purge"));
+        // A late answer still counts.
+        let ticket = rt.state.chat.dm_purge_waiting_ticket().unwrap();
+        rt.update(move |s, _| s.chat.dm_purged(ROOM, &peer_key(), ticket, Ok(())));
+        rt.frame(0.2);
+        rt.frame(0.8);
+        assert!(!shows(&rt, "River has not answered yet"));
+    }
+
+    #[test]
+    fn once_it_lands_the_thread_drops_the_rows_the_rail_follows_and_the_read_position_forgets_them()
+    {
+        let (mut rt, f) = open_thread();
+        // The thread is read: both of the peer's messages are seen.
+        rt.update(|s, _| {
+            s.chat.dm.at_bottom = true;
+            s.chat.dm.mark_read(true);
+        });
+        let counted = inbound_keys(&f);
+        let seen = |rt: &Runtime<RiverApp>| {
+            rt.state
+                .chat
+                .dm
+                .seen
+                .get(&(ROOM.to_owned(), peer_key()))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(counted.iter().all(|k| seen(&rt).contains(k)));
+
+        press(&mut rt, "dm-purge");
+        press(&mut rt, "dm-purge-confirm");
+        let ticket = rt.state.chat.dm_purge_waiting_ticket().unwrap();
+        rt.update(move |s, _| s.chat.dm_purged(ROOM, &peer_key(), ticket, Ok(())));
+        // Queued, not landed: the messages are still in the thread, so they stay read (the
+        // rail's badge does not count what is on its way out).
+        assert!(counted.iter().all(|k| seen(&rt).contains(k)));
+        assert_eq!(rt.state.chat.dm.unread_total(), 0);
+
+        // The room holds the deletion: only what the user sent is left.
+        let mut after = Fixture::new();
+        after.compose(ME, PEER, T0 + 60, b"my answer");
+        give(&mut rt, after.snapshot(true));
+        // Gone from the thread: gone from the read position too.
+        assert!(counted.iter().all(|k| !seen(&rt).contains(k)), "forgotten");
+        assert!(!shows(&rt, "last from the peer"));
+        assert!(!shows(&rt, "first from the peer"));
+        assert!(shows(&rt, "my answer"), "what the user sent is not deleted");
+        assert_eq!(rt.state.chat.dm.unread_total(), 0);
+        // The action is off now: nothing of theirs is left.
+        assert_eq!(rt.state.chat.dm_purge_block(), Some(Block::Nothing));
+    }
+
+    #[test]
+    fn nothing_deleted_is_printed() {
+        let (mut rt, _f) = open_thread();
+        press(&mut rt, "dm-purge");
+        press(&mut rt, "dm-purge-confirm");
+        let shown = format!(
+            "{:?}{:#?}{:?}",
+            rt.state.chat.dm,
+            rt.state.chat.dm,
+            rt.state.chat.queued_commands()
+        );
+        let tokens: Vec<String> = inbound_keys(&conversation());
+        for t in tokens {
+            assert!(!shown.contains(&t), "a token was printed: {shown}");
+        }
+        assert!(shown.contains("tokens: 2"));
+        let _ = id(ME);
+    }
+
+    /// Each purge scene draws what it is for.
+    #[test]
+    fn every_purge_scene_draws_its_content() {
+        for (name, wants, texts_wanted, absent) in [
+            (
+                "chat-dm-purge",
+                &["dm-purge", "dm-thread"][..],
+                &["Delete their messages"][..],
+                &["dm-purge-confirm", "dm-purge-under", "dm-purge-off"][..],
+            ),
+            (
+                "chat-dm-purge-narrow",
+                &["dm-purge"],
+                &[],
+                &["dm-purge-confirm"],
+            ),
+            (
+                "chat-dm-purge-confirm",
+                &["dm-purge-confirm", "dm-purge-cancel", "dm-purge-what"],
+                &[
+                    "Delete their messages?",
+                    "Priya Raman sent you in this room",
+                ],
+                &[],
+            ),
+            (
+                "chat-dm-purge-confirm-narrow",
+                &["dm-purge-confirm", "dm-purge-cancel"],
+                &["Delete their messages?"],
+                &[],
+            ),
+            (
+                "chat-dm-purge-under",
+                &["dm-purge-under"],
+                &["Deleting 2 messages"],
+                &["dm-purge-retry-1"],
+            ),
+            (
+                "chat-dm-purge-failed",
+                &[
+                    "dm-purge-not-taken",
+                    "dm-purge-retry-1",
+                    "dm-purge-discard-1",
+                ],
+                &["Not deleted. Freenet refused it"],
+                &[],
+            ),
+            (
+                "chat-dm-purge-refused",
+                &["dm-purge-error"],
+                &["Not deleted. The room records at most 1000"],
+                &[],
+            ),
+            (
+                "chat-dm-purge-off-nothing",
+                &["dm-purge"],
+                &[],
+                &["dm-purge-confirm"],
+            ),
+            (
+                "chat-dm-purge-off-held",
+                &["dm-purge", "dm-purge-off"],
+                &["Update this app to delete messages here"],
+                &[],
+            ),
+            (
+                "chat-dm-purge-off-key",
+                &["dm-purge", "dm-purge-off"],
+                &["This computer doesn't hold your key"],
+                &[],
+            ),
+            (
+                "chat-dm-purge-off-loading",
+                &["dm-purge", "dm-purge-off"],
+                &["Waiting for this room to load"],
+                &[],
+            ),
+        ] {
+            let scene = SCENES.iter().find(|(n, _)| *n == name).expect(name).1;
+            let mut state = RiverApp::detached();
+            scene(&mut state);
+            let mut rt = Runtime::new(
+                state,
+                view,
+                scene_size(name),
+                Env {
+                    system_dark: true,
+                    scale: 1.0,
+                },
+            );
+            rt.frame(0.0);
+            rt.frame(0.5);
+            assert!(rt.find("dm-thread").is_some(), "{name}: the thread");
+            for key in wants {
+                assert!(rt.find(key).is_some(), "{name}: {key} is drawn");
+            }
+            for key in absent {
+                assert!(rt.find(key).is_none(), "{name}: {key} is not drawn");
+            }
+            for text in texts_wanted {
+                assert!(shows(&rt, text), "{name}: {text:?} is on screen");
+            }
         }
     }
 }
