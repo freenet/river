@@ -197,6 +197,10 @@ enum Kind {
     Join {
         invitation: Box<Invitation>,
         nickname: String,
+        /// The join must add a new member: it is refused when the invitee is a member of the
+        /// room already. For an invitation from a message, which could hand over the key of a
+        /// member of that room (an identity to adopt).
+        only_new: bool,
         /// Built when the room is read, so its join event carries that time. Kept across
         /// connections, so a resend is the same bytes; built again on Try again, so a join
         /// retried much later is not stamped with a time the room has trimmed.
@@ -629,7 +633,7 @@ impl Work {
             Ok(i) => i,
             Err(why) => return self.refuse(WHAT, why),
         };
-        if let Err(why) = self.join_invitation(invitation, nickname, shown) {
+        if let Err(why) = self.join_invitation(invitation, nickname, false, shown) {
             self.refuse(WHAT, why);
         }
     }
@@ -641,6 +645,7 @@ impl Work {
         &mut self,
         invitation: Invitation,
         nickname: &str,
+        only_new: bool,
         shown: &dyn Fn(&VerifyingKey) -> bool,
     ) -> Result<(), String> {
         if let Some(why) = create::join_refusal(nickname) {
@@ -689,6 +694,7 @@ impl Work {
             Kind::Join {
                 invitation: Box::new(invitation),
                 nickname: nickname.trim().to_owned(),
+                only_new,
                 plan: None,
             },
             Step::Get,
@@ -1221,11 +1227,16 @@ impl Work {
                         Kind::Join {
                             invitation,
                             nickname,
+                            only_new,
                             plan,
                         } => {
                             let key = create::contract_key(&invitation.room);
                             match create::join(invitation, nickname, &state, key, SystemTime::now())
                             {
+                                Ok(p) if *only_new && !p.adds_member() => t.fail(
+                                    "This invitation is for someone who is a member of the room already, so it is not used.",
+                                    false,
+                                ),
                                 Ok(p) => {
                                     *plan = Some(Box::new(p));
                                     t.advance();

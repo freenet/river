@@ -593,6 +593,39 @@ fn a_join_the_room_already_has_sends_nothing() {
     expect_read(&mut w, ROOMS_META_KEY);
 }
 
+/// A join started from a direct message must add a new member: an invitation for a key the room
+/// holds already would otherwise make the user store that member's identity.
+#[test]
+fn a_join_from_a_message_for_a_member_of_the_room_is_refused_and_one_for_a_new_member_goes_on() {
+    for (already, expect_failed) in [(true, true), (false, false)] {
+        let mut w = Work::default();
+        let owner_sk = SigningKey::from_bytes(&[60; 32]);
+        let plan =
+            crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+        let room = LiveRoom::new(stored(&plan.room));
+        let (inv, _) = invitation(&room, "http://x/").unwrap();
+        let member = inv.invitee.clone();
+        w.join_invitation(inv, "Bea", true, &|_| false).unwrap();
+        let ClientRequest::ContractOp(ContractRequest::Get { .. }) = next(&mut w) else {
+            panic!("a GET");
+        };
+        let mut state = plan.room.room_state.clone();
+        if already {
+            state.members.members.push(member);
+        }
+        get_answer(
+            &mut w,
+            crate::rooms::create::contract_key(&owner_sk.verifying_key()),
+            &state,
+        );
+        let failed = w
+            .views()
+            .iter()
+            .any(|v| matches!(v.state, WorkState::Failed { retry: false, .. }));
+        assert_eq!(failed, expect_failed);
+    }
+}
+
 /// This join's own store landed but its answer was lost: the room holds exactly its bytes, so
 /// the join still goes out.
 #[test]

@@ -370,8 +370,9 @@ fn a_room_that_would_not_take_the_invitee_refuses_the_join() {
     assert!(join(&inv, "  ", &state, key, now()).is_err());
     assert!(join(&inv, "B\u{200B}ea", &state, key, now()).is_err());
 
-    // And the room as it was takes them.
-    assert!(join(&inv, "Bea", &state, key, now()).is_ok());
+    // And the room as it was takes them, as a new member.
+    let plan = join(&inv, "Bea", &state, key, now()).unwrap();
+    assert!(plan.adds_member());
 }
 
 #[test]
@@ -398,6 +399,7 @@ fn an_invitee_already_in_the_room_is_not_added_twice() {
     // Nothing to send: no second join event, no version-0 nickname record replacing the one
     // the room has, and no invite chain re-added.
     assert!(plan.delta.is_none());
+    assert!(!plan.adds_member(), "a join from a message refuses this");
     assert_eq!(
         plan.room.self_member_info.as_ref(),
         state

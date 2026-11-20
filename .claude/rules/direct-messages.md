@@ -318,9 +318,9 @@ plaintext in the chat delegate.
   Invitation DMs are `src/rooms/dm_invite.rs`: send builds the same `Invite` body the web picker
   does (`encode_body` of an `InvitePayload` holding the CBOR of the user's `Invitation`) and caches
   only the `[Invitation]` summary; accept re-reads the invitation from the room, checks
-  `invitation.room == payload.room_owner_vk` and that the signed sender made it (`invited_by`), and joins with the default nickname. Differences
+  `invitation.room == payload.room_owner_vk` and joins with the default nickname. Differences
   from the web UI: the picker offers only rooms the user can write in and is listed in, the card
-  names the signed sender (an invitation someone else made is refused), an invitation is size-bounded before it is
+  names the signed sender, a join from a message must add a new member (an invitee key the room holds already is refused), an invitation is size-bounded before it is
   decoded, and the note shown is cleaned of hidden and reordering characters.
 - **CLI side**: persists the same `OutboundDmStore` shape into
   `outbound_dms.json` in the riverctl data dir (consistent with

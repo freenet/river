@@ -306,6 +306,14 @@ pub struct JoinPlan {
     pub delta: Option<ChatRoomStateV1Delta>,
 }
 
+impl JoinPlan {
+    /// Whether the join adds the invitee to the room. False when the invitee is already a member
+    /// (an invitation accepted twice, or one for a key the room holds already).
+    pub fn adds_member(&self) -> bool {
+        self.delta.as_ref().is_some_and(|d| d.members.is_some())
+    }
+}
+
 /// Why a join can't go ahead, and whether trying the same join again later can help (a full
 /// room may have room later; a nickname over the room's limit never fits).
 #[derive(Debug, PartialEq, Eq)]

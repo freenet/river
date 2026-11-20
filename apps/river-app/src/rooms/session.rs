@@ -2247,7 +2247,7 @@ impl Rooms {
                         );
                         self.outbox
                             .work
-                            .join_invitation(invitation, &nickname, &|vk| shown.contains(vk))
+                            .join_invitation(invitation, &nickname, true, &|vk| shown.contains(vk))
                     })
                 }
             }

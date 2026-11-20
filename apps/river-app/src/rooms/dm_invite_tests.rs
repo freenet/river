@@ -429,10 +429,7 @@ fn deliver(
 /// The invitation `them()` would send for `target`: made by the user's own code from another
 /// room's owner, since any invitation is only bytes to the recipient.
 fn invitation_for(target: &LiveRoom) -> Invitation {
-    // Made by `them()`, who sends it: an invitation is only accepted from its maker.
-    let mut by_them = target.clone();
-    by_them.stored.self_sk = Some(them());
-    create::mint_invitation(&by_them).expect("a key for the room")
+    create::mint_invitation(target).expect("a key for the room")
 }
 
 fn invite_body(
@@ -602,29 +599,16 @@ fn an_envelope_over_the_contracts_size_is_refused() {
 }
 
 #[test]
-fn an_invitation_someone_else_made_or_one_for_the_senders_own_key_is_refused() {
+fn an_invitation_someone_else_made_opens_and_the_card_claims_nothing_about_who_made_it() {
+    // Any member can pass on an invitation they were given; it opens, and what is joined is the
+    // room it names. (A key a member of that room already holds is refused when joining.)
     let (_, mut carrier) = carrier();
-    // Someone else's invitation, put in a message from `them()` (any member can pass one on).
     let other_owner = owners_room();
     let theirs = create::mint_invitation(&other_owner).unwrap();
     let body = invite_body(&other_owner.stored.owner_vk, &theirs, Some("forwarded"));
     let token = deliver(&mut carrier, &body, BASE);
-    let why = open(&carrier, them_id(), &token).unwrap_err();
-    assert!(why.contains("not made by the person who sent it"), "{why}");
-
-    // An invitation whose invitee key is the sender's own, which would make the user adopt the
-    // sender's identity in that room.
-    let (_, target) = target();
-    let mut adopt = invitation_for(&target);
-    adopt.invitee_signing_key = them();
-    adopt.invitee.member.member_vk = them().verifying_key();
-    let body = invite_body(&target.stored.owner_vk, &adopt, None);
-    let token = deliver(&mut carrier, &body, BASE + 1);
-    assert!(
-        open(&carrier, them_id(), &token)
-            .unwrap_err()
-            .contains("not made by")
-    );
+    let opened = open(&carrier, them_id(), &token).expect("opens");
+    assert_eq!(opened.room, other_owner.stored.owner_vk);
 }
 
 // Where the invitation can end up ------------------------------------------------------------------
