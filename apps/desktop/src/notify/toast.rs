@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
-use super::Waiters;
+use super::{ACTION_MARK_READ, ACTION_REPLY, Waiters};
 
 /// River's AppUserModelID.
 const APP_ID: &str = "org.freenet.River";
@@ -131,6 +131,12 @@ impl Backend {
             .app_id(APP_ID)
             .summary(&n.title)
             .body(&n.body);
+        if n.actions {
+            // Buttons only: the toast crate under notify-rust cannot make a text field, so
+            // Reply opens the room with the composer ready.
+            note.action(ACTION_REPLY, "Reply")
+                .action(ACTION_MARK_READ, "Mark as read");
+        }
         let shown = match note.show() {
             Ok(shown) => shown,
             Err(e) => {
@@ -139,9 +145,14 @@ impl Backend {
             }
         };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.waiters
-            .spawn(n.room_key.clone(), id, handle.clone(), move |on| {
+        self.waiters.spawn(
+            n.room_key.clone(),
+            n.message_key.clone(),
+            id,
+            handle.clone(),
+            move |on| {
                 let _ = shown.wait_for_response(on);
-            });
+            },
+        );
     }
 }

@@ -4997,3 +4997,327 @@ fn an_input_method_can_compose_into_the_composer() {
     rt.frame(0.4);
     assert_eq!(rt.state.chat.composer.text, "漢字é");
 }
+
+// Notification actions ------------------------------------------------------------------------
+
+/// Rooms where the second one has a long history, so its oldest message starts far above the
+/// newest.
+fn with_long_history(rooms: &mut [super::Room]) {
+    let base = rooms[1].messages.clone();
+    let mut long = Vec::new();
+    for i in 0..40 {
+        for m in &base {
+            let mut m = m.clone();
+            m.key = format!("{}-{i}", m.key);
+            long.push(m);
+        }
+    }
+    rooms[1].messages = long;
+}
+
+fn room_keys(rt: &Runtime<RiverApp>) -> Vec<String> {
+    rt.state
+        .chat
+        .rooms()
+        .iter()
+        .map(|r| r.key.clone())
+        .collect()
+}
+
+#[test]
+fn a_click_on_a_notification_opens_its_room_and_shows_the_message_in_one_update() {
+    let mut rt = node_rooms(|r| with_long_history(r));
+    let keys = room_keys(&rt);
+    let (a, b) = (keys[0].clone(), keys[1].clone());
+    assert_eq!(rt.state.chat.room().unwrap().key, a);
+    let oldest = rt.state.chat.rooms()[1].messages[0].key.clone();
+    let el = format!("msg-{oldest}");
+    // Control: opening room B alone leaves its oldest message off screen, so the check below
+    // tells a reveal from a room that is short.
+    let plain = b.clone();
+    rt.update(move |s, _| {
+        s.open_room(&plain);
+    });
+    settle(&mut rt);
+    assert!(!visible(&rt, &el), "room too short for the test");
+    // From room A, in ONE update, as the notification's click does.
+    let back = a.clone();
+    rt.update(move |s, _| {
+        s.open_room(&back);
+    });
+    settle(&mut rt);
+    let (room, message) = (b.clone(), oldest.clone());
+    rt.update(move |s, _| {
+        assert!(s.open_message(&room, &message));
+    });
+    assert!(rt.state.chat.pending_reveal().is_some());
+    // What the per-frame sync does (the test runtime has no poll hook of its own).
+    for _ in 0..10 {
+        let mut again = false;
+        rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+        settle(&mut rt);
+        if !again {
+            break;
+        }
+    }
+    assert_eq!(rt.state.chat.room().unwrap().key, b);
+    assert!(visible(&rt, &el), "the message is brought into view");
+}
+
+#[test]
+fn a_click_on_a_room_that_was_left_or_a_message_that_is_gone() {
+    let mut rt = node_rooms(|_| {});
+    let b = room_keys(&rt)[1].clone();
+    let open = rt.state.chat.room().unwrap().key.clone();
+    assert!(!rt.state.open_message("no-such-room", "m"), "room gone");
+    assert_eq!(
+        rt.state.chat.room().unwrap().key,
+        open,
+        "nothing else opens"
+    );
+    assert!(rt.state.open_message(&b, "no-such-message"));
+    assert_eq!(rt.state.chat.room().unwrap().key, b);
+    assert!(rt.state.chat.pending_reveal().is_none());
+}
+
+#[test]
+fn a_reply_from_a_notification_sends_what_the_composer_would_and_leaves_the_screen_alone() {
+    let mut rt = node_rooms(|_| {});
+    let keys = room_keys(&rt);
+    rt.state.chat.composer.replace_text("half typed");
+    let result = rt
+        .state
+        .reply_from_notification(&keys[1], "  on my way\u{202e}  ");
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        std::mem::take(&mut rt.state.chat.outgoing),
+        [Command {
+            room: keys[1].clone(),
+            action: Action::Send {
+                text: "on my way".into(),
+                reply_to: None
+            }
+        }]
+    );
+    assert_eq!(
+        rt.state.chat.room().unwrap().key,
+        keys[0],
+        "the open room stays"
+    );
+    assert_eq!(rt.state.chat.composer.text, "half typed");
+    assert!(rt.state.chat.reply_notices(&keys[1]).is_empty());
+}
+
+#[test]
+fn a_refused_reply_is_kept_as_that_rooms_draft_and_touches_nothing_else() {
+    use super::ReplyRefusal;
+    let reason = "You have been banned from sending messages in this room.";
+    let mut rt = node_rooms(|rooms| {
+        rooms[1].details.limits.max_message_size = 40;
+        rooms[2].send_block = Some(reason.into());
+    });
+    let keys = room_keys(&rt);
+    let open = rt.state.chat.room().unwrap().key.clone();
+    rt.state.chat.composer.replace_text("typing here");
+    let state = &mut rt.state;
+    assert_eq!(
+        state.reply_from_notification(&keys[1], " \n "),
+        Err(ReplyRefusal::Empty)
+    );
+    assert!(
+        state.chat.reply_notices(&keys[1]).is_empty(),
+        "blank text needs no word"
+    );
+    // A room that was left: nothing to keep it in, and the line says so (in any room).
+    assert_eq!(
+        state.reply_from_notification("nope", "hi"),
+        Err(ReplyRefusal::NoRoom)
+    );
+    assert!(
+        state.chat.reply_notices(&open)[0]
+            .1
+            .contains("could not be kept")
+    );
+    // A blocked room with a draft: the text follows it, in the stored draft.
+    state
+        .chat
+        .drafts
+        .insert(keys[2].clone(), rune::TextEdit::new("earlier"));
+    assert_eq!(
+        state.reply_from_notification(&keys[2], "hi"),
+        Err(ReplyRefusal::Blocked)
+    );
+    assert_eq!(state.chat.drafts[&keys[2]].text, "earlier\nhi");
+    // Too long for another room: kept in its draft; the first room's line is still there.
+    let long = "x".repeat(200);
+    assert_eq!(
+        state.reply_from_notification(&keys[1], &long),
+        Err(ReplyRefusal::TooLong)
+    );
+    assert_eq!(state.chat.drafts[&keys[1]].text, long);
+    assert!(
+        state.chat.reply_notices(&keys[2])[0]
+            .1
+            .contains("cannot send")
+    );
+    assert!(state.chat.reply_notices(&keys[1])[0].1.contains("too long"));
+    assert!(
+        state.chat.reply_notices(&keys[1])[0]
+            .1
+            .contains(&state.chat.rooms()[1].name)
+    );
+    // Nothing else moved: same open room, same composer, nothing sent.
+    assert_eq!(state.chat.room().unwrap().key, open);
+    assert_eq!(state.chat.composer.text, "typing here");
+    assert!(state.chat.outgoing.is_empty());
+    // A reply that works in one room does not clear another room's line.
+    assert_eq!(state.reply_from_notification(&keys[0], "ok"), Ok(()));
+    assert!(!state.chat.reply_notices(&keys[1]).is_empty());
+    state.chat.dismiss_reply_notice(&keys[1]);
+    assert!(
+        state
+            .chat
+            .reply_notices(&keys[1])
+            .iter()
+            .all(|(k, _)| *k != keys[1])
+    );
+    // The draft is there when the room is opened.
+    state.open_room(&keys[1]);
+    assert_eq!(state.chat.composer.text, long);
+}
+
+#[test]
+fn a_refused_reply_to_the_open_room_survives_leaving_it_and_never_joins_a_reply_in_progress() {
+    let mut rt = node_rooms(|rooms| rooms[0].details.limits.max_message_size = 40);
+    let keys = room_keys(&rt);
+    let target = message_of(&rt, false);
+    rt.state.chat.start_reply(&target);
+    rt.state.chat.composer.replace_text("mine");
+    assert!(
+        rt.state
+            .reply_from_notification(&keys[0], &"y".repeat(100))
+            .is_err()
+    );
+    let said = rt.state.chat.reply_notices(&keys[0])[0].1.to_owned();
+    assert!(said.contains("leave this room and come back"), "{said}");
+    // The reply in progress and its text are untouched.
+    assert!(matches!(rt.state.chat.mode, super::Mode::Reply(_)));
+    assert_eq!(rt.state.chat.composer.text, "mine");
+    // Leaving the room keeps both: what was typed, then the refused text.
+    rt.state.open_room(&keys[1]);
+    assert_eq!(
+        rt.state.chat.drafts[&keys[0]].text,
+        format!("mine\n{}", "y".repeat(100))
+    );
+}
+
+#[test]
+fn a_draft_is_never_grown_past_its_cap() {
+    let mut rt = node_rooms(|rooms| rooms[1].details.limits.max_message_size = 40);
+    let keys = room_keys(&rt);
+    let big = "z".repeat(super::quick_reply::MAX_DRAFT_CHARS - 10);
+    rt.state
+        .chat
+        .drafts
+        .insert(keys[1].clone(), rune::TextEdit::new(big.clone()));
+    assert!(
+        rt.state
+            .reply_from_notification(&keys[1], &"x".repeat(100))
+            .is_err()
+    );
+    assert_eq!(rt.state.chat.drafts[&keys[1]].text, big, "not grown");
+    assert!(
+        rt.state.chat.reply_notices(&keys[1])[0]
+            .1
+            .contains("draft is full")
+    );
+}
+
+#[test]
+fn a_click_when_the_window_is_not_in_front_waits_a_frame_even_for_the_open_room() {
+    let mut rt = node_rooms(|r| with_long_history(r));
+    let b = room_keys(&rt)[1].clone();
+    let oldest = rt.state.chat.rooms()[1].messages[0].key.clone();
+    rt.state.open_room(&b);
+    settle(&mut rt);
+    // In front: as the overview does, the scroll goes out on the first apply.
+    rt.state.focus_changed(true);
+    assert!(rt.state.open_message(&b, &oldest));
+    let mut again = true;
+    rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+    assert!(!again, "focused: no wait");
+    // Not in front (hidden, minimised, another window): it waits one frame first.
+    rt.state.focus_changed(false);
+    assert!(rt.state.open_message(&b, &oldest));
+    rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+    assert!(again, "unfocused: waits");
+    rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+    assert!(!again);
+}
+
+#[test]
+fn an_example_room_takes_no_reply_from_a_notification() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let key = rt.state.chat.room().unwrap().key.clone();
+    assert_eq!(
+        rt.state.reply_from_notification(&key, "hi"),
+        Err(super::ReplyRefusal::NoRoom)
+    );
+    assert!(rt.state.chat.outgoing.is_empty());
+}
+
+#[test]
+fn mark_as_read_reads_only_up_to_the_notifications_message() {
+    let mut rt = node_rooms(|rooms| rooms[1].unread = 0);
+    let b = room_keys(&rt)[1].clone();
+    let me = rt.state.chat.rooms()[1].me;
+    let theirs: Vec<(usize, String)> = rt.state.chat.rooms()[1]
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.author != me)
+        .map(|(i, m)| (i, m.key.clone()))
+        .collect();
+    assert!(
+        theirs.len() >= 3,
+        "the example room has enough to tell apart"
+    );
+    // The notification showed the first of their messages; the rest arrived after it.
+    let (shown_at, shown) = theirs[0].clone();
+    let newer = rt.state.chat.rooms()[1].messages[shown_at + 1..]
+        .iter()
+        .filter(|m| m.author != me)
+        .count();
+    rt.state.chat.edit_rooms(|r| r[1].unread = newer + 1);
+    rt.state.mark_read_through(&b, &shown);
+    assert_eq!(
+        rt.state.chat.rooms()[1].unread,
+        newer,
+        "what came after stays unread"
+    );
+    // The mark moved, and survives the node's next update of the rooms.
+    assert!(rt.state.chat.read.contains_key(&b));
+    let rooms = rt.state.chat.rooms().to_vec();
+    rt.state
+        .chat
+        .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_000);
+    assert_eq!(rt.state.chat.rooms()[1].unread, newer);
+    // A stale click on an older message never moves it back.
+    let before = rt.state.chat.read[&b];
+    let older = rt.state.chat.rooms()[1].messages[0].key.clone();
+    rt.state.mark_read_through(&b, &older);
+    assert_eq!(rt.state.chat.read[&b], before);
+    assert_eq!(rt.state.chat.rooms()[1].unread, newer);
+    // A message that is gone marks nothing.
+    rt.state.mark_read_through(&b, "gone");
+    assert_eq!(rt.state.chat.rooms()[1].unread, newer);
+}
+
+#[test]
+fn reply_opens_the_room_with_the_composer_ready() {
+    let mut rt = node_rooms(|_| {});
+    let other = room_keys(&rt)[1].clone();
+    rt.state.open_room_to_reply(&other);
+    assert_eq!(rt.state.chat.room().unwrap().key, other);
+    assert!(rt.state.chat.composer.focused);
+}

@@ -32,6 +32,7 @@ pub mod model;
 pub(crate) mod node_ui;
 mod notify_dialog;
 pub mod overview;
+mod quick_reply;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
 #[path = "../../../../ui/src/util/share_link.rs"]
@@ -46,6 +47,7 @@ mod view;
 pub(crate) mod visual_fold;
 
 pub use background::{BackgroundHost, BackgroundUi};
+pub use quick_reply::{MAX_REPLY_CHARS, ReplyRefusal};
 use std::collections::{HashMap, HashSet};
 
 use rune::TextEdit;
@@ -301,6 +303,8 @@ pub struct Chat {
     pub overview: bool,
     /// A message to scroll to once the room it is in is on screen.
     reveal: Option<overview::Reveal>,
+    /// Why a reply typed into a notification was not sent, shown above the composer.
+    reply_notices: std::collections::BTreeMap<String, String>,
     /// When the switcher's chord last arrived, for [`switcher::chord_gate`].
     chord_at: Option<std::time::Instant>,
 }
@@ -418,6 +422,7 @@ impl Chat {
             switcher: None,
             overview: false,
             reveal: None,
+            reply_notices: Default::default(),
             chord_at: None,
             node: Default::default(),
             update: Default::default(),
@@ -521,9 +526,7 @@ impl Chat {
             open.focused = false;
             let key = std::mem::take(&mut self.selected);
             if !key.is_empty() {
-                if !open.text.is_empty() {
-                    self.drafts.insert(key.clone(), open);
-                }
+                self.park_draft(key.clone(), open);
                 self.last_open = key;
             }
             return;
@@ -721,9 +724,7 @@ impl Chat {
         let incoming = self.drafts.remove(key).unwrap_or_else(|| TextEdit::new(""));
         let mut outgoing = std::mem::replace(&mut self.composer, incoming);
         outgoing.focused = false;
-        if !outgoing.text.is_empty() {
-            self.drafts.insert(self.selected.clone(), outgoing);
-        }
+        self.park_draft(self.selected.clone(), outgoing);
         self.selected = key.to_owned();
     }
     /// Send what the composer holds to the open room. Blank text sends nothing; otherwise the
@@ -791,20 +792,23 @@ impl Chat {
     /// encryption and multi-byte characters all count), and that limit. `None` while deleting
     /// or with no open room, and for a room with no limit known.
     pub fn draft_size(&self) -> Option<(usize, usize)> {
+        Self::size_of(self.room()?, &self.mode, self.composer.text.trim())
+    }
+
+    /// [`Chat::draft_size`] for `text` sent into `room` in `mode`.
+    pub(crate) fn size_of(room: &Room, mode: &Mode, text: &str) -> Option<(usize, usize)> {
         use river_core::room_state::message::{MessageId, RoomMessageBody};
-        let room = self.room()?;
         let max = room.details.limits.max_message_size;
         if max == 0 {
             return None;
         }
-        let text = self.composer.text.trim();
         // Ids are 64-bit hashes that encode in nine bytes almost always; the longest form is
         // measured, so the count is never short.
         // Ids are 64-bit hashes that encode in nine bytes almost always; where the real id is
         // not known the longest form is measured, so the count is never short.
         let worst = || MessageId(freenet_scaffold::util::FastHash(i64::MAX));
         let wrap = |key: &str| room.wraps.as_ref()?.get(key);
-        let bytes = match &self.mode {
+        let bytes = match mode {
             Mode::Delete(_) => return None,
             Mode::Edit { key, .. } => RoomMessageBody::measure_edit(
                 wrap(key).map_or_else(worst, |w| w.id.clone()),

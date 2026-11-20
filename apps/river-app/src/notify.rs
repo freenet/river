@@ -47,6 +47,12 @@ pub struct Notification {
     pub mention: bool,
     /// How many new messages it stands for.
     pub count: usize,
+    /// The message it shows (the newest that mentions you, else the newest), for a click to
+    /// scroll to. Empty when it stands for no single message.
+    pub message_key: String,
+    /// Whether it is about one room, so Reply and Mark as read make sense on it. False for the
+    /// summary of several rooms and for notices that are not about a room.
+    pub actions: bool,
 }
 
 /// How a shell shows notifications and the unread count. Called on the UI thread: an
@@ -80,6 +86,8 @@ pub struct Arrival {
     pub count: usize,
     /// Whether the message shown mentions you.
     pub mention: bool,
+    /// The key of the message shown.
+    pub message_key: String,
     /// The author of the message shown.
     pub author: String,
     /// The message shown, as a one-line preview: the newest that mentions you, else the newest.
@@ -157,6 +165,7 @@ pub fn arrivals(
             private: room.private,
             count: fresh.len(),
             mention: shown.md.contains(&chip),
+            message_key: shown.key.clone(),
             author: tidy(room.nickname(shown.author), AUTHOR_CHARS),
             text: tidy(&shown.text, BODY_CHARS),
             quiet: false,
@@ -190,6 +199,7 @@ impl RoomClock {
             Some(h) => {
                 h.count += a.count;
                 if a.mention || !h.mention {
+                    h.message_key = a.message_key;
                     h.text = a.text;
                     h.author = a.author;
                 }
@@ -316,6 +326,7 @@ impl Limiter {
                 a.count += h.count;
                 if h.mention && !a.mention {
                     a.mention = true;
+                    a.message_key = h.message_key;
                     a.text = h.text;
                     a.author = h.author;
                 }
@@ -410,6 +421,8 @@ pub fn compose_from(
             body: format!("{count} new messages in {} other rooms", rest.len()),
             mention: rest.iter().any(|a| a.mention),
             count,
+            message_key: String::new(),
+            actions: false,
         };
         out.push((summary, rest));
     }
@@ -437,6 +450,8 @@ fn one(a: Arrival, previews: bool) -> Notification {
         body,
         mention: a.mention,
         count: a.count,
+        message_key: a.message_key,
+        actions: true,
     }
 }
 
@@ -738,10 +753,33 @@ mod tests {
             private: false,
             count: 2,
             mention,
+            message_key: format!("m{i}"),
             author: "A".into(),
             text: "t".into(),
             quiet: false,
         }
+    }
+
+    #[test]
+    fn a_room_notification_carries_its_message_and_offers_actions_the_summary_does_not() {
+        let n = compose((0..5).map(|i| arrival(i, false)).collect(), true);
+        assert_eq!(n[0].message_key, "m0");
+        assert!(n[0].actions);
+        let summary = n.last().unwrap();
+        assert!(summary.message_key.is_empty());
+        assert!(!summary.actions, "it stands for several rooms");
+    }
+
+    #[test]
+    fn a_held_mention_keeps_its_own_message_for_the_click() {
+        let mut clock = RoomClock::default();
+        let mut mention = arrival(0, true);
+        mention.message_key = "the-mention".into();
+        clock.hold(mention);
+        let mut plain = arrival(0, false);
+        plain.message_key = "later".into();
+        clock.hold(plain);
+        assert_eq!(clock.held.unwrap().message_key, "the-mention");
     }
 
     #[test]
@@ -1028,6 +1066,99 @@ mod tests {
         s.flush_held(t0 + ROOM_COOLDOWN + Duration::from_secs(1));
         assert_eq!(shown(&rec).len(), 1);
         assert!(s.limiter.next_due(t0).is_none());
+    }
+
+    /// An away app with one notification shown and a second held back for a room that is not
+    /// open, and the room's index and the key of the newest message in it.
+    fn held_for_another_room() -> (RiverApp, Instant, String, String) {
+        let (mut s, rec, rooms) = live();
+        let open = s.chat.room().unwrap().key.clone();
+        let i = rooms.iter().position(|r| r.key != open).unwrap();
+        s.focus_changed(false);
+        let t0 = minute_later();
+        let a = with(&rooms, i, vec![from_other(&rooms[i], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        let b = with(&a, i, vec![from_other(&rooms[i], "b", "two")]);
+        deliver_at(&mut s, b.clone(), t0 + Duration::from_secs(5));
+        assert_eq!(shown(&rec).len(), 1);
+        assert!(s.limiter.next_due(t0).is_some(), "the second is held");
+        let newest = b[i].messages.last().unwrap().key.clone();
+        (s, t0, b[i].key.clone(), newest)
+    }
+
+    #[test]
+    fn each_notification_action_drops_what_it_makes_stale() {
+        // A click opens the room: nothing held for it is shown later.
+        let (mut s, t0, room, newest) = held_for_another_room();
+        assert!(s.open_message(&room, &newest));
+        assert!(s.limiter.next_due(t0).is_none());
+        // Reply to the room (sent, so the person is in the conversation).
+        let (mut s, t0, room, _) = held_for_another_room();
+        s.chat.set_sink(Box::new(|_| {}));
+        assert_eq!(s.reply_from_notification(&room, "ok"), Ok(()));
+        assert!(s.limiter.next_due(t0).is_none());
+        // Reply button.
+        let (mut s, t0, room, _) = held_for_another_room();
+        s.open_room_to_reply(&room);
+        assert!(s.limiter.next_due(t0).is_none());
+        // Mark as read through the newest message: nothing unread is left to report.
+        let (mut s, t0, room, newest) = held_for_another_room();
+        s.mark_read_through(&room, &newest);
+        assert!(s.limiter.next_due(t0).is_none());
+        // Through an older message: what is newer is still unread, so it is still held.
+        let (mut s, t0, room, _) = held_for_another_room();
+        let first = s
+            .chat
+            .rooms()
+            .iter()
+            .find(|r| r.key == room)
+            .unwrap()
+            .messages[0]
+            .key
+            .clone();
+        s.mark_read_through(&room, &first);
+        assert!(s.limiter.next_due(t0).is_some());
+    }
+
+    #[test]
+    fn mark_as_read_on_the_open_unfocused_room_clears_what_was_missed_and_held() {
+        let (mut s, rec, rooms) = live();
+        let open = s.chat.room().unwrap().key.clone();
+        let i = rooms.iter().position(|r| r.key == open).unwrap();
+        s.focus_changed(false);
+        let t0 = minute_later();
+        let a = with(&rooms, i, vec![from_other(&rooms[i], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        let b = with(&a, i, vec![from_other(&rooms[i], "b", "two")]);
+        deliver_at(&mut s, b.clone(), t0 + Duration::from_secs(5));
+        assert_eq!(shown(&rec).len(), 1);
+        assert!(s.limiter.next_due(t0).is_some(), "the second is held");
+        assert!(s.unread() > 0, "missed while away");
+        let newest = b[i].messages.last().unwrap().key.clone();
+        s.mark_read_through(&open, &newest);
+        assert!(
+            s.limiter.next_due(t0).is_none(),
+            "nothing held to show later"
+        );
+        assert_eq!(
+            s.unread(),
+            s.chat.unread_total(),
+            "nothing missed is left in the title"
+        );
+    }
+
+    #[test]
+    fn the_update_notice_offers_no_room_buttons() {
+        use crate::update::{UpdateEvent, UpdateStatus};
+        let rec = Recorder::default();
+        let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        s.focus_changed(false);
+        s.apply_update(UpdateEvent::Status(UpdateStatus::Ready {
+            version: "9.9.9".into(),
+        }));
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1);
+        assert!(!n[0].actions && n[0].message_key.is_empty());
     }
 
     #[test]
