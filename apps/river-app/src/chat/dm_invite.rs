@@ -139,9 +139,14 @@ impl Chat {
         // A join that finished and whose room is not in the list yet is still the join.
         if let Some(w) = self.work.iter().find(|w| w.room.as_deref() == Some(target)) {
             return match &w.state {
+                // A join that failed with nothing to try again is over: Accept starts a new one.
+                WorkState::Failed { why, retry: false } => CardState::Refused(why.clone()),
                 WorkState::Failed { why, .. } => CardState::Failed(why.clone()),
                 _ => CardState::Accepting,
             };
+        }
+        if self.issues.update_required {
+            return CardState::Blocked(UPDATE_REQUIRED_WORK.to_owned());
         }
         match self.dm.invite.ask_of(room, peer, key).map(|a| &a.stage) {
             Some(Stage::Asked { silent: true, .. }) => return CardState::Silent,
@@ -149,9 +154,6 @@ impl Chat {
             Some(Stage::Refused(why)) => return CardState::Refused(why.clone()),
             // A join the work no longer lists (put away) is over: Accept is offered again.
             Some(Stage::Started) | None => {}
-        }
-        if self.issues.update_required {
-            return CardState::Blocked(UPDATE_REQUIRED_WORK.to_owned());
         }
         CardState::New
     }

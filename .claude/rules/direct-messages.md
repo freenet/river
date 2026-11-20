@@ -320,7 +320,7 @@ plaintext in the chat delegate.
   only the `[Invitation]` summary; accept re-reads the invitation from the room, checks
   `invitation.room == payload.room_owner_vk`, and joins with the default nickname. Differences
   from the web UI: the picker offers only rooms the user can write in and is listed in, the card
-  names the signed sender and never claims who invited, an invitation is size-bounded before it is
+  names the signed sender (an invitation someone else made is refused), an invitation is size-bounded before it is
   decoded, and the note shown is cleaned of hidden and reordering characters.
 - **CLI side**: persists the same `OutboundDmStore` shape into
   `outbound_dms.json` in the riverctl data dir (consistent with

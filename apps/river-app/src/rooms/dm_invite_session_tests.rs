@@ -104,9 +104,10 @@ fn accept(room: &str, peer: &str, token: PurgeToken, ticket: u64) -> Command {
 /// carrier room's owner (seed 1), and held by the carrier room. Returns the message's token and
 /// the invited room's key.
 fn receive(rooms: &mut Rooms, f: &Fixture) -> (PurgeToken, String) {
+    // The room's owner is seed 21 and the invitation is made by seed 1, who sends it.
     let g = Fixture {
         owner: SigningKey::from_bytes(&[21; 32]),
-        me: SigningKey::from_bytes(&[21; 32]),
+        me: SigningKey::from_bytes(&[1; 32]),
     };
     let state = ChatRoomStateV1 {
         configuration: AuthorizedConfigurationV1::new(

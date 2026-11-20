@@ -429,7 +429,10 @@ fn deliver(
 /// The invitation `them()` would send for `target`: made by the user's own code from another
 /// room's owner, since any invitation is only bytes to the recipient.
 fn invitation_for(target: &LiveRoom) -> Invitation {
-    create::mint_invitation(target).expect("a key for the room")
+    // Made by `them()`, who sends it: an invitation is only accepted from its maker.
+    let mut by_them = target.clone();
+    by_them.stored.self_sk = Some(them());
+    create::mint_invitation(&by_them).expect("a key for the room")
 }
 
 fn invite_body(
@@ -599,24 +602,28 @@ fn an_envelope_over_the_contracts_size_is_refused() {
 }
 
 #[test]
-fn the_card_names_the_sender_and_holds_no_invitation_so_a_member_can_pass_one_on() {
-    // Someone else's invitation, put in a message from `them()`: it opens, and the room it
-    // names is the room it is for. Nothing in it ties the invitation's inviter to the sender, and
-    // the view model has nowhere to carry either.
+fn an_invitation_someone_else_made_or_one_for_the_senders_own_key_is_refused() {
     let (_, mut carrier) = carrier();
+    // Someone else's invitation, put in a message from `them()` (any member can pass one on).
     let other_owner = owners_room();
-    let invitation = invitation_for(&other_owner);
-    assert_ne!(
-        invitation.invitee.member.invited_by,
-        them_id(),
-        "the inviter is not the sender"
-    );
-    let body = invite_body(&other_owner.stored.owner_vk, &invitation, Some("forwarded"));
+    let theirs = create::mint_invitation(&other_owner).unwrap();
+    let body = invite_body(&other_owner.stored.owner_vk, &theirs, Some("forwarded"));
     let token = deliver(&mut carrier, &body, BASE);
-    let opened = open(&carrier, them_id(), &token).expect("opens");
-    assert_eq!(
-        opened.invitee.member.invited_by,
-        MemberId::from(&other_owner.stored.owner_vk)
+    let why = open(&carrier, them_id(), &token).unwrap_err();
+    assert!(why.contains("not made by the person who sent it"), "{why}");
+
+    // An invitation whose invitee key is the sender's own, which would make the user adopt the
+    // sender's identity in that room.
+    let (_, target) = target();
+    let mut adopt = invitation_for(&target);
+    adopt.invitee_signing_key = them();
+    adopt.invitee.member.member_vk = them().verifying_key();
+    let body = invite_body(&target.stored.owner_vk, &adopt, None);
+    let token = deliver(&mut carrier, &body, BASE + 1);
+    assert!(
+        open(&carrier, them_id(), &token)
+            .unwrap_err()
+            .contains("not made by")
     );
 }
 

@@ -157,8 +157,8 @@ pub struct WorkView {
     pub id: u64,
     /// What it is, for the screen: "Creating “Book club”", "Joining a room".
     pub what: String,
-    /// The room it is about (its key), when it has one: a create or join names it from the
-    /// start, so a card that started a join can tell its own from another.
+    /// The room a join is for (its key), from the start, so a card that started a join can tell
+    /// its own from another. `None` for everything else.
     pub room: Option<String>,
     pub state: WorkState,
 }
@@ -644,6 +644,7 @@ impl Work {
         shown: &dyn Fn(&VerifyingKey) -> bool,
     ) -> Result<(), String> {
         if let Some(why) = create::join_refusal(nickname) {
+            super::dm_invite::wipe_invitation(invitation);
             return Err(why);
         }
         if shown(&invitation.room) {
@@ -676,6 +677,7 @@ impl Work {
                 }
             });
         if let Some(why) = earlier {
+            super::dm_invite::wipe_invitation(invitation);
             return Err(why.into());
         }
         // A leave of this room that failed is over: it must not be tried again over the room

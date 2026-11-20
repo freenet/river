@@ -26,8 +26,8 @@
 //! **What an invitation in a message proves.** Anything sealed to a user's key can be put in a
 //! message by any member, and the envelope has no sender binding, so a member can re-sign a
 //! ciphertext that was sealed to the user as their own message. The signed sender of the message
-//! is the one fact the thread can name. The invitation says who invited the invitee, and the card
-//! says only that the person sent the message, never that they made the invitation. The
+//! is the one fact the thread can name. Accepting therefore requires that the invitation was
+//! made by the signed sender ([`open`]); the card says only that the person sent the message. The
 //! invitation is also untrusted input: its size is bounded before it is decoded, it must name the
 //! room the message names, and it must agree with itself ([`super::create::invitation_refusal`]).
 //! Accepting is never automatic.
@@ -247,6 +247,18 @@ pub fn open(room: &LiveRoom, peer: MemberId, token: &PurgeToken) -> Result<Invit
         return Err(
             "This invitation is damaged: it is for a different room than the message says."
                 .to_owned(),
+        );
+    }
+    // It must be the sender's own invitation: made and signed by them, for a key that is not
+    // theirs. Anyone can put an invitation they were given in a message, and one whose invitee
+    // key is an existing member's would make the user adopt that member's identity in the room
+    // (the join treats a member already in the room as joined and stores the key).
+    if invitation.invitee.member.invited_by != peer
+        || MemberId::from(&invitation.invitee.member.member_vk) == peer
+    {
+        wipe_invitation(invitation);
+        return Err(
+            "This invitation was not made by the person who sent it, so it is not used.".to_owned(),
         );
     }
     match create::invitation_refusal(&invitation) {
