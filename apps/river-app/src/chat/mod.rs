@@ -30,6 +30,7 @@ pub(crate) mod markdown;
 mod member_modal;
 mod mention;
 pub mod model;
+pub mod node_status;
 pub(crate) mod node_ui;
 mod notify_dialog;
 pub mod overview;
@@ -284,6 +285,8 @@ pub struct Chat {
     pub export: Option<identity::ExportDialog>,
     /// "Background and startup", when the shell offers it ([`background`]).
     pub background: Option<background::BackgroundUi>,
+    /// "Node status" ([`node_status`]).
+    pub status: node_status::NodeStatusUi,
     /// Do not disturb: this device's switch and schedule ([`dnd`]).
     pub dnd: dnd::DndUi,
     /// Whether the last status was not live, so the next live update is catch-up rather than
@@ -423,6 +426,7 @@ impl Chat {
             invite: None,
             export: None,
             background: None,
+            status: Default::default(),
             dnd: Default::default(),
             catching_up: true,
             full_list: false,
@@ -991,6 +995,7 @@ impl Chat {
             || self.notify_dialog.is_some()
             || self.switcher.is_some()
             || self.background.as_ref().is_some_and(|b| b.open)
+            || self.status.open
             || self.dnd.open
             || self.overview
             || self.link_menu.is_some()

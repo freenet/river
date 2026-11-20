@@ -63,6 +63,12 @@ pub trait NodeHost: Send + Sync + 'static {
     /// Start an installed node that is not running. Runs on a worker thread.
     fn start(&self) -> Result<(), String>;
 
+    /// The latest Freenet release, for the node status dialog. Blocks on the network, so it runs
+    /// on a worker thread. `None` when it can't be found (or this shell doesn't look).
+    fn latest_version(&self) -> Option<String> {
+        None
+    }
+
     /// A directory private to this user where River keeps its settings, including the
     /// permission the node grants it to open the user's rooms. `None` keeps that permission
     /// for this run only, so it is asked for again next time.

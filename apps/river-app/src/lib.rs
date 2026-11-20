@@ -563,6 +563,7 @@ impl RiverApp {
     /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
     /// the start of every frame, so it sees every change however it came about.
     fn sync_unread(&mut self, tx: &mut Tx) {
+        self.sync_node_status(tx);
         self.sync_dnd(tx);
         // Both run every frame, so neither is short-circuited away.
         self.chat.close_search_under_dialog();
@@ -589,6 +590,41 @@ impl RiverApp {
         }
     }
 
+    /// Keep the node status dialog current while it is open. Does nothing, and schedules
+    /// nothing, while it is closed.
+    fn sync_node_status(&mut self, tx: &mut Tx) {
+        if !self.chat.status.open {
+            return;
+        }
+        // Unknown until the rooms are loaded: "0 rooms" while loading would be wrong.
+        let rooms = match self.chat.source {
+            chat::Source::Node(chat::LinkStatus::Loading) | chat::Source::Example => None,
+            chat::Source::Node(link) => {
+                let all = self.chat.rooms().len();
+                let behind = self.chat.issues.not_following.len().min(all);
+                let following = (link == chat::LinkStatus::Live).then_some(all - behind);
+                Some((all, following))
+            }
+        };
+        let status = &mut self.chat.status;
+        status.connection =
+            chat::node_status::connection_of(&self.setup, &self.access, self.chat.source);
+        status.address = self.chat.node.choice.address.authority();
+        status.remote = !self.chat.node.choice.address.is_loopback();
+        status.rooms = rooms;
+        if let Some(ctl) = &self.ctl {
+            if status.should_refresh(std::time::Instant::now()) {
+                status.refresh_started();
+                ctl.probe_status();
+            }
+            if status.wants_latest() {
+                status.latest_started();
+                ctl.fetch_latest();
+            }
+        }
+        tx.wake_after(chat::node_status::REFRESH_EVERY);
+    }
+
     /// Take a new setup state. Reaching a node starts reading the rooms.
     pub fn set_setup(&mut self, setup: Setup) {
         let connected = matches!(setup, Setup::Connected { .. });
@@ -596,6 +632,15 @@ impl RiverApp {
             Setup::Connected { version } => Some(version.clone()),
             _ => None,
         };
+        if let Setup::Failed(why) = &setup {
+            let at = self.chat.node.choice.address.authority();
+            self.chat.status.note(
+                chat::node_status::ErrorKind::SetupFailed,
+                &at,
+                chat::node_status::now_secs(),
+                why,
+            );
+        }
         if let Setup::Connected { version } = &setup {
             // The node updates itself. When its version changes under the open app, say so.
             if let Some(old) = was.as_ref().filter(|old| *old != version) {
@@ -646,6 +691,10 @@ impl RiverApp {
     pub fn apply_rooms(&mut self, update: RoomsUpdate, tx: &mut Tx) {
         match update {
             RoomsUpdate::Access(access) => {
+                let at = self.chat.node.choice.address.authority();
+                self.chat
+                    .status
+                    .note_access(&access, &at, chat::node_status::now_secs());
                 self.access = access;
             }
             RoomsUpdate::Rooms {
@@ -658,6 +707,10 @@ impl RiverApp {
                 issues,
                 work,
             } => {
+                let at = self.chat.node.choice.address.authority();
+                self.chat
+                    .status
+                    .note_link(status, &at, chat::node_status::now_secs());
                 let was_stale = self.chat.issues.update_required;
                 self.chat.issues = issues;
                 // River moved on and this build stopped writing: look for the update now,
@@ -677,6 +730,10 @@ impl RiverApp {
                 self.sync_unread(tx);
             }
             RoomsUpdate::Status(status) => {
+                let at = self.chat.node.choice.address.authority();
+                self.chat
+                    .status
+                    .note_link(status, &at, chat::node_status::now_secs());
                 self.chat.note_status(status);
             }
             // The link is copied as the web UI's invite dialog copies it: to the clipboard as
@@ -945,6 +1002,35 @@ impl chat::BackgroundHost for PreviewBackground {
     }
 }
 
+/// The chat screen with "Node status" open, the link in `link`, after `edit` set what the node
+/// answered and what went wrong.
+fn node_status_scene(
+    s: &mut RiverApp,
+    link: chat::LinkStatus,
+    edit: fn(&mut chat::node_status::NodeStatusUi, &str),
+) {
+    identity_scene(s, |_| {});
+    s.chat.source = chat::Source::Node(link);
+    s.access = Access::Ready;
+    let at = s.chat.node.choice.address.authority();
+    edit(&mut s.chat.status, &at);
+    s.chat.status.open();
+}
+
+/// The node answered with `version`.
+fn node_answered(ui: &mut chat::node_status::NodeStatusUi, at: &str, version: &str) {
+    ui.apply(
+        at,
+        chat::node_status::StatusEvent::Reach {
+            authority: at.to_owned(),
+            reach: chat::node_status::Reach::Answered {
+                version: version.into(),
+            },
+        },
+        std::time::Instant::now(),
+    );
+}
+
 /// The chat screen with "Background and startup" open, for a desktop with or without a tray.
 fn background_scene(s: &mut RiverApp, tray: bool) {
     identity_scene(s, |_| {});
@@ -1201,6 +1287,52 @@ pub const SCENES: &[Scene] = &[
              0.1.0."
                 .into(),
         );
+    }),
+    ("chat-node-status", |s| {
+        node_status_scene(s, chat::LinkStatus::Live, |ui, at| {
+            node_answered(ui, at, "0.2.158");
+            ui.latest = chat::node_status::Latest::Known("0.2.160".into());
+        })
+    }),
+    ("chat-node-status-reconnecting", |s| {
+        node_status_scene(s, chat::LinkStatus::Reconnecting, |ui, at| {
+            node_answered(ui, at, "0.2.160");
+            ui.latest = chat::node_status::Latest::Known("0.2.160".into());
+            ui.note(
+                chat::node_status::ErrorKind::ConnectionLost,
+                at,
+                1_795_000_000,
+                "",
+            );
+        })
+    }),
+    ("chat-node-status-old-node", |s| {
+        node_status_scene(s, chat::LinkStatus::Live, |ui, at| {
+            node_answered(ui, at, "0.2.155");
+            ui.latest = chat::node_status::Latest::Unavailable;
+        })
+    }),
+    ("chat-node-status-remote", |s| {
+        use_node(s, "192.168.1.20:7509");
+        node_status_scene(s, chat::LinkStatus::Live, |ui, at| {
+            node_answered(ui, at, "0.2.159");
+            ui.latest = chat::node_status::Latest::Fetching;
+        })
+    }),
+    ("rooms-waiting-for-approval-node-status", |s| {
+        connect(s);
+        s.access = Access::WaitingForApproval {
+            approve_url: "http://127.0.0.1:7509/permission/approve".into(),
+        };
+        s.chat.status.latest = chat::node_status::Latest::Known("0.2.160".into());
+        s.chat.status.open();
+    }),
+    ("rooms-unreachable-node-status", |s| {
+        connect(s);
+        s.access = Access::Unreachable("Connection refused".into());
+        let at = s.chat.node.choice.address.authority();
+        s.chat.status.note_access(&s.access, &at, 1_795_000_000);
+        s.chat.status.open();
     }),
     ("chat-settings", |s| {
         connect(s);
@@ -2163,7 +2295,19 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
         }
         root = root.child(notes);
     }
-    root.child(body)
+    // Before the rooms show, the node status says why River is not connected yet.
+    let mut layer = Vec::new();
+    chat::node_status::dialog(&s.chat, &k, &mut layer);
+    rune_kit::root(
+        root.child(body).child(
+            Button::new("Node status")
+                .variant(ButtonVariant::Ghost)
+                .on_press(|s: &mut RiverApp| s.chat.status.open())
+                .build(&k)
+                .key("node-status-open"),
+        ),
+        layer,
+    )
 }
 
 /// The screens between reaching the node and showing the rooms.
@@ -3559,6 +3703,71 @@ mod tests {
         );
         press(&mut rt, "background-close");
         assert!(rt.find("background-dialog").is_none());
+    }
+
+    #[test]
+    fn node_status_opens_from_the_connection_dot_and_settings_and_copies_diagnostics() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, tx| s.apply_rooms(RoomsUpdate::Access(Access::Ready), tx));
+        settle(&mut rt);
+        assert!(rt.find("node-status-dialog").is_none());
+        press(&mut rt, "connection-pill");
+        assert!(rt.find("node-status-dialog").is_some());
+        assert!(rt.find("ns-connection").is_some());
+        assert!(rt.find("ns-peers").is_some());
+        assert_eq!(board.text(), None, "nothing is copied until the user asks");
+        assert!(
+            rt.elements()
+                .into_iter()
+                .filter_map(|e| e.text)
+                .any(|t| t.contains("includes node address")),
+            "the button says the node address is copied"
+        );
+        press(&mut rt, "ns-copy");
+        let copied: String = (*board.text().expect("diagnostics were copied")).clone();
+        assert!(copied.starts_with("River node status\n"), "{copied}");
+        assert!(
+            copied.contains("Node host and port (identifying if remote): 127.0.0.1:7509"),
+            "{copied}"
+        );
+        for room in rt.state.chat.rooms() {
+            assert!(!copied.contains(&room.name), "{}", room.name);
+        }
+        press(&mut rt, "ns-close");
+        assert!(rt.find("node-status-dialog").is_none());
+        // From Settings.
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-node-status");
+        assert!(rt.find("node-status-dialog").is_some());
+        assert!(rt.find("settings-dialog").is_none());
+    }
+
+    #[test]
+    fn node_status_is_reachable_before_the_rooms_show() {
+        let mut state = RiverApp::detached();
+        state.setup = Setup::Connected {
+            version: "0.2.158".into(),
+        };
+        state.access = Access::WaitingForApproval {
+            approve_url: "http://127.0.0.1:7509/x".into(),
+        };
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (1280.0, 800.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.0);
+        press(&mut rt, "node-status-open");
+        assert!(rt.find("node-status-dialog").is_some());
+        // The window's per-frame hook (`spec().poll`) is not run by the test runtime.
+        rt.update(|s, tx| s.sync_node_status(tx));
+        let at = rt.state.chat.status.connection;
+        assert_eq!(at, chat::node_status::Connection::WaitingForApproval);
     }
 
     #[test]

@@ -866,11 +866,12 @@ mod tests {
     fn a_dialog_open_over_the_panel_closes_it_and_the_chord_will_not_reopen_over_it() {
         let uid = Chat::example().room().expect("room").members[0].uid.clone();
         type Open = fn(&mut Chat, &str);
-        let openers: [(&str, Open); 4] = [
+        let openers: [(&str, Open); 5] = [
             ("do not disturb", |c, _| c.open_dnd()),
             ("details", |c, _| c.open_details()),
             ("member", |c, uid| c.open_member(uid)),
             ("notify", |c, _| c.open_notify_dialog()),
+            ("node status", |c, _| c.status.open()),
         ];
         for (name, open) in openers {
             let mut chat = with_panel();

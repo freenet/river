@@ -233,6 +233,7 @@ impl Release {
     /// quota (the same approach as freenet-core's auto-update).
     pub fn latest() -> Result<Release, String> {
         let probe = ureq::AgentBuilder::new()
+            .user_agent(concat!("river-desktop/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .redirects(0)
             .build();
