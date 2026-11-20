@@ -630,6 +630,22 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Production room setup. `false` lists first; `true` is Retry, which
+    // registers first. This build has no node, so the outgoing send fails.
+    set_hook(
+        "reloadRooms",
+        Closure::<dyn FnMut(bool)>::new(move |register_first: bool| {
+            if register_first {
+                crate::components::app::chat_delegate::retry_rooms_load();
+            } else {
+                crate::util::safe_spawn_local(async {
+                    let _ = crate::components::app::chat_delegate::set_up_chat_delegate().await;
+                });
+            }
+        })
+        .into_js_value(),
+    );
+
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.

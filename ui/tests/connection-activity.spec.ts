@@ -118,4 +118,26 @@ test.describe("Connection activity", () => {
     await expect(pill).not.toHaveAttribute("data-busy-reason");
     expect(await rows.evaluateAll(els => els.map(el => el.getAttribute("data-testid")))).toEqual(roomIds);
   });
+
+  for (const registerFirst of [false, true]) {
+    const setup = registerFirst ? "register-first retry" : "normal setup";
+    test(`a failed outgoing room setup (${setup}) settles while cached rooms stay`, { tag: "@chromium-only" }, async ({ page }) => {
+      const pill = await openIdle(page);
+      const rows = page.getByTestId("room-list").locator('[data-testid^="room-item-"]');
+      await expect(rows.first()).toBeVisible();
+      const roomIds = await rows.evaluateAll(els => els.map(el => el.getAttribute("data-testid")));
+      expect(roomIds.length).toBeGreaterThan(0);
+
+      // Seen busy first, so an idle pill below is this attempt settling,
+      // not the initial render.
+      await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "loading");
+      await expect(pill).toHaveAttribute("data-busy-reason", "loading-rooms");
+
+      await callRiverTest(page, "reloadRooms", registerFirst);
+      await expect(pill).toHaveAttribute("aria-busy", "false", { timeout: 5_000 });
+      await expect(pill).not.toHaveAttribute("data-busy-reason");
+      await expect(pill.getByTestId("connection-status-label")).toHaveText("Connected");
+      expect(await rows.evaluateAll(els => els.map(el => el.getAttribute("data-testid")))).toEqual(roomIds);
+    });
+  }
 });

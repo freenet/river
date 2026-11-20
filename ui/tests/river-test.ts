@@ -50,6 +50,9 @@ type RiverTestHooks = {
   refuseOutstandingList(): void;
   // Answers the outstanding list with only rooms_data; the blob read then fails (no node).
   deliverStoredRoomsBlobListing(): void;
+  // Production room setup. false lists first; true is Retry (register first).
+  // This build has no node, so the outgoing send fails.
+  reloadRooms(registerFirst: boolean): void;
   // The held load worker settles; the load state is left as it is.
   releaseHeldLoadWorker(): void;
   switchRoom(name: string): void;
