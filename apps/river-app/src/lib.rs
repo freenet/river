@@ -1348,6 +1348,34 @@ pub const SCENES: &[Scene] = &[
             |c| c.close_member(),
         )
     }),
+    // The quick switcher (Ctrl+K): a blank box lists rooms with unread first, then the open
+    // room's members; typing narrows it; a query nothing matches says so.
+    ("chat-switcher", |s| {
+        connect(s);
+        s.chat.toggle_switcher();
+    }),
+    ("chat-switcher-query", |s| {
+        connect(s);
+        s.chat.toggle_switcher();
+        s.chat
+            .switcher
+            .as_mut()
+            .expect("open")
+            .query
+            .replace_text("ri");
+        s.chat
+            .switcher_highlight(chat::switcher::Target::Member("27".into()));
+    }),
+    ("chat-switcher-empty", |s| {
+        connect(s);
+        s.chat.toggle_switcher();
+        s.chat
+            .switcher
+            .as_mut()
+            .expect("open")
+            .query
+            .replace_text("zzzz");
+    }),
     // The bell in the conversation header opens a room's notification dialog: its three modes,
     // the current one checked. The name says what changes between the variants.
     ("chat-notification-modes", |s| {
@@ -1665,7 +1693,10 @@ pub fn spec() -> AppSpec<RiverApp> {
         }),
         // Keys no focused control took, or any key while nothing has focus: Escape abandons a
         // reply or an edit even when the composer is not focused.
-        on_key: Some(|s, ev, _| ev.key == rune::Key::Escape && s.chat.escape()),
+        on_key: Some(|s, ev, _| {
+            (chat::switcher::is_chord(ev) && s.chat.switcher_chord(std::time::Instant::now()))
+                || (ev.key == rune::Key::Escape && s.chat.escape())
+        }),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
 }
@@ -2528,6 +2559,470 @@ mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         settle(rt);
+    }
+
+    /// A runtime that routes keys no control took to the app's own handler, as the window does.
+    fn node_rooms_with_keys(board: &rune::clipboard::MemoryClipboard) -> Runtime<RiverApp> {
+        let mut rt = node_rooms(board);
+        rt.on_key = spec().on_key;
+        rt
+    }
+
+    fn chord(c: char) -> rune::KeyEvent {
+        rune::KeyEvent {
+            key: rune::Key::Command(c),
+            mods: rune::Mods {
+                cmd: true,
+                ctrl: !cfg!(target_os = "macos"),
+                logo: cfg!(target_os = "macos"),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn bare(key: rune::Key) -> rune::KeyEvent {
+        rune::KeyEvent {
+            key,
+            mods: rune::Mods::default(),
+        }
+    }
+
+    fn open_room_name(rt: &Runtime<RiverApp>) -> String {
+        rt.state.chat.room().expect("a room").name.clone()
+    }
+
+    #[test]
+    fn the_chord_opens_the_switcher_even_from_the_composer_and_closes_it_again() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.update(|s, _| s.chat.composer.focused = true);
+        settle(&mut rt);
+        rt.key(chord('k'));
+        settle(&mut rt);
+        assert!(rt.state.chat.switcher.is_some(), "Ctrl+K opened it");
+        assert!(rt.find("switcher-dialog").is_some());
+        // A second chord inside the repeat guard is swallowed (a held key), one after it closes.
+        // The guard's last time is set an hour ahead, so a real key now is always "too soon"
+        // however fast or slow the machine runs, and the later one is given, not read.
+        let t0 = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        rt.update(move |s, _| s.chat.pin_chord_time(Some(t0)));
+        rt.key(chord('k'));
+        settle(&mut rt);
+        assert!(
+            rt.state.chat.switcher.is_some(),
+            "a chord this soon is a repeat"
+        );
+        let later = t0 + chat::switcher::CHORD_QUIET * 3;
+        rt.update(move |s, _| assert!(s.chat.switcher_chord(later)));
+        settle(&mut rt);
+        assert!(rt.state.chat.switcher.is_none(), "the chord closes it");
+        assert!(rt.find("switcher-dialog").is_none());
+    }
+
+    #[test]
+    fn escape_closes_the_switcher_and_opens_nothing() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        let before = open_room_name(&rt);
+        rt.key(chord('k'));
+        settle(&mut rt);
+        rt.key(bare(rune::Key::Escape));
+        settle(&mut rt);
+        assert!(rt.state.chat.switcher.is_none());
+        assert_eq!(open_room_name(&rt), before);
+    }
+
+    #[test]
+    fn arrows_and_enter_open_a_room_and_a_blank_box_lists_unread_rooms_first() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        assert_eq!(open_room_name(&rt), "Town Square");
+        rt.key(chord('k'));
+        settle(&mut rt);
+        let hits = rt.state.chat.switcher_hits();
+        let first_two: Vec<_> = hits
+            .iter()
+            .take(2)
+            .map(|h| match &h.target {
+                chat::switcher::Target::Room(k) => rt
+                    .state
+                    .chat
+                    .rooms()
+                    .iter()
+                    .find(|r| &r.key == k)
+                    .map(|r| r.name.clone())
+                    .expect("a room"),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(first_two, ["Design Crew", "Rust Help"]);
+        rt.key(bare(rune::Key::Down));
+        settle(&mut rt);
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert!(rt.state.chat.switcher.is_none(), "choosing closes it");
+        assert_eq!(open_room_name(&rt), "Rust Help");
+    }
+
+    #[test]
+    fn up_from_the_top_wraps_to_the_last_result() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.key(chord('k'));
+        settle(&mut rt);
+        let n = rt.state.chat.switcher_hits().len();
+        rt.key(bare(rune::Key::Up));
+        settle(&mut rt);
+        let hits = rt.state.chat.switcher_hits();
+        assert_eq!(rt.state.chat.switcher_selected(&hits), n - 1);
+    }
+
+    #[test]
+    fn typing_narrows_the_results_and_enter_on_a_member_opens_their_dialog() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.key(chord('k'));
+        settle(&mut rt);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text("p".into()),
+            mods: rune::Mods::default(),
+        });
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text("r".into()),
+            mods: rune::Mods::default(),
+        });
+        settle(&mut rt);
+        assert_eq!(
+            rt.state.chat.switcher.as_ref().expect("open").query.text,
+            "pr"
+        );
+        let hits = rt.state.chat.switcher_hits();
+        assert!(
+            matches!(&hits[0].target, chat::switcher::Target::Member(_)),
+            "Priya is the best match: {hits:?}"
+        );
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert!(rt.state.chat.switcher.is_none());
+        let uid = rt
+            .state
+            .chat
+            .member_modal
+            .clone()
+            .expect("the member dialog");
+        let room = rt.state.chat.room().expect("room");
+        assert_eq!(
+            room.member_by_uid(&uid).expect("member").nickname,
+            "Priya Raman"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_row_opens_that_room() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.key(chord('k'));
+        settle(&mut rt);
+        press(&mut rt, "switcher-row-1");
+        assert!(rt.state.chat.switcher.is_none());
+        assert_eq!(open_room_name(&rt), "Rust Help");
+    }
+
+    #[test]
+    fn the_chord_does_nothing_over_another_dialog() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        press(&mut rt, "create-room");
+        assert!(rt.state.chat.form.open.is_some());
+        rt.key(chord('k'));
+        settle(&mut rt);
+        assert!(rt.state.chat.switcher.is_none());
+        assert!(rt.state.chat.form.open.is_some(), "the dialog stays");
+    }
+
+    #[test]
+    fn a_query_with_no_match_says_so_and_enter_does_nothing() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.key(chord('k'));
+        settle(&mut rt);
+        rt.update(|s, _| {
+            s.chat
+                .switcher
+                .as_mut()
+                .expect("open")
+                .query
+                .replace_text("qqqq")
+        });
+        settle(&mut rt);
+        assert!(rt.find("switcher-empty").is_some());
+        let before = open_room_name(&rt);
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert_eq!(open_room_name(&rt), before);
+        assert!(rt.state.chat.member_modal.is_none());
+    }
+
+    fn type_text(rt: &mut Runtime<RiverApp>, text: &str) {
+        for c in text.chars() {
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Text(c.to_string()),
+                mods: rune::Mods::default(),
+            });
+        }
+        settle(rt);
+    }
+
+    /// Open it with the chord. The chord ignores a press soon after another, judged by the real
+    /// clock, so forget the last one first: how fast the machine runs then cannot matter.
+    fn open_switcher(rt: &mut Runtime<RiverApp>) {
+        rt.update(|s, _| s.chat.pin_chord_time(None));
+        rt.key(chord('k'));
+        settle(rt);
+        assert!(rt.state.chat.switcher.is_some(), "the chord opened it");
+    }
+
+    fn room_key(rt: &Runtime<RiverApp>, name: &str) -> String {
+        rt.state
+            .chat
+            .rooms()
+            .iter()
+            .find(|r| r.name == name)
+            .expect("a room")
+            .key
+            .clone()
+    }
+
+    /// The row the highlight is on, by what it opens.
+    fn highlighted(rt: &Runtime<RiverApp>) -> chat::switcher::Target {
+        let hits = rt.state.chat.switcher_hits();
+        let i = rt.state.chat.switcher_selected(&hits);
+        hits[i].target.clone()
+    }
+
+    #[test]
+    fn the_highlight_follows_its_row_when_the_list_changes_under_it() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        open_switcher(&mut rt);
+        rt.key(bare(rune::Key::Down));
+        settle(&mut rt);
+        let rust = room_key(&rt, "Rust Help");
+        assert_eq!(highlighted(&rt), chat::switcher::Target::Room(rust.clone()));
+        // Book Club gets nine unread and moves to the top, so Rust Help is on another row.
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                rooms
+                    .iter_mut()
+                    .find(|r| r.name == "Book Club")
+                    .expect("room")
+                    .unread = 9;
+            })
+        });
+        settle(&mut rt);
+        assert_eq!(
+            highlighted(&rt),
+            chat::switcher::Target::Room(rust),
+            "still the same room"
+        );
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert_eq!(open_room_name(&rt), "Rust Help");
+    }
+
+    #[test]
+    fn a_click_opens_what_is_drawn_on_the_row_after_the_list_changed() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        open_switcher(&mut rt);
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                rooms
+                    .iter_mut()
+                    .find(|r| r.name == "Book Club")
+                    .expect("room")
+                    .unread = 9;
+            })
+        });
+        settle(&mut rt);
+        press(&mut rt, "switcher-row-0");
+        assert_eq!(open_room_name(&rt), "Book Club");
+    }
+
+    #[test]
+    fn a_highlighted_room_that_goes_away_leaves_the_top_row_highlighted() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        open_switcher(&mut rt);
+        rt.key(bare(rune::Key::Down));
+        settle(&mut rt);
+        rt.update(|s, _| {
+            s.chat
+                .edit_rooms(|rooms| rooms.retain(|r| r.name != "Rust Help"))
+        });
+        settle(&mut rt);
+        let hits = rt.state.chat.switcher_hits();
+        assert_eq!(rt.state.chat.switcher_selected(&hits), 0);
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert_eq!(open_room_name(&rt), "Design Crew");
+    }
+
+    #[test]
+    fn a_member_who_leaves_while_the_switcher_is_open_is_not_opened() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        open_switcher(&mut rt);
+        type_text(&mut rt, "pri");
+        let hits = rt.state.chat.switcher_hits();
+        assert!(matches!(&hits[0].target, chat::switcher::Target::Member(_)));
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                rooms[0].members.retain(|m| m.nickname != "Priya Raman");
+            })
+        });
+        settle(&mut rt);
+        assert!(rt.state.chat.switcher_hits().is_empty());
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert!(rt.state.chat.member_modal.is_none());
+    }
+
+    #[test]
+    fn editing_the_query_resets_the_highlight_even_when_the_old_text_comes_back() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        open_switcher(&mut rt);
+        type_text(&mut rt, "a");
+        for _ in 0..3 {
+            rt.key(bare(rune::Key::Down));
+        }
+        settle(&mut rt);
+        let hits = rt.state.chat.switcher_hits();
+        assert_eq!(rt.state.chat.switcher_selected(&hits), 3);
+        type_text(&mut rt, "b");
+        rt.key(bare(rune::Key::Backspace));
+        settle(&mut rt);
+        assert_eq!(
+            rt.state.chat.switcher.as_ref().expect("open").query.text,
+            "a"
+        );
+        let hits = rt.state.chat.switcher_hits();
+        assert_eq!(rt.state.chat.switcher_selected(&hits), 0);
+    }
+
+    #[test]
+    fn typing_after_opening_from_the_composer_goes_to_the_switcher_only() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.update(|s, _| s.chat.composer.focused = true);
+        settle(&mut rt);
+        type_text(&mut rt, "x");
+        assert_eq!(
+            rt.state.chat.composer.text, "x",
+            "the composer had the keyboard"
+        );
+        open_switcher(&mut rt);
+        type_text(&mut rt, "pr");
+        assert_eq!(
+            rt.state.chat.switcher.as_ref().expect("open").query.text,
+            "pr"
+        );
+        assert_eq!(
+            rt.state.chat.composer.text, "x",
+            "nothing reached the composer"
+        );
+    }
+
+    #[test]
+    fn the_composer_has_the_keyboard_back_after_escape_and_after_choosing() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.update(|s, _| s.chat.composer.focused = true);
+        settle(&mut rt);
+        open_switcher(&mut rt);
+        rt.key(bare(rune::Key::Escape));
+        settle(&mut rt);
+        type_text(&mut rt, "a");
+        assert_eq!(rt.state.chat.composer.text, "a", "after Escape");
+        // Choosing a room: its composer takes the text.
+        open_switcher(&mut rt);
+        type_text(&mut rt, "rust");
+        rt.key(bare(rune::Key::Enter));
+        settle(&mut rt);
+        assert_eq!(open_room_name(&rt), "Rust Help");
+        type_text(&mut rt, "b");
+        assert_eq!(rt.state.chat.composer.text, "b", "after choosing a room");
+    }
+
+    #[test]
+    fn more_than_eight_results_show_a_window_that_follows_the_highlight() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                let base = rooms[0].clone();
+                for i in 0..20 {
+                    let mut r = base.clone();
+                    r.key = format!("extra-{i}");
+                    r.name = format!("Extra {i}");
+                    rooms.push(r);
+                }
+            })
+        });
+        open_switcher(&mut rt);
+        assert!(rt.state.chat.switcher_hits().len() > chat::switcher::VISIBLE_ROWS);
+        let drawn = |rt: &Runtime<RiverApp>| {
+            (0..40)
+                .filter(|i| rt.find(&format!("switcher-row-{i}")).is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(drawn(&rt), (0..8).collect::<Vec<_>>());
+        assert!(rt.find("switcher-more").is_some());
+        for _ in 0..10 {
+            rt.key(bare(rune::Key::Down));
+        }
+        settle(&mut rt);
+        let rows = drawn(&rt);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(
+            rows.last(),
+            Some(&10),
+            "the highlighted row is the last shown"
+        );
+        press(&mut rt, "switcher-row-10");
+        assert!(rt.state.chat.switcher.is_none());
+    }
+
+    #[test]
+    fn muted_and_mentions_only_rooms_do_not_rank_as_unread() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms_with_keys(&board);
+        let design = room_key(&rt, "Design Crew");
+        let rust = room_key(&rt, "Rust Help");
+        rt.update(move |s, _| {
+            s.chat
+                .set_mode(&design, rooms::modes::NotificationMode::Muted);
+            s.chat
+                .set_mode(&rust, rooms::modes::NotificationMode::MentionsAndReplies);
+        });
+        open_switcher(&mut rt);
+        let order: Vec<String> = rt
+            .state
+            .chat
+            .switcher_hits()
+            .iter()
+            .take(2)
+            .map(|h| match &h.target {
+                chat::switcher::Target::Room(k) => k.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        // Muted counts as none. A mentions-only room ranks only for the messages that mention
+        // you, which the example's two do not; so both fall back to the room list's order.
+        let town = room_key(&rt, "Town Square");
+        let design = room_key(&rt, "Design Crew");
+        assert_eq!(order, [town, design]);
     }
 
     #[test]

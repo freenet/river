@@ -36,6 +36,7 @@ mod notify_dialog;
 #[allow(dead_code)]
 mod share_link;
 pub(crate) mod style;
+pub mod switcher;
 #[cfg(test)]
 mod tests;
 mod update_view;
@@ -289,6 +290,10 @@ pub struct Chat {
     notify_dialog: Option<String>,
     /// River's own updates and the settings dialog.
     pub update: crate::update::UpdateUi,
+    /// The quick switcher (Ctrl+K), when open ([`switcher`]).
+    pub switcher: Option<switcher::Switcher>,
+    /// When the switcher's chord last arrived, for [`switcher::chord_gate`].
+    chord_at: Option<std::time::Instant>,
 }
 
 impl Chat {
@@ -400,6 +405,8 @@ impl Chat {
             modes: HashMap::new(),
             picked: HashMap::new(),
             notify_dialog: None,
+            switcher: None,
+            chord_at: None,
             node: Default::default(),
             update: Default::default(),
         };
@@ -941,6 +948,7 @@ impl Chat {
             || self.member_modal.is_some()
             || self.details.is_some()
             || self.notify_dialog.is_some()
+            || self.switcher.is_some()
             || self.link_menu.is_some()
             || self.members_overlay
             || self.picker.is_some();
