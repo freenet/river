@@ -1350,6 +1350,24 @@ impl Running {
         }
     }
 
+    /// [`wait_until`](Self::wait_until) for a test that depends on the one connection it
+    /// started with: an answer pushed to the node reaches that connection only, and is not
+    /// resent on a later one. If the session reconnects meanwhile (a dropped socket, a read
+    /// that failed on a loaded machine), the wait fails saying so at once, instead of timing
+    /// out as "never: ..." with the cause hidden.
+    fn wait_on_one_connection(&self, node: &FakeNode, what: &str, done: impl Fn() -> bool) {
+        self.wait_until(what, || {
+            let connections = node.with(|w| w.connections.len());
+            assert!(
+                connections <= 1,
+                "the session reconnected ({connections} connections) before: {what}; this test \
+                 needs its first connection, so a lost connection is an environment fault \
+                 (the log above says why it was lost)"
+            );
+            done()
+        });
+    }
+
     /// Wait until the latest room list satisfies `done`.
     fn wait_rooms(&self, what: &str, done: impl Fn(&[Room], &Issues, LinkStatus) -> bool) {
         self.wait_until(what, || match self.last_rooms() {
@@ -2265,12 +2283,12 @@ fn two_rooms_each_have_an_update_out_at_once() {
     let (session, _dir) = following(&node, &[&a, &b], "send-two-rooms", quick());
     session.act(&a, say("in A"));
     session.act(&b, say("in B"));
-    session.wait_until("both out", || node.with(|w| w.updates.len() == 2));
+    session.wait_on_one_connection(&node, "both out", || node.with(|w| w.updates.len() == 2));
     let keys: HashSet<ContractKey> = node.with(|w| w.updates.iter().map(|(k, _)| *k).collect());
     assert_eq!(keys, HashSet::from([a.key, b.key]));
     // B's answer settles B, not A.
     node.with(|w| w.push.push(accepted(&b)));
-    session.wait_until("B settled", || {
+    session.wait_on_one_connection(&node, "B settled", || {
         session.last_rooms().is_some_and(|(rooms, _, _)| {
             let find = |name: &str, text: &str| {
                 rooms
