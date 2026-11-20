@@ -580,6 +580,7 @@ impl RiverApp {
         self.sync_dnd(tx);
         // Both run every frame, so neither is short-circuited away.
         self.chat.close_search_under_dialog();
+        self.chat.close_member_search_if_hidden();
         let (revealing, flashing) = (
             self.chat.apply_reveal(tx),
             self.chat.tick_flash(std::time::Instant::now()),
@@ -883,6 +884,33 @@ impl RiverApp {
 
 /// Your own member info dialog in the first example room, shown as a room from the node (so
 /// saving sends a command), after `edit` set the field and the delivery state.
+/// The example room with a deeper invite tree, and the members box open on `query`.
+fn members_scene(s: &mut RiverApp, query: Option<&str>) {
+    use chat::model::{Appointer, Member, Role};
+    connect(s);
+    s.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let by = |id: u32, name: &str, inviter: Option<u32>| {
+            let mut m = Member::new(id, name, Role::Member);
+            m.invited_by = inviter;
+            m
+        };
+        room.members.push(by(60, "Aroha Ngata", Some(15)));
+        room.members.push(by(61, "Bjorn Eklund", Some(60)));
+        let mut d = by(62, "Anan Chaudhry", Some(61));
+        d.role = Role::Deputy;
+        d.deputized_by = vec![Appointer::Owner];
+        d.can_ban_you = Some(false);
+        room.members.push(d);
+        room.members.push(by(63, "Ines Alvarez", Some(62)));
+        room.members.push(by(64, "Left Behind", None));
+    });
+    if let Some(q) = query {
+        s.chat.toggle_member_search();
+        s.chat.member_search.query = rune::TextEdit::new(q);
+    }
+}
+
 fn nickname_scene(s: &mut RiverApp, edit: fn(&mut Chat, &mut chat::model::Room)) {
     connect(s);
     let mut rooms = chat::example::data().rooms;
@@ -1487,6 +1515,18 @@ pub const SCENES: &[Scene] = &[
     ("chat-narrow", connect),
     ("chat-narrow-members", |s| {
         connect(s);
+        s.chat.members_overlay = true;
+    }),
+    // The members list as an invite tree several levels deep (with a deputy that rose to the
+    // top, and a member whose inviter left, listed last), then searched: with matches, and
+    // with none.
+    ("chat-members-tree", |s| members_scene(s, None)),
+    ("chat-members-search", |s| members_scene(s, Some("an"))),
+    ("chat-members-search-none", |s| {
+        members_scene(s, Some("zzz"))
+    }),
+    ("chat-narrow-members-search", |s| {
+        members_scene(s, Some("an"));
         s.chat.members_overlay = true;
     }),
     // Rooms read from the node: none yet, and a lost connection.

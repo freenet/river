@@ -28,6 +28,7 @@ pub mod identity_texts {
 mod keys;
 mod links;
 pub(crate) mod markdown;
+pub mod member_list;
 mod member_modal;
 mod mention;
 pub mod model;
@@ -359,6 +360,11 @@ pub struct Chat {
     pub switcher: Option<switcher::Switcher>,
     /// The message search panel (Ctrl+F), when open ([`search`]).
     pub search: Option<search::Search>,
+    /// The members panel's search box ([`member_list`]); closed and cleared when the room changes.
+    pub member_search: member_list::MemberSearch,
+    /// Whether the window was last laid out narrow (set by the screen's layout hook), which
+    /// decides which members flag shows the panel.
+    pub(crate) narrow: bool,
     /// A message marked for a moment after a jump from the search panel.
     flash: Option<search::Flash>,
     /// Whether the unread and mentions overview is open ([`overview`]).
@@ -494,6 +500,8 @@ impl Chat {
             notify_dialog: None,
             switcher: None,
             search: None,
+            member_search: Default::default(),
+            narrow: false,
             flash: None,
             overview: false,
             reveal: None,
@@ -794,6 +802,11 @@ impl Chat {
         self.details = None;
         // The search lists the room it was opened in.
         self.drop_search();
+        // So does the members box: a query left from another room would hide everyone here.
+        // Not when the same room comes back after an empty reload of the list.
+        if !(self.selected.is_empty() && key == self.last_open) {
+            self.drop_member_search();
+        }
         if self.selected.is_empty() {
             // Nothing was open, so what the composer holds belongs to no room yet: keep it,
             // unless it is empty and this room has a draft.
@@ -839,7 +852,7 @@ impl Chat {
                     Source::Node(_) => self.emit(key, Action::Edit { target, text }),
                 }
                 self.composer = *draft;
-                self.composer.focused = true;
+                self.focus_composer();
                 return true;
             }
             (Source::Example, Mode::Reply(target)) => {
@@ -990,7 +1003,7 @@ impl Chat {
         }
         self.cancel();
         self.mode = Mode::Reply(target.to_owned());
-        self.composer.focused = true;
+        self.focus_composer();
     }
 
     /// Edit your message keyed `target` in the composer.
@@ -1055,7 +1068,7 @@ impl Chat {
     /// edit. Does nothing while a dialog or the narrow members panel is open, which take their
     /// own Escape. Returns whether it acted.
     pub fn escape(&mut self) -> bool {
-        let covered = self.form.open.is_some()
+        let covered_by_other = self.form.open.is_some()
             || self.member_modal.is_some()
             || self.details.is_some()
             || self.notify_dialog.is_some()
@@ -1066,13 +1079,20 @@ impl Chat {
             || self.overview
             || self.shortcuts_open
             || self.link_menu.is_some()
-            || self.members_overlay
             || self.picker.is_some();
-        if covered {
+        // The members box, when its field has the keyboard, takes Escape first, even inside a
+        // narrow window's overlay: the first press closes the box, the next closes the overlay.
+        if !covered_by_other && self.member_search_escape(true) {
+            return true;
+        }
+        if covered_by_other || self.members_overlay {
             return false;
         }
         if self.search.is_some() {
             self.close_search();
+            return true;
+        }
+        if self.member_search_escape(false) {
             return true;
         }
         if self.emoji_open {
@@ -1105,7 +1125,7 @@ impl Chat {
             return;
         }
         self.composer.insert(emoji);
-        self.composer.focused = true;
+        self.focus_composer();
     }
 
     /// Open or close the reaction picker on the message keyed `target`.

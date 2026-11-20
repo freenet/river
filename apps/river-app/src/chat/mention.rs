@@ -169,7 +169,7 @@ impl Chat {
         let text = format!("{} ", token(&c.uid, &c.name));
         self.composer.set_selection(p.anchor, self.composer.focus);
         self.composer.insert(&text);
-        self.composer.focused = true;
+        self.focus_composer();
         self.mention_off = None;
     }
 

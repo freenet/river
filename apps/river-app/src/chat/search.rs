@@ -308,7 +308,7 @@ pub struct Search {
     /// the top row. Cleared on every edit of the query.
     sel: Option<String>,
     /// Whether the composer had the keyboard when the panel opened, to give it back on close.
-    restore_composer: bool,
+    pub(super) restore_composer: bool,
     /// The last results, with what they were computed for (see [`Chat::search_results`]).
     cache: RefCell<Option<(u64, Rc<Results>)>>,
     /// How many times the search has run, for tests.
@@ -363,8 +363,12 @@ impl Chat {
         if self.other_dialog_open() || self.switcher.is_some() || self.room().is_none() {
             return false;
         }
-        if let Some(s) = &mut self.search {
+        if self.search.is_some() {
+            // The one search that holds the keyboard: not both boxes at once.
+            let from_members = self.dismiss_member_search();
+            let s = self.search.as_mut().expect("checked");
             s.query.focused = true;
+            s.restore_composer |= from_members;
             self.composer.focused = false;
             return true;
         }
@@ -372,8 +376,9 @@ impl Chat {
         self.picker = None;
         self.members_overlay = false;
         // The box takes the keyboard: the composer must not keep it, or typed text would go to
-        // both.
-        let had = std::mem::replace(&mut self.composer.focused, false);
+        // both. The members box, if open, closes; the composer comes back from this search.
+        let from_members = self.dismiss_member_search();
+        let had = std::mem::replace(&mut self.composer.focused, false) || from_members;
         self.search = Some(Search::new(had));
         true
     }

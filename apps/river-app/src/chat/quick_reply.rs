@@ -201,7 +201,7 @@ impl Chat {
             return false;
         }
         if self.actionable().is_some() {
-            self.composer.focused = true;
+            self.focus_composer();
         }
         true
     }
