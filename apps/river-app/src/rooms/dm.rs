@@ -186,11 +186,14 @@ pub fn threads(src: &Source<'_>) -> Threads {
     }
 
     let mut truncated = false;
-    // Oldest first within a thread (stable: the state's own order breaks ties), newest kept.
+    // Oldest first within a thread, newest kept. Messages in the same second are ordered by their
+    // purge token: the same on every device and every build, and not dependent on the order the
+    // room happens to hold them in (which differs between peers).
     let mut grouped: Vec<(MemberId, Vec<Row<'_>>, u64, u64)> = by_peer
         .into_iter()
         .map(|(peer, mut p)| {
-            p.rows.sort_by_key(|r| r.message.message.timestamp);
+            p.rows
+                .sort_by_key(|r| (r.message.message.timestamp, r.message.purge_token()));
             let last = p.rows.last().map_or(0, |r| r.message.message.timestamp);
             if p.rows.len() > MAX_THREAD_MESSAGES {
                 truncated = true;
@@ -220,7 +223,7 @@ pub fn threads(src: &Source<'_>) -> Threads {
         .map(|(peer, rows, last_ts, last_inbound_ts)| DmThread {
             room: src.room_key.to_string(),
             room_name: src.room_name.to_string(),
-            peer_uid: peer.to_string(),
+            peer_key: peer_key(peer),
             peer,
             peer_name: (src.name_of)(peer),
             peer_is_member: peer == owner_id
@@ -249,6 +252,7 @@ fn message(src: &Source<'_>, peer: MemberId, row: &Row<'_>) -> DmMessage {
         } else {
             received(src, m)
         },
+        pending: None,
     }
 }
 
@@ -306,6 +310,22 @@ fn note_of(note: Option<&str>) -> Option<String> {
 fn short_key(vk: &VerifyingKey) -> String {
     let full = bs58::encode(vk.as_bytes()).into_string();
     format!("Room {}", full.chars().take(8).collect::<String>())
+}
+
+/// What names a peer in a thread: River's full member id, in decimal.
+///
+/// Never the id's `Display` form, which is only the first eight base32 characters (a label for
+/// the screen, 40 bits): a member can grind a key whose label matches another's, and two such
+/// members must never share a thread or receive each other's messages.
+pub fn peer_key(peer: MemberId) -> String {
+    peer.0.0.to_string()
+}
+
+/// The member id [`peer_key`] names.
+pub fn peer_from_key(key: &str) -> Option<MemberId> {
+    key.parse::<i64>()
+        .ok()
+        .map(|n| MemberId(freenet_scaffold::util::FastHash(n)))
 }
 
 /// A purge token as lowercase hex.

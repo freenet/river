@@ -1119,7 +1119,7 @@ fn member_search_box(chat: &Chat, p: &Palette, k: &Kit) -> Option<El> {
 }
 
 fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
-    let uid = m.uid.clone();
+    let uid = m.full_id;
     let mut r = row()
         .key(format!("member-{}", m.id))
         .h(40.0)
@@ -1131,7 +1131,7 @@ fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
         .label(format!("Member info: {}", m.nickname))
         .focusable(true)
         .cursor(rune::Cursor::Pointer)
-        .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid))
+        .on_press(move |s: &mut RiverApp| s.chat.open_member_full(uid))
         .hover(p.surface)
         .child(avatar(Some(m), m.id, 28.0))
         .child(

@@ -5,12 +5,21 @@
 //! CBOR of [`OutboundDmStore`], and join it to the message in the room by its purge token.
 //! [`OutboundCache`] is this app's in-memory copy of that.
 //!
-//! **This module only reads.** Nothing here writes `outbound_dms` or any other delegate key: the
+//! **This module only reads the delegate.** Nothing here writes `outbound_dms` or any other
+//! delegate key (see "Sent this session" for the one in-memory addition): the
 //! web UI saves the whole blob with a blind store, so a write made on a stale copy loses
 //! entries, and the later change that writes it has to hydrate first and merge. That change
 //! gates on [`OutboundCache::hydrated`], so the latch fails safe: it is true only after a read
 //! that listed the key and decoded it (or a list that was trustworthy and did not have the
 //! key), and a read that proves nothing leaves it as it was.
+//!
+//! **Sent this session.** A message this app sends is sealed to its recipient, so the sender
+//! cannot open it again. [`OutboundCache::remember_sent`] keeps its text in memory so the row
+//! shows it for the rest of the run. It is held apart from what the delegate returned
+//! (`local`), so a re-read of the delegate does not drop it, and it is not written anywhere:
+//! after a restart the row reads "text not available" until the change that saves sent text to
+//! `outbound_dms` lands. That change moves these entries into the store and drops them from
+//! `local` ([`OutboundCache::forget_sent`]).
 //!
 //! **What "not hydrated" and "not listed" mean.** The delegate's key list is the only thing that
 //! says whether `outbound_dms` exists, and a list can come back empty for a reason that is not an
@@ -70,6 +79,9 @@ const ENVELOPE_HEADER: usize = 1 + 8;
 /// The most bytes of stored value read. Far above what the per-pair and room-wide caps allow a
 /// user to accumulate; it only stops a corrupt value from being decoded at any length.
 pub const MAX_STORE_BYTES: usize = 32 * 1024 * 1024;
+/// The most sent texts held only in memory ([`OutboundCache::remember_sent`]). The contract
+/// keeps at most 300 direct messages a room, so this is far above what a thread can show.
+pub const MAX_LOCAL: usize = 1000;
 
 /// What the cache is looked up by: the room (its owner's key bytes), the recipient and the
 /// message's purge token.
@@ -80,6 +92,10 @@ type EntryKey = ([u8; 32], MemberId, PurgeToken);
 pub struct Plaintext(String);
 
 impl Plaintext {
+    pub(crate) fn new(text: String) -> Self {
+        Plaintext(text)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -146,6 +162,9 @@ pub struct OutboundCache {
     hydrated: bool,
     /// Bumped by every read that changes what this holds, so a view built from it can tell.
     epoch: u64,
+    /// What this app sent since it started and has not saved to the delegate: the text of its
+    /// own sent messages. Kept across reads (see the module docs).
+    local: HashMap<EntryKey, SentDm>,
 }
 
 impl fmt::Debug for OutboundCache {
@@ -153,6 +172,7 @@ impl fmt::Debug for OutboundCache {
         f.debug_struct("OutboundCache")
             .field("entries", &self.entries.len())
             .field("hidden_threads", &self.hidden.len())
+            .field("sent_this_session", &self.local.len())
             .field("hydrated", &self.hydrated)
             .finish()
     }
@@ -206,6 +226,7 @@ impl OutboundCache {
             generation,
             hydrated: true,
             epoch: 0,
+            local: HashMap::new(),
         })
     }
 
@@ -225,7 +246,14 @@ impl OutboundCache {
     pub fn note_read(&mut self, read: DmRead, list_authoritative: bool) {
         let epoch = self.epoch.wrapping_add(1);
         match read {
-            DmRead::Read(fresh) => *self = *fresh,
+            DmRead::Read(fresh) => {
+                let local = std::mem::take(&mut self.local);
+                *self = *fresh;
+                self.local = local;
+                // What the delegate now holds is no longer only local.
+                let held = &self.entries;
+                self.local.retain(|k, _| !held.contains_key(k));
+            }
             DmRead::Unreadable => self.hydrated = false,
             DmRead::NotListed => {
                 if !(list_authoritative && !self.hydrated && self.entries.is_empty()) {
@@ -270,7 +298,73 @@ impl OutboundCache {
         recipient: MemberId,
         token: &PurgeToken,
     ) -> Option<&SentDm> {
-        self.entries.get(&(room.to_bytes(), recipient, *token))
+        let key = (room.to_bytes(), recipient, *token);
+        self.entries.get(&key).or_else(|| self.local.get(&key))
+    }
+
+    /// Keep the text of a message this app just sent, in memory only (see the module docs).
+    /// `sender` is the user's member id and `timestamp` the message's, as the delegate's own
+    /// entry would hold. Bounded: past [`MAX_LOCAL`] the oldest is dropped.
+    pub fn remember_sent(
+        &mut self,
+        room: &VerifyingKey,
+        recipient: MemberId,
+        token: PurgeToken,
+        sender: MemberId,
+        timestamp: u64,
+        text: String,
+    ) {
+        if self.local.len() >= MAX_LOCAL
+            && let Some(oldest) = self
+                .local
+                .iter()
+                .min_by_key(|(_, e)| e.timestamp)
+                .map(|(k, _)| *k)
+        {
+            self.local.remove(&oldest);
+        }
+        self.local.insert(
+            (room.to_bytes(), recipient, token),
+            SentDm {
+                sender,
+                timestamp,
+                plaintext: Plaintext(text),
+            },
+        );
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Drop what [`OutboundCache::remember_sent`] kept for this message (a send the user
+    /// discarded). True when there was one.
+    pub fn forget_sent(
+        &mut self,
+        room: &VerifyingKey,
+        recipient: MemberId,
+        token: &PurgeToken,
+    ) -> bool {
+        let gone = self
+            .local
+            .remove(&(room.to_bytes(), recipient, *token))
+            .is_some();
+        if gone {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        gone
+    }
+
+    /// Drop the texts kept in memory for rooms `keep` says are no longer here (a room the user
+    /// left): what was written there is not kept past it.
+    pub fn keep_sent_rooms(&mut self, keep: impl Fn(&[u8; 32]) -> bool) {
+        let before = self.local.len();
+        self.local.retain(|(room, _, _), _| keep(room));
+        if self.local.len() != before {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// How many sent texts are held only in memory.
+    pub fn sent_this_session(&self) -> usize {
+        self.local.len()
     }
 
     /// The text of [`OutboundCache::entry`].
@@ -405,6 +499,110 @@ mod tests {
         assert!(bare.hydrated() && wrapped.hydrated());
         assert_eq!((bare.generation(), wrapped.generation()), (0, 41));
         assert_eq!(bare.entries, wrapped.entries);
+    }
+
+    #[test]
+    fn a_text_sent_this_session_shows_and_survives_a_read_of_the_store() {
+        let mut cache = OutboundCache::default();
+        let before = cache.epoch();
+        cache.remember_sent(
+            &vk(1),
+            id(2),
+            PurgeToken([7; 16]),
+            id(99),
+            5,
+            "just sent".to_owned(),
+        );
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+            Some("just sent")
+        );
+        assert_ne!(cache.epoch(), before, "a view built from it is rebuilt");
+        assert!(!cache.hydrated(), "it says nothing of what the store holds");
+        assert_eq!(cache.sent_this_session(), 1);
+        // Not what a read of the store returned, so a read does not take it away.
+        let store = OutboundDmStore {
+            entries: vec![entry(1, 2, 8, "from the store")],
+            hidden_threads: vec![],
+        };
+        let read = OutboundCache::from_bytes(&encode(&store)).unwrap();
+        cache.note_read(DmRead::Read(Box::new(read)), true);
+        assert!(cache.hydrated());
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+            Some("just sent")
+        );
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([8; 16])),
+            Some("from the store")
+        );
+        // Once the store holds it, the store's copy is the one and the local one is dropped.
+        let store = OutboundDmStore {
+            entries: vec![entry(1, 2, 7, "saved")],
+            hidden_threads: vec![],
+        };
+        let read = OutboundCache::from_bytes(&encode(&store)).unwrap();
+        cache.note_read(DmRead::Read(Box::new(read)), true);
+        assert_eq!(cache.sent_this_session(), 0);
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+            Some("saved")
+        );
+        // Forgetting is for a discarded message, and only of what this session held.
+        cache.remember_sent(&vk(1), id(2), PurgeToken([9; 16]), id(99), 6, "x".into());
+        assert!(cache.forget_sent(&vk(1), id(2), &PurgeToken([9; 16])));
+        assert!(!cache.forget_sent(&vk(1), id(2), &PurgeToken([9; 16])));
+        assert!(!cache.forget_sent(&vk(1), id(2), &PurgeToken([8; 16])));
+        // A room the user left takes the texts written in it.
+        cache.remember_sent(
+            &vk(5),
+            id(2),
+            PurgeToken([11; 16]),
+            id(99),
+            8,
+            "gone".into(),
+        );
+        let epoch = cache.epoch();
+        cache.keep_sent_rooms(|room| room != &vk(5).to_bytes());
+        assert!(
+            cache
+                .plaintext(&vk(5), id(2), &PurgeToken([11; 16]))
+                .is_none()
+        );
+        assert_ne!(cache.epoch(), epoch);
+        cache.keep_sent_rooms(|_| true);
+        // Debug shows counts only.
+        cache.remember_sent(
+            &vk(1),
+            id(2),
+            PurgeToken([10; 16]),
+            id(99),
+            7,
+            "SECRET".into(),
+        );
+        assert!(!format!("{cache:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn the_texts_held_only_in_memory_are_bounded() {
+        let mut cache = OutboundCache::default();
+        for n in 0..(MAX_LOCAL + 50) {
+            let mut token = [0u8; 16];
+            token[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            cache.remember_sent(
+                &vk(1),
+                id(2),
+                PurgeToken(token),
+                id(99),
+                n as u64,
+                "t".into(),
+            );
+        }
+        assert_eq!(cache.sent_this_session(), MAX_LOCAL);
+        // The oldest went.
+        let mut oldest = [0u8; 16];
+        oldest[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(cache.plaintext(&vk(1), id(2), &PurgeToken(oldest)), None);
     }
 
     #[test]

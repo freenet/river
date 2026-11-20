@@ -58,6 +58,13 @@
 //!   whole dialog, on Save.
 //!
 //!
+//! - **A direct message** (`Action::SendDm`, [`super::dm_send`]): composed and signed once with the
+//!   room's key, checked to land in a copy of the room, and then queued like the rest. It is not
+//!   a room message: it has no row in the conversation (the thread shows it, with its state, from
+//!   [`Outbox::dm_rows`]) and it is never built again. A retry, a resend after a lost connection
+//!   and a late answer all send the same signed message, because composing again seals with new
+//!   randomness and the node, which may hold the first, would show both.
+//!
 //! Where this differs: the web UI marks a room to sync and never hears whether the node took
 //! the update. Here one update per room is out at a time, and its answer decides: an
 //! `UpdateResponse` means sent (if the room then holds the messages), an update error means
@@ -94,6 +101,7 @@ use river_core::room_state::content::{
     ACTION_CONTENT_VERSION, ActionContentV1, CONTENT_TYPE_ACTION, CONTENT_TYPE_REPLY,
     CONTENT_TYPE_TEXT, REPLY_CONTENT_VERSION, ReplyContentV1, TEXT_CONTENT_VERSION, TextContentV1,
 };
+use river_core::room_state::direct_messages::{AuthorizedDirectMessage, PurgeToken};
 use river_core::room_state::member::{AuthorizedMember, MemberId, MembersDelta};
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1, RoomMessageBody};
@@ -203,6 +211,15 @@ pub enum Action {
         token: super::identity::IdentityToken,
         replace: bool,
     },
+    /// Send a direct message to the member `peer` of the command's room ([`super::dm_send`]).
+    /// `peer` is River's FULL member id, never the `uid` label (40 bits, which a member can
+    /// grind to match another's). The session answers it, by `ticket`, with
+    /// [`super::session::RoomsUpdate::DmSend`]: whether the message was queued, or why not.
+    SendDm {
+        peer: MemberId,
+        text: String,
+        ticket: u64,
+    },
 }
 
 impl std::fmt::Debug for Action {
@@ -266,6 +283,12 @@ impl std::fmt::Debug for Action {
                 .debug_struct("ImportId")
                 .field("token", &"<hidden>")
                 .field("replace", replace)
+                .finish(),
+            Action::SendDm { peer, ticket, .. } => f
+                .debug_struct("SendDm")
+                .field("peer", &super::dm::peer_key(*peer))
+                .field("text", &"<hidden>")
+                .field("ticket", ticket)
                 .finish(),
         }
     }
@@ -1134,6 +1157,7 @@ pub(super) type Clock = Box<dyn Fn() -> SystemTime + Send>;
 const CONFIG_LABEL: &str = "Your change to the room's details";
 const BAN_LABEL: &str = "Your ban";
 const ROTATE_LABEL: &str = "Your secret rotation";
+const DM_LABEL: &str = "Your direct message";
 
 pub(super) const CONFIG_SUPERSEDED: &str =
     "A newer change to the room's details, made elsewhere, replaced this one.";
@@ -1275,6 +1299,38 @@ fn config_privacy_matches(room: &LiveRoom, config: &AuthorizedConfigurationV1) -
         && c.display.name.is_public() != room.is_private()
 }
 
+/// A direct message that was queued: what names it in its thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmQueued {
+    pub recipient: MemberId,
+    /// The user's own member id, when the room's identity is known.
+    pub sender: Option<MemberId>,
+    pub token: PurgeToken,
+    pub timestamp: u64,
+}
+
+/// A direct message of the outbox, as its thread shows it.
+#[derive(Clone)]
+pub struct DmRow {
+    pub recipient: MemberId,
+    pub sender: MemberId,
+    pub token: PurgeToken,
+    pub timestamp: u64,
+    /// What was written. Not printed by `Debug`.
+    pub text: Option<super::dm_cache::Plaintext>,
+    pub pending: Pending,
+}
+
+impl std::fmt::Debug for DmRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmRow")
+            .field("recipient", &self.recipient)
+            .field("timestamp", &self.timestamp)
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What the user wrote or did, kept so it can be built again (on Retry, or sealed again).
 #[derive(Clone)]
 enum Intent {
@@ -1294,6 +1350,8 @@ enum Intent {
     Ban(MemberId),
     /// A rotation of the room's secret.
     Rotate,
+    /// A direct message to this member. The signed message is in the entry's `dm`.
+    Dm(MemberId),
 }
 
 /// As derived, except a nickname is not printed.
@@ -1314,6 +1372,7 @@ impl std::fmt::Debug for Intent {
             Intent::Config(edit) => f.debug_tuple("Config").field(edit).finish(),
             Intent::Ban(target) => f.debug_tuple("Ban").field(target).finish(),
             Intent::Rotate => f.write_str("Rotate"),
+            Intent::Dm(peer) => f.debug_tuple("Dm").field(peer).finish(),
         }
     }
 }
@@ -1328,6 +1387,7 @@ impl Intent {
             Intent::Config(_) => CONFIG_LABEL,
             Intent::Ban(_) => BAN_LABEL,
             Intent::Rotate => ROTATE_LABEL,
+            Intent::Dm(_) => DM_LABEL,
         }
     }
 
@@ -1362,6 +1422,8 @@ impl Intent {
             Intent::Config(_) => Vec::new(),
             // Not a message: built by `bans::build`.
             Intent::Ban(_) | Intent::Rotate => Vec::new(),
+            // Not a room message: composed once, by `dm_send::prepare`.
+            Intent::Dm(_) => Vec::new(),
         }
     }
 }
@@ -1538,6 +1600,17 @@ struct Entry {
     /// deputy through the web UI, banned them): the name of the banned member, so what is said
     /// of it can mention the ban.
     after_ban: Option<String>,
+    /// For a direct message: the signed message to publish (and `messages` is empty). It is
+    /// composed once and only ever sent as it is: a new one would be sealed with new randomness,
+    /// so the node, which may hold the first, would show both.
+    dm: Option<AuthorizedDirectMessage>,
+    /// For a direct message: what was written. Sealed to the recipient, so the sender cannot
+    /// read their own message back; the thread shows this until the sent text is saved.
+    dm_text: Option<super::dm_cache::Plaintext>,
+    /// For a direct message whose recipient the room no longer lists (the typed
+    /// `Refusal::NotMember`, the only refusal that cannot heal): sending it again can only be
+    /// refused again, so only Discard is offered. Other refusals keep Retry.
+    no_retry: bool,
     status: Status,
     /// These messages went to the node at least once. From then on they are only ever sent
     /// again as they are, never rebuilt: the node may have taken them, and a rebuilt message
@@ -1598,6 +1671,9 @@ impl Entry {
         if let Some(ban) = &self.ban {
             return ban.delta();
         }
+        if let Some(dm) = &self.dm {
+            return super::dm_send::delta(room, dm);
+        }
         match (&self.info, &self.config) {
             (Some(info), _) => info_delta(room, info),
             (None, Some(config)) => config_delta(config),
@@ -1607,6 +1683,9 @@ impl Entry {
 
     /// `room` with it applied, or why the room would not take it.
     fn applied(&self, room: &LiveRoom) -> Result<LiveRoom, String> {
+        if let Some(dm) = &self.dm {
+            return super::dm_send::applied(room, dm).map_err(|r| r.text());
+        }
         if let Some(ban) = &self.ban {
             let mut next = room.clone();
             next.apply_delta(ban.delta())
@@ -1642,6 +1721,9 @@ impl Entry {
 
     /// Whether `room` holds it.
     fn held_in(&self, room: &LiveRoom) -> bool {
+        if let Some(dm) = &self.dm {
+            return super::dm_send::landed(room, dm);
+        }
         // A nickname the room replaced is settled too: there is nothing more to send.
         held(room, &self.messages)
             && self.ban.as_ref().is_none_or(|b| b.held_in(room))
@@ -1663,17 +1745,26 @@ impl Entry {
         }
     }
 
+    /// For a direct message the room would not take now, the typed refusal; `None` for anything
+    /// else or when the room takes it.
+    fn dm_refusal(&self, room: &LiveRoom) -> Option<super::dm_send::Refusal> {
+        let dm = self.dm.as_ref()?;
+        super::dm_send::applied(room, dm).err()
+    }
+
     /// Whether it carries anything to publish.
     fn has_payload(&self) -> bool {
         !self.messages.is_empty()
             || self.info.is_some()
             || self.config.is_some()
             || self.ban.is_some()
+            || self.dm.is_some()
     }
 
     /// Whether Retry can do anything for it.
     fn retryable(&self) -> bool {
         self.intent.is_some()
+            && !self.no_retry
             && matches!(
                 self.status,
                 Status::Failed(_) | Status::InFlight { late: true, .. }
@@ -1744,6 +1835,10 @@ impl Default for Outbox {
         }
     }
 }
+
+/// An entry for a direct message that has no message in it. Not reachable from here (a
+/// message is composed before its entry is made); said instead of sending nothing.
+const DM_LOST: &str = "This direct message could not be prepared again. Write it again.";
 
 const IDENTITY_CHANGED: &str =
     "This room's identity changed after it was written, so it was not sent.";
@@ -1858,6 +1953,9 @@ impl Outbox {
             config: None,
             ban: None,
             after_ban: None,
+            dm: None,
+            dm_text: None,
+            no_retry: false,
             status: Status::Unconfirmed(reason),
             sent: false,
             forced: 0,
@@ -1880,6 +1978,9 @@ impl Outbox {
             config: None,
             ban: None,
             after_ban: None,
+            dm: None,
+            dm_text: None,
+            no_retry: false,
             status: Status::Failed(reason),
             sent: false,
             forced: 0,
@@ -2156,6 +2257,9 @@ impl Outbox {
             config: None,
             ban: None,
             after_ban: None,
+            dm: None,
+            dm_text: None,
+            no_retry: false,
             status: Status::Queued,
             sent: false,
             forced: 0,
@@ -2163,6 +2267,90 @@ impl Outbox {
         rebuild(&mut entry, room, fresh, &ctx);
         self.entries.push(entry);
         id
+    }
+
+    /// Check, compose, sign and queue a direct message of `text` to `peer` (River's full member
+    /// id) in `room` ([`super::dm_send`]). Nothing is queued unless the room would
+    /// keep the message, so a refusal leaves nothing behind and the caller keeps the text.
+    ///
+    /// The text is kept with the entry for the thread to show (the sender cannot open their own
+    /// message), and the entry rides the room's one-update-at-a-time queue like any other.
+    /// Returns what the thread needs to name the message.
+    pub fn send_dm(
+        &mut self,
+        room: &LiveRoom,
+        peer: MemberId,
+        text: &str,
+    ) -> Result<DmQueued, String> {
+        let now = (self.clock)()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let message = super::dm_send::prepare(room, peer, text, now).map_err(|r| r.text())?;
+        let author = room.stored.self_verifying_key();
+        let queued = DmQueued {
+            recipient: peer,
+            sender: author.map(|vk| MemberId::from(&vk)),
+            token: message.purge_token(),
+            timestamp: message.message.timestamp,
+        };
+        self.next += 1;
+        self.entries.push(Entry {
+            id: self.next,
+            room: room.stored.owner_vk,
+            intent: Some(Intent::Dm(peer)),
+            label: DM_LABEL,
+            author,
+            time: (self.clock)(),
+            messages: Vec::new(),
+            info: None,
+            config: None,
+            ban: None,
+            after_ban: None,
+            dm: Some(message),
+            dm_text: Some(super::dm_cache::Plaintext::new(text.to_owned())),
+            no_retry: false,
+            status: Status::Queued,
+            sent: false,
+            forced: 0,
+        });
+        Ok(queued)
+    }
+
+    /// The direct messages of `room` still in the outbox, oldest first: what its threads show
+    /// for a message the room does not hold yet or that was not sent.
+    pub fn dm_rows(&self, room: &VerifyingKey) -> Vec<DmRow> {
+        self.entries
+            .iter()
+            .filter(|e| e.room == *room)
+            .filter_map(|e| {
+                let (Some(dm), Some(Intent::Dm(recipient))) = (&e.dm, &e.intent) else {
+                    return None;
+                };
+                Some(DmRow {
+                    recipient: *recipient,
+                    sender: dm.message.sender,
+                    token: dm.purge_token(),
+                    timestamp: dm.message.timestamp,
+                    text: e.dm_text.clone(),
+                    pending: Pending {
+                        entry: e.id,
+                        failed: e.trouble().map(str::to_owned),
+                        retry: e.retryable(),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// The recipient and purge token of the direct message in entry `id` of `room`, if it is one.
+    pub fn dm_identity(&self, room: &VerifyingKey, id: u64) -> Option<(MemberId, PurgeToken)> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id && e.room == *room)
+            .and_then(|e| match (&e.dm, &e.intent) {
+                (Some(dm), Some(Intent::Dm(r))) => Some((*r, dm.purge_token())),
+                _ => None,
+            })
     }
 
     /// Take a command for `room`. `false` for a command that changed nothing.
@@ -2423,7 +2611,8 @@ impl Outbox {
             | Action::SetNotificationMode { .. }
             | Action::LeaveRoom
             | Action::ExportId
-            | Action::ImportId { .. } => Err(("Your message", "Nothing to do.".to_owned())),
+            | Action::ImportId { .. }
+            | Action::SendDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 
@@ -2588,6 +2777,9 @@ impl Outbox {
                 }
                 if let Err(e) = entry.applied(room) {
                     entry.status = Status::Failed(e);
+                    entry.no_retry = entry
+                        .dm_refusal(room)
+                        .is_some_and(|r| super::dm_send::is_permanent(&r));
                     *changed = true;
                     continue;
                 }
@@ -2704,6 +2896,8 @@ impl Outbox {
                             "Freenet took it, but the room here doesn't show it. {}",
                             if entry.ban.is_some() {
                                 super::bans::NOT_KEPT.to_owned()
+                            } else if entry.dm.is_some() {
+                                super::dm_send::NOT_KEPT.to_owned()
                             } else if entry.info.is_some() || entry.config.is_some() {
                                 REMOVED.to_owned()
                             } else {
@@ -2976,10 +3170,12 @@ impl Outbox {
         let mut config_pending = None;
         let mut rotation_pending = None;
         let mut deputy_changes = Vec::new();
+        // A direct message is not in the room's conversation: it is shown by its thread
+        // ([`Outbox::dm_rows`]).
         for e in self
             .entries
             .iter()
-            .filter(|e| e.room == room.stored.owner_vk)
+            .filter(|e| e.room == room.stored.owner_vk && e.dm.is_none())
         {
             let trouble = e.trouble().map(str::to_owned);
             // A failed edit, deletion or reaction has no effect to show. One that is only
@@ -3212,6 +3408,21 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: 
     let Some(intent) = &entry.intent else {
         return;
     };
+    if let Intent::Dm(_) = intent {
+        // Never composed again: the signed message is the one that goes out, however many
+        // times (see `Entry::dm`). Only whether it still can is checked.
+        if entry.dm.is_none() {
+            entry.status = Status::Failed(DM_LOST.into());
+        } else if entry.author.is_some() && entry.author != room.stored.self_verifying_key() {
+            entry.status = Status::Failed(IDENTITY_CHANGED.into());
+        } else if let Err(e) = entry.applied(room) {
+            entry.status = Status::Failed(e);
+            entry.no_retry = entry
+                .dm_refusal(room)
+                .is_some_and(|r| super::dm_send::is_permanent(&r));
+        }
+        return;
+    }
     if let Intent::Config(edit) = intent {
         match build_config(room, edit, ctx) {
             Ok(config) => {

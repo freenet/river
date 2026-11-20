@@ -462,6 +462,7 @@ fn dm_message(
         outgoing,
         timestamp: at,
         body,
+        pending: None,
     }
 }
 
@@ -482,7 +483,7 @@ fn dm_thread(
     super::dm_model::DmThread {
         room: room.into(),
         room_name: room_name.into(),
-        peer_uid: peer.to_string(),
+        peer_key: peer.to_string(),
         peer: river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(
             i64::from(peer),
         )),

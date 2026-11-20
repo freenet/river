@@ -1474,7 +1474,7 @@ fn the_members_dialog_offers_message_and_leaves_moderation_to_the_rooms_own_gate
         .into_iter()
         .find(|e| e.key.as_deref() == Some("member-dm"))
         .expect("no member-dm");
-    // The Message button opens a read-only conversation, so it is not shown unavailable.
+    // The Message button opens the member's conversation, so it is not shown unavailable.
     assert_ne!(e.help.as_deref(), Some(super::view::NOT_YET));
     // The web dialog has no Mention button; mentions come from the composer.
     assert!(rt.find("member-mention").is_none());

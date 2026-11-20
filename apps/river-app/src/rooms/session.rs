@@ -274,6 +274,14 @@ pub enum RoomsUpdate {
     /// The direct-message threads of every room, sent after `Rooms` whenever they changed.
     /// Read only.
     Dms(DmSnapshot),
+    /// What became of a direct message the user asked to send ([`Action::SendDm`]): queued, or
+    /// why not. Said once per ticket. The words never quote the message.
+    DmSend {
+        room: String,
+        peer: String,
+        ticket: u64,
+        result: Result<(), String>,
+    },
     /// The connection's state changed while rooms are shown.
     Status(LinkStatus),
     /// The invitation the user asked for in the room keyed `room`: its link, or why there is
@@ -315,6 +323,18 @@ impl std::fmt::Debug for RoomsUpdate {
                 .field("work", work)
                 .finish(),
             RoomsUpdate::Dms(d) => f.debug_tuple("Dms").field(d).finish(),
+            RoomsUpdate::DmSend {
+                room,
+                peer,
+                ticket,
+                result,
+            } => f
+                .debug_struct("DmSend")
+                .field("room", room)
+                .field("peer", peer)
+                .field("ticket", ticket)
+                .field("result", result)
+                .finish(),
             RoomsUpdate::Status(s) => f.debug_tuple("Status").field(s).finish(),
             RoomsUpdate::Invite { room, link } => f
                 .debug_struct("Invite")
@@ -1549,8 +1569,41 @@ struct DmMemo {
     builds: usize,
 }
 
-/// What the window was last sent as direct-message threads ([`Rooms::dm_sent`]).
-type DmSent = (Vec<(VerifyingKey, super::dm::DmKey)>, bool, Vec<String>);
+/// What the window was last sent as direct-message threads ([`Rooms::dm_sent`]): each room's
+/// threads' key and a digest of its unsent direct messages, whether the sent-text cache had been
+/// read, and which rooms were listed.
+type DmSent = (
+    Vec<(VerifyingKey, super::dm::DmKey, u64)>,
+    bool,
+    Vec<String>,
+);
+
+/// The answer to one [`Action::SendDm`].
+struct DmSendResult {
+    room: String,
+    peer: String,
+    ticket: u64,
+    result: Result<(), String>,
+}
+
+/// A digest of what a room's unsent direct messages show: which there are and how each stands.
+/// Zero for none.
+fn pending_digest(rows: &[super::outbox::DmRow]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    if rows.is_empty() {
+        return 0;
+    }
+    let mut h = DefaultHasher::new();
+    for r in rows {
+        r.token.0.hash(&mut h);
+        r.timestamp.hash(&mut h);
+        r.pending.entry.hash(&mut h);
+        r.pending.failed.hash(&mut h);
+        r.pending.retry.hash(&mut h);
+        r.text.is_some().hash(&mut h);
+    }
+    h.finish() | 1
+}
 
 /// The rooms being shown, with what is needed to keep them current.
 #[derive(Default)]
@@ -1587,6 +1640,8 @@ struct Rooms {
     /// threads were built under, whether the sent-text cache had been read, and which rooms were listed. A report sends
     /// the threads again only when this changes.
     dm_sent: Option<DmSent>,
+    /// Answers to [`Action::SendDm`] not yet reported.
+    dm_results: Vec<DmSendResult>,
     /// River's web app on the node, which invite links open.
     web_app: String,
     /// Invitations made since the last report, by room key.
@@ -1634,21 +1689,58 @@ impl Rooms {
             dm_memo,
             dm_sent,
             network_seen,
+            outbox,
             ..
         } = self;
+        // The direct messages still in the outbox, by room. Their text is kept with them (it
+        // outlives a session), and put in the cache so the row it becomes when the room holds
+        // it keeps its text.
+        dm_cache
+            .keep_sent_rooms(|owner| list.iter().any(|r| r.stored.owner_vk.as_bytes() == owner));
+        let pending: Vec<Vec<super::outbox::DmRow>> = list
+            .iter()
+            .map(|r| outbox.dm_rows(&r.stored.owner_vk))
+            .collect();
+        for (room, rows) in list.iter().zip(&pending) {
+            for row in rows {
+                let (owner, token) = (&room.stored.owner_vk, &row.token);
+                if let Some(text) = &row.text
+                    && dm_cache.plaintext(owner, row.recipient, token).is_none()
+                {
+                    dm_cache.remember_sent(
+                        owner,
+                        row.recipient,
+                        *token,
+                        row.sender,
+                        row.timestamp,
+                        text.as_str().to_owned(),
+                    );
+                }
+            }
+        }
         let all_names: Vec<String> = list.iter().map(LiveRoom::name).collect();
         let label = |vk: &VerifyingKey| {
             list.iter()
                 .find(|r| &r.stored.owner_vk == vk)
                 .map(LiveRoom::name)
         };
-        let with_dms: Vec<&LiveRoom> = list
+        let with_dms: Vec<(&LiveRoom, &[super::outbox::DmRow])> = list
             .iter()
-            .filter(|r| !r.stored.room_state.direct_messages.messages.is_empty())
+            .zip(&pending)
+            .filter(|(r, rows)| {
+                !rows.is_empty() || !r.stored.room_state.direct_messages.messages.is_empty()
+            })
+            .map(|(r, rows)| (r, rows.as_slice()))
             .collect();
-        let keys: Vec<(VerifyingKey, super::dm::DmKey)> = with_dms
+        let keys: Vec<(VerifyingKey, super::dm::DmKey, u64)> = with_dms
             .iter()
-            .map(|r| (r.stored.owner_vk, r.dm_key(dm_cache, &label, &all_names)))
+            .map(|(r, rows)| {
+                (
+                    r.stored.owner_vk,
+                    r.dm_key(dm_cache, &label, &all_names),
+                    pending_digest(rows),
+                )
+            })
             .collect();
         // The loaded rooms are in it too, by key: a room met for the first time has its messages
         // seeded as seen, so a changed list (even one of the same size) is a change here.
@@ -1662,13 +1754,13 @@ impl Rooms {
         if dm_sent.as_ref() == Some(&fingerprint) {
             return None;
         }
-        dm_memo.retain(|vk, _| keys.iter().any(|(k, _)| k == vk));
+        dm_memo.retain(|vk, _| keys.iter().any(|(k, _, _)| k == vk));
         let mut snapshot = DmSnapshot {
             hydrated: dm_cache.hydrated(),
             room_keys,
             ..DmSnapshot::default()
         };
-        for (room, (vk, key)) in with_dms.iter().zip(&keys) {
+        for ((room, rows), (vk, key, _)) in with_dms.iter().zip(&keys) {
             let memo = dm_memo.entry(*vk);
             let memo = match memo {
                 std::collections::hash_map::Entry::Occupied(e) if e.get().key == *key => {
@@ -1698,7 +1790,13 @@ impl Rooms {
             if memo.truncated {
                 snapshot.truncated.push(room.key());
             }
-            snapshot.threads.extend(memo.threads.iter().cloned());
+            if rows.is_empty() {
+                snapshot.threads.extend(memo.threads.iter().cloned());
+            } else {
+                snapshot
+                    .threads
+                    .extend(super::dm_send::with_pending(room, &memo.threads, rows));
+            }
         }
         *dm_sent = Some(fingerprint);
         Some(snapshot)
@@ -1830,6 +1928,14 @@ impl Rooms {
                 changed |= self.list_command(&command.room, command.action);
                 continue;
             }
+            if matches!(command.action, Action::SendDm { .. }) {
+                // Said as an answer, not as a change to a room: the composer waits for it.
+                match self.send_dm(&command) {
+                    Some(()) => changed = true,
+                    None => self.outbox.waiting.push(command),
+                }
+                continue;
+            }
             match self.list.iter().find(|r| r.key() == command.room) {
                 Some(room) if command.action == Action::Invite => {
                     let link = super::create::invitation(room, &self.web_app).map(|(_, l)| l);
@@ -1841,7 +1947,21 @@ impl Rooms {
                         .push((room.key(), super::identity::export_token(room)));
                     changed = true;
                 }
-                Some(room) => changed |= self.outbox.command(room, command.action),
+                Some(room) => {
+                    // A direct message discarded loses the text kept for its row.
+                    let discarded = match &command.action {
+                        Action::Discard { entry } => self
+                            .outbox
+                            .dm_identity(&room.stored.owner_vk, *entry)
+                            .map(|d| (room.stored.owner_vk, d)),
+                        _ => None,
+                    };
+                    let did = self.outbox.command(room, command.action);
+                    if did && let Some((owner, (recipient, token))) = discarded {
+                        self.dm_cache.forget_sent(&owner, recipient, &token);
+                    }
+                    changed |= did;
+                }
                 // The read so far says nothing about this room (no store, nothing listed, or
                 // a slot that couldn't be read): it waits for a read that does.
                 None if !self.complete => self.outbox.waiting.push(command),
@@ -1862,6 +1982,43 @@ impl Rooms {
             }
         }
         changed
+    }
+
+    /// Check, compose and queue a direct message ([`Outbox::send_dm`]) and say what became of
+    /// it. `None` when the rooms have not been read well enough to say the room is gone: it
+    /// waits, as any command does.
+    fn send_dm(&mut self, command: &Command) -> Option<()> {
+        let Action::SendDm { peer, text, ticket } = &command.action else {
+            return Some(());
+        };
+        let result = match self.list.iter().find(|r| r.key() == command.room) {
+            // River has moved on: nothing is written ([`super::generation`]).
+            Some(_) if self.update_required => Err(UPDATE_REQUIRED_SEND.to_owned()),
+            Some(room) => self.outbox.send_dm(room, *peer, text).map(|queued| {
+                // The text is kept at once, not at the next report: the node can answer, and
+                // the entry be done, before one. (The report also puts back what an outbox that
+                // outlived a session still holds.)
+                if let Some(sender) = queued.sender {
+                    self.dm_cache.remember_sent(
+                        &room.stored.owner_vk,
+                        queued.recipient,
+                        queued.token,
+                        sender,
+                        queued.timestamp,
+                        text.to_owned(),
+                    );
+                }
+            }),
+            None if !self.complete => return None,
+            None => Err("This room is no longer here.".to_owned()),
+        };
+        self.dm_results.push(DmSendResult {
+            room: command.room.clone(),
+            peer: super::dm::peer_key(*peer),
+            ticket: *ticket,
+            result,
+        });
+        Some(())
     }
 
     /// Take every room being left out of the list at once, with what was waiting to be sent to
@@ -2315,6 +2472,16 @@ impl Rooms {
         });
         if let Some(dms) = self.dm_snapshot() {
             report(RoomsUpdate::Dms(dms));
+        }
+        // After the threads, so a message that was queued is in its thread when the composer
+        // lets go of its text.
+        for done in std::mem::take(&mut self.dm_results) {
+            report(RoomsUpdate::DmSend {
+                room: done.room,
+                peer: done.peer,
+                ticket: done.ticket,
+                result: done.result,
+            });
         }
         for (room, link) in std::mem::take(&mut self.invites) {
             report(RoomsUpdate::Invite { room, link });

@@ -350,14 +350,14 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
             .child(face);
     }
     // The avatar and the name open the author's dialog, as in the web UI.
-    let author_uid = author.map(|m| m.uid.clone());
-    if let Some(uid) = author_uid.clone() {
+    let author_uid = author.map(|m| m.full_id);
+    if let Some(uid) = author_uid {
         face = face
             .key(format!("author-avatar-{}", first.key))
             .role("button")
             .label(format!("Member info: {}", room.nickname(group.author)))
             .cursor(rune::Cursor::Pointer)
-            .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid));
+            .on_press(move |s: &mut RiverApp| s.chat.open_member_full(uid));
     }
     let mut name = label(
         room.nickname(group.author).to_owned(),
@@ -370,7 +370,7 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
             .role("button")
             .label(format!("Member info: {}", room.nickname(group.author)))
             .cursor(rune::Cursor::Pointer)
-            .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid));
+            .on_press(move |s: &mut RiverApp| s.chat.open_member_full(uid));
     }
     let mut name_row = row().gap(8.0).center_y().child(name);
     if author.is_some_and(|m| m.role == Role::Owner) {
@@ -635,7 +635,7 @@ fn delivery(pending: &Pending, p: &Palette) -> El {
 }
 
 /// A pressable word, for small inline choices.
-fn text_button(
+pub(super) fn text_button(
     key: String,
     name: &'static str,
     color: Color,

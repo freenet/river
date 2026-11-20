@@ -12,6 +12,8 @@ use std::fmt;
 
 use river_core::room_state::member::MemberId as RiverMemberId;
 
+use super::model::Pending;
+
 /// A thread of direct messages between the local user and one peer, in one room. The same two
 /// people in two rooms are two threads.
 #[derive(Clone, PartialEq, Eq)]
@@ -19,8 +21,9 @@ pub struct DmThread {
     /// The room's key, as `Room::key` names it.
     pub room: String,
     pub room_name: String,
-    /// The peer's River member id, as `Member::uid` shows it for the same member.
-    pub peer_uid: String,
+    /// The peer's full River member id in decimal ([`crate::rooms::dm::peer_key`]), as
+    /// `Member::full_id` shows it for the same member. Not `Member::uid`, which is only a label.
+    pub peer_key: String,
     /// The same id, to address a message to them.
     pub peer: RiverMemberId,
     pub peer_name: String,
@@ -39,7 +42,7 @@ impl fmt::Debug for DmThread {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DmThread")
             .field("room", &self.room)
-            .field("peer_uid", &self.peer_uid)
+            .field("peer_key", &self.peer_key)
             .field("messages", &self.messages.len())
             .field("last_ts", &self.last_ts)
             .finish_non_exhaustive()
@@ -60,6 +63,10 @@ pub struct DmMessage {
     /// Unix seconds, as the sender signed it.
     pub timestamp: u64,
     pub body: DmBody,
+    /// Set while the message is on its way, and when it was not sent: what the row says, and
+    /// whether Retry and Discard are offered. `None` once the room holds it. Only a message
+    /// the local user sent has one.
+    pub pending: Option<Pending>,
 }
 
 impl fmt::Debug for DmMessage {
@@ -69,6 +76,7 @@ impl fmt::Debug for DmMessage {
             .field("outgoing", &self.outgoing)
             .field("timestamp", &self.timestamp)
             .field("body", &self.body)
+            .field("pending", &self.pending)
             .finish()
     }
 }

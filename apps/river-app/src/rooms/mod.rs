@@ -42,7 +42,10 @@
 //!
 //! It also reads, and never writes, the plaintext of the direct messages the user sent (the
 //! delegate's `outbound_dms` key, [`dm_cache`]), and builds direct-message threads from it and
-//! the rooms ([`dm`]).
+//! the rooms ([`dm`]). It sends a direct message as an UPDATE of the room contract like any other
+//! change ([`dm_send`], [`outbox`]); what it sent is kept as text in memory only, so after a
+//! restart its own sent messages read "text not available" until a later change saves them to
+//! `outbound_dms`.
 
 pub mod bans;
 pub mod create;
@@ -50,6 +53,7 @@ pub mod delegate;
 pub mod deputies;
 pub mod dm;
 pub mod dm_cache;
+pub mod dm_send;
 #[cfg(test)]
 mod dm_tests;
 pub mod generation;

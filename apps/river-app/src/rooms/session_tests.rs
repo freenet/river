@@ -5931,3 +5931,270 @@ fn a_room_is_listed_as_loaded_only_once_the_network_has_given_its_state() {
     let second = rooms.dm_snapshot().expect("loading is a change");
     assert_eq!(second.room_keys.len(), 1);
 }
+
+// Sending a direct message ------------------------------------------------------------------------
+
+/// A session's rooms holding the fixture's private room, where the owner is the one to write to.
+fn dm_rooms() -> (Rooms, crate::rooms::room_tests::Fixture, String, String) {
+    let f = crate::rooms::room_tests::Fixture::new();
+    let mut rooms = Rooms::default();
+    let room = LiveRoom::new(f.stored(f.private_state()));
+    let key = room.key();
+    rooms.network_seen.insert(room.stored.owner_vk);
+    rooms.list.push(room);
+    rooms.loaded = true;
+    rooms.complete = true;
+    let peer = crate::rooms::dm::peer_key(f.owner_id());
+    (rooms, f, key, peer)
+}
+
+fn send_dm(room: &str, peer: &str, text: &str, ticket: u64) -> Command {
+    Command {
+        room: room.to_owned(),
+        action: Action::SendDm {
+            peer: crate::rooms::dm::peer_from_key(peer).expect("a member key"),
+            text: text.to_owned(),
+            ticket,
+        },
+    }
+}
+
+fn take(rooms: &mut Rooms, command: Command) -> Vec<(u64, Result<(), String>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(command).unwrap();
+    rooms.take_commands(&rx);
+    std::mem::take(&mut rooms.dm_results)
+        .into_iter()
+        .map(|r| (r.ticket, r.result))
+        .collect()
+}
+
+#[test]
+fn a_direct_message_is_answered_queued_and_shown_in_its_thread_before_it_is_sent() {
+    let (mut rooms, f, key, peer) = dm_rooms();
+    assert_eq!(
+        take(&mut rooms, send_dm(&key, &peer, "hello owner", 7)),
+        vec![(7, Ok(()))]
+    );
+    // Queued, nothing in the room yet.
+    assert!(!rooms.outbox.is_empty());
+    assert!(
+        rooms.list[0]
+            .stored
+            .room_state
+            .direct_messages
+            .messages
+            .is_empty()
+    );
+
+    // The window is sent the thread with the message in it, shown as on its way, with its text.
+    let snap = rooms.dm_snapshot().expect("a new thread");
+    assert_eq!(snap.threads.len(), 1);
+    let t = &snap.threads[0];
+    assert_eq!(t.peer_key, peer);
+    assert_eq!(t.messages.len(), 1);
+    let m = &t.messages[0];
+    assert!(m.outgoing);
+    assert_eq!(
+        m.body,
+        crate::chat::dm_model::DmBody::Text("hello owner".into())
+    );
+    assert_eq!(m.pending.as_ref().map(|p| p.failed.clone()), Some(None));
+    assert!(rooms.dm_snapshot().is_none(), "nothing changed");
+
+    // Sent and taken: the room holds it, the entry is done, and the same row (same key) is
+    // there with no state and the same text.
+    let mut changed = false;
+    let delta = rooms
+        .outbox
+        .next_update(&rooms.list[0], Instant::now(), &mut changed)
+        .expect("goes out");
+    assert!(delta.direct_messages.is_some());
+    assert!(rooms.update_answered(&rooms.list[0].contract_id(), Ok(())));
+    let after = rooms.dm_snapshot().expect("the row's state changed");
+    let n = &after.threads[0].messages[0];
+    assert_eq!(n.key, m.key, "the same row");
+    assert!(n.pending.is_none());
+    assert_eq!(
+        n.body,
+        crate::chat::dm_model::DmBody::Text("hello owner".into())
+    );
+    assert_eq!(after.threads[0].messages.len(), 1, "shown once");
+    let _ = f;
+}
+
+#[test]
+fn a_direct_message_the_session_cannot_take_is_answered_with_why_and_leaves_nothing() {
+    let (mut rooms, _f, key, peer) = dm_rooms();
+    // River has moved on: nothing is written, and the answer says so.
+    rooms.update_required = true;
+    let answers = take(&mut rooms, send_dm(&key, &peer, "held", 1));
+    assert_eq!(
+        answers,
+        vec![(
+            1,
+            Err(crate::rooms::generation::UPDATE_REQUIRED_SEND.to_owned())
+        )]
+    );
+    assert!(rooms.outbox.is_empty());
+    rooms.update_required = false;
+
+    // Refusals by the room's own state come with their fixed words.
+    let answers = take(&mut rooms, send_dm(&key, &peer, "   ", 2));
+    assert_eq!(
+        answers,
+        vec![(2, Err(crate::rooms::dm_send::Refusal::Empty.text()))]
+    );
+    let me = rooms.list[0].stored.self_verifying_key().unwrap();
+    let own = crate::rooms::dm::peer_key(river_core::room_state::member::MemberId::from(&me));
+    let answers = take(&mut rooms, send_dm(&key, &own, "me", 3));
+    assert_eq!(
+        answers,
+        vec![(3, Err(crate::rooms::dm_send::Refusal::SelfMessage.text()))]
+    );
+    assert!(rooms.outbox.is_empty());
+    // Nothing was queued, so nothing shows: the first report has no threads.
+    let snap = rooms.dm_snapshot().expect("the first report");
+    assert!(snap.threads.is_empty());
+    assert!(rooms.dm_results.is_empty());
+
+    // A room that is gone says so; one that may only be unread yet waits.
+    let answers = take(&mut rooms, send_dm("nope", &peer, "x", 4));
+    assert_eq!(
+        answers,
+        vec![(4, Err("This room is no longer here.".to_owned()))]
+    );
+    rooms.complete = false;
+    assert!(take(&mut rooms, send_dm("nope", &peer, "x", 5)).is_empty());
+    assert_eq!(rooms.outbox.waiting.len(), 1);
+}
+
+#[test]
+fn a_direct_message_that_waited_for_the_rooms_is_queued_and_answered_once_they_are_read() {
+    let (mut rooms, _f, key, peer) = dm_rooms();
+    // The rooms are not all read yet: the command waits, and nothing is answered.
+    let room = rooms.list.remove(0);
+    rooms.complete = false;
+    assert!(take(&mut rooms, send_dm(&key, &peer, "patient", 8)).is_empty());
+    assert_eq!(rooms.outbox.waiting.len(), 1);
+    assert!(rooms.outbox.is_empty());
+    // The room arrives and the read is complete: the same command is taken again with no new
+    // input, and the answer comes with its own ticket.
+    rooms.list.push(room);
+    rooms.complete = true;
+    let (_tx, rx) = std::sync::mpsc::channel();
+    assert!(rooms.take_commands(&rx));
+    assert!(rooms.outbox.waiting.is_empty());
+    let answers: Vec<_> = std::mem::take(&mut rooms.dm_results)
+        .into_iter()
+        .map(|r| (r.ticket, r.result))
+        .collect();
+    assert_eq!(answers, vec![(8, Ok(()))]);
+    assert!(!rooms.outbox.is_empty());
+    let snap = rooms.dm_snapshot().expect("a thread");
+    assert_eq!(snap.threads[0].messages.len(), 1);
+}
+
+#[test]
+fn a_failed_direct_message_keeps_its_text_in_the_thread_and_a_discard_drops_it() {
+    let (mut rooms, _f, key, peer) = dm_rooms();
+    assert_eq!(
+        take(&mut rooms, send_dm(&key, &peer, "keep me", 1)).len(),
+        1
+    );
+    let mut changed = false;
+    rooms
+        .outbox
+        .next_update(&rooms.list[0], Instant::now(), &mut changed)
+        .expect("goes out");
+    assert!(rooms.update_answered(&rooms.list[0].contract_id(), Err("refused".into())));
+    let snap = rooms.dm_snapshot().expect("the state changed");
+    let m = &snap.threads[0].messages[0];
+    let pending = m.pending.clone().expect("not sent");
+    assert!(pending.failed.unwrap().contains("refused"));
+    assert!(pending.retry);
+    assert_eq!(
+        m.body,
+        crate::chat::dm_model::DmBody::Text("keep me".into())
+    );
+
+    // The text is kept through a read of the delegate's store (the sent text is not saved yet).
+    rooms.replace(loaded(vec![rooms.list[0].stored.clone()]));
+    assert_eq!(rooms.dm_cache().sent_this_session(), 1);
+
+    // Discard drops the row and the text kept for it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Command {
+        room: key.clone(),
+        action: Action::Discard {
+            entry: pending.entry,
+        },
+    })
+    .unwrap();
+    assert!(rooms.take_commands(&rx));
+    assert!(rooms.outbox.is_empty());
+    assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+    let snap = rooms.dm_snapshot().expect("the row went");
+    assert!(snap.threads.is_empty());
+}
+
+#[test]
+fn the_sent_text_outlives_the_session_while_the_message_is_in_the_outbox() {
+    // A session ends and another starts with the same outbox: the thread still shows the text
+    // of what is waiting.
+    let (mut rooms, _f, key, peer) = dm_rooms();
+    assert_eq!(
+        take(&mut rooms, send_dm(&key, &peer, "still here", 1)).len(),
+        1
+    );
+    let room = rooms.list.remove(0);
+    let outbox = std::mem::take(&mut rooms.outbox);
+    let mut next = Rooms {
+        outbox,
+        loaded: true,
+        complete: true,
+        ..Rooms::default()
+    };
+    next.network_seen.insert(room.stored.owner_vk);
+    next.list.push(room);
+    let snap = next.dm_snapshot().expect("a thread");
+    assert_eq!(
+        snap.threads[0].messages[0].body,
+        crate::chat::dm_model::DmBody::Text("still here".into())
+    );
+}
+
+#[test]
+fn rooms_updates_for_a_direct_message_print_no_text() {
+    let update = RoomsUpdate::DmSend {
+        room: "r".into(),
+        peer: "p".into(),
+        ticket: 9,
+        result: Err("The room refused it".into()),
+    };
+    let shown = format!("{update:?}");
+    assert!(shown.contains("DmSend") && shown.contains("9"));
+    let command = send_dm("r", "123", "PLAINTEXT-SECRET", 1);
+    assert!(!format!("{command:?}").contains("PLAINTEXT"));
+}
+
+#[test]
+fn a_direct_message_answered_before_any_report_still_shows_its_text() {
+    let (mut rooms, _f, key, peer) = dm_rooms();
+    assert_eq!(take(&mut rooms, send_dm(&key, &peer, "quick", 1)).len(), 1);
+    // Sent and taken before the window was ever sent the thread.
+    let mut changed = false;
+    rooms
+        .outbox
+        .next_update(&rooms.list[0], Instant::now(), &mut changed)
+        .expect("goes out");
+    assert!(rooms.update_answered(&rooms.list[0].contract_id(), Ok(())));
+    assert!(rooms.outbox.is_empty());
+    let snap = rooms.dm_snapshot().expect("a thread");
+    assert_eq!(snap.threads[0].messages.len(), 1);
+    assert_eq!(
+        snap.threads[0].messages[0].body,
+        crate::chat::dm_model::DmBody::Text("quick".into())
+    );
+    assert!(snap.threads[0].messages[0].pending.is_none());
+}

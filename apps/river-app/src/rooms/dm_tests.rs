@@ -128,7 +128,7 @@ fn texts(t: &DmThread) -> Vec<String> {
 fn thread_with(t: &Threads, peer: u8) -> &DmThread {
     t.threads
         .iter()
-        .find(|th| th.peer_uid == id(peer).to_string())
+        .find(|th| th.peer_key == crate::rooms::dm::peer_key(id(peer)))
         .expect("a thread with that peer")
 }
 
@@ -645,7 +645,7 @@ fn a_message_to_a_third_party_is_in_none_of_my_threads() {
         theirs
             .threads
             .iter()
-            .all(|t| t.peer_uid != id(PEER).to_string())
+            .all(|t| t.peer_key != crate::rooms::dm::peer_key(id(PEER)))
     );
 }
 
@@ -741,9 +741,12 @@ fn threads_group_per_peer_and_sort_by_time() {
     assert_eq!(
         t.threads
             .iter()
-            .map(|t| t.peer_uid.clone())
+            .map(|t| t.peer_key.clone())
             .collect::<Vec<_>>(),
-        [id(OTHER).to_string(), id(PEER).to_string()]
+        [
+            crate::rooms::dm::peer_key(id(OTHER)),
+            crate::rooms::dm::peer_key(id(PEER))
+        ]
     );
     let th = thread_with(&t, PEER);
     assert_eq!(texts(th), ["peer first", "my reply", "peer second"]);
@@ -919,6 +922,7 @@ fn a_body_does_not_print_its_text_however_it_is_formatted() {
             outgoing: false,
             timestamp: 1,
             body: body.clone(),
+            pending: None,
         };
         for shown in [
             format!("{body:?}"),
@@ -1073,4 +1077,30 @@ fn the_key_does_not_confuse_where_the_room_key_ends_and_its_name_begins() {
         )
     };
     assert_ne!(key("ab", "c"), key("a", "bc"));
+}
+
+#[test]
+fn messages_in_one_second_are_ordered_by_purge_token_whatever_order_the_room_holds_them() {
+    let mut room = Room::new();
+    let first = room.send_raw(PEER, ME, T0, "x");
+    let second = room.send_raw(PEER, ME, T0, "y");
+    let third = room.send_raw(ME, PEER, T0, "z");
+    let mut want = vec![
+        token_hex(&first.purge_token()),
+        token_hex(&second.purge_token()),
+        token_hex(&third.purge_token()),
+    ];
+    want.sort();
+    for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
+        let held = room.dms.messages.clone();
+        room.dms.messages = order.iter().map(|i| held[*i].clone()).collect();
+        let t = room.mine();
+        let keys: Vec<String> = thread_with(&t, PEER)
+            .messages
+            .iter()
+            .map(|m| m.key.clone())
+            .collect();
+        assert_eq!(keys, want, "held as {order:?}");
+        room.dms.messages = held;
+    }
 }
