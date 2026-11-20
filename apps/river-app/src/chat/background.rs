@@ -284,6 +284,21 @@ mod tests {
     }
 
     #[test]
+    fn the_switcher_and_escape_leave_the_open_background_dialog_alone() {
+        let mut chat = chat_with(Fake::new(true));
+        chat.set_rooms(crate::chat::example::data().rooms);
+        chat.open_background();
+        assert!(
+            !chat.toggle_switcher(),
+            "the switcher does not open over it"
+        );
+        assert!(chat.switcher.is_none());
+        assert!(!chat.escape(), "Escape belongs to the dialog");
+        chat.close_background();
+        assert!(chat.toggle_switcher());
+    }
+
+    #[test]
     fn without_a_shell_there_is_nothing_to_open() {
         let mut chat = Chat::new(Source::Example, Vec::new(), 0, 0, 0);
         chat.open_background();
