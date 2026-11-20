@@ -1140,7 +1140,9 @@ pub(crate) fn on_current_delegate_missing() {
         }
         MissingAction::FailLoad => {
             mark_fetch_failure_if_current(attempt);
-            resolve_load_failed_if_empty(attempt);
+            // Not the empty-map helper: a reconnect keeps cached rooms, and
+            // they would hold the attempt in Loading (see on_current_list_refused).
+            set_load_state_if_current(attempt, RoomsLoadState::LoadFailed);
         }
         MissingAction::Ignore => {}
     }
@@ -1163,18 +1165,50 @@ pub(crate) fn is_current_list_refusal(err_text: &str, list_outstanding: bool) ->
 
 /// The current delegate refused this attempt's room listing (an index it
 /// cannot read). No `ListResponse` will start the load, so fail the attempt
-/// now and show Retry rather than wait out the backstop and show "no rooms".
-/// Returns whether the error was such a refusal.
+/// now rather than wait out the 60 s backstop. Returns whether the error was
+/// such a refusal.
+///
+/// `LoadFailed` is written whether or not rooms are showing. A reconnect
+/// re-enters `Loading` without clearing `ROOMS`, so with cached rooms the
+/// empty-map helper would leave the attempt in `Loading` and the connection
+/// pill on "Loading your rooms" until the backstop. With rooms on screen the
+/// rail keeps the list (`room_list_display_state` returns `List` whenever
+/// `room_count > 0`), so there is no Retry button there; identity import stays
+/// disabled because the fetch failure is recorded. An empty map gets the
+/// error block with Retry, as before.
 pub(crate) fn on_current_list_refused(err_text: &str) -> bool {
     if !is_current_list_refusal(err_text, list_outstanding_this_attempt()) {
         return false;
     }
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
-    warn!("The chat delegate refused the room listing; showing Retry (freenet/river#592)");
+    warn!("The chat delegate refused the room listing; failing the load (freenet/river#592)");
     mark_fetch_failure_if_current(attempt);
-    resolve_load_failed_if_empty(attempt);
+    set_load_state_if_current(attempt, RoomsLoadState::LoadFailed);
     true
+}
+
+/// Test hook (example-data + no-sync builds only): start a load attempt with
+/// its current-delegate room listing outstanding, the state
+/// `fire_list_rooms_request` leaves a real load in. `begin_load_attempt`
+/// defers its own signal write.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn test_begin_listed_load() {
+    begin_load_attempt();
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    LIST_OUTSTANDING.store(attempt.wrapping_add(1), Ordering::Relaxed);
+}
+
+/// Test hook (example-data + no-sync builds only): the current delegate
+/// refuses the outstanding listing. A no-op unless one is outstanding, like
+/// the real error path.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn test_refuse_outstanding_list() {
+    let text = format!(
+        "test refusal {}",
+        river_core::chat_delegate::LIST_REFUSED_MARKER
+    );
+    let _ = on_current_list_refused(&text);
 }
 
 /// What a current-delegate "missing" answer does to load attempt `attempt`.
@@ -1320,6 +1354,36 @@ mod tests {
             "error while executing operation in the network: execution error: runtime: trap",
             true
         ));
+    }
+
+    /// PR 940 review: a reconnect re-enters `Loading` without clearing the
+    /// cached rooms, and the empty-map helper writes `LoadFailed` only for an
+    /// empty map. A refused listing (or a delegate still missing after it was
+    /// registered) must leave `Loading` either way, or the pill reads "Loading
+    /// your rooms" until the 60 s backstop.
+    #[test]
+    fn a_refused_listing_settles_even_with_cached_rooms() {
+        let production = chat_delegate_production();
+        let refused = fn_body(&production, "pub(crate) fn on_current_list_refused(");
+        assert!(
+            refused.contains("set_load_state_if_current(attempt, RoomsLoadState::LoadFailed)"),
+            "a refused listing must leave Loading even when cached rooms are showing"
+        );
+        assert!(
+            !refused.contains("resolve_load_failed_if_empty"),
+            "the empty-map helper would leave Loading in place"
+        );
+
+        let missing = fn_body(&production, "pub(crate) fn on_current_delegate_missing(");
+        let fail_at = missing
+            .find("MissingAction::FailLoad => {")
+            .expect("FailLoad arm");
+        let ignore_at = missing[fail_at..]
+            .find("MissingAction::Ignore")
+            .expect("Ignore arm");
+        let fail_arm = &missing[fail_at..fail_at + ignore_at];
+        assert!(fail_arm.contains("set_load_state_if_current(attempt, RoomsLoadState::LoadFailed)"));
+        assert!(!fail_arm.contains("resolve_load_failed_if_empty"));
     }
     use ed25519_dalek::SigningKey;
 

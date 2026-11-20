@@ -603,6 +603,24 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Start a load attempt whose current-delegate listing is outstanding,
+    // then have the delegate refuse it: the real refusal path, which a hook
+    // that writes LoadFailed directly would skip (PR 940 review).
+    set_hook(
+        "beginListedLoad",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::components::app::chat_delegate::test_begin_listed_load();
+        })
+        .into_js_value(),
+    );
+    set_hook(
+        "refuseOutstandingList",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::components::app::chat_delegate::test_refuse_outstanding_list();
+        })
+        .into_js_value(),
+    );
+
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.

@@ -98,6 +98,67 @@ test.describe("Connection activity", () => {
     await expect(pill.getByTestId("connection-activity-dots")).toBeVisible();
   });
 
+  test("a restoring walk keeps the pill busy when the current list was empty", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await callRiverTest(page, "setRoomsLoadState", "loaded");
+    await callRiverTest(page, "setSyncStatus", "connected");
+    await expect(page.getByTestId("room-list-empty")).toBeVisible();
+    const pill = visibleConnectionPill(page);
+    await expect(pill).toHaveAttribute("aria-busy", "false");
+
+    await callRiverTest(page, "setWalkRestoringRooms", true);
+    await expect(pill).toHaveAttribute("data-busy-reason", "loading-rooms");
+    await expect(pill).toHaveAttribute("aria-busy", "true");
+    await expect(page.getByTestId("room-list-empty")).toBeVisible();
+
+    await callRiverTest(page, "setWalkRestoringRooms", false);
+    await expect(pill).toHaveAttribute("aria-busy", "false");
+    expect(await pill.getAttribute("data-busy-reason")).toBeNull();
+  });
+
+  test("a refused listing clears the loading pill while cached rooms stay", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "loaded");
+    await callRiverTest(page, "setSyncStatus", "connected");
+    const pill = visibleConnectionPill(page);
+    await expect(pill).toHaveAttribute("aria-busy", "false");
+
+    await callRiverTest(page, "beginListedLoad");
+    await expect(pill).toHaveAttribute("data-busy-reason", "loading-rooms");
+
+    await callRiverTest(page, "refuseOutstandingList");
+    await expect(pill).toHaveAttribute("aria-busy", "false");
+    expect(await pill.getAttribute("data-busy-reason")).toBeNull();
+    await expect(page.getByTestId("room-list").locator('[data-testid^="room-item-"]').first()).toBeVisible();
+  });
+
+  test("the mobile rooms list shows one loading animation", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    await waitForApp(page);
+    await callRiverTest(page, "setSyncStatus", "connected");
+    await callRiverTest(page, "setRoomsLoadState", "loading");
+    await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+
+    const pill = visibleConnectionPill(page);
+    for (const state of ["loading", "migrating"] as const) {
+      await callRiverTest(page, "setRoomsLoadState", state);
+      await expect(pill).toHaveAttribute("data-busy-reason", "loading-rooms");
+      await expect(page.getByTestId(`room-list-${state}-dots`)).toBeVisible();
+      await expect(pill.getByTestId("connection-activity-dots")).toBeHidden();
+      await expect(pill.getByTestId("connection-status-label")).toHaveText("Connected");
+      await expect(pill.getByTestId("connection-status-dot")).toBeVisible();
+    }
+
+    await callRiverTest(page, "setRoomsLoadState", "loading");
+    await page.setViewportSize({ width: 1280, height: 800 });
+    const railPill = page.getByTestId("rooms-rail").getByTestId("connection-status-indicator");
+    await expect(railPill).toHaveAttribute("data-busy-reason", "loading-rooms");
+    await expect(railPill.getByTestId("connection-activity-dots")).toBeVisible();
+  });
+
   // The page's scheduler keeps running. Seek just the actual transitions on
   // the dot slot, including their CSS delays, before an engine can finish
   // them. Each transition starts from a real connection-state change.

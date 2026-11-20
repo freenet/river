@@ -68,10 +68,14 @@ impl RoomActivity {
     }
 }
 
+/// A restoring walk counts on its own, even when the current delegate listed
+/// no rooms: the rail's "Restoring more rooms" note needs a room to sit under,
+/// but the pill is the only sign that rooms may still arrive.
 fn loading_rooms(state: RoomsLoadState, room_count: usize, workers: bool, walk: bool) -> bool {
     state == RoomsLoadState::Loading
         || room_list_display_state(state, room_count) == RoomListDisplay::Migrating
-        || restoring_more_rooms(state, workers, room_count, walk)
+        || walk
+        || restoring_more_rooms(state, workers, room_count, false)
 }
 
 /// Use the same socket snapshot as the label. Room updates that leave these
@@ -186,7 +190,9 @@ mod tests {
         assert!(loading_rooms(Migrating, 2, true, false));
         assert!(loading_rooms(Loaded, 2, false, true));
         assert!(!loading_rooms(Migrating, 2, false, false));
+        assert!(loading_rooms(Loaded, 0, false, true));
         assert!(!loading_rooms(Loaded, 0, false, false));
+        assert!(loading_rooms(LoadFailed, 0, false, true));
         assert!(!loading_rooms(LoadFailed, 0, false, false));
     }
 }

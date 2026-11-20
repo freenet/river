@@ -44,6 +44,10 @@ type RiverTestHooks = {
   setRoomsLoadStateKeepingRooms(state: RoomsLoadState): void;
   // A journaled walk that may still bring rooms back starts (true) or ends (false).
   setWalkRestoringRooms(on: boolean): void;
+  // begin_load_attempt plus an outstanding current-delegate list.
+  beginListedLoad(): void;
+  // on_current_list_refused with LIST_REFUSED_MARKER. No-op unless the list is outstanding.
+  refuseOutstandingList(): void;
   // The held load worker settles; the load state is left as it is.
   releaseHeldLoadWorker(): void;
   switchRoom(name: string): void;

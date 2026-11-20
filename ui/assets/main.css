@@ -1184,6 +1184,13 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
 /* The mobile footer shares this panel with the full-size loading wave. */
 .room-load-placeholder .connection-activity { display: none; }
 
+/* Same for the phone rooms view, where the rail shows the wave above its
+   footer. Phone-only: the rail starts in Loading on every cold start, and on a
+   wide layout its pill is the only connection indicator in that column. */
+@media (max-width: 767px) {
+    .room-list-wave .connection-activity { display: none; }
+}
+
 .connection-activity-clip { min-width: 0; overflow: hidden; display: flex; }
 .connection-activity .small-dots { margin-inline-start: 0.5rem; color: inherit; }
 .connection-pill[aria-busy="true"] .connection-activity {
