@@ -38,7 +38,6 @@ mod dm_archive_tests;
 mod dm_notify_tests;
 #[cfg(test)]
 mod dm_view_tests;
-mod keys;
 mod links;
 pub(crate) mod markdown;
 pub mod member_list;

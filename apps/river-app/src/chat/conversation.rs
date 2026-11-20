@@ -6,7 +6,6 @@ use rune_kit::Kit;
 
 use super::emoji;
 use super::icons;
-use super::keys;
 use super::links;
 use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
@@ -813,7 +812,6 @@ fn markdown_body(m: &Message, p: &Palette, k: &Kit) -> Option<El> {
 ///    (`shortcode_key`). They come first: Esc, Up and Enter belong to a popup while it is open.
 /// 2. Escape: closes the emoji picker, and only then abandons a reply or an edit.
 /// 3. Up in an empty composer: edits your last message.
-/// 4. Ctrl+arrows and Ctrl+Backspace/Delete by word (`keys::word_keys`).
 pub(super) fn composer_key(s: &mut RiverApp, ev: &rune::KeyEvent) -> bool {
     // 1.
     s.chat.mention_sync();
@@ -836,11 +834,7 @@ pub(super) fn composer_key(s: &mut RiverApp, ev: &rune::KeyEvent) -> bool {
         }
     }
     // 3.
-    if ev.key == rune::Key::Up && s.chat.composer.text.is_empty() && s.chat.edit_last() {
-        return true;
-    }
-    // 4.
-    keys::word_keys(&mut s.chat.composer, ev)
+    ev.key == rune::Key::Up && s.chat.composer.text.is_empty() && s.chat.edit_last()
 }
 
 fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {

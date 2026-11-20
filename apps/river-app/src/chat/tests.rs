@@ -1229,31 +1229,18 @@ fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
     assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
     ctrl(&mut rt, Key::Right, false);
     key(&mut rt, Key::Text("Z".into()));
-    // Forward by word is the platform's own rule (see `rune_bump::FORWARD_STOPS`): the end of the
-    // word on Linux, so Z lands right after "Yone"; the start of the next word on Windows, so Z
-    // lands before "two". macOS is excluded above.
-    #[cfg(target_os = "linux")]
-    {
-        assert_eq!(rt.state.chat.composer.text, "YoneZ two Xthree");
-        // Ctrl+Backspace deletes the word before the caret, not the line before it.
-        ctrl(&mut rt, Key::Backspace, false);
-        assert_eq!(rt.state.chat.composer.text, " two Xthree");
-        // Ctrl+Shift+Right selects by word.
-        ctrl(&mut rt, Key::Right, true);
-        key(&mut rt, Key::Text("!".into()));
-        assert_eq!(rt.state.chat.composer.text, "! Xthree");
-    }
-    #[cfg(target_os = "windows")]
-    {
-        assert_eq!(rt.state.chat.composer.text, "Yone Ztwo Xthree");
-        ctrl(&mut rt, Key::Backspace, false);
-        assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
-        ctrl(&mut rt, Key::Backspace, false);
-        assert_eq!(rt.state.chat.composer.text, "two Xthree");
-        ctrl(&mut rt, Key::Right, true);
-        key(&mut rt, Key::Text("!".into()));
-        assert_eq!(rt.state.chat.composer.text, "!Xthree");
-    }
+    // Forward by word goes to the start of the next word off macOS (see
+    // `rune_bump::FORWARD_STOPS`), so Z lands before "two". macOS is excluded above.
+    assert_eq!(rt.state.chat.composer.text, "Yone Ztwo Xthree");
+    // Ctrl+Backspace deletes the word before the caret, not the line before it.
+    ctrl(&mut rt, Key::Backspace, false);
+    assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
+    ctrl(&mut rt, Key::Backspace, false);
+    assert_eq!(rt.state.chat.composer.text, "two Xthree");
+    // Ctrl+Shift+Right selects by word, up to the next word's start.
+    ctrl(&mut rt, Key::Right, true);
+    key(&mut rt, Key::Text("!".into()));
+    assert_eq!(rt.state.chat.composer.text, "!Xthree");
 }
 
 #[test]
@@ -6158,13 +6145,13 @@ mod rune_bump {
         );
     }
 
-    /// Forward word keys follow each platform's own convention (Ian, 2026-11-20: the least
-    /// surprise). Windows: the start of the next word, which is Rune's rule. macOS: the end of
-    /// the word. Linux (GTK, Qt, Chromium): the end of the word too, which Rune stopped doing
-    /// in 2026-11 and `keys::word_keys` restores. Backwards is the start of the word everywhere.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Forward word keys: off macOS (Windows and Linux alike, for now) the start of the next
+    /// word, Rune's rule since 2026-11-12; on macOS the end of the word. Backwards is the start
+    /// of the word everywhere. Ian wants end-of-word on Linux too (GTK, Qt, Chromium); that
+    /// lands in a follow-up change, which will give Linux its own block here.
+    #[cfg(target_os = "macos")]
     const FORWARD_STOPS: [usize; 5] = [3, 14, 19, 27, 29];
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "macos"))]
     const FORWARD_STOPS: [usize; 5] = [5, 15, 22, 28, 29];
 
     fn to_start(rt: &mut Runtime<RiverApp>) {
@@ -6207,9 +6194,9 @@ mod rune_bump {
         let mut rt = typed_line();
         to_start(&mut rt);
         word_key(&mut rt, Key::Delete, false);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
     }
 
@@ -6220,27 +6207,14 @@ mod rune_bump {
         to_start(&mut rt);
         word_key(&mut rt, Key::Right, true);
         word_key(&mut rt, Key::Delete, false);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
     }
 
-    /// The end of a word is found past spaces and punctuation, and at the end of the text it
-    /// stays there. Linux only: the other platforms use Rune's own rule.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_word_end_skips_gaps_and_stops_at_the_end() {
-        assert_eq!(super::super::keys::word_end_for_test(LINE, 3), 14);
-        assert_eq!(super::super::keys::word_end_for_test("abc  ", 3), 5);
-        assert_eq!(super::super::keys::word_end_for_test("abc", 3), 3);
-        assert_eq!(super::super::keys::word_end_for_test("", 0), 0);
-        assert_eq!(super::super::keys::word_end_for_test("don't stop", 0), 5);
-        assert_eq!(super::super::keys::word_end_for_test("a_b.c d", 0), 5);
-    }
-
-    /// Word keys on Linux edit without the field's change hook (`keys::word_keys` handles them
-    /// itself), the others through it; either way a warning about the text before is gone.
+    /// A word key edits through the field's own change hook, so a warning about the text before
+    /// it goes away.
     #[test]
     fn a_word_key_in_the_import_box_clears_the_warning_about_the_text_before() {
         const BAD: &str =

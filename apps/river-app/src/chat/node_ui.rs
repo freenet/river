@@ -226,13 +226,6 @@ pub fn screen(chat: &Chat, connected: bool, k: &Kit) -> Option<Screen> {
             .placeholder("localhost:7509".to_owned())
             .width(None)
             .on_edit(|s: &mut RiverApp| &mut s.chat.node.form.as_mut().expect("open").input)
-            .on_key(|s: &mut RiverApp, ev, _| {
-                s.chat
-                    .node
-                    .form
-                    .as_mut()
-                    .is_some_and(|f| super::keys::word_keys(&mut f.input, ev))
-            })
             .on_submit(|s: &mut RiverApp, _| s.node_submit())
             .build(k)
             .key("node-input")

@@ -8,11 +8,11 @@
 use rune::{El, Key, KeyEvent, TextEdit, col, el, row};
 use rune_kit::{Kit, TextInput};
 
+use super::Chat;
 use super::conversation::avatar;
 use super::dialog_kit::DialogSpec;
 use super::style::{self as st, Palette};
 use super::view::label;
-use super::{Chat, keys};
 use crate::RiverApp;
 
 /// The most results one search returns.
@@ -422,19 +422,7 @@ pub(super) fn switcher_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 s.chat.switcher_chord(std::time::Instant::now());
                 return true;
             }
-            if s.chat.switcher_key(ev) {
-                return true;
-            }
-            // Word keys edit without the field's change hook, so they reset the highlight here.
-            let edited = s
-                .chat
-                .switcher
-                .as_mut()
-                .is_some_and(|sw| keys::word_keys(&mut sw.query, ev));
-            if edited {
-                s.chat.switcher_edited();
-            }
-            edited
+            s.chat.switcher_key(ev)
         })
         .on_submit(|s: &mut RiverApp, _| s.chat.switcher_choose_selected())
         .build(k)

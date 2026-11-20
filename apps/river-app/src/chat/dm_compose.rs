@@ -722,11 +722,11 @@ pub(super) fn composer(chat: &Chat, p: &Palette, k: &Kit) -> El {
         input = input
             .on_input_key(|s: &mut RiverApp, ev, _| {
                 // Escape leaves the thread, as it does from anywhere else in it; the draft stays.
-                if ev.key == rune::Key::Escape {
+                let escape = ev.key == rune::Key::Escape;
+                if escape {
                     s.chat.close_dm();
-                    return true;
                 }
-                super::keys::word_keys(s.chat.dm.compose_edit(), ev)
+                escape
             })
             .on_edit(|s: &mut RiverApp| s.chat.dm.compose_edit())
             .on_submit(|s: &mut RiverApp, _| {

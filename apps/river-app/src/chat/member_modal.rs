@@ -147,7 +147,6 @@ fn nickname_editor(room: &Room, m: &Member, chat: &Chat, p: &Palette, k: &Kit) -
             .placeholder("Your nickname in this room".to_owned())
             .width(None)
             .on_edit(|s: &mut RiverApp| &mut s.chat.nickname)
-            .on_key(|s: &mut RiverApp, ev, _| super::keys::word_keys(&mut s.chat.nickname, ev))
             .on_submit(|s: &mut RiverApp, _| s.chat.submit_nickname())
             .build(k)
             .key("member-nickname-input")

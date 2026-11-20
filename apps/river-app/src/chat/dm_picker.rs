@@ -358,9 +358,6 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 .placeholder("e.g. Thought you would enjoy this room")
                 .width(None)
                 .on_edit(|s: &mut RiverApp| &mut s.chat.dm.invite.picker.note)
-                .on_key(|s: &mut RiverApp, ev, _| {
-                    super::keys::word_keys(&mut s.chat.dm.invite.picker.note, ev)
-                })
                 .on_submit(|s: &mut RiverApp, _| {
                     s.chat.invite_send();
                 })

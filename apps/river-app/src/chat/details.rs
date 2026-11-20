@@ -584,12 +584,6 @@ fn description_section(
                 .width(None)
                 .auto_grow(2, 4)
                 .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").description)
-                .on_key(|s: &mut RiverApp, ev, _| {
-                    super::keys::word_keys(
-                        &mut s.chat.details.as_mut().expect("open").description,
-                        ev,
-                    )
-                })
                 .build(k)
                 .key("details-description-input")
                 .w_full(),
@@ -714,7 +708,6 @@ fn limit_input(i: usize, label_text: &str, form: &DetailsForm, k: &Kit) -> El {
         .label(label_text.to_owned())
         .width(None)
         .on_edit(get)
-        .on_key(move |s: &mut RiverApp, ev, _| super::keys::word_keys(get(s), ev))
         .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
         .build(k)
         .key(format!("details-limit-{i}"))
@@ -1043,9 +1036,6 @@ fn name_field(form: &DetailsForm, p: &Palette, k: &Kit) -> El {
             .placeholder("Room name".to_owned())
             .width(None)
             .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").name)
-            .on_key(|s: &mut RiverApp, ev, _| {
-                super::keys::word_keys(&mut s.chat.details.as_mut().expect("open").name, ev)
-            })
             .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
             .build(k)
             .key("details-name-input")

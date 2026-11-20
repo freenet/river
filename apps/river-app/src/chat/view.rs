@@ -161,14 +161,6 @@ fn join_code_field(chat: &Chat, k: &Kit) -> El {
         .width(None)
         .on_edit(|s: &mut RiverApp| &mut s.chat.form.code)
         .on_change(|s: &mut RiverApp, _| s.chat.join_code_edited())
-        .on_key(|s: &mut RiverApp, ev, _| {
-            let before = s.chat.form.code.text.clone();
-            let handled = super::keys::word_keys(&mut s.chat.form.code, ev);
-            if handled && s.chat.form.code.text != before {
-                s.chat.join_code_edited();
-            }
-            handled
-        })
         .on_submit(|s: &mut RiverApp, _| s.chat.submit_join())
         .build(k)
         .key("invite-code")
@@ -209,7 +201,6 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .placeholder(placeholder.to_owned())
             .width(None)
             .on_edit(get)
-            .on_key(move |s: &mut RiverApp, ev, _| super::keys::word_keys(get(s), ev))
             .on_submit(move |s: &mut RiverApp, _| submit(s))
             .build(k)
             .key(key.to_owned())
@@ -1072,12 +1063,7 @@ fn member_search_box(chat: &Chat, p: &Palette, k: &Kit) -> Option<El> {
         .placeholder("Search members")
         .width(None)
         .on_edit(|s: &mut RiverApp| &mut s.chat.member_search.query)
-        .on_key(|s: &mut RiverApp, ev, _| {
-            if ev.key == rune::Key::Escape {
-                return s.chat.escape();
-            }
-            super::keys::word_keys(&mut s.chat.member_search.query, ev)
-        })
+        .on_key(|s: &mut RiverApp, ev, _| ev.key == rune::Key::Escape && s.chat.escape())
         .build(k)
         .key("member-search-input")
         .grow(1.0)
