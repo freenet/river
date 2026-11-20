@@ -22,46 +22,41 @@ pub(crate) enum BackgroundReason {
 }
 
 impl BackgroundReason {
-    pub(crate) fn as_attr(self) -> &'static str {
+    /// The `data-busy-reason` value and the tooltip text.
+    pub(crate) fn text(self) -> (&'static str, &'static str) {
         match self {
-            Self::Connecting => "connecting",
-            Self::Reconnecting => "reconnecting",
-            Self::LoadingRooms => "loading-rooms",
-            Self::JoiningRoom => "joining-room",
-            Self::SyncingRooms => "syncing-rooms",
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Connecting => "Connecting to Freenet",
-            Self::Reconnecting => "Reconnecting to Freenet",
-            Self::LoadingRooms => "Loading your rooms",
-            Self::JoiningRoom => "Joining the room",
-            Self::SyncingRooms => "Syncing rooms with the network",
+            Self::Connecting => ("connecting", "Connecting to Freenet"),
+            Self::Reconnecting => ("reconnecting", "Reconnecting to Freenet"),
+            Self::LoadingRooms => ("loading-rooms", "Loading your rooms"),
+            Self::JoiningRoom => ("joining-room", "Joining the room"),
+            Self::SyncingRooms => ("syncing-rooms", "Syncing rooms with the network"),
         }
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
-struct RoomActivity {
-    loading: bool,
-    joining: bool,
-    syncing: bool,
+/// Room work by priority: loading, then joining, then syncing.
+fn room_reason(loading: bool, joining: bool, syncing: bool) -> Option<BackgroundReason> {
+    use BackgroundReason::*;
+    [
+        (loading, LoadingRooms),
+        (joining, JoiningRoom),
+        (syncing, SyncingRooms),
+    ]
+    .into_iter()
+    .find_map(|(on, reason)| on.then_some(reason))
 }
 
-impl RoomActivity {
-    fn reason(self, status: &SynchronizerStatus, sync_enabled: bool) -> Option<BackgroundReason> {
-        use BackgroundReason::*;
-        match status {
-            SynchronizerStatus::Connecting => Some(Connecting),
-            SynchronizerStatus::Disconnected => sync_enabled.then_some(Reconnecting),
-            SynchronizerStatus::Error(_) => None,
-            SynchronizerStatus::Connected if self.loading => Some(LoadingRooms),
-            SynchronizerStatus::Connected if self.joining => Some(JoiningRoom),
-            SynchronizerStatus::Connected if self.syncing => Some(SyncingRooms),
-            SynchronizerStatus::Connected => None,
-        }
+/// The socket status outranks room work, which shows only while connected.
+fn reason(
+    status: &SynchronizerStatus,
+    sync_enabled: bool,
+    room: Option<BackgroundReason>,
+) -> Option<BackgroundReason> {
+    match status {
+        SynchronizerStatus::Connecting => Some(BackgroundReason::Connecting),
+        SynchronizerStatus::Disconnected => sync_enabled.then_some(BackgroundReason::Reconnecting),
+        SynchronizerStatus::Error(_) => None,
+        SynchronizerStatus::Connected => room,
     }
 }
 
@@ -75,8 +70,9 @@ fn loading_rooms(state: RoomsLoadState, room_count: usize, workers: bool, walk: 
         || (state == RoomsLoadState::Migrating && (room_count == 0 || workers))
 }
 
-/// Use the same socket snapshot as the label. Room updates that leave these
-/// three facts alone do not need to rerender the pill.
+/// Use the same socket snapshot as the label. Room updates that leave the room
+/// reason alone do not need to rerender the pill. The memo yields `None` when an
+/// input is contended, `Some(room reason)` otherwise.
 pub(crate) fn use_background_reason(status: &SynchronizerStatus) -> Option<BackgroundReason> {
     let activity = use_memo(move || {
         signal_guard::anchor();
@@ -116,30 +112,27 @@ pub(crate) fn use_background_reason(status: &SynchronizerStatus) -> Option<Backg
             signal_guard::schedule_nudge();
             return None;
         };
-        Some(RoomActivity {
-            loading: loading_rooms(
-                state,
-                live_keys.len(),
-                pending_load_workers() > 0,
-                migration_journal::current_walk_may_restore_rooms(),
-            ),
-            joining,
-            syncing,
-        })
+        let loading = loading_rooms(
+            state,
+            live_keys.len(),
+            pending_load_workers() > 0,
+            migration_journal::current_walk_may_restore_rooms(),
+        );
+        Some(room_reason(loading, joining, syncing))
     });
-    // A contended input keeps the mounted pill's last good room activity.
+    // A contended input keeps the mounted pill's last good room reason.
     // The socket status can still change independently during that render.
-    let last_good = use_hook(|| Rc::new(Cell::new(RoomActivity::default())));
+    let last_good = use_hook(|| Rc::new(Cell::new(None)));
     signal_guard::anchor();
     match activity.try_read() {
         Ok(snapshot) => {
-            if let Some(facts) = *snapshot {
-                last_good.set(facts);
+            if let Some(room) = *snapshot {
+                last_good.set(room);
             }
         }
         Err(_) => signal_guard::schedule_nudge(),
     }
-    last_good.get().reason(status, !cfg!(feature = "no-sync"))
+    reason(status, !cfg!(feature = "no-sync"), last_good.get())
 }
 
 #[cfg(test)]
@@ -152,31 +145,18 @@ mod tests {
         use BackgroundReason as R;
         use SynchronizerStatus as S;
 
-        let all = RoomActivity {
-            loading: true,
-            joining: true,
-            syncing: true,
-        };
-        let join_and_sync = RoomActivity {
-            loading: false,
-            ..all
-        };
-        let sync = RoomActivity {
-            joining: false,
-            ..join_and_sync
-        };
         let error = S::Error(ErrorReport::new(LABEL_DISCONNECTED, "closed", "closed"));
-        assert_eq!(all.reason(&S::Connecting, true), Some(R::Connecting));
-        assert_eq!(all.reason(&S::Disconnected, true), Some(R::Reconnecting));
-        assert_eq!(all.reason(&S::Disconnected, false), None);
-        assert_eq!(all.reason(&error, true), None);
-        assert_eq!(all.reason(&S::Connected, true), Some(R::LoadingRooms));
-        assert_eq!(
-            join_and_sync.reason(&S::Connected, true),
-            Some(R::JoiningRoom)
-        );
-        assert_eq!(sync.reason(&S::Connected, true), Some(R::SyncingRooms));
-        assert_eq!(RoomActivity::default().reason(&S::Connected, true), None);
+        let all = room_reason(true, true, true);
+        assert_eq!(all, Some(R::LoadingRooms));
+        assert_eq!(reason(&S::Connecting, true, all), Some(R::Connecting));
+        assert_eq!(reason(&S::Disconnected, true, all), Some(R::Reconnecting));
+        assert_eq!(reason(&S::Disconnected, false, all), None);
+        assert_eq!(reason(&error, true, all), None);
+        assert_eq!(reason(&S::Connected, true, all), Some(R::LoadingRooms));
+        assert_eq!(room_reason(false, true, true), Some(R::JoiningRoom));
+        assert_eq!(room_reason(false, false, true), Some(R::SyncingRooms));
+        assert_eq!(room_reason(false, false, false), None);
+        assert_eq!(reason(&S::Connected, true, None), None);
     }
 
     #[test]

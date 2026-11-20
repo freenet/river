@@ -2,8 +2,8 @@
 use dioxus::prelude::*;
 
 #[component]
-pub(crate) fn WaveDots(test_id: Option<&'static str>) -> Element {
-    dots("wave-dots", 10, test_id)
+pub(crate) fn WaveDots(test_id: &'static str) -> Element {
+    dots("wave-dots", 10, Some(test_id))
 }
 
 #[component]

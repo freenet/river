@@ -1418,14 +1418,9 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             // reading it is known-stored-data that failed to load. Mark the failure
             // (attempt-scoped, review 7).
             //
-            // The initial load also settles here (PR #940 review): worker
-            // settlement leaves the state alone while rooms are on screen, and
-            // a reconnect keeps the cached rooms, so without this write the
-            // attempt stayed `Loading` (the pill on "Loading your rooms") until
-            // the 60 s backstop. With rooms showing the rail keeps the list; an
-            // empty map gets the error block with Retry. The recovery re-run
-            // starts after a per-room load has already settled, and keeps its
-            // background-only behaviour.
+            // The initial load settles here even with cached rooms showing
+            // (see `on_current_list_refused`). The recovery re-run starts after
+            // a per-room load has settled and stays background-only.
             warn!("Failed to read current-delegate rooms blob: {}", e);
             worker.mark_fetch_failure();
             if !recovery {

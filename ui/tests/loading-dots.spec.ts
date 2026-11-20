@@ -36,7 +36,7 @@ test("initial room sync keeps the row name and explains the wait above the conve
   await expect(page.getByTestId("room-sync-banner-dots")).toHaveCount(0);
 });
 
-test("room dots move normally and shimmer in place with reduced motion", async ({ page }) => {
+test("room dots move normally and shimmer in place with reduced motion", { tag: "@chromium-only" }, async ({ page }) => {
   await page.goto("/");
   await waitForApp(page);
   await selectRoom(page, "Team Chat Room");

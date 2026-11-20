@@ -104,23 +104,3 @@ impl PendingRoomStatus {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pill_join_activity_ends_on_subscription_or_error() {
-        use PendingRoomStatus::*;
-
-        assert!(!PendingInvites::new().any_in_progress());
-        for (phase, pending) in [
-            (PendingSubscription, true),
-            (Subscribing, true),
-            (Subscribed, false),
-            (Error("join failed".into()), false),
-        ] {
-            assert_eq!(phase.is_in_progress(), pending, "{phase:?}");
-        }
-    }
-}

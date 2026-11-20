@@ -1175,12 +1175,9 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
 .connection-pill-face { display: flex; align-items: center; }
 
 /* The slot animates its own width, so the box that pushes the label aside is
-   exactly the box that shows the dots. (A `0fr`→`1fr` grid track left the
-   slot up to ~7px wider than its clipped content mid-animation, in every
-   engine, so the label slid past empty space.) The open width is the leading
-   gap plus the five small dots: 5 × 3px + 4 × 2px, see `.small-dots`. */
+   exactly the box that shows the dots. The open width is the leading gap plus
+   the five small dots: 5 × 3px + 4 × 2px, see `.small-dots`. */
 .connection-activity {
-    --activity-open-width: calc(0.5rem + 23px);
     display: inline-flex;
     width: 0;
     flex-shrink: 0;
@@ -1188,26 +1185,20 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
     transition: width 300ms ease 700ms, opacity 300ms ease 700ms;
 }
 
-/* The mobile footer shares this panel with the full-size loading wave. */
-.room-load-placeholder .connection-activity { display: none; }
-
-/* Same for the single-panel rooms view, where the rail shows the wave above
-   its footer. The query is the complement of Tailwind's `md` (48rem), which
-   decides that layout: a fixed 767px stops matching while a larger default
-   font still keeps the single panel. Never on the wide layout: the rail starts
-   in Loading on every cold start, and there its pill is the only connection
-   indicator in that column. */
+/* On the single panel (the complement of Tailwind's `md`, 48rem, so a larger
+   default font still matches) the pill drops its dots while the same panel
+   shows the full-size wave. Never on the wide layout, where the rail's pill is
+   that column's only connection indicator. */
 @media not all and (min-width: 48rem) {
-    .room-list-wave .connection-activity { display: none; }
+    :is([data-testid="rooms-rail"], [data-testid^="conversation-rooms-"]):has(.wave-dots) .connection-activity { display: none; }
 }
 
-/* Anchored to the label side: while the slot opens or closes, the dots next
-   to the label are what show, and the empty margin by the status dot is the
-   part clipped. Start-anchored, the label slid over a blank gap first. */
+/* Anchored to the label side, so the dots next to the label are what show
+   while the slot opens or closes. */
 .connection-activity-clip { width: 100%; min-width: 0; overflow: hidden; display: flex; justify-content: flex-end; }
 .connection-activity .small-dots { margin-inline-start: 0.5rem; color: inherit; }
 .connection-pill[aria-busy="true"] .connection-activity {
-    width: var(--activity-open-width);
+    width: calc(0.5rem + 23px);
     opacity: 1;
     transition-delay: 0s;
     transition-duration: 300ms, 0s;

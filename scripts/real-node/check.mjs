@@ -68,10 +68,7 @@ page.on('request', (r) => {
 const pillGaps = [];
 const wsEvents = [];
 page.on('console', (m) => {
-  if (m.text().startsWith('PILL-GAP ')) {
-    const sample = m.text().slice(9);
-    if (pillGaps.length < PILL_GAP_SAMPLES && !pillGaps.includes(sample)) pillGaps.push(sample);
-  }
+  if (m.text().startsWith('PILL-GAP ')) pillGaps.push(m.text().slice(9));
   if (m.text().startsWith('WS ')) wsEvents.push({ at: Date.now(), what: m.text().slice(3) });
 });
 await page.addInitScript((limit) => {
@@ -109,7 +106,6 @@ await page.addInitScript((limit) => {
         if (!gapSamples.includes(sample)) {
           gapSamples.push(sample);
           console.log(`PILL-GAP ${sample}`);
-          if (gapSamples.length >= limit) return;
         }
       }
     }
@@ -118,15 +114,6 @@ await page.addInitScript((limit) => {
   requestAnimationFrame(tick);
 }, PILL_GAP_SAMPLES);
 
-// Command sockets, as the gateway page opens them for River.
-const sockets = [];
-page.on('websocket', (ws) => {
-  const u = new URL(ws.url());
-  if (!u.pathname.endsWith('/contract/command')) return;
-  const s = { opened: Date.now(), closed: null };
-  sockets.push(s);
-  ws.on('close', () => (s.closed = Date.now()));
-});
 const app = () => page.frames().find((f) => f.url().includes('__sandbox=1'));
 async function until(what, ms, fn) {
   const end = Date.now() + ms;
@@ -163,8 +150,8 @@ await until('River connects', DEADLINE.connect, connected);
 const f = app();
 const rail = f.getByTestId('hamburger-rooms-button').filter({ visible: true });
 const room = f.locator('[data-testid^="room-item-"]');
-if ((await f.locator('[data-testid^="room-item-"]').count()) === 0) {
-  if (await rail.count()) await rail.first().click();
+if (await rail.count()) await rail.first().click();
+if ((await room.count()) === 0) {
   await f.getByTestId('create-room-button').first().click();
   await f.getByTestId('create-room-name-input').fill('real-node check');
   await f.getByTestId('create-room-nickname-input').fill('tester');
@@ -173,7 +160,6 @@ if ((await f.locator('[data-testid^="room-item-"]').count()) === 0) {
   log('created a room; giving the delegate a moment to store it');
   await sleep(3000);
 } else {
-  if (await rail.count()) await rail.first().click();
   await room.first().click();
 }
 const input = f.getByTestId('message-input');
@@ -224,10 +210,6 @@ await sampler;
 // --- Results.
 const rel = (ms) => `${((ms - upAt) / 1000).toFixed(1)}s`;
 log('River socket events (relative to node ready): ' + wsEvents.filter((e) => e.at >= upAt - 60_000).map((e) => `${rel(e.at)} ${e.what}`).join(', '));
-log(
-  'command sockets since the outage (relative to node ready): ' +
-    sockets.filter((s) => s.opened >= upAt - 60_000).map((s) => `${rel(s.opened)}→${s.closed ? rel(s.closed) : 'open'}`).join(', '),
-);
 const frameNow = app();
 const results = [];
 const check = (name, ok, detail = '') => results.push({ name, ok, detail });
@@ -243,15 +225,16 @@ check('reconnected', reconnectedAfter !== null, reconnectedAfter !== null ? `${r
 if (reconnectedAfter !== null && frameNow) {
   if (draftKept !== draft) await frameNow.getByTestId('message-input').fill(draft);
   await frameNow.getByTestId('send-message-button').click();
+  const draftCount = () => frameNow.evaluate((d) => ({
+    shown: [...document.querySelectorAll('[data-testid="message-body"]')].filter((e) => e.textContent.includes(d)).length,
+    pending: document.querySelectorAll('[data-testid="pending-message"]').length,
+  }), draft);
   const sent = await until('the draft is delivered', DEADLINE.send, async () => {
-    const c = await frameNow.evaluate((d) => ({
-      shown: [...document.querySelectorAll('[data-testid="message-body"]')].filter((e) => e.textContent.includes(d)).length,
-      pending: document.querySelectorAll('[data-testid="pending-message"]').length,
-    }), draft);
+    const c = await draftCount();
     return c.shown >= 1 && c.pending === 0 ? c : null;
   }).catch((e) => ({ error: e.message }));
   await sleep(2000);
-  const finalCount = await frameNow.evaluate((d) => [...document.querySelectorAll('[data-testid="message-body"]')].filter((e) => e.textContent.includes(d)).length, draft).catch(() => -1);
+  const finalCount = await draftCount().then((c) => c.shown, () => -1);
   check('draft sent exactly once', !sent.error && finalCount === 1, sent.error ?? `${finalCount} shown`);
 }
 check('pill never slides over an empty slot', pillGaps.length === 0, pillGaps.join('; '));

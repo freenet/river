@@ -117,7 +117,7 @@ pub fn ConnectionStatusIndicator() -> Element {
     let tip = report
         .as_ref()
         .map(|r| r.summary.clone())
-        .or_else(|| reason.map(|r| r.label().to_owned()));
+        .or_else(|| reason.map(|r| r.text().1.to_owned()));
     let copy = report.as_ref().map(ErrorReport::diagnostics);
 
     rsx! {
@@ -127,7 +127,7 @@ pub fn ConnectionStatusIndicator() -> Element {
                 role: "group",
                 "aria-label": "{name}",
                 "aria-busy": if reason.is_some() { "true" } else { "false" },
-                "data-busy-reason": reason.map(|r| r.as_attr()),
+                "data-busy-reason": reason.map(|r| r.text().0),
                 "data-testid": "connection-status-indicator",
                 // The visual stays mounted while the control above it changes
                 // between an explanation, a copy button and an idle status.

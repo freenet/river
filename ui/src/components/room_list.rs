@@ -407,18 +407,7 @@ pub fn RoomList() -> Element {
             // tests anchor on this testid instead of the brittle visible
             // text "Rooms".
             "data-testid": "rooms-rail",
-            // `room-list-wave` marks the two states that show the full-size
-            // wave, so on a phone the footer pill drops its own dots
-            // (main.css). The empty, list and failed states keep them: a
-            // restoring walk over an empty list has only the pill to show it.
-            class: format!(
-                "w-full md:w-64 flex-shrink-0 bg-rail border-r border-border flex flex-col overflow-y-auto{}",
-                if matches!(display, RoomListDisplay::Loading | RoomListDisplay::Migrating) {
-                    " room-list-wave"
-                } else {
-                    ""
-                }
-            ),
+            class: "w-full md:w-64 flex-shrink-0 bg-rail border-r border-border flex flex-col overflow-y-auto",
             // Mobile back button (hidden on desktop)
             div { class: "md:hidden flex items-center px-3 py-2 border-b border-border flex-shrink-0",
                 BackToChatButton {

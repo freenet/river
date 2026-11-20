@@ -605,27 +605,25 @@ pub fn install_test_hooks() {
 
     // Start a load attempt whose current-delegate listing is outstanding,
     // then have the delegate refuse it: the real refusal path, which a hook
-    // that writes LoadFailed directly would skip (PR 940 review).
+    // that writes LoadFailed directly would skip.
     set_hook(
         "beginListedLoad",
-        Closure::<dyn FnMut()>::new(|| {
-            crate::components::app::chat_delegate::test_begin_listed_load();
-        })
-        .into_js_value(),
+        Closure::<dyn FnMut()>::new(crate::components::app::chat_delegate::test_begin_listed_load)
+            .into_js_value(),
     );
     // The outstanding listing is answered with only the stored `rooms_data`
     // blob, whose read then fails (no node in this build).
     set_hook(
         "deliverStoredRoomsBlobListing",
-        Closure::<dyn FnMut()>::new(|| {
-            crate::components::app::freenet_api::response_handler::test_deliver_stored_rooms_blob_listing();
-        })
+        Closure::<dyn FnMut()>::new(
+            crate::components::app::freenet_api::response_handler::test_deliver_stored_rooms_blob_listing,
+        )
         .into_js_value(),
     );
     set_hook(
         "refuseOutstandingList",
         Closure::<dyn FnMut()>::new(|| {
-            let _ = crate::components::app::chat_delegate::on_current_list_refused(
+            crate::components::app::chat_delegate::on_current_list_refused(
                 river_core::chat_delegate::LIST_REFUSED_MARKER,
             );
         })
@@ -900,16 +898,14 @@ pub fn install_test_hooks() {
 /// Model an imported placeholder until it receives a valid signed configuration.
 /// Caller runs inside `defer`; release ROOMS before notifying SYNC_INFO readers.
 fn set_initial_sync_status(status: RoomSyncStatus) {
-    let Some(key) = CURRENT_ROOM.peek().owner_key else {
+    let mut found = None;
+    with_current_room_mut(|room, key| {
+        room.room_state.configuration.signature = ed25519_dalek::Signature::from_bytes(&[0; 64]);
+        found = Some(*key);
+    });
+    let Some(key) = found else {
         return;
     };
-    {
-        let mut rooms = ROOMS.write();
-        let Some(room) = rooms.map.get_mut(&key) else {
-            return;
-        };
-        room.room_state.configuration.signature = ed25519_dalek::Signature::from_bytes(&[0; 64]);
-    }
     SYNC_INFO.with_mut(|sync_info| {
         sync_info.register_new_room(key);
         sync_info.update_sync_status(&key, status);

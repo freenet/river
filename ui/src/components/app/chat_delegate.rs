@@ -1165,27 +1165,20 @@ pub(crate) fn is_current_list_refusal(err_text: &str, list_outstanding: bool) ->
 
 /// The current delegate refused this attempt's room listing (an index it
 /// cannot read). No `ListResponse` will start the load, so fail the attempt
-/// now rather than wait out the 60 s backstop. Returns whether the error was
-/// such a refusal.
+/// now rather than wait out the 60 s backstop.
 ///
-/// `LoadFailed` is written whether or not rooms are showing. A reconnect
-/// re-enters `Loading` without clearing `ROOMS`, so with cached rooms the
-/// empty-map helper would leave the attempt in `Loading` and the connection
-/// pill on "Loading your rooms" until the backstop. With rooms on screen the
-/// rail keeps the list (`room_list_display_state` returns `List` whenever
-/// `room_count > 0`), so there is no Retry button there; identity import stays
-/// disabled because the fetch failure is recorded. An empty map gets the
-/// error block with Retry, as before.
-pub(crate) fn on_current_list_refused(err_text: &str) -> bool {
+/// `LoadFailed` is written even with rooms showing: a reconnect keeps cached
+/// rooms, so the empty-map helper would leave the attempt in `Loading` (and the
+/// pill on "Loading your rooms") until the backstop. The rail keeps its list.
+pub(crate) fn on_current_list_refused(err_text: &str) {
     if !is_current_list_refusal(err_text, list_outstanding_this_attempt()) {
-        return false;
+        return;
     }
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
     warn!("The chat delegate refused the room listing; failing the load (freenet/river#592)");
     mark_fetch_failure_if_current(attempt);
     set_load_state_if_current(attempt, RoomsLoadState::LoadFailed);
-    true
 }
 
 /// Test hook (example-data + no-sync builds only): start a load attempt with
@@ -1344,11 +1337,7 @@ mod tests {
         ));
     }
 
-    /// A delegate still missing after this attempt registered it must leave
-    /// `Loading` even when cached rooms are showing. The empty-map helper
-    /// writes `LoadFailed` only for an empty map, so a reconnect that kept its
-    /// rooms would otherwise hold the pill on "Loading your rooms" until the
-    /// 60 s backstop.
+    /// See `on_current_list_refused` for why cached rooms must not hold `Loading`.
     #[test]
     fn missing_delegate_after_registration_settles_even_with_cached_rooms() {
         let production = chat_delegate_production();
