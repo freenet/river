@@ -1206,6 +1206,16 @@ fn details_scene(s: &mut RiverApp, room: &str, edit: fn(&mut Chat, &mut chat::mo
     });
 }
 
+/// The room `room` holding as many members and bans as its limits allow.
+fn fill_room(s: &mut RiverApp, room: &str) {
+    s.chat.edit_rooms(|r| {
+        if let Some(r) = r.iter_mut().find(|r| r.key == room) {
+            r.details.usage.members = r.details.limits.max_members;
+            r.details.usage.bans = r.details.limits.max_user_bans;
+        }
+    });
+}
+
 /// River pointed at the node at `address`, as if the person had chosen it.
 fn use_node(s: &mut RiverApp, address: &str) {
     s.chat.node.choice =
@@ -2361,6 +2371,34 @@ pub const SCENES: &[Scene] = &[
     }),
     ("chat-room-details-owner", |s| {
         details_scene(s, chat::example::EMPTY_ROOM, |_, _| {})
+    }),
+    // The same dialogs in the narrow window, and with the room and its ban list full.
+    ("chat-room-details-member-narrow", |s| {
+        details_scene(s, "town-square", |_, _| {})
+    }),
+    ("chat-room-details-owner-narrow", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |_, _| {})
+    }),
+    ("chat-room-details-editing-narrow", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |chat, _| {
+            let form = chat.details.as_mut().expect("open");
+            form.limits[0].replace_text("40");
+        })
+    }),
+    ("chat-room-details-member-open", |s| {
+        details_scene(s, "town-square", |chat, _| {
+            let form = chat.details.as_mut().expect("open");
+            form.limits_open = true;
+            form.technical_open = true;
+        })
+    }),
+    ("chat-room-details-full", |s| {
+        details_scene(s, "town-square", |_, _| {});
+        fill_room(s, "town-square");
+    }),
+    ("chat-room-details-owner-full", |s| {
+        details_scene(s, chat::example::EMPTY_ROOM, |_, _| {});
+        fill_room(s, chat::example::EMPTY_ROOM);
     }),
     // Leave Room: the question as a member and as the owner sees it.
     ("chat-room-leave-member", |s| {
