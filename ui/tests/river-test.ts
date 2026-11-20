@@ -75,6 +75,8 @@ type RiverTestHooks = {
   setSyncStatus(status: SyncStatus): void;
   // A connection error report with one of the report labels.
   setSyncErrorReport(label: ReportLabel, summary: string, detail: string): void;
+  // The current room as a placeholder subscribing to receive its signed state.
+  showRoomInitialSync(): void;
   // The current room as a placeholder awaiting its initial sync that ended in this error.
   // With failBannerRead, the room banner's first read of it fails as a contended read does.
   showRoomSyncError(label: ReportLabel, summary: string, detail: string, failBannerRead: boolean): void;

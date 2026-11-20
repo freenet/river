@@ -12,6 +12,7 @@ use crate::components::app::{
 };
 use crate::components::back_to_chat::CountBadge;
 use crate::components::icons::*;
+use crate::components::loading_dots::{SmallDots, WaveDots};
 use crate::components::members::{
     deputy_badges_for_viewer, impersonation_checker_for_viewer, impersonation_warning_for_display,
     privilege_in_view, DeputyBadge,
@@ -1170,7 +1171,7 @@ type MessageGroupsValue = Rc<(
 ///   It matters most in the unresolved states: a node that never connects
 ///   leaves `ROOMS_LOAD_STATE` at its `Loading` default forever, because
 ///   `begin_load_attempt` — which arms the 60s backstop — runs only after a
-///   successful connect. Without the pill that user watches a spinner with
+///   successful connect. Without the pill that user watches loading dots with
 ///   nothing on screen saying the socket is down. It is also what makes the
 ///   failed state's "Check your connection and try again" actionable.
 ///
@@ -3248,7 +3249,7 @@ pub fn Conversation() -> Element {
                 // A room still awaiting its initial sync can reach a terminal
                 // `RoomSyncStatus::Error` — most importantly the bounded
                 // contract-absent case (freenet/river#290), but also a failed
-                // GET/PUT send (WebSocket/API error). The spinner below is gated
+                // GET/PUT send (WebSocket/API error). The loading indicator below is gated
                 // on `is_awaiting_initial_sync()`, which stays true while the
                 // room holds placeholder state — so without this check it would
                 // spin forever. Surface the STORED error report (not a
@@ -3267,7 +3268,7 @@ pub fn Conversation() -> Element {
                         }
                         // A contended read neither returns the status nor
                         // subscribes to SYNC_INFO, so without a retry the
-                        // banner would read as the spinner until something
+                        // banner would show loading dots until something
                         // unrelated re-rendered (freenet/river#555). The
                         // anchor keeps this render subscribed to the nudge.
                         crate::util::signal_guard::anchor();
@@ -3310,7 +3311,7 @@ pub fn Conversation() -> Element {
                     Some(room_data) if room_data.is_awaiting_initial_sync() => {
                         rsx! {
                             div { class: "px-4 py-3 mx-4 mb-4 bg-surface rounded-lg text-sm text-text-muted flex items-center gap-3",
-                                div { class: "animate-spin w-4 h-4 border-2 border-accent border-t-transparent rounded-full" }
+                                SmallDots { test_id: "room-sync-banner-dots" }
                                 span { "Syncing room state from the network... You'll be able to send messages once sync completes." }
                             }
                         }
@@ -3448,14 +3449,14 @@ pub fn Conversation() -> Element {
                         // its `Loading` default indefinitely — `begin_load_attempt`,
                         // which arms the 60s backstop, runs only after a
                         // successful connect — so without the pill that user
-                        // would watch a spinner with nothing telling them the
+                        // would watch loading dots with nothing telling them the
                         // socket is down (#509).
                         match crate::components::room_list::current_room_list_display() {
                             crate::components::room_list::RoomListDisplay::Loading => rsx! {
                                 div {
                                     class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
                                     "data-testid": "conversation-rooms-loading",
-                                    div { class: "animate-spin w-6 h-6 border-2 border-text-muted border-t-transparent rounded-full" }
+                                    WaveDots { test_id: "conversation-rooms-loading-dots" }
                                     span { class: "text-sm text-text-muted", "Loading your rooms…" }
                                     NoRoomFooter {}
                                 }
@@ -3464,7 +3465,7 @@ pub fn Conversation() -> Element {
                                 div {
                                     class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
                                     "data-testid": "conversation-rooms-migrating",
-                                    div { class: "animate-spin w-6 h-6 border-2 border-text-muted border-t-transparent rounded-full" }
+                                    WaveDots { test_id: "conversation-rooms-migrating-dots" }
                                     span { class: "text-sm text-text-muted", "Migrating your rooms…" }
                                     span { class: "text-xs text-text-muted opacity-70", "(one-time step after an update)" }
                                     NoRoomFooter {}

@@ -33,6 +33,10 @@ test.describe("Restoring more rooms note", { tag: "@chromium-only" }, () => {
     await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "migrating");
     await expect(note).toBeVisible({ timeout: 5_000 });
     await expect(note.getByText("Restoring more rooms…")).toBeVisible();
+    const dots = note.getByTestId("room-list-restoring-dots");
+    await expect(dots).toBeVisible();
+    await expect(dots).toHaveAttribute("aria-hidden", "true");
+    await expect(dots.locator(":scope > span")).toHaveCount(5);
     // Screen readers hear it through the always-mounted live region.
     const status = page.getByTestId("room-list-restoring-status");
     await expect(status).toHaveAttribute("role", "status");

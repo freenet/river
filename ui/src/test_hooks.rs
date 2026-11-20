@@ -23,6 +23,8 @@
 //!   into a real room, or contract-invalid state where they do not verify.
 
 use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+use crate::components::app::freenet_api::error_report::ErrorReport;
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData};
 use dioxus::prelude::*;
@@ -801,13 +803,20 @@ pub fn install_test_hooks() {
         "setSyncErrorReport",
         Closure::<dyn FnMut(String, String, String)>::new(
             move |label: String, summary: String, detail: String| {
-                use crate::components::app::freenet_api::error_report::ErrorReport;
                 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
                 use crate::components::app::{set_sync_status, StatusOrigin};
                 let report = ErrorReport::new(report_label(&label), summary, detail);
                 set_sync_status(SynchronizerStatus::Error(report), StatusOrigin::Test);
             },
         )
+        .into_js_value(),
+    );
+
+    set_hook(
+        "showRoomInitialSync",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::util::defer(|| set_initial_sync_status(RoomSyncStatus::Subscribing));
+        })
         .into_js_value(),
     );
 
@@ -827,7 +836,8 @@ pub fn install_test_hooks() {
                     if fail_banner_read {
                         FAIL_NEXT_BANNER_READ.with(|f| f.set(true));
                     }
-                    show_room_sync_error(label, summary, detail);
+                    let report = ErrorReport::new(label, summary, detail);
+                    set_initial_sync_status(RoomSyncStatus::Error(report));
                 });
             },
         )
@@ -858,23 +868,22 @@ pub fn install_test_hooks() {
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
-/// The current room becomes a placeholder awaiting its initial sync (its
-/// configuration no longer verifies) whose sync ended in this error. Call
-/// inside `defer`.
-fn show_room_sync_error(label: &'static str, summary: String, detail: String) {
-    use crate::components::app::freenet_api::error_report::ErrorReport;
-    use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
-    let report = ErrorReport::new(label, summary, detail);
-    with_current_room_mut(|room, room_key| {
-        let signature = room.room_state.configuration.signature.to_bytes();
-        let mut forged = signature;
-        forged[0] ^= 1;
-        room.room_state.configuration.signature = ed25519_dalek::Signature::from_bytes(&forged);
-        let key = *room_key;
-        SYNC_INFO.with_mut(|sync_info| {
-            sync_info.register_new_room(key);
-            sync_info.update_sync_status(&key, RoomSyncStatus::Error(report));
-        });
+/// Model an imported placeholder until it receives a valid signed configuration.
+/// Caller runs inside `defer`; release ROOMS before notifying SYNC_INFO readers.
+fn set_initial_sync_status(status: RoomSyncStatus) {
+    let Some(key) = CURRENT_ROOM.peek().owner_key else {
+        return;
+    };
+    {
+        let mut rooms = ROOMS.write();
+        let Some(room) = rooms.map.get_mut(&key) else {
+            return;
+        };
+        room.room_state.configuration.signature = ed25519_dalek::Signature::from_bytes(&[0; 64]);
+    }
+    SYNC_INFO.with_mut(|sync_info| {
+        sync_info.register_new_room(key);
+        sync_info.update_sync_status(&key, status);
     });
 }
 

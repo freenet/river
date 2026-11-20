@@ -60,6 +60,8 @@ for (const { label, viewport, isMobile } of [
       // is also the first browser coverage #397's rail states have ever had —
       // their absence is why #509 went unnoticed.
       await expect(page.getByTestId("room-list-loading")).toHaveCount(1);
+      await expect(loading.getByTestId("conversation-rooms-loading-dots")).toBeVisible();
+      await expect(page.getByTestId("room-list-loading-dots")).toHaveCount(1);
 
       // The bug: the false-empty invitation to create a room.
       await expect(page.getByText(WELCOME)).toHaveCount(0);
@@ -100,6 +102,8 @@ for (const { label, viewport, isMobile } of [
       await expect(migrating).toBeVisible({ timeout: 5_000 });
       await expect(migrating.getByText("Migrating your rooms…")).toBeVisible();
       await expect(page.getByTestId("room-list-migrating")).toHaveCount(1);
+      await expect(migrating.getByTestId("conversation-rooms-migrating-dots")).toBeVisible();
+      await expect(page.getByTestId("room-list-migrating-dots")).toHaveCount(1);
       await expect(page.getByText(WELCOME)).toHaveCount(0);
     });
 
