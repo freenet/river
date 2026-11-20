@@ -1191,7 +1191,10 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
     .room-list-wave .connection-activity { display: none; }
 }
 
-.connection-activity-clip { min-width: 0; overflow: hidden; display: flex; }
+/* Anchored to the label side: while the slot opens or closes, the dots next
+   to the label are what show, and the empty margin by the status dot is the
+   part clipped. Start-anchored, the label slid over a blank gap first. */
+.connection-activity-clip { min-width: 0; overflow: hidden; display: flex; justify-content: flex-end; }
 .connection-activity .small-dots { margin-inline-start: 0.5rem; color: inherit; }
 .connection-pill[aria-busy="true"] .connection-activity {
     grid-template-columns: 1fr;

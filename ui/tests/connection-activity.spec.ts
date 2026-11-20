@@ -191,6 +191,71 @@ test.describe("Connection activity", () => {
     }, { connecting, times });
   }
 
+  // While the slot pushes the label away from the status dot, the dots must be
+  // what fills the space: the label never slides over an empty gap. Sampled
+  // part-way through the open and the close, where a slot that reveals its
+  // empty margin first showed no dots at all.
+  test("the label never slides over an empty dot slot", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    const pill = visibleConnectionPill(page);
+    await expect(pill).toHaveAttribute("aria-busy", "false");
+    const slot = pill.getByTestId("connection-activity-dots");
+    const restGap = await slot.evaluate(el => {
+      const pill = el.closest('[data-testid="connection-status-indicator"]')!;
+      const dot = pill.querySelector('[data-testid="connection-status-dot"]')!;
+      const label = pill.querySelector('[data-testid="connection-status-label"]')!;
+      return label.getBoundingClientRect().left - dot.getBoundingClientRect().right;
+    });
+
+    const frames = async (connecting: boolean, times: number[]) =>
+      slot.evaluate(async (el, args) => {
+        const pill = el.closest('[data-testid="connection-status-indicator"]')!;
+        const dot = pill.querySelector('[data-testid="connection-status-dot"]')!;
+        const label = pill.querySelector('[data-testid="connection-status-label"]')!;
+        const clip = el.querySelector(".connection-activity-clip")!;
+        const changed = new Promise<void>(resolve => {
+          const observer = new MutationObserver(() => {
+            if (pill.getAttribute("aria-busy") === String(args.connecting)) {
+              observer.disconnect();
+              resolve();
+            }
+          });
+          observer.observe(pill, { attributes: true, attributeFilter: ["aria-busy"] });
+        });
+        const hooks = (window as unknown as { __riverTest: { setSyncStatus(s: string): void } }).__riverTest;
+        hooks.setSyncStatus(args.connecting ? "connecting" : "disconnected");
+        await changed;
+        const transitions = el.getAnimations();
+        for (const transition of transitions) transition.pause();
+        return args.times.map(time => {
+          for (const transition of transitions) transition.currentTime = time;
+          const c = clip.getBoundingClientRect();
+          const shown = [...el.querySelectorAll(".small-dots > span")].filter(span => {
+            const r = span.getBoundingClientRect();
+            return r.left >= c.left - 0.5 && r.right <= c.right + 0.5;
+          }).length;
+          return {
+            time,
+            gap: label.getBoundingClientRect().left - dot.getBoundingClientRect().right,
+            shown,
+            opacity: Number(getComputedStyle(el).opacity),
+          };
+        });
+      }, { connecting, times });
+
+    const opening = await frames(true, [60, 100, 150, 200, 250]);
+    const closing = await frames(false, [750, 800, 850, 900]);
+    for (const f of [...opening, ...closing]) {
+      // Room for a dot and its spacing: a dot must be in it.
+      if (f.gap - restGap >= 8 && f.opacity > 0.2) {
+        expect(f.shown, `dots shown when the label is pushed ${Math.round(f.gap - restGap)}px at ${f.time}ms`).toBeGreaterThan(0);
+      }
+    }
+    // The samples did cover a partly open slot.
+    expect(opening.some(f => f.gap - restGap >= 8 && f.gap - restGap < 20)).toBe(true);
+  });
+
   for (const reduced of [false, true]) {
     test(`the pill opens immediately and can resume mid-fade (${reduced ? "reduced" : "normal"} motion)`, async ({ page }) => {
       await page.emulateMedia({ reducedMotion: reduced ? "reduce" : "no-preference" });
