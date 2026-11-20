@@ -404,6 +404,9 @@ impl RiverApp {
     /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
     /// the start of every frame, so it sees every change however it came about.
     fn sync_unread(&mut self, tx: &mut Tx) {
+        if self.chat.apply_reveal(tx) {
+            tx.wake_after(std::time::Duration::from_millis(30));
+        }
         if !matches!(self.chat.source, chat::Source::Node(_)) {
             return;
         }
@@ -870,6 +873,33 @@ fn node_change_scene(s: &mut RiverApp, current: Option<&str>, typed: Option<&str
         form.input.replace_text(t);
         s.chat.node.submit(true);
     }
+}
+
+/// The overview scenes: the example rooms with unread messages, a mention in Rust Help and
+/// a muted room that is left out.
+fn overview_scene(s: &mut RiverApp, caught_up: bool) {
+    use rooms::modes::NotificationMode;
+    connect(s);
+    s.chat.edit_rooms(|rooms| {
+        for r in rooms {
+            r.unread = match r.key.as_str() {
+                "design-crew" => 3,
+                "rust-help" => 2,
+                "family" => 4,
+                _ => 0,
+            };
+            if r.key == "rust-help"
+                && let Some(m) = r.messages.iter_mut().rev().find(|m| m.author != r.me)
+            {
+                m.md = format!("{} [@Sam]({}:self)", m.text, chat::model::mention_scheme());
+            }
+        }
+    });
+    s.chat.set_mode("family", NotificationMode::Muted);
+    if caught_up {
+        s.chat.mark_all_read();
+    }
+    s.chat.toggle_overview();
 }
 
 /// A named state for `--snap` and `--list-scenes`: a name and how it changes the initial state.
@@ -1387,6 +1417,10 @@ pub const SCENES: &[Scene] = &[
             |c| c.close_member(),
         )
     }),
+    // The unread and mentions overview, opened from the room list: rooms with unread messages,
+    // the one with a mention first, a muted room left out; and when everything is read.
+    ("chat-overview", |s| overview_scene(s, false)),
+    ("chat-overview-empty", |s| overview_scene(s, true)),
     // The quick switcher (Ctrl+K): a blank box lists rooms with unread first, then the open
     // room's members; typing narrows it; a query nothing matches says so.
     ("chat-switcher", |s| {
@@ -3637,5 +3671,359 @@ mod tests {
             ]
         );
         assert!(rt.find("work-why").is_none(), "dismissed at once");
+    }
+
+    /// The example rooms from the node with unread messages: a mention in Rust Help, Family muted.
+    fn overview_rooms(board: &rune::clipboard::MemoryClipboard) -> Runtime<RiverApp> {
+        let mut rt = node_rooms(board);
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                for r in rooms {
+                    r.unread = match r.key.as_str() {
+                        "design-crew" => 3,
+                        "rust-help" => 2,
+                        "family" => 4,
+                        _ => 0,
+                    };
+                    if r.key == "rust-help"
+                        && let Some(m) = r.messages.iter_mut().rev().find(|m| m.author != r.me)
+                    {
+                        m.md = format!("hi [@Sam]({}:self)", chat::model::mention_scheme());
+                    }
+                }
+            });
+            s.chat
+                .set_mode("family", rooms::modes::NotificationMode::Muted);
+        });
+        settle(&mut rt);
+        rt
+    }
+
+    #[test]
+    fn the_room_lists_entry_opens_the_overview_with_the_unread_rooms_and_not_the_muted_one() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        assert!(rt.find("overview-dialog").is_none());
+        press(&mut rt, "overview-open");
+        assert!(rt.state.chat.overview);
+        assert!(rt.find("overview-dialog").is_some());
+        assert!(rt.find("overview-row-rust-help").is_some());
+        assert!(rt.find("overview-row-design-crew").is_some());
+        assert!(rt.find("overview-row-family").is_none(), "Family is muted");
+        let rows = rt.state.chat.overview_rows();
+        assert_eq!(rows[0].name, "Rust Help", "the mention comes first");
+        assert_eq!(rt.state.chat.unread_summary().total, 5);
+        assert_eq!(rt.state.chat.unread_summary().mentions, 1);
+    }
+
+    #[test]
+    fn a_row_opens_its_room_closes_the_overview_and_stages_the_scroll() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        press(&mut rt, "overview-open");
+        let want = rt.state.chat.overview_rows()[0].clone();
+        press(&mut rt, "overview-row-rust-help");
+        assert!(!rt.state.chat.overview);
+        assert_eq!(rt.state.chat.room().expect("open").key, want.key);
+        let pending = rt.state.chat.pending_reveal().expect("a scroll is staged");
+        assert_eq!(Some(pending.message.as_str()), want.reveal.as_deref());
+        // It waits for the history to be laid out, then goes once.
+        let mut waits = 0;
+        loop {
+            let mut again = false;
+            rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+            if !again {
+                break;
+            }
+            waits += 1;
+            assert!(waits < 5, "the reveal never fires");
+        }
+        assert!(rt.state.chat.pending_reveal().is_none());
+        assert_eq!(
+            rt.state.chat.unread_summary().total,
+            3,
+            "the room is read now"
+        );
+    }
+
+    #[test]
+    fn mark_all_read_clears_every_count_and_the_title() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        press(&mut rt, "overview-open");
+        assert_eq!(rt.state.unread(), 5);
+        press(&mut rt, "overview-mark-all");
+        assert_eq!(rt.state.unread(), 0);
+        assert_eq!(rt.state.chat.unread_summary(), Default::default());
+        assert!(rt.state.chat.overview, "the overview stays, now empty");
+        assert!(rt.find("overview-row-rust-help").is_none());
+        assert!(rt.find("overview-row-design-crew").is_none());
+    }
+
+    #[test]
+    fn the_overview_does_not_open_over_another_dialog_or_the_switcher() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        rt.on_key = spec().on_key;
+        open_switcher(&mut rt);
+        assert!(!rt.state.chat.toggle_overview());
+        rt.key(bare(rune::Key::Escape));
+        settle(&mut rt);
+        press(&mut rt, "overview-open");
+        rt.update(|s, _| {
+            s.chat.pin_chord_time(None);
+            assert!(!s.chat.switcher_chord(std::time::Instant::now()));
+        });
+        assert!(rt.state.chat.switcher.is_none());
+    }
+
+    #[test]
+    fn mark_all_read_clears_only_the_rooms_the_overview_lists() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        press(&mut rt, "overview-open");
+        press(&mut rt, "overview-mark-all");
+        let unread = |rt: &Runtime<RiverApp>, k: &str| {
+            rt.state
+                .chat
+                .rooms()
+                .iter()
+                .find(|r| r.key == k)
+                .expect("room")
+                .unread
+        };
+        assert_eq!(unread(&rt, "design-crew"), 0);
+        assert_eq!(unread(&rt, "rust-help"), 0);
+        assert_eq!(
+            unread(&rt, "family"),
+            4,
+            "muted, so not listed and not cleared"
+        );
+    }
+
+    #[test]
+    fn mentions_only_rooms_keep_the_unread_the_overview_does_not_count() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        rt.update(|s, _| {
+            s.chat.set_mode(
+                "design-crew",
+                rooms::modes::NotificationMode::MentionsAndReplies,
+            );
+            s.chat.mark_all_read();
+        });
+        let r = rt
+            .state
+            .chat
+            .rooms()
+            .iter()
+            .find(|r| r.key == "design-crew");
+        assert_eq!(r.expect("room").unread, 3, "none of it mentions you");
+    }
+
+    /// The same rooms as `overview_rooms`, as a later update from the node. `book_club` is the
+    /// empty room's unread count, which the node reports as 0 for a room with no messages.
+    fn node_update(rt: &mut Runtime<RiverApp>, history_in_book_club: bool) {
+        let mut rooms = chat::example::data().rooms;
+        for r in &mut rooms {
+            r.unread = match r.key.as_str() {
+                "design-crew" => 3,
+                "rust-help" => 2,
+                "family" => 4,
+                _ => 0,
+            };
+            if r.key == chat::example::EMPTY_ROOM && history_in_book_club {
+                let mut template = chat::example::data()
+                    .rooms
+                    .into_iter()
+                    .find(|r| r.key == "rust-help")
+                    .expect("room")
+                    .messages;
+                template.truncate(4);
+                r.messages = template;
+            }
+        }
+        rt.update(move |s, tx| {
+            s.apply_rooms(
+                RoomsUpdate::Rooms {
+                    rooms,
+                    open: None,
+                    modes: [("family".to_owned(), rooms::modes::NotificationMode::Muted)]
+                        .into_iter()
+                        .collect(),
+                    settled: Vec::new(),
+                    status: chat::LinkStatus::Live,
+                    now: 29_000_001,
+                    issues: Default::default(),
+                    work: Vec::new(),
+                },
+                tx,
+            );
+        });
+        settle(rt);
+    }
+
+    #[test]
+    fn mark_all_read_survives_the_next_update_from_the_node() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        node_update(&mut rt, false);
+        assert_eq!(rt.state.chat.unread_total(), 5);
+        press(&mut rt, "overview-open");
+        press(&mut rt, "overview-mark-all");
+        assert_eq!(rt.state.chat.unread_total(), 0);
+        node_update(&mut rt, false);
+        assert_eq!(rt.state.chat.unread_total(), 0, "nothing came back");
+        assert!(rt.state.chat.overview_rows().is_empty());
+    }
+
+    /// An empty room carries no unread (the node reports 0 without a read position). Opening it
+    /// must not make the history that arrives later count as unread.
+    #[test]
+    fn history_arriving_in_a_room_opened_while_empty_is_not_unread() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        node_update(&mut rt, false);
+        rt.update(|s, _| s.chat.select(chat::example::EMPTY_ROOM));
+        press(&mut rt, "overview-open");
+        press(&mut rt, "overview-mark-all");
+        assert_eq!(rt.state.chat.unread_total(), 0);
+        node_update(&mut rt, true);
+        let room = rt
+            .state
+            .chat
+            .rooms()
+            .iter()
+            .find(|r| r.key == chat::example::EMPTY_ROOM)
+            .expect("room");
+        assert!(!room.messages.is_empty(), "the history arrived");
+        assert_eq!(room.unread, 0);
+        assert_eq!(rt.state.chat.unread_total(), 0);
+    }
+
+    /// The dialog takes Escape itself; no window-level handler is installed here, so this is
+    /// the dialog's own path.
+    #[test]
+    fn escape_closes_the_overview_through_the_dialog() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        press(&mut rt, "overview-open");
+        assert!(rt.find("overview-dialog").is_some());
+        rt.key(bare(rune::Key::Escape));
+        settle(&mut rt);
+        assert!(!rt.state.chat.overview);
+        assert!(rt.find("overview-dialog").is_none());
+    }
+
+    /// The window-level Escape leaves an open overview to the dialog.
+    #[test]
+    fn the_window_level_escape_does_not_act_while_the_overview_is_open() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        press(&mut rt, "overview-open");
+        rt.update(|s, _| assert!(!s.chat.escape()));
+        assert!(rt.state.chat.overview);
+    }
+
+    /// The per-frame hook that applies a staged scroll is `sync_unread`, which `spec().poll`
+    /// runs; it must call `apply_reveal` even when the rooms are not from a node.
+    #[test]
+    fn the_per_frame_sync_applies_a_staged_scroll() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        press(&mut rt, "overview-open");
+        press(&mut rt, "overview-row-rust-help");
+        assert!(rt.state.chat.pending_reveal().is_some());
+        let poll = spec().poll.expect("a poll hook");
+        for _ in 0..10 {
+            rt.update(|s, tx| {
+                poll(s, 0.0, tx);
+            });
+            if rt.state.chat.pending_reveal().is_none() {
+                break;
+            }
+        }
+        assert!(rt.state.chat.pending_reveal().is_none());
+    }
+
+    /// A click on a row scrolls the long history to the first mention and leaves it there, even
+    /// though the room opened stuck to its bottom. This drives `apply_reveal` directly; that the
+    /// per-frame sync calls it is `the_per_frame_sync_applies_a_staged_scroll`.
+    #[test]
+    fn the_scroll_to_the_first_mention_lands_and_stays() {
+        let board = rune::clipboard::memory();
+        let mut rt = overview_rooms(&board);
+        let mention = format!("hi [@Sam]({}:self)", chat::model::mention_scheme());
+        let target = rt.state.chat.rooms().iter().find(|r| r.key == "rust-help");
+        let template = target
+            .expect("room")
+            .messages
+            .last()
+            .expect("a message")
+            .clone();
+        let mut first_mention = String::new();
+        rt.update(|s, _| {
+            s.chat.edit_rooms(|rooms| {
+                let r = rooms
+                    .iter_mut()
+                    .find(|r| r.key == "rust-help")
+                    .expect("room");
+                let base = r.messages.len();
+                for i in 0..60usize {
+                    let mut m = template.clone();
+                    m.key = format!("long-{i}");
+                    m.id = (base + i + 1) as u32;
+                    m.time += i as u32 + 1;
+                    m.text = format!("filler line number {i}");
+                    m.md = m.text.clone();
+                    // The 40th is the first unread mention; the last 20 are unread too.
+                    if i == 40 {
+                        m.md = mention.clone();
+                    }
+                    r.messages.push(m);
+                }
+                r.unread = 20;
+                first_mention = "long-40".into();
+            });
+        });
+        settle(&mut rt);
+        press(&mut rt, "overview-open");
+        press(&mut rt, "overview-row-rust-help");
+        assert_eq!(
+            rt.state.chat.pending_reveal().map(|r| r.message.as_str()),
+            Some(first_mention.as_str())
+        );
+        let msg = format!("msg-{first_mention}");
+        // The history viewport as laid out, not a guessed window position.
+        let (view, _) = rt
+            .presented("history-scroll-rust-help")
+            .expect("the history is drawn");
+        let inside = move |y: f32| y > view[1] && y < view[1] + view[3];
+        // The room opened at its newest message, so the mention is far off screen.
+        let before = rt.find(&msg).map(|(_, y)| y);
+        assert!(
+            before.is_none_or(|y| !inside(y)),
+            "the mention starts off screen: {before:?}"
+        );
+        // What `sync_unread` does each frame, until the request goes out.
+        for _ in 0..10 {
+            let mut again = false;
+            rt.update(|s, tx| again = s.chat.apply_reveal(tx));
+            settle(&mut rt);
+            if !again {
+                break;
+            }
+        }
+        let (_, y) = rt.find(&msg).expect("the mention is drawn");
+        assert!(
+            (80.0..680.0).contains(&y),
+            "scrolled into the viewport: y = {y}"
+        );
+        // Still there after more frames: the bottom-sticking viewport does not pull it back.
+        for _ in 0..5 {
+            settle(&mut rt);
+        }
+        let (_, later) = rt.find(&msg).expect("still drawn");
+        assert!((y - later).abs() < 1.0, "it moved from {y} to {later}");
     }
 }

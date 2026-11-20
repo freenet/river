@@ -57,6 +57,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         super::update_view::settings_dialog(&chat.update, &k, &mut layer);
     }
     super::switcher::switcher_dialog(chat, &k, &mut layer);
+    super::overview::overview_dialog(chat, &k, &mut layer);
     screen = screen.child(link_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
@@ -346,6 +347,9 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         });
     let width = if narrow { ROOMS_NARROW_W } else { ROOMS_W };
     let mut list = col().key("room-list").gap(2.0).px(10.0).pb(10.0);
+    if !chat.rooms().is_empty() {
+        list = list.child(super::overview::entry(chat, p));
+    }
     for room in chat.rooms() {
         let selected = chat.room().is_some_and(|r| r.key == room.key);
         list = list.child(room_row(room, chat.unread_of(room), selected, width, p));

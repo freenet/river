@@ -31,6 +31,7 @@ mod mention;
 pub mod model;
 pub(crate) mod node_ui;
 mod notify_dialog;
+pub mod overview;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
 #[path = "../../../../ui/src/util/share_link.rs"]
@@ -296,6 +297,10 @@ pub struct Chat {
     pub update: crate::update::UpdateUi,
     /// The quick switcher (Ctrl+K), when open ([`switcher`]).
     pub switcher: Option<switcher::Switcher>,
+    /// Whether the unread and mentions overview is open ([`overview`]).
+    pub overview: bool,
+    /// A message to scroll to once the room it is in is on screen.
+    reveal: Option<overview::Reveal>,
     /// When the switcher's chord last arrived, for [`switcher::chord_gate`].
     chord_at: Option<std::time::Instant>,
 }
@@ -411,6 +416,8 @@ impl Chat {
             picked: HashMap::new(),
             notify_dialog: None,
             switcher: None,
+            overview: false,
+            reveal: None,
             chord_at: None,
             node: Default::default(),
             update: Default::default(),
@@ -636,6 +643,17 @@ impl Chat {
     /// Unread messages across all rooms.
     pub fn unread_total(&self) -> usize {
         self.rooms.iter().map(|r| self.unread_of(r)).sum()
+    }
+
+    /// Mark the room keyed `key` read, without opening it.
+    pub fn mark_read(&mut self, key: &str) {
+        let Some(room) = self.rooms.iter_mut().find(|r| r.key == key) else {
+            return;
+        };
+        room.unread = 0;
+        if let Some(mark) = ReadMark::of(room) {
+            self.read.insert(key.to_owned(), mark);
+        }
     }
 
     /// Bring the room keyed `key` to the front, as a click on its notification does: open it,
@@ -955,6 +973,7 @@ impl Chat {
             || self.notify_dialog.is_some()
             || self.switcher.is_some()
             || self.background.as_ref().is_some_and(|b| b.open)
+            || self.overview
             || self.link_menu.is_some()
             || self.members_overlay
             || self.picker.is_some();

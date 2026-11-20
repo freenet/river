@@ -284,6 +284,27 @@ mod tests {
     }
 
     #[test]
+    fn the_overview_and_the_background_dialog_do_not_open_over_each_other() {
+        let mut chat = chat_with(Fake::new(true));
+        chat.set_rooms(crate::chat::example::data().rooms);
+        chat.open_background();
+        assert!(
+            !chat.toggle_overview(),
+            "the overview does not open over it"
+        );
+        assert!(!chat.overview);
+        chat.close_background();
+        assert!(chat.toggle_overview());
+        assert!(!chat.escape(), "Escape belongs to the overview's dialog");
+        assert!(
+            !chat.toggle_switcher(),
+            "the switcher does not open over it"
+        );
+        assert!(chat.switcher.is_none());
+        assert!(chat.toggle_overview(), "the same call closes it");
+    }
+
+    #[test]
     fn the_switcher_and_escape_leave_the_open_background_dialog_alone() {
         let mut chat = chat_with(Fake::new(true));
         chat.set_rooms(crate::chat::example::data().rooms);
