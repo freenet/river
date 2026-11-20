@@ -119,6 +119,8 @@ pub struct DmUi {
     restore_focus: bool,
     /// Deleting the peer's messages ([`super::dm_purge`]).
     pub(super) purge: super::dm_purge::DmPurgeUi,
+    /// Invitations: Accept on a card and the "Share an invite" dialog ([`super::dm_invite`]).
+    pub(super) invite: super::dm_invite::DmInviteUi,
     /// Deletions the background work took, whose messages the room still held at the last
     /// snapshot: `(room key, peer, message keys)`. The read position forgets a key once the
     /// thread no longer has it ([`DmUi::forget_deleted`]), so the badge does not count messages
@@ -478,6 +480,7 @@ impl Chat {
             .compose
             .forget_rooms(|r| keys.iter().any(|k| k == r));
         self.dm.purge.forget_rooms(|r| keys.iter().any(|k| k == r));
+        self.dm.invite.forget_rooms(|r| keys.iter().any(|k| k == r));
     }
 
     /// Open the conversation with the member `uid` of the room keyed `room`, in the main pane.
@@ -1006,7 +1009,7 @@ fn group_el(
         rows = rows.fill(p.own_row);
     }
     for (i, (m, dm)) in group.messages.iter().zip(dms).enumerate() {
-        let body = body_el(m, dm, hydrated, p, k);
+        let body = body_el(chat, shown, m, dm, hydrated, p, k);
         let (gutter, content) = if i == 0 {
             (
                 row()
@@ -1051,7 +1054,7 @@ fn group_el(
 }
 
 /// Plain text a peer or the app wrote: no markdown, no links.
-fn plain(s: impl Into<String>, color: rune::Color) -> El {
+pub(super) fn plain(s: impl Into<String>, color: rune::Color) -> El {
     rune::rich(s.into(), Vec::new())
         .font(st::MESSAGE)
         .color(color)
@@ -1060,84 +1063,49 @@ fn plain(s: impl Into<String>, color: rune::Color) -> El {
         .selectable(true)
 }
 
-fn body_el(m: &Message, dm: &DmMessage, hydrated: bool, p: &Palette, k: &Kit) -> El {
+fn body_el(
+    chat: &Chat,
+    shown: &Shown<'_>,
+    m: &Message,
+    dm: &DmMessage,
+    hydrated: bool,
+    p: &Palette,
+    k: &Kit,
+) -> El {
     let body = match &dm.body {
         // As the room does: the text's markdown.
         DmBody::Text(_) => message_body(m, p, k),
-        DmBody::Invite { room_label, note } => invite_card(
+        DmBody::Invite {
+            room,
+            room_label,
+            note,
+        } => super::dm_invite::card(
+            chat,
+            (shown.room, shown.uid),
             &m.key,
-            "Invitation",
+            Some((room_label.as_str(), room.as_str())),
             Some(room_label.as_str()),
             note.as_deref(),
-            Some("Accepting an invitation is not available yet in this build."),
+            &shown.peer_name,
             p,
+            k,
         ),
-        DmBody::SentInvite { note } => invite_card(
+        DmBody::SentInvite { note } => super::dm_invite::card(
+            chat,
+            (shown.room, shown.uid),
             &m.key,
-            "You sent an invitation",
+            None,
             None,
             note.as_deref(),
-            None,
+            &shown.peer_name,
             p,
+            k,
         ),
         DmBody::Placeholder(ph) => plain(placeholder_text(*ph, hydrated), p.text_muted),
     };
     let mut c = col().key(format!("dm-msg-{}", m.key)).w_full().child(body);
     if let Some(pending) = &dm.pending {
         c = c.gap(4.0).child(super::dm_compose::delivery(pending, p));
-    }
-    c
-}
-
-/// A read-only invitation card. `room` and `note` are a peer's words: plain text.
-fn invite_card(
-    key: &str,
-    title: &str,
-    room: Option<&str>,
-    note: Option<&str>,
-    footer: Option<&str>,
-    p: &Palette,
-) -> El {
-    let mut c = col()
-        .key(format!("dm-invite-{key}"))
-        .w_full()
-        .max_w(420.0)
-        .px(12.0)
-        .py(10.0)
-        .gap(6.0)
-        .radius(10.0)
-        .fill(p.surface)
-        .border(1.0, p.line_strong)
-        .child(
-            row()
-                .gap(8.0)
-                .center_y()
-                .child(icon(&icons::INVITE, 15.0).color(p.text_secondary))
-                .child(label(title.to_owned(), st::NAME, p.text)),
-        );
-    if let Some(room) = room {
-        c = c.child(
-            row()
-                .gap(6.0)
-                .child(label("Room:", st::SMALL, p.text_muted))
-                .child(
-                    label(room.to_owned(), st::SMALL_STRONG, p.text)
-                        .key(format!("dm-invite-room-{key}"))
-                        .wrap()
-                        .shrink(),
-                ),
-        );
-    }
-    if let Some(note) = note {
-        c = c.child(
-            col()
-                .key(format!("dm-invite-note-{key}"))
-                .w_full()
-                .child(plain(note.to_owned(), p.text)),
-        );
-    }
-    if let Some(footer) = footer {
-        c = c.child(label(footer.to_owned(), st::SMALL, p.text_muted).wrap());
     }
     c
 }

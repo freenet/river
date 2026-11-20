@@ -517,7 +517,7 @@ fn what_is_not_known_yet_is_said_as_a_state_of_the_cache_and_not_of_the_message(
 }
 
 #[test]
-fn an_invitation_is_a_read_only_card_in_plain_text() {
+fn an_invitation_card_shows_the_peers_words_in_plain_text_and_offers_accept() {
     let mut f = Fixture::new();
     let body = DirectMessageBody::Invite(Box::new(InvitePayload {
         room_owner_vk: vk(9),
@@ -533,13 +533,10 @@ fn an_invitation_is_a_read_only_card_in_plain_text() {
     assert!(shows(&rt, "join **us** [x](https://evil.example)"));
     // The room is named from this computer's rooms, or by a short form of its key.
     assert!(shows(&rt, "Rust Help"));
-    // It cannot be accepted here.
-    let accept = rt.elements().into_iter().any(|e| {
-        e.key.as_deref().is_some_and(|k| k.contains("accept"))
-            || e.text.as_deref().is_some_and(|t| t == "Accept")
-    });
-    assert!(!accept);
-    assert!(shows(&rt, "not available yet in this build"));
+    // It is offered for accepting (the example sends nothing: see `dm_invite_tests`), and the
+    // build no longer says it is not available.
+    assert_eq!(keys_with(&rt, "dm-invite-accept-").len(), 1);
+    assert!(!shows(&rt, "not available yet in this build"));
 }
 
 #[test]
@@ -585,6 +582,7 @@ fn a_rail_preview_is_one_bounded_plain_line() {
     for (body, outgoing, expect) in [
         (
             DmBody::Invite {
+                room: "rust-help".into(),
                 room_label: "Rust Help".into(),
                 note: Some("secret note".into()),
             },
@@ -877,6 +875,7 @@ fn a_rail_preview_follows_the_cache_and_an_invitation_s_room_name() {
     let mut snap = g.snapshot(true);
     let mut t = (*snap.threads[0]).clone();
     t.messages[0].body = DmBody::Invite {
+        room: "rust-help".into(),
         room_label: "Renamed".into(),
         note: None,
     };

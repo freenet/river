@@ -264,6 +264,16 @@ pub fn new_room(
 /// An invitation to `room` from the user, and the link that carries it. `web_app` is the web
 /// app's address on the user's node (`http://<authority>/v1/contract/web/<id>/`).
 pub fn invitation(room: &LiveRoom, web_app: &str) -> Result<(Invitation, String), String> {
+    let invitation = mint_invitation(room)?;
+    let code = invitation.to_encoded_string()?;
+    let link = format!("{web_app}?invitation={code}");
+    Ok((invitation, link))
+}
+
+/// A fresh invitation to `room` from the user, with no link: a new key for the invitee, their
+/// membership signed with the user's key, and for a private room its secrets. It is a bearer
+/// credential. A direct message carries it sealed ([`super::dm_invite`]).
+pub fn mint_invitation(room: &LiveRoom) -> Result<Invitation, String> {
     let Some(inviter) = &room.stored.self_sk else {
         return Err(
             "This computer doesn't hold your key for this room, so it can't make an invitation."
@@ -276,7 +286,7 @@ pub fn invitation(room: &LiveRoom, web_app: &str) -> Result<(Invitation, String)
         invited_by: MemberId::from(&inviter.verifying_key()),
         member_vk: invitee.verifying_key(),
     };
-    let invitation = Invitation {
+    Ok(Invitation {
         room: room.stored.owner_vk,
         invitee_signing_key: invitee,
         invitee: AuthorizedMember::new(member, inviter),
@@ -285,10 +295,7 @@ pub fn invitation(room: &LiveRoom, web_app: &str) -> Result<(Invitation, String)
         } else {
             Vec::new()
         },
-    };
-    let code = invitation.to_encoded_string()?;
-    let link = format!("{web_app}?invitation={code}");
-    Ok((invitation, link))
+    })
 }
 
 /// What joining a room sends and stores. No `Debug`: it holds the invitee's key.

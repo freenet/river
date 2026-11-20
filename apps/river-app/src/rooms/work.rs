@@ -157,6 +157,9 @@ pub struct WorkView {
     pub id: u64,
     /// What it is, for the screen: "Creating “Book club”", "Joining a room".
     pub what: String,
+    /// The room it is about (its key), when it has one: a create or join names it from the
+    /// start, so a card that started a join can tell its own from another.
+    pub room: Option<String>,
     pub state: WorkState,
 }
 
@@ -418,6 +421,9 @@ impl Task {
         WorkView {
             id: self.id,
             what,
+            room: self
+                .owner()
+                .map(|o| bs58::encode(o.to_bytes()).into_string()),
             state,
         }
     }
@@ -623,16 +629,29 @@ impl Work {
             Ok(i) => i,
             Err(why) => return self.refuse(WHAT, why),
         };
+        if let Err(why) = self.join_invitation(invitation, nickname, shown) {
+            self.refuse(WHAT, why);
+        }
+    }
+
+    /// Join the room `invitation` is for, as `nickname`, or say at once why it is not queued
+    /// (nothing is shown as failed: the caller says it). The invitation is not checked for
+    /// consistency here beyond what [`create::join`] does when the room is read.
+    pub fn join_invitation(
+        &mut self,
+        invitation: Invitation,
+        nickname: &str,
+        shown: &dyn Fn(&VerifyingKey) -> bool,
+    ) -> Result<(), String> {
         if let Some(why) = create::join_refusal(nickname) {
-            return self.refuse(WHAT, why);
+            return Err(why);
         }
         if shown(&invitation.room) {
             // Joining writes the room into the store, and over a stored room only the web UI
             // can write without losing what it keeps there. The window opens such a room
             // instead of asking for this ([`crate::chat::Chat::submit_join`]); this is for an
             // invitation that reaches here some other way.
-            return self.refuse(
-                WHAT,
+            return Err(
                 "You are already a member of this room, so this invitation was not used.".into(),
             );
         }
@@ -657,7 +676,7 @@ impl Work {
                 }
             });
         if let Some(why) = earlier {
-            return self.refuse(WHAT, why.into());
+            return Err(why.into());
         }
         // A leave of this room that failed is over: it must not be tried again over the room
         // joined now.
@@ -672,6 +691,7 @@ impl Work {
             },
             Step::Get,
         );
+        Ok(())
     }
 
     /// Leave `room`, which the screen calls `name`. Nothing is queued when it is being left

@@ -766,6 +766,18 @@ impl RiverApp {
                 ticket,
                 result,
             } => self.chat.dm_purged(&room, &peer, ticket, result),
+            RoomsUpdate::DmInvite {
+                room,
+                peer,
+                ticket,
+                result,
+            } => {
+                // A sent invitation opens its thread at the end, where it shows as sent.
+                if let Some((room, peer)) = self.chat.dm_invite_answer(&room, &peer, ticket, result)
+                {
+                    tx.scroll_to_bottom(chat::dm_view::scroll_key(&room, &peer));
+                }
+            }
             RoomsUpdate::Status(status) => {
                 let at = self.chat.node.choice.address.authority();
                 self.chat
@@ -1539,6 +1551,68 @@ pub const SCENES: &[Scene] = &[
     }),
     ("chat-dm-invite", |s| {
         dm_scene(s, Some(("design-crew", "19")), |_| {})
+    }),
+    // Invitations in a direct message: a card waiting to be accepted (with the sent one under
+    // it), a room you are in already, one that dropped you, an accept under way, one that was
+    // refused, and one that failed, River moved on; then the "Share an invite" dialog, wide and
+    // narrow, with a room chosen and a note typed, and with nothing to choose.
+    ("chat-dm-invite-member", |s| {
+        dm_invite_scene(s, |c| {
+            let mut rooms = c.rooms().to_vec();
+            let mut have = rooms[0].clone();
+            have.key = "rust-help-key".into();
+            have.name = "Rust Help".into();
+            rooms.push(have);
+            c.set_rooms(rooms);
+        })
+    }),
+    ("chat-dm-invite-dropped", |s| {
+        dm_invite_scene(s, |c| {
+            let mut rooms = c.rooms().to_vec();
+            let mut gone = rooms[0].clone();
+            gone.key = "rust-help-key".into();
+            gone.name = "Rust Help".into();
+            gone.not_member = true;
+            rooms.push(gone);
+            c.set_rooms(rooms);
+        })
+    }),
+    ("chat-dm-invite-accepting", |s| {
+        dm_invite_scene(s, |c| assert!(c.dm_accept(&chat::example::invite_key())))
+    }),
+    ("chat-dm-invite-refused", |s| {
+        dm_invite_scene(s, |c| {
+            assert!(c.dm_accept(&chat::example::invite_key()));
+            c.dm_invite_answer(
+                "design-crew",
+                "19",
+                1,
+                Err(
+                    "This invitation is damaged: it is for a different room than the message says."
+                        .into(),
+                ),
+            );
+        })
+    }),
+    ("chat-dm-invite-update-required", |s| {
+        dm_invite_scene(s, |c| c.issues.update_required = true)
+    }),
+    ("chat-dm-invite-picker", |s| {
+        invite_picker_scene(s, true, |_| {})
+    }),
+    ("chat-dm-invite-picker-narrow", |s| {
+        invite_picker_scene(s, true, |_| {})
+    }),
+    ("chat-dm-invite-picker-none", |s| {
+        invite_picker_scene(s, false, |c| {
+            let only: Vec<_> = c
+                .rooms()
+                .iter()
+                .filter(|r| r.key == "town-square")
+                .cloned()
+                .collect();
+            c.set_rooms(only);
+        })
     }),
     ("chat-dm-empty", |s| {
         dm_scene(s, Some(("town-square", "30")), |_| {})
@@ -2464,6 +2538,37 @@ fn dm_scene(
     s.chat.apply_dms(snapshot);
     if let Some((room, peer)) = open {
         assert!(s.chat.open_dm(room, peer), "the example has {room}/{peer}");
+    }
+}
+
+/// The example thread with Kwame open (it holds a received and a sent invitation), as a node's
+/// room, then `tweak`.
+fn dm_invite_scene(s: &mut RiverApp, tweak: impl FnOnce(&mut Chat)) {
+    dm_scene(s, Some(("design-crew", "19")), |_| {});
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    tweak(&mut s.chat);
+}
+
+/// The "Share an invite" dialog for a member of the Town Square, as a node's room. With `choose`
+/// a room is picked and a note typed.
+fn invite_picker_scene(s: &mut RiverApp, choose: bool, tweak: impl FnOnce(&mut Chat)) {
+    connect(s);
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    tweak(&mut s.chat);
+    let room = s.chat.room().expect("a room").key.clone();
+    let peer = s
+        .chat
+        .room()
+        .and_then(|r| r.members.iter().find(|m| m.nickname == "Jonas"))
+        .expect("Jonas")
+        .full_id
+        .to_string();
+    assert!(s.chat.open_invite_picker(&room, &peer));
+    if choose {
+        let target = s.chat.invite_picker_rooms()[0].key.clone();
+        s.chat.invite_pick(&target);
+        s.chat
+            .invite_write("Thought you would enjoy this room. Say hi to everyone.");
     }
 }
 
@@ -4991,6 +5096,7 @@ mod tests {
             s.chat.show_work(vec![rooms::work::WorkView {
                 id: 5,
                 what: "Creating “Book club”".into(),
+                room: None,
                 state: rooms::work::WorkState::Done {
                     room: "not-yet-shown".into(),
                 },
@@ -5017,6 +5123,7 @@ mod tests {
             s.chat.show_work(vec![rooms::work::WorkView {
                 id: 4,
                 what: "Creating “Book club”".into(),
+                room: None,
                 state: rooms::work::WorkState::Failed {
                     why: "River's storage refused".into(),
                     retry: true,

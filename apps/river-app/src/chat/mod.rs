@@ -13,7 +13,9 @@ mod background;
 mod conversation;
 mod details;
 pub mod dm_compose;
+pub mod dm_invite;
 pub mod dm_model;
+pub mod dm_picker;
 pub mod dm_purge;
 pub mod dm_view;
 pub mod dnd;
@@ -1989,6 +1991,7 @@ mod state_tests {
         vec![WorkView {
             id,
             what: String::new(),
+            room: None,
             state: WorkState::Done { room: room.into() },
         }]
     }

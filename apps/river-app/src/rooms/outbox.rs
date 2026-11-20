@@ -240,6 +240,24 @@ pub enum Action {
         tokens: Vec<PurgeToken>,
         ticket: u64,
     },
+    /// Send the member `peer` of the command's room an invitation to the room keyed `target` in
+    /// a direct message, with an optional `note` ([`super::dm_invite`]). The session answers it,
+    /// by `ticket`, with [`super::session::RoomsUpdate::DmInvite`]: queued, or why not.
+    SendInviteDm {
+        peer: MemberId,
+        target: String,
+        note: Option<String>,
+        ticket: u64,
+    },
+    /// Accept the invitation in the message `token` that `peer` sent the user in the command's
+    /// room ([`super::dm_invite`]): the invitation is read from the room now and joined. The
+    /// session answers it, by `ticket`, with [`super::session::RoomsUpdate::DmInvite`]:
+    /// whether the join was started, or why not. Nothing carries the invitation.
+    AcceptInviteDm {
+        peer: MemberId,
+        token: PurgeToken,
+        ticket: u64,
+    },
 }
 
 impl std::fmt::Debug for Action {
@@ -318,6 +336,26 @@ impl std::fmt::Debug for Action {
                 .debug_struct("PurgeDm")
                 .field("peer", &super::dm::peer_key(*peer))
                 .field("tokens", &tokens.len())
+                .field("ticket", ticket)
+                .finish(),
+            // Neither prints the note, nor a token (a name for a message), and nothing here
+            // holds an invitation.
+            Action::SendInviteDm {
+                peer,
+                target,
+                ticket,
+                ..
+            } => f
+                .debug_struct("SendInviteDm")
+                .field("peer", &super::dm::peer_key(*peer))
+                .field("target", target)
+                .field("note", &"<hidden>")
+                .field("ticket", ticket)
+                .finish(),
+            Action::AcceptInviteDm { peer, ticket, .. } => f
+                .debug_struct("AcceptInviteDm")
+                .field("peer", &super::dm::peer_key(*peer))
+                .field("token", &"<hidden>")
                 .field("ticket", ticket)
                 .finish(),
         }
@@ -2390,6 +2428,54 @@ impl Outbox {
         Ok(queued)
     }
 
+    /// Make, compose, sign and queue an invitation to `target` as a direct message to `peer` in
+    /// `room` ([`super::dm_invite`]), with `note`. Queued exactly like a text message
+    /// ([`Outbox::send_dm`]); the text kept for its row is only the summary the web UI keeps
+    /// ([`super::dm_invite::summary`]), which is also returned for the sent-message cache. The
+    /// invitation is in the signed message only, sealed to `peer`.
+    pub fn send_invite_dm(
+        &mut self,
+        room: &LiveRoom,
+        target: &LiveRoom,
+        peer: MemberId,
+        note: Option<&str>,
+    ) -> Result<(DmQueued, String), String> {
+        let now = (self.clock)()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let (message, summary) =
+            super::dm_invite::prepare(room, target, peer, note, now).map_err(|r| r.text())?;
+        let author = room.stored.self_verifying_key();
+        let queued = DmQueued {
+            recipient: peer,
+            sender: author.map(|vk| MemberId::from(&vk)),
+            token: message.purge_token(),
+            timestamp: message.message.timestamp,
+        };
+        self.next += 1;
+        self.entries.push(Entry {
+            id: self.next,
+            room: room.stored.owner_vk,
+            intent: Some(Intent::Dm(peer)),
+            label: DM_LABEL,
+            author,
+            time: (self.clock)(),
+            messages: Vec::new(),
+            info: None,
+            config: None,
+            ban: None,
+            after_ban: None,
+            dm: Some(message),
+            dm_text: Some(super::dm_cache::Plaintext::new(summary.clone())),
+            purge: None,
+            no_retry: false,
+            status: Status::Queued,
+            sent: false,
+            forced: 0,
+        });
+        Ok((queued, summary))
+    }
+
     /// The direct messages of `room` still in the outbox, oldest first: what its threads show
     /// for a message the room does not hold yet or that was not sent.
     pub fn dm_rows(&self, room: &VerifyingKey) -> Vec<DmRow> {
@@ -2757,7 +2843,9 @@ impl Outbox {
             | Action::ExportId
             | Action::ImportId { .. }
             | Action::SendDm { .. }
-            | Action::PurgeDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
+            | Action::PurgeDm { .. }
+            | Action::SendInviteDm { .. }
+            | Action::AcceptInviteDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 

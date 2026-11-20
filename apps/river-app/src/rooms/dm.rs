@@ -275,6 +275,7 @@ fn received(src: &Source<'_>, m: &AuthorizedDirectMessage) -> DmBody {
             let room_label = (src.room_label)(&payload.room_owner_vk)
                 .unwrap_or_else(|| short_key(&payload.room_owner_vk));
             DmBody::Invite {
+                room: bs58::encode(payload.room_owner_vk.to_bytes()).into_string(),
                 room_label,
                 note: note_of(payload.personal_message.as_deref()),
             }
@@ -288,6 +289,12 @@ fn sent(src: &Source<'_>, recipient: MemberId, m: &AuthorizedDirectMessage) -> D
     let Some(text) = src.cache.plaintext(src.owner, recipient, &m.purge_token()) else {
         return DmBody::Placeholder(Placeholder::CiphertextOnly);
     };
+    sent_body(text)
+}
+
+/// What a sent message's cached text shows as: an invitation when it starts with the sentinel
+/// (as the web UI reads it), else the text.
+pub(super) fn sent_body(text: &str) -> DmBody {
     match text.strip_prefix(INVITE_SENTINEL) {
         Some(rest) => DmBody::SentInvite {
             note: note_of(Some(rest)),
@@ -299,11 +306,18 @@ fn sent(src: &Source<'_>, recipient: MemberId, m: &AuthorizedDirectMessage) -> D
 /// What the web UI and `riverctl` cache for an invitation the user sent
 /// (`OUTBOUND_INVITE_SENTINEL`), followed by the personal note. Text the user typed that starts
 /// the same way reads as an invitation too, as it does in the web UI.
-const INVITE_SENTINEL: &str = "[Invitation]";
+pub(super) const INVITE_SENTINEL: &str = "[Invitation]";
+
+/// The most characters of a note shown. A note is what its sender wrote, up to the size of a
+/// message, and is drawn as plain text: what shows is bounded, with characters that draw nothing
+/// or reorder text dropped (line breaks are kept).
+pub const MAX_NOTE_SHOWN: usize = 4_000;
 
 fn note_of(note: Option<&str>) -> Option<String> {
-    let note = note?.trim();
-    (!note.is_empty()).then(|| note.to_string())
+    let note = super::room::clean_multiline(note?);
+    let shown: String = note.chars().take(MAX_NOTE_SHOWN).collect();
+    let shown = shown.trim();
+    (!shown.is_empty()).then(|| shown.to_string())
 }
 
 /// A room's key shortened to name it when its name is not known.

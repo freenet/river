@@ -295,6 +295,15 @@ pub enum RoomsUpdate {
         ticket: u64,
         result: Result<(), String>,
     },
+    /// What became of an invitation the user asked to send ([`Action::SendInviteDm`]) or accept
+    /// ([`Action::AcceptInviteDm`]): queued or started, or why not. Said once per ticket. The
+    /// words never quote a note and no invitation is in them.
+    DmInvite {
+        room: String,
+        peer: String,
+        ticket: u64,
+        result: Result<(), String>,
+    },
     /// The connection's state changed while rooms are shown.
     Status(LinkStatus),
     /// The invitation the user asked for in the room keyed `room`: its link, or why there is
@@ -355,6 +364,18 @@ impl std::fmt::Debug for RoomsUpdate {
                 result,
             } => f
                 .debug_struct("DmPurge")
+                .field("room", room)
+                .field("peer", peer)
+                .field("ticket", ticket)
+                .field("result", result)
+                .finish(),
+            RoomsUpdate::DmInvite {
+                room,
+                peer,
+                ticket,
+                result,
+            } => f
+                .debug_struct("DmInvite")
                 .field("room", room)
                 .field("peer", peer)
                 .field("ticket", ticket)
@@ -1627,6 +1648,14 @@ struct DmSendResult {
     result: Result<(), String>,
 }
 
+/// The answer to one [`Action::SendInviteDm`] or [`Action::AcceptInviteDm`].
+struct DmInviteResult {
+    room: String,
+    peer: String,
+    ticket: u64,
+    result: Result<(), String>,
+}
+
 /// What a deletion says when the room has not been read from the network yet.
 const NOT_LOADED_PURGE: &str = "River hasn't loaded this room's latest messages from Freenet \
      yet, so it can't delete safely. Try again in a moment.";
@@ -1708,6 +1737,8 @@ struct Rooms {
     dm_results: Vec<DmSendResult>,
     /// Answers to [`Action::PurgeDm`] not yet reported.
     dm_purge_results: Vec<DmPurgeResult>,
+    /// Answers to [`Action::SendInviteDm`] and [`Action::AcceptInviteDm`] not yet reported.
+    dm_invite_results: Vec<DmInviteResult>,
     /// What [`Rooms::prune_purged_texts`] last ran on.
     purge_pruned: Option<u64>,
     /// River's web app on the node, which invite links open.
@@ -2036,6 +2067,17 @@ impl Rooms {
                 }
                 continue;
             }
+            if matches!(
+                command.action,
+                Action::SendInviteDm { .. } | Action::AcceptInviteDm { .. }
+            ) {
+                // Likewise: the picker and the card wait for their answers.
+                match self.invite_dm(&command) {
+                    Some(()) => changed = true,
+                    None => self.outbox.waiting.push(command),
+                }
+                continue;
+            }
             if matches!(command.action, Action::PurgeDm { .. }) {
                 // Likewise: the confirmation waits for its answer.
                 match self.purge_dm(&command) {
@@ -2134,6 +2176,87 @@ impl Rooms {
             room: command.room.clone(),
             peer: super::dm::peer_key(*peer),
             ticket: *ticket,
+            result,
+        });
+        Some(())
+    }
+
+    /// Send or accept an invitation in a direct message ([`super::dm_invite`]) and say what
+    /// became of it. `None` when the rooms have not been read well enough to say the room is
+    /// gone: it waits, as any command does.
+    ///
+    /// Sending is queued like a text message ([`Outbox::send_invite_dm`]) and its summary is
+    /// kept for the sender's row like a text's. Accepting reads the invitation from the room now
+    /// ([`super::dm_invite::open`]) and starts the join ([`super::work::Work::join_invitation`]),
+    /// as a pasted invite code does, with the nickname the join dialog offers. Nothing here keeps
+    /// the invitation: it is moved into the join, and every refusal is in fixed words.
+    fn invite_dm(&mut self, command: &Command) -> Option<()> {
+        let (peer, ticket) = match &command.action {
+            Action::SendInviteDm { peer, ticket, .. }
+            | Action::AcceptInviteDm { peer, ticket, .. } => (*peer, *ticket),
+            _ => return Some(()),
+        };
+        let Some(carrier) = self.list.iter().find(|r| r.key() == command.room) else {
+            if !self.complete {
+                return None;
+            }
+            self.dm_invite_results.push(DmInviteResult {
+                room: command.room.clone(),
+                peer: super::dm::peer_key(peer),
+                ticket,
+                result: Err("This room is no longer here.".to_owned()),
+            });
+            return Some(());
+        };
+        let result = match &command.action {
+            Action::SendInviteDm { target, note, .. } => {
+                if self.update_required {
+                    Err(UPDATE_REQUIRED_SEND.to_owned())
+                } else if let Some(target) = self.list.iter().find(|r| &r.key() == target) {
+                    self.outbox
+                        .send_invite_dm(carrier, target, peer, note.as_deref())
+                        .map(|(queued, summary)| {
+                            // Only the summary is kept, as the web UI keeps it.
+                            if let Some(sender) = queued.sender {
+                                if self.dm_cache.remember_sent(
+                                    &carrier.stored.owner_vk,
+                                    queued.recipient,
+                                    queued.token,
+                                    sender,
+                                    queued.timestamp,
+                                    summary,
+                                ) {
+                                    eprintln!("River: too many sent direct messages are unsaved; the oldest text was dropped");
+                                }
+                                self.dm_saver.new_work();
+                            }
+                        })
+                } else {
+                    Err("That room is no longer here.".to_owned())
+                }
+            }
+            Action::AcceptInviteDm { token, .. } => {
+                if self.update_required {
+                    Err(UPDATE_REQUIRED_WORK.to_owned())
+                } else {
+                    let shown: HashSet<VerifyingKey> =
+                        self.list.iter().map(|r| r.stored.owner_vk).collect();
+                    super::dm_invite::open(carrier, peer, token).and_then(|invitation| {
+                        let nickname = crate::chat::visual_fold::generate_default_nickname(
+                            &invitation.invitee.member.member_vk,
+                        );
+                        self.outbox
+                            .work
+                            .join_invitation(invitation, &nickname, &|vk| shown.contains(vk))
+                    })
+                }
+            }
+            _ => return Some(()),
+        };
+        self.dm_invite_results.push(DmInviteResult {
+            room: command.room.clone(),
+            peer: super::dm::peer_key(peer),
+            ticket,
             result,
         });
         Some(())
@@ -2852,6 +2975,14 @@ impl Rooms {
                 result: done.result,
             });
         }
+        for done in std::mem::take(&mut self.dm_invite_results) {
+            report(RoomsUpdate::DmInvite {
+                room: done.room,
+                peer: done.peer,
+                ticket: done.ticket,
+                result: done.result,
+            });
+        }
         for (room, link) in std::mem::take(&mut self.invites) {
             report(RoomsUpdate::Invite { room, link });
         }
@@ -2939,3 +3070,7 @@ fn order(room_order: &[VerifyingKey], mut present: Vec<VerifyingKey>) -> Vec<Ver
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dm_invite_session_tests.rs"]
+mod invite_dm_tests;

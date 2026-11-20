@@ -553,6 +553,7 @@ pub fn dm_snapshot() -> super::dm_model::DmSnapshot {
                 false,
                 dm_secs(TODAY, 8, 30),
                 Invite {
+                    room: "rust-help-key".into(),
                     room_label: "Rust Help".into(),
                     note: Some("Come and help us review the **parser** patch.".into()),
                 },
@@ -586,6 +587,12 @@ pub fn dm_snapshot() -> super::dm_model::DmSnapshot {
         hydrated: true,
         purges: Vec::new(),
     }
+}
+
+/// The key of the example's received invitation (in the thread with Kwame), which the scenes
+/// press Accept on.
+pub fn invite_key() -> String {
+    blake3::hash(b"k1").to_hex()[..32].to_string()
 }
 
 /// The key of the thread the example opens: Priya in the Town Square.

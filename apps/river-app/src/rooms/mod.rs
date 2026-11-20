@@ -54,6 +54,7 @@ pub mod delegate;
 pub mod deputies;
 pub mod dm;
 pub mod dm_cache;
+pub mod dm_invite;
 pub mod dm_purge;
 pub mod dm_save;
 pub mod dm_send;

@@ -88,6 +88,9 @@ pub enum DmBody {
     /// An invitation the local user received. It carries no invitation: that is a bearer
     /// credential, and reading it again from the message is the accepting step's business.
     Invite {
+        /// The room the message names (its owner's key, as rooms are keyed). A sender's claim:
+        /// accepting checks it against the invitation itself.
+        room: String,
         /// The target room's name when this computer has it, else a short form of its key.
         room_label: String,
         note: Option<String>,

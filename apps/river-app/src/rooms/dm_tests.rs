@@ -212,6 +212,7 @@ fn an_invitation_shows_its_room_and_its_note() {
     assert_eq!(
         *body,
         DmBody::Invite {
+            room: bs58::encode(vk(9).as_bytes()).into_string(),
             room_label: format!(
                 "Room {}",
                 &bs58::encode(vk(9).as_bytes()).into_string()[..8]
@@ -227,7 +228,10 @@ fn an_invitation_shows_its_room_and_its_note() {
         DmBody::Invite { room_label, .. } if room_label == "The pub"
     ));
     // The body has a room label and a note and nowhere to carry the credential; neither holds it.
-    let DmBody::Invite { room_label, note } = &t.threads[0].messages[0].body else {
+    let DmBody::Invite {
+        room_label, note, ..
+    } = &t.threads[0].messages[0].body
+    else {
         panic!("an invitation");
     };
     assert!(!room_label.contains("BEARER") && !note.clone().unwrap_or_default().contains("BEARER"));
@@ -910,6 +914,7 @@ fn a_body_does_not_print_its_text_however_it_is_formatted() {
     for body in [
         DmBody::Text("SECRET-BODY".into()),
         DmBody::Invite {
+            room: "SECRET-ROOM".into(),
             room_label: "SECRET-LABEL".into(),
             note: Some("SECRET-NOTE".into()),
         },
