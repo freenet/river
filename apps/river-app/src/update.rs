@@ -737,6 +737,24 @@ mod tests {
         assert_eq!(rec.0.borrow()[1].body, "River 0.5.0 is available.");
     }
 
+    #[test]
+    fn an_update_notice_held_back_by_do_not_disturb_is_announced_after_it() {
+        let rec = Recorder::default();
+        let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.settings.manual = true;
+        let ready = || {
+            UpdateEvent::Status(UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            })
+        };
+        s.apply_update(ready());
+        assert!(rec.0.borrow().is_empty());
+        s.chat.dnd.settings.manual = false;
+        s.apply_update(ready());
+        assert_eq!(rec.0.borrow().len(), 1);
+    }
+
     // The screen ---------------------------------------------------------------------------
 
     fn connected() -> RiverApp {

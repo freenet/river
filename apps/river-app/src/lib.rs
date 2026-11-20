@@ -122,6 +122,28 @@ fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
     });
 }
 
+/// Save one preference. `Prefs` rewrites the whole file from what it loaded, so this loads it
+/// again, sets the key and saves in one step: a key saved by another part of the app since
+/// startup is kept. It writes nothing when the file exists but cannot be read (a sharing
+/// violation, say), because the empty store `Prefs::open` falls back to would erase the other
+/// keys. There is no lock against another River process writing at the same moment.
+fn save_pref<T: serde::Serialize + ?Sized>(key: &str, value: &T) {
+    let mut prefs = rune::prefs::Prefs::open("org.freenet.River");
+    if let Some(path) = prefs.path()
+        && let Err(e) = std::fs::read(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "River: not saving {key}: couldn't read {}: {e}",
+            path.display()
+        );
+        return;
+    }
+    if let Err(e) = prefs.set(key, value) {
+        eprintln!("River: couldn't save {key}: {e}");
+    }
+}
+
 impl RiverApp {
     /// A window with nothing running behind it, for snapshots and tests. It shows the example
     /// rooms.
@@ -243,10 +265,16 @@ impl RiverApp {
         match event {
             UpdateEvent::Notice(text) => self.chat.update.notice = Some(text),
             UpdateEvent::Status(status) => {
+                let before = self.chat.update.announced.clone();
                 if let Some((title, body)) = self.chat.update.apply(status)
                     && !self.focused
-                    && self.dnd_allows(false)
                 {
+                    if !self.dnd_allows(false) {
+                        // Held back by do not disturb: leave the version unannounced so the
+                        // next status for it, once DND is off, still tells the person.
+                        self.chat.update.announced = before;
+                        return;
+                    }
                     // Not a room's notification: nothing to open when it is clicked.
                     self.notifier.notify(notify::Notification {
                         room_key: "river-update".into(),
@@ -305,12 +333,12 @@ impl RiverApp {
                 u.check_now();
             }
         }
-        // `Prefs` rewrites the whole file from what it loaded, so reload before writing or
-        // another key saved since (do not disturb) would be lost.
         if self.update_prefs.path().is_some() {
-            self.update_prefs = rune::prefs::Prefs::open("org.freenet.River");
+            save_pref(UPDATE_AUTO_PREF, &auto);
+        } else {
+            // In memory (tests, no config directory): nothing on disk to protect.
+            let _ = self.update_prefs.set(UPDATE_AUTO_PREF, &auto);
         }
-        let _ = self.update_prefs.set(UPDATE_AUTO_PREF, &auto);
     }
 
     /// Offer "Background and startup" in the room list, backed by `host` (the desktop shell's
@@ -377,21 +405,34 @@ impl RiverApp {
         if let Some(settings) = self.chat.dnd.take_dirty()
             && self.dnd_persist
         {
-            let mut prefs = rune::prefs::Prefs::open("org.freenet.River");
-            let _ = prefs.set(chat::dnd::PREF, &settings);
+            save_pref(chat::dnd::PREF, &settings);
         }
-        if self.chat.dnd.settings.schedule.is_some() && !self.chat.dnd.pinned {
+        let d = &self.chat.dnd;
+        // The switch on means the schedule changes nothing, so nothing to wake for.
+        if d.settings.schedule.is_some() && !d.settings.manual && !d.pinned {
             tx.wake_after(std::time::Duration::from_secs(30));
         }
     }
 
-    /// Show what the limits let through, minus what do not disturb holds back. What it holds
-    /// back is dropped, not kept for later.
+    /// What do not disturb lets through of `a`, if anything. Run before the limiter, so what
+    /// is held back neither spends its budget nor comes back later.
+    fn dnd_filter(&mut self, a: notify::Arrival) -> Option<notify::Arrival> {
+        self.refresh_dnd_clock();
+        self.chat.dnd.settings.filter(a, self.chat.dnd.now)
+    }
+
+    /// Apply do not disturb to what the limiter is holding back from before it came on.
+    fn dnd_filter_held(&mut self) {
+        self.refresh_dnd_clock();
+        let (settings, now) = (self.chat.dnd.settings.clone(), self.chat.dnd.now);
+        if settings.active(now) {
+            self.limiter.filter_held(|a| settings.filter(a, now));
+        }
+    }
+
+    /// Show what the limits let through.
     fn show(&mut self, admitted: Vec<notify::Arrival>, now: std::time::Instant) {
         for (n, from) in notify::compose_from(admitted, self.private_previews) {
-            if !self.dnd_allows(n.mention) {
-                continue;
-            }
             if !self.notifier.notify(n) {
                 self.limiter.refund(from, now);
             }
@@ -401,6 +442,7 @@ impl RiverApp {
     /// Show held-back notifications whose cooldown has ended, for a room that went quiet.
     pub(crate) fn flush_held(&mut self, now: std::time::Instant) {
         self.drop_read_held();
+        self.dnd_filter_held();
         let due = self.limiter.admit(Vec::new(), now);
         self.show(due, now);
     }
@@ -431,11 +473,14 @@ impl RiverApp {
                 }
                 self.missed.1 += a.count;
             }
-            if !a.quiet && self.dnd_allows(a.mention) {
+            if !a.quiet
+                && let Some(a) = self.dnd_filter(a)
+            {
                 shown.push(a);
             }
         }
         self.drop_read_held();
+        self.dnd_filter_held();
         let admitted = self.limiter.admit(shown, now);
         self.show(admitted, now);
     }

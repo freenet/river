@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::style::{self as st};
 use super::view::label;
 use crate::RiverApp;
+use crate::notify::Arrival;
 
 /// The preference key the settings are stored under.
 pub const PREF: &str = "do_not_disturb";
@@ -66,7 +67,7 @@ pub struct Settings {
     /// The daily window, when one is set.
     #[serde(default)]
     pub schedule: Option<Schedule>,
-    /// Whether a message that mentions you (or replies to you) still notifies.
+    /// Whether a message that mentions you or replies to you still notifies.
     #[serde(default)]
     pub allow_mentions: bool,
 }
@@ -101,6 +102,20 @@ impl Settings {
     /// that mentions you.
     pub fn allows(&self, mention: bool, minute: u16) -> bool {
         !self.active(minute) || (mention && self.allow_mentions)
+    }
+
+    /// What of `a` may notify at `minute`: all of it when do not disturb is off; otherwise,
+    /// with "allow mentions through", only the messages that mention you or reply to you (the
+    /// count shrinks to them); otherwise nothing.
+    pub fn filter(&self, mut a: Arrival, minute: u16) -> Option<Arrival> {
+        if !self.active(minute) {
+            return Some(a);
+        }
+        if self.allow_mentions && a.for_me_count > 0 {
+            a.count = a.for_me_count;
+            return Some(a);
+        }
+        None
     }
 }
 
@@ -143,6 +158,10 @@ pub struct DndUi {
     pub error: Option<String>,
     /// Set when the settings changed and have not been saved.
     dirty: bool,
+    /// Times were typed since the dialog opened; saved when it closes, not per keystroke.
+    times_pending: bool,
+    /// The schedule last in use, offered again when the schedule is turned back on.
+    last_schedule: Schedule,
 }
 
 impl Default for DndUi {
@@ -156,6 +175,8 @@ impl Default for DndUi {
             end: TextEdit::new(""),
             error: None,
             dirty: false,
+            times_pending: false,
+            last_schedule: DEFAULT_SCHEDULE,
         }
     }
 }
@@ -165,6 +186,9 @@ impl DndUi {
     pub fn load(&mut self, mut s: Settings) {
         if s.schedule.is_some_and(|x| !x.valid()) {
             s.schedule = None;
+        }
+        if let Some(x) = s.schedule {
+            self.last_schedule = x;
         }
         self.settings = s;
     }
@@ -180,7 +204,7 @@ impl DndUi {
     }
 
     fn fill_inputs(&mut self) {
-        let s = self.settings.schedule.unwrap_or(DEFAULT_SCHEDULE);
+        let s = self.settings.schedule.unwrap_or(self.last_schedule);
         self.start.replace_text(format_time(s.start));
         self.end.replace_text(format_time(s.end));
         self.error = None;
@@ -198,7 +222,8 @@ impl DndUi {
                 let new = Schedule { start, end };
                 if self.settings.schedule != Some(new) {
                     self.settings.schedule = Some(new);
-                    self.dirty = true;
+                    self.last_schedule = new;
+                    self.times_pending = true;
                 }
             }
             _ => {
@@ -214,8 +239,16 @@ impl super::Chat {
         self.dnd.open = true;
     }
 
+    /// Close the dialog, saving typed times. Times that do not parse keep it open with the
+    /// reason shown, so a schedule is never silently ignored.
     pub fn close_dnd(&mut self) {
         self.dnd.sync_inputs();
+        if self.dnd.error.is_some() {
+            return;
+        }
+        if std::mem::take(&mut self.dnd.times_pending) {
+            self.dnd.dirty = true;
+        }
         self.dnd.open = false;
     }
 
@@ -228,9 +261,13 @@ impl super::Chat {
     pub fn toggle_dnd_schedule(&mut self) {
         let d = &mut self.dnd;
         d.settings.schedule = match d.settings.schedule {
-            Some(_) => None,
-            None => Some(DEFAULT_SCHEDULE),
+            Some(s) => {
+                d.last_schedule = s;
+                None
+            }
+            None => Some(d.last_schedule),
         };
+        d.times_pending = false;
         d.fill_inputs();
         d.dirty = true;
     }
@@ -462,8 +499,7 @@ mod tests {
             })
         );
         assert!(ui.error.is_none());
-        assert!(ui.take_dirty().is_some());
-        assert!(ui.take_dirty().is_none(), "reported once");
+        assert!(ui.take_dirty().is_none(), "typing alone does not save");
         ui.end.replace_text("soon");
         ui.sync_inputs();
         assert_eq!(
@@ -474,6 +510,26 @@ mod tests {
             })
         );
         assert!(ui.error.is_some());
+    }
+
+    #[test]
+    fn the_dialog_will_not_close_on_times_that_do_not_parse_and_saves_good_ones_once() {
+        let mut chat = crate::chat::Chat::example();
+        chat.dnd.settings.schedule = Some(DEFAULT_SCHEDULE);
+        chat.open_dnd();
+        chat.dnd.start.replace_text("nope");
+        chat.close_dnd();
+        assert!(chat.dnd.open && chat.dnd.error.is_some());
+        chat.dnd.start.replace_text("21:00");
+        chat.close_dnd();
+        assert!(!chat.dnd.open);
+        let saved = chat.dnd.take_dirty().expect("saved on close");
+        assert_eq!(saved.schedule.unwrap().start, at(21, 0));
+        assert!(chat.dnd.take_dirty().is_none());
+        // Off and on again offers the times that were in use.
+        chat.toggle_dnd_schedule();
+        chat.toggle_dnd_schedule();
+        assert_eq!(chat.dnd.settings.schedule.unwrap().start, at(21, 0));
     }
 
     #[test]
