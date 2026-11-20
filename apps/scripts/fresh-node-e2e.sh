@@ -21,6 +21,15 @@
 # bad token and a replace nobody asked for are refused, and a replace the user confirmed makes
 # the peer's app write as the gateway app's member in a room it already held.
 #
+# Last, the app is pointed at the gateway as a node it was told about, on a port other than 7509
+# (apps/river-app/examples/remote_node_e2e.rs): through the saved setting, through $FREENET_NODE
+# (which must beat a wrong saved address), and through a plain TCP forwarder in front of the node,
+# which is what an SSH tunnel to a node on another machine looks like to it. Each time the setup
+# step reaches Connected without touching a Freenet on this computer, the grant is approved on the
+# page at the chosen address, and the app creates a room and sees its own message. The forwarder
+# listens on the TCP port with the number of the peer's network port (that one is UDP), so the
+# whole run stays inside the four ports.
+#
 # Usage: apps/scripts/fresh-node-e2e.sh <work dir>
 #   FREENET_BIN  the freenet binary to run (default: freenet on PATH)
 #   E2E_PORT_BASE  first of the four ports used (default 39400): two network, two API
@@ -144,6 +153,19 @@ for n in gw peer; do
   if ! find "$WORK/$n/data/delegates" -type f | grep -q .; then
     echo "no delegate stored on the $n node after the run" >&2
     exit 1
+  fi
+done
+
+# The app pointed at the gateway as a node it was told about, on a port other than 7509.
+FWD=$PEER_NET   # TCP; the peer's network port of that number is UDP
+for mode in saved env tunnel; do
+  mkdir -p "$WORK/remote-$mode"
+  if [ "$mode" = env ]; then
+    (cd "$APPS" && FREENET_NODE="127.0.0.1:$GW_API" cargo run --locked -q -p river-app \
+      --example remote_node_e2e -- env "127.0.0.1:$GW_API" "$WORK/remote-$mode")
+  else
+    (cd "$APPS" && env -u FREENET_NODE cargo run --locked -q -p river-app \
+      --example remote_node_e2e -- "$mode" "127.0.0.1:$GW_API" "$WORK/remote-$mode" "127.0.0.1:$FWD")
   fi
 done
 echo "fresh-node e2e passed"

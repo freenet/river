@@ -51,6 +51,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     let mut layer = Vec::new();
     dialogs(chat, &k, &mut layer);
     super::identity::export_dialog(chat, &k, &mut layer);
+    super::node_ui::node_dialog(chat, &k, &mut layer);
     screen = screen.child(link_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
@@ -462,39 +463,50 @@ fn work_row(w: &WorkView, p: &Palette, k: &Kit) -> El {
 /// How the connection to Freenet is shown: the dot, the words, their colour and the tooltip.
 pub(super) struct Pill {
     pub dot: rune::Color,
-    pub text: &'static str,
+    pub text: String,
     pub color: rune::Color,
-    pub tip: &'static str,
+    pub tip: String,
 }
 
 /// The web UI's connection pill (`ConnectionStatusIndicator`): a green dot and "Connected", an
 /// amber dot and "Connecting...", a red dot and "Disconnected" in the error colour. The app
 /// has no per-attempt error report to explain, so the tooltip says what the state means.
-pub(super) fn connection_pill(source: Source, p: &Palette) -> Pill {
+pub(super) fn connection_pill(source: Source, node: Option<&str>, p: &Palette) -> Pill {
+    // A node other than the default is named, so the person can see which one River is on.
+    let named = |plain: &str, with: &dyn Fn(&str) -> String| match node {
+        Some(n) => with(n),
+        None => plain.to_owned(),
+    };
+    let tip = |t: &str| match node {
+        Some(n) => format!("{t} The node is at {n}."),
+        None => t.to_owned(),
+    };
     match source {
         Source::Example => Pill {
             dot: p.text_muted,
-            text: "Example rooms, not connected to Freenet",
+            text: "Example rooms, not connected to Freenet".into(),
             color: p.text_muted,
-            tip: "These are example rooms. River is not connected to Freenet.",
+            tip: "These are example rooms. River is not connected to Freenet.".into(),
         },
         Source::Node(LinkStatus::Loading) => Pill {
             dot: p.warning,
-            text: "Connecting...",
+            text: named("Connecting...", &|n| format!("Connecting to {n}...")),
             color: p.text_muted,
-            tip: "Showing your stored rooms while River catches up with Freenet.",
+            tip: tip("Showing your stored rooms while River catches up with Freenet."),
         },
         Source::Node(LinkStatus::Live) => Pill {
             dot: p.success,
-            text: "Connected",
+            text: named("Connected", &|n| format!("Connected to {n}")),
             color: p.text_muted,
-            tip: "Connected to Freenet.",
+            tip: tip("Connected to Freenet."),
         },
         Source::Node(LinkStatus::Reconnecting) => Pill {
             dot: p.error,
-            text: "Disconnected",
+            text: named("Disconnected", &|n| format!("Disconnected from {n}")),
             color: p.danger,
-            tip: "Connection to Freenet lost. The rooms shown are as last seen. River is reconnecting.",
+            tip: tip(
+                "Connection to Freenet lost. The rooms shown are as last seen. River is reconnecting.",
+            ),
         },
     }
 }
@@ -502,13 +514,13 @@ pub(super) fn connection_pill(source: Source, p: &Palette) -> Pill {
 /// Where the rooms come from, at the foot of the room list, and for rooms from the node the
 /// connection's state, as the web UI's connection pill shows it.
 fn source_status(chat: &Chat, p: &Palette, k: &Kit) -> El {
-    let pill = connection_pill(chat.source, p);
+    let pill = connection_pill(chat.source, chat.node.label().as_deref(), p);
     let mut status = col().key("source-status").px(4.0).gap(4.0).child(
         row()
             .key("connection-pill")
             .gap(8.0)
             .center_y()
-            .help(pill.tip)
+            .help(pill.tip.clone())
             .child(
                 el().key("connection-dot")
                     .size(7.0, 7.0)
@@ -516,12 +528,18 @@ fn source_status(chat: &Chat, p: &Palette, k: &Kit) -> El {
                     .fill(pill.dot),
             )
             .child(
-                label(pill.text, st::SMALL_STRONG, pill.color)
+                label(pill.text.clone(), st::SMALL_STRONG, pill.color)
                     .key("connection-label")
                     .wrap()
                     .w_full(),
             ),
     );
+    if matches!(chat.source, Source::Node(_)) {
+        status = status.child(super::node_ui::node_entry(chat, p, k));
+        for banner in super::node_ui::banners(&chat.node, p) {
+            status = status.child(banner);
+        }
+    }
     let issues = &chat.issues;
     let mut notes: Vec<(&str, String)> = Vec::new();
     if issues.update_required {

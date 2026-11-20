@@ -91,14 +91,20 @@ fn the_connection_dot_follows_the_link_status() {
     use super::view::connection_pill;
     use super::{LinkStatus::*, Source};
     let p = super::style::palette();
-    let words = |s| connection_pill(s, &p).text;
+    let words = |s| connection_pill(s, None, &p).text;
     assert_eq!(words(Source::Node(Live)), "Connected");
     assert_eq!(words(Source::Node(Loading)), "Connecting...");
     assert_eq!(words(Source::Node(Reconnecting)), "Disconnected");
-    assert_eq!(connection_pill(Source::Node(Live), &p).dot, p.success);
-    assert_eq!(connection_pill(Source::Node(Loading), &p).dot, p.warning);
-    assert_eq!(connection_pill(Source::Node(Reconnecting), &p).dot, p.error);
-    assert_eq!(connection_pill(Source::Example, &p).dot, p.text_muted);
+    assert_eq!(connection_pill(Source::Node(Live), None, &p).dot, p.success);
+    assert_eq!(
+        connection_pill(Source::Node(Loading), None, &p).dot,
+        p.warning
+    );
+    assert_eq!(
+        connection_pill(Source::Node(Reconnecting), None, &p).dot,
+        p.error
+    );
+    assert_eq!(connection_pill(Source::Example, None, &p).dot, p.text_muted);
     // Each state is on screen, with its dot and a tooltip.
     for (status, text) in [
         (Live, "Connected"),

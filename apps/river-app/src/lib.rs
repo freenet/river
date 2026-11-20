@@ -3,8 +3,11 @@
 //! A shell (today `apps/desktop`) supplies a [`NodeHost`] that knows how to find, install and
 //! start Freenet on its platform; everything the user sees lives here.
 
+pub mod address;
 pub mod chat;
 pub mod node;
+#[cfg(test)]
+mod node_ui_tests;
 pub mod notify;
 pub mod rooms;
 pub mod setup;
@@ -18,6 +21,8 @@ mod util {
 
 use rune::{AppHandle, AppSpec, Cx, El, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Kit};
+
+use address::NodeChoice;
 
 pub use chat::Chat;
 pub use node::{InstallStep, MANUAL_INSTALL_URL, NodeHost, NodeProbe};
@@ -58,6 +63,12 @@ pub struct RiverApp {
     private_previews: bool,
     /// The unread count last given to the notifier, so it hears only changes.
     reported_unread: Option<usize>,
+    /// The number of the node in use ([`rooms::Link::generation`]). What a node the app has left
+    /// still delivers carries an older number and is dropped.
+    node_generation: u64,
+    /// A node the person typed, kept until it has answered as Freenet: a typo must not become
+    /// the saved choice.
+    pending_save: Option<NodeChoice>,
 }
 
 /// The logo and the cache that keeps its pixels alive.
@@ -110,14 +121,36 @@ impl RiverApp {
             reported_unread: None,
             limiter: Default::default(),
             private_previews: false,
+            node_generation: 0,
+            pending_save: None,
         }
     }
 
     /// The live app: starts checking for a node straight away, and reads the user's rooms
     /// through `link` once one answers.
     pub fn attached(ctl: Controller, link: rooms::Link) -> Self {
+        let startup = address::Startup {
+            choice: ctl.node(),
+            notice: None,
+            problem: None,
+        };
+        RiverApp::attached_at_startup(ctl, link, startup)
+    }
+
+    /// [`attached`](RiverApp::attached) with what resolving the node at start found: a problem
+    /// (the app waits for the person to choose a node) or a notice.
+    pub fn attached_at_startup(
+        ctl: Controller,
+        link: rooms::Link,
+        startup: address::Startup,
+    ) -> Self {
         let prefs = rune::prefs::Prefs::open("org.freenet.River");
-        ctl.check();
+        let node = startup.choice;
+        address::set_current(&node.address);
+        let waiting = startup.problem.is_some();
+        if !waiting {
+            ctl.check();
+        }
         let mut chat = Chat::new(
             chat::Source::Node(chat::LinkStatus::Loading),
             Vec::new(),
@@ -125,11 +158,19 @@ impl RiverApp {
             0,
             0,
         );
+        chat.node.choice = node;
+        chat.node.notice = startup.notice;
+        chat.node.problem = startup.problem;
         // What the user does in a room goes to the background work, which sends it.
         let sink = link.clone();
         chat.set_sink(Box::new(move |command| sink.send(command)));
+        let link_generation = link.generation();
         RiverApp {
-            setup: Setup::Checking,
+            setup: if waiting {
+                Setup::Failed(String::new())
+            } else {
+                Setup::Checking
+            },
             chat,
             access: Access::Connecting,
             ctl: Some(ctl),
@@ -142,6 +183,8 @@ impl RiverApp {
             reported_unread: None,
             limiter: Default::default(),
             private_previews: prefs.get("notification_previews").unwrap_or(false),
+            node_generation: link_generation,
+            pending_save: None,
         }
     }
 
@@ -271,6 +314,16 @@ impl RiverApp {
     pub fn set_setup(&mut self, setup: Setup) {
         let connected = matches!(setup, Setup::Connected { .. });
         self.setup = setup;
+        // The node answered as Freenet: now the address is worth remembering.
+        if connected
+            && let Some(choice) = self.pending_save.take()
+            && choice == self.chat.node.choice
+            && let Some(ctl) = &self.ctl
+            && let Err(e) = ctl.save_node(&choice)
+        {
+            // Used for this run; chosen again next time.
+            eprintln!("River: {e}");
+        }
         if connected && let Some(link) = &self.link {
             link.start();
         }
@@ -279,6 +332,13 @@ impl RiverApp {
     /// Take an update from the rooms link. The approval page is NOT opened here: the person
     /// presses a button for it, so they are looking at the app when the browser window
     /// appears (an automatic open can land on another workspace or fail unseen).
+    pub fn apply_rooms_from(&mut self, update: RoomsUpdate, generation: u64, tx: &mut Tx) {
+        // Read under a node the app has since left: it says nothing about this one.
+        if generation == self.node_generation {
+            self.apply_rooms(update, tx);
+        }
+    }
+
     pub fn apply_rooms(&mut self, update: RoomsUpdate, tx: &mut Tx) {
         match update {
             RoomsUpdate::Access(access) => {
@@ -332,6 +392,99 @@ impl RiverApp {
 
     fn can_install(&self) -> bool {
         self.ctl.as_ref().is_none_or(Controller::can_install)
+    }
+
+    /// Whether the rooms are on screen, so a change of node would replace them.
+    fn rooms_shown(&self) -> bool {
+        matches!(self.setup, Setup::Connected { .. })
+            && matches!(self.access, Access::Example | Access::Ready)
+    }
+
+    /// Open the form that picks the node to use.
+    pub fn node_open(&mut self) {
+        self.chat.node.open();
+    }
+
+    /// Close the form without changing anything.
+    pub fn node_cancel(&mut self) {
+        self.chat.node.close();
+    }
+
+    /// Connect was pressed: check the address, and ask first when something needs saying.
+    pub fn node_submit(&mut self) {
+        let shown = self.rooms_shown();
+        if let Some(address) = self.chat.node.submit(shown) {
+            self.apply_node(NodeChoice::saved(address));
+        }
+    }
+
+    /// The person confirmed the warning.
+    pub fn node_confirm(&mut self) {
+        if let Some(address) = self.chat.node.confirm() {
+            self.apply_node(NodeChoice::saved(address));
+        }
+    }
+
+    /// Leave the problem panel for the Freenet on this computer.
+    pub fn node_dismiss_problem(&mut self) {
+        self.chat.node.problem = None;
+        self.retry();
+    }
+
+    /// Go back to the Freenet on this computer.
+    pub fn node_use_local(&mut self) {
+        self.apply_node(NodeChoice::local());
+    }
+
+    /// Use `choice` from now on: remember it, drop what was read from the previous node, and
+    /// check the new one, which then goes through the same approval as any node. Nothing here
+    /// starts, stops or installs a Freenet on this computer.
+    pub(crate) fn apply_node(&mut self, choice: NodeChoice) {
+        let current = self.chat.node.choice.clone();
+        self.chat.node.close();
+        if choice == current {
+            return;
+        }
+        if let Some(ctl) = &self.ctl {
+            if choice.is_existing_node() {
+                // Saved once the node has answered as Freenet (see `set_setup`).
+                self.pending_save = Some(choice.clone());
+            } else {
+                self.pending_save = None;
+                if let Err(e) = ctl.save_node(&choice) {
+                    eprintln!("River: {e}");
+                }
+            }
+            ctl.set_node(choice.clone());
+        }
+        let authority = choice.address.authority();
+        address::set_current(&choice.address);
+        self.node_generation = match &self.link {
+            Some(link) => link.set_node(&authority, choice.is_existing_node()),
+            None => self.node_generation + 1,
+        };
+        // The rooms, their read marks and modes, and the open room are the previous node's.
+        let mut chat = Chat::new(
+            chat::Source::Node(chat::LinkStatus::Loading),
+            Vec::new(),
+            0,
+            0,
+            0,
+        );
+        chat.node.choice = choice;
+        if let Some(link) = &self.link {
+            let sink = link.clone();
+            chat.set_sink(Box::new(move |command| sink.send(command)));
+        }
+        self.chat = chat;
+        self.access = Access::Connecting;
+        self.setup = Setup::Checking;
+        self.missed = Default::default();
+        self.limiter = Default::default();
+        self.reported_unread = None;
+        if let Some(ctl) = &self.ctl {
+            ctl.check();
+        }
     }
 
     fn install(&mut self) {
@@ -506,6 +659,46 @@ fn details_scene(s: &mut RiverApp, room: &str, edit: fn(&mut Chat, &mut chat::mo
     });
 }
 
+/// River pointed at the node at `address`, as if the person had chosen it.
+fn use_node(s: &mut RiverApp, address: &str) {
+    s.chat.node.choice =
+        NodeChoice::saved(address::NodeAddress::parse(address).expect("an address"));
+}
+
+/// The first-run form for a node the person already has, with `typed` entered and Connect
+/// pressed.
+fn node_form_scene(s: &mut RiverApp, typed: &str) {
+    s.setup = Setup::NotInstalled;
+    s.chat.node.open();
+    if let Some(form) = s.chat.node.form.as_mut() {
+        form.input.replace_text(typed);
+    }
+    if !typed.is_empty() {
+        s.chat.node.submit(false);
+    }
+}
+
+/// The rooms from a node the person chose, with the form that changes it open and `typed`
+/// entered and Connect pressed.
+fn node_change_scene(s: &mut RiverApp, current: Option<&str>, typed: Option<&str>) {
+    connect(s);
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    s.chat.show_node_rooms(
+        chat::example::data().rooms,
+        None,
+        chat::LinkStatus::Live,
+        29_000_000,
+    );
+    if let Some(a) = current {
+        use_node(s, a);
+    }
+    s.chat.node.open();
+    if let (Some(t), Some(form)) = (typed, s.chat.node.form.as_mut()) {
+        form.input.replace_text(t);
+        s.chat.node.submit(true);
+    }
+}
+
 /// A named state for `--snap` and `--list-scenes`: a name and how it changes the initial state.
 pub type Scene = (&'static str, fn(&mut RiverApp));
 
@@ -632,6 +825,83 @@ pub const SCENES: &[Scene] = &[
             .collect();
         s.chat
             .show_node_rooms(rooms, None, chat::LinkStatus::Live, 29_000_000);
+    }),
+    // A node the person already has: the form that picks it at first run (empty, with an address
+    // the form refuses, and with one that is not on this computer, which asks first), a node that
+    // did not answer, the approval step through a tunnel, and the rooms screen naming the node
+    // with the form that changes it.
+    ("not-installed-node-form", |s| node_form_scene(s, "")),
+    ("not-installed-node-form-error", |s| {
+        node_form_scene(s, "https://my-server.example:7509/")
+    }),
+    ("not-installed-node-warning", |s| {
+        node_form_scene(s, "192.168.1.20:7509")
+    }),
+    ("checking-node", |s| {
+        use_node(s, "localhost:40302");
+        s.setup = Setup::Checking;
+    }),
+    ("failed-node-unreachable", |s| {
+        use_node(s, "localhost:40302");
+        s.setup = Setup::Failed(
+            "Nothing answered at localhost:40302. Check that the node is running there and \
+             that the address and port are right. If you reach it through an SSH tunnel or a \
+             VPN, check that it is up."
+                .into(),
+        );
+    }),
+    ("rooms-waiting-for-approval-node", |s| {
+        connect(s);
+        use_node(s, "localhost:40302");
+        s.access = Access::WaitingForApproval {
+            approve_url: "http://localhost:40302/v1/app-grants/approve/example".into(),
+        };
+    }),
+    ("rooms-unreachable-node", |s| {
+        connect(s);
+        use_node(s, "localhost:40302");
+        s.access = Access::Unreachable("Connection refused".into());
+    }),
+    // A node that is not on this computer, said at every start however it was chosen; a bad
+    // `--node` said on screen; a saved address that is not valid.
+    ("chat-node-remote-banner", |s| {
+        node_change_scene(s, Some("home.example.org:7509"), None);
+        s.chat.node.close();
+    }),
+    ("checking-node-remote-banner", |s| {
+        use_node(s, "home.example.org:7509");
+        s.setup = Setup::Checking;
+    }),
+    ("failed-node-problem", |s| {
+        s.setup = Setup::Failed(String::new());
+        s.chat.node.problem = Some(
+            "--node \"a@b\" isn't a node address: Enter just the host and port. A user name or \
+             password isn't used."
+                .into(),
+        );
+    }),
+    ("chat-node-notice", |s| {
+        node_change_scene(s, None, None);
+        s.chat.node.close();
+        s.chat.node.notice = Some(
+            "Your saved node address http://x/ is not valid; using this computer's Freenet.".into(),
+        );
+    }),
+    ("chat-node-entry", |s| {
+        node_change_scene(s, Some("localhost:40302"), None);
+        s.chat.node.close();
+    }),
+    ("chat-node-change", |s| {
+        node_change_scene(s, Some("localhost:40302"), None)
+    }),
+    ("chat-node-change-error", |s| {
+        node_change_scene(s, None, Some("my server:7509"))
+    }),
+    ("chat-node-change-confirm", |s| {
+        node_change_scene(s, None, Some("localhost:40302"))
+    }),
+    ("chat-node-change-confirm-remote", |s| {
+        node_change_scene(s, None, Some("home.example.org:7509"))
     }),
     // Getting at the rooms, once a node answered.
     ("rooms-connecting", |s| {
@@ -1167,77 +1437,150 @@ pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
     let k = Kit::neutral(true);
     let logo = s.logo.as_ref().map(|l| l.image.pixels());
     let t = (&palette, logo);
-    let body = match &s.setup {
-        Setup::Checking => panel(
+    let node = &s.chat.node.choice;
+    let existing = node.is_existing_node();
+    let at = node.address.authority();
+    // The form that picks the node replaces the setup card until the rooms are showing, and is
+    // a dialog over them after.
+    let form = if s.rooms_shown() {
+        None
+    } else {
+        chat::node_ui::screen(&s.chat, false, &k)
+    };
+    let body = if let Some(form) = form {
+        panel_with(
             t,
-            "Looking for Freenet…",
-            "River runs on Freenet, a peer-to-peer network on your own computer.",
+            &form.title,
+            &form.intro,
+            form.content,
             None,
-            vec![],
-        ),
-        Setup::NotInstalled if s.can_install() => panel(
+            form.actions,
+        )
+    } else if let Some(problem) = &s.chat.node.problem {
+        // Said on screen, not only on a console that a release build on Windows has none of.
+        panel(
             t,
-            "Freenet isn't installed",
-            "River needs Freenet running on this computer. River can download it from the official release, check its signature, and set it up to run in the background.",
+            "Can't use that node address",
+            problem,
             None,
             vec![
-                Button::new("Install Freenet")
-                    .variant(ButtonVariant::Contrast)
-                    .on_press(|s: &mut RiverApp| s.install())
-                    .build(&k)
-                    .key("install"),
-                manual_install_button(&k),
-                // For someone who installed Freenet another way and came back.
-                Button::new("Check again")
+                use_node_button(&k, true),
+                Button::new("Use Freenet on this computer")
                     .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.retry())
+                    .on_press(|s: &mut RiverApp| s.node_dismiss_problem())
                     .build(&k)
-                    .key("retry"),
+                    .key("problem-local"),
             ],
-        ),
-        Setup::NotInstalled => panel(
-            t,
-            "Freenet isn't installed",
-            "River needs Freenet running on this computer. Install it, then try again.",
-            None,
-            vec![manual_install_button(&k), retry_button(&k)],
-        ),
-        Setup::Installing(step) => {
-            let (title, fraction) = install_progress(step);
-            let progress = fraction.map(|f| (f, download_detail(step)));
-            panel(t, title, "This only happens once.", progress, vec![])
+        )
+    } else {
+        match &s.setup {
+            Setup::Checking if existing => panel(
+                t,
+                &format!("Checking the node at {at}…"),
+                "River is asking it whether it is Freenet, and which version.",
+                None,
+                vec![],
+            ),
+            Setup::Checking => panel(
+                t,
+                "Looking for Freenet…",
+                "River runs on Freenet, a peer-to-peer network on your own computer.",
+                None,
+                vec![],
+            ),
+            Setup::NotInstalled if s.can_install() => panel(
+                t,
+                "Freenet isn't installed",
+                "River needs Freenet running on this computer. River can download it from the official release, check its signature, and set it up to run in the background.",
+                None,
+                vec![
+                    Button::new("Install Freenet")
+                        .variant(ButtonVariant::Contrast)
+                        .on_press(|s: &mut RiverApp| s.install())
+                        .build(&k)
+                        .key("install"),
+                    manual_install_button(&k),
+                    // For someone who installed Freenet another way and came back.
+                    Button::new("Check again")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut RiverApp| s.retry())
+                        .build(&k)
+                        .key("retry"),
+                    use_node_button(&k, false),
+                ],
+            ),
+            Setup::NotInstalled => panel(
+                t,
+                "Freenet isn't installed",
+                "River needs Freenet running on this computer. Install it, then try again.",
+                None,
+                vec![
+                    manual_install_button(&k),
+                    retry_button(&k),
+                    use_node_button(&k, false),
+                ],
+            ),
+            Setup::Installing(step) => {
+                let (title, fraction) = install_progress(step);
+                let progress = fraction.map(|f| (f, download_detail(step)));
+                panel(t, title, "This only happens once.", progress, vec![])
+            }
+            Setup::Starting => panel(
+                t,
+                "Starting Freenet…",
+                "This can take a moment the first time.",
+                None,
+                vec![],
+            ),
+            // A node somebody else runs is not installed from here, so no install offer.
+            Setup::Failed(message) if existing => panel(
+                t,
+                "Can't use that node",
+                message,
+                None,
+                vec![retry_button(&k), use_node_button(&k, true)],
+            ),
+            Setup::Failed(message) => panel(
+                t,
+                "Something went wrong",
+                message,
+                None,
+                vec![
+                    retry_button(&k),
+                    manual_install_button(&k),
+                    use_node_button(&k, false),
+                ],
+            ),
+            Setup::Connected { .. } => match &s.access {
+                Access::Example | Access::Ready => return chat::view(&s.chat, logo, cx),
+                access => rooms_panel(t, access, &k, node),
+            },
         }
-        Setup::Starting => panel(
-            t,
-            "Starting Freenet…",
-            "This can take a moment the first time.",
-            None,
-            vec![],
-        ),
-        Setup::Failed(message) => panel(
-            t,
-            "Something went wrong",
-            message,
-            None,
-            vec![retry_button(&k), manual_install_button(&k)],
-        ),
-        Setup::Connected { .. } => match &s.access {
-            Access::Example | Access::Ready => return chat::view(&s.chat, logo, cx),
-            access => rooms_panel(t, access, &k),
-        },
     };
-    col()
+    // A node that is not on this computer is said on every screen, at every start.
+    let banners = chat::node_ui::banners(&s.chat.node, &palette);
+    let mut root = col()
         .key("root")
         .w_full()
         .h_full()
         .center()
+        .gap(16.0)
         .padding(24.0)
-        .fill(palette.rail)
-        .child(body)
+        .fill(palette.rail);
+    if !banners.is_empty() {
+        let mut notes = col().key("node-banners").w(PANEL_W + 64.0).gap(8.0);
+        for b in banners {
+            notes = notes.child(b);
+        }
+        root = root.child(notes);
+    }
+    root.child(body)
 }
 
 /// The screens between reaching the node and showing the rooms.
-fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
+fn rooms_panel(t: Look, access: &Access, k: &Kit, node: &NodeChoice) -> El {
+    let existing = node.is_existing_node();
+    let at = node.address.authority();
     match access {
         Access::Example | Access::Ready | Access::Connecting => panel(
             t,
@@ -1248,12 +1591,25 @@ fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
         ),
         Access::WaitingForApproval { approve_url } => {
             let url = approve_url.clone();
+            let body = if existing {
+                format!(
+                    "Freenet keeps your rooms for River in your browser. Press the button to \
+                     open a Freenet page in your browser that asks whether this app may use \
+                     them too, then choose Allow there. The page is at {at}, so that address \
+                     has to work in this computer's browser too: for a node reached through an \
+                     SSH tunnel it is the tunnel's address on this computer, such as \
+                     localhost:7509."
+                )
+            } else {
+                "Freenet keeps your rooms for River in your browser. Press the button to open \
+                 a Freenet page in your browser that asks whether this app may use them too, \
+                 then choose Allow there."
+                    .to_owned()
+            };
             panel(
                 t,
                 "Allow River to open your rooms",
-                "Freenet keeps your rooms for River in your browser. Press the button to open \
-                 a Freenet page in your browser that asks whether this app may use them too, \
-                 then choose Allow there.",
+                &body,
                 None,
                 vec![
                     Button::new("Open Freenet's approval page")
@@ -1300,23 +1656,35 @@ fn rooms_panel(t: Look, access: &Access, k: &Kit) -> El {
                 rooms::grant::GRANT_NODE_VERSION
             ),
             None,
-            vec![rooms_retry_button(k), manual_install_button(k)],
+            if existing {
+                vec![rooms_retry_button(k), use_node_button(k, true)]
+            } else {
+                vec![rooms_retry_button(k), manual_install_button(k)]
+            },
         ),
         Access::Refused(message) => panel(
             t,
             "River can't open your rooms",
             message,
             None,
-            vec![rooms_retry_button(k)],
+            vec![rooms_retry_button(k), use_node_button(k, existing)],
         ),
         // The reason is the node's or the network library's own text; it goes to the log,
         // and the screen says what it means.
         Access::Unreachable(_) => panel(
             t,
             "Can't reach Freenet",
-            "Freenet on this computer isn't answering River yet. River will keep trying.",
+            &if existing {
+                format!(
+                    "Nothing is answering River at {at} yet. River will keep trying. If you \
+                     reach the node through an SSH tunnel or a VPN, check that it is up."
+                )
+            } else {
+                "Freenet on this computer isn't answering River yet. River will keep trying."
+                    .to_owned()
+            },
             None,
-            vec![],
+            vec![use_node_button(k, existing)],
         ),
     }
 }
@@ -1386,6 +1754,18 @@ type Look<'a> = (&'a chat::style::Palette, Option<&'a rune::Pixels>);
 type Progress = Option<(f32, Option<String>)>;
 
 fn panel(t: Look, title: &str, body: &str, progress: Progress, actions: Vec<El>) -> El {
+    panel_with(t, title, body, Vec::new(), progress, actions)
+}
+
+/// [`panel`] with `content` (a text field, a warning) between the words and the buttons.
+fn panel_with(
+    t: Look,
+    title: &str,
+    body: &str,
+    content: Vec<El>,
+    progress: Progress,
+    actions: Vec<El>,
+) -> El {
     let (p, logo) = t;
     let mark = match logo {
         Some(px) => el().size(LOGO_PT, LOGO_PT).pixels(px),
@@ -1417,8 +1797,10 @@ fn panel(t: Look, title: &str, body: &str, progress: Progress, actions: Vec<El>)
                 .color(p.text)
                 .wrap()
                 .w_full(),
-        )
-        .child(
+        );
+    // A card with no words under the title (the confirmation) keeps no empty gap.
+    if !body.is_empty() {
+        card = card.child(
             text(body.to_owned())
                 .key("body")
                 .font(chat::style::BODY.lh(21.0))
@@ -1426,6 +1808,10 @@ fn panel(t: Look, title: &str, body: &str, progress: Progress, actions: Vec<El>)
                 .wrap()
                 .w_full(),
         );
+    }
+    for c in content {
+        card = card.child(c);
+    }
     if let Some((fraction, detail)) = progress {
         card = card.child(progress_bar(p, fraction));
         if let Some(detail) = detail {
@@ -1462,6 +1848,20 @@ fn progress_bar(p: &chat::style::Palette, fraction: f32) -> El {
                 .fill(p.accent)
                 .motion(rune::Spring::new(0.3, 0.0)),
         )
+}
+
+/// The way to the form that picks a node the person already has: "Use a Freenet node I already
+/// have" when none is chosen, "Use a different node" when one is.
+fn use_node_button(k: &Kit, changing: bool) -> El {
+    Button::new(if changing {
+        "Use a different node"
+    } else {
+        "Use a Freenet node I already have"
+    })
+    .variant(ButtonVariant::Ghost)
+    .on_press(|s: &mut RiverApp| s.node_open())
+    .build(k)
+    .key("use-node")
 }
 
 fn manual_install_button(k: &Kit) -> El {
@@ -1568,6 +1968,11 @@ mod tests {
     }
 
     impl NodeHost for CountingHost {
+        fn probe_at(&self, _: &str) -> NodeProbe {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            NodeProbe::Unreachable
+        }
         fn probe(&self) -> NodeProbe {
             self.probes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

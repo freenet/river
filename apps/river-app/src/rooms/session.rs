@@ -324,6 +324,26 @@ impl std::fmt::Debug for RoomsUpdate {
     }
 }
 
+/// Why the node would not honour River's permission on this connection, and what to do. The node
+/// honours it only on a direct loopback connection with a loopback `Host`.
+fn unusable_message(authority: &str) -> String {
+    let on_this_computer = authority == crate::address::DEFAULT_AUTHORITY
+        || crate::address::NodeAddress::parse(authority).is_ok_and(|a| a.is_loopback());
+    if on_this_computer {
+        format!(
+            "Freenet won't let River use its permission over this connection. River has to \
+             reach Freenet directly on this computer, at {authority}."
+        )
+    } else {
+        format!(
+            "Freenet won't let River use its permission over a connection to {authority}: it \
+             honours it only on a direct connection from the same computer. To use a node on \
+             another machine, reach it through an SSH tunnel and give River the tunnel's \
+             address on this computer, such as localhost:7509."
+        )
+    }
+}
+
 /// Run until stopped, or until a state that needs the user. `outbox` is what the user sent
 /// that the node has not taken; it is kept across runs, so a stop does not lose it, and what
 /// was in flight goes again on the next run.
@@ -478,10 +498,7 @@ fn run_with(
                 return Access::PermissionRemoved;
             }
             TokenVerdict::Unusable => {
-                return Access::Refused(format!(
-                    "Freenet won't let River use its permission over this connection. River \
-                     has to reach Freenet directly on this computer, at {authority}."
-                ));
+                return Access::Refused(unusable_message(authority));
             }
             TokenVerdict::Refused => return Access::Refused(format!("{err}.")),
             TokenVerdict::Retry => {
