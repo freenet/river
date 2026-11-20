@@ -101,6 +101,9 @@ impl DesktopUpdate {
     /// before returning. `Ok` means the new one has confirmed it started.
     fn restart_and_release(&self, args: &[OsString]) -> Result<(), String> {
         let applied = self.updater.apply()?;
+        // The new version waits on nothing but must be the only River: it would otherwise see
+        // this one's lock, ask it to show its window and exit without confirming its start.
+        crate::single::release_current();
         let launched = self.updater.launch(&applied, args);
         drop(applied);
         launched

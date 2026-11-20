@@ -9,6 +9,7 @@
 //! from an invite code and inviting someone are only for rooms from the node: each is a
 //! [`Command`] too, and what became of it comes back as [`WorkView`]s and an invitation's link.
 
+mod background;
 mod conversation;
 mod details;
 mod emoji;
@@ -43,6 +44,7 @@ mod update_view;
 mod view;
 pub(crate) mod visual_fold;
 
+pub use background::{BackgroundHost, BackgroundUi};
 use std::collections::{HashMap, HashSet};
 
 use rune::TextEdit;
@@ -274,6 +276,8 @@ pub struct Chat {
     pub invite: Option<(String, InviteState)>,
     /// The "Export Identity" dialog, when open ([`identity`]).
     pub export: Option<identity::ExportDialog>,
+    /// "Background and startup", when the shell offers it ([`background`]).
+    pub background: Option<background::BackgroundUi>,
     /// Whether the last status was not live, so the next live update is catch-up rather than
     /// news (see [`Chat::show_node_rooms`]).
     catching_up: bool,
@@ -400,6 +404,7 @@ impl Chat {
             open_when_shown: None,
             invite: None,
             export: None,
+            background: None,
             catching_up: true,
             full_list: false,
             modes: HashMap::new(),

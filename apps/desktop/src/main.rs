@@ -6,15 +6,22 @@
 //! uses a Freenet node somewhere else instead of the one on this computer. `-- --node-check`
 //! prints the node the arguments and environment name and exits (2 if the address is not valid).
 //! `-- --self-update` checks for, installs and starts a newer signed River once, without a
-//! window (see `update/`). Windows release builds have no console, so they print nothing.
+//! window (see `update/`). `-- --background` starts hidden in the tray (what start at login
+//! runs). Windows release builds have no console, so they print nothing.
+//!
+//! Only one River runs per user: a second launch shows the first one's window and exits.
 
 // No console window behind the app on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod autostart;
+mod background;
 mod host;
 mod install;
 mod notify;
 mod release;
+mod single;
+mod tray;
 mod update;
 
 use std::io::IsTerminal;
@@ -71,7 +78,37 @@ fn main() {
     }
     let on_exit = updater.clone();
     let started = std::time::Instant::now();
-    river_app::app(move |handle| {
+    let background_start = std::env::args_os().any(|a| a == autostart::BACKGROUND_FLAG);
+    let settings = Arc::new(background::DesktopBackground::new(host.config_dir()));
+    // One River per user: a later launch shows this one's window and leaves.
+    let instance = host.config_dir().and_then(|dir| {
+        let token = std::env::var("XDG_ACTIVATION_TOKEN")
+            .or_else(|_| std::env::var("DESKTOP_STARTUP_ID"))
+            .ok();
+        match single::acquire(&dir, token.as_deref()) {
+            Ok(single::Start::First(guard)) => Some(guard),
+            Ok(single::Start::Running { asked }) => {
+                say(if asked {
+                    "River is already running; showing its window."
+                } else {
+                    "River is already running."
+                });
+                std::process::exit(0);
+            }
+            // Better two Rivers than none.
+            Err(e) => {
+                say(&format!("couldn't check for another River: {e}"));
+                None
+            }
+        }
+    });
+    let app = river_app::app(move |handle| {
+        // The tray icon is made here on Windows and macOS: init runs on the thread that handles
+        // the window system's events, which they need. A failure leaves the window up.
+        #[cfg(any(windows, target_os = "macos"))]
+        if !tray::start(&handle) {
+            handle.open();
+        }
         // An updater waiting on this process (and probation after a swap) hears that this
         // version works once it has connected to the node (the app reports that itself) or,
         // failing that, after it has run for a while with its event loop turning.
@@ -102,17 +139,44 @@ fn main() {
             link,
             startup,
         )
-        .with_notifier(Box::new(notifier));
+        .with_notifier(Box::new(notifier))
+        .with_background(settings);
         match updates {
             Some(updates) => app.with_updates(updates),
             None => app,
         }
-    })
-    .run();
+    });
+    let handle = app.handle();
+    // Linux has no event-loop thread to respect, and whether the desktop has a tray decides how
+    // the app starts, so ask now.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let tray_expected = tray::start(&handle);
+    #[cfg(any(windows, target_os = "macos"))]
+    let tray_expected = true;
+    if let Some(guard) = &instance {
+        let show = handle.clone();
+        let served = guard.serve(move |activation| match activation {
+            Some(token) => show.activate(token),
+            None => show.open(),
+        });
+        if let Err(e) = served {
+            say(&format!("couldn't listen for a second River: {e}"));
+        }
+    }
+    // Closing the window hides it; `on_close` quits when there is no tray or the person asked
+    // for closing to quit. Started at login, there is no window until the tray asks for one.
+    let mut app = app.keep_running().on_close(background::on_close);
+    if background_start && tray_expected {
+        app = app.windowless();
+    }
+    app.run();
     // The window closed normally: this start was not a failed one.
     if let Some(u) = on_exit {
         u.clean_exit(started.elapsed());
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    tray::stop();
+    drop(instance);
 }
 
 /// `--node-check`: say which node the arguments and environment name, and exit without opening a

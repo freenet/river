@@ -120,3 +120,10 @@ pub static GEAR: Icon = Icon {
     view: 16.0,
     body: r#"<circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#,
 };
+
+/// A window with its corner tucked behind it, for "Background and startup" (a 24 point grid).
+pub static BACKGROUND: Icon = Icon {
+    name: "river-background",
+    view: 24.0,
+    body: r#"<rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M3 10h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>"#,
+};
