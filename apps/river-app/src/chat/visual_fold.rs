@@ -1770,6 +1770,23 @@ mod tests {
         }
     }
 
+    /// One fixed key and its handle, worked out by hand from the web UI's pools: the first word
+    /// is picked by the fold of key bytes 0..16 and the last by bytes 16..32 (the swapped
+    /// pairing gives "Neon Albatross").
+    #[test]
+    fn a_fixed_key_gets_the_handle_the_web_ui_gives_it() {
+        let mut bytes = [0u8; 32];
+        for (i, pair) in "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+            .as_bytes()
+            .chunks(2)
+            .enumerate()
+        {
+            bytes[i] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        let vk = VerifyingKey::from_bytes(&bytes).unwrap();
+        assert_eq!(generate_default_nickname(&vk), "Titanium Pulse");
+    }
+
     /// Every item above is a verbatim copy of an item in the web UI's source; this fails when
     /// the web copy changes or moves, so the two cannot drift apart silently.
     #[test]
@@ -1812,6 +1829,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 21, "only {checked} items found");
+        assert!(checked >= 37, "only {checked} items found");
     }
 }

@@ -257,20 +257,31 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                     );
                 }
                 JoinPreview::New { room } => {
+                    // An invitation carries no room name, only the owner's key.
                     let id: String = room.chars().take(8).collect();
                     body = body.child(note(format!(
-                        "An invitation to a room you have not joined (room {id}…). Choose the \
-                         nickname you will have there."
+                        "This invitation is for a new room, not one you have (room id {id}…). \
+                         Choose the nickname you will have there."
                     )));
                 }
                 JoinPreview::Member { name, .. } => {
                     body = body.child(note(format!(
                         "You are already a member of “{}”. This invitation is not needed.",
-                        name.chars().take(80).collect::<String>()
+                        crate::rooms::create::plain_room_name(name)
+                    )));
+                }
+                JoinPreview::Have { name, .. } => {
+                    body = body.child(note(format!(
+                        "You already have “{}” in your list, but you are not a current member \
+                         of it. This invitation is not used for it; open the room to see why.",
+                        crate::rooms::create::plain_room_name(name)
                     )));
                 }
             }
-            if !matches!(chat.form.join, JoinPreview::Member { .. }) {
+            if !matches!(
+                chat.form.join,
+                JoinPreview::Member { .. } | JoinPreview::Have { .. }
+            ) {
                 body = body.child(field(
                     "join-nickname",
                     "Your nickname",
@@ -281,7 +292,9 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             }
         }
     }
-    if let Some(error) = &chat.form.error {
+    // A refusal the preview already shows is not said twice.
+    let said = matches!(&chat.form.join, JoinPreview::Refused(why) if Some(why) == chat.form.error.as_ref());
+    if let Some(error) = chat.form.error.as_ref().filter(|_| !said) {
         body = body.child(
             text(error.clone())
                 .font(k.ty.ui)
@@ -306,7 +319,10 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .child(
                 Button::new(
                     if kind == DialogKind::Join
-                        && matches!(chat.form.join, JoinPreview::Member { .. })
+                        && matches!(
+                            chat.form.join,
+                            JoinPreview::Member { .. } | JoinPreview::Have { .. }
+                        )
                     {
                         "Open room"
                     } else {

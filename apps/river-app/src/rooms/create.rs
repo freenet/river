@@ -325,7 +325,9 @@ impl JoinRefusal {
 
 /// Why `invitation` can't be used at all: the key it gives the invitee is not the one its
 /// membership names, so joining with it would add someone else. The web UI leaves this to the
-/// room contract; here it is said before anything is stored.
+/// room contract; here it is said before anything is stored. This is a consistency check on the
+/// invitation's own fields, not a validity gate and not authentication: nothing here verifies the
+/// inviter's signature or that the inviter is a member, and the room contract still decides.
 pub fn invitation_refusal(invitation: &Invitation) -> Option<String> {
     if invitation.invitee_signing_key.verifying_key() != invitation.invitee.member.member_vk {
         return Some(
@@ -344,20 +346,31 @@ pub fn invitation_refusal(invitation: &Invitation) -> Option<String> {
     None
 }
 
+/// A room's name as plain text to put in a message or a sentence: the owner chose it, so control
+/// characters, line and paragraph separators, bidi overrides and isolates, and zero-width and
+/// other format characters are dropped, and it is cut at 80 characters (on a character).
+pub fn plain_room_name(name: &str) -> String {
+    name.chars()
+        .filter(|&c| {
+            !crate::chat::visual_fold::is_format_or_control(c)
+                && !matches!(c, '\u{200C}' | '\u{200D}' | '\u{2028}' | '\u{2029}')
+        })
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 /// The message the web UI offers to copy for an invitation (`InviteMemberBody`'s `default_msg`
 /// in `invite_member_modal.rs`): the room's name, how to join, the link, and the warning that an
 /// invitation is for one person. The room name is the room owner's text, so control characters
 /// are dropped and a long one is cut.
 pub fn invitation_message(room_name: &str, link: &str) -> String {
-    let name: String = room_name
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect();
-    let name = if name.trim().is_empty() {
+    let name = plain_room_name(room_name);
+    let name = if name.is_empty() {
         "this chat room"
     } else {
-        name.trim()
+        name.as_str()
     };
     format!(
         "You've been invited to join the chat room \"{name}\"!\n\n\
@@ -372,9 +385,11 @@ pub fn invitation_message(room_name: &str, link: &str) -> String {
 }
 
 /// The longest pasted invite code or link that is looked at. A real invitation is a few hundred
-/// bytes, and a private room's adds 32 bytes of secret per version it has had; this leaves room
-/// for thousands of versions and refuses a multi-megabyte paste before anything decodes it.
-pub const MAX_INVITE_PASTE_LEN: usize = 64 * 1024;
+/// bytes, and a private room's adds about 90 characters per secret version it has had, so a room
+/// that has rotated its secret 100 times needs about 9.9 KB; this leaves room for about 120.
+/// It is small because base58 decoding is quadratic in the length: the cost at 64 KiB was
+/// billions of steps per edit.
+pub const MAX_INVITE_PASTE_LEN: usize = 12 * 1024;
 
 /// The invitation a pasted invite code or link holds. An invitation is a bearer credential and
 /// what is pasted is untrusted, so the text is bounded first, no error repeats any of it, and a

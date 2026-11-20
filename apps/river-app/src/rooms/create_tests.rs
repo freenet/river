@@ -524,11 +524,25 @@ fn a_pasted_link_or_code_decodes_and_anything_else_is_refused_without_echoing_it
 
 #[test]
 fn a_paste_over_the_bound_is_refused_before_it_is_decoded() {
-    let long = "1".repeat(MAX_INVITE_PASTE_LEN + 1);
+    let long = "z".repeat(MAX_INVITE_PASTE_LEN + 1);
     assert!(decode_invitation(&long).unwrap_err().contains("too long"));
-    let near = "1".repeat(MAX_INVITE_PASTE_LEN);
-    // Within the bound it is decoded (and refused for what it holds).
-    assert!(!decode_invitation(&near).unwrap_err().contains("too long"));
+    // At the bound, with the character base58 decodes slowest ("1" decodes for free), it is
+    // decoded and refused for what it holds. Base58 decoding is quadratic, which is why the
+    // bound is small. No timing is asserted: the decode completes.
+    let at = "z".repeat(MAX_INVITE_PASTE_LEN);
+    assert!(!decode_invitation(&at).unwrap_err().contains("too long"));
+}
+
+/// The bound leaves room for a private room that has rotated its secret 100 times (about 9.9 KB
+/// as a code: each version's 32-byte secret costs about 90 characters).
+#[test]
+fn an_invitation_to_a_room_with_100_secret_versions_fits_the_bound() {
+    let owner = SigningKey::from_bytes(&[53; 32]);
+    let (_, mut inv) = public_room_and_invitation(&owner);
+    inv.room_secrets = (0..100u32).map(|v| (v, [0xF0 ^ v as u8; 32])).collect();
+    let code = inv.to_encoded_string().unwrap();
+    assert!(code.len() < MAX_INVITE_PASTE_LEN, "{}", code.len());
+    assert!(decode_invitation(&format!("{WEB_APP}?invitation={code}")).unwrap() == inv);
 }
 
 #[test]
@@ -551,9 +565,28 @@ fn the_invitation_message_is_the_web_uis_and_cleans_the_room_name() {
     assert!(msg.contains("1. Install Freenet from https://freenet.org\n"));
     assert!(msg.contains("2. Open this link:\nhttp://x/?invitation=abc\n\n"));
     assert!(msg.contains("for you only"));
-    // The owner's text: no control characters, bounded, and a stand-in when it is empty.
+    // The owner's text: no control, line-separator, bidi, zero-width or other format
+    // characters, bounded, and a stand-in when nothing is left.
     let odd = invitation_message("A\nB\u{7}C", "l");
     assert!(odd.contains("\"ABC\""), "{odd}");
+    for hostile in [
+        "Ro\u{202E}om",
+        "Ro\u{2066}o\u{2069}m",
+        "Ro\u{200B}o\u{200D}\u{200C}m\u{FEFF}",
+        "Ro\u{2028}o\u{2029}m",
+        "Ro\u{AD}o\u{2060}m\u{E0041}",
+    ] {
+        let cleaned = plain_room_name(hostile);
+        assert!(
+            cleaned.chars().all(|c| c.is_ascii_alphabetic()),
+            "{cleaned:?}"
+        );
+        assert_eq!(cleaned, "Room", "{hostile:?}");
+        assert!(invitation_message(hostile, "l").contains("\"Room\""));
+    }
+    // The cut is on a character, not a byte, and a name of nothing visible gets the stand-in.
+    assert_eq!(plain_room_name(&"\u{e9}".repeat(500)).chars().count(), 80);
     assert!(invitation_message(&"x".repeat(500), "l").len() < 700);
     assert!(invitation_message("  ", "l").contains("\"this chat room\""));
+    assert!(invitation_message("\u{202E}\u{200B}", "l").contains("\"this chat room\""));
 }

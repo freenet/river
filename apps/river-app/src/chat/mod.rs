@@ -118,6 +118,9 @@ pub struct Form {
     pub join: JoinPreview,
     /// The nickname the join dialog filled in from the invitation, to tell it from one typed.
     pub generated_nickname: String,
+    /// A hash of the code last decoded, so an edit that leaves it as it was (the cursor moving,
+    /// a key that changed nothing) is not decoded again. Not the code, which is a credential.
+    pub decoded_hash: Option<u64>,
 }
 
 /// What the join dialog makes of the invite code or link typed in it. It holds nothing from the
@@ -134,8 +137,16 @@ pub enum JoinPreview {
         /// The room owner's key, as rooms are keyed.
         room: String,
     },
-    /// An invitation to a room the user is already in.
+    /// An invitation to a room the user is a current member of.
     Member {
+        /// The room's key.
+        room: String,
+        /// Its name.
+        name: String,
+    },
+    /// An invitation to a room that is in the list but the user is not a current member of
+    /// (removed, banned, or their key not known here). This invitation is not used for it.
+    Have {
         /// The room's key.
         room: String,
         /// Its name.
@@ -156,6 +167,7 @@ impl Default for Form {
             error: None,
             join: JoinPreview::Empty,
             generated_nickname: String::new(),
+            decoded_hash: None,
         }
     }
 }
@@ -1545,11 +1557,23 @@ impl Chat {
     /// The code in the join dialog was edited: decide what it is, and offer the nickname the
     /// invitation's key gives (as the web UI does), unless one was typed.
     pub fn join_code_edited(&mut self) {
-        self.form.error = None;
-        if self.form.code.text.trim().is_empty() {
+        use std::hash::{Hash, Hasher};
+        let text = self.form.code.text.trim();
+        if text.is_empty() {
             self.form.join = JoinPreview::Empty;
+            self.form.decoded_hash = None;
+            self.form.error = None;
             return;
         }
+        // Decoding costs more the longer the paste: do it once per distinct text.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let hash = hasher.finish();
+        if self.form.decoded_hash == Some(hash) {
+            return;
+        }
+        self.form.decoded_hash = Some(hash);
+        self.form.error = None;
         let invitation = match crate::rooms::create::decode_invitation(&self.form.code.text) {
             Ok(i) => i,
             Err(why) => {
@@ -1559,9 +1583,15 @@ impl Chat {
         };
         let room = bs58::encode(invitation.room.to_bytes()).into_string();
         if let Some(known) = self.rooms.iter().find(|r| r.key == room) {
-            self.form.join = JoinPreview::Member {
-                name: known.name.clone(),
-                room,
+            let name = known.name.clone();
+            // A current member: this computer's key is in the room's member list and nothing
+            // says the room has removed it. Anything else is only a room in the list.
+            let member =
+                known.send_block.is_none() && known.members.iter().any(|m| m.id == known.me);
+            self.form.join = if member {
+                JoinPreview::Member { name, room }
+            } else {
+                JoinPreview::Have { name, room }
             };
             return;
         }
@@ -1587,6 +1617,8 @@ impl Chat {
             }
         };
         let room = bs58::encode(invitation.room.to_bytes()).into_string();
+        // A room in the list is opened, not joined again, whether or not this computer's key is
+        // a current member of it: the invitation is not used over a room this app already has.
         if self.rooms.iter().any(|r| r.key == room) {
             self.close_dialog();
             self.select(&room);
