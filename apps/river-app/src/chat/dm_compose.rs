@@ -65,9 +65,9 @@ struct Sending {
     /// Not answered for [`ANSWER_WAIT`]: the thread says so and lets the user send again. The
     /// answer, if it ever comes, still takes `sent` out of the box.
     silent: bool,
-    /// Sent from a notification's reply: there is no box to keep the text in, so a refusal puts
-    /// it in the thread's draft.
-    keep_on_refusal: bool,
+    /// Sent from a notification's reply: the box is not the user's to change. The answer leaves
+    /// the box alone, and a refusal keeps the text in [`DmCompose::stash`].
+    notification: bool,
 }
 
 impl Drop for Sending {
@@ -93,6 +93,11 @@ pub struct DmCompose {
     /// not show over a newer one that went through.
     queued_up_to: HashMap<(String, String), u64>,
     next_ticket: u64,
+    /// Text of replies typed into notifications that were refused, for threads that are OPEN:
+    /// their box is live and is never written to behind the user's back. Merged into the
+    /// thread's draft when it is closed or left ([`Chat::merge_stash`]); for a thread that is not
+    /// open the text goes to the draft at once.
+    stash: HashMap<(String, String), String>,
 }
 
 impl std::fmt::Debug for DmCompose {
@@ -135,11 +140,6 @@ impl DmCompose {
             .map(|(_, _, why)| why.as_str())
     }
 
-    #[cfg(test)]
-    pub(super) fn sends_clear_for_test(&mut self) {
-        self.sends.clear();
-    }
-
     pub(super) fn drafts_mut(&mut self) -> &mut HashMap<(String, String), rune::TextEdit> {
         &mut self.drafts
     }
@@ -157,6 +157,14 @@ impl DmCompose {
     /// screen asks first.
     pub(super) fn needs_confirm(&self, key: &(String, String)) -> bool {
         let text = self.drafts.get(key).map_or("", |d| d.text.as_str());
+        self.sends.iter().any(|s| {
+            s.silent && !s.notification && s.room == key.0 && s.peer == key.1 && s.sent == text
+        })
+    }
+
+    /// Whether the thread has a send, from anywhere, that was not answered in time and whose
+    /// text is exactly `text`: sending it again may deliver it twice.
+    pub(super) fn has_unanswered(&self, key: &(String, String), text: &str) -> bool {
         self.sends
             .iter()
             .any(|s| s.silent && s.room == key.0 && s.peer == key.1 && s.sent == text)
@@ -176,6 +184,7 @@ impl DmCompose {
             self.refused = None;
         }
         self.queued_up_to.retain(|k, _| listed(&k.0));
+        self.stash.retain(|k, _| listed(&k.0));
     }
 }
 
@@ -318,7 +327,7 @@ impl Chat {
             sent: text.clone(),
             at: now,
             silent: false,
-            keep_on_refusal: false,
+            notification: false,
         });
         self.emit(
             room,
@@ -407,7 +416,10 @@ impl Chat {
                 {
                     self.dm.compose.refused = None;
                 }
-                if let Some(d) = self.dm.compose.drafts.get_mut(&key) {
+                // A reply typed into a notification never owned the box.
+                if !sending.notification
+                    && let Some(d) = self.dm.compose.drafts.get_mut(&key)
+                {
                     take_sent(d, &sending.sent);
                 }
                 // Sending into an archived thread brings it back (the background work does that
@@ -435,8 +447,8 @@ impl Chat {
                 if !newer_ok && !newer_refusal {
                     self.dm.compose.refused = Some((key.clone(), ticket, why));
                 }
-                if sending.keep_on_refusal {
-                    self.keep_dm_draft(&key, &sending.sent);
+                if sending.notification {
+                    self.keep_notification_reply(&key, &sending.sent);
                 }
                 None
             }
@@ -486,22 +498,23 @@ impl Chat {
             Some((ReplyRefusal::Blocked, why))
         } else if cut || text.len() > BODY_CAP {
             Some((ReplyRefusal::TooLong, "the message is too long".to_owned()))
-        } else if self.dm.compose.is_sending_in(&key) || self.dm.compose.needs_confirm(&key) {
+        } else if self.dm.compose.is_sending_in(&key) {
             Some((
                 ReplyRefusal::Blocked,
                 "a message in this conversation is still waiting to be sent".to_owned(),
+            ))
+        } else if self.dm.compose.has_unanswered(&key, &text) {
+            Some((
+                ReplyRefusal::Blocked,
+                "River has not answered for an identical message, which may still go out"
+                    .to_owned(),
             ))
         } else {
             None
         };
         let (Some(to), None) = (to, &why) else {
             let (refusal, reason) = why.unwrap_or((ReplyRefusal::NoRoom, String::new()));
-            let kept = self.keep_dm_draft(&key, &text);
-            let tail = if kept {
-                "It is kept in this conversation's draft."
-            } else {
-                "It could not be kept: the draft is full."
-            };
+            let tail = self.keep_notification_reply(&key, &text);
             self.dm.compose.next_ticket += 1;
             let ticket = self.dm.compose.next_ticket;
             self.dm.compose.refused = Some((
@@ -520,7 +533,7 @@ impl Chat {
             sent: text.clone(),
             at: now,
             silent: false,
-            keep_on_refusal: true,
+            notification: true,
         });
         self.emit(
             room.to_owned(),
@@ -533,26 +546,47 @@ impl Chat {
         Ok(())
     }
 
-    /// Append `text` to the draft of the thread `key`, on a line of its own. False if the draft
-    /// would pass [`MAX_DRAFT_CHARS`], in which case nothing is kept.
-    fn keep_dm_draft(&mut self, key: &(String, String), text: &str) -> bool {
-        let held = self
-            .dm
-            .compose
-            .drafts
-            .get(key)
-            .map_or("", |d| d.text.as_str());
+    /// Keep the text of a reply from a notification that was not sent, and say where it is.
+    /// The open thread's box is live and is not touched: the text waits in the stash and joins
+    /// the draft when the thread is left. For a thread that is not open it is the draft's own
+    /// new last line, which the box shows when the thread opens.
+    fn keep_notification_reply(&mut self, key: &(String, String), text: &str) -> &'static str {
+        let open = self.dm.open.as_ref() == Some(key);
+        let held = if open {
+            self.dm.compose.stash.get(key).map(String::as_str)
+        } else {
+            self.dm.compose.drafts.get(key).map(|d| d.text.as_str())
+        }
+        .unwrap_or("");
         let joined = appended(held, text);
         if joined.chars().count() > MAX_DRAFT_CHARS {
-            return false;
+            return "It could not be kept: the draft is full.";
         }
-        self.dm
-            .compose
-            .drafts
-            .entry(key.clone())
-            .or_default()
-            .replace_text(joined);
-        true
+        if open {
+            self.dm.compose.stash.insert(key.clone(), joined);
+            "It is saved, and will be in the draft when you leave this conversation."
+        } else {
+            self.dm
+                .compose
+                .drafts
+                .entry(key.clone())
+                .or_default()
+                .replace_text(joined);
+            "It is kept in this conversation's draft."
+        }
+    }
+
+    /// Put what a refused notification reply left in the stash of the thread `key` into its
+    /// draft, after what is there. Called when the thread is closed or another is opened.
+    pub(super) fn merge_stash(&mut self, key: &(String, String)) {
+        let Some(text) = self.dm.compose.stash.remove(key) else {
+            return;
+        };
+        let draft = self.dm.compose.drafts.entry(key.clone()).or_default();
+        let joined = appended(&draft.text, &text);
+        if joined.chars().count() <= MAX_DRAFT_CHARS {
+            draft.replace_text(joined);
+        }
     }
 
     /// Ask for the message of entry `entry` (a failed or unanswered send of the open thread) to

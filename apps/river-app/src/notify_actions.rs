@@ -42,6 +42,11 @@ impl RiverApp {
     /// the room says why (see `Chat::send_reply`).
     pub fn reply_from_notification(&mut self, room: &str, text: &str) -> Result<(), ReplyRefusal> {
         if let Some((r, p)) = parse_dm_target(room) {
+            // The notification offered no reply when it hid its sender (previews off): a reply
+            // that arrives anyway is not sent, and nothing is kept (no name to say whose).
+            if !self.private_previews {
+                return Err(ReplyRefusal::Blocked);
+            }
             let result = self
                 .chat
                 .send_dm_reply(r, p, text, std::time::Instant::now());

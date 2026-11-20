@@ -413,13 +413,14 @@ impl RiverApp {
     /// window is focused, or any other room with nothing unread.
     fn drop_read_held(&mut self) {
         let (chat, focused) = (&self.chat, self.focused);
+        let front = self.window_in_front();
         let open = chat.visible_room().map(|r| r.key.as_str());
         self.limiter.retain_held_dm(|room, peer| {
             if chat.mode_of(room) == rooms::modes::NotificationMode::Muted {
                 return false;
             }
             if chat.dm.open_key() == Some((room, peer)) {
-                !focused
+                !front
             } else {
                 chat.dm.unread_in(room, peer) > 0
             }
@@ -450,6 +451,7 @@ impl RiverApp {
             count: 1,
             message_key: String::new(),
             actions: false,
+            reply: false,
         });
     }
 
@@ -541,6 +543,12 @@ impl RiverApp {
         self.chat.unread_total() + self.missed.1 + self.chat.dm_unread_counted()
     }
 
+    /// Whether the window is in front, counting a window that never reported focus as in front
+    /// (as the title does): what decides whether an open thread is being read.
+    fn window_in_front(&self) -> bool {
+        self.focused || !self.focus_known
+    }
+
     /// Notify about the direct messages in `arrived`, as about mentions: the user is the one
     /// addressed. Not for a muted room (the room's mode is the only control over a private
     /// conversation), a room that is gone, or the thread on screen in a window in front. Do not
@@ -551,7 +559,8 @@ impl RiverApp {
         for d in arrived {
             let here = self.chat.rooms().iter().any(|r| r.key == d.room);
             let muted = self.chat.mode_of(&d.room) == rooms::modes::NotificationMode::Muted;
-            let on_screen = self.focused && self.chat.dm.open_key() == Some((&d.room, &d.peer_key));
+            let on_screen =
+                self.window_in_front() && self.chat.dm.open_key() == Some((&d.room, &d.peer_key));
             if !here || muted || on_screen {
                 continue;
             }
@@ -617,7 +626,7 @@ impl RiverApp {
         self.sync_dnd(tx);
         // An unknown focus counts as focused, as the title does: a window that never reports it
         // must still let a thread be read.
-        self.chat.dm_sync(self.focused || !self.focus_known);
+        self.chat.dm_sync(self.window_in_front());
         // Both run every frame, so neither is short-circuited away.
         self.chat.close_search_under_dialog();
         self.chat.close_member_search_if_hidden();

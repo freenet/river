@@ -91,8 +91,10 @@ impl Backend {
         // has no field to type a reply in (`inline-reply` is a KDE extension this crate does
         // not receive), so Reply opens the room with the composer ready.
         if n.actions && caps.buttons {
-            note.action(ACTION_REPLY, "Reply")
-                .action(ACTION_MARK_READ, "Mark as read");
+            if n.reply {
+                note.action(ACTION_REPLY, "Reply");
+            }
+            note.action(ACTION_MARK_READ, "Mark as read");
         }
         if let Some(id) = self.ids.get(&n.room_key) {
             note.id(*id);

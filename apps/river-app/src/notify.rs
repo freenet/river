@@ -22,6 +22,13 @@ pub const MAX_PER_UPDATE: usize = 3;
 pub const ROOM_COOLDOWN: Duration = Duration::from_secs(30);
 /// The same for a room whose new message mentions you.
 pub const MENTION_COOLDOWN: Duration = Duration::from_secs(10);
+/// The most notifications for direct messages of one room that are let through in
+/// [`DM_CAP_WINDOW`]. Past it they are held and counted into one notification when the window
+/// frees. A direct message cannot be told apart from a flood by who sent it (there is no block),
+/// so without this a few members could use up every notification the app may show.
+pub const DM_PER_ROOM: usize = 3;
+/// The window [`DM_PER_ROOM`] is counted in.
+pub const DM_CAP_WINDOW: Duration = Duration::from_secs(60);
 /// Notifications allowed per minute across all rooms, so no room or crowd of rooms can fill
 /// the operating system's notification list.
 pub const PER_MINUTE: f64 = 6.0;
@@ -52,6 +59,9 @@ pub fn parse_dm_target(target: &str) -> Option<(&str, &str)> {
         .then_some((room, peer))
 }
 
+/// The `room_key` of the notification that sums up direct messages of several threads.
+pub const DM_SUMMARY_KEY: &str = "river-dm-summary";
+
 /// What to show: one per room per update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notification {
@@ -71,6 +81,10 @@ pub struct Notification {
     /// Whether it is about one room, so Reply and Mark as read make sense on it. False for the
     /// summary of several rooms and for notices that are not about a room.
     pub actions: bool,
+    /// Whether Reply (a button or the system's reply field) is offered. Never for a direct
+    /// message whose sender is hidden (previews off): a reply to someone the notification does
+    /// not name is a mistake waiting to happen. Click and Mark as read stay.
+    pub reply: bool,
 }
 
 /// How a shell shows notifications and the unread count. Called on the UI thread: an
@@ -125,10 +139,22 @@ impl Arrival {
         parse_dm_target(&self.room_key).is_some()
     }
 
-    /// Whether it gets the shorter cooldown: it mentions you, or is a direct message (addressed
-    /// to you alone, so it counts as a mention).
+    /// Whether it gets the shorter cooldown: it mentions you. A direct message does not: it
+    /// has the room cooldown per thread, so a sender cannot hold the shared budget open.
     fn urgent(&self) -> bool {
-        self.mention || self.is_dm()
+        self.mention
+    }
+
+    /// The order the limiter lets arrivals take tokens in: mentions, then direct messages, then
+    /// the rest.
+    fn priority(&self) -> u8 {
+        if self.mention {
+            0
+        } else if self.is_dm() {
+            1
+        } else {
+            2
+        }
     }
 
     /// How much the message shown matters when arrivals are merged: a mention, then a reply
@@ -271,6 +297,8 @@ pub struct Limiter {
     started: bool,
     /// After a notification could not be queued, nothing is let through until then.
     paused_until: Option<Instant>,
+    /// When direct-message notifications were let through, by room key (see [`DM_PER_ROOM`]).
+    dm_stamps: HashMap<String, Vec<Instant>>,
 }
 
 /// How long to hold everything back after the shell could not take a notification.
@@ -284,6 +312,7 @@ impl Default for Limiter {
             refilled: None,
             started: false,
             paused_until: None,
+            dm_stamps: HashMap::new(),
         }
     }
 }
@@ -305,6 +334,8 @@ impl Limiter {
                 let room = parse_dm_target(k).map_or(k.as_str(), |(room, _)| room);
                 rooms.iter().any(|r| r.key == room)
             });
+            self.dm_stamps
+                .retain(|k, _| rooms.iter().any(|r| &r.key == k));
         }
         for room in rooms {
             let new = !self.rooms.contains_key(&room.key);
@@ -318,6 +349,24 @@ impl Limiter {
             clock.empty = room.messages.is_empty();
         }
         self.started = true;
+    }
+
+    /// How long until the direct message notifications of the room of thread `key` are under
+    /// [`DM_PER_ROOM`] again; `None` if they are now.
+    fn dm_wait(&self, key: &str, now: Instant) -> Option<Duration> {
+        let (room, _) = parse_dm_target(key)?;
+        let recent: Vec<Instant> = self
+            .dm_stamps
+            .get(room)?
+            .iter()
+            .copied()
+            .filter(|t| now.saturating_duration_since(*t) < DM_CAP_WINDOW)
+            .collect();
+        if recent.len() < DM_PER_ROOM {
+            return None;
+        }
+        let oldest = recent.iter().min()?;
+        Some(DM_CAP_WINDOW.saturating_sub(now.saturating_duration_since(*oldest)))
     }
 
     /// Whether `room_key` is still filling with history, so its messages are not news.
@@ -351,10 +400,11 @@ impl Limiter {
                 all.push(held);
             }
         }
-        // Mentions first, so they get the tokens.
-        all.sort_by_key(|a| !a.mention);
+        // Mentions first, so they get the tokens, then direct messages, then the rest.
+        all.sort_by_key(Arrival::priority);
         let mut out = Vec::new();
         for mut a in all {
+            let capped = a.is_dm() && self.dm_wait(&a.room_key, now).is_some();
             let clock = self.rooms.entry(a.room_key.clone()).or_default();
             if clock.joined.is_some_and(|t| now.duration_since(t) < SETTLE) {
                 continue;
@@ -369,13 +419,18 @@ impl Limiter {
                 .last
                 .is_some_and(|t| now.saturating_duration_since(t) < cooldown);
             let paused = self.paused_until.is_some_and(|t| now < t);
-            if cooling || paused || self.tokens < 1.0 {
+            if cooling || paused || capped || self.tokens < 1.0 {
                 clock.hold(a);
                 continue;
             }
             self.tokens -= 1.0;
             clock.prev_last = clock.last;
             clock.last = Some(now);
+            if let Some((room, _)) = parse_dm_target(&a.room_key) {
+                let stamps = self.dm_stamps.entry(room.to_owned()).or_default();
+                stamps.retain(|t| now.saturating_duration_since(*t) < DM_CAP_WINDOW);
+                stamps.push(now);
+            }
             if let Some(h) = clock.held.take() {
                 // Before folding the counts in: the rank is of the message shown by each side.
                 let take = h.rank() > a.rank();
@@ -391,6 +446,12 @@ impl Limiter {
             out.push(a);
         }
         out
+    }
+
+    /// The held-back arrivals, for tests.
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&self) -> Vec<Arrival> {
+        self.rooms.values().filter_map(|c| c.held.clone()).collect()
     }
 
     /// How long until something held back can be shown, if anything is held.
@@ -413,7 +474,8 @@ impl Limiter {
                 let paused = self
                     .paused_until
                     .map_or(Duration::ZERO, |t| t.saturating_duration_since(now));
-                Some(ready.max(token_wait).max(paused) + Duration::from_millis(50))
+                let capped = self.dm_wait(&held.room_key, now).unwrap_or(Duration::ZERO);
+                Some(ready.max(token_wait).max(paused).max(capped) + Duration::from_millis(50))
             })
             .min()
     }
@@ -458,6 +520,11 @@ impl Limiter {
             self.tokens = (self.tokens + 1.0).min(PER_MINUTE);
             if let Some(clock) = self.rooms.get_mut(&a.room_key) {
                 clock.last = clock.prev_last;
+                if let Some((room, _)) = parse_dm_target(&a.room_key)
+                    && let Some(stamps) = self.dm_stamps.get_mut(room)
+                {
+                    stamps.pop();
+                }
                 clock.hold(a);
             }
         }
@@ -498,10 +565,12 @@ fn compose_dms(mut dms: Vec<Arrival>, previews: bool) -> Vec<(Notification, Vec<
         .into_iter()
         .map(|a| (one(a.clone(), previews), vec![a]))
         .collect();
-    if let Some(first) = rest.first() {
+    if !rest.is_empty() {
         let count: usize = rest.iter().map(|a| a.count).sum();
+        // Its own key: a click only raises the window (no thread is opened for a summary that
+        // names none), and it never replaces a thread's notification.
         let summary = Notification {
-            room_key: first.room_key.clone(),
+            room_key: DM_SUMMARY_KEY.to_owned(),
             room_name: String::new(),
             title: "River".to_owned(),
             body: format!("{count} new direct messages"),
@@ -509,6 +578,7 @@ fn compose_dms(mut dms: Vec<Arrival>, previews: bool) -> Vec<(Notification, Vec<
             count,
             message_key: String::new(),
             actions: false,
+            reply: false,
         };
         out.push((summary, rest));
     }
@@ -537,6 +607,7 @@ fn compose_rooms(mut arrivals: Vec<Arrival>, previews: bool) -> Vec<(Notificatio
             count,
             message_key: String::new(),
             actions: false,
+            reply: false,
         };
         out.push((summary, rest));
     }
@@ -569,6 +640,7 @@ fn one_dm(a: Arrival) -> Notification {
         count: a.count,
         message_key: a.message_key,
         actions: true,
+        reply: shown,
     }
 }
 
@@ -625,6 +697,7 @@ fn one(a: Arrival, previews: bool) -> Notification {
         count: a.count,
         message_key: a.message_key,
         actions: true,
+        reply: true,
     }
 }
 
@@ -1901,15 +1974,51 @@ mod tests {
             lim.admit(vec![dm(&key, "1")], t0 + Duration::from_secs(1))
                 .is_empty()
         );
-        // The mention cooldown applies, not the room's.
-        let after = t0 + MENTION_COOLDOWN + Duration::from_secs(1);
-        assert!(after < t0 + ROOM_COOLDOWN);
+        // The room cooldown applies, not the mention's: a sender cannot keep the shared budget
+        // open by writing every few seconds.
+        let early = t0 + MENTION_COOLDOWN + Duration::from_secs(1);
+        assert!(lim.admit(Vec::new(), early).is_empty(), "still cooling");
+        let after = t0 + ROOM_COOLDOWN + Duration::from_secs(1);
         assert_eq!(lim.admit(Vec::new(), after).len(), 1, "the held one is due");
         // A full list that still has the room keeps the clocks; one without it drops them.
         lim.observe(&rooms, after, true);
         assert!(lim.rooms.contains_key(&dm_target(&key, "2")));
         lim.observe(&[], after, true);
         assert!(!lim.rooms.contains_key(&dm_target(&key, "2")));
+    }
+
+    #[test]
+    fn a_room_may_show_only_so_many_direct_message_notifications_a_minute() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now() + SETTLE;
+        // Threads of one room, each past its own cooldown, one every 31 s: the first
+        // DM_PER_ROOM show, the next is held until the window frees.
+        for i in 0..DM_PER_ROOM {
+            let at = t0 + Duration::from_secs(i as u64);
+            assert_eq!(lim.admit(vec![dm("r", &i.to_string())], at).len(), 1);
+        }
+        let at = t0 + Duration::from_secs(DM_PER_ROOM as u64);
+        assert!(lim.admit(vec![dm("r", "9")], at).is_empty(), "over the cap");
+        // Another room is not affected.
+        assert_eq!(lim.admit(vec![dm("other", "9")], at).len(), 1);
+        // It is due when the window frees, and shown then as one notification.
+        let wait = lim.next_due(at).expect("held");
+        assert!(wait >= Duration::from_secs(50) && wait <= DM_CAP_WINDOW);
+        let out = lim.admit(Vec::new(), t0 + DM_CAP_WINDOW + Duration::from_secs(1));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].room_key, dm_target("r", "9"));
+    }
+
+    #[test]
+    fn mentions_take_tokens_before_direct_messages_and_those_before_the_rest() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now() + SETTLE;
+        lim.tokens = 2.0;
+        let mut m = arrival(1, true);
+        m.room_key = "mention-room".into();
+        let out = lim.admit(vec![arrival(2, false), dm("r", "1"), m], t0);
+        let keys: Vec<_> = out.iter().map(|a| a.room_key.as_str()).collect();
+        assert_eq!(keys, ["mention-room", &dm_target("r", "1")]);
     }
 
     #[test]

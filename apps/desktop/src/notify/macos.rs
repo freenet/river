@@ -73,7 +73,10 @@ impl Backend {
         note.summary(&n.title).body(&n.body).id(n.room_key.as_str());
         if n.actions {
             // The system's own reply field (typed text arrives as `Reply`), and a button.
-            note.reply("Reply").action(ACTION_MARK_READ, "Mark as read");
+            if n.reply {
+                note.reply("Reply");
+            }
+            note.action(ACTION_MARK_READ, "Mark as read");
         }
         let shown = match note.show() {
             Ok(shown) => shown,

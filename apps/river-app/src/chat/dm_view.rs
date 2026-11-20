@@ -142,6 +142,16 @@ pub struct DmUi {
     rebuilds: usize,
 }
 
+/// How old (by the time its sender signed) a direct message may be and still raise a
+/// notification: one hour. Older ones count as unread but stay quiet.
+pub const MAX_NOTIFY_AGE_SECS: u64 = 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// The least number of tokens remembered as known. The set also never falls below twice what the
 /// latest snapshot holds, so a message the snapshot still has is never forgotten.
 const KNOWN_MIN: usize = 8192;
@@ -255,6 +265,12 @@ impl DmUi {
     /// so it counts), and that no deletion of that peer's messages is waiting on. What a room
     /// held when it was met is known, not news, and a row that could not be opened is never news.
     pub fn apply(&mut self, snapshot: DmSnapshot) {
+        self.apply_at(snapshot, now_secs());
+    }
+
+    /// [`DmUi::apply`] at the time `now` (unix seconds), which decides how old a message may be
+    /// and still notify ([`MAX_NOTIFY_AGE_SECS`]).
+    pub fn apply_at(&mut self, snapshot: DmSnapshot, now: u64) {
         let mut met_now: HashSet<String> = HashSet::new();
         for room in &snapshot.room_keys {
             if !self.known_rooms.insert(room.clone()) {
@@ -288,11 +304,11 @@ impl DmUi {
         self.snapshot = snapshot;
         self.forget_deleted();
         self.rebuild();
-        self.find_arrivals(&met_now);
+        self.find_arrivals(&met_now, now);
     }
 
     /// Note which inbound messages of the snapshot just taken are news, and remember them all.
-    fn find_arrivals(&mut self, met_now: &HashSet<String>) {
+    fn find_arrivals(&mut self, met_now: &HashSet<String>, now: u64) {
         let mut inbound = 0;
         for t in self.snapshot.threads.iter() {
             // A room not met yet has no read position: what it holds is seeded when it is.
@@ -316,9 +332,18 @@ impl DmUi {
             let mut newest: Option<&DmMessage> = None;
             for m in t.messages.iter().filter(|m| !m.outgoing) {
                 inbound += 1;
+                // A row that cannot be opened is not remembered, so it can notify once it can
+                // be (when the room's key arrives), if it is still recent.
+                if matches!(m.body, DmBody::Placeholder(_)) {
+                    continue;
+                }
                 let new = self.known.insert(&m.key);
-                let readable = !matches!(m.body, DmBody::Placeholder(_));
-                if new && !quiet && readable && !seen.is_some_and(|s| s.contains(&m.key)) {
+                // The age is of the time the sender signed. A message hours old (a stale first
+                // state, a reconnect after a long outage) is still unread but not announced; a
+                // sender who backdates only silences their own notification, and a time in the
+                // future is "recent".
+                let recent = m.timestamp.saturating_add(MAX_NOTIFY_AGE_SECS) >= now;
+                if new && recent && !quiet && !seen.is_some_and(|s| s.contains(&m.key)) {
                     count += 1;
                     newest = Some(m);
                 }
@@ -369,11 +394,12 @@ impl DmUi {
     /// what the window title and tray count add for direct messages. A direct message is
     /// addressed to the user, so a room's "mentions and replies" mode counts it.
     pub fn counted_unread(&self, muted: impl Fn(&str) -> bool) -> usize {
-        self.snapshot
-            .threads
+        // The rows hold each thread's unread count, worked out when the snapshot or a read
+        // position changed ([`DmUi::rebuild`]), and leave out archived threads.
+        self.rows
             .iter()
-            .filter(|t| !muted(&t.room) && !self.archive.is_hidden(t))
-            .map(|t| self.unread_of(t))
+            .filter(|r| !muted(&r.room))
+            .map(|r| r.unread)
             .sum()
     }
 
@@ -407,6 +433,12 @@ impl DmUi {
         }
         self.rebuild();
         true
+    }
+
+    /// Whether `token` is remembered as known, for tests.
+    #[cfg(test)]
+    pub(super) fn knows(&self, token: &str) -> bool {
+        self.known.set.contains(token)
     }
 
     /// The new messages found since the last call, one entry per thread.
@@ -635,6 +667,13 @@ impl Chat {
         self.dm_settle();
     }
 
+    /// [`Chat::apply_dms`] at the time `now` (unix seconds), for tests.
+    #[cfg(test)]
+    pub(super) fn apply_dms_at(&mut self, snapshot: DmSnapshot, now: u64) {
+        self.dm.apply_at(snapshot, now);
+        self.dm_settle();
+    }
+
     /// The thread's unread count counted by the title and the tray: not those of a muted room.
     pub fn dm_unread_counted(&self) -> usize {
         self.dm
@@ -696,6 +735,12 @@ impl Chat {
         if !known {
             return false;
         }
+        // A thread left for another gets what a notification reply left for it.
+        if let Some(prev) = self.dm.open.clone()
+            && (prev.0 != room || prev.1 != uid)
+        {
+            self.merge_stash(&prev);
+        }
         // What belonged to the room's own screen gives way: it is no longer in front.
         self.member_modal = None;
         self.clear_ban_confirm();
@@ -732,6 +777,7 @@ impl Chat {
             return;
         };
         self.dm.purge.keep_confirm_for(None);
+        self.merge_stash(&closed);
         // What was typed stays as the thread's draft; the box gives up the keyboard.
         if let Some(d) = self.dm.compose.drafts_mut().get_mut(&closed) {
             d.focused = false;
