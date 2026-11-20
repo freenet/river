@@ -188,14 +188,16 @@ fn the_plan_reads_room_keys_and_meta_and_ignores_the_rest() {
         plan(keys.into_iter()),
         Plan {
             rooms: vec![vk(1), vk(2)],
-            has_meta: true
+            has_meta: true,
+            has_dms: false
         }
     );
     assert_eq!(
         plan(std::iter::empty()),
         Plan {
             rooms: vec![],
-            has_meta: false
+            has_meta: false,
+            has_dms: false
         }
     );
 }
@@ -346,6 +348,7 @@ fn loaded(slots: Vec<StoredRoom>) -> Loaded {
         modes: Default::default(),
         store_missing: false,
         unreadable: 0,
+        dms: Default::default(),
     }
 }
 
@@ -5621,4 +5624,155 @@ fn trying_a_failed_leave_again_never_tombstones_a_room_joined_since() {
     session.wait_rooms("the room is shown", |r, _, _| {
         r.iter().any(|r| r.name == "B")
     });
+}
+
+// The sent direct messages are read with the rooms, and only read -----------------------------
+
+fn dm_store_bytes(text: &str) -> Vec<u8> {
+    use river_core::chat_delegate::{OutboundDmEntry, OutboundDmStore};
+    use river_core::room_state::direct_messages::PurgeToken;
+    let store = OutboundDmStore {
+        entries: vec![OutboundDmEntry {
+            room_owner_vk: vk(1).to_bytes(),
+            sender: MemberId::from(&vk(2)),
+            recipient: MemberId::from(&vk(3)),
+            purge_token: PurgeToken([5; 16]),
+            timestamp: 1,
+            plaintext: text.to_string(),
+        }],
+        hidden_threads: vec![],
+    };
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&store, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn the_loader_reads_outbound_dms_when_the_store_lists_them() {
+    let (mut loader, _) = Loader::start();
+    let keys = vec![
+        ChatDelegateKey::new(room_storage_key(&vk(1))),
+        ChatDelegateKey::new(crate::rooms::dm_cache::KEY.to_vec()),
+    ];
+    let Step::Send(reads) = loader.on_answer(ChatDelegateResponseMsg::ListResponse { keys }) else {
+        panic!("gets follow the list");
+    };
+    assert_eq!(reads.len(), 2);
+    assert!(
+        reads
+            .iter()
+            .any(|r| matches!(r, Read::Get(k) if k == b"outbound_dms"))
+    );
+    assert!(matches!(
+        loader.on_answer(get_answer(
+            b"outbound_dms".to_vec(),
+            Some(dm_store_bytes("sent words"))
+        )),
+        Step::Wait
+    ));
+    let Step::Done(loaded) = loader.on_answer(get_answer(room_storage_key(&vk(1)), None)) else {
+        panic!("all answered");
+    };
+    let DmRead::Read(cache) = loaded.dms else {
+        panic!("the store decoded");
+    };
+    assert_eq!(cache.len(), 1);
+    // Rooms are counted as before: the sent messages are not one.
+    assert_eq!(loaded.listed, 1);
+}
+
+#[test]
+fn a_store_without_outbound_dms_asks_for_none_and_an_unreadable_one_is_unreadable() {
+    let (mut loader, _) = Loader::start();
+    let keys = vec![ChatDelegateKey::new(ROOMS_META_KEY.to_vec())];
+    let Step::Send(reads) = loader.on_answer(ChatDelegateResponseMsg::ListResponse { keys }) else {
+        panic!("a get follows the list");
+    };
+    assert!(
+        !reads
+            .iter()
+            .any(|r| matches!(r, Read::Get(k) if k == b"outbound_dms"))
+    );
+    let Step::Done(loaded) = loader.on_answer(get_answer(ROOMS_META_KEY.to_vec(), None)) else {
+        panic!("all answered");
+    };
+    assert_eq!(loaded.dms, DmRead::NotListed);
+
+    let (mut loader, _) = Loader::start();
+    let keys = vec![ChatDelegateKey::new(b"outbound_dms".to_vec())];
+    loader.on_answer(ChatDelegateResponseMsg::ListResponse { keys });
+    let Step::Done(loaded) = loader.on_answer(get_answer(
+        b"outbound_dms".to_vec(),
+        Some(vec![0xff, 0x01, 0x02]),
+    )) else {
+        panic!("all answered");
+    };
+    assert_eq!(loaded.dms, DmRead::Unreadable);
+}
+
+#[test]
+fn a_listed_key_with_no_value_is_unreadable_not_empty() {
+    for value in [None, Some(vec![])] {
+        let (mut loader, _) = Loader::start();
+        let keys = vec![ChatDelegateKey::new(b"outbound_dms".to_vec())];
+        loader.on_answer(ChatDelegateResponseMsg::ListResponse { keys });
+        let Step::Done(loaded) = loader.on_answer(get_answer(b"outbound_dms".to_vec(), value))
+        else {
+            panic!("all answered");
+        };
+        assert_eq!(loaded.dms, DmRead::Unreadable);
+    }
+}
+
+#[test]
+fn reading_the_rooms_hydrates_the_cache_and_a_missing_store_leaves_it_alone() {
+    let mut rooms = Rooms::default();
+    assert!(!rooms.dm_cache().hydrated());
+    let read = |bytes: &[u8]| DmRead::Read(Box::new(OutboundCache::from_bytes(bytes).unwrap()));
+    let mut first = loaded(vec![]);
+    first.dms = read(&dm_store_bytes("one"));
+    rooms.replace(first);
+    assert!(rooms.dm_cache().hydrated());
+    assert_eq!(rooms.dm_cache().len(), 1);
+
+    // The store is gone from this read: that says nothing about what was in it.
+    rooms.replace(Loaded::missing());
+    assert!(rooms.dm_cache().hydrated());
+    assert_eq!(rooms.dm_cache().len(), 1);
+
+    // An empty list of rooms that did not list the key (a transient empty read) neither wipes
+    // the cache nor changes its latch.
+    rooms.replace(loaded(vec![]));
+    assert!(rooms.dm_cache().hydrated());
+    assert_eq!(rooms.dm_cache().len(), 1);
+    // Nor does a list that named rooms but not the key clear what was read.
+    rooms.replace(loaded(vec![TestRoom::new(1, "A", 1, &["a1"]).stored()]));
+    assert!(rooms.dm_cache().hydrated());
+    assert_eq!(rooms.dm_cache().len(), 1);
+
+    // An unreadable value keeps the entries and unlatches; the next good read latches again.
+    let mut bad = loaded(vec![]);
+    bad.dms = DmRead::Unreadable;
+    rooms.replace(bad);
+    assert!(!rooms.dm_cache().hydrated());
+    assert_eq!(rooms.dm_cache().len(), 1);
+    let mut good = loaded(vec![]);
+    good.dms = read(&dm_store_bytes("two"));
+    rooms.replace(good);
+    assert!(rooms.dm_cache().hydrated());
+}
+
+#[test]
+fn a_key_not_listed_hydrates_an_empty_cache_only_from_a_list_that_named_rooms() {
+    // A read that listed nothing proves nothing: not hydrated.
+    let mut rooms = Rooms::default();
+    rooms.replace(loaded(vec![]));
+    assert!(!rooms.dm_cache().hydrated());
+    // The same for a store that was not there.
+    rooms.replace(Loaded::missing());
+    assert!(!rooms.dm_cache().hydrated());
+    // A list that named a room was read, so the key's absence is real.
+    rooms.replace(loaded(vec![TestRoom::new(1, "A", 1, &["a1"]).stored()]));
+    assert!(rooms.dm_cache().hydrated());
+    assert!(rooms.dm_cache().is_empty());
 }

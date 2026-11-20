@@ -12,6 +12,7 @@
 mod background;
 mod conversation;
 mod details;
+pub mod dm_model;
 pub mod dnd;
 mod emoji;
 pub mod example;
