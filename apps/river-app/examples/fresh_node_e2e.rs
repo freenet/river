@@ -732,6 +732,12 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
             })
         });
         println!("B: accepted the invitation to {name} from the direct message");
+
+        // Both leave the room again, so the steps after this start from the rooms they had.
+        let (b_authority, b_dir) = (bob.authority.clone(), bob.dir.clone());
+        leave_room(bob, &b_authority, &b_dir, name, &target, Some(room));
+        let (a_authority, a_dir) = (alice.authority.clone(), alice.dir.clone());
+        leave_room(alice, &a_authority, &a_dir, name, &target, Some(room));
     }
 }
 

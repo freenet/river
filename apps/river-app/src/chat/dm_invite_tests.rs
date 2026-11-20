@@ -405,8 +405,10 @@ fn the_picker_lists_your_other_rooms_and_sends_the_chosen_one_with_the_note() {
     assert_eq!(to, target);
     assert_eq!(note.as_deref(), Some("see you there"));
     assert_eq!(rt.state.chat.queued_commands()[0].room, ROOM);
-    // While it waits there is no second send.
+    // While it waits there is no second send, and the dialog stays to say what became of it.
     assert!(!rt.state.chat.invite_send());
+    rt.update(|s, _| s.chat.close_invite_picker());
+    assert!(rt.state.chat.invite_picker_open());
     assert!(shows(&rt, "Sending"));
     assert_eq!(sent(&rt).len(), 1);
 

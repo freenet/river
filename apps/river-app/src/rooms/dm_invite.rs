@@ -138,7 +138,7 @@ pub fn prepare(
     let invitation = create::mint_invitation(target).map_err(Refusal::Invite)?;
     let mut cbor = Vec::new();
     let encoded = into_writer(&invitation, &mut cbor);
-    drop(invitation);
+    wipe_invitation(invitation);
     if encoded.is_err() {
         cbor.zeroize();
         return Err(Refusal::Invite(
@@ -161,6 +161,14 @@ pub fn prepare(
     let message = dm_send::prepare_body(carrier, peer, &bytes, now);
     bytes.zeroize();
     Ok((message?, summary(note)))
+}
+
+/// Wipe an invitation's secrets and drop it. Its signing key wipes itself when dropped; the room
+/// secrets of a private room's invitation do not, so they are wiped here.
+pub(super) fn wipe_invitation(mut invitation: Invitation) {
+    for (_, secret) in &mut invitation.room_secrets {
+        secret.zeroize();
+    }
 }
 
 /// Wipe the invitation a body carries.
@@ -235,13 +243,17 @@ pub fn open(room: &LiveRoom, peer: MemberId, token: &PurgeToken) -> Result<Invit
     // The room the message names is the room the invitation is for: the card names the first and
     // joining uses the second.
     if invitation.room != room_owner_vk {
+        wipe_invitation(invitation);
         return Err(
             "This invitation is damaged: it is for a different room than the message says."
                 .to_owned(),
         );
     }
     match create::invitation_refusal(&invitation) {
-        Some(why) => Err(why),
+        Some(why) => {
+            wipe_invitation(invitation);
+            Err(why)
+        }
         None => Ok(invitation),
     }
 }

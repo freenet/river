@@ -121,9 +121,22 @@ impl Chat {
         true
     }
 
-    /// Close the picker. A send that is waiting still gets its answer, and is queued or refused
-    /// as asked; the dialog is only not there to say so.
+    /// Close the picker, unless a send is waiting for its answer.
     pub fn close_invite_picker(&mut self) {
+        // Not while a send waits for its answer (the answer would have nowhere to say what
+        // became of it), as the web UI does not close its picker then either. A send that went
+        // unanswered for the wait can be left.
+        if self
+            .dm
+            .invite
+            .picker
+            .open
+            .as_ref()
+            .and_then(|o| o.sending.as_ref())
+            .is_some_and(|s| !s.silent)
+        {
+            return;
+        }
         self.dm.invite.picker.open = None;
         self.dm.invite.picker.note.clear();
     }
@@ -251,7 +264,8 @@ impl Chat {
         open.sending = None;
         match result {
             Ok(()) => {
-                self.close_invite_picker();
+                self.dm.invite.picker.open = None;
+                self.dm.invite.picker.note.clear();
                 self.open_dm(room, peer)
                     .then(|| (room.to_owned(), peer.to_owned()))
             }
