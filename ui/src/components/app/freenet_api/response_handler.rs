@@ -860,6 +860,21 @@ const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
 /// The per-room slot GETs are fanned out CONCURRENTLY in waves of
 /// [`ROOM_LOAD_CONCURRENCY`] (freenet/river#417) to collapse N serial delegate
 /// round-trips into ~ceil(N / ROOM_LOAD_CONCURRENCY).
+/// Test hook (example-data + no-sync builds only): the current delegate
+/// answers the outstanding listing (`beginListedLoad`) with only the
+/// `rooms_data` blob, and the room load runs as it would for that answer.
+/// Without a node the versioned blob read then fails: the read-error path of
+/// [`migrate_current_blob_to_per_room`]. Writes no load state of its own.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn test_deliver_stored_rooms_blob_listing() {
+    note_current_list_response();
+    if claim_list_load() {
+        crate::util::safe_spawn_local(load_rooms_per_room(vec![ChatDelegateKey::new(
+            ROOMS_STORAGE_KEY.to_vec(),
+        )]));
+    }
+}
+
 async fn load_rooms_per_room(keys: Vec<ChatDelegateKey>) {
     // Progress-tracked termination (freenet/river#397 review 6): this awaited
     // worker holds a guard for its whole lifetime, so on EVERY exit path the
@@ -1401,11 +1416,21 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             // `LoadPlan::MigrateCurrentBlob`, i.e. the current delegate's index
             // LISTED a `rooms_data` key, so the blob exists — a SEND failure
             // reading it is known-stored-data that failed to load. Mark the failure
-            // (attempt-scoped, review 7) so the worker's settlement resolves to
-            // LoadFailed rather than a silent Empty. (Display is masked by `List`
-            // if rooms are concurrently present.)
+            // (attempt-scoped, review 7).
+            //
+            // The initial load also settles here (PR #940 review): worker
+            // settlement leaves the state alone while rooms are on screen, and
+            // a reconnect keeps the cached rooms, so without this write the
+            // attempt stayed `Loading` (the pill on "Loading your rooms") until
+            // the 60 s backstop. With rooms showing the rail keeps the list; an
+            // empty map gets the error block with Retry. The recovery re-run
+            // starts after a per-room load has already settled, and keeps its
+            // background-only behaviour.
             warn!("Failed to read current-delegate rooms blob: {}", e);
             worker.mark_fetch_failure();
+            if !recovery {
+                worker.set_load_state(RoomsLoadState::LoadFailed);
+            }
         }
     }
 }

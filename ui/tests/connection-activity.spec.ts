@@ -1,4 +1,4 @@
-import { expect, Locator, test } from "@playwright/test";
+import { expect, firefox, Locator, test } from "@playwright/test";
 import { INVITATION_CODE } from "./dialog-cases";
 import { visibleConnectionPill, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
@@ -134,6 +134,75 @@ test.describe("Connection activity", () => {
     await expect(page.getByTestId("room-list").locator('[data-testid^="room-item-"]').first()).toBeVisible();
   });
 
+  test("a failed read of the stored rooms clears the loading pill while cached rooms stay", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "loaded");
+    await callRiverTest(page, "setSyncStatus", "connected");
+    const pill = visibleConnectionPill(page);
+    await expect(pill).toHaveAttribute("aria-busy", "false");
+    const rows = page.getByTestId("room-list").locator('[data-testid^="room-item-"]');
+    await expect(rows.first()).toBeVisible();
+    const roomIds = await rows.evaluateAll(els => els.map(el => el.getAttribute("data-testid")));
+    expect(roomIds.length).toBeGreaterThan(0);
+
+    // A reconnect: the load is running (seen busy first, so an idle pill
+    // below is the settled load, not the initial render).
+    await callRiverTest(page, "beginListedLoad");
+    await expect(pill).toHaveAttribute("data-busy-reason", "loading-rooms");
+
+    // The delegate lists only `rooms_data`, and reading it fails.
+    await callRiverTest(page, "deliverStoredRoomsBlobListing");
+    await expect(pill).toHaveAttribute("aria-busy", "false");
+    expect(await pill.getAttribute("data-busy-reason")).toBeNull();
+    expect(await rows.evaluateAll(els => els.map(el => el.getAttribute("data-testid")))).toEqual(roomIds);
+  });
+
+  // The single-panel Rooms layout follows Tailwind's `md` (48rem), which grows
+  // with the browser's default font size. With a 20px default an 800px window
+  // is still single-panel (48rem = 960px), and the footer must still leave the
+  // dots to the rail's wave.
+  test("with a larger default font, the single-panel rooms list still shows one loading animation", async ({ browserName }, testInfo) => {
+    test.skip(browserName !== "firefox", "the default-font preference is set through Firefox");
+    const browser = await firefox.launch({
+      firefoxUserPrefs: {
+        "font.size.variable.x-western": 20,
+        "font.size.variable.x-unicode": 20,
+      },
+    });
+    try {
+      const context = await browser.newContext({
+        baseURL: testInfo.project.use.baseURL,
+        viewport: { width: 800, height: 900 },
+      });
+      const page = await context.newPage();
+      await page.goto("/");
+      await waitForApp(page);
+      expect(await page.evaluate(() => matchMedia("(min-width: 48rem)").matches), "800px is below 48rem at 20px").toBe(false);
+      await callRiverTest(page, "setSyncStatus", "connected");
+      await callRiverTest(page, "setRoomsLoadState", "loading");
+      await page.getByTestId("hamburger-rooms-button").filter({ visible: true }).click();
+
+      const pill = visibleConnectionPill(page);
+      for (const state of ["loading", "migrating"] as const) {
+        await callRiverTest(page, "setRoomsLoadState", state);
+        await expect(pill).toHaveAttribute("data-busy-reason", "loading-rooms");
+        await expect(page.getByTestId(`room-list-${state}-dots`)).toBeVisible();
+        await expect(pill.getByTestId("connection-activity-dots")).toBeHidden();
+        await expect(pill.getByTestId("connection-status-label")).toHaveText("Connected");
+        await expect(pill.getByTestId("connection-status-dot")).toBeVisible();
+      }
+
+      await callRiverTest(page, "setRoomsLoadState", "loading");
+      await page.setViewportSize({ width: 1280, height: 900 });
+      const railPill = page.getByTestId("rooms-rail").getByTestId("connection-status-indicator");
+      await expect(railPill).toHaveAttribute("data-busy-reason", "loading-rooms");
+      await expect(railPill.getByTestId("connection-activity-dots")).toBeVisible();
+    } finally {
+      await browser.close();
+    }
+  });
+
   test("the mobile rooms list shows one loading animation", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
@@ -239,21 +308,28 @@ test.describe("Connection activity", () => {
             time,
             gap: label.getBoundingClientRect().left - dot.getBoundingClientRect().right,
             shown,
+            slotWidth: el.getBoundingClientRect().width,
+            clipWidth: c.width,
             opacity: Number(getComputedStyle(el).opacity),
           };
         });
       }, { connecting, times });
 
-    const opening = await frames(true, [60, 100, 150, 200, 250]);
+    const opening = await frames(true, [30, 60, 100, 150, 200, 250, 300]);
     const closing = await frames(false, [750, 800, 850, 900]);
     for (const f of [...opening, ...closing]) {
+      // The box that pushes the label is the box that shows the dots: no
+      // empty part of the slot sits between them and the label.
+      expect(Math.abs(f.slotWidth - f.clipWidth), `slot ${f.slotWidth}px vs visible ${f.clipWidth}px at ${f.time}ms`).toBeLessThanOrEqual(0.5);
       // Room for a dot and its spacing: a dot must be in it.
       if (f.gap - restGap >= 8 && f.opacity > 0.2) {
         expect(f.shown, `dots shown when the label is pushed ${Math.round(f.gap - restGap)}px at ${f.time}ms`).toBeGreaterThan(0);
       }
     }
-    // The samples did cover a partly open slot.
+    // The samples did cover a partly open slot, and the open slot shows all
+    // five dots (its width fits them exactly).
     expect(opening.some(f => f.gap - restGap >= 8 && f.gap - restGap < 20)).toBe(true);
+    expect(opening[opening.length - 1].shown).toBe(5);
   });
 
   for (const reduced of [false, true]) {

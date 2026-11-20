@@ -48,6 +48,8 @@ type RiverTestHooks = {
   beginListedLoad(): void;
   // on_current_list_refused with LIST_REFUSED_MARKER. No-op unless the list is outstanding.
   refuseOutstandingList(): void;
+  // Answers the outstanding list with only rooms_data; the blob read then fails (no node).
+  deliverStoredRoomsBlobListing(): void;
   // The held load worker settles; the load state is left as it is.
   releaseHeldLoadWorker(): void;
   switchRoom(name: string): void;

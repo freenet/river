@@ -613,6 +613,15 @@ pub fn install_test_hooks() {
         })
         .into_js_value(),
     );
+    // The outstanding listing is answered with only the stored `rooms_data`
+    // blob, whose read then fails (no node in this build).
+    set_hook(
+        "deliverStoredRoomsBlobListing",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::components::app::freenet_api::response_handler::test_deliver_stored_rooms_blob_listing();
+        })
+        .into_js_value(),
+    );
     set_hook(
         "refuseOutstandingList",
         Closure::<dyn FnMut()>::new(|| {
