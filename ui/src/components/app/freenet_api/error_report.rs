@@ -22,7 +22,7 @@ use freenet_stdlib::client_api;
 pub const LABEL_DISCONNECTED: &str = "Disconnected";
 pub const LABEL_INVALID_OPERATION: &str = "Invalid operation";
 pub const LABEL_UNEXPECTED_MESSAGE: &str = "Unexpected message";
-pub const LABEL_REFRESHING: &str = "Refreshing...";
+pub const LABEL_REFRESHING: &str = "Refreshing";
 pub const LABEL_ROOM_NOT_FOUND: &str = "Room not found";
 pub const LABEL_ROOM_FULL: &str = "Room is full";
 

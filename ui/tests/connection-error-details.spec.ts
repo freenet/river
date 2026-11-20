@@ -282,17 +282,17 @@ test.describe("Connection error details", () => {
     await expect(tooltipOf(pill(page))).toHaveCount(0);
   });
 
-  test("an auth reload reads Refreshing... with the progress dot", { tag: "@chromium-only" }, async ({ page }) => {
+  test("an auth reload reads Refreshing with the progress dot", { tag: "@chromium-only" }, async ({ page }) => {
     await open(page);
     await callRiverTest(
       page,
       "setSyncErrorReport",
-      "Refreshing...",
+      "Refreshing",
       "Authentication expired. Refreshing the page.",
       "AUTH_TOKEN_INVALID"
     );
-    await expect(pillLabel(page)).toHaveText("Refreshing...");
-    await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Refreshing...`);
+    await expect(pillLabel(page)).toHaveText("Refreshing");
+    await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Refreshing`);
     await expect(pill(page).getByTestId("connection-status-dot")).toHaveClass(/(^|\s)bg-warning(\s|$)/);
   });
 

@@ -560,7 +560,7 @@ fn resolve_reply_strip(
 /// simply were not a reply — flashing "Original message unavailable" over every
 /// reply on every page load is the alarming-placeholder failure that
 /// freenet/river#284 was filed to remove. The message body itself takes the
-/// same view, rendering a calm "Decrypting messages…".
+/// same view, rendering a calm "Decrypting messages".
 ///
 /// The discriminator is deliberately "no secrets AT ALL", not "this version is
 /// missing": a rotated-past version is genuinely unavailable and must keep
@@ -1063,7 +1063,7 @@ pub(crate) fn decrypt_message_content(
                 // accurate for both; an earlier version of this branch
                 // said "Decrypting your invitation" which was wrong for
                 // the reload case.
-                "Decrypting messages — this should only take a moment...".to_string()
+                "Decrypting messages — this should only take a moment.".to_string()
             } else {
                 // We have SOME secrets but not the one this message
                 // was encrypted under. This is the older-message case
@@ -3312,7 +3312,7 @@ pub fn Conversation() -> Element {
                         rsx! {
                             div { class: "px-4 py-3 mx-4 mb-4 bg-surface rounded-lg text-sm text-text-muted flex items-center gap-3",
                                 SmallDots { test_id: "room-sync-banner-dots" }
-                                span { "Syncing room state from the network... You'll be able to send messages once sync completes." }
+                                span { "Syncing room state from the network. You'll be able to send messages once sync completes." }
                             }
                         }
                     },
@@ -3457,7 +3457,7 @@ pub fn Conversation() -> Element {
                                     class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
                                     "data-testid": "conversation-rooms-loading",
                                     WaveDots { test_id: "conversation-rooms-loading-dots" }
-                                    span { class: "text-sm text-text-muted", "Loading your rooms…" }
+                                    span { class: "text-sm text-text-muted", "Loading your rooms" }
                                     NoRoomFooter {}
                                 }
                             },
@@ -3466,7 +3466,7 @@ pub fn Conversation() -> Element {
                                     class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
                                     "data-testid": "conversation-rooms-migrating",
                                     WaveDots { test_id: "conversation-rooms-migrating-dots" }
-                                    span { class: "text-sm text-text-muted", "Migrating your rooms…" }
+                                    span { class: "text-sm text-text-muted", "Migrating your rooms" }
                                     span { class: "text-xs text-text-muted opacity-70", "(one-time step after an update)" }
                                     NoRoomFooter {}
                                 }

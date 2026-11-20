@@ -5,9 +5,9 @@ import { callRiverTest } from "./river-test";
 // Regression coverage for freenet/river#802.
 //
 // Once one room has loaded, the rail shows the list rather than its
-// "Migrating your rooms…" state, so while a delegate migration was still
+// "Migrating your rooms" state, so while a delegate migration was still
 // restoring rooms a partly restored list looked final. The rail now carries a
-// small "Restoring more rooms…" note under the list until the migration is
+// small "Restoring more rooms" note under the list until the migration is
 // done. The example build is seeded with rooms and never migrates, so both
 // sources are driven through hooks (test_hooks.rs, example-data + no-sync
 // only): the sweep's `Migrating` with a load worker running
@@ -32,12 +32,12 @@ test.describe("Restoring more rooms note", { tag: "@chromium-only" }, () => {
 
     await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "migrating");
     await expect(note).toBeVisible({ timeout: 5_000 });
-    await expect(note.getByText("Restoring more rooms…")).toBeVisible();
+    await expect(note.getByText("Restoring more rooms", { exact: true })).toBeVisible();
     await expect(note.locator('[data-testid="room-list-restoring-dots"].small-dots')).toBeVisible();
     // Screen readers hear it through the always-mounted live region.
     const status = page.getByTestId("room-list-restoring-status");
     await expect(status).toHaveAttribute("role", "status");
-    await expect(status).toHaveText("Restoring more rooms…");
+    await expect(status).toHaveText("Restoring more rooms");
     // The list itself still shows, unchanged, and the full-size empty-list
     // state does not.
     await expect(rows).toHaveCount(roomCount);

@@ -284,7 +284,7 @@ pub(crate) fn pending_load_workers() -> u32 {
 /// Bumped when a load worker starts and when the last one of the current
 /// attempt settles, so a render that reads [`pending_load_workers`] (a plain
 /// atomic) re-renders when it changes between zero and non-zero. The rail's
-/// "Restoring more rooms…" note shows `Migrating` only while a worker is
+/// "Restoring more rooms" note shows `Migrating` only while a worker is
 /// still running (freenet/river#802): with rooms present, a worker settling
 /// leaves `Migrating` as it is (`settle_terminal`, since the list renders
 /// anyway) until the hard-max backstop turns it into `LoadFailed`, so a stale

@@ -200,7 +200,7 @@ pub(crate) fn a_pending_predecessor_may_hold_data(status: &JournalStatus) -> boo
 /// Whether a journaled walk running now may still bring rooms back: it is
 /// requested or running, and the journal says a pending predecessor may hold
 /// data (it has not been found "not installed") or an import was interrupted.
-/// Drives the rail's "Restoring more rooms…" note while a partly restored list
+/// Drives the rail's "Restoring more rooms" note while a partly restored list
 /// is already showing (freenet/river#802). A walk whose pending predecessors
 /// were all found "not installed" (the usual case once a migration is done)
 /// shows nothing. A predecessor not yet walked, or one that stays silent (it
@@ -1046,7 +1046,7 @@ mod tests {
         }
     }
 
-    /// freenet/river#802: the rail's "Restoring more rooms…" note follows a
+    /// freenet/river#802: the rail's "Restoring more rooms" note follows a
     /// walk that may still bring rooms, and nothing else.
     #[test]
     fn walk_may_restore_rooms_only_while_a_walk_may_bring_data() {

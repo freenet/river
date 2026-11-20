@@ -237,7 +237,7 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
             rsx! {
                 div { class: "text-center py-8",
                     div { class: "w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto mb-4" }
-                    p { class: "text-text-muted", "Generating invitation..." }
+                    p { class: "text-text-muted", "Generating invitation" }
                 }
             }
         }

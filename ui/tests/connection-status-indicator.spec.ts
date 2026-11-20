@@ -49,11 +49,11 @@ async function waitForApp(page: Page) {
 // painted colour, which must be the token's (status-contrast.spec.ts pins
 // the tokens themselves).
 // An error report shows its own short label (error_report.rs): the error
-// dot, except "Refreshing..." (an auth reload under way), which is progress.
+// dot, except "Refreshing" (an auth reload under way), which is progress.
 const STATUS_STATES = [
   { dot: "bg-success", token: "--color-success", label: "Connected" },
   { dot: "bg-warning", token: "--color-warning", label: "Connecting" },
-  { dot: "bg-warning", token: "--color-warning", label: "Refreshing..." },
+  { dot: "bg-warning", token: "--color-warning", label: "Refreshing" },
   { dot: "bg-error", token: "--color-error", label: "Disconnected" },
   { dot: "bg-error", token: "--color-error", label: "Invalid operation" },
   { dot: "bg-error", token: "--color-error", label: "Unexpected message" },

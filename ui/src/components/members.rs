@@ -58,7 +58,7 @@ use self::invite_member_modal::InviteMemberModal;
 /// that their node WebSocket was broken.
 ///
 /// Short labels only: Connected, Connecting, Disconnected, or an error
-/// report's label ("Invalid operation", "Refreshing..."). When there is an
+/// report's label ("Invalid operation", "Refreshing"). When there is an
 /// error report, the current one or the last one kept through a reconnect
 /// (`LAST_CONNECTION_ERROR`, cleared on Connected), hovering or focusing the
 /// pill explains it and clicking copies its diagnostics. Its accessible name
@@ -3024,7 +3024,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             div {
                                 "data-testid": "import-identity-loading-rooms",
                                 class: "mt-3 text-[13px] text-text-muted",
-                                "Loading your rooms\u{2026} the import will be available in a moment."
+                                "Loading your rooms. The import will be available in a moment."
                             }
                         }
                     }

@@ -3369,7 +3369,7 @@ mod tests {
     /// Regression guard for freenet/river#287.
     ///
     /// A user restoring old room identities from exported backups hit a
-    /// never-ending "Syncing room state from the network..." spinner.
+    /// never-ending "Syncing room state from the network" spinner.
     /// Root cause: the rooms-loaded-from-delegate path issued a bare
     /// `Subscribe` request for every room. The node REJECTS a Subscribe
     /// when the contract's WASM/parameters are not cached locally

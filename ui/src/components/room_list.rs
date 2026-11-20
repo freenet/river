@@ -44,7 +44,7 @@ const TAIL_DROP_ZONE_KEY: &str = "room-reorder-tail-drop-zone";
 // the element across transitions.
 const ROOM_LIST_STATE_KEY: &str = "room-list-state";
 
-// Stable Dioxus key for the "Restoring more rooms…" note (freenet/river#802).
+// Stable Dioxus key for the "Restoring more rooms" note (freenet/river#802).
 const RESTORING_MORE_KEY: &str = "room-list-restoring-more";
 
 /// What the rooms rail shows in place of the room list (freenet/river#397).
@@ -54,7 +54,7 @@ const RESTORING_MORE_KEY: &str = "room-list-restoring-more";
 /// non-empty list always wins.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RoomListDisplay {
-    /// Initial load hasn't resolved yet — wave dots + "Loading your rooms…".
+    /// Initial load hasn't resolved yet — wave dots + "Loading your rooms".
     Loading,
     /// A delegate/room migration is recovering rooms — wave dots + "Migrating…".
     Migrating,
@@ -92,7 +92,7 @@ pub(crate) fn room_list_display_state(
     }
 }
 
-/// Whether the rail shows a "Restoring more rooms…" note under a list that is
+/// Whether the rail shows a "Restoring more rooms" note under a list that is
 /// already showing (freenet/river#802). Once one room has loaded the rail
 /// shows the list, so without it a partly restored list looked final while a
 /// migration was still bringing rooms back. `walk_restoring` is the journaled
@@ -493,7 +493,7 @@ pub fn RoomList() -> Element {
                 }
             }
 
-            // Announces the "Restoring more rooms…" note to screen readers.
+            // Announces the "Restoring more rooms" note to screen readers.
             // Always mounted, with only its text toggled: a live region
             // inserted together with its content is not reliably announced.
             div {
@@ -501,7 +501,7 @@ pub fn RoomList() -> Element {
                 role: "status",
                 "aria-live": "polite",
                 "data-testid": "room-list-restoring-status",
-                if restoring_more { "Restoring more rooms…" }
+                if restoring_more { "Restoring more rooms" }
             }
 
             // Room list
@@ -520,7 +520,7 @@ pub fn RoomList() -> Element {
                             "data-testid": "room-list-loading",
                             class: "flex flex-col items-center justify-center gap-2 py-10 px-4 text-center",
                             WaveDots { test_id: "room-list-loading-dots" }
-                            span { class: "text-sm text-text-muted", "Loading your rooms…" }
+                            span { class: "text-sm text-text-muted", "Loading your rooms" }
                         }
                     },
                     RoomListDisplay::Migrating => rsx! {
@@ -529,7 +529,7 @@ pub fn RoomList() -> Element {
                             "data-testid": "room-list-migrating",
                             class: "flex flex-col items-center justify-center gap-2 py-10 px-4 text-center",
                             WaveDots { test_id: "room-list-migrating-dots" }
-                            span { class: "text-sm text-text-muted", "Migrating your rooms…" }
+                            span { class: "text-sm text-text-muted", "Migrating your rooms" }
                             span { class: "text-xs text-text-muted opacity-70", "(one-time step after an update)" }
                         }
                     },
@@ -827,7 +827,7 @@ pub fn RoomList() -> Element {
                         "data-testid": "room-list-restoring-more",
                         class: "flex items-center gap-2 px-3 py-2 text-xs text-text-muted",
                         SmallDots { test_id: "room-list-restoring-dots" }
-                        span { "Restoring more rooms…" }
+                        span { "Restoring more rooms" }
                     }
                 }
 
@@ -1019,7 +1019,7 @@ mod tests {
     }
 
     /// freenet/river#802: a list that is showing while a migration still
-    /// restores rooms carries a "Restoring more rooms…" note; a settled list,
+    /// restores rooms carries a "Restoring more rooms" note; a settled list,
     /// or an empty one (which shows the full Migrating state), does not.
     #[test]
     fn restoring_more_rooms_only_under_a_list_while_restoring() {

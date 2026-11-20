@@ -91,7 +91,7 @@ type ReportLabel =
   | "Disconnected"
   | "Invalid operation"
   | "Unexpected message"
-  | "Refreshing..."
+  | "Refreshing"
   | "Room not found"
   | "Room is full";
 

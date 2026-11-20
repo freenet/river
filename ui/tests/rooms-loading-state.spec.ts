@@ -54,7 +54,7 @@ for (const { label, viewport, isMobile } of [
       // mode violation rather than a signal.
       const loading = page.getByTestId("conversation-rooms-loading");
       await expect(loading).toBeVisible({ timeout: 5_000 });
-      await expect(loading.getByText("Loading your rooms…")).toBeVisible();
+      await expect(loading.getByText("Loading your rooms", { exact: true })).toBeVisible();
 
       // The two surfaces read one shared state, so the rail must agree. This
       // is also the first browser coverage #397's rail states have ever had —
@@ -98,7 +98,7 @@ for (const { label, viewport, isMobile } of [
 
       const migrating = page.getByTestId("conversation-rooms-migrating");
       await expect(migrating).toBeVisible({ timeout: 5_000 });
-      await expect(migrating.getByText("Migrating your rooms…")).toBeVisible();
+      await expect(migrating.getByText("Migrating your rooms", { exact: true })).toBeVisible();
       await expect(page.getByTestId("room-list-migrating")).toHaveCount(1);
       await expect(migrating.getByTestId("conversation-rooms-migrating-dots")).toBeVisible();
       await expect(page.getByTestId("room-list-migrating-dots")).toHaveCount(1);

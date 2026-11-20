@@ -62,7 +62,7 @@ fn banner_text(notice: Notice) -> (String, bool, bool) {
             false,
             true,
         ),
-        Notice::Reloading => ("Reloading River…".to_string(), false, false),
+        Notice::Reloading => ("Reloading River".to_string(), false, false),
     }
 }
 
