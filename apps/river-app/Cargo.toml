@@ -43,6 +43,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 freenet-migrate = "0.8"
 blake3 = "1"
 toml = "0.8"
+# Names (:smile:) for the emoji the picker lists; the glyph list itself stays in src/chat/emoji.rs.
+emojis = "0.9.1"
 
 [dev-dependencies]
 # Encrypting test rooms needs the randomized helpers.

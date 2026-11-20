@@ -401,6 +401,11 @@ fn narrow_scenes_are_named_narrow() {
         if !matches!(state.setup, Setup::Connected { .. }) {
             continue;
         }
+        // A zoomed scene lays out at the window's size divided by the zoom, so it goes narrow
+        // at a window size that is not (`zoom_makes_the_layout_narrow_like_a_smaller_window`).
+        if state.chat.zoom.percent() != 100 {
+            continue;
+        }
         // The members overlay only exists in a narrow window.
         if state.chat.members_overlay {
             assert!(name.contains("narrow"), "{name} needs the narrow size");
