@@ -169,9 +169,9 @@ mod native {
     use std::cell::RefCell;
 
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::{
-        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    };
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+    #[cfg(windows)]
+    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
     use super::*;
     use crate::background;
@@ -210,21 +210,25 @@ mod native {
                 on_menu.quit();
             }
         }));
-        let on_click = handle.clone();
-        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                on_click.open();
-            }
-        }));
+        // Windows shows the window on a left click and the menu on a right one. The Mac's
+        // menu bar opens the menu on a click, so there the click is the menu's, and the window
+        // is not also opened.
+        #[cfg(windows)]
+        {
+            let on_click = handle.clone();
+            TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    on_click.open();
+                }
+            }));
+        }
         let built = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            // The Mac's menu bar opens the menu on a click; Windows shows the window on a left
-            // click and the menu on a right one.
             .with_menu_on_left_click(cfg!(target_os = "macos"))
             .with_tooltip(TOOLTIP)
             .with_icon(icon)

@@ -4,6 +4,10 @@
 //! `Run` key. All three start `river --background`, which opens no window when the tray is
 //! there to bring it back from (see `background`).
 //!
+//! A macOS LaunchAgent is read by launchd at login, so turning it on or off takes effect at the
+//! next login, not at once. Linux and Windows read their entries at login too, which is when
+//! it matters.
+//!
 //! The file formats are built by plain functions that take the paths, so tests check what is
 //! written without touching the real login items.
 
@@ -30,6 +34,8 @@ enum Place {
     File {
         path: PathBuf,
         body: fn(&Path) -> String,
+        /// Whether the system would run the file's text at login.
+        on: fn(&str) -> bool,
     },
     #[cfg(windows)]
     Registry,
@@ -56,19 +62,22 @@ impl LoginItem {
         }
     }
 
+    /// Whether the system would start River at login: the entry exists and is not switched
+    /// off (a desktop's own startup settings tool does that by editing the entry).
     pub fn enabled(&self) -> bool {
         match &self.place {
-            Place::File { path, .. } => path.is_file(),
+            Place::File { path, on, .. } => std::fs::read_to_string(path).is_ok_and(|t| on(&t)),
             #[cfg(windows)]
-            Place::Registry => registry::present(),
+            Place::Registry => registry::get(registry::VALUE).is_some(),
         }
     }
 
     /// Turn the login item on, or off (also when it was never on).
     pub fn set(&self, on: bool) -> Result<(), String> {
         match &self.place {
-            Place::File { path, body } => {
+            Place::File { path, body, .. } => {
                 if on {
+                    check_exe(&self.exe)?;
                     write_file(path, &body(&self.exe))
                 } else {
                     match std::fs::remove_file(path) {
@@ -81,13 +90,68 @@ impl LoginItem {
             #[cfg(windows)]
             Place::Registry => {
                 if on {
-                    registry::set(&run_command(&self.exe))
+                    check_exe(&self.exe)?;
+                    registry::set(registry::VALUE, &run_command(&self.exe))
                 } else {
-                    registry::remove()
+                    registry::remove(registry::VALUE)
                 }
             }
         }
     }
+
+    /// Point an item that is on at the program running now. River moves (an update, a new
+    /// install folder), and an entry left at the old path would start nothing. An item that
+    /// is off, or already right, is left alone.
+    pub fn refresh(&self) {
+        if !self.enabled() || check_exe(&self.exe).is_err() {
+            return;
+        }
+        let current = match &self.place {
+            Place::File { path, .. } => std::fs::read_to_string(path).ok(),
+            #[cfg(windows)]
+            Place::Registry => registry::get(registry::VALUE),
+        };
+        let wanted = match &self.place {
+            Place::File { body, .. } => body(&self.exe),
+            #[cfg(windows)]
+            Place::Registry => run_command(&self.exe),
+        };
+        if current.as_deref() != Some(wanted.as_str()) {
+            let _ = self.set(true);
+        }
+    }
+}
+
+/// Refuse a path no login item should name: one the kernel reports as deleted (a running copy
+/// that was replaced on disk) or with control characters, which cannot be written safely.
+fn check_exe(exe: &Path) -> Result<(), String> {
+    let text = exe.to_string_lossy();
+    if text.ends_with(" (deleted)") {
+        return Err(
+            "River's program file was replaced while it runs. Restart River, then try again."
+                .into(),
+        );
+    }
+    if text.chars().any(char::is_control) {
+        return Err("River's program path has characters a login item cannot hold.".into());
+    }
+    Ok(())
+}
+
+/// Whether a desktop entry would run: not `Hidden=true`, and not switched off with
+/// `X-GNOME-Autostart-enabled=false`.
+pub fn entry_enabled(text: &str) -> bool {
+    !text.lines().any(|l| {
+        let Some((key, value)) = l.split_once('=') else {
+            return false;
+        };
+        let value = value.trim().to_ascii_lowercase();
+        match key.trim() {
+            "Hidden" => value == "true",
+            "X-GNOME-Autostart-enabled" => value == "false",
+            _ => false,
+        }
+    })
 }
 
 /// The program to start: the AppImage when River runs from one (its temporary mount is gone
@@ -108,6 +172,7 @@ fn file_place(os: &str, config_home: &Path, home: &Path) -> Option<Place> {
                 .join("LaunchAgents")
                 .join(format!("{LABEL}.plist")),
             body: launch_agent,
+            on: |_| true,
         }),
         "windows" => None,
         _ => Some(Place::File {
@@ -115,6 +180,7 @@ fn file_place(os: &str, config_home: &Path, home: &Path) -> Option<Place> {
                 .join("autostart")
                 .join(format!("{NAME}.desktop")),
             body: desktop_entry,
+            on: entry_enabled,
         }),
     }
 }
@@ -209,7 +275,7 @@ mod registry {
     };
 
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    const VALUE: &str = "River";
+    pub const VALUE: &str = "River";
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -228,32 +294,40 @@ mod registry {
         }
     }
 
-    pub fn present() -> bool {
-        let Ok(key) = open(KEY_QUERY_VALUE) else {
-            return false;
-        };
-        let name = wide(VALUE);
-        // SAFETY: `name` is NUL-terminated; every optional out pointer may be null, which only
-        // asks whether the value exists.
+    /// The value's text, or `None` when there is none (or it is not a string).
+    pub fn get(name: &str) -> Option<String> {
+        let key = open(KEY_QUERY_VALUE).ok()?;
+        let name = wide(name);
+        let mut kind = 0u32;
+        let mut buf = [0u16; 2048];
+        let mut bytes = std::mem::size_of_val(&buf) as u32;
+        // SAFETY: `name` is NUL-terminated; `buf` and `bytes` describe the same writable
+        // memory, which outlives the call; `kind` is a valid out pointer.
         let status = unsafe {
             RegQueryValueExW(
                 key,
                 name.as_ptr(),
                 std::ptr::null(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut kind,
+                buf.as_mut_ptr().cast(),
+                &mut bytes,
             )
         };
         // SAFETY: `key` was opened above and is closed once.
         unsafe { RegCloseKey(key) };
-        status == ERROR_SUCCESS
+        if status != ERROR_SUCCESS || kind != REG_SZ {
+            return None;
+        }
+        let units = (bytes as usize / 2).min(buf.len());
+        let text = &buf[..units];
+        let end = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+        Some(String::from_utf16_lossy(&text[..end]))
     }
 
-    pub fn set(command: &str) -> Result<(), String> {
+    pub fn set(name: &str, command: &str) -> Result<(), String> {
         let key = open(KEY_SET_VALUE)
             .map_err(|e| format!("couldn't open the Run key (registry error {e})"))?;
-        let (name, value) = (wide(VALUE), wide(command));
+        let (name, value) = (wide(name), wide(command));
         // SAFETY: both strings are NUL-terminated and outlive the call; the length counts the
         // value's bytes including its terminator, as REG_SZ requires.
         let status = unsafe {
@@ -277,10 +351,10 @@ mod registry {
         }
     }
 
-    pub fn remove() -> Result<(), String> {
+    pub fn remove(name: &str) -> Result<(), String> {
         let key = open(KEY_SET_VALUE)
             .map_err(|e| format!("couldn't open the Run key (registry error {e})"))?;
-        let name = wide(VALUE);
+        let name = wide(name);
         // SAFETY: `name` is NUL-terminated and outlives the call.
         let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
         // SAFETY: `key` was opened above and is closed once.
@@ -291,6 +365,28 @@ mod registry {
             Err(format!(
                 "couldn't remove the login item (registry error {status})"
             ))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Writes, reads and removes a value of its own under the real `Run` key (no program
+        /// runs it: the name is not River's and the command is inert). Not run by the Linux
+        /// CI; it needs a Windows session.
+        #[test]
+        fn a_run_value_is_written_read_and_removed() {
+            let name = format!("RiverTest-{}", std::process::id());
+            assert_eq!(get(&name), None);
+            set(&name, "\"C:\\inert.exe\" --background").unwrap();
+            assert_eq!(
+                get(&name).as_deref(),
+                Some("\"C:\\inert.exe\" --background")
+            );
+            remove(&name).unwrap();
+            assert_eq!(get(&name), None);
+            remove(&name).expect("removing what is not there is fine");
         }
     }
 }
@@ -334,6 +430,56 @@ mod tests {
         assert!(text.contains("<string>/Applications/R&amp;D &lt;x&gt;/River</string>"));
         assert!(text.contains("<string>--background</string>"));
         assert!(text.contains("<key>RunAtLoad</key>\n\t<true/>"));
+    }
+
+    #[test]
+    fn a_hidden_or_switched_off_entry_is_not_enabled() {
+        assert!(entry_enabled(&desktop_entry(Path::new("/opt/river"))));
+        assert!(!entry_enabled("[Desktop Entry]\nHidden=true\n"));
+        assert!(!entry_enabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=false\n"
+        ));
+        assert!(entry_enabled(
+            "[Desktop Entry]\nHidden=false\nX-GNOME-Autostart-enabled=true\n"
+        ));
+    }
+
+    #[test]
+    fn a_program_path_that_would_not_survive_is_refused() {
+        assert!(check_exe(Path::new("/opt/river")).is_ok());
+        assert!(check_exe(Path::new("/opt/river (deleted)")).is_err());
+        assert!(check_exe(Path::new("/opt/ri\nver")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = item_in(dir.path(), "linux");
+        item.exe = PathBuf::from("/opt/river (deleted)");
+        assert!(item.set(true).is_err());
+        assert!(!item.enabled());
+    }
+
+    #[test]
+    fn an_item_that_is_on_follows_the_program_and_one_that_is_off_stays_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = item_in(dir.path(), "linux");
+        item.refresh();
+        assert!(!item.enabled(), "refreshing never turns it on");
+        item.set(true).unwrap();
+        #[allow(irrefutable_let_patterns)] // Windows has a second place.
+        let Place::File { path, .. } = &item.place else {
+            unreachable!()
+        };
+        let path = path.clone();
+        item.exe = PathBuf::from("/opt/River2/river");
+        item.refresh();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("/opt/River2/river")
+        );
+        // Switched off in the desktop's settings: left alone.
+        std::fs::write(&path, "[Desktop Entry]\nHidden=true\nExec=old\n").unwrap();
+        item.refresh();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Exec=old"));
+        assert!(!item.enabled());
     }
 
     #[test]

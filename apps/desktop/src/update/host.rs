@@ -2,7 +2,7 @@
 //! the two calls `main` makes (at start, and once the window is running).
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,12 +99,13 @@ impl DesktopUpdate {
 
     /// Install the downloaded version and start it with `args`, and let go of the apply lock
     /// before returning. `Ok` means the new one has confirmed it started.
+    ///
+    /// The single-instance lock is handed over for the launch (the new version must be the
+    /// only River, or it would ask this one to show its window and exit unconfirmed) and
+    /// taken back when the launch fails, so this River stays the only one.
     fn restart_and_release(&self, args: &[OsString]) -> Result<(), String> {
         let applied = self.updater.apply()?;
-        // The new version waits on nothing but must be the only River: it would otherwise see
-        // this one's lock, ask it to show its window and exit without confirming its start.
-        crate::single::release_current();
-        let launched = self.updater.launch(&applied, args);
+        let launched = hand_over_instance(|| self.updater.launch(&applied, args));
         drop(applied);
         launched
     }
@@ -124,10 +125,37 @@ impl DesktopUpdate {
         }
     }
 
+    /// This launch found another River running and is about to leave (it has asked that one to
+    /// show its window). A launch an updater is waiting for (`handshake`) did start, so it says
+    /// so before it goes: the updater would otherwise read the early exit as a failed start
+    /// and roll the update back. It is not counted as an unconfirmed start either: `on_start`
+    /// is never called for it.
+    pub fn second_launch(&self, handshake: Option<&Path>) {
+        if handshake.is_some() {
+            self.updater.confirm_started(handshake);
+        }
+    }
+
+    /// [`second_launch`](Self::second_launch) for this process.
+    pub fn second_launch_here(&self) {
+        self.second_launch(Self::handshake().as_deref());
+    }
+
     /// The window closed normally.
     pub fn clean_exit(&self, ran: Duration) {
         self.updater.clean_exit(ran);
     }
+}
+
+/// Run `start`, which starts a replacement River, with the single-instance lock let go of;
+/// take it back if `start` fails.
+fn hand_over_instance<T>(start: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    crate::single::release_current();
+    let started = start();
+    if started.is_err() {
+        crate::single::reacquire_current();
+    }
+    started
 }
 
 /// Replace this process with `path`. Only returns if that fails.
@@ -135,9 +163,17 @@ fn restart_into(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(path)
-            .args(std::env::args_os().skip(1))
-            .exec();
+        // The lock is not carried over an exec (the file is close-on-exec) but is let go of
+        // explicitly, and taken back if the exec fails.
+        let failed = hand_over_instance(|| {
+            Err::<(), String>(
+                std::process::Command::new(path)
+                    .args(std::env::args_os().skip(1))
+                    .exec()
+                    .to_string(),
+            )
+        });
+        let Err(err) = failed else { return };
         eprintln!(
             "River: couldn't start the previous version {}: {err}",
             path.display()
@@ -145,6 +181,13 @@ fn restart_into(path: &std::path::Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// The arguments to start the new version with: this run's, without `--background`, so a River
+/// the person opened (from the tray, say) does not come back hidden.
+pub(crate) fn restart_args(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    args.filter(|a| a != crate::autostart::BACKGROUND_FLAG)
+        .collect()
 }
 
 fn info(offer: &Offer) -> UpdateInfo {
@@ -206,7 +249,7 @@ impl UpdateHost for DesktopUpdate {
     }
 
     fn restart(&self) -> Result<(), String> {
-        self.restart_with(&std::env::args_os().skip(1).collect::<Vec<_>>())
+        self.restart_with(&restart_args(std::env::args_os().skip(1)))
     }
 }
 

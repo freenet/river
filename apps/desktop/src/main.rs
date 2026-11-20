@@ -70,29 +70,34 @@ fn main() {
     if let Some(notice) = &startup.notice {
         say(notice);
     }
-    // After the command line has been accepted: a start that exits on a bad option is not a
-    // failed update, so it is not counted (see `Updater::on_start`).
     let updater = update::host::DesktopUpdate::new();
-    if let Some(u) = &updater {
-        u.on_start();
-    }
-    let on_exit = updater.clone();
-    let started = std::time::Instant::now();
     let background_start = std::env::args_os().any(|a| a == autostart::BACKGROUND_FLAG);
     let settings = Arc::new(background::DesktopBackground::new(host.config_dir()));
-    // One River per user: a later launch shows this one's window and leaves.
+    // One River per user: a later launch shows this one's window and leaves. This comes before
+    // the updater counts the start (`on_start`), so a launch that only shows the first River
+    // is not counted as an unconfirmed start of a swapped-in version.
     let instance = host.config_dir().and_then(|dir| {
         let token = std::env::var("XDG_ACTIVATION_TOKEN")
             .or_else(|_| std::env::var("DESKTOP_STARTUP_ID"))
             .ok();
         match single::acquire(&dir, token.as_deref()) {
-            Ok(single::Start::First(guard)) => Some(guard),
+            Ok(single::Start::First(guard)) => {
+                let guard = Arc::new(guard);
+                single::register(&guard);
+                Some(guard)
+            }
             Ok(single::Start::Running { asked }) => {
-                say(if asked {
-                    "River is already running; showing its window."
-                } else {
-                    "River is already running."
-                });
+                // An updater waiting on this launch is told it started: it did, and leaving
+                // at once would read as a failed start.
+                if let Some(u) = &updater {
+                    u.second_launch_here();
+                }
+                if !asked {
+                    tell_user(
+                        "River is already running but did not answer. Look for its icon \
+                         in the tray, or quit it and start it again.",
+                    );
+                }
                 std::process::exit(0);
             }
             // Better two Rivers than none.
@@ -102,6 +107,15 @@ fn main() {
             }
         }
     });
+    // After the command line has been accepted and the instance check passed: a start that
+    // exits on a bad option, or only shows the other River, is not a failed update, so it is
+    // not counted (see `Updater::on_start`).
+    if let Some(u) = &updater {
+        u.on_start();
+    }
+    let on_exit = updater.clone();
+    let started = std::time::Instant::now();
+    settings.refresh_login();
     let app = river_app::app(move |handle| {
         // The tray icon is made here on Windows and macOS: init runs on the thread that handles
         // the window system's events, which they need. A failure leaves the window up.
@@ -196,6 +210,20 @@ fn node_check() -> ! {
             let _ = writeln!(std::io::stdout(), "node {}", startup.choice.address);
             std::process::exit(0);
         }
+    }
+}
+
+/// Tell the person something when nobody may be reading stderr (a launcher, a Windows release
+/// build with no console): on stderr, and as a notification where there is one to show.
+fn tell_user(line: &str) {
+    say(line);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut note = notify_rust::Notification::new();
+        note.appname("River").summary("River").body(line);
+        #[cfg(windows)]
+        note.app_id("org.freenet.River");
+        let _ = note.show();
     }
 }
 

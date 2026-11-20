@@ -119,9 +119,9 @@ pub(super) fn background_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>
         Checkbox::new(b.tray && b.close_to_tray)
             .label("Keep River running when the window is closed")
             .description(if b.tray {
-                "River stays in the tray, so you still get notifications. Quit it from the tray icon's menu."
+                "River stays in the tray, so notifications keep coming."
             } else {
-                "This computer has no tray for River's icon, so closing the window quits River."
+                "There is no tray here, so closing the window quits River."
             })
             .disabled(!b.tray)
             .on_toggle(|s: &mut RiverApp| s.chat.toggle_close_to_tray())
@@ -134,11 +134,27 @@ pub(super) fn background_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>
             .description(if b.tray {
                 "River starts hidden in the tray."
             } else {
-                "River starts with its window open, since there is no tray."
+                "River starts with its window open: there is no tray."
             })
             .on_toggle(|s: &mut RiverApp| s.chat.toggle_start_at_login())
             .build(k)
             .key("background-start-at-login"),
+    );
+    body = body.child(
+        label(
+            if b.tray {
+                "Quit River with the button below, Ctrl+Q, or the tray icon's menu. If the icon \
+                 goes missing, starting River again shows its window."
+            } else {
+                "GNOME shows a tray only with its AppIndicator extension installed. Without a \
+                 tray, closing the window quits River."
+            },
+            st::SMALL,
+            p.text_muted,
+        )
+        .wrap()
+        .w_full()
+        .key("background-note"),
     );
     if let Some(e) = &b.error {
         body = body.child(
@@ -149,13 +165,24 @@ pub(super) fn background_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>
         );
     }
     body = body.child(
-        rune::row().w_full().justify_end().child(
-            Button::new("Close")
-                .variant(ButtonVariant::Ghost)
-                .on_press(|s: &mut RiverApp| s.chat.close_background())
-                .build(k)
-                .key("background-close"),
-        ),
+        rune::row()
+            .w_full()
+            .gap(8.0)
+            .justify_end()
+            .child(
+                Button::new("Quit River")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press_tx(|_: &mut RiverApp, tx: &mut rune::Tx| tx.quit())
+                    .build(k)
+                    .key("background-quit"),
+            )
+            .child(
+                Button::new("Close")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.close_background())
+                    .build(k)
+                    .key("background-close"),
+            ),
     );
     Dialog::new("background", "Background and startup")
         .width(460.0)

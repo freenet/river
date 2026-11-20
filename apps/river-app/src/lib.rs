@@ -1734,9 +1734,18 @@ pub fn spec() -> AppSpec<RiverApp> {
         }),
         // Keys no focused control took, or any key while nothing has focus: Escape abandons a
         // reply or an edit even when the composer is not focused.
-        on_key: Some(|s, ev, _| {
-            (chat::switcher::is_chord(ev) && s.chat.switcher_chord(std::time::Instant::now()))
-                || (ev.key == rune::Key::Escape && s.chat.escape())
+        on_key: Some(|s, ev, tx| {
+            if chat::switcher::is_chord(ev) && s.chat.switcher_chord(std::time::Instant::now()) {
+                return true;
+            }
+            // Ctrl+Q (Cmd+Q on a Mac) quits where the window's close button only hides it to
+            // the tray, so a hidden River is never the only way out. It quits whatever dialog
+            // is open: a dialog is no reason to keep a River running that someone is quitting.
+            if ev.is_command('q') && s.chat.background.is_some() {
+                tx.quit();
+                return true;
+            }
+            ev.key == rune::Key::Escape && s.chat.escape()
         }),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
@@ -3236,6 +3245,10 @@ mod tests {
         press(&mut rt, "background-start-at-login");
         press(&mut rt, "background-close-to-tray");
         assert_eq!(*host.0.lock().unwrap(), ["login true", "close false"]);
+        assert!(
+            rt.find("background-quit").is_some(),
+            "a way out of a hidden River"
+        );
         press(&mut rt, "background-close");
         assert!(rt.find("background-dialog").is_none());
     }

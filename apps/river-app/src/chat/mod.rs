@@ -954,6 +954,7 @@ impl Chat {
             || self.details.is_some()
             || self.notify_dialog.is_some()
             || self.switcher.is_some()
+            || self.background.as_ref().is_some_and(|b| b.open)
             || self.link_menu.is_some()
             || self.members_overlay
             || self.picker.is_some();

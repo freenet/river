@@ -46,7 +46,7 @@ ksni = { version = "0.3", default-features = false, features = ["async-io", "blo
 # The tray icon on Windows and macOS (MIT OR Apache-2.0); its Linux backend needs GTK, so Linux
 # uses ksni above instead.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-tray-icon = { version = "0.21", default-features = false }
+tray-icon = { version = "0.26", default-features = false }
 
 # macOS uses UNUserNotificationCenter (the default NSUserNotification backend is deprecated).
 [target.'cfg(target_os = "macos")'.dependencies]
