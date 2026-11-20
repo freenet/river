@@ -34,6 +34,24 @@ const TITLE_CHARS: usize = 60;
 const AUTHOR_CHARS: usize = 40;
 const BODY_CHARS: usize = 200;
 
+/// The `room_key` of a notification or arrival that is about one direct-message thread: the
+/// room's key and the peer's FULL member id (decimal, never the 40-bit label a member can
+/// grind), so two peers never share a cooldown, a replacement slot or a click. The shell treats
+/// it as an opaque key; the app's click, reply and mark-read steps read it with
+/// [`parse_dm_target`]. A room key is base58 and holds no `:`.
+pub fn dm_target(room: &str, peer: &str) -> String {
+    format!("dm:{room}:{peer}")
+}
+
+/// The `(room key, peer id)` of a [`dm_target`]; `None` for an ordinary room key.
+pub fn parse_dm_target(target: &str) -> Option<(&str, &str)> {
+    let rest = target.strip_prefix("dm:")?;
+    let (room, peer) = rest.rsplit_once(':')?;
+    let digits = peer.strip_prefix('-').unwrap_or(peer);
+    (!room.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then_some((room, peer))
+}
+
 /// What to show: one per room per update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notification {
@@ -102,6 +120,17 @@ pub struct Arrival {
 }
 
 impl Arrival {
+    /// Whether it is about a direct-message thread ([`dm_target`]).
+    pub fn is_dm(&self) -> bool {
+        parse_dm_target(&self.room_key).is_some()
+    }
+
+    /// Whether it gets the shorter cooldown: it mentions you, or is a direct message (addressed
+    /// to you alone, so it counts as a mention).
+    fn urgent(&self) -> bool {
+        self.mention || self.is_dm()
+    }
+
     /// How much the message shown matters when arrivals are merged: a mention, then a reply
     /// to you, then anything else. The same order [`arrivals`] picks the message shown by.
     fn rank(&self) -> u8 {
@@ -271,7 +300,11 @@ impl Limiter {
     /// forgets them all. A partial list while reconnecting forgets nothing.
     pub fn observe(&mut self, rooms: &[Room], now: Instant, full: bool) {
         if full {
-            self.rooms.retain(|k, _| rooms.iter().any(|r| &r.key == k));
+            // A direct-message clock lives while its room does.
+            self.rooms.retain(|k, _| {
+                let room = parse_dm_target(k).map_or(k.as_str(), |(room, _)| room);
+                rooms.iter().any(|r| r.key == room)
+            });
         }
         for room in rooms {
             let new = !self.rooms.contains_key(&room.key);
@@ -326,8 +359,8 @@ impl Limiter {
             if clock.joined.is_some_and(|t| now.duration_since(t) < SETTLE) {
                 continue;
             }
-            let mention = a.mention || clock.held.as_ref().is_some_and(|h| h.mention);
-            let cooldown = if mention {
+            let urgent = a.urgent() || clock.held.as_ref().is_some_and(|h| h.urgent());
+            let cooldown = if urgent {
                 MENTION_COOLDOWN
             } else {
                 ROOM_COOLDOWN
@@ -369,7 +402,7 @@ impl Limiter {
             .values()
             .filter_map(|c| {
                 let held = c.held.as_ref()?;
-                let cooldown = if held.mention {
+                let cooldown = if held.urgent() {
                     MENTION_COOLDOWN
                 } else {
                     ROOM_COOLDOWN
@@ -385,10 +418,23 @@ impl Limiter {
             .min()
     }
 
-    /// Keep only the held-back arrivals of the rooms `keep` says are still unread.
+    /// Keep only the held-back arrivals of the rooms `keep` says are still unread. Direct
+    /// messages are not rooms: see [`Limiter::retain_held_dm`].
     pub fn retain_held(&mut self, mut keep: impl FnMut(&str) -> bool) {
         for (key, clock) in &mut self.rooms {
-            if clock.held.is_some() && !keep(key) {
+            if clock.held.is_some() && parse_dm_target(key).is_none() && !keep(key) {
+                clock.held = None;
+            }
+        }
+    }
+
+    /// The same for the held-back arrivals of direct-message threads, by `(room key, peer id)`.
+    pub fn retain_held_dm(&mut self, mut keep: impl FnMut(&str, &str) -> bool) {
+        for (key, clock) in &mut self.rooms {
+            if clock.held.is_some()
+                && let Some((room, peer)) = parse_dm_target(key)
+                && !keep(room, peer)
+            {
                 clock.held = None;
             }
         }
@@ -431,10 +477,45 @@ pub fn compose(arrivals: Vec<Arrival>, previews: bool) -> Vec<Notification> {
 
 /// [`compose`], with the arrivals each notification stands for, to give back if it cannot be
 /// shown.
-pub fn compose_from(
-    mut arrivals: Vec<Arrival>,
-    previews: bool,
-) -> Vec<(Notification, Vec<Arrival>)> {
+pub fn compose_from(arrivals: Vec<Arrival>, previews: bool) -> Vec<(Notification, Vec<Arrival>)> {
+    // Direct messages are never folded into a room summary: its words ("in N other rooms")
+    // would be false, and the threads are told apart. They get a summary of their own.
+    let (dms, arrivals): (Vec<Arrival>, Vec<Arrival>) =
+        arrivals.into_iter().partition(Arrival::is_dm);
+    let mut out = compose_dms(dms, previews);
+    out.extend(compose_rooms(arrivals, previews));
+    out
+}
+
+/// One notification per direct-message thread, at most [`MAX_PER_UPDATE`], the last of them a
+/// summary that names no one when more threads than that arrived.
+fn compose_dms(mut dms: Vec<Arrival>, previews: bool) -> Vec<(Notification, Vec<Arrival>)> {
+    let mut rest = Vec::new();
+    if dms.len() > MAX_PER_UPDATE {
+        rest = dms.split_off(MAX_PER_UPDATE - 1);
+    }
+    let mut out: Vec<(Notification, Vec<Arrival>)> = dms
+        .into_iter()
+        .map(|a| (one(a.clone(), previews), vec![a]))
+        .collect();
+    if let Some(first) = rest.first() {
+        let count: usize = rest.iter().map(|a| a.count).sum();
+        let summary = Notification {
+            room_key: first.room_key.clone(),
+            room_name: String::new(),
+            title: "River".to_owned(),
+            body: format!("{count} new direct messages"),
+            mention: false,
+            count,
+            message_key: String::new(),
+            actions: false,
+        };
+        out.push((summary, rest));
+    }
+    out
+}
+
+fn compose_rooms(mut arrivals: Vec<Arrival>, previews: bool) -> Vec<(Notification, Vec<Arrival>)> {
     // Stable, so rooms keep their list order within each group.
     arrivals.sort_by_key(|a| !a.mention);
     let mut rest = Vec::new();
@@ -462,7 +543,66 @@ pub fn compose_from(
     out
 }
 
+/// The notification for one direct-message thread. The arrival carries a name and text only
+/// when the previews setting let [`dm_arrival`] put them there, so with it off there is nothing
+/// here to leak: no sender, no text, no room name.
+fn one_dm(a: Arrival) -> Notification {
+    let shown = !a.author.is_empty();
+    let title = if shown {
+        format!("{} · direct message", a.author)
+    } else {
+        "River".to_owned()
+    };
+    let body = if a.count > 1 {
+        format!("{} new direct messages", a.count)
+    } else if shown && !a.text.is_empty() {
+        a.text
+    } else {
+        "New direct message".to_owned()
+    };
+    Notification {
+        room_key: a.room_key,
+        room_name: String::new(),
+        title,
+        body,
+        mention: false,
+        count: a.count,
+        message_key: a.message_key,
+        actions: true,
+    }
+}
+
+/// What a new direct message becomes for the limiter and do not disturb. `previews` is the
+/// `notification_previews` setting: off, the arrival holds no sender and no text at all.
+/// It counts as "for me" (do not disturb's "allow mentions through" lets it pass), and its
+/// `room_key` is the thread's [`dm_target`].
+pub fn dm_arrival(d: &crate::chat::DmArrival, previews: bool) -> Arrival {
+    Arrival {
+        room_key: dm_target(&d.room, &d.peer_key),
+        room_name: String::new(),
+        private: true,
+        count: d.count,
+        mention: false,
+        for_me_count: d.count,
+        message_key: d.key.clone(),
+        author: if previews {
+            tidy(&d.peer_name, AUTHOR_CHARS)
+        } else {
+            String::new()
+        },
+        text: if previews {
+            tidy(&d.preview, BODY_CHARS)
+        } else {
+            String::new()
+        },
+        quiet: false,
+    }
+}
+
 fn one(a: Arrival, previews: bool) -> Notification {
+    if a.is_dm() {
+        return one_dm(a);
+    }
     let room = tidy(&a.room_name, TITLE_CHARS);
     let title = if a.mention {
         format!("{room} · mentioned you")
@@ -1736,5 +1876,60 @@ mod tests {
             ),
         );
         assert_eq!(s.unread(), before + 1);
+    }
+
+    fn dm(room: &str, peer: &str) -> Arrival {
+        Arrival {
+            room_key: dm_target(room, peer),
+            for_me_count: 1,
+            count: 1,
+            ..arrival(0, false)
+        }
+    }
+
+    #[test]
+    fn direct_message_clocks_are_per_thread_short_and_follow_their_room() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now();
+        let rooms = [crate::chat::example::data().rooms.remove(0)];
+        lim.observe(&rooms, t0, true);
+        let key = rooms[0].key.clone();
+        assert_eq!(lim.admit(vec![dm(&key, "1")], t0).len(), 1);
+        // A second thread is not held by the first's cooldown; the same thread is.
+        assert_eq!(lim.admit(vec![dm(&key, "2")], t0).len(), 1);
+        assert!(
+            lim.admit(vec![dm(&key, "1")], t0 + Duration::from_secs(1))
+                .is_empty()
+        );
+        // The mention cooldown applies, not the room's.
+        let after = t0 + MENTION_COOLDOWN + Duration::from_secs(1);
+        assert!(after < t0 + ROOM_COOLDOWN);
+        assert_eq!(lim.admit(Vec::new(), after).len(), 1, "the held one is due");
+        // A full list that still has the room keeps the clocks; one without it drops them.
+        lim.observe(&rooms, after, true);
+        assert!(lim.rooms.contains_key(&dm_target(&key, "2")));
+        lim.observe(&[], after, true);
+        assert!(!lim.rooms.contains_key(&dm_target(&key, "2")));
+    }
+
+    #[test]
+    fn room_retention_leaves_direct_message_holds_and_the_reverse() {
+        let mut lim = Limiter::default();
+        let t0 = Instant::now() + SETTLE;
+        lim.admit(vec![dm("r", "1"), arrival(0, false)], t0);
+        lim.admit(
+            vec![dm("r", "1"), arrival(0, false)],
+            t0 + Duration::from_secs(1),
+        );
+        lim.retain_held(|_| false);
+        assert!(lim.next_due(t0).is_some(), "the thread's hold stays");
+        lim.retain_held_dm(|_, _| false);
+        assert!(lim.next_due(t0).is_none());
+    }
+
+    #[test]
+    fn an_ordinary_room_key_is_never_taken_for_a_thread() {
+        assert!(!arrival(0, false).is_dm());
+        assert!(dm("r", "-5").is_dm());
     }
 }

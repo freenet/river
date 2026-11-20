@@ -77,7 +77,8 @@ pub struct RiverApp {
     /// in front, which counts as told).
     pending_notice: Option<(String, String)>,
     /// Whether a private room's notification may show the message text. Off unless the
-    /// `notification_previews` preference is set (there is no switch for it yet).
+    /// `notification_previews` preference is set (there is no switch for it yet). Also governs
+    /// direct messages: off, their notifications name no sender and show no text.
     private_previews: bool,
     /// The unread count last given to the notifier, so it hears only changes.
     reported_unread: Option<usize>,
@@ -413,6 +414,16 @@ impl RiverApp {
     fn drop_read_held(&mut self) {
         let (chat, focused) = (&self.chat, self.focused);
         let open = chat.visible_room().map(|r| r.key.as_str());
+        self.limiter.retain_held_dm(|room, peer| {
+            if chat.mode_of(room) == rooms::modes::NotificationMode::Muted {
+                return false;
+            }
+            if chat.dm.open_key() == Some((room, peer)) {
+                !focused
+            } else {
+                chat.dm.unread_in(room, peer) > 0
+            }
+        });
         self.limiter.retain_held(|k| {
             // A room muted since its notification was held back has nothing to show.
             if chat.mode_of(k) == rooms::modes::NotificationMode::Muted {
@@ -527,7 +538,32 @@ impl RiverApp {
 
     /// Unread messages across all rooms, counting the open room's while the window was away.
     pub fn unread(&self) -> usize {
-        self.chat.unread_total() + self.missed.1
+        self.chat.unread_total() + self.missed.1 + self.chat.dm_unread_counted()
+    }
+
+    /// Notify about the direct messages in `arrived`, as about mentions: the user is the one
+    /// addressed. Not for a muted room (the room's mode is the only control over a private
+    /// conversation), a room that is gone, or the thread on screen in a window in front. Do not
+    /// disturb's "allow mentions through" lets them pass. What was known or seeded when the room
+    /// was met never arrives here ([`chat::dm_view::DmUi::apply`]).
+    fn notify_dm_arrivals(&mut self, arrived: Vec<chat::DmArrival>, now: std::time::Instant) {
+        let mut shown = Vec::new();
+        for d in arrived {
+            let here = self.chat.rooms().iter().any(|r| r.key == d.room);
+            let muted = self.chat.mode_of(&d.room) == rooms::modes::NotificationMode::Muted;
+            let on_screen = self.focused && self.chat.dm.open_key() == Some((&d.room, &d.peer_key));
+            if !here || muted || on_screen {
+                continue;
+            }
+            let a = notify::dm_arrival(&d, self.private_previews);
+            if let Some(a) = self.dnd_filter(a) {
+                shown.push(a);
+            }
+        }
+        self.drop_read_held();
+        self.dnd_filter_held();
+        let admitted = self.limiter.admit(shown, now);
+        self.show(admitted, now);
     }
 
     /// Notify about `arrived`, unless the person is looking at that room right now.
@@ -748,7 +784,12 @@ impl RiverApp {
                 // hidden, and the title and count must still follow.
                 self.sync_unread(tx);
             }
-            RoomsUpdate::Dms(dms) => self.chat.apply_dms(dms),
+            RoomsUpdate::Dms(dms) => {
+                self.chat.apply_dms(dms);
+                let arrived = self.chat.take_dm_arrivals();
+                self.notify_dm_arrivals(arrived, std::time::Instant::now());
+                self.sync_unread(tx);
+            }
             RoomsUpdate::DmSend {
                 room,
                 peer,

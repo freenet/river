@@ -32,6 +32,7 @@ use super::conversation::text_button;
 use super::dm_view::DmUi;
 use super::icons;
 use super::model::Pending;
+use super::quick_reply::{MAX_DRAFT_CHARS, NO_ROOM, ReplyRefusal, appended, clean_reply};
 use super::style::{self as st, Palette};
 use super::view::label;
 use super::{Chat, Source};
@@ -64,6 +65,9 @@ struct Sending {
     /// Not answered for [`ANSWER_WAIT`]: the thread says so and lets the user send again. The
     /// answer, if it ever comes, still takes `sent` out of the box.
     silent: bool,
+    /// Sent from a notification's reply: there is no box to keep the text in, so a refusal puts
+    /// it in the thread's draft.
+    keep_on_refusal: bool,
 }
 
 impl Drop for Sending {
@@ -129,6 +133,11 @@ impl DmCompose {
             .as_ref()
             .filter(|(k, _, _)| k.0 == room && k.1 == peer)
             .map(|(_, _, why)| why.as_str())
+    }
+
+    #[cfg(test)]
+    pub(super) fn sends_clear_for_test(&mut self) {
+        self.sends.clear();
     }
 
     pub(super) fn drafts_mut(&mut self) -> &mut HashMap<(String, String), rune::TextEdit> {
@@ -309,6 +318,7 @@ impl Chat {
             sent: text.clone(),
             at: now,
             silent: false,
+            keep_on_refusal: false,
         });
         self.emit(
             room,
@@ -319,6 +329,18 @@ impl Chat {
             },
         );
         true
+    }
+
+    /// The ticket of the newest send still waiting in the thread `(room, peer)`, for tests.
+    #[cfg(test)]
+    pub(super) fn dm_waiting_ticket_of(&self, room: &str, peer: &str) -> Option<u64> {
+        self.dm
+            .compose
+            .sends
+            .iter()
+            .rev()
+            .find(|s| s.room == room && s.peer == peer)
+            .map(|s| s.ticket)
     }
 
     /// The ticket of the newest send still waiting for its answer in the open thread, for scenes
@@ -411,11 +433,126 @@ impl Chat {
                     .as_ref()
                     .is_some_and(|(k, t, _)| *k == key && *t > ticket);
                 if !newer_ok && !newer_refusal {
-                    self.dm.compose.refused = Some((key, ticket, why));
+                    self.dm.compose.refused = Some((key.clone(), ticket, why));
+                }
+                if sending.keep_on_refusal {
+                    self.keep_dm_draft(&key, &sending.sent);
                 }
                 None
             }
         }
+    }
+
+    /// The text typed into a direct-message notification's reply field, sent to the peer
+    /// `peer` (their full member id) in the room keyed `room`, after the checks the thread's
+    /// composer makes: the room is here and takes messages, the peer is a current member and
+    /// not the user, the text fits, and no send of this thread is waiting. The window, the open
+    /// thread and every other box are left alone.
+    ///
+    /// Not sent: the text is appended to that thread's draft (on a line of its own, up to
+    /// [`MAX_DRAFT_CHARS`]) and the thread says why. A refusal that comes later from the
+    /// background work keeps it the same way ([`Chat::dm_sent`]).
+    pub fn send_dm_reply(
+        &mut self,
+        room: &str,
+        peer: &str,
+        text: &str,
+        now: Instant,
+    ) -> Result<(), ReplyRefusal> {
+        let (text, cut) = clean_reply(text);
+        if text.is_empty() {
+            return Err(ReplyRefusal::Empty);
+        }
+        let Some(r) = self.rooms().iter().find(|r| r.key == room) else {
+            self.reply_notices.insert(
+                NO_ROOM.to_owned(),
+                "A reply typed into a notification was not sent, and could not be kept: that room is no longer here."
+                    .to_owned(),
+            );
+            return Err(ReplyRefusal::NoRoom);
+        };
+        let to = crate::rooms::dm::peer_from_key(peer);
+        if !matches!(self.source, Source::Node(_)) || to.is_none() {
+            return Err(ReplyRefusal::NoRoom);
+        }
+        let key = (room.to_owned(), peer.to_owned());
+        let blocked = match (&r.send_block, r.member_by_peer_key(peer)) {
+            (Some(why), _) => Some(why.clone()),
+            (None, None) => Some(dm_send::Refusal::NotMember.text()),
+            (None, Some(m)) if m.id == r.me => Some(dm_send::Refusal::SelfMessage.text()),
+            _ => None,
+        };
+        let why = if let Some(why) = blocked {
+            Some((ReplyRefusal::Blocked, why))
+        } else if cut || text.len() > BODY_CAP {
+            Some((ReplyRefusal::TooLong, "the message is too long".to_owned()))
+        } else if self.dm.compose.is_sending_in(&key) || self.dm.compose.needs_confirm(&key) {
+            Some((
+                ReplyRefusal::Blocked,
+                "a message in this conversation is still waiting to be sent".to_owned(),
+            ))
+        } else {
+            None
+        };
+        let (Some(to), None) = (to, &why) else {
+            let (refusal, reason) = why.unwrap_or((ReplyRefusal::NoRoom, String::new()));
+            let kept = self.keep_dm_draft(&key, &text);
+            let tail = if kept {
+                "It is kept in this conversation's draft."
+            } else {
+                "It could not be kept: the draft is full."
+            };
+            self.dm.compose.next_ticket += 1;
+            let ticket = self.dm.compose.next_ticket;
+            self.dm.compose.refused = Some((
+                key,
+                ticket,
+                format!("Your reply was not sent because {reason}. {tail}"),
+            ));
+            return Err(refusal);
+        };
+        self.dm.compose.next_ticket += 1;
+        let ticket = self.dm.compose.next_ticket;
+        self.dm.compose.sends.push(Sending {
+            ticket,
+            room: room.to_owned(),
+            peer: peer.to_owned(),
+            sent: text.clone(),
+            at: now,
+            silent: false,
+            keep_on_refusal: true,
+        });
+        self.emit(
+            room.to_owned(),
+            Action::SendDm {
+                peer: to,
+                text,
+                ticket,
+            },
+        );
+        Ok(())
+    }
+
+    /// Append `text` to the draft of the thread `key`, on a line of its own. False if the draft
+    /// would pass [`MAX_DRAFT_CHARS`], in which case nothing is kept.
+    fn keep_dm_draft(&mut self, key: &(String, String), text: &str) -> bool {
+        let held = self
+            .dm
+            .compose
+            .drafts
+            .get(key)
+            .map_or("", |d| d.text.as_str());
+        let joined = appended(held, text);
+        if joined.chars().count() > MAX_DRAFT_CHARS {
+            return false;
+        }
+        self.dm
+            .compose
+            .drafts
+            .entry(key.clone())
+            .or_default()
+            .replace_text(joined);
+        true
     }
 
     /// Ask for the message of entry `entry` (a failed or unanswered send of the open thread) to
