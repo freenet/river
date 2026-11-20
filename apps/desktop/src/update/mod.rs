@@ -719,12 +719,15 @@ impl Updater {
             ),
         };
         // Best effort: the binary is already back (or not), whatever the notes say.
-        let _ = state::modify(&self.cfg.data_dir, |st| {
-            if restored && st.probation.as_ref().is_some_and(|q| q.to == p.to) {
-                st.probation = None;
-            }
-            st.notice = Some(message.clone());
-        });
+        report_unrecorded(
+            "the rollback",
+            state::modify(&self.cfg.data_dir, |st| {
+                if restored && st.probation.as_ref().is_some_and(|q| q.to == p.to) {
+                    st.probation = None;
+                }
+                st.notice = Some(message.clone());
+            }),
+        );
         (message, restored)
     }
 
@@ -762,11 +765,14 @@ impl Updater {
             eprintln!("River: {message}");
             return None;
         }
-        let _ = state::modify(&self.cfg.data_dir, |s| {
-            if let Some(p) = s.probation.as_mut() {
-                p.starts = starts;
-            }
-        });
+        report_unrecorded(
+            "this start",
+            state::modify(&self.cfg.data_dir, |s| {
+                if let Some(p) = s.probation.as_mut() {
+                    p.starts = starts;
+                }
+            }),
+        );
         None
     }
 
@@ -800,15 +806,18 @@ impl Updater {
     /// The new binary is up: tell the launcher, and end probation.
     pub fn confirm_started(&self, handshake: Option<&Path>) {
         self.signal_started(handshake);
-        let _ = state::modify(&self.cfg.data_dir, |st| {
-            if st
-                .probation
-                .as_ref()
-                .is_some_and(|p| p.to == self.cfg.running.to_string())
-            {
-                st.probation = None;
-            }
-        });
+        report_unrecorded(
+            "the confirmed start",
+            state::modify(&self.cfg.data_dir, |st| {
+                if st
+                    .probation
+                    .as_ref()
+                    .is_some_and(|p| p.to == self.cfg.running.to_string())
+                {
+                    st.probation = None;
+                }
+            }),
+        );
     }
 
     /// A message left by an automatic rollback, once.
@@ -816,6 +825,15 @@ impl Updater {
         state::modify(&self.cfg.data_dir, |st| st.notice.take())
             .ok()
             .flatten()
+    }
+}
+
+/// Say, without any of the notes' content, that a change to the update notes was not saved
+/// (they were busy or unreadable). The caller carries on, as before; this only makes a start
+/// that was not counted, or a swap that was not confirmed, visible.
+fn report_unrecorded<T>(what: &str, result: Result<T, String>) {
+    if let Err(e) = result {
+        eprintln!("River: the update notes did not record {what}: {e}");
     }
 }
 
