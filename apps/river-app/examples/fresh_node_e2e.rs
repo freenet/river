@@ -139,7 +139,7 @@ impl App {
                 }
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
                 RoomsUpdate::Export { room, token } => self.exports.push((room, token)),
-                RoomsUpdate::Status(_) => {}
+                RoomsUpdate::Status(_) | RoomsUpdate::Dms(_) => {}
             }
         }
         println!("{}: {what}", self.name);

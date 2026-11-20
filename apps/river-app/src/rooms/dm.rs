@@ -62,6 +62,18 @@ pub const MAX_THREAD_MESSAGES: usize = 200;
 /// enforces is 300 by default.
 pub const MAX_TOTAL_MESSAGES: usize = 1000;
 
+/// The latest time (unix seconds, the start of 2100) a thread shows or reports.
+///
+/// A message's timestamp is signed by its sender and the contract does not bound it, so a member
+/// can sign `u64::MAX`. Everything above this ceiling is reported as the ceiling, here, once, so
+/// no consumer of a thread (the rail, the unread count, a clock, a day heading) ever converts an
+/// out-of-range time. Messages are still ordered by the signed value.
+pub const MAX_SHOWN_SECS: u64 = 4_102_444_800;
+
+fn shown_secs(ts: u64) -> u64 {
+    ts.min(MAX_SHOWN_SECS)
+}
+
 /// What a room hands over to be read as threads. Everything is borrowed: nothing is copied out
 /// of the room, least of all the key.
 pub struct Source<'a> {
@@ -214,8 +226,8 @@ pub fn threads(src: &Source<'_>) -> Threads {
             peer_is_member: peer == owner_id
                 || src.members.members.iter().any(|m| m.member.id() == peer),
             messages: rows.iter().map(|r| message(src, peer, r)).collect(),
-            last_ts,
-            last_inbound_ts,
+            last_ts: shown_secs(last_ts),
+            last_inbound_ts: shown_secs(last_inbound_ts),
         })
         .collect();
     Threads {
@@ -231,7 +243,7 @@ fn message(src: &Source<'_>, peer: MemberId, row: &Row<'_>) -> DmMessage {
     DmMessage {
         key: token_hex(&m.purge_token()),
         outgoing: row.outgoing,
-        timestamp: m.message.timestamp,
+        timestamp: shown_secs(m.message.timestamp),
         body: if row.outgoing {
             sent(src, peer, m)
         } else {

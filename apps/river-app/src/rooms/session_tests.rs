@@ -5776,3 +5776,158 @@ fn a_key_not_listed_hydrates_an_empty_cache_only_from_a_list_that_named_rooms() 
     assert!(rooms.dm_cache().hydrated());
     assert!(rooms.dm_cache().is_empty());
 }
+
+// The direct-message threads sent to the window -----------------------------------------------
+
+#[test]
+fn threads_are_sent_when_they_change_and_a_room_s_messages_are_opened_only_then() {
+    use river_core::room_state::direct_messages::compose_direct_message;
+    let f = crate::rooms::room_tests::Fixture::new();
+    let mut state = f.private_state();
+    let (owner, me) = (f.owner.verifying_key(), f.me.verifying_key());
+    for (from, to, at, text) in [(&f.owner, &me, 100, "hello"), (&f.me, &owner, 160, "mine")] {
+        state
+            .direct_messages
+            .messages
+            .push(compose_direct_message(from, to, &owner, at, at, text.as_bytes()).unwrap());
+    }
+    let mut rooms = Rooms::default();
+    rooms.list.push(LiveRoom::new(f.stored(state)));
+    rooms.network_seen.insert(owner);
+
+    let first = rooms.dm_snapshot().expect("the first report sends them");
+    assert_eq!(
+        (first.threads.len(), first.room_keys.len(), first.hydrated),
+        (1, 1, false)
+    );
+    let thread = &first.threads[0];
+    assert_eq!(
+        (thread.room_name.as_str(), thread.peer_name.as_str()),
+        ("Secret garden", "Olive")
+    );
+    assert_eq!(thread.messages.len(), 2);
+    // The user's own message has no cached text yet.
+    assert!(matches!(
+        thread.messages[1].body,
+        crate::chat::dm_model::DmBody::Placeholder(
+            crate::chat::dm_model::Placeholder::CiphertextOnly
+        )
+    ));
+    let builds = |rooms: &Rooms| rooms.dm_memo[&owner].builds;
+    assert_eq!(builds(&rooms), 1);
+
+    // Nothing changed: nothing is sent, and nothing is opened again.
+    assert!(rooms.dm_snapshot().is_none());
+    assert!(rooms.dm_snapshot().is_none());
+    assert_eq!(builds(&rooms), 1);
+
+    // Another room arrives: the rooms an invitation can name changed, so the threads are built
+    // under a new key and sent again.
+    let other = TestRoom::new(5, "Other", 1, &["x"]).stored();
+    rooms.network_seen.insert(other.owner_vk);
+    rooms.list.push(LiveRoom::new(other));
+    let second = rooms.dm_snapshot().expect("the list changed");
+    assert_eq!(second.room_keys.len(), 2);
+    // The room that did not change keeps the very thread it had (nothing is cloned again).
+    assert!(
+        !std::sync::Arc::ptr_eq(&first.threads[0], &second.threads[0]),
+        "its key changed with the other room's name, so it was built again"
+    );
+    let again = rooms.dm_snapshot();
+    assert!(again.is_none());
+    assert_eq!(builds(&rooms), 2);
+    assert!(rooms.dm_snapshot().is_none());
+
+    // Reading the sent messages changes what the user's own rows show.
+    rooms.dm_cache.note_read(
+        DmRead::Read(Box::new(
+            OutboundCache::from_bytes(&dm_store_bytes("x")).unwrap(),
+        )),
+        false,
+    );
+    let third = rooms.dm_snapshot().expect("the cache was read");
+    assert!(third.hydrated);
+    assert_eq!(builds(&rooms), 3);
+    assert!(rooms.dm_snapshot().is_none());
+
+    // A room with no direct messages costs nothing and is never in the memo.
+    assert_eq!(rooms.dm_memo.len(), 1);
+    // Its messages going away empties the thread list, and says so once.
+    rooms.list[0]
+        .stored
+        .room_state
+        .direct_messages
+        .messages
+        .clear();
+    let gone = rooms.dm_snapshot().expect("the threads went");
+    assert!(gone.threads.is_empty());
+    assert!(rooms.dm_memo.is_empty());
+}
+
+#[test]
+fn the_threads_key_follows_the_peer_s_nickname_and_the_names_of_the_rooms_an_invitation_can_name() {
+    use river_core::room_state::direct_messages::compose_direct_message;
+    let f = crate::rooms::room_tests::Fixture::new();
+    let (owner, me) = (f.owner.verifying_key(), f.me.verifying_key());
+    // Composed once: sealing is randomised, so a second composition is a different message.
+    let message = compose_direct_message(&f.owner, &me, &owner, 100, 100, b"hi").unwrap();
+    let room = |nick: &str| {
+        let mut state = f.private_state();
+        state.direct_messages.messages.push(message.clone());
+        state.member_info.member_info[0] = f.nickname(&f.owner, nick);
+        LiveRoom::new(f.stored(state))
+    };
+    let cache = OutboundCache::default();
+    let label = |_: &VerifyingKey| None;
+    let names = |others: &[&str]| others.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let key = |r: &LiveRoom, others: &[&str]| r.dm_key(&cache, &label, &names(others));
+
+    let base = key(&room("Olive"), &["Secret garden", "Other"]);
+    assert_eq!(
+        base,
+        key(&room("Olive"), &["Secret garden", "Other"]),
+        "stable"
+    );
+    assert_ne!(
+        base,
+        key(&room("Oliver"), &["Secret garden", "Other"]),
+        "peer renamed"
+    );
+    assert_ne!(
+        base,
+        key(&room("Olive"), &["Secret garden", "Renamed"]),
+        "another room renamed"
+    );
+}
+
+#[test]
+fn replacing_a_room_with_another_is_sent_even_when_neither_has_messages() {
+    let mut rooms = Rooms::default();
+    let (one, two) = (
+        TestRoom::new(5, "One", 1, &["x"]).stored(),
+        TestRoom::new(6, "Two", 1, &["y"]).stored(),
+    );
+    rooms.network_seen.extend([one.owner_vk, two.owner_vk]);
+    rooms.list.push(LiveRoom::new(one));
+    let first = rooms.dm_snapshot().expect("first");
+    assert!(rooms.dm_snapshot().is_none());
+    rooms.list[0] = LiveRoom::new(two);
+    let second = rooms
+        .dm_snapshot()
+        .expect("the list changed, though its size did not");
+    assert_ne!(first.room_keys, second.room_keys);
+}
+
+#[test]
+fn a_room_is_listed_as_loaded_only_once_the_network_has_given_its_state() {
+    let mut rooms = Rooms::default();
+    let stored = TestRoom::new(5, "Joined", 1, &["x"]).stored();
+    let vk = stored.owner_vk;
+    rooms.list.push(LiveRoom::new(stored));
+    let first = rooms.dm_snapshot().expect("first");
+    assert!(first.room_keys.is_empty(), "a stub is not loaded");
+    assert!(rooms.dm_snapshot().is_none());
+    rooms.network_seen.insert(vk);
+    let second = rooms.dm_snapshot().expect("loading is a change");
+    assert_eq!(second.room_keys.len(), 1);
+}

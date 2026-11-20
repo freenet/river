@@ -125,3 +125,40 @@ impl Placeholder {
         }
     }
 }
+
+/// Every room's threads, as the window shows them: what the rail lists and the thread view reads.
+/// Sent from the background work whenever the threads, the sent-message cache or a name they
+/// show changed.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct DmSnapshot {
+    /// Threads of all rooms, in no particular order (the rail sorts them). Shared with the
+    /// background work's copy, so the decrypted text is held once, not once per holder.
+    pub threads: Vec<std::sync::Arc<DmThread>>,
+    /// The rooms whose state has been loaded from the network, by key, whether or not they have
+    /// threads. A room met here for the first time has its messages counted as read
+    /// ([`super::dm_view::DmUi::apply`]); a room listed with a stub (just joined) is not here yet.
+    pub room_keys: Vec<String>,
+    /// Rooms (by key) where this app's bounds left messages or threads out, so older messages
+    /// may be missing from what is shown.
+    pub truncated: Vec<String>,
+    /// The user's sent text has been read from River's storage. Until it has, a message the
+    /// user sent has no text to show yet, which says nothing about the message.
+    pub hydrated: bool,
+}
+
+impl DmSnapshot {
+    /// Whether the room keyed `room` may be missing older messages.
+    pub fn is_truncated(&self, room: &str) -> bool {
+        self.truncated.iter().any(|r| r == room)
+    }
+}
+
+impl fmt::Debug for DmSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DmSnapshot")
+            .field("threads", &self.threads.len())
+            .field("truncated", &self.truncated.len())
+            .field("hydrated", &self.hydrated)
+            .finish()
+    }
+}

@@ -379,7 +379,7 @@ impl Chat {
     /// Close the box and clear it, giving the composer the keyboard back if it had it when the
     /// box opened (and the room can still be written in).
     pub fn close_member_search(&mut self) {
-        if self.dismiss_member_search() && self.actionable().is_some() {
+        if self.dismiss_member_search() && self.actionable().is_some() && !self.dm.is_open() {
             self.composer.focused = true;
         }
     }
@@ -407,7 +407,8 @@ impl Chat {
         if !self.member_search.open {
             return;
         }
-        if self.modal_dialog_open() || self.switcher.is_some() {
+        // A direct-message thread covers the panel: nothing is restored into a hidden composer.
+        if self.modal_dialog_open() || self.switcher.is_some() || self.dm.is_open() {
             self.drop_member_search();
         } else if !self.members_visible() {
             self.close_member_search();
@@ -436,6 +437,10 @@ impl Chat {
     /// Give the composer the keyboard on purpose (a reply started, an emoji picked): the
     /// members box, if open, no longer holds it.
     pub fn focus_composer(&mut self) {
+        // Not while a direct-message thread covers the room: its composer is not on screen.
+        if self.dm.is_open() {
+            return;
+        }
         self.composer.focused = true;
         self.member_search.query.focused = false;
     }
