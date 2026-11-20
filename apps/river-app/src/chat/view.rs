@@ -63,6 +63,9 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
+    let win_h = cx.layout_with("chat", |r| r[3]).unwrap_or(800.0);
+    // The composer's field grows with the draft, and the search panel gives way to it.
+    let field_h = cx.layout_with("composer-field", |r| r[3]).unwrap_or(24.0);
     if let Some(uid) = &chat.member_modal {
         super::member_modal::member_modal(chat, room, uid, &k, &mut layer);
     }
@@ -72,10 +75,9 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         super::notify_dialog::notify_dialog(room, chat.mode_of(&room.key), &k, &mut layer);
     }
     if let Some(form) = &chat.details {
-        let win_h = cx.layout_with("chat", |r| r[3]).unwrap_or(800.0);
         super::details::details_modal(chat, room, form, narrow, win_h, &k, &mut layer);
     }
-    screen = screen.child(conversation(chat, room, narrow, &p, &k));
+    screen = screen.child(conversation(chat, room, narrow, win_h, field_h, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);
     mention_overlay(chat, &k, &mut layer);
     if chat.members_shown(narrow) {

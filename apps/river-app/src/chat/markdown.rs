@@ -84,6 +84,12 @@ fn container_depth(line: &str) -> usize {
 /// `text` as plain words, for a one-line preview: the markup dropped, link text and code kept,
 /// each block and line break a space. Text too costly to parse is returned as it is.
 pub fn strip(text: &str) -> String {
+    strip_with(text, true)
+}
+
+/// [`strip`], with `keep_html` false to leave out raw HTML, which the message renderer does not
+/// draw (message search compares what is drawn).
+pub fn strip_with(text: &str, keep_html: bool) -> String {
     use pulldown_cmark::{Event, Options, Parser, TagEnd};
     if !is_cheap(text) {
         return text.to_owned();
@@ -96,9 +102,8 @@ pub fn strip(text: &str) -> String {
     };
     for ev in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES) {
         match ev {
-            Event::Text(t) | Event::Code(t) | Event::Html(t) | Event::InlineHtml(t) => {
-                out.push_str(&t)
-            }
+            Event::Text(t) | Event::Code(t) => out.push_str(&t),
+            Event::Html(t) | Event::InlineHtml(t) if keep_html => out.push_str(&t),
             Event::SoftBreak | Event::HardBreak => gap(&mut out),
             Event::End(
                 TagEnd::Paragraph
