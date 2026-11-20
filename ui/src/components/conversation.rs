@@ -3454,7 +3454,7 @@ pub fn Conversation() -> Element {
                         match crate::components::room_list::current_room_list_display() {
                             crate::components::room_list::RoomListDisplay::Loading => rsx! {
                                 div {
-                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    class: "room-load-placeholder flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
                                     "data-testid": "conversation-rooms-loading",
                                     WaveDots { test_id: "conversation-rooms-loading-dots" }
                                     span { class: "text-sm text-text-muted", "Loading your rooms" }
@@ -3463,7 +3463,7 @@ pub fn Conversation() -> Element {
                             },
                             crate::components::room_list::RoomListDisplay::Migrating => rsx! {
                                 div {
-                                    class: "flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
+                                    class: "room-load-placeholder flex-1 flex flex-col items-center justify-center gap-3 text-center p-8",
                                     "data-testid": "conversation-rooms-migrating",
                                     WaveDots { test_id: "conversation-rooms-migrating-dots" }
                                     span { class: "text-sm text-text-muted", "Migrating your rooms" }

@@ -1181,6 +1181,9 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
     transition: grid-template-columns 300ms ease 700ms, opacity 300ms ease 700ms;
 }
 
+/* The mobile footer shares this panel with the full-size loading wave. */
+.room-load-placeholder .connection-activity { display: none; }
+
 .connection-activity-clip { min-width: 0; overflow: hidden; display: flex; }
 .connection-activity .small-dots { margin-inline-start: 0.5rem; color: inherit; }
 .connection-pill[aria-busy="true"] .connection-activity {

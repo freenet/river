@@ -52,7 +52,7 @@ test.describe("Connection activity", () => {
     await expect(pill.getByRole("tooltip", { includeHidden: true })).toHaveText("Joining the room");
   });
 
-  test("the mobile no-room pill paints a connection already in progress on mount", async ({ page }) => {
+  test("the mobile load-error footer paints a connection already in progress on mount", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
     await waitForApp(page);
@@ -60,21 +60,42 @@ test.describe("Connection activity", () => {
     await expect(page.getByTestId("message-composer")).toBeVisible();
     await callRiverTest(page, "setSyncStatus", "connecting");
     // The rooms rail is mounted but hidden in phone Chat. Losing the selected
-    // room now mounts a second pill while the socket is already Connecting.
+    // room on a load error now mounts a second pill while the socket is already Connecting.
     await expect(page.getByTestId("rooms-rail").getByTestId("connection-status-indicator"))
       .toHaveAttribute("data-busy-reason", "connecting");
     const firstStyle = await page.evaluate(() => new Promise<{ width: number; opacity: string }>(resolve => {
       const observer = new MutationObserver(() => {
-        const slot = document.querySelector('[data-testid="conversation-rooms-loading"] [data-testid="connection-activity-dots"]');
+        const slot = document.querySelector('[data-testid="conversation-rooms-error"] [data-testid="connection-activity-dots"]');
         if (!slot) return;
         observer.disconnect();
         resolve({ width: slot.getBoundingClientRect().width, opacity: getComputedStyle(slot).opacity });
       });
       observer.observe(document.body, { childList: true, subtree: true });
-      (window as unknown as { __riverTest: { setRoomsLoadState(s: string): void } }).__riverTest.setRoomsLoadState("loading");
+      (window as unknown as { __riverTest: { setRoomsLoadState(s: string): void } }).__riverTest.setRoomsLoadState("failed");
     }));
     expect(firstStyle.width).toBeGreaterThan(0);
     expect(firstStyle.opacity).toBe("1");
+  });
+
+  test("the mobile room-loading wave supplies the dots while the footer keeps its connection status", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    await waitForApp(page);
+    await callRiverTest(page, "setSyncStatus", "connected");
+    const pill = visibleConnectionPill(page);
+    for (const state of ["loading", "migrating"] as const) {
+      await callRiverTest(page, "setRoomsLoadState", state);
+      await expect(page.getByTestId(`conversation-rooms-${state}-dots`)).toBeVisible();
+      await expect(pill.getByTestId("connection-status-label")).toHaveText("Connected");
+      await expect(pill.getByTestId("connection-status-dot")).toBeVisible();
+      await expect(pill.getByTestId("connection-activity-dots")).toBeHidden();
+    }
+    await callRiverTest(page, "setSyncStatus", "connecting");
+    await expect(pill.getByTestId("connection-status-label")).toHaveText("Connecting");
+    await expect(pill.getByTestId("connection-activity-dots")).toBeHidden();
+    await callRiverTest(page, "setRoomsLoadState", "loaded");
+    await expect(page.getByRole("heading", { name: "Welcome to River" })).toBeVisible();
+    await expect(pill.getByTestId("connection-activity-dots")).toBeVisible();
   });
 
   // The page's scheduler keeps running. Seek just the actual transitions on
