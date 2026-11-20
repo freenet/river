@@ -30,7 +30,7 @@ use river_core::stored_rooms::StoredRoom;
 use super::deputies;
 use crate::chat::model::{
     self, Appointer, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role,
-    Room, Usage,
+    Room, RotateOffer, Usage,
 };
 
 /// Why the owner can't change the room's details here (the web UI's `edit-room-no-key-notice`).
@@ -568,6 +568,8 @@ impl LiveRoom {
             deputy_changes: Vec::new(),
             deputy_block: None,
             deputy_grant_block: None,
+            ban_offers: super::bans::offers(self),
+            ban_preview: Default::default(),
             deputies_full: my_deputies.len() >= river_core::room_state::member_info::MAX_DEPUTIES,
             details: self.details(),
             wraps: Some(
@@ -625,8 +627,14 @@ impl LiveRoom {
                 .as_ref()
                 .and_then(|d| self.unseal(d))
                 .unwrap_or_default(),
+            rotate: match (&editable, self.is_private()) {
+                (_, false) | (Editable::No, _) => RotateOffer::No,
+                (Editable::Yes, true) => RotateOffer::Allowed,
+                (Editable::Blocked(why), true) => RotateOffer::Blocked(why.clone()),
+            },
             editable,
             pending: None,
+            rotation: None,
         }
     }
 

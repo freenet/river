@@ -2,23 +2,25 @@
 //! `MemberInfoModal` (`ui/src/components/members/member_info_modal.rs`): who the member is, how
 //! they came to be in the room, and a warning when their name imitates the owner's.
 //!
-//! What it leaves out is what this app cannot do or know yet: sending a direct message, sharing
-//! an invite by one, and banning (moderation commands). Those are shown dimmed with the app's
-//! "not available yet" tooltip, not faked. Your own dialog edits your nickname
+//! What it leaves out is sending a direct message and sharing an invite by one, shown dimmed with
+//! the app's "not available yet" tooltip, not faked. Your own dialog edits your nickname
 //! (`nickname_editor`), as the web UI's `NicknameField` does. Deputize and Revoke deputy
-//! (`deputy_block`) work as the web UI's `DeputyButton` does, with a confirmation first.
+//! (`deputy_block`) work as the web UI's `DeputyButton` does, with a confirmation first. Ban
+//! (`ban_confirmation`) is offered as the web UI's `ban_gate` decides it, with a confirmation;
+//! in a private room the ban also rotates the room's secret, which only the owner's computer can
+//! do, so others are told why not ([`crate::rooms::bans`]).
 
 use std::collections::HashMap;
 
 use rune::{El, col, el, icon, row};
 use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextInput};
 
-use super::Chat;
 use super::conversation::avatar;
 use super::icons;
-use super::model::{Appointer, Member, MemberId, Role, Room};
+use super::model::{Appointer, BanOffer, Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{label, not_yet};
+use super::{Chat, Source};
 use crate::RiverApp;
 
 /// The web UI's `ImpersonationWarning::tooltip` for an imitated owner. The text before the
@@ -504,6 +506,145 @@ fn deputy_block(
     block
 }
 
+/// The web UI's confirmation, in place of its popup: the question in its words, what else the ban
+/// takes with it (a ban removes everyone the banned member invited), and in a private room that
+/// the room's secret changes.
+fn ban_confirmation(
+    chat: &Chat,
+    room: &Room,
+    m: &Member,
+    by_id: &HashMap<MemberId, &Member>,
+    p: &Palette,
+    k: &Kit,
+) -> El {
+    let invitees = room
+        .members
+        .iter()
+        .filter(|x| x.id != m.id && invited_through(by_id, x, m))
+        .count();
+    let mut block = col()
+        .key("member-ban-confirm")
+        .w_full()
+        .gap(8.0)
+        .padding(12.0)
+        .radius(8.0)
+        .fill(p.warning_bg)
+        .border(1.0, p.warning)
+        .child(label("Confirm Ban", st::ROOM_STRONG, p.text).key("member-ban-title"))
+        .child(
+            label(
+                format!(
+                    "Are you sure you want to ban {} (ID: {})? This action cannot be undone.",
+                    m.nickname, m.uid
+                ),
+                st::SMALL,
+                p.text,
+            )
+            .wrap_anywhere()
+            .w_full()
+            .key("member-ban-words"),
+        );
+    if invitees > 0 {
+        let who = if invitees == 1 {
+            "1 member they invited".to_owned()
+        } else {
+            format!("{invitees} members they invited")
+        };
+        block = block.child(
+            label(
+                format!("The ban also removes {who}, and anyone those members invited."),
+                st::SMALL,
+                p.text,
+            )
+            .wrap()
+            .w_full()
+            .key("member-ban-reach"),
+        );
+    }
+    let preview = chat.ban_preview();
+    if let Some(preview) = preview {
+        let said = if preview.refused {
+            Some((
+                crate::rooms::bans::REFUSED_SENTENCE.to_owned(),
+                "member-ban-refused",
+            ))
+        } else if !preview.lifts.is_empty() {
+            Some((
+                crate::rooms::bans::lifted_sentence(
+                    &preview.lifts,
+                    room.details.limits.max_user_bans,
+                ),
+                "member-ban-lifts",
+            ))
+        } else {
+            None
+        };
+        if let Some((text, key)) = said {
+            block = block.child(label(text, st::SMALL, p.text).wrap().w_full().key(key));
+        }
+    } else if !matches!(chat.source, Source::Example) {
+        block = block.child(
+            label(
+                "Checking what this ban does\u{2026}",
+                st::SMALL,
+                p.text_muted,
+            )
+            .w_full()
+            .key("member-ban-checking"),
+        );
+    }
+    if chat.ban_changed.is_some() {
+        block = block.child(
+            label(
+                "This changed while you were looking. Check it, then confirm again.",
+                st::SMALL,
+                p.warning_text,
+            )
+            .wrap()
+            .w_full()
+            .key("member-ban-changed"),
+        );
+    }
+    if room.private {
+        block = block.child(
+            label(
+                "This is a private room, so the ban also changes the room's secret. Messages \
+                 sent from now on are sealed so the banned member cannot read them.",
+                st::SMALL,
+                p.text,
+            )
+            .wrap()
+            .w_full()
+            .key("member-ban-secret"),
+        );
+    }
+    block.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .justify_end()
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.cancel_ban())
+                    .build(k)
+                    .key("member-ban-cancel"),
+            )
+            .child({
+                let mut yes = Button::new("Yes, Ban User")
+                    .variant(ButtonVariant::Danger)
+                    .on_press(|s: &mut RiverApp| s.chat.confirm_ban())
+                    .build(k)
+                    .key("member-ban-confirm-yes");
+                // Not until the room has said what the ban does, and never one it would drop.
+                if !chat.ban_ready() {
+                    yes = yes.disabled(true).opacity(0.45);
+                }
+                yes
+            }),
+    )
+}
+
 pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
     let Some(m) = room.member_by_uid(uid) else {
@@ -682,23 +823,44 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             .child(invited_by),
     );
 
-    // What needs commands this app does not send yet is shown, not faked.
+    // Direct messages need commands this app does not send yet: shown, not faked.
     let mut actions = row().key("member-actions").w_full().gap(8.0).flex_wrap();
     if !is_me {
-        let mut names = vec![("member-dm", "DM")];
-        if above && !is_owner {
-            names.push(("member-ban", "Ban user"));
-        }
-        for (key, name) in names {
-            actions = actions.child(not_yet(
-                Button::new(name)
-                    .variant(ButtonVariant::Ghost)
+        actions = actions.child(not_yet(
+            Button::new("DM")
+                .variant(ButtonVariant::Ghost)
+                .build(k)
+                .key("member-dm"),
+        ));
+        if matches!(room.ban_offers.get(uid), Some(BanOffer::Allowed)) && chat.ban_confirm.is_none()
+        {
+            actions = actions.child(
+                Button::new("Ban user")
+                    .variant(ButtonVariant::Danger)
+                    .on_press(|s: &mut RiverApp| s.chat.ask_ban())
                     .build(k)
-                    .key(key),
-            ));
+                    .key("member-ban"),
+            );
         }
     }
     body = body.child(el().w_full().h(1.0).fill(p.line)).child(actions);
+    if !is_me {
+        match room.ban_offers.get(uid) {
+            // As the web UI's `ban-withheld-reason`: owed to one who would otherwise have had Ban.
+            Some(BanOffer::Withheld(why)) => {
+                body = body.child(
+                    label(why.clone(), st::SMALL, p.text_muted)
+                        .wrap()
+                        .w_full()
+                        .key("member-ban-withheld"),
+                );
+            }
+            Some(BanOffer::Allowed) if chat.ban_confirm.as_deref() == Some(uid) => {
+                body = body.child(ban_confirmation(chat, room, m, &by_id, &p, k));
+            }
+            _ => {}
+        }
+    }
     if let Some((offer, why_not)) = chat.deputy_offer().filter(|_| !is_me) {
         body = body.child(deputy_block(chat, room, m, offer, why_not, &p, k));
     }

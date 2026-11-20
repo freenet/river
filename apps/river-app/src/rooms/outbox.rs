@@ -152,6 +152,19 @@ pub enum Action {
         target: String,
         grant: bool,
     },
+    /// Ban the member `target` (River's member id, as `Member::uid`): a signed ban, and in a
+    /// private room the rotated secret in the same update ([`super::bans`]).
+    Ban {
+        target: String,
+    },
+    /// Ask what banning `target` (`Member::uid`) would do to the room's other bans: the next
+    /// view says, for that member alone. Sends nothing.
+    PreviewBan {
+        target: String,
+    },
+    /// Rotate the room's secret (a private room's owner): the next secret version for every
+    /// member the room holds, as the web UI's Room Details "Rotate" does ([`super::bans`]).
+    RotateSecret,
     /// Make an invitation to the room, for its link to be copied ([`super::create`]).
     Invite,
     /// Create a room. The command's `room` is empty: this is not about a room shown.
@@ -218,6 +231,12 @@ impl std::fmt::Debug for Action {
                 .debug_struct("SetDeputy")
                 .field("target", target)
                 .field("grant", grant)
+                .finish(),
+            Action::Ban { target } => f.debug_struct("Ban").field("target", target).finish(),
+            Action::RotateSecret => f.write_str("RotateSecret"),
+            Action::PreviewBan { target } => f
+                .debug_struct("PreviewBan")
+                .field("target", target)
                 .finish(),
             Action::SetRoomDetails { edit } => f
                 .debug_struct("SetRoomDetails")
@@ -1113,6 +1132,8 @@ pub(super) type Clock = Box<dyn Fn() -> SystemTime + Send>;
 
 /// What an entry labels itself as when it is about the room's details.
 const CONFIG_LABEL: &str = "Your change to the room's details";
+const BAN_LABEL: &str = "Your ban";
+const ROTATE_LABEL: &str = "Your secret rotation";
 
 pub(super) const CONFIG_SUPERSEDED: &str =
     "A newer change to the room's details, made elsewhere, replaced this one.";
@@ -1269,6 +1290,10 @@ enum Intent {
     Record(RecordEdit),
     /// A change to the room's details.
     Config(ConfigEdit),
+    /// A ban of one member.
+    Ban(MemberId),
+    /// A rotation of the room's secret.
+    Rotate,
 }
 
 /// As derived, except a nickname is not printed.
@@ -1287,6 +1312,8 @@ impl std::fmt::Debug for Intent {
                 .finish(),
             Intent::Record(edit) => f.debug_tuple("Record").field(edit).finish(),
             Intent::Config(edit) => f.debug_tuple("Config").field(edit).finish(),
+            Intent::Ban(target) => f.debug_tuple("Ban").field(target).finish(),
+            Intent::Rotate => f.write_str("Rotate"),
         }
     }
 }
@@ -1299,6 +1326,8 @@ impl Intent {
             Intent::Actions { label, .. } => label,
             Intent::Record(edit) => edit.label(),
             Intent::Config(_) => CONFIG_LABEL,
+            Intent::Ban(_) => BAN_LABEL,
+            Intent::Rotate => ROTATE_LABEL,
         }
     }
 
@@ -1331,6 +1360,8 @@ impl Intent {
             Intent::Record(_) => Vec::new(),
             // Not a message: built by `build_config`.
             Intent::Config(_) => Vec::new(),
+            // Not a message: built by `bans::build`.
+            Intent::Ban(_) | Intent::Rotate => Vec::new(),
         }
     }
 }
@@ -1500,6 +1531,13 @@ struct Entry {
     /// For a change to the room's details: the signed configuration to publish (and `messages`
     /// is empty).
     config: Option<AuthorizedConfigurationV1>,
+    /// For a ban or a rotation: the signed ban and/or the rotated secret (and `messages` is
+    /// empty).
+    ban: Option<super::bans::Moderation>,
+    /// For a rotation that stands in for a ban the room already holds (another device, or a
+    /// deputy through the web UI, banned them): the name of the banned member, so what is said
+    /// of it can mention the ban.
+    after_ban: Option<String>,
     status: Status,
     /// These messages went to the node at least once. From then on they are only ever sent
     /// again as they are, never rebuilt: the node may have taken them, and a rebuilt message
@@ -1557,6 +1595,9 @@ impl Entry {
 
     /// The update that publishes it.
     fn delta(&self, room: &LiveRoom) -> ChatRoomStateV1Delta {
+        if let Some(ban) = &self.ban {
+            return ban.delta();
+        }
         match (&self.info, &self.config) {
             (Some(info), _) => info_delta(room, info),
             (None, Some(config)) => config_delta(config),
@@ -1566,6 +1607,16 @@ impl Entry {
 
     /// `room` with it applied, or why the room would not take it.
     fn applied(&self, room: &LiveRoom) -> Result<LiveRoom, String> {
+        if let Some(ban) = &self.ban {
+            let mut next = room.clone();
+            next.apply_delta(ban.delta())
+                .map_err(|e| format!("The room refused it: {e}"))?;
+            return if ban.held_in(&next) {
+                Ok(next)
+            } else {
+                Err(super::bans::NOT_KEPT.into())
+            };
+        }
         if let Some(config) = &self.config {
             let mut next = room.clone();
             next.apply_delta(config_delta(config))
@@ -1593,6 +1644,7 @@ impl Entry {
     fn held_in(&self, room: &LiveRoom) -> bool {
         // A nickname the room replaced is settled too: there is nothing more to send.
         held(room, &self.messages)
+            && self.ban.as_ref().is_none_or(|b| b.held_in(room))
             && self
                 .info
                 .as_ref()
@@ -1613,7 +1665,10 @@ impl Entry {
 
     /// Whether it carries anything to publish.
     fn has_payload(&self) -> bool {
-        !self.messages.is_empty() || self.info.is_some() || self.config.is_some()
+        !self.messages.is_empty()
+            || self.info.is_some()
+            || self.config.is_some()
+            || self.ban.is_some()
     }
 
     /// Whether Retry can do anything for it.
@@ -1667,6 +1722,10 @@ pub(super) struct Outbox {
     /// come, and are not the answer to anything sent to the room if it is back. A new
     /// connection owes nothing, so this empties with `owed`.
     stale: HashMap<ContractInstanceId, usize>,
+    /// The member whose ban the viewer asked what it would do to the room's other bans.
+    preview: Option<(VerifyingKey, MemberId)>,
+    /// The last answer of [`Outbox::cached_preview`] and the digest of what it was for.
+    preview_cache: std::cell::RefCell<Option<(u64, crate::chat::model::BanPreview)>>,
 }
 
 impl Default for Outbox {
@@ -1680,6 +1739,8 @@ impl Default for Outbox {
             owed: HashMap::new(),
             reconnect: false,
             stale: HashMap::new(),
+            preview: None,
+            preview_cache: Default::default(),
         }
     }
 }
@@ -1782,6 +1843,28 @@ impl Outbox {
         }
     }
 
+    /// Say, as a notice to discard, something about a change the node took.
+    fn note_taken(&mut self, room: &LiveRoom, reason: String) {
+        self.next += 1;
+        let entry = Entry {
+            id: self.next,
+            room: room.stored.owner_vk,
+            intent: None,
+            label: BAN_LABEL,
+            author: room.stored.self_verifying_key(),
+            time: (self.clock)(),
+            messages: Vec::new(),
+            info: None,
+            config: None,
+            ban: None,
+            after_ban: None,
+            status: Status::Unconfirmed(reason),
+            sent: false,
+            forced: 0,
+        };
+        self.entries.push(entry);
+    }
+
     /// Say, as a trouble to discard, that part of a deputy change was lost.
     fn note(&mut self, room: &LiveRoom, reason: String) {
         self.next += 1;
@@ -1795,11 +1878,75 @@ impl Outbox {
             messages: Vec::new(),
             info: None,
             config: None,
+            ban: None,
+            after_ban: None,
             status: Status::Failed(reason),
             sent: false,
             forced: 0,
         };
         self.entries.push(entry);
+    }
+
+    /// Before a waiting ban goes out: one whose member is already gone and banned by the room's
+    /// own decision (another device of the owner, or a deputy through the web UI) has nothing
+    /// left to ban. In a public room it is done. In a private room the banned member may still
+    /// hold the current secret, and no rotation seen here can be told to have come after they
+    /// left (one that landed while they were still a member gave them its secret), so the owner's
+    /// entry goes out as a rotation alone, built when it is sent so it leaves them out. One
+    /// rotation covers every such member, so a second is not queued behind it. Only the owner
+    /// can rotate: for anyone else the ban is as done as it can be from here, and the notice
+    /// says the owner must rotate.
+    fn settle_bans(&mut self, room: &LiveRoom, changed: &mut bool) {
+        let vk = room.stored.owner_vk;
+        let me = room.stored.self_verifying_key();
+        let me_id = me.map(|k| MemberId::from(&k));
+        let ids: Vec<(u64, MemberId)> = self
+            .entries
+            .iter()
+            .filter(|e| e.room == vk && e.status == Status::Queued && !e.sent)
+            .filter_map(|e| match &e.intent {
+                Some(Intent::Ban(t)) if super::bans::banned_and_gone(room, *t) => Some((e.id, *t)),
+                _ => None,
+            })
+            .collect();
+        for (id, target) in ids {
+            *changed = true;
+            let name = room.nickname(target, me_id);
+            if !room.is_private() {
+                self.entries.retain(|e| e.id != id);
+                continue;
+            }
+            if me != Some(vk) {
+                self.entries.retain(|e| e.id != id);
+                self.note_taken(
+                    room,
+                    format!(
+                        "{name} is banned. This room is now private, so only the owner can \
+                         change its secret; ask the owner to rotate it."
+                    ),
+                );
+                continue;
+            }
+            let covered_by_a_waiting_rotation = self.entries.iter().any(|e| {
+                e.id != id
+                    && e.room == vk
+                    && e.status == Status::Queued
+                    && !e.sent
+                    && matches!(e.intent, Some(Intent::Rotate))
+            });
+            if covered_by_a_waiting_rotation {
+                self.entries.retain(|e| e.id != id);
+                continue;
+            }
+            let ctx = self.config_ctx(room, id);
+            if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+                e.intent = Some(Intent::Rotate);
+                e.label = ROTATE_LABEL;
+                e.ban = None;
+                e.after_ban = Some(name);
+                rebuild(e, room, None, &ctx);
+            }
+        }
     }
 
     /// Before a waiting record goes out: a grant whose member has left the room is not sent
@@ -1927,6 +2074,27 @@ impl Outbox {
             }
             *edit = merged;
         }
+        if let Some(Intent::Ban(target)) = &intent {
+            // A newer ban of the same member replaces every older one that is not on its way
+            // (waiting, refused, or taken but not shown): keeping one would let its Retry sign
+            // the same ban again at a later time.
+            let target = *target;
+            self.entries.retain(|e| {
+                !(e.room == room.stored.owner_vk
+                    && matches!(&e.intent, Some(Intent::Ban(t)) if *t == target)
+                    && !matches!(e.status, Status::InFlight { .. }))
+            });
+        }
+        if matches!(intent, Some(Intent::Rotate)) {
+            // A newer rotation replaces every older one that is not on its way: each is built
+            // again at the version above the room's when it goes out, so two would only move
+            // the secret twice.
+            self.entries.retain(|e| {
+                !(e.room == room.stored.owner_vk
+                    && matches!(e.intent, Some(Intent::Rotate))
+                    && !matches!(e.status, Status::InFlight { .. }))
+            });
+        }
         let mut label = label;
         if let Some(Intent::Record(edit)) = &mut intent {
             // A newer change to the record replaces every older one that is not on its way
@@ -1986,6 +2154,8 @@ impl Outbox {
             messages: Vec::new(),
             info: None,
             config: None,
+            ban: None,
+            after_ban: None,
             status: Status::Queued,
             sent: false,
             forced: 0,
@@ -1999,6 +2169,20 @@ impl Outbox {
     pub fn command(&mut self, room: &LiveRoom, action: Action) -> bool {
         let intent = match action {
             Action::Retry { entry } => return self.retry(entry, room),
+            Action::PreviewBan { target } => {
+                let found = room
+                    .stored
+                    .room_state
+                    .members
+                    .members
+                    .iter()
+                    .map(|m| m.member.id())
+                    .find(|id| id.to_string() == target);
+                let next = found.map(|id| (room.stored.owner_vk, id));
+                let changed = self.preview != next;
+                self.preview = next;
+                return changed;
+            }
             Action::Discard { entry } => {
                 // Only what is shown as not sent, and only in the room it was written in.
                 let before = self.entries.len();
@@ -2053,6 +2237,51 @@ impl Outbox {
             ) {
                 Some(why) => Err((CONFIG_LABEL, why)),
                 None => Ok(Intent::Config(edit.clone())),
+            };
+        }
+        if let Action::RotateSecret = &action {
+            let label = ROTATE_LABEL;
+            let sk = room
+                .stored
+                .self_sk
+                .as_ref()
+                .ok_or((label, Blocked::NoKey.reason().to_owned()))?;
+            if !room.is_private() {
+                return Err((label, super::bans::NOT_PRIVATE.to_owned()));
+            }
+            if sk.verifying_key() != room.stored.owner_vk {
+                return Err((label, super::bans::NOT_OWNER.to_owned()));
+            }
+            return Ok(Intent::Rotate);
+        }
+        if let Action::Ban { target } = &action {
+            let label = BAN_LABEL;
+            let target = room
+                .stored
+                .room_state
+                .members
+                .members
+                .iter()
+                .map(|m| m.member.id())
+                .find(|id| id.to_string() == *target)
+                .ok_or((label, super::bans::NOT_A_MEMBER.to_owned()))?;
+            // Counting bans still on their way: a member already being banned is not banned twice.
+            let shown = self.overlay(room).0;
+            if !shown
+                .stored
+                .room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == target)
+            {
+                return Err((label, "They are already being banned.".to_owned()));
+            }
+            let me = me.ok_or((label, Blocked::NoKey.reason().to_owned()))?;
+            return match super::bans::gate(room, me, target) {
+                Some(crate::chat::model::BanOffer::Allowed) => Ok(Intent::Ban(target)),
+                Some(crate::chat::model::BanOffer::Withheld(why)) => Err((label, why)),
+                None => Err((label, "You can't ban this member.".to_owned())),
             };
         }
         if let Action::SetNickname { nickname } = &action {
@@ -2182,6 +2411,9 @@ impl Outbox {
             | Action::Discard { .. }
             | Action::SetNickname { .. }
             | Action::SetDeputy { .. }
+            | Action::Ban { .. }
+            | Action::RotateSecret
+            | Action::PreviewBan { .. }
             | Action::SetRoomDetails { .. }
             | Action::Invite
             | Action::CreateRoom { .. }
@@ -2243,6 +2475,8 @@ impl Outbox {
                     (f, _) => f,
                 };
                 // Likewise a refused configuration: a fresh version, never one it had.
+                // A refused ban is signed again, stamped now, against the room as it is.
+                entry.ban = None;
                 let had_config = entry.config.is_some();
                 let above_old_config = entry
                     .config
@@ -2275,6 +2509,7 @@ impl Outbox {
             return None;
         }
         self.settle_deputy_changes(room, changed);
+        self.settle_bans(room, changed);
         let current = room.current_secret().map(|(_, v)| v);
         let me = room.stored.self_verifying_key();
         let fresh = self.fresh_info_version(room, 0);
@@ -2308,6 +2543,18 @@ impl Outbox {
                     if entry.status != Status::Queued {
                         continue;
                     }
+                }
+            }
+            // A ban built for what the room was is built again for what it is, at the moment it
+            // goes out: who remains to get the new secret, the secret version to move to and
+            // whether the room is private are read from the room now, and the ban may no longer
+            // be one this member can make.
+            if !entry.sent && entry.ban.is_some() {
+                entry.ban = None;
+                rebuild(entry, room, fresh, ctx);
+                *changed = true;
+                if entry.status != Status::Queued {
+                    continue;
                 }
             }
             // A configuration signed for what the room was is signed again for what it is: its
@@ -2418,7 +2665,30 @@ impl Outbox {
                                 room.stored.self_nickname = Some(nickname.clone());
                             }
                         }
-                        self.entries.remove(i);
+                        let removed = self.entries.remove(i);
+                        // A ban that made the room drop others' bans (it keeps a fixed number)
+                        // says so, as a notice to discard.
+                        if let Some(b) = &removed.ban
+                            && !b.displaced.is_empty()
+                        {
+                            let names = b.displaced.clone();
+                            let max = room
+                                .stored
+                                .room_state
+                                .configuration
+                                .configuration
+                                .max_user_bans;
+                            self.note_taken(room, super::bans::lifted_notice(&names, max));
+                        }
+                        if let Some(name) = &removed.after_ban {
+                            self.note_taken(
+                                room,
+                                format!(
+                                    "{name} was already banned. The room's secret is rotated \
+                                     now, so they cannot read new messages."
+                                ),
+                            );
+                        }
                         // A newer change of yours is the room's now, so an older one still
                         // waiting for its answer is explained by it.
                         self.entries.retain(|e| {
@@ -2432,7 +2702,9 @@ impl Outbox {
                     Ok(()) => {
                         self.entries[i].status = Status::Unconfirmed(format!(
                             "Freenet took it, but the room here doesn't show it. {}",
-                            if entry.info.is_some() || entry.config.is_some() {
+                            if entry.ban.is_some() {
+                                super::bans::NOT_KEPT.to_owned()
+                            } else if entry.info.is_some() || entry.config.is_some() {
                                 REMOVED.to_owned()
                             } else {
                                 why_not_kept(room, &messages)
@@ -2656,6 +2928,7 @@ impl Outbox {
     /// The answers it owed (the room's contract is `id`) are remembered, to be discarded when
     /// they come.
     pub fn purge_room(&mut self, room: &VerifyingKey, id: ContractInstanceId) {
+        self.preview = self.preview.take().filter(|(vk, _)| vk != room);
         self.entries.retain(|e| e.room != *room);
         if let Some(owed) = self.owed.remove(room)
             && !owed.is_empty()
@@ -2688,6 +2961,7 @@ impl Outbox {
 
     /// Forget the rooms no longer shown: what was waiting there goes with them.
     pub fn keep_rooms(&mut self, shown: &HashSet<VerifyingKey>) {
+        self.preview = self.preview.take().filter(|(vk, _)| shown.contains(vk));
         self.entries.retain(|e| shown.contains(&e.room));
         self.owed.retain(|room, _| shown.contains(room));
     }
@@ -2700,6 +2974,7 @@ impl Outbox {
         let mut notices = Vec::new();
         let mut own_nickname = None;
         let mut config_pending = None;
+        let mut rotation_pending = None;
         let mut deputy_changes = Vec::new();
         for e in self
             .entries
@@ -2753,6 +3028,9 @@ impl Outbox {
             if matches!(e.intent, Some(Intent::Config(_))) {
                 config_pending = Some(dialog_pending());
             }
+            if matches!(e.intent, Some(Intent::Rotate)) {
+                rotation_pending = Some(dialog_pending());
+            }
             if on_screen && e.is_text() {
                 for m in &e.messages {
                     rows.insert(
@@ -2765,12 +3043,29 @@ impl Outbox {
                     );
                 }
             } else if let Some(reason) = trouble {
+                // A ban says whom: two can be waiting. The name is the room's own (a ban not
+                // taken is not applied to `room`, so the member is still listed there).
+                let what = match (&e.intent, &e.after_ban) {
+                    (Some(Intent::Ban(target)), _) => {
+                        format!("{} of {}", e.label, room.nickname(*target, None))
+                    }
+                    (_, Some(name)) => format!("{} after the ban of {name}", e.label),
+                    _ => e.label.to_owned(),
+                };
+                // Said so that discarding a failed rotation does not hide the danger.
+                let reason = match &e.after_ban {
+                    Some(name) => format!(
+                        "{reason} {name} is banned but can still read new messages until the \
+                         secret is rotated."
+                    ),
+                    None => reason,
+                };
                 notices.push(Notice {
                     entry: e.id,
                     text: match e.status {
                         // Taken by the node, so not "couldn't be sent".
-                        Status::Unconfirmed(_) => format!("{}: {reason}", e.label),
-                        _ => format!("{} couldn't be sent. {reason}", e.label),
+                        Status::Unconfirmed(_) => format!("{what}: {reason}"),
+                        _ => format!("{what} couldn't be sent. {reason}"),
                     },
                     retry: e.retryable(),
                 });
@@ -2783,14 +3078,59 @@ impl Outbox {
             own_nickname,
             config_pending,
             deputy_changes,
+            rotation_pending,
         )
+    }
+
+    /// [`super::bans::preview`] of `target` on `basis`, worked out again only when the bans, the
+    /// members or the limits it depends on are not what the last answer was for.
+    fn cached_preview(&self, basis: &LiveRoom, target: MemberId) -> crate::chat::model::BanPreview {
+        use std::hash::{Hash, Hasher};
+        let state = &basis.stored.room_state;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        target.hash(&mut hasher);
+        state
+            .configuration
+            .configuration
+            .max_user_bans
+            .hash(&mut hasher);
+        state
+            .configuration
+            .configuration
+            .max_members
+            .hash(&mut hasher);
+        let mut bytes = Vec::new();
+        let _ = ciborium::ser::into_writer(&state.bans, &mut bytes);
+        let _ = ciborium::ser::into_writer(&state.members, &mut bytes);
+        let _ = ciborium::ser::into_writer(&state.member_info, &mut bytes);
+        let _ = ciborium::ser::into_writer(&state.ban_evidence, &mut bytes);
+        bytes.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((k, p)) = &*self.preview_cache.borrow()
+            && *k == key
+        {
+            return p.clone();
+        }
+        let p = super::bans::preview(basis, target);
+        *self.preview_cache.borrow_mut() = Some((key, p.clone()));
+        p
     }
 
     /// The chat screen's view of `room`, with what is on its way shown as if sent and marked.
     pub fn view(&self, room: &LiveRoom, minutes: &dyn Fn(SystemTime) -> u32) -> Room {
+        // The member the viewer asked what a ban would do to the other bans, in this room.
+        let asked = self
+            .preview
+            .as_ref()
+            .filter(|(vk, _)| *vk == room.stored.owner_vk)
+            .map(|(_, t)| *t);
+        let mut basis: Option<LiveRoom> = None;
         let mut view = if self.entries.iter().any(|e| e.room == room.stored.owner_vk) {
-            let (shown, rows, notices, own_nickname, config_pending, deputy_changes) =
+            let (shown, rows, notices, own_nickname, config_pending, deputy_changes, rotation) =
                 self.overlay(room);
+            if asked.is_some() {
+                basis = Some(shown.clone());
+            }
             let mut view = shown.view(minutes);
             for m in &mut view.messages {
                 m.pending = rows.get(&m.key).cloned();
@@ -2798,11 +3138,31 @@ impl Outbox {
             view.notices = notices;
             view.own_nickname = own_nickname;
             view.details.pending = config_pending;
+            view.details.rotation = rotation;
             view.deputy_changes = deputy_changes;
             view
         } else {
             room.view(minutes)
         };
+        // Ban is offered by the room as it is, not as it will be: a member already being banned
+        // is no longer listed.
+        view.ban_offers = super::bans::offers(room);
+        // What banning the member the viewer asked about does to the other bans, as it will be
+        // when sent: with the bans still on their way applied. For that member only, and kept
+        // until what it depends on changes, since working it out applies the room's ban cap.
+        view.ban_preview.clear();
+        if let Some(target) = asked
+            && view.ban_offers.contains_key(&target.to_string())
+        {
+            let basis = basis.as_ref().unwrap_or(room);
+            view.ban_preview
+                .insert(target.to_string(), self.cached_preview(basis, target));
+        }
+        let listed: HashSet<&str> = view.members.iter().map(|m| m.uid.as_str()).collect();
+        view.ban_offers
+            .retain(|uid, _| listed.contains(uid.as_str()));
+        view.ban_preview
+            .retain(|uid, _| listed.contains(uid.as_str()));
         view.send_block = participation(room).err().map(|b| b.reason().to_owned());
         view.nickname_block = rejoin(room).0.is_some().then(|| PRUNED.to_owned());
         // A change to your deputies is a change to your record: the room must take it, and it
@@ -2838,6 +3198,7 @@ type Overlay = (
     Option<Pending>,
     Option<Pending>,
     Vec<DeputyChange>,
+    Option<Pending>,
 );
 
 /// Build `entry` again against `room`: at its time, under the room's current secret. Fails
@@ -2858,6 +3219,28 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: 
                 }
                 entry.author = author;
                 entry.config = Some(config);
+                if let Err(e) = entry.applied(room) {
+                    entry.status = Status::Failed(e);
+                }
+            }
+            Err(e) => entry.status = Status::Failed(e),
+        }
+        return;
+    }
+    if matches!(intent, Intent::Ban(_) | Intent::Rotate) {
+        let built = match intent {
+            Intent::Ban(target) => super::bans::build(room, *target, entry.time),
+            _ => super::bans::build_rotation(room, entry.time),
+        };
+        match built {
+            Ok(built) => {
+                let author = room.stored.self_verifying_key();
+                if entry.author.is_some() && entry.author != author {
+                    entry.status = Status::Failed(IDENTITY_CHANGED.into());
+                    return;
+                }
+                entry.author = author;
+                entry.ban = Some(built);
                 if let Err(e) = entry.applied(room) {
                     entry.status = Status::Failed(e);
                 }

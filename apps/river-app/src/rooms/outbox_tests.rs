@@ -4727,3 +4727,33 @@ fn leaving_a_room_drops_its_queued_messages_and_record_entries() {
     );
     assert!(outbox.is_empty(), "every entry of the room is gone");
 }
+
+#[test]
+fn a_ban_names_no_member_in_any_debug_output() {
+    use crate::rooms::bans::tests::World;
+    let w = World::new();
+    let room = w.room(w.state(false), w.owner());
+    let mut o = outbox();
+    let ann = MemberId::from(&w.ann.verifying_key());
+    assert!(o.command(
+        &room,
+        Action::Ban {
+            target: ann.to_string()
+        }
+    ));
+    // The room holds a nickname "Ann"; none of what a developer can print may carry it.
+    for text in [
+        format!("{:?}", o.entries),
+        format!("{:?}", Intent::Ban(ann)),
+        format!(
+            "{:?}",
+            Action::Ban {
+                target: ann.to_string()
+            }
+        ),
+    ] {
+        for name in ["Ann", "Bo", "Cy", "Di", "Mia", "Olive"] {
+            assert!(!text.contains(name), "{name} in {text}");
+        }
+    }
+}

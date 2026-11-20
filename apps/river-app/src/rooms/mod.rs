@@ -37,6 +37,7 @@
 //! the one it carries ([`generation`]): it would be writing where the web UI no longer reads.
 //! It then only shows the rooms and asks the user to update it.
 
+pub mod bans;
 pub mod create;
 pub mod delegate;
 pub mod deputies;

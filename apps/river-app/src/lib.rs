@@ -395,6 +395,26 @@ fn deputy_scene(
     chat_edit(&mut s.chat);
 }
 
+/// Offer Ban for Priya (27) in the example room.
+fn offer_ban(r: &mut chat::model::Room) {
+    r.ban_offers
+        .insert("27".into(), chat::model::BanOffer::Allowed);
+    r.ban_preview.insert("27".into(), Default::default());
+}
+
+/// Offer Ban for Jonas (30) in the example room.
+fn offer_ban_30(r: &mut chat::model::Room) {
+    r.ban_offers
+        .insert("30".into(), chat::model::BanOffer::Allowed);
+    r.ban_preview.insert(
+        "30".into(),
+        chat::model::BanPreview {
+            lifts: vec!["Priya Raman".into()],
+            refused: false,
+        },
+    );
+}
+
 /// One of your own pending changes for the deputy scenes.
 fn deputy_change(
     uid: &str,
@@ -475,9 +495,11 @@ fn details_scene(s: &mut RiverApp, room: &str, edit: fn(&mut Chat, &mut chat::mo
     let mut shown = rooms.swap_remove(i);
     edit(&mut s.chat, &mut shown);
     let pending = shown.details.pending.clone();
+    let rotation = shown.details.rotation.clone();
     let editable = shown.details.editable.clone();
     s.chat.edit_rooms(|r| {
         if let Some(r) = r.iter_mut().find(|r| r.key == room) {
+            r.details.rotation = rotation;
             r.details.pending = pending;
             r.details.editable = editable;
         }
@@ -784,6 +806,51 @@ pub const SCENES: &[Scene] = &[
     ("chat-revoke-deputy-confirm", |s| {
         deputy_scene(s, "town-square", "16", |_| {}, |c| c.ask_deputy())
     }),
+    // Ban in a member's dialog (Sam owns Design Crew, a private room, and Town Square is public
+    // with Sam as a plain member): the button, the confirmation in a public and a private room,
+    // what is withheld and why, and a ban the node refused, said above the composer.
+    ("chat-ban", |s| {
+        deputy_scene(s, chat::example::PRIVATE_ROOM, "27", offer_ban, |_| {})
+    }),
+    ("chat-ban-confirm", |s| {
+        deputy_scene(s, "town-square", "30", offer_ban_30, |c| c.ask_ban())
+    }),
+    ("chat-ban-confirm-private", |s| {
+        deputy_scene(s, chat::example::PRIVATE_ROOM, "27", offer_ban, |c| {
+            c.ask_ban()
+        })
+    }),
+    ("chat-ban-withheld", |s| {
+        deputy_scene(
+            s,
+            chat::example::PRIVATE_ROOM,
+            "27",
+            |r| {
+                r.ban_offers.insert(
+                    "27".into(),
+                    chat::model::BanOffer::Withheld(rooms::bans::PRIVATE_OWNER_ONLY.into()),
+                );
+            },
+            |_| {},
+        )
+    }),
+    ("chat-ban-failed", |s| {
+        deputy_scene(
+            s,
+            chat::example::PRIVATE_ROOM,
+            "27",
+            |r| {
+                r.notices.push(chat::model::Notice {
+                    entry: 1,
+                    text: "Your ban of Priya Raman couldn't be sent. Freenet refused it: the \
+                           contract rejected the update."
+                        .into(),
+                    retry: true,
+                });
+            },
+            |c| c.close_member(),
+        )
+    }),
     // The bell in the conversation header opens a room's notification dialog: its three modes,
     // the current one checked. The name says what changes between the variants.
     ("chat-notification-modes", |s| {
@@ -932,6 +999,27 @@ pub const SCENES: &[Scene] = &[
             let form = chat.details.as_mut().expect("open");
             form.name.replace_text("Reading Circle");
             form.limits[2].replace_text("lots");
+        })
+    }),
+    // The owner of a private room: Rotate beside the secret version, on its way, and refused.
+    ("chat-room-details-rotating", |s| {
+        details_scene(s, chat::example::PRIVATE_ROOM, |_, room| {
+            room.details.rotation = Some(chat::model::Pending {
+                entry: 1,
+                failed: None,
+                retry: false,
+            });
+        })
+    }),
+    ("chat-room-details-rotate-failed", |s| {
+        details_scene(s, chat::example::PRIVATE_ROOM, |_, room| {
+            room.details.rotation = Some(chat::model::Pending {
+                entry: 1,
+                failed: Some(
+                    "Not saved. Freenet refused it: the contract rejected the update.".into(),
+                ),
+                retry: true,
+            });
         })
     }),
     ("chat-room-details-pending", |s| {
