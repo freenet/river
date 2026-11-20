@@ -41,7 +41,7 @@ use river_app::rooms::generation::{
 };
 use river_app::rooms::modes::NotificationMode;
 use river_app::rooms::socket::NodeSocket;
-use river_app::rooms::token::TokenStore;
+use river_app::rooms::token::{TokenStore, node_dir};
 use river_app::rooms::work::WorkState;
 use river_app::rooms::{Access, Action, Command, InviteCode, Issues, Link, RoomsUpdate};
 use river_core::chat_delegate::ChatDelegateResponseMsg;
@@ -207,7 +207,7 @@ fn delegate_key(
     dir: &Path,
     owner: &VerifyingKey,
 ) -> Result<(VerifyingKey, Option<[u8; 32]>), String> {
-    let token = TokenStore::in_dir(dir)
+    let token = TokenStore::in_dir(&node_dir(dir, authority, false))
         .load()
         .ok_or("the app has no grant token")?;
     let mut socket = NodeSocket::connect(authority, &token, &Default::default())
@@ -249,7 +249,7 @@ fn delegate_key(
 
 /// The room list's view preferences (`rooms_meta`) as the delegate on `authority` holds them.
 fn stored_meta(authority: &str, dir: &Path) -> Result<StoredRoomsMeta, String> {
-    let token = TokenStore::in_dir(dir)
+    let token = TokenStore::in_dir(&node_dir(dir, authority, false))
         .load()
         .ok_or("the app has no grant token")?;
     let mut socket = NodeSocket::connect(authority, &token, &Default::default())
@@ -284,7 +284,7 @@ fn stored_slot(authority: &str, dir: &Path, room_key: &str) -> Vec<u8> {
         .try_into()
         .expect("32 bytes");
     let owner = VerifyingKey::from_bytes(&bytes).expect("the room key is the owner's key");
-    let token = TokenStore::in_dir(dir)
+    let token = TokenStore::in_dir(&node_dir(dir, authority, false))
         .load()
         .expect("the app's grant token");
     let mut socket = NodeSocket::connect(authority, &token, &Default::default()).expect("connect");
@@ -379,7 +379,9 @@ fn put_test_pointer(
         expected,
         "the pointer WASM does not give the address freenet-migrate derives"
     );
-    let token = TokenStore::in_dir(dir).load().expect("a grant token");
+    let token = TokenStore::in_dir(&node_dir(dir, authority, false))
+        .load()
+        .expect("a grant token");
     let mut socket = NodeSocket::connect(authority, &token, &Default::default()).unwrap();
     socket.set_read_timeout(STEP).unwrap();
     socket
@@ -678,7 +680,9 @@ struct Carol {
 
 impl Carol {
     fn socket(authority: &str, dir: &Path) -> NodeSocket {
-        let token = TokenStore::in_dir(dir).load().expect("a grant token");
+        let token = TokenStore::in_dir(&node_dir(dir, authority, false))
+            .load()
+            .expect("a grant token");
         let mut socket =
             NodeSocket::connect(authority, &token, &Default::default()).expect("a connection");
         socket

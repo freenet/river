@@ -31,12 +31,16 @@ enum Answer {
 
 pub struct DesktopHost {
     agent: ureq::Agent,
+    /// For a node the person runs elsewhere, which may be across the internet or a tunnel: a
+    /// longer timeout than the node on this computer needs.
+    remote_agent: ureq::Agent,
 }
 
 impl DesktopHost {
     pub fn new() -> Self {
         DesktopHost {
-            agent: probe_agent(),
+            agent: probe_agent(Duration::from_secs(2)),
+            remote_agent: probe_agent(Duration::from_secs(6)),
         }
     }
 
@@ -46,9 +50,9 @@ impl DesktopHost {
 }
 
 /// A short timeout, and no redirects: the node's own endpoint never redirects.
-fn probe_agent() -> ureq::Agent {
+fn probe_agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(2))
+        .timeout(timeout)
         .redirects(0)
         .build()
 }
@@ -73,6 +77,17 @@ fn ask(agent: &ureq::Agent, url: &str) -> Answer {
     }
 }
 
+/// A version a node reported, made safe to show: it came from whatever answered at the address,
+/// so controls are dropped and the length is capped.
+fn clean_version(v: &str) -> String {
+    v.chars()
+        .filter(|c| !c.is_control())
+        .take(40)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 /// Classify what answered. Only the `MAJOR.MINOR.PATCH` part of a version is compared, so a
 /// suffixed version (`0.2.100-rc.1`) is still held to the floor. A version River can't parse
 /// at all is let through: the node reported one, so it is new enough to have the endpoint.
@@ -80,6 +95,7 @@ fn classify(answer: Answer, installed: bool) -> NodeProbe {
     let minimum = release::MIN_NODE_VERSION.to_string();
     match answer {
         Answer::Version(version) => {
+            let version = clean_version(&version);
             let pre_release = version.split('+').next().unwrap_or_default().contains('-');
             match release::parse_version(version.split(['-', '+']).next().unwrap_or_default()) {
                 // A pre-release comes before its release, so `0.2.155-rc.1` is below 0.2.155.
@@ -104,9 +120,27 @@ fn classify(answer: Answer, installed: bool) -> NodeProbe {
     }
 }
 
+/// What a node somebody else runs answered. Whether Freenet is installed here has no bearing,
+/// and nothing answering is simply unreachable.
+fn classify_at(answer: Answer) -> NodeProbe {
+    match answer {
+        Answer::Nothing => NodeProbe::Unreachable,
+        other => classify(other, false),
+    }
+}
+
 impl NodeHost for DesktopHost {
     fn probe(&self) -> NodeProbe {
         classify(self.ask_node(), find_installed().is_some())
+    }
+
+    fn probe_at(&self, authority: &str) -> NodeProbe {
+        // `authority` was validated as host:port when it was chosen. Only the version is
+        // asked, and a redirect is not followed (`probe_agent`), so nothing else is contacted.
+        classify_at(ask(
+            &self.remote_agent,
+            &format!("http://{authority}/v1/version"),
+        ))
     }
 
     fn config_dir(&self) -> Option<std::path::PathBuf> {
@@ -834,7 +868,7 @@ mod tests {
 
     #[test]
     fn what_the_port_says_is_read_correctly() {
-        let agent = probe_agent();
+        let agent = probe_agent(Duration::from_secs(2));
         let ok = "HTTP/1.1 200 OK\r\ncontent-length: 23\r\n\r\n{\"version\":\"0.2.155\"}\r\n";
         assert_eq!(
             ask(&agent, &serve_once(ok)),
@@ -876,6 +910,103 @@ mod tests {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/version", silent.local_addr().unwrap());
         assert_eq!(ask(&agent, &url), Answer::Nothing);
+    }
+
+    /// The `host:port` of a URL made by [`serve_once`].
+    fn authority_of(url: &str) -> String {
+        url.trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_node_somebody_else_runs_is_asked_only_its_version() {
+        let host = DesktopHost::new();
+        let floor = release::MIN_NODE_VERSION;
+        let body = format!("{{\"version\":\"{floor}\"}}");
+        let ok: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        assert_eq!(
+            host.probe_at(&authority_of(&serve_once(ok))),
+            NodeProbe::Running {
+                version: floor.to_string()
+            }
+        );
+        // Not Freenet: something HTTP that says no version.
+        let html = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
+        assert!(matches!(
+            host.probe_at(&authority_of(&serve_once(html))),
+            NodeProbe::Outdated { running: None, .. }
+        ));
+        // Too old: it says a version below the floor.
+        let old = "HTTP/1.1 200 OK\r\ncontent-length: 19\r\n\r\n{\"version\":\"0.2.1\"}";
+        assert!(matches!(
+            host.probe_at(&authority_of(&serve_once(old))),
+            NodeProbe::Outdated {
+                running: Some(_),
+                ..
+            }
+        ));
+        // Nothing listening: unreachable, and not "not installed", whatever this computer has.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        assert_eq!(host.probe_at(&closed), NodeProbe::Unreachable);
+    }
+
+    #[test]
+    fn a_redirect_from_the_node_is_not_followed_to_another_host() {
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        elsewhere.set_nonblocking(true).unwrap();
+        let target = elsewhere.local_addr().unwrap();
+        let moved: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://{target}/v1/version\r\ncontent-length: 0\r\n\r\n"
+            )
+            .into_boxed_str(),
+        );
+        let host = DesktopHost::new();
+        assert!(matches!(
+            host.probe_at(&authority_of(&serve_once(moved))),
+            NodeProbe::Outdated { running: None, .. }
+        ));
+        assert!(
+            elsewhere.accept().is_err(),
+            "the redirect target was contacted"
+        );
+    }
+
+    #[test]
+    fn a_version_from_the_node_is_capped_and_has_no_controls() {
+        let hostile = format!("0.2.200\u{1b}[31m\r\n{}", "9".repeat(500));
+        let NodeProbe::Running { version } = classify(Answer::Version(hostile.clone()), true)
+        else {
+            panic!("a version that can't be parsed is let through");
+        };
+        assert!(version.chars().count() <= 40, "{version}");
+        assert!(!version.chars().any(char::is_control), "{version:?}");
+        assert_eq!(clean_version("0.2.161"), "0.2.161");
+    }
+
+    #[test]
+    fn only_the_node_answering_nothing_is_unreachable() {
+        assert_eq!(classify_at(Answer::Nothing), NodeProbe::Unreachable);
+        assert!(matches!(
+            classify_at(Answer::NoVersion),
+            NodeProbe::Outdated { running: None, .. }
+        ));
+        assert!(matches!(
+            classify_at(Answer::Version("9.9.9".into())),
+            NodeProbe::Running { .. }
+        ));
     }
 
     #[test]

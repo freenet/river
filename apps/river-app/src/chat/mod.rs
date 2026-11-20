@@ -28,6 +28,7 @@ pub(crate) mod markdown;
 mod member_modal;
 mod mention;
 pub mod model;
+pub(crate) mod node_ui;
 mod notify_dialog;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
@@ -184,6 +185,8 @@ impl ReadMark {
 
 pub struct Chat {
     pub source: Source,
+    /// The node River uses, and the form that picks another.
+    pub node: node_ui::NodeUi,
     /// The rooms, in the room list's order. Private so every change goes through
     /// [`Chat::set_rooms`], which keeps a room open whenever there is one.
     rooms: Vec<Room>,
@@ -394,6 +397,7 @@ impl Chat {
             modes: HashMap::new(),
             picked: HashMap::new(),
             notify_dialog: None,
+            node: Default::default(),
         };
         chat.set_rooms(rooms);
         chat

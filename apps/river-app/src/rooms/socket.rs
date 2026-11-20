@@ -130,6 +130,25 @@ struct Chunks {
     started: Instant,
 }
 
+/// Connect to the first of `addrs` that accepts. A name such as `localhost` can resolve to
+/// `::1` before `127.0.0.1` while a tunnel (or the node) listens on only one of them, as the
+/// HTTP calls already cope with; trying only the first would be refused.
+fn connect_any(
+    addrs: impl Iterator<Item = std::net::SocketAddr>,
+    timeout: Duration,
+) -> std::io::Result<TcpStream> {
+    let mut last = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "the name has no address")
+    }))
+}
+
 impl NodeSocket {
     /// Open `ws://<authority><COMMAND_PATH>` presenting `token` as a bearer grant. `authority`
     /// is `host:port` and must be a loopback address: the node honours a grant only there.
@@ -140,13 +159,8 @@ impl NodeSocket {
         writes: &WriteGate,
     ) -> Result<NodeSocket, SocketError> {
         let fail = |e: &dyn std::fmt::Display| SocketError::Failed(e.to_string());
-        let addr = authority
-            .to_socket_addrs()
-            .map_err(|e| fail(&e))?
-            .next()
-            .ok_or_else(|| SocketError::Failed(format!("no address for {authority}")))?;
-        let stream =
-            TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| fail(&e))?;
+        let addrs = authority.to_socket_addrs().map_err(|e| fail(&e))?;
+        let stream = connect_any(addrs, Duration::from_secs(5)).map_err(|e| fail(&e))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| fail(&e))?;
@@ -1047,5 +1061,21 @@ mod tests {
             assert_eq!(token_verdict(&err), TokenVerdict::Discard, "{bad:?}");
         }
         assert!(is_token68("abc-DEF_123.~+/=="));
+    }
+
+    #[test]
+    fn a_name_that_resolves_to_a_refusing_address_first_still_connects() {
+        // What `localhost` can do: an address nobody listens on, then the one that does.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let live = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addrs = vec![dead, live.local_addr().unwrap()];
+        let stream = connect_any(addrs.into_iter(), Duration::from_secs(2)).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), live.local_addr().unwrap());
+        // Nothing accepting is still an error, and no address is too.
+        assert!(connect_any(vec![dead].into_iter(), Duration::from_secs(2)).is_err());
+        assert!(connect_any(Vec::new().into_iter(), Duration::from_secs(2)).is_err());
     }
 }

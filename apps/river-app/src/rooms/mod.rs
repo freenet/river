@@ -9,6 +9,9 @@
 //! storage. It registers only on a grant connection: the node records the identity a
 //! delegate was first registered under, for good.
 //!
+//! It talks to whatever answers at the node's address, `127.0.0.1:7509` unless the person chose
+//! another ([`crate::address`]); the trust below is the same wherever that is, and for a node on
+//! another machine reached through a tunnel the tunnel's local end is that address.
 //! It talks to whatever answers on the node's loopback port. A local program that took that
 //! port before Freenet could pose as the node: it would receive the grant token, and could show
 //! made-up rooms. The web UI places the same trust in the port, and Freenet does not treat
@@ -46,6 +49,8 @@ pub mod grant;
 pub mod identity;
 pub mod keys;
 pub mod leave;
+#[cfg(test)]
+mod link_tests;
 pub mod modes;
 pub mod outbox;
 pub mod room;
@@ -57,7 +62,7 @@ pub mod token;
 pub mod work;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -65,8 +70,9 @@ pub use identity::IdentityToken;
 pub use outbox::{Action, Command, InviteCode};
 pub use session::{Access, Issues, LinkStatus, RoomsUpdate};
 
-/// The node's client API on this computer.
-pub const NODE_AUTHORITY: &str = "127.0.0.1:7509";
+/// The node's client API on this computer, which River uses unless told another
+/// ([`crate::address`]).
+pub const NODE_AUTHORITY: &str = crate::address::DEFAULT_AUTHORITY;
 
 /// Starts and owns the background work that reads the rooms. Cloning shares it.
 #[derive(Clone)]
@@ -75,10 +81,22 @@ pub struct Link {
 }
 
 struct Inner {
-    report: Box<dyn Fn(RoomsUpdate) + Send + Sync>,
+    /// Gets each update with the node generation it was read under ([`Link::generation`]).
+    report: Box<dyn Fn(RoomsUpdate, u64) + Send + Sync>,
     /// Where the grant token is kept. `None` keeps it in memory only, for this run.
     config_dir: Option<PathBuf>,
-    authority: String,
+    /// The node's `host:port`, read when a session starts. Changed only by [`Link::set_node`].
+    authority: Mutex<String>,
+    /// Whether the person chose this node (see [`token::node_dir`]).
+    explicit: AtomicBool,
+    /// Bumped by every [`Link::set_node`]: a session of an older number stops.
+    generation: AtomicU64,
+    /// The generation the running session started under.
+    running_generation: AtomicU64,
+    /// A node change is waiting for the running session to stop, then a new one starts.
+    restart: AtomicBool,
+    /// The next session starts without what the user sent to the previous node.
+    drop_pending: AtomicBool,
     running: AtomicBool,
     /// What the user did, for the background work. The receiving end is held by the one
     /// session running at a time.
@@ -86,8 +104,11 @@ struct Inner {
     inbox: Mutex<Receiver<Command>>,
     /// What the user sent that the node has not taken, kept while no session runs.
     outbox: Mutex<outbox::Outbox>,
-    /// Whether River has moved on, for every session of this link.
-    watch: generation::Watch,
+    /// Whether River has moved on, for every session of this link. A node of its own has its
+    /// own answer, so [`Link::set_node`] replaces it, unless it was given by
+    /// [`Link::with_watch`].
+    watch: Mutex<Arc<generation::Watch>>,
+    replace_watch: Mutex<bool>,
 }
 
 impl Link {
@@ -107,32 +128,105 @@ impl Link {
         config_dir: Option<PathBuf>,
         report: impl Fn(RoomsUpdate) + Send + Sync + 'static,
     ) -> Self {
+        Link::for_node(authority, false, config_dir, move |u, _| report(u))
+    }
+
+    /// A link to the node at `authority`, which the person chose when `explicit`. `report`
+    /// also gets the node generation each update was read under, so the app can drop what a
+    /// node it has left still delivers ([`Link::generation`]).
+    pub fn for_node(
+        authority: &str,
+        explicit: bool,
+        config_dir: Option<PathBuf>,
+        report: impl Fn(RoomsUpdate, u64) + Send + Sync + 'static,
+    ) -> Self {
         let watch = generation::Watch::shipped(config_dir.as_deref());
-        Link::with_watch(authority, config_dir, watch, report)
+        let link = Link::build(authority, config_dir, watch, Box::new(report));
+        link.inner.explicit.store(explicit, Ordering::Release);
+        *link
+            .inner
+            .replace_watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        link
     }
 
     /// A link that watches for a newer River with `watch` rather than River's own pointer
     /// records: for end-to-end tests against a node holding test records. The app itself uses
-    /// [`Link::new`].
+    /// [`Link::for_node`].
     pub fn with_watch(
         authority: &str,
         config_dir: Option<PathBuf>,
         watch: generation::Watch,
         report: impl Fn(RoomsUpdate) + Send + Sync + 'static,
     ) -> Self {
+        Link::build(
+            authority,
+            config_dir,
+            watch,
+            Box::new(move |u, _| report(u)),
+        )
+    }
+
+    fn build(
+        authority: &str,
+        config_dir: Option<PathBuf>,
+        watch: generation::Watch,
+        report: Box<dyn Fn(RoomsUpdate, u64) + Send + Sync>,
+    ) -> Self {
         let (tx, rx) = channel();
         Link {
             inner: Arc::new(Inner {
-                report: Box::new(report),
+                report,
                 config_dir,
-                authority: authority.to_owned(),
+                authority: Mutex::new(authority.to_owned()),
+                explicit: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+                running_generation: AtomicU64::new(0),
+                restart: AtomicBool::new(false),
+                drop_pending: AtomicBool::new(false),
                 running: AtomicBool::new(false),
                 commands: Mutex::new(tx),
                 inbox: Mutex::new(rx),
                 outbox: Mutex::new(outbox::Outbox::default()),
-                watch,
+                watch: Mutex::new(Arc::new(watch)),
+                replace_watch: Mutex::new(false),
             }),
         }
+    }
+
+    /// The number of the node in use: it grows with every [`set_node`](Link::set_node), and
+    /// every update is delivered with the number it was read under.
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::Acquire)
+    }
+
+    /// Use the node at `authority` from now on, which the person chose when `explicit`. What
+    /// the link read from the previous node (its rooms, what the user sent to it, what it
+    /// learnt about a newer River) belongs to that node and is dropped. Each node keeps its own
+    /// saved permission ([`token::node_dir`]), so the previous node's is never presented to
+    /// this one. A running session stops, and the next [`start`](Link::start) reads from the
+    /// new node. Returns the new [`generation`](Link::generation).
+    pub fn set_node(&self, authority: &str, explicit: bool) -> u64 {
+        let inner = &self.inner;
+        *inner
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = authority.to_owned();
+        inner.explicit.store(explicit, Ordering::Release);
+        if *inner
+            .replace_watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            *inner
+                .watch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Arc::new(generation::Watch::shipped(inner.config_dir.as_deref()));
+        }
+        inner.drop_pending.store(true, Ordering::Release);
+        inner.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Hand something the user did to the background work. It shows in the next update.
@@ -147,12 +241,34 @@ impl Link {
     /// only on a state that needs the user (a denial, a node too old for grants); calling
     /// this again then starts over.
     pub fn start(&self) {
-        if self.inner.running.swap(true, Ordering::AcqRel) {
-            return;
-        }
+        let generation = loop {
+            let generation = self.inner.generation.load(Ordering::Acquire);
+            if !self.inner.running.swap(true, Ordering::AcqRel) {
+                break generation;
+            }
+            // A session for the node before a change is stopping: start for the new one as
+            // it ends. (A session that is merely waiting for the user is left alone.)
+            if self.inner.running_generation.load(Ordering::Acquire) == generation {
+                return;
+            }
+            self.inner.restart.store(true, Ordering::Release);
+            if self.inner.running.load(Ordering::Acquire) {
+                return;
+            }
+            // It ended between the two looks: start now.
+        };
+        self.inner
+            .running_generation
+            .store(generation, Ordering::Release);
+        let me = self.clone();
         let inner = self.inner.clone();
         std::thread::spawn(move || {
-            let report = |u: RoomsUpdate| (inner.report)(u);
+            // Nothing a stopped session still has to say is about the node now in use.
+            let report = |u: RoomsUpdate| {
+                if inner.generation.load(Ordering::Acquire) == generation {
+                    (inner.report)(u, generation)
+                }
+            };
             let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Only one session runs at a time (`running`), so this is never contended; a
                 // poisoned lock only means an earlier session panicked, which is reported.
@@ -164,15 +280,33 @@ impl Link {
                     .outbox
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if inner.drop_pending.swap(false, Ordering::AcqRel) {
+                    *outbox = outbox::Outbox::default();
+                    while inbox.try_recv().is_ok() {}
+                }
+                let authority = inner
+                    .authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let watch = inner
+                    .watch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                // The permission saved for this node, in the directory its grants live in.
+                let token_dir = inner.config_dir.as_deref().map(|d| {
+                    token::node_dir(d, &authority, inner.explicit.load(Ordering::Acquire))
+                });
                 session::run(
-                    &inner.authority,
-                    inner.config_dir.as_deref(),
+                    &authority,
+                    token_dir.as_deref(),
                     &report,
                     &session::Pace::default(),
-                    &|| false,
+                    &|| inner.generation.load(Ordering::Acquire) != generation,
                     &inbox,
                     &mut outbox,
-                    &inner.watch,
+                    &watch,
                 )
             }))
             .unwrap_or_else(|_| {
@@ -183,6 +317,13 @@ impl Link {
             // Free the link BEFORE reporting where it stopped, so the button that state shows
             // works the moment it appears.
             inner.running.store(false, Ordering::Release);
+            if inner.generation.load(Ordering::Acquire) != generation {
+                // Stopped for a node change: what it ended with is about the old node.
+                if inner.restart.swap(false, Ordering::AcqRel) {
+                    me.start();
+                }
+                return;
+            }
             report(RoomsUpdate::Access(end));
         });
     }

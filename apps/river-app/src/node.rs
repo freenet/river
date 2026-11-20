@@ -1,6 +1,7 @@
 //! What River needs from the platform it runs on, to reach a Freenet node.
 //!
-//! The desktop shell answers these by probing `127.0.0.1:7509` and installing Freenet from the
+//! The desktop shell answers these by probing the node's address (`127.0.0.1:7509` unless the
+//! person chose another, see [`crate::address`]) and installing Freenet from the
 //! signed GitHub release. A mobile shell would answer them differently (it may connect to a node
 //! rather than install one), which is why this is a trait and not desktop code.
 
@@ -19,6 +20,9 @@ pub enum NodeProbe {
     InstalledNotRunning,
     /// Freenet is not installed.
     NotInstalled,
+    /// Nothing answered at a node address the person gave ([`NodeHost::probe_at`]). Whether
+    /// Freenet is installed on this computer says nothing about it, so it is not asked.
+    Unreachable,
 }
 
 /// One step of installing Freenet, reported as it happens.
@@ -37,6 +41,15 @@ pub enum InstallStep {
 
 pub trait NodeHost: Send + Sync + 'static {
     fn probe(&self) -> NodeProbe;
+
+    /// Ask the node at `authority` (`host:port`) which version it is, as [`probe`] does for the
+    /// node on this computer. The answer is only ever [`NodeProbe::Running`],
+    /// [`NodeProbe::Outdated`] or [`NodeProbe::Unreachable`]: a node somebody else runs is not
+    /// installed, started or stopped from here. It must send nothing but the version request,
+    /// and follow no redirect.
+    ///
+    /// [`probe`]: NodeHost::probe
+    fn probe_at(&self, authority: &str) -> NodeProbe;
 
     /// Whether this platform can install Freenet itself.
     fn can_install(&self) -> bool;

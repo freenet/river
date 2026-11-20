@@ -279,6 +279,10 @@ fn parse_created(body: &str, authority: &str) -> Option<Created> {
     }
     // Only ever open the node's own page: the URL's authority must be exactly the one River
     // is talking to (no userinfo, no other host or port).
+    // And nothing that could be read as more than one thing when the browser is asked to open it.
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
     let rest = url.strip_prefix("http://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     if &rest[..end] != authority {
@@ -318,6 +322,15 @@ fn grant_limit_message(body: &str) -> String {
 fn refusal(status: u16, body: &str) -> String {
     let reason = json(body).and_then(|v| v.get("error")?.as_str().map(str::to_owned));
     match reason {
+        // The node gives its permission only to a program on its own computer (a loopback
+        // connection with a loopback `Host`). Said plainly, since a node on another machine
+        // lands here.
+        Some(r) if status == 403 && r.starts_with("loopback") => format!(
+            "Freenet refused River's request ({status}: {r}). Freenet only gives River its \
+             permission over a connection from the same computer. To use a node on another \
+             machine, reach it through an SSH tunnel and give River the tunnel's address on \
+             this computer, such as localhost:7509."
+        ),
         Some(r) => format!("Freenet refused River's request ({status}: {r})."),
         None => format!("Freenet refused River's request ({status})."),
     }
@@ -606,6 +619,10 @@ mod tests {
             r#"{"request_id":"r","approve_url":"http://127.0.0.1:7510/a"}"#,
             r#"{"request_id":"r","approve_url":"http://localhost:7509/a"}"#,
             r#"{"request_id":"r","approve_url":"http://127.0.0.1:75091/a"}"#,
+            // Spaces and control characters in what the browser is asked to open.
+            "{\"request_id\":\"r\",\"approve_url\":\"http://127.0.0.1:7509/a b\"}",
+            "{\"request_id\":\"r\",\"approve_url\":\"http://127.0.0.1:7509/a\\r\\nb\"}",
+            "{\"request_id\":\"r\",\"approve_url\":\"http://127.0.0.1:7509/a\\u001bb\"}",
             "not json",
         ] {
             let (outcome, opened, _) = run(vec![Ok((200, created))]);
@@ -619,7 +636,18 @@ mod tests {
         let (outcome, _, _) = run(vec![Ok((403, r#"{"error":"loopback only"}"#))]);
         assert_eq!(
             outcome,
-            GrantOutcome::Refused("Freenet refused River's request (403: loopback only).".into())
+            GrantOutcome::Refused(
+                "Freenet refused River's request (403: loopback only). Freenet only gives \
+                 River its permission over a connection from the same computer. To use a node \
+                 on another machine, reach it through an SSH tunnel and give River the \
+                 tunnel's address on this computer, such as localhost:7509."
+                    .into()
+            )
+        );
+        let (outcome, _, _) = run(vec![Ok((403, r#"{"error":"forbidden"}"#))]);
+        assert_eq!(
+            outcome,
+            GrantOutcome::Refused("Freenet refused River's request (403: forbidden).".into())
         );
     }
 

@@ -6,7 +6,8 @@
 //!
 //! 1. A share link (`https://freenet.org/open#<id><rest>`, `freenet:<id>`, `freenet://<id>`)
 //!    that is the visible text of a link, or bare in prose, opens that webapp on the READER'S
-//!    node (`http://127.0.0.1:7509/v1/contract/web/<id><rest>`). The destination comes only
+//!    node (`http://127.0.0.1:7509/v1/contract/web/<id><rest>`, or the address of the node the person
+//!    chose instead). The destination comes only
 //!    from the visible text, never from a hidden href.
 //! 2. A Freenet web-contract URL on any host (`http(s)://host/v1|v2/contract/web/<id>/...`), or
 //!    a relative `/v1|v2/contract/web/<id>` href, is rewritten to the reader's node. A path
@@ -41,7 +42,7 @@ use pulldown_cmark::{CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 use super::model;
 use super::share_link::{self, parse_share_link};
 use super::visual_fold::{is_display_hidden, is_format_or_control};
-use crate::rooms::NODE_AUTHORITY;
+use crate::address::current_authority;
 
 /// Most rewrites made to one text. Past it [`prepare`] gives up (`None`) and the caller shows
 /// the text as plain text: handing the widget the unchanged source would switch every
@@ -512,7 +513,7 @@ pub fn plain_link_target(url: &str) -> Option<String> {
 /// A destination rewritten to the reader's node, if it names a Freenet web contract on any
 /// host, or relatively. (The web UI rewrites an absolute URL to the same-origin path
 /// (`rewrite_freenet_href`) and lets the browser resolve a relative href against the node it is
-/// served from; here the node is [`NODE_AUTHORITY`].)
+/// served from; here the node is the one in use, [`current_authority`].)
 fn rewrite_dest(dest: &str) -> Option<String> {
     let path = |u: &str| rewrite_freenet_href(u).map(|p| node_url(&p));
     if let Some(p) = path(dest) {
@@ -534,7 +535,7 @@ fn rewrite_dest(dest: &str) -> Option<String> {
         .iter()
         .any(|m| relative.starts_with(m));
     if on_node && !relative.starts_with("//") {
-        return path(&format!("http://{NODE_AUTHORITY}{relative}"));
+        return path(&format!("http://{}{relative}", current_authority()));
     }
     None
 }
@@ -706,7 +707,7 @@ fn starts_with_ci(s: &str, prefix: &str) -> bool {
 
 /// The URL of `path` (`/v1/contract/web/<id>…`) on the reader's own node.
 fn node_url(path: &str) -> String {
-    format!("http://{NODE_AUTHORITY}{path}")
+    format!("http://{}{path}", current_authority())
 }
 
 /// `[label](<dest>)`, the destination made safe to sit between `<` and `>` (and in a table
@@ -2488,5 +2489,26 @@ mod tests {
         // Outside a link, an emoji's joiner is left as it is.
         let family = "x \u{1f469}\u{200d}\u{1f467}";
         assert_eq!(prepare(family), family);
+    }
+
+    #[test]
+    fn links_open_on_the_node_in_use() {
+        let _node = crate::address::use_authority_in_test("localhost:40302");
+        let url = format!("http://localhost:40302/v1/contract/web/{SAMPLE_ID}");
+        let share = prepare(&format!("freenet:{SAMPLE_ID}"));
+        assert!(share.contains(&url), "{share}");
+        assert!(!share.contains("127.0.0.1:7509"), "{share}");
+        // A gateway URL on another host, and a relative path, go to the node in use too.
+        let gateway = prepare(&format!(
+            "[Atlas](https://gw.example/v1/contract/web/{SAMPLE_ID}/)"
+        ));
+        assert!(gateway.contains(&url), "{gateway}");
+        assert!(!gateway.contains("gw.example"), "{gateway}");
+        let relative = prepare(&format!("[Atlas](/v1/contract/web/{SAMPLE_ID}/)"));
+        assert!(relative.contains(&url), "{relative}");
+        // Another test's node is not this one's: the default stays the default elsewhere.
+        drop(_node);
+        let default = prepare(&format!("freenet:{SAMPLE_ID}"));
+        assert!(default.contains("http://127.0.0.1:7509/"), "{default}");
     }
 }
