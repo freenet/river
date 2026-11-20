@@ -370,8 +370,9 @@ fn a_room_that_would_not_take_the_invitee_refuses_the_join() {
     assert!(join(&inv, "  ", &state, key, now()).is_err());
     assert!(join(&inv, "B\u{200B}ea", &state, key, now()).is_err());
 
-    // And the room as it was takes them.
-    assert!(join(&inv, "Bea", &state, key, now()).is_ok());
+    // And the room as it was takes them, as a new member.
+    let plan = join(&inv, "Bea", &state, key, now()).unwrap();
+    assert!(plan.adds_member());
 }
 
 #[test]
@@ -398,6 +399,7 @@ fn an_invitee_already_in_the_room_is_not_added_twice() {
     // Nothing to send: no second join event, no version-0 nickname record replacing the one
     // the room has, and no invite chain re-added.
     assert!(plan.delta.is_none());
+    assert!(!plan.adds_member(), "a join from a message refuses this");
     assert_eq!(
         plan.room.self_member_info.as_ref(),
         state
@@ -600,4 +602,32 @@ fn the_invitation_message_is_the_web_uis_and_cleans_the_room_name() {
     assert!(invitation_message(&"x".repeat(500), "l").len() < 700);
     assert!(invitation_message("  ", "l").contains("\"this chat room\""));
     assert!(invitation_message("\u{202E}\u{200B}", "l").contains("\"this chat room\""));
+}
+
+#[test]
+fn a_generated_nickname_is_cut_to_the_limit_with_a_fixed_fallback() {
+    let cfg = |n: usize| Configuration {
+        max_nickname_size: n,
+        ..Configuration::default()
+    };
+    assert_eq!(
+        fit_nickname("Cipher Daylight", &cfg(50)).as_deref(),
+        Some("Cipher Daylight")
+    );
+    assert_eq!(
+        fit_nickname("Cipher Daylight", &cfg(7)).as_deref(),
+        Some("Cipher")
+    );
+    // Never inside a character: a 2-byte character at a 3-byte limit leaves one.
+    assert_eq!(
+        fit_nickname("\u{e9}\u{e9}", &cfg(3)).as_deref(),
+        Some("\u{e9}")
+    );
+    // Nothing left: "Member" when it fits, else nothing.
+    assert_eq!(fit_nickname("\u{e9}x", &cfg(1)), None);
+    assert_eq!(
+        fit_nickname("       Bea", &cfg(6)).as_deref(),
+        Some("Member")
+    );
+    assert_eq!(fit_nickname("x", &cfg(0)), None);
 }

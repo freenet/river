@@ -157,6 +157,9 @@ pub struct WorkView {
     pub id: u64,
     /// What it is, for the screen: "Creating “Book club”", "Joining a room".
     pub what: String,
+    /// The room a join is for (its key), from the start, so a card that started a join can tell
+    /// its own from another. `None` for everything else.
+    pub room: Option<String>,
     pub state: WorkState,
 }
 
@@ -194,6 +197,10 @@ enum Kind {
     Join {
         invitation: Box<Invitation>,
         nickname: String,
+        /// The join must add a new member: it is refused when the invitee is a member of the
+        /// room already. For an invitation from a message, which could hand over the key of a
+        /// member of that room (an identity to adopt).
+        only_new: bool,
         /// Built when the room is read, so its join event carries that time. Kept across
         /// connections, so a resend is the same bytes; built again on Try again, so a join
         /// retried much later is not stamped with a time the room has trimmed.
@@ -327,6 +334,75 @@ struct Task {
     dm_rooms: Vec<[u8; 32]>,
     /// For a [`Kind::DmSave`] the merge refused: why.
     dm_refusal: Option<dm_store::Refusal>,
+    /// For a finished join: the room's name, kept for the line that says it is done after the
+    /// plan (which holds the invitee's key and the room's secrets) has been wiped.
+    done_name: Option<String>,
+}
+
+/// For tests: how many non-zero secrets of an invitation and of a join plan were wiped on this
+/// thread, so a test can see that a copy was reached (a dropped value cannot be looked at).
+#[cfg(test)]
+pub(crate) mod wiped {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn note(invitation: bool, secret: &[u8; 32]) {
+        if *secret != [0; 32] {
+            COUNTS.with(|c| {
+                let (i, p) = c.get();
+                c.set(if invitation { (i + 1, p) } else { (i, p + 1) });
+            });
+        }
+    }
+
+    /// (invitation secrets, plan secrets) wiped since the last call, and reset.
+    pub(crate) fn take() -> (usize, usize) {
+        COUNTS.with(|c| c.replace((0, 0)))
+    }
+}
+
+impl Kind {
+    /// Wipe the credential a join holds: the invitation's secrets and signing key, and the plan
+    /// (which holds the invitee's key as the room's `self_sk`, and the secrets). The room it is
+    /// for stays, so the task still names it.
+    fn wipe_credential(&mut self) {
+        self.wipe_invitation();
+        if let Kind::Join { plan, .. } = self {
+            if let Some(p) = plan.as_mut() {
+                for secret in p.room.invitation_secrets.values_mut() {
+                    #[cfg(test)]
+                    wiped::note(false, secret);
+                    zeroize::Zeroize::zeroize(secret);
+                }
+            }
+            *plan = None;
+        }
+    }
+
+    /// Wipe the invitation of a join: its room secrets, and its signing key (replaced by a zero
+    /// one; the old key wipes itself as it is dropped).
+    fn wipe_invitation(&mut self) {
+        if let Kind::Join { invitation, .. } = self {
+            for (_, secret) in &mut invitation.room_secrets {
+                #[cfg(test)]
+                wiped::note(true, secret);
+                zeroize::Zeroize::zeroize(secret);
+            }
+            invitation.room_secrets.clear();
+            invitation.invitee_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0; 32]);
+        }
+    }
+}
+
+/// A task that held an invitation wipes it when it goes (finished, put away, or the session
+/// ended): an `Invitation` does not wipe its room secrets itself.
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.kind.wipe_credential();
+    }
 }
 
 impl Task {
@@ -348,6 +424,7 @@ impl Task {
             dm_dropped: Vec::new(),
             dm_rooms: Vec::new(),
             dm_refusal: None,
+            done_name: None,
         }
     }
 
@@ -389,6 +466,10 @@ impl Task {
     fn view(&self) -> WorkView {
         let what = match &self.kind {
             Kind::Create(plan) => format!("Creating “{}”", plan.name()),
+            Kind::Join { .. } if self.done_name.is_some() => format!(
+                "Joining “{}”",
+                self.done_name.as_deref().unwrap_or_default()
+            ),
             Kind::Join { plan: Some(p), .. } => format!(
                 "Joining “{}”",
                 super::room::LiveRoom::new(stored(&p.room)).name()
@@ -418,6 +499,11 @@ impl Task {
         WorkView {
             id: self.id,
             what,
+            room: self
+                .is_join()
+                .then(|| self.owner())
+                .flatten()
+                .map(|o| bs58::encode(o.to_bytes()).into_string()),
             state,
         }
     }
@@ -434,7 +520,15 @@ impl Task {
     fn fail(&mut self, why: impl Into<String>, retry: bool) {
         self.out = None;
         self.wipe();
+        // A join that can't be tried again has no use for the invitation it holds.
+        if !retry {
+            self.kind.wipe_credential();
+        }
         self.failed = Some((why.into(), retry));
+    }
+
+    fn is_join(&self) -> bool {
+        matches!(self.kind, Kind::Join { .. })
     }
 
     /// On to the next step.
@@ -462,6 +556,14 @@ impl Task {
             (_, Step::Meta) => Step::Done,
             (_, step) => step,
         };
+        // A finished join has no use for the invitation or the plan: nothing reads them after the
+        // last write but the line that names the room, which keeps the name.
+        if self.step == Step::Done {
+            if let Kind::Join { plan: Some(p), .. } = &self.kind {
+                self.done_name = Some(super::room::LiveRoom::new(stored(&p.room)).name());
+            }
+            self.kind.wipe_credential();
+        }
     }
 
     fn running(&self) -> bool {
@@ -623,16 +725,32 @@ impl Work {
             Ok(i) => i,
             Err(why) => return self.refuse(WHAT, why),
         };
+        if let Err(why) = self.join_invitation(invitation, nickname, false, shown) {
+            self.refuse(WHAT, why);
+        }
+    }
+
+    /// Join the room `invitation` is for, as `nickname`, or say at once why it is not queued
+    /// (nothing is shown as failed: the caller says it). The invitation is not checked for
+    /// consistency here beyond what [`create::join`] does when the room is read.
+    pub fn join_invitation(
+        &mut self,
+        invitation: Invitation,
+        nickname: &str,
+        only_new: bool,
+        shown: &dyn Fn(&VerifyingKey) -> bool,
+    ) -> Result<(), String> {
         if let Some(why) = create::join_refusal(nickname) {
-            return self.refuse(WHAT, why);
+            super::dm_invite::wipe_invitation(invitation);
+            return Err(why);
         }
         if shown(&invitation.room) {
             // Joining writes the room into the store, and over a stored room only the web UI
             // can write without losing what it keeps there. The window opens such a room
             // instead of asking for this ([`crate::chat::Chat::submit_join`]); this is for an
             // invitation that reaches here some other way.
-            return self.refuse(
-                WHAT,
+            super::dm_invite::wipe_invitation(invitation);
+            return Err(
                 "You are already a member of this room, so this invitation was not used.".into(),
             );
         }
@@ -657,21 +775,30 @@ impl Work {
                 }
             });
         if let Some(why) = earlier {
-            return self.refuse(WHAT, why.into());
+            super::dm_invite::wipe_invitation(invitation);
+            return Err(why.into());
         }
         // A leave of this room that failed is over: it must not be tried again over the room
-        // joined now.
+        // joined now. So is a join that failed with nothing to try again: it is replaced, not
+        // shown beside the new one.
         self.tasks.retain(|t| {
-            !(t.is_leave() && t.owner() == Some(invitation.room) && t.failed.is_some())
+            let over = if t.is_leave() {
+                t.failed.is_some()
+            } else {
+                t.is_join() && matches!(t.failed, Some((_, false)))
+            };
+            !(over && t.owner() == Some(invitation.room))
         });
         self.push(
             Kind::Join {
                 invitation: Box::new(invitation),
                 nickname: nickname.trim().to_owned(),
+                only_new,
                 plan: None,
             },
             Step::Get,
         );
+        Ok(())
     }
 
     /// Leave `room`, which the screen calls `name`. Nothing is queued when it is being left
@@ -1199,14 +1326,38 @@ impl Work {
                         Kind::Join {
                             invitation,
                             nickname,
+                            only_new,
                             plan,
                         } => {
                             let key = create::contract_key(&invitation.room);
-                            match create::join(invitation, nickname, &state, key, SystemTime::now())
-                            {
+                            // A nickname made for the user (a join from a message) is cut to
+                            // what this room allows; one the user typed is not changed.
+                            let nick = if *only_new {
+                                create::fit_nickname(nickname, &state.configuration.configuration)
+                            } else {
+                                Some(nickname.clone())
+                            };
+                            let Some(nick) = nick else {
+                                t.fail(
+                                    "This room's nickname limit is too small for a generated nickname, so the invitation is not used.",
+                                    false,
+                                );
+                                return true;
+                            };
+                            match create::join(invitation, &nick, &state, key, SystemTime::now()) {
                                 Ok(p) => {
+                                    // Kept in the task before it is judged, so a plan that is
+                                    // refused is wiped with the task's credential.
+                                    let rejected = *only_new && !p.adds_member();
                                     *plan = Some(Box::new(p));
-                                    t.advance();
+                                    if rejected {
+                                        t.fail(
+                                            "This invitation is for someone who is a member of the room already, so it is not used.",
+                                            false,
+                                        );
+                                    } else {
+                                        t.advance();
+                                    }
                                 }
                                 Err(r) => t.fail(r.why, r.retry),
                             }
@@ -1378,6 +1529,21 @@ impl Work {
                 self.reload = true;
             }
         }
+    }
+
+    /// Whether no join task holds an invitation's key or secrets, for tests.
+    #[cfg(test)]
+    pub(crate) fn join_credentials_wiped(&self) -> bool {
+        self.tasks.iter().all(|t| match &t.kind {
+            Kind::Join {
+                invitation, plan, ..
+            } => {
+                invitation.room_secrets.is_empty()
+                    && invitation.invitee_signing_key.to_bytes() == [0; 32]
+                    && plan.is_none()
+            }
+            _ => true,
+        })
     }
 
     pub fn views(&self) -> Vec<WorkView> {

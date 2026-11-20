@@ -264,6 +264,16 @@ pub fn new_room(
 /// An invitation to `room` from the user, and the link that carries it. `web_app` is the web
 /// app's address on the user's node (`http://<authority>/v1/contract/web/<id>/`).
 pub fn invitation(room: &LiveRoom, web_app: &str) -> Result<(Invitation, String), String> {
+    let invitation = mint_invitation(room)?;
+    let code = invitation.to_encoded_string()?;
+    let link = format!("{web_app}?invitation={code}");
+    Ok((invitation, link))
+}
+
+/// A fresh invitation to `room` from the user, with no link: a new key for the invitee, their
+/// membership signed with the user's key, and for a private room its secrets. It is a bearer
+/// credential. A direct message carries it sealed ([`super::dm_invite`]).
+pub fn mint_invitation(room: &LiveRoom) -> Result<Invitation, String> {
     let Some(inviter) = &room.stored.self_sk else {
         return Err(
             "This computer doesn't hold your key for this room, so it can't make an invitation."
@@ -276,7 +286,7 @@ pub fn invitation(room: &LiveRoom, web_app: &str) -> Result<(Invitation, String)
         invited_by: MemberId::from(&inviter.verifying_key()),
         member_vk: invitee.verifying_key(),
     };
-    let invitation = Invitation {
+    Ok(Invitation {
         room: room.stored.owner_vk,
         invitee_signing_key: invitee,
         invitee: AuthorizedMember::new(member, inviter),
@@ -285,10 +295,7 @@ pub fn invitation(room: &LiveRoom, web_app: &str) -> Result<(Invitation, String)
         } else {
             Vec::new()
         },
-    };
-    let code = invitation.to_encoded_string()?;
-    let link = format!("{web_app}?invitation={code}");
-    Ok((invitation, link))
+    })
 }
 
 /// What joining a room sends and stores. No `Debug`: it holds the invitee's key.
@@ -297,6 +304,14 @@ pub struct JoinPlan {
     /// What to send, or `None` when the room already has everything (the invitee is already a
     /// member, as when an invitation is accepted twice).
     pub delta: Option<ChatRoomStateV1Delta>,
+}
+
+impl JoinPlan {
+    /// Whether the join adds the invitee to the room. False when the invitee is already a member
+    /// (an invitation accepted twice, or one for a key the room holds already).
+    pub fn adds_member(&self) -> bool {
+        self.delta.as_ref().is_some_and(|d| d.members.is_some())
+    }
 }
 
 /// Why a join can't go ahead, and whether trying the same join again later can help (a full
@@ -417,6 +432,28 @@ pub fn decode_invitation(pasted: &str) -> Result<Invitation, String> {
         None => Ok(invitation),
     }
 }
+
+/// `nickname` cut, on a character boundary, to the longest the room takes. Only for a nickname
+/// made for the user: a typed one is refused when too long, not changed. When nothing is left (the
+/// first character is wider than the limit) the fixed "Member" is used if it fits, as `riverctl`
+/// does; `None` when even that is over the limit.
+pub fn fit_nickname(nickname: &str, config: &Configuration) -> Option<String> {
+    let limit = config
+        .max_nickname_size
+        .min(river_core::room_state::member_info::NICKNAME_CEILING);
+    let mut end = nickname.len().min(limit);
+    while !nickname.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = nickname[..end].trim_end();
+    if !cut.is_empty() {
+        return Some(cut.to_owned());
+    }
+    (FALLBACK_NICKNAME.len() <= limit).then(|| FALLBACK_NICKNAME.to_owned())
+}
+
+/// The nickname used when a generated one does not fit at all.
+const FALLBACK_NICKNAME: &str = "Member";
 
 /// Why `nickname` can't be used to join, before the room is read.
 pub fn join_refusal(nickname: &str) -> Option<String> {

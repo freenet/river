@@ -76,6 +76,8 @@ struct App {
     dm_results: Vec<(u64, Result<(), String>)>,
     /// Answers to deletions of someone's messages asked for, by ticket.
     dm_purge_results: Vec<(u64, Result<(), String>)>,
+    /// Answers to invitations asked to be sent or accepted in a direct message, by ticket.
+    dm_invite_results: Vec<(u64, Result<(), String>)>,
     /// Deletions the rooms do not hold yet, as last reported.
     dm_purges: usize,
     access: Option<Access>,
@@ -113,6 +115,7 @@ impl App {
             dms: Vec::new(),
             dm_results: Vec::new(),
             dm_purge_results: Vec::new(),
+            dm_invite_results: Vec::new(),
             dm_purges: 0,
             access: None,
         }
@@ -165,6 +168,9 @@ impl App {
                 }
                 RoomsUpdate::DmSend { ticket, result, .. } => {
                     self.dm_results.push((ticket, result))
+                }
+                RoomsUpdate::DmInvite { ticket, result, .. } => {
+                    self.dm_invite_results.push((ticket, result))
                 }
                 RoomsUpdate::Status(_) => {}
             }
@@ -564,6 +570,198 @@ fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
         generation,
         "a store was made after the restart"
     );
+}
+
+/// Invitations in direct messages: A makes a second room (a public one, then a private one), sends
+/// B an invitation to it in a direct message in `room` (key `key`), and B accepts it from the
+/// message. B's thread shows a card for a room it does not have, with A's note; A's own thread
+/// shows the sent card; the sent text A's delegate holds is the web UI's `[Invitation]` summary
+/// and nothing of the invitation; B joins through the card (a public room, then a private one,
+/// where B can read it with the secret the invitation carried); accepting again is refused as
+/// already a member; and an accept naming a message that is not there is refused.
+fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
+    use river_app::chat::dm_model::DmBody;
+    use river_app::rooms::dm::{peer_key, token_from_hex};
+    let id_in = |app: &App, name: &str| {
+        let full = app
+            .room(room)
+            .and_then(|r| r.members.iter().find(|m| m.nickname == name))
+            .map(|m| m.full_id)
+            .unwrap_or_else(|| panic!("{name} is not a member in {}'s view", app.name));
+        river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(full))
+    };
+    let (bob_id, alice_id) = (id_in(alice, "Bob"), id_in(bob, "Alice"));
+    let (bob_in_a, alice_in_b) = (peer_key(bob_id), peer_key(alice_id));
+
+    for (n, (name, private)) in [("Invited room", false), ("Invited private room", true)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut tickets = 20 + 10 * n as u64;
+        let mut ticket = || {
+            tickets += 1;
+            tickets
+        };
+        let (send_ticket, missing_ticket, accept_ticket, again_ticket) =
+            (ticket(), ticket(), ticket(), ticket());
+        let note = format!("come along to {name}");
+        alice.send(
+            "",
+            Action::CreateRoom {
+                name: name.into(),
+                nickname: "Alice".into(),
+                private,
+            },
+        );
+        alice.until(&format!("{name} is created and shown"), |app| {
+            app.room(name).is_some_and(|r| r.send_block.is_none())
+        });
+        let target = alice.room(name).unwrap().key.clone();
+
+        alice.send(
+            key,
+            Action::SendInviteDm {
+                peer: bob_id,
+                target: target.clone(),
+                note: Some(note.clone()),
+                ticket: send_ticket,
+            },
+        );
+        alice.until("the invitation is queued", |app| {
+            app.dm_invite_results
+                .iter()
+                .any(|(t, r)| *t == send_ticket && r.is_ok())
+        });
+        // A's own card: sent, with the note, nothing pending.
+        alice.until("A shows the invitation it sent", |app| {
+            app.thread(key, &bob_in_a).is_some_and(|t| {
+                t.messages.iter().any(|m| {
+                    m.outgoing
+                        && m.pending.is_none()
+                        && matches!(&m.body, DmBody::SentInvite { note: Some(n) } if *n == note)
+                })
+            })
+        });
+        // B's card: a room B does not have, A's note, and the key B would join (named by the
+        // message): the label is a short form of the key.
+        let card = |app: &App| {
+            app.thread(key, &alice_in_b).and_then(|t| {
+                t.messages.iter().find_map(|m| match &m.body {
+                    DmBody::Invite {
+                        room,
+                        room_label,
+                        note: Some(n),
+                    } if !m.outgoing && *n == note => {
+                        Some((token_from_hex(&m.key), room.clone(), room_label.clone()))
+                    }
+                    _ => None,
+                })
+            })
+        };
+        bob.until("B opens A's invitation", |app| card(app).is_some());
+        let (token, named, label) = card(bob).unwrap();
+        assert_eq!(named, target, "the card names the room it is for");
+        assert!(label.starts_with("Room "), "{label}");
+        assert!(bob.room(name).is_none(), "B is not in the room yet");
+        let token = token.expect("a message is keyed by its purge token");
+
+        // What A's delegate holds for it is the summary and nothing else.
+        let summary = format!("[Invitation] {note}");
+        wait_until_saved("A", &alice.authority, &alice.dir, &summary);
+        let (texts, _) = stored_sent_texts(&alice.authority, &alice.dir).expect("A's store");
+        let mine: Vec<_> = texts.iter().filter(|t| t.contains(&note)).collect();
+        assert!(
+            !mine.is_empty() && mine.iter().all(|t| **t == summary),
+            "the entries naming the note are exactly the summary: {texts:?}"
+        );
+
+        // An accept naming a message that is not there is refused, and joins nothing.
+        let none = river_core::room_state::direct_messages::PurgeToken([7; 16]);
+        bob.send(
+            key,
+            Action::AcceptInviteDm {
+                peer: alice_id,
+                token: none,
+                ticket: missing_ticket,
+            },
+        );
+        bob.until(
+            "an accept of a message that is not there is refused",
+            |app| {
+                app.dm_invite_results.iter().any(|(t, r)| {
+                    *t == missing_ticket && r.as_ref().is_err_and(|e| e.contains("no longer"))
+                })
+            },
+        );
+        assert!(bob.room(name).is_none());
+
+        // B accepts: the room appears, readable (a private room opens with the invitation's
+        // secrets), and A sees B in it.
+        bob.send(
+            key,
+            Action::AcceptInviteDm {
+                peer: alice_id,
+                token,
+                ticket: accept_ticket,
+            },
+        );
+        bob.until("the accept is started", |app| {
+            app.dm_invite_results
+                .iter()
+                .any(|(t, r)| *t == accept_ticket && r.is_ok())
+        });
+        bob.until(&format!("B joined {name} from the card"), |app| {
+            if let Some(t) = app
+                .work
+                .iter()
+                .find(|t| matches!(t.state, WorkState::Failed { .. }))
+            {
+                panic!("joining failed: {t:?}");
+            }
+            app.room(name).is_some_and(|r| r.send_block.is_none())
+        });
+        alice.until(&format!("A sees B join {name}"), |app| {
+            app.room(name).is_some_and(|r| r.members.len() >= 2)
+        });
+        // The room works both ways: B is a member with an entry of its own, and what A posts is
+        // read in plaintext by B (in the private room, with the secrets the invitation carried).
+        let hello = format!("Welcome to {name}");
+        alice.send(
+            &target,
+            Action::Send {
+                text: hello.clone(),
+                reply_to: None,
+            },
+        );
+        bob.until(&format!("B reads A's message in {name}"), |app| {
+            app.has_text(name, &hello)
+                && app
+                    .room(name)
+                    .is_some_and(|r| r.members.iter().any(|m| m.id == r.me))
+        });
+        // Accepting again: B is a member now.
+        bob.send(
+            key,
+            Action::AcceptInviteDm {
+                peer: alice_id,
+                token,
+                ticket: again_ticket,
+            },
+        );
+        bob.until("a second accept is refused", |app| {
+            app.dm_invite_results.iter().any(|(t, r)| {
+                *t == again_ticket && r.as_ref().is_err_and(|e| e.contains("already a member"))
+            })
+        });
+        println!("B: accepted the invitation to {name} from the direct message");
+
+        bob.until("B's join work is done", |app| app.work.is_empty());
+        // Both leave the room again, so the steps after this start from the rooms they had.
+        let (b_authority, b_dir) = (bob.authority.clone(), bob.dir.clone());
+        leave_room(bob, &b_authority, &b_dir, name, &target, Some(room));
+        let (a_authority, a_dir) = (alice.authority.clone(), alice.dir.clone());
+        leave_room(alice, &a_authority, &a_dir, name, &target, Some(room));
+    }
 }
 
 /// Allow the grant on its approval page, as the user would: read the page's nonce, wait out
@@ -1820,6 +2018,7 @@ fn main() {
     // room checks against the owner's key).
     direct_messages(&mut alice, &mut bob, ROOM, &key);
     delete_their_messages(&mut alice, &mut bob, ROOM, &key);
+    invitations_in_direct_messages(&mut alice, &mut bob, ROOM, &key);
     rename_both_ways(&mut alice, &mut bob, ROOM, &key, "Bob", "Alice");
     deputize_and_revoke(&mut alice, &mut bob, ROOM, &key);
     // A nickname over the room's limit (50 bytes) is refused by the app and said, and is

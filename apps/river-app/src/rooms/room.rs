@@ -853,7 +853,7 @@ pub(crate) fn clean(s: &str) -> String {
         .join(" ")
 }
 
-fn clean_multiline(s: &str) -> String {
+pub(crate) fn clean_multiline(s: &str) -> String {
     s.chars()
         .filter(|c| *c == '\n' || !is_hidden(*c))
         .collect::<String>()

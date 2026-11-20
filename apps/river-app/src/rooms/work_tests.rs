@@ -2,6 +2,7 @@ use super::*;
 use crate::rooms::create::invitation;
 use crate::rooms::room::LiveRoom;
 use crate::rooms::room_tests::Fixture;
+use crate::rooms::work::wiped;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{InboundDelegateMsg, StateSummary, WrappedState};
@@ -402,6 +403,7 @@ fn joining_reads_the_room_stores_it_over_a_tombstone_then_sends_the_join() {
     owner_side.room_state = state0.clone();
     let (inv, link) = invitation(&LiveRoom::new(owner_side), "http://x/").unwrap();
     let mut w = Work::default();
+    wiped::take();
     w.join(&link, "Bea", &|_| false);
     let owner = f.owner.verifying_key();
     assert!(w.holds(&owner));
@@ -459,7 +461,15 @@ fn joining_reads_the_room_stores_it_over_a_tombstone_then_sends_the_join() {
     ));
     assert!(matches!(state(&w), WorkState::Done { .. }));
     assert!(!w.holds(&owner));
+    // Done: the invitation and the plan (the invitee's key and the room's secrets) were wiped
+    // when the join finished, and the line still names the room.
     assert!(w.views()[0].what.contains("Secret garden"));
+    assert!(w.join_credentials_wiped());
+    let (invitation_secrets, plan_secrets) = wiped::take();
+    assert!(
+        invitation_secrets > 0 && plan_secrets > 0,
+        "{invitation_secrets} {plan_secrets}"
+    );
 }
 
 #[test]
@@ -591,6 +601,39 @@ fn a_join_the_room_already_has_sends_nothing() {
         3,
     ));
     expect_read(&mut w, ROOMS_META_KEY);
+}
+
+/// A join started from a direct message must add a new member: an invitation for a key the room
+/// holds already would otherwise make the user store that member's identity.
+#[test]
+fn a_join_from_a_message_for_a_member_of_the_room_is_refused_and_one_for_a_new_member_goes_on() {
+    for (already, expect_failed) in [(true, true), (false, false)] {
+        let mut w = Work::default();
+        let owner_sk = SigningKey::from_bytes(&[60; 32]);
+        let plan =
+            crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+        let room = LiveRoom::new(stored(&plan.room));
+        let (inv, _) = invitation(&room, "http://x/").unwrap();
+        let member = inv.invitee.clone();
+        w.join_invitation(inv, "Bea", true, &|_| false).unwrap();
+        let ClientRequest::ContractOp(ContractRequest::Get { .. }) = next(&mut w) else {
+            panic!("a GET");
+        };
+        let mut state = plan.room.room_state.clone();
+        if already {
+            state.members.members.push(member);
+        }
+        get_answer(
+            &mut w,
+            crate::rooms::create::contract_key(&owner_sk.verifying_key()),
+            &state,
+        );
+        let failed = w
+            .views()
+            .iter()
+            .any(|v| matches!(v.state, WorkState::Failed { retry: false, .. }));
+        assert_eq!(failed, expect_failed);
+    }
 }
 
 /// This join's own store landed but its answer was lost: the room holds exactly its bytes, so
@@ -2337,4 +2380,157 @@ mod dm_saves {
         assert!(w.on_delegate(&store_answer(KEY, CasStoreResult::Stored { generation: 1 })));
         assert_eq!(w.tasks[0].phase, Phase::Read);
     }
+}
+
+// Joining from an invitation already decoded ([`Work::join_invitation`]) -----------------------------
+
+fn an_invitation() -> (Invitation, SigningKey) {
+    let owner_sk = SigningKey::from_bytes(&[62; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let room = LiveRoom::new(stored(&plan.room));
+    let (inv, _) = invitation(&room, "http://x/").unwrap();
+    (inv, owner_sk)
+}
+
+#[test]
+fn join_invitation_says_why_at_once_and_queues_nothing_for_each_refusal() {
+    let mut w = Work::default();
+    // A nickname that can't be used.
+    let (inv, _) = an_invitation();
+    assert!(w.join_invitation(inv, "  ", false, &|_| false).is_err());
+    // A room already in the list.
+    let (inv, _) = an_invitation();
+    let why = w.join_invitation(inv, "Bea", false, &|_| true).unwrap_err();
+    assert!(why.contains("already a member"), "{why}");
+    assert!(
+        w.views().is_empty(),
+        "nothing is shown as failed: the caller says it"
+    );
+    // A join of the room under way.
+    let (inv, _) = an_invitation();
+    w.join_invitation(inv, "Bea", false, &|_| false).unwrap();
+    let (inv, _) = an_invitation();
+    let why = w
+        .join_invitation(inv, "Bea", false, &|_| false)
+        .unwrap_err();
+    assert!(why.contains("already joining"), "{why}");
+    assert_eq!(w.views().len(), 1);
+}
+
+#[test]
+fn only_a_join_names_its_room_so_a_leave_does_not_look_like_one() {
+    let mut w = Work::default();
+    let (inv, _) = an_invitation();
+    let room = inv.room;
+    w.join_invitation(inv, "Bea", false, &|_| false).unwrap();
+    assert_eq!(
+        w.views()[0].room,
+        Some(bs58::encode(room.to_bytes()).into_string())
+    );
+    let mut w = Work::default();
+    assert!(w.leave(room, "Open".into(), None));
+    assert_eq!(w.views()[0].room, None);
+}
+
+/// A private room's state with an owner-side copy that can make an invitation for it.
+fn private_join() -> (Fixture, river_core::room_state::ChatRoomStateV1, Invitation) {
+    let f = Fixture::new();
+    let mut state = f.private_state();
+    let mut owner_side = f.stored(state.clone());
+    owner_side.self_sk = Some(f.owner.clone());
+    crate::rooms::room_tests::add_secret(
+        &f,
+        &mut state,
+        0,
+        &crate::rooms::room_tests::SECRET,
+        &f.owner,
+    );
+    owner_side.room_state = state.clone();
+    let (inv, _) = invitation(&LiveRoom::new(owner_side), "http://x/").unwrap();
+    (f, state, inv)
+}
+
+#[test]
+fn a_refused_plan_and_a_dropped_task_are_wiped_too() {
+    // A join from a message for a key the room holds: the plan made for it (with the room's
+    // secrets and the invitee's key) is refused, and is wiped with the invitation.
+    let (f, mut state, inv) = private_join();
+    state.members.members.push(inv.invitee.clone());
+    let mut w = Work::default();
+    wiped::take();
+    w.join_invitation(inv, "Bea", true, &|_| false).unwrap();
+    next(&mut w);
+    get_answer(
+        &mut w,
+        crate::rooms::create::contract_key(&f.owner.verifying_key()),
+        &state,
+    );
+    assert!(
+        w.views()
+            .iter()
+            .any(|v| matches!(v.state, WorkState::Failed { retry: false, .. }))
+    );
+    assert!(w.join_credentials_wiped());
+    let (invitation_secrets, plan_secrets) = wiped::take();
+    assert!(invitation_secrets > 0, "the invitation's secrets");
+    assert!(plan_secrets > 0, "the refused plan's secrets");
+
+    // Dropping a task that holds an invitation wipes it. (The dropped value cannot be looked at;
+    // the count is what shows the secrets were reached.)
+    let (_, _, inv) = private_join();
+    let mut w = Work::default();
+    w.join_invitation(inv, "Bea", false, &|_| false).unwrap();
+    wiped::take();
+    drop(w);
+    assert!(wiped::take().0 > 0);
+}
+
+#[test]
+fn a_generated_nickname_is_cut_to_the_rooms_limit_and_the_cut_is_what_is_joined_with() {
+    use river_core::room_state::configuration::AuthorizedConfigurationV1;
+    let run = |nickname: &str, limit: usize, only_new: bool| {
+        let mut w = Work::default();
+        let (inv, owner_sk) = an_invitation();
+        w.join_invitation(inv, nickname, only_new, &|_| false)
+            .unwrap();
+        next(&mut w);
+        let plan =
+            crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+        let mut state = plan.room.room_state;
+        let mut config = state.configuration.configuration.clone();
+        config.max_nickname_size = limit;
+        state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
+        get_answer(
+            &mut w,
+            crate::rooms::create::contract_key(&owner_sk.verifying_key()),
+            &state,
+        );
+        let joined = match &w.tasks[0].kind {
+            Kind::Join { plan: Some(p), .. } => p.room.self_nickname.clone(),
+            _ => None,
+        };
+        let failed = w.views().into_iter().find_map(|v| match v.state {
+            WorkState::Failed { why, retry } => Some((why, retry)),
+            _ => None,
+        });
+        (joined, failed)
+    };
+    // Cut on a character boundary, trailing space dropped.
+    let (joined, failed) = run("Cipher Daylight \u{e9}\u{e9}\u{e9}", 7, true);
+    assert_eq!((joined.as_deref(), failed), (Some("Cipher"), None));
+    // A typed nickname is refused when too long, not changed.
+    let (joined, failed) = run("Cipher Daylight", 7, false);
+    assert!(
+        joined.is_none()
+            && failed.is_some_and(|(w, _)| w.contains("too long") || w.contains("at most"))
+    );
+    // A first character wider than the limit leaves nothing, and a limit under the fixed
+    // fallback's length is said, for good.
+    let (joined, failed) = run("\u{e9}Bea", 1, true);
+    assert!(joined.is_none());
+    let (why, retry) = failed.expect("refused");
+    assert!(
+        why.contains("nickname limit is too small") && !retry,
+        "{why}"
+    );
 }

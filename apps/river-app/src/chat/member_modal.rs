@@ -2,8 +2,8 @@
 //! `MemberInfoModal` (`ui/src/components/members/member_info_modal.rs`): who the member is, how
 //! they came to be in the room, and a warning when their name imitates the owner's.
 //!
-//! Its Message button opens the conversation with the member (for the member the dialog shows, by full id). What it leaves
-//! out is sharing an invite by direct message, which the web UI offers too. Your own dialog edits your nickname
+//! Its Message button opens the conversation with the member (for the member the dialog shows, by full id), and Share
+//! invite opens the picker that sends them an invitation to another room ([`super::dm_picker`]). Your own dialog edits your nickname
 //! (`nickname_editor`), as the web UI's `NicknameField` does. Deputize and Revoke deputy
 //! (`deputy_block`) work as the web UI's `DeputyButton` does, with a confirmation first. Ban
 //! (`ban_confirmation`) is offered as the web UI's `ban_gate` decides it, with a confirmation;
@@ -837,6 +837,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         // composer says why it cannot send. The thread is named by the member's full id, so
         // the right member gets it even where another shares their short label.
         let (room_key, peer) = (room.key.clone(), m.full_id.to_string());
+        let (invite_room, invite_peer) = (room_key.clone(), peer.clone());
         let message = Button::new("Message")
             .variant(ButtonVariant::Ghost)
             .on_press(move |s: &mut RiverApp| {
@@ -845,6 +846,16 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             .build(k)
             .key("member-dm");
         actions = actions.child(message);
+        // Sends them an invitation to one of your other rooms, in the conversation.
+        actions = actions.child(
+            Button::new("Share invite")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut RiverApp| {
+                    s.chat.open_invite_picker(&invite_room, &invite_peer);
+                })
+                .build(k)
+                .key("member-dm-invite"),
+        );
         if !shared
             && matches!(room.ban_offers.get(uid), Some(BanOffer::Allowed))
             && chat.ban_confirm.is_none()

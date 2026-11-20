@@ -83,6 +83,8 @@ pub enum Refusal {
     Refused(String),
     /// The update applied and the message is not in the room afterwards.
     NotKept,
+    /// An invitation could not be made or sent ([`super::dm_invite`]); the words are fixed ones.
+    Invite(String),
 }
 
 impl Refusal {
@@ -101,6 +103,7 @@ impl Refusal {
             Refusal::Compose(why) => format!("The message could not be prepared: {why}"),
             Refusal::Refused(why) => why.clone(),
             Refusal::NotKept => NOT_KEPT.to_owned(),
+            Refusal::Invite(why) => why.clone(),
         }
     }
 }
@@ -132,14 +135,24 @@ fn peer_vk(room: &LiveRoom, peer: MemberId) -> Option<VerifyingKey> {
 /// listed and has no stored admission ([`Blocked::NotMember`]), and [`applied`] checks that the
 /// room kept the message whatever the reason.
 pub fn preflight(room: &LiveRoom, peer: MemberId, text: &str) -> Result<VerifyingKey, Refusal> {
+    check(room, peer, text.len(), text.trim().is_empty())
+}
+
+/// [`preflight`] for a body of `len` bytes that is `empty` or not.
+fn check(
+    room: &LiveRoom,
+    peer: MemberId,
+    len: usize,
+    empty: bool,
+) -> Result<VerifyingKey, Refusal> {
     participation(room).map_err(Refusal::Blocked)?;
     // As the web UI: blank text is refused, and what is sent is the text as written, so the cap
     // is on its bytes as they are.
-    if text.trim().is_empty() {
+    if empty {
         return Err(Refusal::Empty);
     }
-    if text.len() > BODY_CAP {
-        return Err(Refusal::TooLong { bytes: text.len() });
+    if len > BODY_CAP {
+        return Err(Refusal::TooLong { bytes: len });
     }
     let Some(sk) = &room.stored.self_sk else {
         return Err(Refusal::Blocked(Blocked::NoKey));
@@ -213,18 +226,33 @@ pub fn prepare(
     now: u64,
 ) -> Result<AuthorizedDirectMessage, Refusal> {
     let peer_vk = preflight(room, peer, text)?;
+    seal(room, &peer_vk, text.as_bytes(), now)
+}
+
+/// [`prepare`] for a structured body already encoded as `body` (an invitation,
+/// [`super::dm_invite`]): the same checks, with the cap on the encoded bytes.
+pub fn prepare_body(
+    room: &LiveRoom,
+    peer: MemberId,
+    body: &[u8],
+    now: u64,
+) -> Result<AuthorizedDirectMessage, Refusal> {
+    let peer_vk = check(room, peer, body.len(), false)?;
+    seal(room, &peer_vk, body, now)
+}
+
+/// Seal `body` to `peer_vk`, sign it with the room's key, and check the room would keep it.
+fn seal(
+    room: &LiveRoom,
+    peer_vk: &VerifyingKey,
+    body: &[u8],
+    now: u64,
+) -> Result<AuthorizedDirectMessage, Refusal> {
     let Some(sk) = &room.stored.self_sk else {
         return Err(Refusal::Blocked(Blocked::NoKey));
     };
-    let message = compose_direct_message(
-        sk,
-        &peer_vk,
-        &room.stored.owner_vk,
-        now,
-        now,
-        text.as_bytes(),
-    )
-    .map_err(Refusal::Compose)?;
+    let message = compose_direct_message(sk, peer_vk, &room.stored.owner_vk, now, now, body)
+        .map_err(Refusal::Compose)?;
     applied(room, &message)?;
     Ok(message)
 }
@@ -248,7 +276,7 @@ pub fn with_pending(
             outgoing: true,
             timestamp: row.timestamp.min(MAX_SHOWN_SECS),
             body: match &row.text {
-                Some(t) => DmBody::Text(t.as_str().to_owned()),
+                Some(t) => super::dm::sent_body(t.as_str()),
                 None => DmBody::Placeholder(Placeholder::CiphertextOnly),
             },
             pending: Some(pending),
