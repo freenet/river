@@ -14,6 +14,14 @@ mod details;
 mod emoji;
 pub mod example;
 mod icons;
+mod identity;
+/// What the identity dialogs say and hold, for tests that pin them to the web UI's.
+pub mod identity_texts {
+    pub use super::identity::{
+        EXPORT_INTRO, EXPORT_WARNING, IMPORT_INTRO, REPLACE_SESSIONS_WARNING, REPLACE_WARNING,
+        Secret,
+    };
+}
 mod keys;
 mod links;
 pub(crate) mod markdown;
@@ -74,6 +82,8 @@ pub type Sink = Box<dyn Fn(Command)>;
 pub enum DialogKind {
     Create,
     Join,
+    /// Import ID ([`identity`]).
+    Import,
 }
 
 /// What the create and join dialogs hold.
@@ -83,6 +93,10 @@ pub struct Form {
     pub nickname: TextEdit,
     pub code: TextEdit,
     pub private: bool,
+    /// What is pasted in the import dialog: an identity token, which is a private key.
+    pub token: TextEdit,
+    /// The import waiting for the user to confirm replacing an identity.
+    pub replace: Option<identity::ReplaceConfirm>,
     /// Why what was entered can't be used, said in the dialog.
     pub error: Option<String>,
 }
@@ -95,6 +109,8 @@ impl Default for Form {
             nickname: TextEdit::new(""),
             code: TextEdit::new(""),
             private: false,
+            token: TextEdit::new(""),
+            replace: None,
             error: None,
         }
     }
@@ -243,6 +259,8 @@ pub struct Chat {
     open_when_shown: Option<String>,
     /// The invitation asked for, by the room it was asked for in.
     pub invite: Option<(String, InviteState)>,
+    /// The "Export Identity" dialog, when open ([`identity`]).
+    pub export: Option<identity::ExportDialog>,
     /// Whether the last status was not live, so the next live update is catch-up rather than
     /// news (see [`Chat::show_node_rooms`]).
     catching_up: bool,
@@ -358,6 +376,7 @@ impl Chat {
             opened: HashSet::new(),
             open_when_shown: None,
             invite: None,
+            export: None,
             catching_up: true,
             full_list: false,
             modes: HashMap::new(),
@@ -940,6 +959,7 @@ impl Chat {
         match kind {
             DialogKind::Create => self.form.name.focused = true,
             DialogKind::Join => self.form.code.focused = true,
+            DialogKind::Import => self.form.token.focused = true,
         }
     }
 

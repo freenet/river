@@ -16,6 +16,11 @@
 # newer chat delegate, and a third app that trusts that key must show the room read-only and
 # write nothing (the record goes to the local test node only, never to River's addresses).
 #
+# Then the identity moves: on the gateway the app creates a room and exports its identity, the
+# app on the peer imports it (adding the room), shows it and sends in it as that same member; a
+# bad token and a replace nobody asked for are refused, and a replace the user confirmed makes
+# the peer's app write as the gateway app's member in a room it already held.
+#
 # Usage: apps/scripts/fresh-node-e2e.sh <work dir>
 #   FREENET_BIN  the freenet binary to run (default: freenet on PATH)
 #   E2E_PORT_BASE  first of the four ports used (default 39400): two network, two API

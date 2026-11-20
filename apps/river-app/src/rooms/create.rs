@@ -308,14 +308,14 @@ pub struct JoinRefusal {
 }
 
 impl JoinRefusal {
-    fn final_(why: impl Into<String>) -> Self {
+    pub(crate) fn final_(why: impl Into<String>) -> Self {
         JoinRefusal {
             why: why.into(),
             retry: false,
         }
     }
 
-    fn for_now(why: impl Into<String>) -> Self {
+    pub(crate) fn for_now(why: impl Into<String>) -> Self {
         JoinRefusal {
             why: why.into(),
             retry: true,

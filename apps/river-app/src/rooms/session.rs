@@ -277,6 +277,12 @@ pub enum RoomsUpdate {
         room: String,
         link: Result<String, String>,
     },
+    /// The identity export the user asked for in the room keyed `room`: its token, or why
+    /// there is none. The token is the user's signing key.
+    Export {
+        room: String,
+        token: Result<String, String>,
+    },
 }
 
 impl std::fmt::Debug for RoomsUpdate {
@@ -308,6 +314,11 @@ impl std::fmt::Debug for RoomsUpdate {
                 .debug_struct("Invite")
                 .field("room", room)
                 .field("link", &link.as_ref().map(|_| "<hidden>"))
+                .finish(),
+            RoomsUpdate::Export { room, token } => f
+                .debug_struct("Export")
+                .field("room", room)
+                .field("token", &token.as_ref().map(|_| "<hidden>"))
                 .finish(),
         }
     }
@@ -1503,6 +1514,9 @@ struct Rooms {
     web_app: String,
     /// Invitations made since the last report, by room key.
     invites: Vec<(String, Result<String, String>)>,
+    /// Identity export tokens asked for, by room, waiting to be reported. Each is the user's
+    /// signing key: it is held only until the next report and is never printed.
+    exports: Vec<(String, Result<String, String>)>,
     /// The store went missing on the last connection: the next one registers it first.
     register_first: bool,
     /// While the store could not be set up: when the app next registers it by itself, and
@@ -1510,6 +1524,13 @@ struct Rooms {
     register_retry: Option<(Instant, Duration)>,
     /// Keeping the delegate's copy of each room's signing key.
     keys: super::keys::KeySweep,
+    /// Imports that were stored, waiting for the room to show under the imported identity so
+    /// the room's record of that member can be checked ([`Rooms::run_heals`]). With how many
+    /// reports they have waited.
+    heals: Vec<(super::work::ImportDone, u32)>,
+    /// Rooms whose copy has taken a whole state from the network in this run, so what it holds
+    /// about the room's members is not only what the store had.
+    network_seen: HashSet<VerifyingKey>,
     /// River has moved on: nothing is written, and the screen says so.
     update_required: bool,
     /// The store needs registering, and waits for the first pointer check to settle.
@@ -1564,6 +1585,13 @@ impl Rooms {
                 Some(previous) => {
                     let mut fresh = LiveRoom::new(slot);
                     if fresh.contract_id() == previous.contract_id() {
+                        // A replaced identity with its member-info check waiting needs the
+                        // network's current state: ask for it again.
+                        if fresh.stored.self_verifying_key() != previous.stored.self_verifying_key()
+                            && self.heals.iter().any(|(d, _)| d.room == vk)
+                        {
+                            new_ids.push(fresh.contract_id());
+                        }
                         if let Err(e) = fresh.merge_state(&previous.stored.room_state) {
                             eprintln!("River: a room's earlier copy was not merged: {e}");
                             self.not_updated.insert(vk);
@@ -1634,6 +1662,11 @@ impl Rooms {
                     self.invites.push((room.key(), link));
                     changed = true;
                 }
+                Some(room) if command.action == Action::ExportId => {
+                    self.exports
+                        .push((room.key(), super::identity::export_token(room)));
+                    changed = true;
+                }
                 Some(room) => changed |= self.outbox.command(room, command.action),
                 // The read so far says nothing about this room (no store, nothing listed, or
                 // a slot that couldn't be read): it waits for a read that does.
@@ -1644,6 +1677,10 @@ impl Rooms {
                     eprintln!("River: a command for a room no longer shown was dropped");
                     if command.action == Action::Invite {
                         self.invites
+                            .push((command.room, Err("This room is no longer here.".into())));
+                        changed = true;
+                    } else if command.action == Action::ExportId {
+                        self.exports
                             .push((command.room, Err("This room is no longer here.".into())));
                         changed = true;
                     }
@@ -1732,6 +1769,14 @@ impl Rooms {
                 self.outbox
                     .work
                     .join(&code.0, &nickname, &|vk| shown.contains(vk));
+                true
+            }
+            Action::ImportId { token, replace } => {
+                let shown: HashSet<VerifyingKey> =
+                    self.list.iter().map(|r| r.stored.owner_vk).collect();
+                self.outbox
+                    .work
+                    .import_identity(&token, replace, &|vk| shown.contains(vk));
                 true
             }
             Action::RetryWork { id } => {
@@ -1906,6 +1951,10 @@ impl Rooms {
             .map_err(|e| format!("unreadable state: {e}"))
             .and_then(|incoming| room.merge_state(&incoming));
         let sent = self.outbox.reconcile(room);
+        if result.is_ok() {
+            let owner = room.stored.owner_vk;
+            self.network_seen.insert(owner);
+        }
         self.outcome(id, result) | sent
     }
 
@@ -1982,7 +2031,90 @@ impl Rooms {
         }
     }
 
+    /// The web UI's member-info heal after an identity import (river#414): an imported member
+    /// the room holds but holds no nickname record for would show as "Unknown" to everyone
+    /// else until they next change their nickname. Their record can only be signed with their
+    /// own key, so only this app can publish it: the nickname the token carries goes out as
+    /// the member's own record through the ordinary nickname path ([`Action::SetNickname`]),
+    /// which seals it in a private room and refuses without the secret. Not for the owner, and
+    /// not for a member the room does not hold (the first message adds them, as for any
+    /// pruned member). Without a nickname in the token nothing is invented.
+    fn run_heals(&mut self) {
+        for (done, waited) in std::mem::take(&mut self.heals) {
+            let Some(i) = self
+                .list
+                .iter()
+                .position(|r| r.stored.owner_vk == done.room)
+            else {
+                // Not shown: wait for it unless a complete read says it is gone.
+                if !self.complete {
+                    self.heals.push((done, waited));
+                }
+                continue;
+            };
+            if self.list[i].stored.self_verifying_key() != Some(done.identity) {
+                // The read that shows the new identity has not come yet.
+                if waited < 500 {
+                    self.heals.push((done, waited + 1));
+                }
+                continue;
+            }
+            // Decided only on a copy that has taken the network's state (a stored copy may lack
+            // a nickname record the room has, and a heal over it could replace a newer one), and,
+            // in a private room, once the secret is here (the nickname is sealed under it).
+            let ready = self.network_seen.contains(&done.room)
+                && !(self.list[i].is_private() && self.list[i].current_secret().is_none());
+            if !ready {
+                if waited < 500 {
+                    self.heals.push((done, waited + 1));
+                } else if done.nickname.is_some() {
+                    self.outbox.notice(
+                        &self.list[i],
+                        "Your nickname",
+                        "Your identity was imported, but the room's nickname for it could not be \
+                         checked yet, so none was published. Change your nickname to publish one."
+                            .to_owned(),
+                    );
+                }
+                continue;
+            }
+            let state = &self.list[i].stored.room_state;
+            let id = SelfId::from(&done.identity);
+            let stranded = done.identity != done.room
+                && state
+                    .members
+                    .members
+                    .iter()
+                    .any(|m| m.member.member_vk == done.identity)
+                && !state
+                    .member_info
+                    .member_info
+                    .iter()
+                    .any(|r| r.member_info.member_id == id);
+            if let (true, Some(nickname)) = (stranded, done.nickname) {
+                self.outbox
+                    .command(&self.list[i], Action::SetNickname { nickname });
+            }
+        }
+    }
+
     fn report(&mut self, status: LinkStatus, report: &dyn Fn(RoomsUpdate)) {
+        for done in self.outbox.work.take_done_imports() {
+            // The user chose this identity: the delegate's key for the room becomes it.
+            self.keys.authoritative(done.room, done.identity);
+            if done.fetched {
+                // An add reads the room from the network and stores it as read.
+                self.network_seen.insert(done.room);
+            } else {
+                // A replace keeps the stored state, which may be older than the network's: the
+                // heal waits for a read after this ([`Rooms::replace`] asks for one).
+                self.network_seen.remove(&done.room);
+            }
+            self.heals.push((done, 0));
+        }
+        if status == LinkStatus::Live {
+            self.run_heals();
+        }
         // A pick that was stored is the store's now; one that failed never was.
         let mut settled = Vec::new();
         for (vk, mode, stored) in self.outbox.work.settle_modes() {
@@ -2009,6 +2141,9 @@ impl Rooms {
         });
         for (room, link) in std::mem::take(&mut self.invites) {
             report(RoomsUpdate::Invite { room, link });
+        }
+        for (room, token) in std::mem::take(&mut self.exports) {
+            report(RoomsUpdate::Export { room, token });
         }
         // A finished task is shown once its room is in the list (so the screen can open it),
         // then it is done with.

@@ -65,6 +65,8 @@ struct App {
     work: Vec<river_app::rooms::work::WorkView>,
     modes: std::collections::HashMap<String, NotificationMode>,
     invites: Vec<(String, Result<String, String>)>,
+    /// Identity tokens reported, by room. The e2e holds them only as long as it needs them.
+    exports: Vec<(String, Result<String, String>)>,
     access: Option<Access>,
 }
 
@@ -95,6 +97,7 @@ impl App {
             work: Vec::new(),
             modes: Default::default(),
             invites: Vec::new(),
+            exports: Vec::new(),
             access: None,
         }
     }
@@ -135,6 +138,7 @@ impl App {
                     self.work = work;
                 }
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
+                RoomsUpdate::Export { room, token } => self.exports.push((room, token)),
                 RoomsUpdate::Status(_) => {}
             }
         }
@@ -267,6 +271,41 @@ fn stored_meta(authority: &str, dir: &Path) -> Result<StoredRoomsMeta, String> {
             }
             Ok(_) => {}
             Err(e) => return Err(format!("the node answered with an error: {e}")),
+        }
+    }
+}
+
+/// The bytes node `authority` holds in the chat delegate's storage for the room owned by the
+/// key `room_key` (the stored slot, as the web UI wrote it), asked on a connection of its own.
+fn stored_slot(authority: &str, dir: &Path, room_key: &str) -> Vec<u8> {
+    let bytes: [u8; 32] = bs58::decode(room_key)
+        .into_vec()
+        .expect("a base58 room key")
+        .try_into()
+        .expect("32 bytes");
+    let owner = VerifyingKey::from_bytes(&bytes).expect("the room key is the owner's key");
+    let token = TokenStore::in_dir(dir)
+        .load()
+        .expect("the app's grant token");
+    let mut socket = NodeSocket::connect(authority, &token, &Default::default()).expect("connect");
+    socket
+        .set_read_timeout(Duration::from_secs(10))
+        .expect("a read timeout");
+    socket
+        .send(&delegate::request(&Read::Get(room_storage_key(&owner))))
+        .expect("send");
+    loop {
+        match socket.recv().expect("recv") {
+            Ok(response @ HostResponse::DelegateResponse { .. }) => {
+                if let Some(ChatDelegateResponseMsg::GetResponse { value: Some(v), .. }) =
+                    delegate::answers(&response).pop()
+                {
+                    return v;
+                }
+                panic!("no stored room");
+            }
+            Ok(_) => {}
+            Err(e) => panic!("the node answered with an error: {e}"),
         }
     }
 }
@@ -824,6 +863,240 @@ fn room_details(alice: &mut App, bob: &mut App, name: &str, key: &str) {
     });
 }
 
+/// Moving an identity between the two nodes: export on A, import on B.
+///
+/// First a room node B's store does not hold: A's app creates it and exports its identity (the
+/// owner's), B's app imports it (adding the room, read from the network), shows it, and sends in
+/// it as that same member, which A's app sees as its own member's message. Then a room B's app
+/// already holds (as Bob): importing without saying replace is refused and changes nothing;
+/// replacing swaps the identity, so B's app now writes as A's member. A token that does not
+/// check is refused before anything is sent.
+fn moving_an_identity(
+    alice: &mut App,
+    bob: &mut App,
+    existing: &str,
+    existing_key: &str,
+    bob_authority: &str,
+    bob_dir: &Path,
+) {
+    const MOVED: &str = "Moving room";
+    alice.send(
+        "",
+        Action::CreateRoom {
+            name: MOVED.into(),
+            nickname: "Alice".into(),
+            private: false,
+        },
+    );
+    alice.until("node A creates the room to move", |app| {
+        app.room(MOVED).is_some()
+    });
+    let moved_key = alice.room(MOVED).unwrap().key.clone();
+    let alice_me = alice.room(MOVED).unwrap().me;
+    alice.exports.clear();
+    alice.send(&moved_key, Action::ExportId);
+    alice.until("node A makes the identity token", |app| {
+        !app.exports.is_empty()
+    });
+    let token = match alice.exports.pop().unwrap() {
+        (room, Ok(t)) if room == moved_key => t,
+        other => panic!("no token: {:?}", other.1.map(|_| "<token>")),
+    };
+    assert!(token.starts_with("-----BEGIN RIVER IDENTITY-----"));
+    assert!(
+        bob.room(MOVED).is_none(),
+        "node B does not hold the room yet"
+    );
+
+    // A token that does not check is refused before anything is sent.
+    bob.send(
+        "",
+        Action::ImportId {
+            token: river_app::rooms::IdentityToken(
+                "-----BEGIN RIVER IDENTITY-----\nabc\n-----END RIVER IDENTITY-----".into(),
+            ),
+            replace: false,
+        },
+    );
+    bob.until("node B refuses a bad token", |app| {
+        app.work
+            .iter()
+            .any(|t| matches!(&t.state, WorkState::Failed { why, retry: false } if why.starts_with("Invalid token")))
+    });
+    let bad = bob
+        .work
+        .iter()
+        .find(|t| matches!(t.state, WorkState::Failed { .. }))
+        .unwrap()
+        .id;
+    bob.send("", Action::DismissWork { id: bad });
+    bob.until("the refusal is dismissed", |app| app.work.is_empty());
+
+    bob.send(
+        "",
+        Action::ImportId {
+            token: river_app::rooms::IdentityToken(token),
+            replace: false,
+        },
+    );
+    bob.until("node B imports the room and shows it", |app| {
+        if let Some(t) = app
+            .work
+            .iter()
+            .find(|t| matches!(t.state, WorkState::Failed { .. }))
+        {
+            panic!("importing failed: {t:?}");
+        }
+        app.room(MOVED).is_some_and(|r| r.send_block.is_none())
+    });
+    assert_eq!(bob.room(MOVED).unwrap().me, alice_me, "B is A's member now");
+    let text = "Sent from node B as the moved identity";
+    bob.send(
+        &moved_key,
+        Action::Send {
+            text: text.into(),
+            reply_to: None,
+        },
+    );
+    alice.until("node A sees B's message as its own member's", |app| {
+        app.room(MOVED).is_some_and(|r| {
+            r.messages
+                .iter()
+                .any(|m| m.text == text && m.author == alice_me)
+        })
+    });
+
+    // A room B already holds: not replaced unless the user says so.
+    alice.exports.clear();
+    alice.send(existing_key, Action::ExportId);
+    alice.until(
+        "node A makes the owner's token for the shared room",
+        |app| !app.exports.is_empty(),
+    );
+    let owners = match alice.exports.pop().unwrap() {
+        (room, Ok(t)) if room == existing_key => t,
+        other => panic!("no token: {:?}", other.1.map(|_| "<token>")),
+    };
+    let alice_existing_me = alice.room(existing).unwrap().me;
+    let bobs_before = bob.room(existing).unwrap().me;
+    // Bob's own token for the shared room, to put his identity back at the end.
+    bob.exports.clear();
+    bob.send(existing_key, Action::ExportId);
+    bob.until("node B makes its own member's token", |app| {
+        !app.exports.is_empty()
+    });
+    let bobs_token = match bob.exports.pop().unwrap() {
+        (room, Ok(t)) if room == existing_key => t,
+        other => panic!("no token: {:?}", other.1.map(|_| "<token>")),
+    };
+    let slot_before = stored_slot(bob_authority, bob_dir, existing_key);
+    bob.send(
+        "",
+        Action::ImportId {
+            token: river_app::rooms::IdentityToken(owners.clone()),
+            replace: false,
+        },
+    );
+    bob.until("node B refuses to replace without being told to", |app| {
+        app.work.iter().any(|t| {
+            matches!(&t.state, WorkState::Failed { why, retry: false } if why.contains("already have"))
+        })
+    });
+    assert_eq!(
+        bob.room(existing).unwrap().me,
+        bobs_before,
+        "nothing changed"
+    );
+    assert_eq!(
+        stored_slot(bob_authority, bob_dir, existing_key),
+        slot_before,
+        "the refused import left the stored slot exactly as it was"
+    );
+    let refused = bob
+        .work
+        .iter()
+        .find(|t| matches!(t.state, WorkState::Failed { .. }))
+        .unwrap()
+        .id;
+    bob.send("", Action::DismissWork { id: refused });
+    bob.until("the refusal is dismissed", |app| app.work.is_empty());
+
+    bob.send(
+        "",
+        Action::ImportId {
+            token: river_app::rooms::IdentityToken(owners),
+            replace: true,
+        },
+    );
+    bob.until(
+        "node B's app is the owner's member in the shared room",
+        |app| {
+            app.room(existing)
+                .is_some_and(|r| r.me == alice_existing_me)
+        },
+    );
+    let text = "Sent from node B after replacing its identity";
+    bob.send(
+        existing_key,
+        Action::Send {
+            text: text.into(),
+            reply_to: None,
+        },
+    );
+    alice.until(
+        "node A sees the replaced identity's message as its own member's",
+        |app| {
+            app.room(existing).is_some_and(|r| {
+                r.messages
+                    .iter()
+                    .any(|m| m.text == text && m.author == r.me)
+            })
+        },
+    );
+
+    // And back: Bob's own token, with his nickname record in it, replaces the owner's. Node A's
+    // app sees his message under his name again.
+    bob.send(
+        "",
+        Action::ImportId {
+            token: river_app::rooms::IdentityToken(bobs_token),
+            replace: true,
+        },
+    );
+    bob.until("node B's app is Bob again", |app| {
+        app.room(existing).is_some_and(|r| r.me == bobs_before)
+    });
+    let text = "Sent from node B as Bob again";
+    bob.send(
+        existing_key,
+        Action::Send {
+            text: text.into(),
+            reply_to: None,
+        },
+    );
+    alice.until("node A shows Bob's message under his nickname", |app| {
+        app.room(existing).is_some_and(|r| {
+            r.messages.iter().any(|m| {
+                m.text == text
+                    && r.members
+                        .iter()
+                        .any(|mem| mem.id == m.author && mem.nickname == "Bob Two")
+            })
+        })
+    });
+
+    // A room that was imported is left like any other, and stays left: this also leaves node
+    // B with only the rooms the steps after this expect.
+    leave_room(
+        bob,
+        bob_authority,
+        bob_dir,
+        MOVED,
+        &moved_key,
+        Some(existing),
+    );
+}
+
 /// A fresh store: registered (not missing), with no rooms.
 fn ready_and_empty(app: &App) -> bool {
     app.access == Some(Access::Ready) && app.rooms.is_empty() && !app.issues.store_missing
@@ -991,6 +1264,7 @@ fn main() {
 
     room_details(&mut alice, &mut bob, ROOM, &key);
     notification_modes(&mut alice, a, &dir_a, ROOM, &key);
+    moving_an_identity(&mut alice, &mut bob, ROOM, &key, b, &dir_b);
 
     // A member leaves, then the owner leaves: each room is gone for good in its own app.
     leave_room(&mut bob, b, &dir_b, PRIVATE, &pkey, Some(ROOM));

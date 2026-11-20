@@ -50,6 +50,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         .child(rooms(chat, logo, narrow, &p, &k));
     let mut layer = Vec::new();
     dialogs(chat, &k, &mut layer);
+    super::identity::export_dialog(chat, &k, &mut layer);
     screen = screen.child(link_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
@@ -132,6 +133,9 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     let Some(kind) = chat.form.open else {
         return;
     };
+    if kind == DialogKind::Import {
+        return super::identity::import_dialog(chat, k, layer);
+    }
     let (key, title, description, submit_label, submit): (_, _, _, _, fn(&mut RiverApp)) =
         match kind {
             DialogKind::Create => (
@@ -148,6 +152,7 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 "Join room",
                 |s| s.chat.submit_join(),
             ),
+            DialogKind::Import => unreachable!("handled above"),
         };
     let field = |key: &str, label: &str, placeholder: &str, edit: &rune::TextEdit, get: Get| {
         TextInput::new(edit)
@@ -163,6 +168,7 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     };
     let mut body = col().key("form").w_full().px(16.0).pb(16.0).gap(12.0);
     match kind {
+        DialogKind::Import => unreachable!("handled above"),
         DialogKind::Create => {
             body = body
                 .child(field(
@@ -331,6 +337,7 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         list = list.child(room_row(room, chat.unread_of(room), selected, width, p));
     }
     let enter = outlined("enter-invite", "Enter invite code", &icons::INVITE, 34.0, p);
+    let import = outlined("import-id", "Import ID", &icons::IMPORT, 34.0, p);
     let mut footer = col()
         .key("rooms-footer")
         .px(12.0)
@@ -344,6 +351,14 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
                 .on_press(|s: &mut RiverApp| s.chat.open_dialog(DialogKind::Join))
         } else {
             not_yet(enter)
+        })
+        .child(if chat.can_change_rooms() {
+            import
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                .on_press(|s: &mut RiverApp| s.chat.open_import())
+        } else {
+            not_yet(import)
         });
     for w in &chat.work {
         footer = footer.child(work_row(w, p, k));
@@ -738,6 +753,26 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
             .on_press(|s: &mut RiverApp| s.chat.invite())
     } else {
         not_yet(invite)
+    });
+    // Quiet and secondary, below the invite, as the web UI's.
+    let export = row()
+        .key("export-id")
+        .role("button")
+        .label("Export ID")
+        .w_full()
+        .h(28.0)
+        .gap(6.0)
+        .radius(8.0)
+        .center()
+        .child(icon(&icons::EXPORT, 13.0).color(p.text_muted))
+        .child(label("Export ID", st::SMALL_STRONG, p.text_muted));
+    footer = footer.child(if chat.can_change_rooms() {
+        export
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.open_export())
+    } else {
+        not_yet(export)
     });
     match chat.open_invite() {
         None => {}
