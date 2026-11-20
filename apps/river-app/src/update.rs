@@ -738,21 +738,24 @@ mod tests {
     }
 
     #[test]
-    fn an_update_notice_held_back_by_do_not_disturb_is_announced_after_it() {
+    fn an_update_notice_held_back_by_do_not_disturb_is_shown_once_after_it() {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.dnd.pinned = true;
         s.chat.dnd.settings.manual = true;
-        let ready = || {
-            UpdateEvent::Status(UpdateStatus::Ready {
-                version: "0.2.0".into(),
-            })
-        };
-        s.apply_update(ready());
+        s.apply_update(UpdateEvent::Status(UpdateStatus::Ready {
+            version: "0.2.0".into(),
+        }));
+        s.flush_held(std::time::Instant::now());
         assert!(rec.0.borrow().is_empty());
         s.chat.dnd.settings.manual = false;
-        s.apply_update(ready());
+        s.flush_held(std::time::Instant::now());
         assert_eq!(rec.0.borrow().len(), 1);
+        s.flush_held(std::time::Instant::now());
+        s.apply_update(UpdateEvent::Status(UpdateStatus::Ready {
+            version: "0.2.0".into(),
+        }));
+        assert_eq!(rec.0.borrow().len(), 1, "announced once");
     }
 
     // The screen ---------------------------------------------------------------------------

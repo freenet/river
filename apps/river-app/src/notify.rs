@@ -101,6 +101,20 @@ pub struct Arrival {
     pub quiet: bool,
 }
 
+impl Arrival {
+    /// How much the message shown matters when arrivals are merged: a mention, then a reply
+    /// to you, then anything else. The same order [`arrivals`] picks the message shown by.
+    fn rank(&self) -> u8 {
+        if self.mention {
+            2
+        } else if self.for_me_count > 0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// `text` for a notification: hidden and control characters (including the ones that reverse
 /// text direction) dropped, whitespace runs collapsed, cut to `max` characters.
 fn tidy(text: &str, max: usize) -> String {
@@ -205,7 +219,7 @@ impl RoomClock {
             Some(h) => {
                 h.count += a.count;
                 h.for_me_count += a.for_me_count;
-                if a.mention || !h.mention {
+                if a.rank() >= h.rank() {
                     h.message_key = a.message_key;
                     h.text = a.text;
                     h.author = a.author;
@@ -332,8 +346,9 @@ impl Limiter {
             if let Some(h) = clock.held.take() {
                 a.count += h.count;
                 a.for_me_count += h.for_me_count;
-                if h.mention && !a.mention {
-                    a.mention = true;
+                let take = h.rank() > a.rank();
+                a.mention |= h.mention;
+                if take {
                     a.message_key = h.message_key;
                     a.text = h.text;
                     a.author = h.author;
@@ -796,6 +811,28 @@ mod tests {
             n[1]
         );
         assert!(n[1].mention);
+    }
+
+    #[test]
+    fn a_held_reply_stays_the_message_shown_when_plain_ones_are_held_after_it() {
+        let (mut s, rec, rooms) = live();
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.now = 12 * 60;
+        s.chat.dnd.settings.allow_mentions = true;
+        let me = rooms[0].me;
+        let t0 = minute_later();
+        let a = with(&rooms, 1, vec![from_other(&rooms[1], "a", "one")]);
+        deliver_at(&mut s, a.clone(), t0);
+        let b = with(&a, 1, vec![reply_to(&rooms[1], "rep", me)]);
+        deliver_at(&mut s, b.clone(), t0 + Duration::from_secs(1));
+        let c = with(&b, 1, vec![from_other(&rooms[1], "p", "plain")]);
+        deliver_at(&mut s, c, t0 + Duration::from_secs(2));
+        s.chat.dnd.settings.manual = true;
+        s.flush_held(t0 + ROOM_COOLDOWN + Duration::from_secs(5));
+        let n = shown(&rec);
+        assert_eq!(n.len(), 2, "{n:?}");
+        assert_eq!(n[1].count, 1);
+        assert_eq!(n[1].message_key, "rep");
     }
 
     #[test]

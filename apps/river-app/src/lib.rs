@@ -71,6 +71,9 @@ pub struct RiverApp {
     /// Whether do not disturb is kept in this device's preferences. Off in snapshots and tests,
     /// which must not write the real ones.
     dnd_persist: bool,
+    /// An update notice do not disturb held back, shown once it is off (and the window is not
+    /// in front, which counts as told).
+    pending_notice: Option<(String, String)>,
     /// Whether a private room's notification may show the message text. Off unless the
     /// `notification_previews` preference is set (there is no switch for it yet).
     private_previews: bool,
@@ -122,26 +125,59 @@ fn load_logo(s: &mut RiverApp, waker: rune::Waker) {
     });
 }
 
-/// Save one preference. `Prefs` rewrites the whole file from what it loaded, so this loads it
-/// again, sets the key and saves in one step: a key saved by another part of the app since
-/// startup is kept. It writes nothing when the file exists but cannot be read (a sharing
-/// violation, say), because the empty store `Prefs::open` falls back to would erase the other
-/// keys. There is no lock against another River process writing at the same moment.
+/// Save one preference into this app's preferences file (none: nothing is saved). The file is
+/// read ONCE, merged with the key and written back atomically, so a key saved by another
+/// part of the app since startup is kept. A file that exists but cannot be read or parsed (a
+/// sharing violation, say) is left alone: writing then would erase the other keys. There is
+/// no lock against another River process writing at the same moment. The crate has no
+/// `tracing`, so failures go to stderr as elsewhere in it.
 fn save_pref<T: serde::Serialize + ?Sized>(key: &str, value: &T) {
-    let mut prefs = rune::prefs::Prefs::open("org.freenet.River");
-    if let Some(path) = prefs.path()
-        && let Err(e) = std::fs::read(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "River: not saving {key}: couldn't read {}: {e}",
-            path.display()
-        );
+    let Some(path) = rune::prefs::Prefs::open("org.freenet.River")
+        .path()
+        .map(std::path::Path::to_path_buf)
+    else {
         return;
-    }
-    if let Err(e) = prefs.set(key, value) {
+    };
+    if let Err(e) = merge_pref(&path, key, value) {
         eprintln!("River: couldn't save {key}: {e}");
     }
+}
+
+fn merge_pref<T: serde::Serialize + ?Sized>(
+    path: &std::path::Path,
+    key: &str,
+    value: &T,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut map: serde_json::Map<String, serde_json::Value> = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{} is not readable as preferences: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => return Err(format!("couldn't read {}: {e}", path.display())),
+    };
+    map.insert(
+        key.to_owned(),
+        serde_json::to_value(value).map_err(|e| e.to_string())?,
+    );
+    let json = serde_json::to_vec_pretty(&map).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let done = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&json)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 impl RiverApp {
@@ -164,6 +200,7 @@ impl RiverApp {
             reported_unread: None,
             limiter: Default::default(),
             dnd_persist: false,
+            pending_notice: None,
             private_previews: false,
             node_generation: 0,
             pending_save: None,
@@ -232,6 +269,7 @@ impl RiverApp {
             reported_unread: None,
             limiter: Default::default(),
             dnd_persist: true,
+            pending_notice: None,
             private_previews: prefs.get("notification_previews").unwrap_or(false),
             node_generation: link_generation,
             pending_save: None,
@@ -265,27 +303,16 @@ impl RiverApp {
         match event {
             UpdateEvent::Notice(text) => self.chat.update.notice = Some(text),
             UpdateEvent::Status(status) => {
-                let before = self.chat.update.announced.clone();
                 if let Some((title, body)) = self.chat.update.apply(status)
                     && !self.focused
                 {
-                    if !self.dnd_allows(false) {
-                        // Held back by do not disturb: leave the version unannounced so the
-                        // next status for it, once DND is off, still tells the person.
-                        self.chat.update.announced = before;
-                        return;
+                    if self.dnd_allows(false) {
+                        self.send_update_notice(title, body);
+                    } else {
+                        // `Ready` is sent once per download, so there may be no later status
+                        // to announce it: keep it until do not disturb is off.
+                        self.pending_notice = Some((title, body));
                     }
-                    // Not a room's notification: nothing to open when it is clicked.
-                    self.notifier.notify(notify::Notification {
-                        room_key: "river-update".into(),
-                        room_name: "River".into(),
-                        title,
-                        body,
-                        mention: false,
-                        count: 1,
-                        message_key: String::new(),
-                        actions: false,
-                    });
                 }
             }
         }
@@ -384,6 +411,32 @@ impl RiverApp {
         });
     }
 
+    /// Not a room's notification: nothing to open when it is clicked.
+    fn send_update_notice(&mut self, title: String, body: String) {
+        self.notifier.notify(notify::Notification {
+            room_key: "river-update".into(),
+            room_name: "River".into(),
+            title,
+            body,
+            mention: false,
+            count: 1,
+            message_key: String::new(),
+            actions: false,
+        });
+    }
+
+    /// Show the update notice do not disturb held back, once, when it allows. A window in
+    /// front shows the update block itself, which counts as told.
+    fn flush_pending_notice(&mut self) {
+        if self.pending_notice.is_some()
+            && self.dnd_allows(false)
+            && let Some((title, body)) = self.pending_notice.take()
+            && !self.focused
+        {
+            self.send_update_notice(title, body);
+        }
+    }
+
     /// Whether do not disturb lets a notification through (`mention`: it is about a message
     /// that mentions you). Unread counts do not depend on this.
     fn dnd_allows(&mut self, mention: bool) -> bool {
@@ -401,6 +454,7 @@ impl RiverApp {
     /// the saved copy, and a wake-up while a schedule is set so the indicator changes on time.
     fn sync_dnd(&mut self, tx: &mut Tx) {
         self.refresh_dnd_clock();
+        self.flush_pending_notice();
         self.chat.dnd.sync_inputs();
         if let Some(settings) = self.chat.dnd.take_dirty()
             && self.dnd_persist
@@ -442,6 +496,7 @@ impl RiverApp {
     /// Show held-back notifications whose cooldown has ended, for a room that went quiet.
     pub(crate) fn flush_held(&mut self, now: std::time::Instant) {
         self.drop_read_held();
+        self.flush_pending_notice();
         self.dnd_filter_held();
         let due = self.limiter.admit(Vec::new(), now);
         self.show(due, now);
@@ -3361,6 +3416,21 @@ mod tests {
             invitation_secrets: Default::default(),
         };
         (export.to_armored_string(), owner.verifying_key())
+    }
+
+    #[test]
+    fn saving_one_preference_keeps_the_others_and_never_overwrites_an_unreadable_file() {
+        let dir = std::env::temp_dir().join(format!("river-prefs-test-{}", std::process::id()));
+        let path = dir.join("prefs.json");
+        merge_pref(&path, "a", &1).unwrap();
+        merge_pref(&path, "b", &true).unwrap();
+        let both: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(both, serde_json::json!({"a": 1, "b": true}));
+        std::fs::write(&path, "not json").unwrap();
+        assert!(merge_pref(&path, "c", &2).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

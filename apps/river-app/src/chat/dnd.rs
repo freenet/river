@@ -220,14 +220,24 @@ impl DndUi {
             (Some(start), Some(end)) => {
                 self.error = None;
                 let new = Schedule { start, end };
+                let editing = self.start.focused || self.end.focused;
                 if self.settings.schedule != Some(new) {
                     self.settings.schedule = Some(new);
                     self.last_schedule = new;
                     self.times_pending = true;
                 }
+                // Saved once typing pauses (neither field has the cursor), and at the latest
+                // when the dialog closes: not on every keystroke.
+                if self.times_pending && !editing {
+                    self.times_pending = false;
+                    self.dirty = true;
+                }
             }
             _ => {
-                self.error = Some("Times are 24 hour, like 22:00 or 7:30.".into());
+                self.error = Some(
+                    "Times are 24 hour, like 22:00 or 7:30. To discard the schedule, turn it off."
+                        .into(),
+                );
             }
         }
     }
@@ -490,6 +500,7 @@ mod tests {
         ui.settings.schedule = Some(DEFAULT_SCHEDULE);
         ui.fill_inputs();
         ui.start.replace_text("23:30");
+        ui.start.focused = true;
         ui.sync_inputs();
         assert_eq!(
             ui.settings.schedule,
@@ -500,6 +511,10 @@ mod tests {
         );
         assert!(ui.error.is_none());
         assert!(ui.take_dirty().is_none(), "typing alone does not save");
+        ui.start.focused = false;
+        ui.sync_inputs();
+        assert!(ui.take_dirty().is_some(), "saved once typing pauses");
+        assert!(ui.take_dirty().is_none());
         ui.end.replace_text("soon");
         ui.sync_inputs();
         assert_eq!(
