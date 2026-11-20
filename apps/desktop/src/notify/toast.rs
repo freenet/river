@@ -134,8 +134,10 @@ impl Backend {
         if n.actions {
             // Buttons only: the toast crate under notify-rust cannot make a text field, so
             // Reply opens the room with the composer ready.
-            note.action(ACTION_REPLY, "Reply")
-                .action(ACTION_MARK_READ, "Mark as read");
+            if n.reply {
+                note.action(ACTION_REPLY, "Reply");
+            }
+            note.action(ACTION_MARK_READ, "Mark as read");
         }
         let shown = match note.show() {
             Ok(shown) => shown,

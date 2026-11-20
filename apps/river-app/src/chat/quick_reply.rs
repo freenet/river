@@ -51,7 +51,7 @@ pub(super) fn appended(old: &str, add: &str) -> String {
 }
 
 /// The key notices for a room that is gone are kept under (there is no room to show them in).
-const NO_ROOM: &str = "";
+pub(super) const NO_ROOM: &str = "";
 
 impl Chat {
     /// Send `text` to the room keyed `room_key` as a plain message (not a reply to one: a

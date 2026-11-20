@@ -564,3 +564,50 @@ fn the_invitation_is_in_nothing_the_session_keeps_prints_or_saves() {
         .to_owned();
     assert_eq!(entry, format!("[Invitation] {NOTE}"));
 }
+
+/// Detection of new direct messages on the session's own snapshots: what the room held when it
+/// was first read is not news, a message received afterwards is, once, and the session handing
+/// the same threads over again after a re-read is not.
+#[test]
+fn a_received_message_is_news_once_on_the_sessions_own_snapshots() {
+    use crate::chat::dm_view::DmUi;
+
+    // Messages in this fixture are signed at 1_700_000_200.
+    const NOW: u64 = 1_700_000_300;
+    let (mut rooms, f, carrier, _target, _peer) = two_rooms();
+    let mut ui = DmUi::default();
+
+    // A DM the room already holds at the first read: seeded, silent, unread by no one.
+    receive(&mut rooms, &f);
+    let first = rooms.dm_snapshot().expect("the first report");
+    assert!(
+        first.room_keys.contains(&carrier),
+        "the room was read from the network"
+    );
+    ui.apply_at(first, NOW);
+    assert!(ui.take_arrivals().is_empty(), "seeded when the room is met");
+
+    // One received afterwards notifies.
+    receive(&mut rooms, &f);
+    let second = rooms.dm_snapshot().expect("a new message");
+    ui.apply_at(second, NOW);
+    let news = ui.take_arrivals();
+    assert_eq!(news.len(), 1);
+    assert_eq!(news[0].count, 1);
+    assert_eq!(news[0].room, carrier);
+    assert!(
+        news[0].preview.starts_with("Invitation to "),
+        "{}",
+        news[0].preview
+    );
+
+    // The session reads the rooms again and hands the same threads over: nothing is new.
+    rooms.dm_sent = None;
+    let again = rooms.dm_snapshot().expect("handed over again");
+    ui.apply_at(again, NOW);
+    assert!(ui.take_arrivals().is_empty());
+    rooms.dm_memo.clear();
+    rooms.dm_sent = None;
+    ui.apply_at(rooms.dm_snapshot().expect("rebuilt"), NOW);
+    assert!(ui.take_arrivals().is_empty());
+}

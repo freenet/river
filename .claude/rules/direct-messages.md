@@ -324,6 +324,51 @@ plaintext in the chat delegate.
   message must add a new member (an invitee key the room holds already is refused), an
   invitation is size-bounded before it is decoded, and the note shown is cleaned of hidden and
   reordering characters.
+- **Native app notifications** (`apps/river-app`, `src/chat/dm_view.rs` `DmUi::find_arrivals`,
+  `src/notify.rs`, `src/notify_actions.rs`): unlike the web UI, the native app DOES raise an OS
+  notification for a new DM (Ian's decision, PARITY-PLAN item 4). A message is news only when its
+  purge token was never in a snapshot of a met room (`KnownTokens`: a reconnect re-delivery, a
+  thread leaving and re-entering a snapshot, or a deletion that lagged and came back is not news;
+  what a room held when met is seeded and never notifies), it is inbound from a current member,
+  its SIGNED time is at most `MAX_NOTIFY_AGE_SECS` (1 hour) before now (older ones, from a stale
+  first state or a long outage, count as unread but stay quiet; a time in the future counts as
+  recent, so a forger only ever gets one notification per token; clock skew applies: a sender whose clock is more than an hour behind never notifies the receiver, and a receiver whose clock is fast does the same, unread still counting), the thread is not archived (a
+  message past the archive cutoff revives it and notifies), no deletion of that peer's messages is
+  waiting, and the row opened. A row that cannot be opened (placeholder) is unread, never
+  remembered as known, and notifies once it opens if still recent. `network_seen` is set by the
+  first successful merge of any network state, which can be a node's older copy, so a later
+  fresher state can bring messages the user never saw here; the age bound limits their
+  notifications to the last hour.
+  **Privacy.** With the `notification_previews` preference off (its default; no switch exists yet)
+  the limiter's `notify::Arrival` and every `Notification` built from it hold no sender, no text
+  and no room name: title `River`, body `New direct message` (`N new direct messages` for
+  several), no Reply button or reply field (the sender is hidden; click and Mark as read stay).
+  This is true of the `Arrival`, not of everything on the way: the `DmArrival` in `DmUi.arrivals`
+  holds the peer's name and a bounded preview until the next `RoomsUpdate::Dms` drains it, and
+  the thread view model holds the text throughout. The notification KEY, `dm:<room key>:<peer
+  FULL member id>` (`notify::dm_target`), is stored in OS notification identifiers (the macOS
+  identifier, the xdg id map), so previews off hides what is DISPLAYED, not that a DM exists in a
+  room. On, the title is `<nickname> · direct message` and the body a bounded plain-text preview
+  (markdown stripped), or `Invitation to <room label>`; never an invitation payload (the view
+  model holds none). The room's name is never shown. Nothing is logged.
+  **Flood bound.** A DM cannot be told from a flood by sender (there is no block feature), so DM
+  notifications are limited: the room cooldown (30 s) per thread, at most `DM_PER_ROOM` (3) per
+  room per `DM_CAP_WINDOW` (a minute; the rest are held and counted into one notification when it
+  frees), and DMs rank below real mentions for the shared per-minute budget. Residual: a member
+  can still use the DM share of that budget (up to 3 a minute per room); muting the room is the
+  control. A summary of many threads (`N new direct messages`, key `river-dm-summary`) names no
+  one, never replaces a thread's notification, and its click only raises the window.
+  **Rules.** `Muted` raises none (and wins over do not disturb); `MentionsAndReplies` still lets a
+  DM through, since it is addressed to the user; do not disturb treats it as "for me" (so "allow
+  mentions through" passes it, and a held one is dropped while it is on otherwise); none while
+  that thread is open and the window is in front (an unknown focus counts as in front, as for
+  marking read). Click opens the thread; the reply field sends through the composer's checks
+  (`Chat::send_dm_reply`) and NEVER touches the open thread's live box: a refused reply (and a
+  later refusal from the background work) goes to a per-thread stash merged into the draft when
+  the thread is left by ANY path (Back, choosing a room, the room or peer going: `Chat::leave_dm` is the one place `dm.open` is cleared), or at once for a thread that is not open; text that does not fit the draft then stays in the stash, never dropped; a send from a notification never
+  clears the box when it is answered, and an identical reply after an unanswered one is refused
+  rather than sent twice (the thread's own box asks to confirm, as for its own sends). Mark as read reads the thread up to the message shown. The window title
+  and tray count include DM unread, except for muted rooms and archived threads.
 - **Native app archive** (`apps/river-app`, `src/rooms/dm_archive.rs`, `src/chat/dm_archive.rs`):
   the same data and rules as the web UI, written by the same compare-and-swap as the sent text but
   in writes of their own, with their own pacing (`DmOp::Archive`: add or raise an entry, remove
@@ -387,8 +432,8 @@ wall-clock time.
 timestamp is our local wall clock — so a thread where we replied last would be
 archived against OUR clock while the gate below compares a SENDER's timestamp,
 and a peer DM already in flight across the click would land at or below the
-cutoff and vanish from the rail, the unread badge, and everything else (DMs
-raise no notification). Our own sends revive the thread through the
+cutoff and vanish from the rail, the unread badge, and everything else (the web UI
+raises no notification for a DM; the native app does, see "Native app notifications"). Our own sends revive the thread through the
 unconditional `unhide_dm_thread` in `do_send` / `send_structured_dm` — on the
 SENDING DEVICE only: hydration never propagates a removal, and `riverctl dm
 send` does not call it, so archiving on a laptop and replying from a phone

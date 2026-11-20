@@ -82,6 +82,13 @@ struct App {
     dm_purges: usize,
     /// The archive list as last reported.
     dm_archived: Vec<river_app::chat::dm_model::DmArchived>,
+    /// The window's own direct-message state, fed every snapshot as the app feeds it, and the
+    /// new messages it found (what the app turns into notifications), oldest first.
+    dm_ui: river_app::chat::dm_view::DmUi,
+    /// Rooms the snapshots listed as read from the network (met): what arrives in one afterwards
+    /// is news, so a test waits for it before it sends.
+    dm_met: std::collections::HashSet<String>,
+    dm_news: Vec<river_app::chat::DmArrival>,
     access: Option<Access>,
 }
 
@@ -120,6 +127,9 @@ impl App {
             dm_invite_results: Vec::new(),
             dm_purges: 0,
             dm_archived: Vec::new(),
+            dm_ui: Default::default(),
+            dm_met: Default::default(),
+            dm_news: Vec::new(),
             access: None,
         }
     }
@@ -163,6 +173,9 @@ impl App {
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
                 RoomsUpdate::Export { room, token } => self.exports.push((room, token)),
                 RoomsUpdate::Dms(snapshot) => {
+                    self.dm_met.extend(snapshot.room_keys.iter().cloned());
+                    self.dm_ui.apply(snapshot.clone());
+                    self.dm_news.extend(self.dm_ui.take_arrivals());
                     self.dm_purges = snapshot.purges.len();
                     self.dm_archived = snapshot.archived;
                     self.dms = snapshot.threads;
@@ -500,6 +513,14 @@ fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
             .iter()
             .any(|(t, r)| *t == 1 && r.as_ref().is_err_and(|e| e.contains("Write something")))
     });
+    // B must have read the room from the network first: what is in a room when it is first read
+    // is seeded as seen, so a message sent before that is not news.
+    bob.until("node B has read the room from the network", |app| {
+        app.dm_met.contains(key)
+    });
+    alice.until("node A has read the room from the network", |app| {
+        app.dm_met.contains(key)
+    });
     alice.send(
         key,
         Action::SendDm {
@@ -517,6 +538,13 @@ fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
     bob.until("node B opens node A's direct message", |app| {
         app.dm_text(key, &alice_in_b, from_a, false)
     });
+    // What the app would notify about: B got one new message, in that thread, and A (which only
+    // sent so far) got none. A's own sends are never news.
+    assert_eq!(bob.dm_news.len(), 1, "B: {:?}", bob.dm_news);
+    assert_eq!(bob.dm_news[0].count, 1);
+    assert_eq!(bob.dm_news[0].peer_key, alice_in_b);
+    assert!(bob.dm_news[0].room == key && !bob.dm_news[0].preview.is_empty());
+    assert!(alice.dm_news.is_empty(), "A: {:?}", alice.dm_news);
     // A second later: two messages in one second are ordered by purge token, so the order sent
     // is only the order shown when their times differ.
     std::thread::sleep(Duration::from_millis(1100));
@@ -537,6 +565,14 @@ fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
     alice.until("node A opens node B's direct message", |app| {
         app.dm_text(key, &bob_in_a, from_b, false)
     });
+    assert_eq!(alice.dm_news.len(), 1, "A: {:?}", alice.dm_news);
+    assert_eq!(alice.dm_news[0].peer_key, bob_in_a);
+    assert_eq!(
+        bob.dm_news.len(),
+        1,
+        "B's own send is not news: {:?}",
+        bob.dm_news
+    );
     // Both threads hold both messages, A's first (it was sent and settled before B's), and the
     // sender's view of what it sent is the text and not a placeholder.
     for (app, peer) in [(&*alice, &bob_in_a), (&*bob, &alice_in_b)] {

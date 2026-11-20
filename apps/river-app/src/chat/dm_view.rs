@@ -7,8 +7,9 @@
 //!
 //! What it takes care over:
 //!
-//! - **Privacy.** Nothing here logs, and no title, notification or status text is made from a
-//!   thread. Everything a peer controls (nickname, an invitation's note and room label) is drawn
+//! - **Privacy.** Nothing here logs, and no title or status text is made from a thread. A
+//!   notification for a new message is built by `notify::dm_arrival`, which leaves out the sender
+//!   and the text unless the previews setting is on. Everything a peer controls (nickname, an invitation's note and room label) is drawn
 //!   as plain text. A message's text is drawn as the room's markdown, as the web UI does. The
 //!   rail's preview is a bounded plain line that holds no invitation payload (the view model
 //!   has none).
@@ -39,12 +40,13 @@ use rune_kit::{Button, ButtonVariant, Kit};
 
 use super::Chat;
 use super::conversation::{day_divider, message_body};
-use super::dm_model::{DmBody, DmMessage, DmSnapshot, DmThread, Placeholder};
+use super::dm_model::{DmArrival, DmBody, DmMessage, DmSnapshot, DmThread, Placeholder};
 use super::icons;
 use super::model::{self, MINUTES_PER_DAY, Message};
 use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label};
 use crate::RiverApp;
+use crate::rooms::modes::NotificationMode;
 use crate::rooms::room::local_minutes_of_secs;
 
 /// The most deletions whose messages are waited for to leave the read positions.
@@ -129,8 +131,56 @@ pub struct DmUi {
     /// thread no longer has it ([`DmUi::forget_deleted`]), so the badge does not count messages
     /// that are on their way out as unread. Bounded by [`MAX_DELETING`].
     deleting: Vec<(String, String, Vec<String>)>,
+    /// Every inbound message (by purge token) seen in a snapshot of a met room, oldest first,
+    /// so a message is news once: not when it is delivered again after a reconnect, not when a
+    /// thread leaves a snapshot and comes back, not when a deletion that lagged is undone.
+    known: KnownTokens,
+    /// New messages not yet handed to the notifications, one entry per thread
+    /// ([`DmUi::take_arrivals`]).
+    arrivals: Vec<DmArrival>,
     /// How many times the rail rows were rebuilt, for tests.
     rebuilds: usize,
+}
+
+/// How old (by the time its sender signed) a direct message may be and still raise a
+/// notification: one hour. Older ones count as unread but stay quiet.
+pub const MAX_NOTIFY_AGE_SECS: u64 = 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The least number of tokens remembered as known. The set also never falls below twice what the
+/// latest snapshot holds, so a message the snapshot still has is never forgotten.
+const KNOWN_MIN: usize = 8192;
+
+/// A bounded set of purge tokens that forgets the oldest first.
+#[derive(Default)]
+struct KnownTokens {
+    set: HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl KnownTokens {
+    /// Remember `token`. True if it was not known.
+    fn insert(&mut self, token: &str) -> bool {
+        if self.set.contains(token) {
+            return false;
+        }
+        self.set.insert(token.to_owned());
+        self.order.push_back(token.to_owned());
+        true
+    }
+
+    fn trim(&mut self, keep: usize) {
+        while self.order.len() > keep.max(KNOWN_MIN) {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for DmUi {
@@ -207,12 +257,26 @@ impl DmUi {
     ///
     /// Consequences, accepted for now: a room left and joined again keeps its read positions;
     /// and messages that arrived while the app was closed are seeded as seen (no unread, and no
-    /// notification; notifications come with PR 8).
+    /// notification).
+    ///
+    /// **What is news** ([`DmUi::take_arrivals`]): an inbound message whose token no snapshot of
+    /// a met room has held before, in a thread whose peer is a current member, that is not
+    /// archived (a message that makes the peer write past the archive cutoff revives the thread,
+    /// so it counts), and that no deletion of that peer's messages is waiting on. What a room
+    /// held when it was met is known, not news, and a row that could not be opened is never news.
     pub fn apply(&mut self, snapshot: DmSnapshot) {
+        self.apply_at(snapshot, now_secs());
+    }
+
+    /// [`DmUi::apply`] at the time `now` (unix seconds), which decides how old a message may be
+    /// and still notify ([`MAX_NOTIFY_AGE_SECS`]).
+    pub fn apply_at(&mut self, snapshot: DmSnapshot, now: u64) {
+        let mut met_now: HashSet<String> = HashSet::new();
         for room in &snapshot.room_keys {
             if !self.known_rooms.insert(room.clone()) {
                 continue;
             }
+            met_now.insert(room.clone());
             for t in snapshot.threads.iter().filter(|t| &t.room == room) {
                 self.seen
                     .entry((t.room.clone(), t.peer_key.clone()))
@@ -240,6 +304,146 @@ impl DmUi {
         self.snapshot = snapshot;
         self.forget_deleted();
         self.rebuild();
+        self.find_arrivals(&met_now, now);
+    }
+
+    /// Note which inbound messages of the snapshot just taken are news, and remember them all.
+    fn find_arrivals(&mut self, met_now: &HashSet<String>, now: u64) {
+        let mut inbound = 0;
+        for t in self.snapshot.threads.iter() {
+            // A room not met yet has no read position: what it holds is seeded when it is.
+            if !self.known_rooms.contains(&t.room) {
+                continue;
+            }
+            let quiet = met_now.contains(&t.room)
+                || !t.peer_is_member
+                || self.archive.is_hidden(t)
+                || self
+                    .snapshot
+                    .purges
+                    .iter()
+                    .any(|p| p.room == t.room && p.peer_key == t.peer_key)
+                || self
+                    .deleting
+                    .iter()
+                    .any(|(room, peer, _)| *room == t.room && *peer == t.peer_key);
+            let seen = self.seen.get(&(t.room.clone(), t.peer_key.clone()));
+            let mut count = 0;
+            let mut newest: Option<&DmMessage> = None;
+            for m in t.messages.iter().filter(|m| !m.outgoing) {
+                inbound += 1;
+                // A row that cannot be opened is not remembered, so it can notify once it can
+                // be (when the room's key arrives), if it is still recent.
+                if matches!(m.body, DmBody::Placeholder(_)) {
+                    continue;
+                }
+                let new = self.known.insert(&m.key);
+                // The age is of the time the sender signed. A message hours old (a stale first
+                // state, a reconnect after a long outage) is still unread but not announced; a
+                // sender who backdates only silences their own notification, and a time in the
+                // future is "recent".
+                let recent = m.timestamp.saturating_add(MAX_NOTIFY_AGE_SECS) >= now;
+                if new && recent && !quiet && !seen.is_some_and(|s| s.contains(&m.key)) {
+                    count += 1;
+                    newest = Some(m);
+                }
+            }
+            let Some(newest) = newest else { continue };
+            let preview = match &newest.body {
+                DmBody::Text(text) => model::preview(text, PREVIEW_CHARS),
+                DmBody::Invite { room_label, .. } => {
+                    format!(
+                        "Invitation to {}",
+                        bounded(&name(room_label), PREVIEW_CHARS)
+                    )
+                }
+                _ => String::new(),
+            };
+            let (room, peer_key) = (t.room.clone(), t.peer_key.clone());
+            let arrival = DmArrival {
+                room,
+                peer_key,
+                peer_name: name(&t.peer_name),
+                count,
+                key: newest.key.clone(),
+                preview: name(&preview),
+            };
+            match self
+                .arrivals
+                .iter_mut()
+                .find(|a| a.room == arrival.room && a.peer_key == arrival.peer_key)
+            {
+                Some(old) => {
+                    old.count += arrival.count;
+                    old.key = arrival.key;
+                    old.preview = arrival.preview;
+                    old.peer_name = arrival.peer_name;
+                }
+                None => self.arrivals.push(arrival),
+            }
+        }
+        self.known.trim(inbound * 2);
+    }
+
+    /// How many messages the thread `(room, peer)` has not seen; 0 if it is not there.
+    pub fn unread_in(&self, room: &str, peer: &str) -> usize {
+        self.thread(room, peer).map_or(0, |t| self.unread_of(t))
+    }
+
+    /// The unread messages of the threads on the rail, less those of rooms that `muted` names:
+    /// what the window title and tray count add for direct messages. A direct message is
+    /// addressed to the user, so a room's "mentions and replies" mode counts it.
+    pub fn counted_unread(&self, muted: impl Fn(&str) -> bool) -> usize {
+        // The rows hold each thread's unread count, worked out when the snapshot or a read
+        // position changed ([`DmUi::rebuild`]), and leave out archived threads.
+        self.rows
+            .iter()
+            .filter(|r| !muted(&r.room))
+            .map(|r| r.unread)
+            .sum()
+    }
+
+    /// Mark the thread `(room, peer)` read up to the message with purge token `token`, without
+    /// opening it: what a notification showed was seen and what is newer was not. Nothing for a
+    /// message the thread no longer holds. True if the read position moved.
+    pub fn mark_read_through(&mut self, room: &str, peer: &str, token: &str) -> bool {
+        if !self.known_rooms.contains(room) {
+            return false;
+        }
+        let Some(keys) = self.thread(room, peer).and_then(|t| {
+            let at = t.messages.iter().position(|m| m.key == token)?;
+            Some(
+                t.messages[..=at]
+                    .iter()
+                    .filter(|m| !m.outgoing)
+                    .map(|m| m.key.clone())
+                    .collect::<Vec<_>>(),
+            )
+        }) else {
+            return false;
+        };
+        let seen = self
+            .seen
+            .entry((room.to_owned(), peer.to_owned()))
+            .or_default();
+        let before = seen.len();
+        seen.extend(keys);
+        if seen.len() == before {
+            return false;
+        }
+        self.rebuild();
+        true
+    }
+
+    /// Whether `token` is remembered as known, for tests.
+    #[cfg(test)]
+    pub(super) fn knows(&self, token: &str) -> bool {
+        self.known.set.contains(token)
+    }
+
+    /// The new messages found since the last call, one entry per thread.
+    pub fn take_arrivals(&mut self) -> Vec<DmArrival> {
+        std::mem::take(&mut self.arrivals)
     }
 
     /// Note that the messages `keys` of the thread `(room, peer)` are being deleted: once the
@@ -463,25 +667,53 @@ impl Chat {
         self.dm_settle();
     }
 
+    /// [`Chat::apply_dms`] at the time `now` (unix seconds), for tests.
+    #[cfg(test)]
+    pub(super) fn apply_dms_at(&mut self, snapshot: DmSnapshot, now: u64) {
+        self.dm.apply_at(snapshot, now);
+        self.dm_settle();
+    }
+
+    /// The thread's unread count counted by the title and the tray: not those of a muted room.
+    pub fn dm_unread_counted(&self) -> usize {
+        self.dm
+            .counted_unread(|room| self.mode_of(room) == NotificationMode::Muted)
+    }
+
+    /// The new direct messages since the last call, for the notifications.
+    pub fn take_dm_arrivals(&mut self) -> Vec<DmArrival> {
+        self.dm.take_arrivals()
+    }
+
     /// Close the open thread when there is nothing left to show it as: its room is gone, or its
     /// peer has no messages and is not a member of the room.
     pub(super) fn dm_settle(&mut self) {
+        // Before what waits for a room that is gone is dropped, so what a reply left for the
+        // open thread reaches its draft.
+        if let Some((room, uid)) = self.dm.open.clone() {
+            let known = self.rooms().iter().any(|r| {
+                r.key == room
+                    && (self.dm.thread(&room, &uid).is_some()
+                        || r.member_by_peer_key(&uid).is_some_and(|m| m.id != r.me))
+            });
+            if !known {
+                self.leave_dm();
+            }
+        }
         self.dm_forget_gone();
         // A confirmation belongs to the thread that was open when it was asked.
         let open = self.dm.open.clone();
         self.dm.purge.keep_confirm_for(open.as_ref());
-        let Some((room, uid)) = self.dm.open.clone() else {
-            return;
-        };
-        let known = self.rooms().iter().any(|r| {
-            r.key == room
-                && (self.dm.thread(&room, &uid).is_some()
-                    || r.member_by_peer_key(&uid).is_some_and(|m| m.id != r.me))
-        });
-        if !known {
-            self.dm.open = None;
-            self.dm.purge.keep_confirm_for(None);
-        }
+    }
+
+    /// Stop showing the open thread, whatever the reason (Back, another room chosen, the room or
+    /// the peer gone): the one place `dm.open` is cleared, so what a notification reply left in
+    /// the thread's stash always reaches its draft ([`Chat::merge_stash`]). Returns the thread.
+    pub(super) fn leave_dm(&mut self) -> Option<(String, String)> {
+        let closed = self.dm.open.take()?;
+        self.merge_stash(&closed);
+        self.dm.purge.keep_confirm_for(None);
+        Some(closed)
     }
 
     /// What waits for an answer for a room that is gone will not get one.
@@ -512,6 +744,12 @@ impl Chat {
         });
         if !known {
             return false;
+        }
+        // A thread left for another gets what a notification reply left for it.
+        if let Some(prev) = self.dm.open.clone()
+            && (prev.0 != room || prev.1 != uid)
+        {
+            self.merge_stash(&prev);
         }
         // What belonged to the room's own screen gives way: it is no longer in front.
         self.member_modal = None;
@@ -545,10 +783,9 @@ impl Chat {
 
     /// Back to the room that was open.
     pub fn close_dm(&mut self) {
-        let Some(closed) = self.dm.open.take() else {
+        let Some(closed) = self.leave_dm() else {
             return;
         };
-        self.dm.purge.keep_confirm_for(None);
         // What was typed stays as the thread's draft; the box gives up the keyboard.
         if let Some(d) = self.dm.compose.drafts_mut().get_mut(&closed) {
             d.focused = false;

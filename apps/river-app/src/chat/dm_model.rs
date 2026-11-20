@@ -168,6 +168,33 @@ pub struct DmSnapshot {
     pub archived: Vec<DmArchived>,
 }
 
+/// New direct messages from one person in one thread, found when a snapshot was taken
+/// ([`super::dm_view::DmUi::apply`]) and not yet turned into a notification. Holds the newest
+/// message's text, so it never derives `Debug` over it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DmArrival {
+    /// The room's key, as `Room::key` names it.
+    pub room: String,
+    /// The peer, as [`DmThread::peer_key`] names them: their FULL member id.
+    pub peer_key: String,
+    pub peer_name: String,
+    /// How many new messages (text or invitations; a row that could not be opened is not news).
+    pub count: usize,
+    /// The newest of them, by purge token.
+    pub key: String,
+    /// What the newest says, as plain text: its words, or "Invitation to <room>". Never an
+    /// invitation payload (the view model holds none). Empty if there are none.
+    pub preview: String,
+}
+
+impl fmt::Debug for DmArrival {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DmArrival")
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A thread in the archive list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DmArchived {

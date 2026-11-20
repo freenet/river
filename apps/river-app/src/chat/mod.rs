@@ -34,6 +34,8 @@ pub mod identity_texts {
 #[cfg(test)]
 mod dm_archive_tests;
 #[cfg(test)]
+mod dm_notify_tests;
+#[cfg(test)]
 mod dm_view_tests;
 mod keys;
 mod links;
@@ -65,6 +67,7 @@ pub(crate) mod visual_fold;
 pub mod zoom;
 
 pub use background::{BackgroundHost, BackgroundUi};
+pub use dm_model::DmArrival;
 pub use dnd::{DndUi, Schedule as DndSchedule, Settings as DndSettings};
 pub use quick_reply::{MAX_REPLY_CHARS, ReplyRefusal};
 use std::collections::{HashMap, HashSet};
@@ -812,7 +815,7 @@ impl Chat {
             self.read.insert(key.to_owned(), mark);
         }
         // Choosing a room shows its conversation, whatever thread was open.
-        self.dm.open = None;
+        self.leave_dm();
         if key == self.selected {
             return;
         }
