@@ -124,6 +124,7 @@ fn with_cards(note: Option<&str>) -> (Runtime<RiverApp>, String) {
         ],
         last_ts: T0,
         last_inbound_ts: T0,
+        last_inbound_signed: T0,
     };
     let snapshot = DmSnapshot {
         threads: vec![thread.into()],

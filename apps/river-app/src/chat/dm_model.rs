@@ -36,6 +36,10 @@ pub struct DmThread {
     /// The time of the newest message the peer sent, 0 when they sent none. What the first
     /// read position is seeded from.
     pub last_inbound_ts: u64,
+    /// The same time as the peer signed it, not clamped for display. The archive compares and
+    /// writes this one, as the web UI does (`rooms::dm_archive`); [`DmThread::last_inbound_ts`] is
+    /// for display and read positions only.
+    pub last_inbound_signed: u64,
 }
 
 impl fmt::Debug for DmThread {
@@ -158,6 +162,23 @@ pub struct DmSnapshot {
     /// Deletions of someone's messages that the room does not hold yet: on their way, or not
     /// taken. One that the room holds is gone from here, and the messages with it.
     pub purges: Vec<DmPurge>,
+    /// The archive list as the user should see it ([`crate::rooms::dm_cache::OutboundCache::archived`]):
+    /// the threads taken off the rail until the peer writes again, for the rooms listed. Read
+    /// from the delegate on every read, so an entry the web UI wrote is here.
+    pub archived: Vec<DmArchived>,
+}
+
+/// A thread in the archive list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DmArchived {
+    /// The room's key, as `Room::key` names it.
+    pub room: String,
+    /// The peer, as [`DmThread::peer_key`] names them.
+    pub peer_key: String,
+    /// The newest time (unix seconds, clamped as every shown time is) of a message the peer had
+    /// sent when it was archived. The thread stays off the rail while the peer's newest message
+    /// is not past it.
+    pub hidden_at_ts: u64,
 }
 
 /// A deletion of the messages one person sent the user that the room does not hold yet.
@@ -187,6 +208,7 @@ impl fmt::Debug for DmSnapshot {
             .field("truncated", &self.truncated.len())
             .field("hydrated", &self.hydrated)
             .field("purges", &self.purges.len())
+            .field("archived", &self.archived.len())
             .finish()
     }
 }

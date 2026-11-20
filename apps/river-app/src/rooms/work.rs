@@ -106,6 +106,7 @@ use river_core::stored_rooms::{
 
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
+use super::dm_archive::ArchiveOp;
 use super::dm_cache;
 use super::dm_store::{self, DmOp, EntryKey};
 use super::identity::{self, IdentityToken, ImportWrite};
@@ -186,6 +187,14 @@ pub struct DmEnd {
     pub added: Vec<EntryKey>,
     /// The entries it was to remove.
     pub removed: Vec<EntryKey>,
+    /// The archive changes it was to make ([`super::dm_archive`]).
+    pub archived: Vec<ArchiveOp>,
+    /// The ones that found the store already as asked, or at a higher cutoff (another device got
+    /// there first): the store may differ from what this app assumed.
+    pub archive_skipped: Vec<ArchiveOp>,
+    /// New archive entries left out because their room is not shown: not written, so they are
+    /// not applied to the list either.
+    pub archive_dropped: Vec<ArchiveOp>,
     /// Entries of the user it dropped to stay in bounds.
     pub evicted: Vec<EntryKey>,
     /// Why the merge refused, if it did.
@@ -334,6 +343,10 @@ struct Task {
     dm_rooms: Vec<[u8; 32]>,
     /// For a [`Kind::DmSave`] the merge refused: why.
     dm_refusal: Option<dm_store::Refusal>,
+    /// For a [`Kind::DmSave`] that ended well: an archive change found nothing to change.
+    dm_archive_skipped: Vec<ArchiveOp>,
+    /// For a [`Kind::DmSave`]: the archive entries it left out because their room is not shown.
+    dm_archive_dropped: Vec<ArchiveOp>,
     /// For a finished join: the room's name, kept for the line that says it is done after the
     /// plan (which holds the invitee's key and the room's secrets) has been wiped.
     done_name: Option<String>,
@@ -423,6 +436,8 @@ impl Task {
             dm_evicted: Vec::new(),
             dm_dropped: Vec::new(),
             dm_rooms: Vec::new(),
+            dm_archive_skipped: Vec::new(),
+            dm_archive_dropped: Vec::new(),
             dm_refusal: None,
             done_name: None,
         }
@@ -580,24 +595,36 @@ impl Task {
             // until a complete read of the rooms says the room is gone, so a room missing from a
             // partial list is saved when it is back.
             let rooms = &self.dm_rooms;
-            let (kept, dropped): (Vec<DmOp>, Vec<DmOp>) =
+            let (kept, left_out): (Vec<DmOp>, Vec<DmOp>) =
                 ops.iter().cloned().partition(|op| match op {
                     DmOp::Add { key, .. } => rooms.contains(&key.0),
-                    DmOp::Remove { .. } => true,
+                    // A new archive entry for a room that is gone would never be cleared: left
+                    // out (it still ends as done, so the cache stops owing it). Taking one out
+                    // is always fine.
+                    DmOp::Archive(ArchiveOp::Hide { thread, .. }) => rooms.contains(&thread.0),
+                    DmOp::Remove { .. } | DmOp::Archive(_) => true,
                 });
-            let dropped: Vec<EntryKey> = dropped
+            let dropped: Vec<EntryKey> = left_out
                 .iter()
                 .filter_map(|op| match op {
                     DmOp::Add { key, .. } => Some(*key),
-                    DmOp::Remove { .. } => None,
+                    DmOp::Remove { .. } | DmOp::Archive(_) => None,
                 })
                 .collect();
             let merged = dm_store::merge(value, *listed, &kept);
+            self.dm_archive_dropped = left_out
+                .iter()
+                .filter_map(|op| match op {
+                    DmOp::Archive(a) => Some(*a),
+                    _ => None,
+                })
+                .collect();
             self.dm_dropped = dropped;
             return match merged {
                 Ok(m) => {
                     self.dm_evicted = m.evicted;
                     self.dm_refusal = None;
+                    self.dm_archive_skipped = m.archive_skipped;
                     Ok(m.bytes)
                 }
                 Err(refusal) => {
@@ -998,19 +1025,27 @@ impl Work {
             let Kind::DmSave { ops, .. } = &t.kind else {
                 return true;
             };
-            let (mut added, mut removed) = (Vec::new(), Vec::new());
+            let (mut added, mut removed, mut archived) = (Vec::new(), Vec::new(), Vec::new());
+            let mut dropped_archive = Vec::new();
             for op in ops {
                 match op {
                     // An add left out for a room that is gone is not one the store holds.
                     DmOp::Add { key, .. } if t.dm_dropped.contains(key) => {}
                     DmOp::Add { key, .. } => added.push(*key),
                     DmOp::Remove { key } => removed.push(*key),
+                    DmOp::Archive(op) if t.dm_archive_dropped.contains(op) => {
+                        dropped_archive.push(*op)
+                    }
+                    DmOp::Archive(op) => archived.push(*op),
                 }
             }
             ends.push(DmEnd {
                 ok,
                 added,
                 removed,
+                archived,
+                archive_skipped: std::mem::take(&mut t.dm_archive_skipped),
+                archive_dropped: dropped_archive,
                 evicted: std::mem::take(&mut t.dm_evicted),
                 refusal: t.dm_refusal.take(),
             });

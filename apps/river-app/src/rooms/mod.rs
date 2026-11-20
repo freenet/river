@@ -46,13 +46,15 @@
 //! ([`dm_send`], [`outbox`]), and saves the text it sent to `outbound_dms` ([`dm_save`]), the one
 //! way it writes that key: a read-merge-compare-and-swap that adds or removes its own entries and
 //! keeps everything else in the value as it found it ([`dm_store`]). It deletes the messages
-//! someone sent the user by signing a purge envelope, the same update ([`dm_purge`]).
+//! someone sent the user by signing a purge envelope, the same update ([`dm_purge`]). It archives
+//! a thread by editing `hidden_threads` of the same value, in the same write ([`dm_archive`]).
 
 pub mod bans;
 pub mod create;
 pub mod delegate;
 pub mod deputies;
 pub mod dm;
+pub mod dm_archive;
 pub mod dm_cache;
 pub mod dm_invite;
 pub mod dm_purge;

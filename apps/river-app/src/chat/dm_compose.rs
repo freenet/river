@@ -338,6 +338,7 @@ impl Chat {
     /// shows.
     pub fn dm_tick(&mut self, now: Instant) -> bool {
         let mut changed = self.dm_purge_tick(now) | self.dm_invite_tick(now);
+        changed |= self.dm_archive_tick(now);
         for s in self.dm.compose.sends.iter_mut().filter(|s| !s.silent) {
             if now.saturating_duration_since(s.at) >= ANSWER_WAIT {
                 s.silent = true;
@@ -386,6 +387,11 @@ impl Chat {
                 }
                 if let Some(d) = self.dm.compose.drafts.get_mut(&key) {
                     take_sent(d, &sending.sent);
+                }
+                // Sending into an archived thread brings it back (the background work does that
+                // for the saved list): shown at once.
+                if self.dm.archive.note_sent(&key.0, &key.1) {
+                    self.dm.refresh_archive();
                 }
                 (self.dm.open.as_ref() == Some(&key)).then_some(key)
             }

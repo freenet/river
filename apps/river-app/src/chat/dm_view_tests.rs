@@ -15,33 +15,33 @@ use crate::rooms::dm::{self, Source};
 use crate::rooms::dm_cache::OutboundCache;
 use crate::{RiverApp, Setup, WINDOW_SIZE, view};
 
-const OWNER: u8 = 1;
-const ME: u8 = 2;
-const PEER: u8 = 3;
-const ROOM: &str = "town-square";
-const T0: u64 = 1_700_000_000;
+pub(super) const OWNER: u8 = 1;
+pub(super) const ME: u8 = 2;
+pub(super) const PEER: u8 = 3;
+pub(super) const ROOM: &str = "town-square";
+pub(super) const T0: u64 = 1_700_000_000;
 
-fn sk(n: u8) -> SigningKey {
+pub(super) fn sk(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
 }
 
-fn vk(n: u8) -> VerifyingKey {
+pub(super) fn vk(n: u8) -> VerifyingKey {
     sk(n).verifying_key()
 }
 
-fn id(n: u8) -> MemberId {
+pub(super) fn id(n: u8) -> MemberId {
     MemberId::from(&vk(n))
 }
 
 /// A room with the owner, the user and a peer, and the messages between them.
-struct Fixture {
+pub(super) struct Fixture {
     members: ChatRoomStateV1,
     dms: DirectMessagesV1,
     cache: OutboundCache,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut members = ChatRoomStateV1::default();
         for n in [ME, PEER] {
             members.members.members.push(AuthorizedMember::new(
@@ -60,7 +60,7 @@ impl Fixture {
         }
     }
 
-    fn compose(&mut self, from: u8, to: u8, ts: u64, body: &[u8]) {
+    pub(super) fn compose(&mut self, from: u8, to: u8, ts: u64, body: &[u8]) {
         let m = compose_direct_message(&sk(from), &vk(to), &vk(OWNER), ts, ts, body).unwrap();
         if from == ME {
             // The user's own words are cached under the token, as the web UI caches them.
@@ -72,7 +72,7 @@ impl Fixture {
     }
 
     /// What the window is sent for this room.
-    fn snapshot(&self, hydrated: bool) -> DmSnapshot {
+    pub(super) fn snapshot(&self, hydrated: bool) -> DmSnapshot {
         let name_of = |m: MemberId| {
             if m == id(PEER) {
                 "Priya".to_owned()
@@ -105,12 +105,13 @@ impl Fixture {
             truncated: Vec::new(),
             hydrated,
             purges: Vec::new(),
+            archived: Vec::new(),
         }
     }
 }
 
 /// The rooms are listed and hold no messages yet: what arrives afterwards is news.
-fn empty_rooms() -> DmSnapshot {
+pub(super) fn empty_rooms() -> DmSnapshot {
     DmSnapshot {
         room_keys: vec![ROOM.to_owned()],
         hydrated: true,
@@ -118,11 +119,11 @@ fn empty_rooms() -> DmSnapshot {
     }
 }
 
-fn peer_key() -> String {
+pub(super) fn peer_key() -> String {
     dm::peer_key(id(PEER))
 }
 
-fn app() -> Runtime<RiverApp> {
+pub(super) fn app() -> Runtime<RiverApp> {
     let mut state = RiverApp::detached();
     state.setup = Setup::Connected {
         version: "0.2.155".into(),
@@ -143,14 +144,14 @@ fn app() -> Runtime<RiverApp> {
     rt
 }
 
-fn give(rt: &mut Runtime<RiverApp>, snapshot: DmSnapshot) {
+pub(super) fn give(rt: &mut Runtime<RiverApp>, snapshot: DmSnapshot) {
     rt.update(move |s, _| s.chat.apply_dms(snapshot));
     // Two frames: what went away is gone from the tree after the second.
     rt.frame(0.1);
     rt.frame(0.6);
 }
 
-fn press(rt: &mut Runtime<RiverApp>, key: &str) {
+pub(super) fn press(rt: &mut Runtime<RiverApp>, key: &str) {
     let (x, y) = rt.find(key).unwrap_or_else(|| panic!("no element {key}"));
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
@@ -158,7 +159,7 @@ fn press(rt: &mut Runtime<RiverApp>, key: &str) {
     rt.frame(0.2);
 }
 
-fn esc(rt: &mut Runtime<RiverApp>) {
+pub(super) fn esc(rt: &mut Runtime<RiverApp>) {
     rt.key(KeyEvent {
         key: Key::Escape,
         mods: Default::default(),
@@ -166,11 +167,11 @@ fn esc(rt: &mut Runtime<RiverApp>) {
     rt.frame(0.3);
 }
 
-fn texts(rt: &Runtime<RiverApp>) -> Vec<String> {
+pub(super) fn texts(rt: &Runtime<RiverApp>) -> Vec<String> {
     rt.elements().into_iter().filter_map(|e| e.text).collect()
 }
 
-fn shows(rt: &Runtime<RiverApp>, needle: &str) -> bool {
+pub(super) fn shows(rt: &Runtime<RiverApp>, needle: &str) -> bool {
     texts(rt).iter().any(|t| t.contains(needle))
 }
 
@@ -189,7 +190,7 @@ fn at(rt: &Runtime<RiverApp>, needle: &str) -> usize {
 }
 
 /// The keys of the elements whose key starts with `prefix`.
-fn keys_with(rt: &Runtime<RiverApp>, prefix: &str) -> Vec<String> {
+pub(super) fn keys_with(rt: &Runtime<RiverApp>, prefix: &str) -> Vec<String> {
     rt.elements()
         .into_iter()
         .filter_map(|e| e.key)
@@ -197,12 +198,12 @@ fn keys_with(rt: &Runtime<RiverApp>, prefix: &str) -> Vec<String> {
         .collect()
 }
 
-fn row_key() -> String {
+pub(super) fn row_key() -> String {
     format!("dm-{ROOM}-{}", peer_key())
 }
 
 /// A room with a conversation: the peer writes first and last, the user answers between.
-fn conversation() -> Fixture {
+pub(super) fn conversation() -> Fixture {
     let mut f = Fixture::new();
     f.compose(PEER, ME, T0, b"first from the peer, with **bold**");
     f.compose(ME, PEER, T0 + 60, b"my answer");
@@ -212,7 +213,7 @@ fn conversation() -> Fixture {
 
 /// A room whose backlog (one old message from the peer) has been met, and the conversation that
 /// arrives after it: the fixture, and the snapshot of the backlog alone.
-fn conversation_after_seed() -> (Fixture, DmSnapshot) {
+pub(super) fn conversation_after_seed() -> (Fixture, DmSnapshot) {
     let mut f = Fixture::new();
     f.compose(PEER, ME, T0 - 100, b"backlog");
     let seed = f.snapshot(true);
@@ -558,6 +559,7 @@ fn a_rail_preview_is_one_bounded_plain_line() {
         }],
         last_ts: T0,
         last_inbound_ts: T0,
+        last_inbound_signed: T0,
     };
     let mut ui = DmUi::default();
     ui.apply(DmSnapshot {
@@ -635,7 +637,11 @@ fn the_direct_message_view_neither_logs_nor_feeds_titles_notifications_or_status
             .collect::<Vec<_>>()
             .join("\n")
     }
-    for file in ["chat/dm_view.rs", "chat/dm_compose.rs"] {
+    for file in [
+        "chat/dm_view.rs",
+        "chat/dm_compose.rs",
+        "chat/dm_archive.rs",
+    ] {
         let view = code(&read(file));
         for banned in [
             "println!",
@@ -677,6 +683,7 @@ fn the_direct_message_view_neither_logs_nor_feeds_titles_notifications_or_status
         let s: String = code(&read(file)).split_whitespace().collect();
         for banned in [
             "dm_view",
+            "dm_archive",
             "DmThread",
             "DmSnapshot",
             ".dm.snapshot",
@@ -1478,6 +1485,7 @@ mod sending {
             }],
             last_ts: T0,
             last_inbound_ts: T0,
+            last_inbound_signed: T0,
         };
         give(
             &mut rt,
@@ -1650,6 +1658,7 @@ mod sending {
             }],
             last_ts: T0,
             last_inbound_ts: 0,
+            last_inbound_signed: 0,
         };
         let snapshot = DmSnapshot {
             threads: vec![me_thread.into()],
@@ -1995,6 +2004,7 @@ mod sending {
                         peer_is_member: true,
                         last_ts: T0 + 100,
                         last_inbound_ts: T0 + 99,
+                        last_inbound_signed: T0 + 99,
                         messages,
                     }
                     .into(),

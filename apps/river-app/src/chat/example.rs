@@ -494,6 +494,7 @@ fn dm_thread(
         messages,
         last_ts,
         last_inbound_ts,
+        last_inbound_signed: last_inbound_ts,
     }
 }
 
@@ -586,6 +587,7 @@ pub fn dm_snapshot() -> super::dm_model::DmSnapshot {
         truncated: Vec::new(),
         hydrated: true,
         purges: Vec::new(),
+        archived: Vec::new(),
     }
 }
 

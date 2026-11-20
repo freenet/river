@@ -85,6 +85,7 @@ use river_core::stored_rooms::{
 };
 
 use super::delegate::{self, Read};
+use super::dm_archive::{self, ArchiveOp};
 use super::dm_cache::{self, DmRead, OutboundCache};
 use super::dm_save::DmSaver;
 use super::dm_store::{DmOp, EntryKey};
@@ -947,6 +948,7 @@ fn follow_on(
                 "reconnecting to finish creating or joining a room".into()
             });
         }
+        rooms.archive_revival(unix_secs());
         rooms.dm_save_tick(writes, Instant::now());
         if writes {
             match rooms.send_updates(socket) {
@@ -1631,13 +1633,25 @@ struct DmMemo {
     builds: usize,
 }
 
+/// The fewest seconds between two reads of the stored rooms asked for by sends into threads this
+/// app does not hold as archived.
+const REREAD_EVERY: Duration = Duration::from_secs(30);
+
+/// The time in unix seconds.
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// What the window was last sent as direct-message threads ([`Rooms::dm_sent`]): each room's
 /// threads' key and a digest of its unsent direct messages, whether the sent-text cache had been
-/// read, and which rooms were listed.
+/// read, which rooms were listed, and the archive list's revision.
 type DmSent = (
     Vec<(VerifyingKey, super::dm::DmKey, u64)>,
     bool,
     Vec<String>,
+    u64,
 );
 
 /// The answer to one [`Action::SendDm`].
@@ -1741,6 +1755,14 @@ struct Rooms {
     dm_invite_results: Vec<DmInviteResult>,
     /// What [`Rooms::prune_purged_texts`] last ran on.
     purge_pruned: Option<u64>,
+    /// A message was sent into a thread this copy of the archive list does not hold: the stored
+    /// rooms are read again once at the next tick, and at most once in [`REREAD_EVERY`].
+    reread_after_send: bool,
+    reread_not_before: Option<Instant>,
+    /// The pacing of the writes that carry archive changes ([`super::dm_archive`]), apart from
+    /// the sent text's: a write the store keeps refusing must not delay the text, and the text
+    /// must not delay it.
+    archive_saver: DmSaver,
     /// River's web app on the node, which invite links open.
     web_app: String,
     /// Invitations made since the last report, by room key.
@@ -1869,14 +1891,35 @@ impl Rooms {
             .filter(|r| network_seen.contains(&r.stored.owner_vk))
             .map(LiveRoom::key)
             .collect();
-        let fingerprint = (keys.clone(), dm_cache.hydrated(), room_keys.clone());
+        let fingerprint = (
+            keys.clone(),
+            dm_cache.hydrated(),
+            room_keys.clone(),
+            dm_cache.archive_rev(),
+        );
         if dm_sent.as_ref() == Some(&fingerprint) {
             return None;
         }
         dm_memo.retain(|vk, _| keys.iter().any(|(k, _, _)| k == vk));
+        // The archive list, for the rooms listed: from the last read, with what the user did
+        // since laid over it, so what the web UI wrote shows and what it removed does not.
+        let archived = dm_cache
+            .archived()
+            .into_iter()
+            .filter_map(|((owner, peer), hidden_at_ts)| {
+                list.iter()
+                    .find(|r| r.stored.owner_vk.as_bytes() == &owner)
+                    .map(|r| crate::chat::dm_model::DmArchived {
+                        room: r.key(),
+                        peer_key: super::dm::peer_key(peer),
+                        hidden_at_ts,
+                    })
+            })
+            .collect();
         let mut snapshot = DmSnapshot {
             hydrated: dm_cache.hydrated(),
             room_keys,
+            archived,
             ..DmSnapshot::default()
         };
         for ((room, rows, purges), (vk, key, _)) in with_dms.iter().zip(&keys) {
@@ -2078,6 +2121,17 @@ impl Rooms {
                 }
                 continue;
             }
+            if matches!(
+                command.action,
+                Action::ArchiveDm { .. } | Action::UnarchiveDm { .. }
+            ) {
+                // Not answered: the thread is archived on screen as soon as this is taken.
+                match self.archive_dm(&command) {
+                    Some(()) => changed = true,
+                    None => self.outbox.waiting.push(command),
+                }
+                continue;
+            }
             if matches!(command.action, Action::PurgeDm { .. }) {
                 // Likewise: the confirmation waits for its answer.
                 match self.purge_dm(&command) {
@@ -2167,6 +2221,21 @@ impl Rooms {
                         eprintln!("River: too many sent direct messages are unsaved; the oldest text was dropped");
                     }
                     self.dm_saver.new_work();
+                    // Sending into a thread brings it back, whatever its cutoff: the user did
+                    // it (a conditional unhide would be a no-op here). Only when there may be
+                    // something to remove: before the archive list is read there may be. A
+                    // thread another device archived since this copy was read is not seen
+                    // here, and shows archived again at the next read (the web UI always asks).
+                    let thread = (room.stored.owner_vk.to_bytes(), queued.recipient);
+                    if !self.dm_cache.hydrated() || self.dm_cache.archived_at(&thread).is_some() {
+                        self.dm_cache.archive(ArchiveOp::Unhide { thread });
+                        self.archive_saver.new_work();
+                    } else {
+                        // This copy of the list does not hold the thread, and another device
+                        // may have archived it since it was read: read it again, once, soon
+                        // ([`Rooms::dm_save_tick`]), so the next send or gated sync sees it.
+                        self.reread_after_send = true;
+                    }
                 }
             }),
             None if !self.complete => return None,
@@ -2297,6 +2366,106 @@ impl Rooms {
         Some(())
     }
 
+    /// Archive or unarchive a thread as the user asked ([`Action::ArchiveDm`],
+    /// [`Action::UnarchiveDm`]). The change shows at once and is owed to the delegate
+    /// ([`OutboundCache::archive`]). `None` when the rooms have not been read well enough to say
+    /// the room is gone: it waits, as any command does.
+    fn archive_dm(&mut self, command: &Command) -> Option<()> {
+        let Some(room) = self.list.iter().find(|r| r.key() == command.room) else {
+            if !self.complete {
+                return None;
+            }
+            eprintln!("River: an archive command for a room no longer shown was dropped");
+            return Some(());
+        };
+        let owner = room.stored.owner_vk.to_bytes();
+        let op = match &command.action {
+            Action::ArchiveDm {
+                peer,
+                row_inbound_ts,
+            } => {
+                // The newest inbound time of the room as it is now, as well as the thread as the
+                // window showed it: the window can lag a message that landed since.
+                let live = room.stored.self_verifying_key().map(|vk| {
+                    dm_archive::live_inbound_ts(
+                        &room.stored.room_state.direct_messages,
+                        MemberId::from(&vk),
+                        *peer,
+                    )
+                });
+                ArchiveOp::Hide {
+                    thread: (owner, *peer),
+                    hidden_at_ts: dm_archive::archive_cutoff(*row_inbound_ts, live),
+                }
+            }
+            Action::UnarchiveDm { peer } => ArchiveOp::Unhide {
+                thread: (owner, *peer),
+            },
+            _ => return Some(()),
+        };
+        self.dm_cache.archive(op);
+        self.archive_saver.new_work();
+        Some(())
+    }
+
+    /// Drop the archive entry of a thread whose peer has written since, the inbound-sync half of
+    /// the rules ([`super::dm_archive`]): a message strictly past the stored cutoff. The rail
+    /// already shows such a thread; this stops a later sweep (which leaves the thread with no
+    /// messages, so nothing past any cutoff) from hiding it again. Only an entry the delegate
+    /// holds and no change of the user's is owed for, and the write drops it only if it still
+    /// finds a cutoff below the message. `now_secs` is the time in unix seconds.
+    ///
+    /// Run at every tick of the loop, with no memo of what it last saw: what it reads is a few
+    /// entries against one room's messages, and a memo keyed on the room's message count would
+    /// miss a revival when a pair at its cap evicts one message as another lands.
+    fn archive_revival(&mut self, now_secs: u64) {
+        let archived = self.dm_cache.archived();
+        if archived.is_empty() {
+            return;
+        }
+        // Each room with an entry is read once for every peer's newest inbound time, so the cost
+        // is the messages of those rooms plus the entries, not entries times messages. Rooms
+        // with no entry are not looked at.
+        let owed: HashSet<dm_archive::ThreadKey> = self
+            .dm_cache
+            .archive_owed()
+            .iter()
+            .map(ArchiveOp::thread)
+            .collect();
+        let mut newest: HashMap<[u8; 32], HashMap<MemberId, u64>> = HashMap::new();
+        let mut ops = Vec::new();
+        for (thread, cutoff) in archived {
+            if owed.contains(&thread) || self.dm_cache.revival_held(&thread) {
+                continue;
+            }
+            let list = &self.list;
+            let by_peer = newest.entry(thread.0).or_insert_with(|| {
+                list.iter()
+                    .find(|r| r.stored.owner_vk.as_bytes() == &thread.0)
+                    .and_then(|room| {
+                        let me = MemberId::from(&room.stored.self_verifying_key()?);
+                        Some(dm_archive::live_inbound_by_peer(
+                            &room.stored.room_state.direct_messages,
+                            me,
+                        ))
+                    })
+                    .unwrap_or_default()
+            });
+            let Some(&latest) = by_peer.get(&thread.1) else {
+                continue;
+            };
+            if let Some(op) = dm_archive::revival_op(thread, cutoff, latest, now_secs) {
+                ops.push(op);
+            }
+        }
+        if !ops.is_empty() {
+            for op in ops {
+                self.dm_cache.archive(op);
+            }
+            self.archive_saver.new_work();
+        }
+    }
+
     /// Settle the sent-message writes that ended, and start the next one if one is due
     /// ([`super::dm_save`] has the rules). `writes` is the connection's write gate.
     fn dm_save_tick(&mut self, writes: bool, now: Instant) {
@@ -2308,16 +2477,38 @@ impl Rooms {
                 .collect(),
         );
         for end in self.outbox.work.take_dm_ends() {
-            self.dm_saver.ended(end.ok, now);
+            // A write carries archive changes or sent text, never both.
+            // (A write whose every change was left out, for rooms that are gone, is an archive
+            // write too.)
+            let archive_write = !end.archived.is_empty() || !end.archive_dropped.is_empty();
+            let saver = if archive_write {
+                &mut self.archive_saver
+            } else {
+                &mut self.dm_saver
+            };
+            saver.ended(end.ok, now);
+            let failures = saver.failures();
             if end.ok {
                 self.dm_cache.note_saved(&end.added, &end.evicted);
+                self.dm_cache
+                    .note_archive_saved(&end.archived, &end.archive_skipped);
+                self.dm_cache.note_archive_dropped(&end.archive_dropped);
+                if !end.archive_skipped.is_empty() {
+                    // The store held something else than this copy of the list assumed (another
+                    // device got there first): read it again to show what it holds.
+                    self.outbox.work.ask_reload();
+                }
             } else {
                 // Said once, without a word of what was written.
-                eprintln!(
-                    "River: saving sent direct messages failed ({}), {} in a row",
-                    end.refusal.map_or("other", |r| r.kind()),
-                    self.dm_saver.failures()
-                );
+                let kind = end.refusal.map_or("other", |r| r.kind());
+                if archive_write {
+                    eprintln!("River: saving archive changes failed ({kind}), {failures} in a row");
+                } else {
+                    eprintln!(
+                        "River: saving sent direct messages failed ({}), {} in a row",
+                        kind, failures
+                    );
+                }
                 if end.refusal == Some(super::dm_store::Refusal::Vanished) {
                     // The key may be gone for good or only unread: read the stored rooms again,
                     // whose list says which ([`OutboundCache::note_read`]).
@@ -2326,16 +2517,78 @@ impl Rooms {
             }
         }
         self.prune_purged_texts();
+        // Only when the read can run: the window is not used up by a request nothing will take.
+        if self.reread_after_send
+            && writes
+            && self.loaded
+            && !self.update_required
+            && !self.store_missing
+            && self.reread_not_before.is_none_or(|at| now >= at)
+        {
+            self.reread_after_send = false;
+            self.reread_not_before = Some(now + REREAD_EVERY);
+            self.outbox.work.ask_reload();
+        }
         if !writes
             || self.update_required
             || !self.loaded
             || self.store_missing
             || self.outbox.work.has_dm()
             || !self.dm_cache.hydrated()
-            || !self.dm_saver.due(now)
         {
             return;
         }
+        if self.dm_saver.due(now) {
+            self.start_text_write();
+        }
+        // Archive changes go after the text, and not at all while a write is out. They have their
+        // own waits and their own count of failures.
+        if !self.outbox.work.has_dm() && self.archive_saver.due(now) {
+            self.start_archive_write();
+        }
+    }
+
+    /// Start the write that carries archive changes, if any are owed: only those, so a store that
+    /// refuses them cannot refuse a removal or a sent text with them.
+    fn start_archive_write(&mut self) {
+        // Taking an entry out is never refused for size, and a new one can be: so removals go
+        // first and alone, and the new entries after, or a new entry that does not fit would hold
+        // back an Un-archive for good.
+        // A new entry for a room missing from the list waits, as a sent text does, until a
+        // complete read of the rooms says the room is gone (a partial list is missing rooms for a
+        // while); only then it is left out of the write as an orphan ([`super::work`]).
+        let list = &self.list;
+        let complete = self.complete;
+        let owed: Vec<ArchiveOp> = self
+            .dm_cache
+            .archive_owed()
+            .iter()
+            .filter(|op| match op {
+                ArchiveOp::Hide { thread, .. } => {
+                    complete
+                        || list
+                            .iter()
+                            .any(|r| r.stored.owner_vk.as_bytes() == &thread.0)
+                }
+                _ => true,
+            })
+            .copied()
+            .collect();
+        let removals: Vec<DmOp> = owed
+            .iter()
+            .filter(|op| !matches!(op, ArchiveOp::Hide { .. }))
+            .map(|op| DmOp::Archive(*op))
+            .collect();
+        let ops = if removals.is_empty() {
+            owed.iter().map(|op| DmOp::Archive(*op)).collect()
+        } else {
+            removals
+        };
+        self.outbox.work.dm_save(ops, self.dm_cache.listed());
+    }
+
+    /// Start the write that carries sent text and its removals, if anything is owed.
+    fn start_text_write(&mut self) {
         let mut ops = Vec::new();
         let mut adding = Vec::new();
         let mut stopped = Vec::new();

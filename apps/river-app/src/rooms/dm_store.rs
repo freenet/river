@@ -5,10 +5,12 @@
 //! `hidden_threads` (the archive list) live in the same value. So a write here is a
 //! read-merge-write over the CBOR as the delegate holds it, never a rebuild from the cache:
 //!
-//! - The value is decoded to a generic CBOR map, and only the `entries` array is edited. Every
-//!   other field of the map, known or not, `hidden_threads` included, is carried over value for
-//!   value, and so is every entry of the array that is not being removed, with any field this
-//!   build does not know. The result is encoded again, canonically, so what is preserved is
+//! - The value is decoded to a generic CBOR map, and only the `entries` array is edited, and the
+//!   `hidden_threads` array too when the write carries an archive change ([`DmOp::Archive`],
+//!   [`super::dm_archive`]), and then only the entries of the thread it names. Every other field
+//!   of the map, known or not, is carried over value for value, and so is every entry of either
+//!   array that is not being removed or changed, with any field this build does not know (a
+//!   changed archive entry keeps its other fields too: only `hidden_at_ts` is set). The result is encoded again, canonically, so what is preserved is
 //!   the decoded value and not the bytes: an indefinite-length array or map comes back
 //!   definite-length and an integer with a non-minimal encoding comes back minimal. Map order,
 //!   text, byte strings and integers' values are kept. (The web UI and this app write the
@@ -40,16 +42,19 @@ use std::collections::HashSet;
 use std::fmt;
 
 use ciborium::Value;
-use river_core::chat_delegate::OutboundDmEntry;
+use river_core::chat_delegate::{HiddenDmThreadEntry, OutboundDmEntry};
 use river_core::room_state::direct_messages::{MAX_DM_MESSAGES_PER_PAIR, PurgeToken};
 use river_core::room_state::member::MemberId;
 
+use super::dm_archive::{ArchiveOp, ThreadKey};
 use super::dm_cache::{MAX_STORE_BYTES, Plaintext};
 
 /// The field of the stored map that holds the sent messages.
 const ENTRIES: &str = "entries";
-/// The archive list, which is never edited here.
+/// The archive list, edited only for an [`ArchiveOp`].
 const HIDDEN: &str = "hidden_threads";
+/// The field of an archive entry that holds its cutoff.
+const CUTOFF: &str = "hidden_at_ts";
 
 /// The most bytes a save stores. The node's client API accepts messages of 100 MiB
 /// (`WEBSOCKET_MAX_MESSAGE_SIZE`, freenet-core), and this app's own reader (tungstenite's default
@@ -77,6 +82,8 @@ pub enum DmOp {
     },
     /// Remove the entry for a message the user discarded.
     Remove { key: EntryKey },
+    /// Change the archive list ([`super::dm_archive`]): the thread's entries and nothing else.
+    Archive(ArchiveOp),
 }
 
 impl fmt::Debug for DmOp {
@@ -90,6 +97,13 @@ impl fmt::Debug for DmOp {
                 .field("text", text)
                 .finish_non_exhaustive(),
             DmOp::Remove { .. } => f.debug_struct("Remove").finish_non_exhaustive(),
+            DmOp::Archive(op) => f
+                .debug_struct(match op {
+                    ArchiveOp::Hide { .. } => "Archive",
+                    ArchiveOp::Unhide { .. } => "Unarchive",
+                    ArchiveOp::UnhideIfPast { .. } => "UnarchiveIfPast",
+                })
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -137,6 +151,9 @@ pub struct Merged {
     pub bytes: Option<Vec<u8>>,
     /// Entries of this user dropped to stay inside the bounds.
     pub evicted: Vec<EntryKey>,
+    /// An archive change found the store already as it asks, or holding a higher cutoff (another
+    /// device got there first), so this app's copy of the list may not match what is stored.
+    pub archive_skipped: Vec<ArchiveOp>,
 }
 
 /// Zero the text and bytes of a decoded value.
@@ -198,6 +215,80 @@ fn item_of(value: Value) -> Result<Item, Refusal> {
         value,
         added: false,
     })
+}
+
+/// One entry of the stored archive list, kept as read.
+struct Archived {
+    value: Value,
+    thread: ThreadKey,
+    cutoff: u64,
+}
+
+fn archived_of(value: Value) -> Result<Archived, Refusal> {
+    let bytes = encode(&value)?;
+    let parsed = ciborium::de::from_reader::<HiddenDmThreadEntry, _>(bytes.as_slice())
+        .map_err(|_| Refusal::Unreadable)?;
+    Ok(Archived {
+        value,
+        thread: (parsed.room_owner_vk, parsed.peer),
+        cutoff: parsed.hidden_at_ts,
+    })
+}
+
+/// Set an archive entry's cutoff, keeping its other fields.
+fn set_cutoff(value: &mut Value, ts: u64) -> Result<(), Refusal> {
+    let Value::Map(fields) = value else {
+        return Err(Refusal::Unreadable);
+    };
+    let slot = fields
+        .iter_mut()
+        .find(|(k, _)| k.as_text() == Some(CUTOFF))
+        .ok_or(Refusal::Unreadable)?;
+    slot.1 = Value::Integer(ts.into());
+    Ok(())
+}
+
+/// What an archive op does to the entries read, as [`super::dm_archive::apply`] does to a list.
+/// True when something changed, and whether an entry was added.
+fn archive_apply(list: &mut Vec<Archived>, op: &ArchiveOp) -> Result<(bool, bool), Refusal> {
+    let thread = op.thread();
+    let held = list
+        .iter()
+        .filter(|a| a.thread == thread)
+        .map(|a| a.cutoff)
+        .max();
+    match (op, held) {
+        (ArchiveOp::Hide { hidden_at_ts, .. }, None) => {
+            let entry = HiddenDmThreadEntry {
+                room_owner_vk: thread.0,
+                peer: thread.1,
+                hidden_at_ts: *hidden_at_ts,
+            };
+            let value = Value::serialized(&entry).map_err(|_| Refusal::Encode)?;
+            list.push(Archived {
+                value,
+                thread,
+                cutoff: *hidden_at_ts,
+            });
+            Ok((true, true))
+        }
+        (ArchiveOp::Hide { hidden_at_ts, .. }, Some(at)) if at < *hidden_at_ts => {
+            for a in list.iter_mut().filter(|a| a.thread == thread) {
+                set_cutoff(&mut a.value, *hidden_at_ts)?;
+                a.cutoff = *hidden_at_ts;
+            }
+            Ok((true, false))
+        }
+        (ArchiveOp::Unhide { .. }, Some(_)) => {
+            list.retain(|a| a.thread != thread);
+            Ok((true, false))
+        }
+        (ArchiveOp::UnhideIfPast { past, .. }, Some(at)) if at < *past => {
+            list.retain(|a| a.thread != thread);
+            Ok((true, false))
+        }
+        _ => Ok((false, false)),
+    }
 }
 
 fn encode(value: &Value) -> Result<Vec<u8>, Refusal> {
@@ -265,6 +356,38 @@ fn merge_within(
     };
     let mut items: Vec<Item> = stored.into_iter().map(item_of).collect::<Result<_, _>>()?;
 
+    // The archive list is read only when the write changes it; otherwise it is carried over
+    // as it was found.
+    let archiving = ops.iter().any(|o| matches!(o, DmOp::Archive(_)));
+    let hidden_at = if archiving {
+        Some(
+            match top.0.iter().position(|(k, _)| k.as_text() == Some(HIDDEN)) {
+                Some(i) => i,
+                None => {
+                    top.0
+                        .push((Value::Text(HIDDEN.into()), Value::Array(Vec::new())));
+                    top.0.len() - 1
+                }
+            },
+        )
+    } else {
+        None
+    };
+    let mut archive: Vec<Archived> = match hidden_at {
+        Some(at) => {
+            let Value::Array(stored) = std::mem::replace(&mut top.0[at].1, Value::Null) else {
+                return Err(Refusal::Unreadable);
+            };
+            stored
+                .into_iter()
+                .map(archived_of)
+                .collect::<Result<_, _>>()?
+        }
+        None => Vec::new(),
+    };
+    let mut grew = false;
+    let mut skipped: Vec<ArchiveOp> = Vec::new();
+
     let mut changed = false;
     // Removals first, so an entry to remove goes whatever is asked of the adds.
     let removals = ops.iter().filter(|o| matches!(o, DmOp::Remove { .. }));
@@ -303,12 +426,24 @@ fn merge_within(
                 });
                 changed = true;
             }
+            DmOp::Archive(_) => {}
+        }
+    }
+    for op in ops {
+        if let DmOp::Archive(op) = op {
+            let (did, added) = archive_apply(&mut archive, op)?;
+            changed |= did;
+            grew |= added;
+            if !did {
+                skipped.push(*op);
+            }
         }
     }
     if !changed {
         return Ok(Merged {
             bytes: None,
             evicted: Vec::new(),
+            archive_skipped: skipped,
         });
     }
 
@@ -340,14 +475,18 @@ fn merge_within(
         let mut value = Value::Map(top.0.clone());
         if let Value::Map(map) = &mut value {
             map[at].1 = Value::Array(items.iter().map(|i| i.value.clone()).collect());
+            if let Some(h) = hidden_at {
+                map[h].1 = Value::Array(archive.iter().map(|a| a.value.clone()).collect());
+            }
         }
         let out = encode(&value);
         wipe_value(&mut value);
         out
     };
     let mut bytes = build(&items, &top)?;
-    // A removal only makes the value smaller, so it is never refused for size.
-    if bytes.len() > limit && items.iter().any(|i| i.added) {
+    // A removal only makes the value smaller, so it is never refused for size, and neither is
+    // taking a thread out of the archive or moving its cutoff.
+    if bytes.len() > limit && (grew || items.iter().any(|i| i.added)) {
         // This user's oldest entries in the rooms and under the ids being added to, oldest
         // first, until it fits.
         let ours: HashSet<([u8; 32], MemberId)> = items
@@ -381,6 +520,7 @@ fn merge_within(
     Ok(Merged {
         bytes: Some(bytes),
         evicted,
+        archive_skipped: skipped,
     })
 }
 

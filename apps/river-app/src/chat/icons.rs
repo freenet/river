@@ -75,6 +75,13 @@ pub static TRASH: Icon = Icon {
     body: r#"<path d="M2.5 4.5h11M6.5 4.5V3h3v1.5M4 4.5l.7 9h6.6l.7-9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+/// A box with a lid and a handle: put a conversation away.
+pub static ARCHIVE: Icon = Icon {
+    name: "river-archive",
+    view: 16.0,
+    body: r#"<rect x="2" y="3" width="12" height="3.2" rx="1" stroke="currentColor" stroke-width="1.4"/><path d="M3.2 6.2V12a1.3 1.3 0 0 0 1.3 1.3h7A1.3 1.3 0 0 0 12.8 12V6.2M6.5 9h3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
 pub static BELL: Icon = Icon {
     name: "river-bell",
     view: 16.0,

@@ -11,7 +11,10 @@
 # node's chat delegate then holds the sent text, and after the first app's link restarts it reads
 # its own sent message back as text from there; the peer deletes the gateway's message (a deletion
 # of its own is refused), both threads lose it, the gateway's saved copy of its text is removed
-# from the delegate, and it stays deleted after a restart; and each changes its own nickname and the other sees
+# from the delegate, and it stays deleted after a restart; the gateway archives its thread with the
+# peer (the delegate holds the entry in the web UI's shape and keeps the sent texts, and the thread
+# stays archived after a restart), a new message from the peer brings it back and the app drops the
+# entry, and sending into an archived thread unarchives it; and each changes its own nickname and the other sees
 # it; the owner makes the joiner a deputy, whose app shows the Deputy tag, and revokes it. Last,
 # the example asks each node's chat delegate for
 # the room's signing key and requires it to be that app's own member key (the app's background
