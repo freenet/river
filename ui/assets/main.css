@@ -1165,6 +1165,9 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
  * remounts the dots halfway through a transition. The enclosing rail strip
  * stays the positioning frame for the non-anchor tooltip fallback. */
 .connection-pill {
+    /* Five 3px dots, four 2px gaps, and the gap after the status dot. */
+    --activity-space: calc(23px + 0.5rem);
+    --activity-slide: transform 300ms ease 700ms;
     display: inline-grid;
     vertical-align: middle;
     font-size: 12.5px;
@@ -1172,34 +1175,47 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
 }
 
 .connection-pill-face, .connection-pill-details { grid-area: 1 / 1; }
-.connection-pill-face { display: flex; align-items: center; }
+.connection-pill-face { display: flex; align-items: center; overflow: clip; pointer-events: none; }
 
+/* Reserve the open slot so moving the label never lays out the rail mid-slide. */
 .connection-activity {
-    display: inline-grid;
-    grid-template-columns: 0fr;
+    display: flex;
+    flex: 0 0 var(--activity-space);
+    transform-origin: left center;
+    transform: scaleX(0);
     opacity: 0;
-    transition: grid-template-columns 300ms ease 700ms, opacity 300ms ease 700ms;
+    transition: var(--activity-slide), opacity 300ms ease 700ms;
+}
+
+.connection-activity + span {
+    /* Reclaim the slot in the idle hit target once the label has slid back.
+     * Long error labels then have the full rail width for wrapping. */
+    margin-inline-end: calc(-1 * var(--activity-space));
+    transform: translateX(calc(-1 * var(--activity-space)));
+    transition: var(--activity-slide), margin-inline-end 0s linear 1s;
 }
 
 /* The mobile footer shares this panel with the full-size loading wave. */
+.room-load-placeholder .connection-pill { --activity-space: 0px; }
 .room-load-placeholder .connection-activity { display: none; }
 
-.connection-activity-clip { min-width: 0; overflow: hidden; display: flex; }
+.connection-activity-clip { display: flex; }
 .connection-activity .small-dots { margin-inline-start: 0.5rem; color: inherit; }
+.connection-pill[aria-busy="true"] { --activity-slide: transform 300ms ease; }
 .connection-pill[aria-busy="true"] .connection-activity {
-    grid-template-columns: 1fr;
+    transform: scaleX(1);
     opacity: 1;
-    transition-delay: 0s;
-    transition-duration: 300ms, 0s;
+    transition: var(--activity-slide);
+}
+.connection-pill[aria-busy="true"] .connection-activity + span {
+    margin-inline-end: 0;
+    transform: none;
+    transition: var(--activity-slide);
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .connection-activity {
-        transition: grid-template-columns 0s linear 1s, opacity 300ms ease 700ms;
-    }
-    .connection-pill[aria-busy="true"] .connection-activity {
-        transition-duration: 0s;
-    }
+    .connection-pill { --activity-slide: transform 0s linear 1s; }
+    .connection-pill[aria-busy="true"] { --activity-slide: transform 0s; }
 }
 
 /* Explain-only cards must not intercept the controls beneath them. */
