@@ -24,6 +24,11 @@
 //! start of a mention pill inside it. Whole segments are used, so the caret never lands inside
 //! a grapheme cluster (an accent, a keycap, an emoji with a joiner, a Thai tone mark).
 //!
+//! A run of more than 4096 segments with no word in it (5000 dots) is left to Rune for that
+//! press, so a press there follows Rune's rule while the presses before it followed this one.
+//! Pills are read with `TextEdit::pills`, which skips a malformed pill that Rune's own lookup
+//! would still count; River's fields hold none.
+//!
 //! Limits: a key taken here skips Rune's follow-up for a key (it scrolls the caret into view), so
 //! in a field that scrolls the caret may stay out of view until the next key.
 

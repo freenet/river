@@ -6625,8 +6625,7 @@ mod rune_bump {
             assert_eq!((composer(&rt).1, composer(&rt).2), (0, 14));
         }
 
-        /// A key that moves the caret in Rune's own way and one of ours land in the same state:
-        /// the text, the focus and the anchor.
+        /// The caret never lands inside a grapheme cluster: after an accent, a keycap, a ZWJ emoji.
         #[test]
         fn the_caret_lands_off_the_middle_of_a_grapheme_cluster() {
             for (text, end) in [
@@ -6667,7 +6666,7 @@ mod rune_bump {
         fn right_to_left_text_and_forced_direction_keep_runes_rule() {
             for text in [
                 "\u{5E9}\u{5DC}\u{5D5}\u{5DD} \u{5E2}\u{5D5}\u{5DC}\u{5DD} hello there",
-                "hello \u{645}\u{631}\u{62D}\u{628}\u{627} there",
+                "\u{645}\u{631}\u{62D}\u{628}\u{627} hello there",
             ] {
                 let mut rt = fresh(text, 0, 0);
                 right(&mut rt, false);
@@ -6677,7 +6676,7 @@ mod rune_bump {
                 let ours =
                     super::super::super::word_end::forward_word_end(&end_of_first, 0).unwrap();
                 assert!(
-                    rune_at != ours || text.starts_with("hello"),
+                    rune_at != ours,
                     "{text:?}: the caret went to {rune_at}, the end-of-word rule's {ours}"
                 );
             }
