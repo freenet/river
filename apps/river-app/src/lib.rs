@@ -3490,6 +3490,10 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with('#') && l.contains("anomalyco/rune"))
             .map(|l| {
                 let name = l.split('=').next().unwrap().trim();
+                assert!(
+                    l.contains("git = \"https://github.com/anomalyco/rune\""),
+                    "{name} is not a `git =` entry on Rune's repository: {l}"
+                );
                 let rev = l
                     .split("rev = \"")
                     .nth(1)
@@ -3512,7 +3516,10 @@ mod tests {
             assert!(names.contains(&want), "{want} has no Rune entry: {names:?}");
         }
         let first = revs[0].1;
-        assert_eq!(first.len(), 40, "rev is a full commit id: {first}");
+        assert!(
+            first.len() == 40 && first.bytes().all(|b| b.is_ascii_hexdigit()),
+            "rev is a full commit id (40 hex digits): {first}"
+        );
         for (name, rev) in &revs {
             assert_eq!(*rev, first, "{name} names a different Rune rev");
         }

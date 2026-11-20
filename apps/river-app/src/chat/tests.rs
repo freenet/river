@@ -1229,21 +1229,31 @@ fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
     assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
     ctrl(&mut rt, Key::Right, false);
     key(&mut rt, Key::Text("Z".into()));
-    // Off macOS a word forward ends at the next word's start (Windows' Ctrl+Right, which Rune
-    // applies on Linux too since its 2026-11-12 word-boundary change); only macOS stops at the
-    // word's end, and this test does not run there. So Z lands before "two", not after "Yone".
-    assert_eq!(rt.state.chat.composer.text, "Yone Ztwo Xthree");
-    // Ctrl+Backspace deletes the word before the caret (here the "Z" typed at the start of
-    // "Ztwo"), not the line before it.
-    ctrl(&mut rt, Key::Backspace, false);
-    assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
-    // Again: the caret now sits at the start of "two", so the word before it is "Yone ".
-    ctrl(&mut rt, Key::Backspace, false);
-    assert_eq!(rt.state.chat.composer.text, "two Xthree");
-    // Ctrl+Shift+Right selects by word, up to the next word's start.
-    ctrl(&mut rt, Key::Right, true);
-    key(&mut rt, Key::Text("!".into()));
-    assert_eq!(rt.state.chat.composer.text, "!Xthree");
+    // Forward by word is the platform's own rule (see `rune_bump::FORWARD_STOPS`): the end of the
+    // word on Linux, so Z lands right after "Yone"; the start of the next word on Windows, so Z
+    // lands before "two". macOS is excluded above.
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(rt.state.chat.composer.text, "YoneZ two Xthree");
+        // Ctrl+Backspace deletes the word before the caret, not the line before it.
+        ctrl(&mut rt, Key::Backspace, false);
+        assert_eq!(rt.state.chat.composer.text, " two Xthree");
+        // Ctrl+Shift+Right selects by word.
+        ctrl(&mut rt, Key::Right, true);
+        key(&mut rt, Key::Text("!".into()));
+        assert_eq!(rt.state.chat.composer.text, "! Xthree");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(rt.state.chat.composer.text, "Yone Ztwo Xthree");
+        ctrl(&mut rt, Key::Backspace, false);
+        assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
+        ctrl(&mut rt, Key::Backspace, false);
+        assert_eq!(rt.state.chat.composer.text, "two Xthree");
+        ctrl(&mut rt, Key::Right, true);
+        key(&mut rt, Key::Text("!".into()));
+        assert_eq!(rt.state.chat.composer.text, "!Xthree");
+    }
 }
 
 #[test]
@@ -6043,4 +6053,525 @@ fn enter_on_ban_user_asks_once_and_the_opener_goes() {
         .filter(|a| matches!(a, Action::PreviewBan { .. }))
         .count();
     assert_eq!(previews, 1, "the room is asked what the ban does once");
+}
+
+// Behaviour a Rune bump can change -------------------------------------------------------------
+//
+// Each test here pins what the app does through a Rune feature (word motion, input method,
+// undo, modal focus, the direction chord), driven with the events a window delivers. They are
+// the ratchet for the next bump: a changed line means Rune changed, so read its changelog.
+mod rune_bump {
+    use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use rune::{PhysicalInput, PhysicalKeyCode};
+
+    /// The key of the element Rune says has the keyboard (`Tx::focused`), not River's mirror
+    /// of it (`composer.focused`).
+    fn rune_focus(rt: &mut Runtime<RiverApp>) -> Option<String> {
+        let mut out = None;
+        rt.update(|_, tx| out = tx.focused().map(str::to_owned));
+        out
+    }
+
+    /// River's flag and Rune's focus say the same about the composer.
+    fn assert_composer_focus_agrees(rt: &mut Runtime<RiverApp>, what: &str) {
+        let rune = rune_focus(rt);
+        let flag = rt.state.chat.composer.focused;
+        assert_eq!(
+            flag,
+            rune.as_deref() == Some("composer-field"),
+            "{what}: composer.focused={flag} but Rune's focus is {rune:?}"
+        );
+    }
+
+    /// What a Ctrl+key is off macOS: rune's `cmd` and `ctrl` both set (see `ctrl` above).
+    #[cfg(not(target_os = "macos"))]
+    fn word_key(rt: &mut Runtime<RiverApp>, key: Key, shift: bool) {
+        ctrl(rt, key, shift);
+    }
+
+    /// What the same key is on macOS: Option.
+    #[cfg(target_os = "macos")]
+    fn word_key(rt: &mut Runtime<RiverApp>, key: Key, shift: bool) {
+        rt.key(KeyEvent {
+            key,
+            mods: rune::Mods {
+                shift,
+                alt: true,
+                ..rune::Mods::default()
+            },
+        });
+        rt.frame(0.3);
+    }
+
+    fn command(rt: &mut Runtime<RiverApp>, c: char) {
+        rt.key(KeyEvent {
+            key: Key::Command(c),
+            mods: rune::Mods {
+                cmd: true,
+                ctrl: !cfg!(target_os = "macos"),
+                ..rune::Mods::default()
+            },
+        });
+        rt.frame(0.3);
+    }
+
+    fn composer(rt: &Runtime<RiverApp>) -> (&str, usize, usize) {
+        let c = &rt.state.chat.composer;
+        (c.text.as_str(), c.anchor, c.focus)
+    }
+
+    const LINE: &str = "see @maya.chen http://x.org/a";
+
+    fn typed_line() -> Runtime<RiverApp> {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, LINE);
+        rt
+    }
+
+    // ---- word motion (UAX #29) ---------------------------------------------------------------
+
+    /// Words are Unicode's: `maya.chen` and `x.org` are one word each, `@`, `://` and `/` are
+    /// not. Backwards is the same on every platform: to the word's start.
+    #[test]
+    fn word_left_and_word_backspace_stop_at_unicode_word_starts() {
+        let mut rt = typed_line();
+        let mut stops = Vec::new();
+        for _ in 0..5 {
+            word_key(&mut rt, Key::Left, false);
+            stops.push(composer(&rt).2);
+        }
+        assert_eq!(stops, [28, 22, 15, 5, 0]);
+        let mut rt = typed_line();
+        let mut left = Vec::new();
+        for _ in 0..3 {
+            word_key(&mut rt, Key::Backspace, false);
+            left.push(composer(&rt).0.to_owned());
+        }
+        assert_eq!(
+            left,
+            [
+                "see @maya.chen http://x.org/",
+                "see @maya.chen http://",
+                "see @maya.chen "
+            ]
+        );
+    }
+
+    /// Forward word keys follow each platform's own convention (Ian, 2026-11-20: the least
+    /// surprise). Windows: the start of the next word, which is Rune's rule. macOS: the end of
+    /// the word. Linux (GTK, Qt, Chromium): the end of the word too, which Rune stopped doing
+    /// in 2026-11 and `keys::word_keys` restores. Backwards is the start of the word everywhere.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const FORWARD_STOPS: [usize; 5] = [3, 14, 19, 27, 29];
+    #[cfg(target_os = "windows")]
+    const FORWARD_STOPS: [usize; 5] = [5, 15, 22, 28, 29];
+
+    fn to_start(rt: &mut Runtime<RiverApp>) {
+        for _ in 0..5 {
+            word_key(rt, Key::Left, false);
+        }
+        assert_eq!(composer(rt).2, 0);
+    }
+
+    #[test]
+    fn ctrl_right_moves_a_word_forward_by_the_platforms_rule() {
+        let mut rt = typed_line();
+        to_start(&mut rt);
+        let mut stops = Vec::new();
+        for _ in 0..5 {
+            word_key(&mut rt, Key::Right, false);
+            stops.push(composer(&rt).2);
+        }
+        assert_eq!(stops, FORWARD_STOPS);
+    }
+
+    #[test]
+    fn ctrl_shift_right_selects_a_word_forward_by_the_platforms_rule() {
+        let mut rt = typed_line();
+        to_start(&mut rt);
+        let mut ends = Vec::new();
+        for _ in 0..5 {
+            word_key(&mut rt, Key::Right, true);
+            ends.push(composer(&rt).2);
+        }
+        assert_eq!(ends, FORWARD_STOPS);
+        assert_eq!(composer(&rt).1, 0, "the anchor stays");
+        // Ctrl+Shift+Left shrinks it back to the start of a word, on every platform.
+        word_key(&mut rt, Key::Left, true);
+        assert_eq!(composer(&rt).2, 28);
+    }
+
+    #[test]
+    fn ctrl_delete_removes_forward_by_the_platforms_rule() {
+        let mut rt = typed_line();
+        to_start(&mut rt);
+        word_key(&mut rt, Key::Delete, false);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
+        #[cfg(target_os = "windows")]
+        assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
+    }
+
+    /// With a selection, Ctrl+Delete deletes the selection and nothing more.
+    #[test]
+    fn ctrl_delete_with_a_selection_deletes_only_the_selection() {
+        let mut rt = typed_line();
+        to_start(&mut rt);
+        word_key(&mut rt, Key::Right, true);
+        word_key(&mut rt, Key::Delete, false);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
+        #[cfg(target_os = "windows")]
+        assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
+    }
+
+    /// The end of a word is found past spaces and punctuation, and at the end of the text it
+    /// stays there. Linux only: the other platforms use Rune's own rule.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_word_end_skips_gaps_and_stops_at_the_end() {
+        assert_eq!(super::super::keys::word_end_for_test(LINE, 3), 14);
+        assert_eq!(super::super::keys::word_end_for_test("abc  ", 3), 5);
+        assert_eq!(super::super::keys::word_end_for_test("abc", 3), 3);
+        assert_eq!(super::super::keys::word_end_for_test("", 0), 0);
+        assert_eq!(super::super::keys::word_end_for_test("don't stop", 0), 5);
+        assert_eq!(super::super::keys::word_end_for_test("a_b.c d", 0), 5);
+    }
+
+    /// Word keys on Linux edit without the field's change hook (`keys::word_keys` handles them
+    /// itself), the others through it; either way a warning about the text before is gone.
+    #[test]
+    fn a_word_key_in_the_import_box_clears_the_warning_about_the_text_before() {
+        const BAD: &str =
+            "-----BEGIN RIVER IDENTITY-----\n3mJr7AoUXx2Wqd\n-----END RIVER IDENTITY-----";
+        for (k, caret) in [(Key::Backspace, BAD.len()), (Key::Delete, 0)] {
+            let mut app = connected();
+            let rooms = super::super::example::data().rooms;
+            app.chat.source = super::super::Source::Node(super::super::LinkStatus::Live);
+            app.chat
+                .show_node_rooms(rooms, None, super::super::LinkStatus::Live, 29_000_000);
+            let mut rt = render(app, WINDOW_SIZE);
+            rt.update(|s, _| {
+                s.chat.open_import();
+                s.chat.form.token.replace_text(BAD);
+                s.chat.submit_import();
+            });
+            rt.frame(0.3);
+            assert!(
+                rt.state.chat.form.error.is_some(),
+                "the bad token is refused"
+            );
+            press(&mut rt, "import-token");
+            rt.update(|s, _| s.chat.form.token.set_caret(caret));
+            word_key(&mut rt, k.clone(), false);
+            assert_ne!(rt.state.chat.form.token.text, BAD, "{k:?} edited it");
+            assert!(rt.state.chat.form.error.is_none(), "{k:?}");
+        }
+    }
+
+    // ---- input method ------------------------------------------------------------------------
+
+    fn composing(rt: &mut Runtime<RiverApp>) {
+        rt.ime(rune::Ime::Enabled);
+        rt.ime(rune::Ime::Preedit("かん".into(), Some((0, 6)), Vec::new()));
+        rt.frame(0.3);
+    }
+
+    fn commit(rt: &mut Runtime<RiverApp>, text: &str) {
+        rt.ime(rune::Ime::Preedit(String::new(), None, Vec::new()));
+        rt.ime(rune::Ime::Commit(text.into()));
+        rt.frame(0.3);
+    }
+
+    #[test]
+    fn a_composition_hides_the_mention_popup_and_commit_brings_it_back() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, "hi @ma");
+        assert!(rt.state.chat.mention_popup().is_some());
+        composing(&mut rt);
+        assert!(rt.state.chat.mention_popup().is_none());
+        assert!(rt.find("mention-popup-content").is_none());
+        commit(&mut rt, "y");
+        assert_eq!(rt.state.chat.composer.text, "hi @may");
+        assert_eq!(mention_names(&rt), ["Maya Chen"]);
+        assert!(rt.find("mention-popup-content").is_some());
+    }
+
+    #[test]
+    fn tab_and_enter_in_a_composition_complete_no_mention_and_send_nothing() {
+        for k in [Key::Tab, Key::Enter] {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            type_text(&mut rt, "hi @ma");
+            composing(&mut rt);
+            key(&mut rt, k.clone());
+            let text = &rt.state.chat.composer.text;
+            assert!(!text.contains("rv:"), "{k:?} completed a mention: {text:?}");
+            assert!(!text.is_empty(), "{k:?} sent the draft: {text:?}");
+            assert!(rt.state.chat.mention_popup().is_none(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn a_composition_hides_the_shortcode_popup_and_commit_brings_it_back() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, ":smi");
+        assert!(rt.state.chat.shortcode_popup().is_some());
+        composing(&mut rt);
+        assert!(rt.state.chat.shortcode_popup().is_none());
+        key(&mut rt, Key::Tab);
+        assert!(
+            rt.state.chat.composer.text.starts_with(":smi"),
+            "Tab did not complete the emoji: {:?}",
+            rt.state.chat.composer.text
+        );
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, ":smi");
+        composing(&mut rt);
+        commit(&mut rt, "l");
+        assert_eq!(rt.state.chat.composer.text, ":smil");
+        assert!(rt.state.chat.shortcode_popup().is_some());
+    }
+
+    // ---- undo --------------------------------------------------------------------------------
+
+    #[test]
+    fn undo_restores_a_word_deleted_with_ctrl_backspace() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, "hello big world");
+        word_key(&mut rt, Key::Backspace, false);
+        assert_eq!(composer(&rt).0, "hello big ");
+        command(&mut rt, 'z');
+        assert_eq!(composer(&rt), ("hello big world", 15, 15));
+    }
+
+    /// Undo after completing a mention puts back what was typed, selected, with no popup left
+    /// open; a second undo removes the typing.
+    #[test]
+    fn undo_after_a_mention_completes_leaves_no_popup_or_stuck_anchor() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, "hello world @ma");
+        key(&mut rt, Key::Tab);
+        assert_eq!(composer(&rt).0, "hello world @[Maya Chen](rv:12) ");
+        command(&mut rt, 'z');
+        assert_eq!(composer(&rt), ("hello world @ma", 12, 15));
+        assert!(rt.state.chat.mention_popup().is_none());
+        // Typing replaces the selection, and the popup works again from the new text.
+        key(&mut rt, Key::Text("@pr".into()));
+        assert_eq!(composer(&rt).0, "hello world @pr");
+        assert_eq!(mention_names(&rt), ["Priya Raman"]);
+        command(&mut rt, 'z');
+        command(&mut rt, 'z');
+        assert!(rt.state.chat.mention_popup().is_none());
+    }
+
+    #[test]
+    fn undo_after_an_emoji_shortcode_completes_leaves_no_popup() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, "ok :smi");
+        key(&mut rt, Key::Tab);
+        assert_eq!(composer(&rt).0, "ok \u{1F604}");
+        command(&mut rt, 'z');
+        assert_eq!(composer(&rt), ("ok :smi", 3, 7));
+        assert!(rt.state.chat.shortcode_popup().is_none());
+        command(&mut rt, 'z');
+        assert_eq!(composer(&rt), ("", 0, 0));
+        assert!(rt.state.chat.shortcode_popup().is_none());
+    }
+
+    // ---- focus under and after dialogs -------------------------------------------------------
+
+    fn open_dialog(rt: &mut Runtime<RiverApp>, which: &str) {
+        match which {
+            "room-details" => rt.update(|s, _| s.chat.open_details()),
+            "shortcuts" => rt.update(|s, _| {
+                s.chat.open_shortcuts();
+            }),
+            _ => rt.update(|s, _| s.chat.open_member("27")),
+        }
+        for i in 0..6 {
+            rt.frame(1.0 + f64::from(i) / 60.0);
+        }
+    }
+
+    fn dialog_open(rt: &Runtime<RiverApp>) -> bool {
+        rt.find("room-details-dialog").is_some()
+            || rt.find("shortcuts-dialog").is_some()
+            || rt.state.chat.member_modal.is_some()
+    }
+
+    fn settle_frames(rt: &mut Runtime<RiverApp>) {
+        for i in 0..6 {
+            rt.frame(2.0 + f64::from(i) / 60.0);
+        }
+    }
+
+    /// Where the keyboard goes when each dialog closes, by each way of closing it. The room
+    /// details and member dialogs hand it back to the composer, which had it; the shortcuts
+    /// page does not (nothing has it afterwards, as before the Rune bump). In every case Rune's
+    /// focus and River's flag agree.
+    #[test]
+    fn closing_a_dialog_returns_the_keyboard_as_documented_and_rune_agrees() {
+        // (dialog, expected landing: composer or nowhere)
+        let dialogs = [
+            ("room-details", true),
+            ("member", true),
+            ("shortcuts", false),
+        ];
+        for (which, to_composer) in dialogs {
+            for how in ["escape", "x", "scrim", "button"] {
+                if how == "button" && which != "shortcuts" {
+                    continue; // the others close with the X (details' Cancel is the owner's)
+                }
+                let what = format!("{which} closed by {how}");
+                let mut rt = render(connected(), WINDOW_SIZE);
+                press(&mut rt, "composer-field");
+                assert_composer_focus_agrees(&mut rt, "before");
+                open_dialog(&mut rt, which);
+                assert!(dialog_open(&rt), "{what}: opened");
+                assert!(!rt.state.chat.composer.focused, "{what}: not under it");
+                assert_composer_focus_agrees(&mut rt, &format!("{what}, open"));
+                match how {
+                    "escape" => key(&mut rt, Key::Escape),
+                    "x" => press(&mut rt, "close"),
+                    "scrim" => {
+                        rt.pointer_down(2.0, 2.0);
+                        rt.pointer_up(2.0, 2.0);
+                        rt.frame(0.1);
+                        rt.frame(0.2);
+                    }
+                    _ => press(&mut rt, "shortcuts-close"),
+                }
+                settle_frames(&mut rt);
+                assert!(!dialog_open(&rt), "{what}: closed");
+                assert_eq!(rt.state.chat.composer.focused, to_composer, "{what}");
+                assert_composer_focus_agrees(&mut rt, &what);
+                if !to_composer {
+                    assert_eq!(rune_focus(&mut rt), None, "{what}: nothing has it");
+                }
+            }
+        }
+    }
+
+    /// The real user path of a click on the panel toggle while a dialog is up: the click is
+    /// outside the dialog, so it dismisses the dialog and does not toggle the panel, and the
+    /// composer gets the keyboard back from Rune, which agrees with River's flag.
+    #[test]
+    fn pressing_the_members_toggle_under_a_dialog_only_dismisses_the_dialog() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        press(&mut rt, "composer-field");
+        open_dialog(&mut rt, "room-details");
+        let panel = rt.state.chat.members_open;
+        press(&mut rt, "toggle-members");
+        settle_frames(&mut rt);
+        assert!(!dialog_open(&rt), "the press dismissed the dialog");
+        assert_eq!(
+            rt.state.chat.members_open, panel,
+            "the panel did not toggle"
+        );
+        assert!(rt.state.chat.composer.focused);
+        assert_composer_focus_agrees(&mut rt, "after the dismissal");
+    }
+
+    /// A direct-message thread is not a modal: River's own hand-back (`dm.restore_focus`) is the
+    /// only one. Opened by a key (the quick switcher, a notification) while the composer has the
+    /// keyboard, the thread's box takes it and Escape gives it back to the composer; Rune's
+    /// focus agrees at each step. Opened by a click on its row the composer has already lost
+    /// the keyboard to the click, so nothing is handed back and Rune puts the keyboard on the
+    /// first control it can (the connection pill), which River's flag also reports as not the
+    /// composer.
+    #[test]
+    fn a_dm_thread_takes_the_keyboard_and_gives_it_back_as_documented() {
+        use super::super::dm_view_tests as dm;
+        let thread_app = || {
+            let mut rt = dm::app();
+            dm::give(&mut rt, dm::conversation().snapshot(true));
+            rt
+        };
+        // By key.
+        let mut rt = thread_app();
+        press(&mut rt, "composer-field");
+        assert_composer_focus_agrees(&mut rt, "before");
+        let room = rt.state.chat.room().expect("a room").key.clone();
+        rt.update(|s, _| {
+            assert!(s.chat.open_dm(&room, &dm::peer_key()));
+        });
+        rt.frame(0.3);
+        assert!(rt.find("dm-thread").is_some());
+        assert!(!rt.state.chat.composer.focused);
+        assert_eq!(rune_focus(&mut rt).as_deref(), Some("dm-composer-field"));
+        key(&mut rt, Key::Escape);
+        settle_frames(&mut rt);
+        assert!(rt.find("dm-thread").is_none());
+        assert!(rt.state.chat.composer.focused);
+        assert_composer_focus_agrees(&mut rt, "after closing the thread");
+        // By a click on the row.
+        let mut rt = thread_app();
+        press(&mut rt, "composer-field");
+        press(&mut rt, &dm::row_key());
+        rt.frame(0.3);
+        assert_eq!(rune_focus(&mut rt).as_deref(), Some("dm-composer-field"));
+        key(&mut rt, Key::Escape);
+        settle_frames(&mut rt);
+        assert!(rt.find("dm-thread").is_none());
+        assert!(!rt.state.chat.composer.focused);
+        assert_eq!(rune_focus(&mut rt).as_deref(), Some("connection-pill"));
+        assert_composer_focus_agrees(&mut rt, "after a click-opened thread closes");
+    }
+
+    // ---- Ctrl+Shift sets a field's direction ----------------------------------------------------
+
+    #[cfg(not(target_os = "macos"))]
+    fn chord(rt: &mut Runtime<RiverApp>, shift: PhysicalKeyCode) {
+        let mods = |ctrl: bool, shift: bool| rune::Mods {
+            ctrl,
+            cmd: ctrl,
+            shift,
+            ..rune::Mods::default()
+        };
+        let mut phys = |key: PhysicalKeyCode, mods: rune::Mods, pressed: bool| {
+            rt.physical_input(PhysicalInput::Key {
+                key,
+                mods,
+                pressed,
+                repeat: false,
+            });
+            rt.frame(0.3);
+        };
+        phys(PhysicalKeyCode::ControlLeft, mods(false, false), true);
+        phys(shift, mods(true, false), true);
+        phys(shift, mods(true, true), false);
+        phys(PhysicalKeyCode::ControlLeft, mods(true, false), false);
+    }
+
+    /// Characterisation, not a wish: Rune (2026-11-12, Windows and Linux) makes Ctrl+Left Shift
+    /// and Ctrl+Right Shift, pressed together and released with no key between, set the focused
+    /// field's direction. That is also a common keyboard-layout switch chord, and River cannot
+    /// opt out. The direction stays after a send. Tracked in freenet/river#955.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_ctrl_shift_chord_sets_the_composers_direction_and_it_survives_a_send() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, "abc");
+        // The direction's type is Rune's internal one, so it is compared by its name.
+        let dir = |rt: &Runtime<RiverApp>| format!("{:?}", rt.state.chat.composer.forced_dir());
+        assert_eq!(dir(&rt), "None");
+        chord(&mut rt, PhysicalKeyCode::ShiftRight);
+        assert_eq!(
+            dir(&rt),
+            "Some(Rtl)",
+            "Ctrl+Right Shift flips the composer to right to left"
+        );
+        assert_eq!(rt.state.chat.composer.text, "abc", "no text is typed");
+        chord(&mut rt, PhysicalKeyCode::ShiftLeft);
+        assert_eq!(dir(&rt), "Some(Ltr)");
+        chord(&mut rt, PhysicalKeyCode::ShiftRight);
+        key(&mut rt, Key::Enter);
+        assert_eq!(rt.state.chat.composer.text, "", "sent");
+        assert_eq!(
+            dir(&rt),
+            "Some(Rtl)",
+            "the next draft is still right to left"
+        );
+    }
 }
