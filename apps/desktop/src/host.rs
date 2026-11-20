@@ -395,6 +395,8 @@ fn run_with_deadline(cmd: &mut Command, deadline: Duration) -> Result<(), String
         format!("{} {}", cmd.get_program().to_string_lossy(), args.join(" "))
     };
     let mut stderr = tempfile::tempfile().map_err(|e| e.to_string())?;
+    // The node is not part of an update handshake, and must not inherit one.
+    cmd.env_remove(crate::update::HANDSHAKE_ENV);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr.try_clone().map_err(|e| e.to_string())?);
@@ -1073,6 +1075,16 @@ mod tests {
             recipe.contains(r"`sudo '/a b/it'\''s/freenet' service install --system`"),
             "{recipe}"
         );
+    }
+
+    /// The node River starts must not inherit the update handshake variable.
+    #[cfg(unix)]
+    #[test]
+    fn commands_river_runs_do_not_inherit_the_update_handshake() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "test -z \"$RIVER_UPDATE_HANDSHAKE\""])
+            .env(crate::update::HANDSHAKE_ENV, "/some/handshake");
+        assert!(run(&mut cmd).is_ok());
     }
 
     #[cfg(unix)]

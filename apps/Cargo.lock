@@ -3526,6 +3526,7 @@ dependencies = [
  "notify-rust",
  "river-app",
  "rune",
+ "serde",
  "serde_json",
  "sha2",
  "tar",

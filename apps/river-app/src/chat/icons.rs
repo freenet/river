@@ -113,3 +113,10 @@ pub static IMPORT: Icon = Icon {
     view: 24.0,
     body: r#"<path d="M12 3v12M7 10l5 5 5-5M5 21h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+
+/// A gear: the settings button.
+pub static GEAR: Icon = Icon {
+    name: "river-gear",
+    view: 16.0,
+    body: r#"<circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#,
+};

@@ -38,6 +38,30 @@ fn fake_node() -> FakeNode {
                 }
             }
             let text = String::from_utf8_lossy(&request).into_owned();
+            // Take the whole request, body included. Closing a socket that still has unread
+            // bytes makes the kernel reset the connection, and a client that hears the reset
+            // before (or instead of) the answer reports the node unreachable and tries again:
+            // macOS does that, with "Invalid argument (os error 22)", which made these tests
+            // count extra requests there.
+            let body_len: usize = text
+                .lines()
+                .find_map(|l| {
+                    let l = l.to_ascii_lowercase();
+                    l.strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            let head_len = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(request.len(), |i| i + 4);
+            let mut have = request.len().saturating_sub(head_len);
+            while have < body_len {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => have += k,
+                }
+            }
             let line = text.lines().next().unwrap_or("").to_owned();
             let host = text
                 .lines()
@@ -49,7 +73,15 @@ fn fake_node() -> FakeNode {
                 .to_owned();
             log.lock().unwrap().push((line, host));
             n.fetch_add(1, Ordering::SeqCst);
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
+            // One request per connection, said so, so the client does not keep the connection
+            // for a request this node will not answer on it.
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+            // Close politely: stop sending, then wait for the client to finish and close.
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            while matches!(stream.read(&mut buf), Ok(k) if k > 0) {}
         }
     });
     FakeNode {

@@ -4972,3 +4972,28 @@ fn a_ban_dialog_open_when_the_room_is_left_goes_with_it() {
     rt.state.chat.confirm_ban();
     assert!(sent(&mut rt).is_empty());
 }
+
+/// Probe: the composer is a Rune editor, so an input method's events reach it. A pre-edit
+/// (the underlined text before it is chosen) is not in the text; the commit is. This is the
+/// layer River controls; whether the operating system's input method (ibus, fcitx, the macOS
+/// and Windows ones) sends these events to a Rune window is Rune's winit layer, which needs
+/// a real input method to test.
+#[test]
+fn an_input_method_can_compose_into_the_composer() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "composer-field");
+    rt.ime(rune::Ime::Enabled);
+    rt.ime(rune::Ime::Preedit("かん".into(), Some((0, 6))));
+    assert_eq!(
+        rt.state.chat.composer.text, "",
+        "a pre-edit is not yet text"
+    );
+    rt.ime(rune::Ime::Preedit(String::new(), None));
+    rt.ime(rune::Ime::Commit("漢字".into()));
+    rt.frame(0.3);
+    assert_eq!(rt.state.chat.composer.text, "漢字");
+    // A dead key (é from ' then e) arrives as a commit too.
+    rt.ime(rune::Ime::Commit("é".into()));
+    rt.frame(0.4);
+    assert_eq!(rt.state.chat.composer.text, "漢字é");
+}

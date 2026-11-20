@@ -11,11 +11,17 @@ publish = false
 name = "river"
 path = "src/main.rs"
 
+[features]
+# Lets a release-profile build be pointed at a local update server (the CI check and
+# scripts/update-e2e.sh). Debug builds have it anyway. Never enabled in a release.
+test-hooks = []
+
 [dependencies]
 river-app.workspace = true
 rune.workspace = true
 # Blocking HTTP over rustls: the installer runs on a worker thread, never the UI thread.
 ureq = { version = "2", default-features = false, features = ["tls"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 ed25519-dalek = "2"

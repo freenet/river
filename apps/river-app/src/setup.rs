@@ -208,6 +208,38 @@ impl Controller {
         });
     }
 
+    /// Every `every`, look at the running node's version and report it when it changes. The
+    /// node updates itself (its supervisor restarts it onto the new version), so this is how
+    /// the app notices. It never touches the node.
+    pub fn watch_version(&self, every: Duration) {
+        let this = self.clone();
+        thread::spawn(move || {
+            let mut last: Option<String> = None;
+            loop {
+                thread::sleep(every);
+                if this.busy.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let node = this.node();
+                let probe = if node.is_existing_node() {
+                    this.host.probe_at(&node.address.authority())
+                } else {
+                    this.host.probe()
+                };
+                if let NodeProbe::Running { version } = probe
+                    && last.as_ref() != Some(&version)
+                {
+                    if last.is_some() {
+                        (this.report)(Setup::Connected {
+                            version: version.clone(),
+                        });
+                    }
+                    last = Some(version);
+                }
+            }
+        });
+    }
+
     /// Install Freenet, then start it if the installer didn't. Does nothing for a node the
     /// person already has: River doesn't put a second Freenet on this computer.
     pub fn install(&self) {
@@ -376,8 +408,9 @@ fn outdated(running: Option<String>, minimum: String) -> Setup {
     Setup::Failed(match running {
         Some(v) => format!(
             "The Freenet running on this computer is version {v}, and River needs {minimum} \
-             or newer. Update it (run `freenet update`, or install the latest from \
-             freenet.org), then try again."
+             or newer (older versions cannot give River permission to open your rooms). \
+             Freenet normally updates itself in the background. To update it now, run \
+             `freenet update` (or install the latest from freenet.org), then try again."
         ),
         None => format!(
             "Something is answering on Freenet's port (7509) but doesn't say which version of \
@@ -668,8 +701,9 @@ mod tests {
             seen.last(),
             Some(&Setup::Failed(
                 "The Freenet running on this computer is version 0.2.60, and River needs \
-                 0.2.155 or newer. Update it (run `freenet update`, or install the latest from \
-                 freenet.org), then try again."
+                 0.2.155 or newer (older versions cannot give River permission to open your \
+                 rooms). Freenet normally updates itself in the background. To update it now, \
+                 run `freenet update` (or install the latest from freenet.org), then try again."
                     .into()
             ))
         );
