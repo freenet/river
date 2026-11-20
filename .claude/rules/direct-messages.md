@@ -300,6 +300,16 @@ plaintext in the chat delegate.
   instead discovered via the legacy `ListRequest` path — see river-publish.md
   for that carve-out. `outbound_dms` is NOT dynamic, so the fixed probe
   is the right mechanism for it.)
+- **Native app side** (`apps/river-app`, `src/rooms/dm_save.rs`, `dm_store.rs`): saves the text of
+  a sent DM as soon as it is queued, by a compare-and-swap that re-reads the key, edits only the
+  `entries` array of the CBOR it found (so `hidden_threads` and fields it does not know are kept
+  value for value, and re-encoded canonically) and refuses a value it cannot decode, one that
+  vanished since it was read, and any write before the key was read and decoded. It cannot stop
+  the web UI's blind store from overwriting the blob; it notices when a read lacks an entry it
+  saved and saves it again (3 times at most, only for a message still in the room, sent by the
+  user's current identity, not purged, and inside its pair's newest 100). There is no
+  purge-based pruning; the user's own entries are evicted at the per-pair cap (and, past 4 MiB,
+  oldest first). See `.claude/rules/native-apps.md`.
 - **CLI side**: persists the same `OutboundDmStore` shape into
   `outbound_dms.json` in the riverctl data dir (consistent with
   `rooms.json`'s plaintext-on-disk threat model).

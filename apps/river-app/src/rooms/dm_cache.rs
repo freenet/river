@@ -5,21 +5,29 @@
 //! CBOR of [`OutboundDmStore`], and join it to the message in the room by its purge token.
 //! [`OutboundCache`] is this app's in-memory copy of that.
 //!
-//! **This module only reads the delegate.** Nothing here writes `outbound_dms` or any other
-//! delegate key (see "Sent this session" for the one in-memory addition): the
-//! web UI saves the whole blob with a blind store, so a write made on a stale copy loses
-//! entries, and the later change that writes it has to hydrate first and merge. That change
-//! gates on [`OutboundCache::hydrated`], so the latch fails safe: it is true only after a read
-//! that listed the key and decoded it (or a list that was trustworthy and did not have the
-//! key), and a read that proves nothing leaves it as it was.
+//! **This module holds state and never talks to the delegate.** The write is
+//! [`super::dm_save`] (pacing) and [`super::dm_store`] (what is stored), run as a task of
+//! [`super::work`]. The web UI saves the whole blob with a blind store, so a write made on a
+//! stale copy loses entries; that is why the write re-reads the key with its generation and
+//! merges, and why it gates on [`OutboundCache::hydrated`]. The latch fails safe: it is true
+//! only after a read that listed the key and decoded it (or a list that was trustworthy and did
+//! not have the key), and a read that proves nothing leaves it as it was.
 //!
-//! **Sent this session.** A message this app sends is sealed to its recipient, so the sender
-//! cannot open it again. [`OutboundCache::remember_sent`] keeps its text in memory so the row
-//! shows it for the rest of the run. It is held apart from what the delegate returned
-//! (`local`), so a re-read of the delegate does not drop it, and it is not written anywhere:
-//! after a restart the row reads "text not available" until the change that saves sent text to
-//! `outbound_dms` lands. That change moves these entries into the store and drops them from
-//! `local` ([`OutboundCache::forget_sent`]).
+//! **Sent this session, and saving.** A message this app sends is sealed to its recipient, so
+//! the sender cannot open it again. [`OutboundCache::remember_sent`] keeps its text in memory so
+//! the row shows it, held apart from what the delegate returned (`local`), so a re-read does not
+//! drop it. The save moves it on: after the store holds it, [`OutboundCache::note_saved`] moves
+//! it from `local` to `saved`. It is not dropped there (the hand-off this module used to promise
+//! was [`OutboundCache::forget_sent`]) because the web UI's blind store can overwrite the blob
+//! with a copy that lacks it, and the only copy of the text left would then be gone: `saved` is
+//! what lets [`OutboundCache::note_read`] notice that and put the entry back
+//! ([`MAX_RESAVES`] times; after that the text stays in memory for the session and is not saved
+//! again). Which of "a read holds the entry" and "the save's end was taken" comes first does not
+//! matter: a read that holds a local entry moves it to `saved` itself, and
+//! [`OutboundCache::note_saved`] does nothing for one already there. A read that began before a
+//! save ended is not counted as losing that save's entries ([`OutboundCache::note_read_from`]).
+//! [`OutboundCache::forget_sent`] and [`OutboundCache::forget_saved`]
+//! are for a send the user discarded.
 //!
 //! **What "not hydrated" and "not listed" mean.** The delegate's key list is the only thing that
 //! says whether `outbound_dms` exists, and a list can come back empty for a reason that is not an
@@ -32,8 +40,8 @@
 //! **Generation.** The delegate wraps every stored value in a generation envelope (`[1][generation
 //! u64 LE][value]`, `delegates/chat-delegate/src/versioning.rs`). The session reads this key with
 //! a plain `GetRequest`, which strips it, so on the real path the value is the bare CBOR and
-//! [`OutboundCache::generation`] is 0. The write change needs the generation and must read with
-//! `Versioned::Read` (`GetVersionedRequest`) instead. [`OutboundCache::from_bytes`] still accepts
+//! [`OutboundCache::generation`] is 0. The write does not use it: it reads with
+//! `Versioned::Read` (`GetVersionedRequest`) itself, immediately before it stores. [`OutboundCache::from_bytes`] still accepts
 //! the enveloped form and tells the two apart as the delegate does: a CBOR map never starts with
 //! the envelope's tag byte.
 //!
@@ -43,11 +51,13 @@
 //! mode. The basis is that the delegate keeps the index as one stored value, read whole by
 //! `get_key_index` (`delegates/chat-delegate/src/handlers.rs`), which errors rather than answer
 //! with a part when the value is absent but a key it must list is stored. That is read from the
-//! code, not tested against a node, and it does not cover a writer adding the key just after
-//! the list was read. So the latch is not what makes a write safe: the writer (PR 4) must read
-//! the key again with `Versioned::Read` immediately before writing and refuse when the
-//! generation is not the one it read, which makes a wrong latch unable to cause a blind
-//! overwrite by itself.
+//! code; the absent-key case (a node River never ran on, listing rooms and no `outbound_dms`) is
+//! what the real-node e2e's first save goes through. It does not cover a writer adding the key
+//! just after the list was read. So the latch is not what makes a write safe: the writer reads the key
+//! again with `Versioned::Read` immediately before writing and stores only if the generation is
+//! still the one it read, which makes a wrong latch unable to cause a blind overwrite by
+//! itself. A key the cache read with a value ([`OutboundCache::listed`]) that is then found
+//! empty is refused too ([`super::dm_store::Refusal::Vanished`]).
 //!
 //! The entries are what people wrote, so nothing here prints one: [`Plaintext`] and the cache
 //! `Debug` show lengths only and decode errors never carry the bytes. A [`Plaintext`] wipes its
@@ -85,7 +95,12 @@ pub const MAX_LOCAL: usize = 1000;
 
 /// What the cache is looked up by: the room (its owner's key bytes), the recipient and the
 /// message's purge token.
-type EntryKey = ([u8; 32], MemberId, PurgeToken);
+pub use super::dm_store::EntryKey;
+
+/// How many times an entry this app saved is put back after a read finds it gone (a web UI tab
+/// saved its own copy over it). Past this the entry is left out, so a writer that keeps
+/// overwriting is not fought forever.
+pub const MAX_RESAVES: u8 = 3;
 
 /// A sent message's text. `Debug` does not print it, and drop wipes it.
 #[derive(Clone, PartialEq, Eq)]
@@ -165,6 +180,17 @@ pub struct OutboundCache {
     /// What this app sent since it started and has not saved to the delegate: the text of its
     /// own sent messages. Kept across reads (see the module docs).
     local: HashMap<EntryKey, SentDm>,
+    /// What this app saved to the delegate since it started, kept in memory so an entry a web
+    /// UI tab overwrites can be put back (see "Saving"). Bounded by [`MAX_LOCAL`].
+    saved: HashMap<EntryKey, SentDm>,
+    /// How many times each key was put back after being found gone.
+    resaves: HashMap<EntryKey, u8>,
+    /// Bumped by every save that ends well, so a read can be told from one that began before
+    /// the save ([`OutboundCache::note_read_from`]).
+    save_seq: u64,
+    /// The last read that decoded found the key with a value. A later read of nothing is then
+    /// a value that went missing, which a write must not paper over.
+    listed: bool,
 }
 
 impl fmt::Debug for OutboundCache {
@@ -173,6 +199,7 @@ impl fmt::Debug for OutboundCache {
             .field("entries", &self.entries.len())
             .field("hidden_threads", &self.hidden.len())
             .field("sent_this_session", &self.local.len())
+            .field("saved_this_session", &self.saved.len())
             .field("hydrated", &self.hydrated)
             .finish()
     }
@@ -227,6 +254,10 @@ impl OutboundCache {
             hydrated: true,
             epoch: 0,
             local: HashMap::new(),
+            saved: HashMap::new(),
+            resaves: HashMap::new(),
+            save_seq: 0,
+            listed: true,
         })
     }
 
@@ -244,18 +275,49 @@ impl OutboundCache {
     /// A cache that was unreadable keeps its entries, so a later `NotListed` does not hydrate it
     /// (that needs `entries.is_empty()`); it stays unhydrated, and the next `Read` fixes it.
     pub fn note_read(&mut self, read: DmRead, list_authoritative: bool) {
+        self.note_read_from(read, list_authoritative, self.save_seq);
+    }
+
+    /// [`OutboundCache::note_read`] for a read that began when [`OutboundCache::save_seq`] was
+    /// `began_at`. A save that ended since then may not be in what the read returned, so a
+    /// saved entry the read lacks says nothing: it is not counted as lost.
+    pub fn note_read_from(&mut self, read: DmRead, list_authoritative: bool, began_at: u64) {
         let epoch = self.epoch.wrapping_add(1);
         match read {
             DmRead::Read(fresh) => {
                 let local = std::mem::take(&mut self.local);
+                let saved = std::mem::take(&mut self.saved);
+                let resaves = std::mem::take(&mut self.resaves);
+                let save_seq = self.save_seq;
                 *self = *fresh;
                 self.local = local;
-                // What the delegate now holds is no longer only local.
-                let held = &self.entries;
-                self.local.retain(|k, _| !held.contains_key(k));
+                self.saved = saved;
+                self.resaves = resaves;
+                self.save_seq = save_seq;
+                // What the delegate now holds is no longer only local: it is saved, whichever
+                // of the read and the end of the save came first.
+                let confirmed: Vec<EntryKey> = self
+                    .local
+                    .keys()
+                    .filter(|k| self.entries.contains_key(*k))
+                    .copied()
+                    .collect();
+                for key in confirmed {
+                    if let Some(entry) = self.local.remove(&key) {
+                        self.keep_saved(key, entry);
+                    }
+                }
+                if began_at == self.save_seq {
+                    self.note_lost();
+                }
             }
             DmRead::Unreadable => self.hydrated = false,
             DmRead::NotListed => {
+                // A trustworthy list without the key says it is gone, which a value read as
+                // empty ([`super::dm_store::Refusal::Vanished`]) waits on.
+                if list_authoritative {
+                    self.listed = false;
+                }
                 if !(list_authoritative && !self.hydrated && self.entries.is_empty()) {
                     return;
                 }
@@ -263,6 +325,32 @@ impl OutboundCache {
             }
         }
         self.epoch = epoch;
+    }
+
+    /// Changes whenever a save ends well.
+    pub fn save_seq(&self) -> u64 {
+        self.save_seq
+    }
+
+    /// Hold a text the delegate has, bounded by [`MAX_LOCAL`].
+    fn keep_saved(&mut self, key: EntryKey, entry: SentDm) {
+        if self.saved.len() >= MAX_LOCAL && !self.saved.contains_key(&key) {
+            // Prefer dropping the oldest text the delegate holds (it is not the only copy);
+            // else the oldest of all.
+            let entries = &self.entries;
+            let oldest = |held: bool| {
+                self.saved
+                    .iter()
+                    .filter(|(k, _)| !held || entries.contains_key(*k))
+                    .min_by_key(|(_, e)| e.timestamp)
+                    .map(|(k, _)| *k)
+            };
+            if let Some(oldest) = oldest(true).or_else(|| oldest(false)) {
+                self.saved.remove(&oldest);
+                self.resaves.remove(&oldest);
+            }
+        }
+        self.saved.insert(key, entry);
     }
 
     /// True while the last read that proved anything succeeded. A writer must hydrate first and
@@ -299,12 +387,16 @@ impl OutboundCache {
         token: &PurgeToken,
     ) -> Option<&SentDm> {
         let key = (room.to_bytes(), recipient, *token);
-        self.entries.get(&key).or_else(|| self.local.get(&key))
+        self.entries
+            .get(&key)
+            .or_else(|| self.local.get(&key))
+            .or_else(|| self.saved.get(&key))
     }
 
     /// Keep the text of a message this app just sent, in memory only (see the module docs).
     /// `sender` is the user's member id and `timestamp` the message's, as the delegate's own
-    /// entry would hold. Bounded: past [`MAX_LOCAL`] the oldest is dropped.
+    /// entry would hold. Bounded: past [`MAX_LOCAL`] the oldest is dropped, which is what the
+    /// return value says (the caller logs it: this module never prints).
     pub fn remember_sent(
         &mut self,
         room: &VerifyingKey,
@@ -313,7 +405,8 @@ impl OutboundCache {
         sender: MemberId,
         timestamp: u64,
         text: String,
-    ) {
+    ) -> bool {
+        let mut dropped = false;
         if self.local.len() >= MAX_LOCAL
             && let Some(oldest) = self
                 .local
@@ -322,6 +415,8 @@ impl OutboundCache {
                 .map(|(k, _)| *k)
         {
             self.local.remove(&oldest);
+            self.resaves.remove(&oldest);
+            dropped = true;
         }
         self.local.insert(
             (room.to_bytes(), recipient, token),
@@ -332,6 +427,7 @@ impl OutboundCache {
             },
         );
         self.epoch = self.epoch.wrapping_add(1);
+        dropped
     }
 
     /// Drop what [`OutboundCache::remember_sent`] kept for this message (a send the user
@@ -357,9 +453,122 @@ impl OutboundCache {
     pub fn keep_sent_rooms(&mut self, keep: impl Fn(&[u8; 32]) -> bool) {
         let before = self.local.len();
         self.local.retain(|(room, _, _), _| keep(room));
+        self.saved.retain(|(room, _, _), _| keep(room));
+        self.resaves.retain(|(room, _, _), _| keep(room));
         if self.local.len() != before {
             self.epoch = self.epoch.wrapping_add(1);
         }
+    }
+
+    /// Whether the delegate was found to hold a value under the key at the last read that
+    /// decoded one.
+    pub fn listed(&self) -> bool {
+        self.listed
+    }
+
+    /// The texts held only in memory, oldest first, each with whether it is one being put back
+    /// after a read found it gone from the delegate (rather than a message just sent).
+    pub fn unsaved(&self) -> Vec<(EntryKey, &SentDm, bool)> {
+        let mut out: Vec<_> = self
+            .local
+            .iter()
+            .map(|(k, e)| (*k, e, self.resaves.contains_key(k)))
+            .collect();
+        out.sort_by_key(|(k, e, _)| (e.timestamp, k.0, k.1.0.0, k.2.0));
+        out
+    }
+
+    /// Whether this message's text is in the delegate's store, as far as the last read and this
+    /// app's own saves say. A text that was lost and given up on (see [`MAX_RESAVES`]) is held
+    /// in memory only and is not saved. (Nothing outside the tests asks yet: the thread view
+    /// does not show a saved state.)
+    pub fn is_saved(&self, room: &VerifyingKey, recipient: MemberId, token: &PurgeToken) -> bool {
+        let key = (room.to_bytes(), recipient, *token);
+        if self.entries.contains_key(&key) {
+            return true;
+        }
+        let given_up = self.resaves.get(&key).is_some_and(|n| *n >= MAX_RESAVES);
+        self.saved.contains_key(&key) && !given_up
+    }
+
+    /// A save stored `added` (they were in the delegate's store when it ended) and dropped
+    /// `evicted` to stay in bounds. The saved texts leave [`OutboundCache::remember_sent`]'s
+    /// set and are kept apart, so a later read that does not find one puts it back
+    /// ([`OutboundCache::unsaved`]). The text shown does not change.
+    pub fn note_saved(&mut self, added: &[EntryKey], evicted: &[EntryKey]) {
+        self.save_seq = self.save_seq.wrapping_add(1);
+        for key in added {
+            // Idempotent: a read may have confirmed the entry first and moved it already.
+            if let Some(entry) = self.local.remove(key) {
+                self.keep_saved(*key, entry);
+            }
+        }
+        for key in evicted {
+            self.local.remove(key);
+            self.saved.remove(key);
+            self.resaves.remove(key);
+        }
+    }
+
+    /// Stop putting an entry back: its text stays in memory, held as saved, for the session.
+    pub fn stop_resaving(&mut self, key: &EntryKey) {
+        if let Some(entry) = self.local.remove(key) {
+            self.keep_saved(*key, entry);
+            self.resaves.insert(*key, MAX_RESAVES);
+        }
+    }
+
+    /// Drop what [`OutboundCache::note_saved`] kept for this message (a send the user
+    /// discarded). True when there was one.
+    pub fn forget_saved(
+        &mut self,
+        room: &VerifyingKey,
+        recipient: MemberId,
+        token: &PurgeToken,
+    ) -> bool {
+        let key = (room.to_bytes(), recipient, *token);
+        self.resaves.remove(&key);
+        self.saved.remove(&key).is_some()
+    }
+
+    /// After a read: what this app saved and the delegate no longer holds was overwritten (the
+    /// web UI saves its whole copy blind). It goes back to being unsaved, to be saved again, up
+    /// to [`MAX_RESAVES`] times. After that the text stays in memory for the session (the row
+    /// keeps showing it) and is not saved again.
+    fn note_lost(&mut self) {
+        let lost: Vec<EntryKey> = self
+            .saved
+            .keys()
+            .filter(|k| !self.entries.contains_key(*k))
+            .copied()
+            .collect();
+        for key in lost {
+            let times = self.resaves.entry(key).or_insert(0);
+            if *times >= MAX_RESAVES {
+                continue;
+            }
+            *times += 1;
+            if let Some(entry) = self.saved.remove(&key) {
+                self.local.insert(key, entry);
+            }
+        }
+    }
+
+    /// How many entries of the same pair (room, sender, recipient) this cache holds that are
+    /// newer than the message with this timestamp and token: what says whether the message is
+    /// inside the pair's cap window ([`MAX_DM_MESSAGES_PER_PAIR`]).
+    pub fn newer_in_pair(&self, key: &EntryKey, sender: MemberId, timestamp: u64) -> usize {
+        let mut seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
+        for (k, e) in self.entries.iter().chain(&self.local).chain(&self.saved) {
+            if k.0 == key.0
+                && k.1 == key.1
+                && e.sender == sender
+                && (e.timestamp, k.2.0) > (timestamp, key.2.0)
+            {
+                seen.insert(*k);
+            }
+        }
+        seen.len()
     }
 
     /// How many sent texts are held only in memory.
@@ -825,6 +1034,356 @@ mod tests {
         );
         assert!(!shown.contains("TOP-SECRET"), "{shown}");
         assert!(shown.contains("entries: 1"));
+    }
+
+    fn key_of(room: u8, recipient: u8, token: u8) -> EntryKey {
+        (vk(room).to_bytes(), id(recipient), PurgeToken([token; 16]))
+    }
+
+    fn sent(cache: &mut OutboundCache, room: u8, recipient: u8, token: u8, ts: u64, text: &str) {
+        cache.remember_sent(
+            &vk(room),
+            id(recipient),
+            PurgeToken([token; 16]),
+            id(99),
+            ts,
+            text.to_string(),
+        );
+    }
+
+    /// A cache that read an empty store, as the delegate returned it.
+    fn read_empty() -> OutboundCache {
+        let mut cache = OutboundCache::default();
+        let store = OutboundDmStore::default();
+        let read = OutboundCache::from_bytes(&encode(&store)).unwrap();
+        cache.note_read(DmRead::Read(Box::new(read)), true);
+        cache
+    }
+
+    #[test]
+    fn a_saved_text_leaves_the_unsaved_set_and_is_still_shown() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        sent(&mut cache, 1, 2, 8, 20, "also mine");
+        assert_eq!(cache.sent_this_session(), 2);
+        assert!(!cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+        let epoch = cache.epoch();
+
+        cache.note_saved(&[key_of(1, 2, 7)], &[]);
+        assert_eq!(cache.sent_this_session(), 1);
+        assert!(cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+        assert!(!cache.is_saved(&vk(1), id(2), &PurgeToken([8; 16])));
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+            Some("mine")
+        );
+        assert_eq!(cache.epoch(), epoch, "what is shown did not change");
+        let unsaved = cache.unsaved();
+        assert_eq!(unsaved.len(), 1);
+        assert_eq!(unsaved[0].0, key_of(1, 2, 8));
+        assert!(!unsaved[0].2, "a message just sent is not a put-back");
+    }
+
+    #[test]
+    fn unsaved_texts_are_listed_oldest_first() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 30, "c");
+        sent(&mut cache, 1, 2, 8, 10, "a");
+        sent(&mut cache, 1, 2, 9, 20, "b");
+        let texts: Vec<&str> = cache
+            .unsaved()
+            .iter()
+            .map(|(_, e, _)| e.plaintext.as_str())
+            .collect();
+        assert_eq!(texts, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_read_that_lost_a_saved_entry_makes_it_unsaved_again_a_bounded_number_of_times() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        let k = key_of(1, 2, 7);
+        let empty = || {
+            DmRead::Read(Box::new(
+                OutboundCache::from_bytes(&encode(&OutboundDmStore::default())).unwrap(),
+            ))
+        };
+        let with = || {
+            DmRead::Read(Box::new(
+                OutboundCache::from_bytes(&encode(&OutboundDmStore {
+                    entries: vec![entry(1, 2, 7, "mine")],
+                    hidden_threads: vec![],
+                }))
+                .unwrap(),
+            ))
+        };
+        for round in 1..=MAX_RESAVES {
+            cache.note_saved(&[k], &[]);
+            assert_eq!(cache.sent_this_session(), 0);
+            // A read that holds it: nothing to do, and the count stays.
+            cache.note_read(with(), true);
+            assert_eq!(cache.sent_this_session(), 0, "round {round}");
+            // A read that does not: put back, as a put-back.
+            cache.note_read(empty(), true);
+            assert_eq!(cache.sent_this_session(), 1, "round {round}");
+            assert!(cache.unsaved()[0].2);
+            assert_eq!(
+                cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+                Some("mine")
+            );
+        }
+        // The next loss is the last put-back: the text stays in memory for the session, shown, and
+        // is not saved again.
+        cache.note_saved(&[k], &[]);
+        cache.note_read(empty(), true);
+        assert_eq!(cache.sent_this_session(), 0);
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+            Some("mine")
+        );
+        cache.note_read(empty(), true);
+        assert_eq!(cache.sent_this_session(), 0, "and still not");
+    }
+
+    #[test]
+    fn an_unreadable_or_unlisted_read_loses_nothing_that_was_saved() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        cache.note_saved(&[key_of(1, 2, 7)], &[]);
+        cache.note_read(DmRead::Unreadable, true);
+        cache.note_read(DmRead::NotListed, true);
+        assert_eq!(
+            cache.sent_this_session(),
+            0,
+            "not put back for a read that proved nothing"
+        );
+        assert!(cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+    }
+
+    #[test]
+    fn evicted_and_discarded_entries_are_forgotten_everywhere() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "a");
+        sent(&mut cache, 1, 2, 8, 20, "b");
+        sent(&mut cache, 1, 2, 9, 30, "c");
+        cache.note_saved(&[key_of(1, 2, 7), key_of(1, 2, 8)], &[key_of(1, 2, 7)]);
+        assert_eq!(cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])), None);
+        assert!(cache.forget_saved(&vk(1), id(2), &PurgeToken([8; 16])));
+        assert!(!cache.forget_saved(&vk(1), id(2), &PurgeToken([8; 16])));
+        assert_eq!(cache.plaintext(&vk(1), id(2), &PurgeToken([8; 16])), None);
+        // Stopped being put back: the text stays, held as saved.
+        cache.stop_resaving(&key_of(1, 2, 9));
+        assert_eq!(cache.sent_this_session(), 0);
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([9; 16])),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn a_room_that_is_gone_takes_its_saved_texts_with_it() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "a");
+        sent(&mut cache, 3, 2, 8, 20, "b");
+        cache.note_saved(&[key_of(1, 2, 7), key_of(3, 2, 8)], &[]);
+        cache.keep_sent_rooms(|room| *room == vk(1).to_bytes());
+        assert!(cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+        assert!(!cache.is_saved(&vk(3), id(2), &PurgeToken([8; 16])));
+    }
+
+    #[test]
+    fn the_cache_knows_whether_the_key_held_a_value() {
+        let mut cache = OutboundCache::default();
+        assert!(!cache.listed());
+        cache.note_read(DmRead::NotListed, true);
+        assert!(
+            !cache.listed(),
+            "hydrated by an absent key: nothing was listed"
+        );
+        cache.note_read(DmRead::Read(Box::new(hydrated_with("x"))), true);
+        assert!(cache.listed());
+        // A later unreadable read, or a list that cannot be trusted, does not say it went away.
+        cache.note_read(DmRead::Unreadable, true);
+        cache.note_read(DmRead::NotListed, false);
+        assert!(cache.listed());
+        // A trustworthy list without the key does: a write may create it again.
+        cache.note_read(DmRead::NotListed, true);
+        assert!(!cache.listed());
+    }
+
+    fn with_entry() -> DmRead {
+        DmRead::Read(Box::new(
+            OutboundCache::from_bytes(&encode(&OutboundDmStore {
+                entries: vec![entry(1, 2, 7, "mine")],
+                hidden_threads: vec![],
+            }))
+            .unwrap(),
+        ))
+    }
+
+    fn without_entry() -> DmRead {
+        DmRead::Read(Box::new(
+            OutboundCache::from_bytes(&encode(&OutboundDmStore::default())).unwrap(),
+        ))
+    }
+
+    /// The read that shows a save landed can come before or after the save's end is taken, and
+    /// the text is tracked as saved either way.
+    #[test]
+    fn a_read_that_confirms_an_entry_before_the_save_ends_tracks_it_as_saved() {
+        let k = key_of(1, 2, 7);
+        let lost_later = |cache: &mut OutboundCache| {
+            cache.note_read(without_entry(), true);
+            assert_eq!(cache.sent_this_session(), 1, "put back after being lost");
+            assert_eq!(
+                cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+                Some("mine")
+            );
+        };
+
+        // The read first: the entry was in `local`, the read holds it.
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        cache.note_read(with_entry(), true);
+        assert_eq!(cache.sent_this_session(), 0);
+        assert!(cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+        // Then the save's end arrives: nothing changes, and it is not an error.
+        cache.note_saved(&[k], &[]);
+        assert_eq!(cache.sent_this_session(), 0);
+        // A web overwrite afterwards is noticed, and the entry put back.
+        lost_later(&mut cache);
+
+        // The end first, then the read: the same.
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        cache.note_saved(&[k], &[]);
+        cache.note_read(with_entry(), true);
+        assert!(cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+        lost_later(&mut cache);
+
+        // The end alone, twice: idempotent.
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        cache.note_saved(&[k], &[]);
+        cache.note_saved(&[k], &[]);
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+            Some("mine")
+        );
+    }
+
+    #[test]
+    fn a_read_that_began_before_a_save_ended_does_not_count_that_save_as_lost() {
+        let k = key_of(1, 2, 7);
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        // The read begins; the save ends; the read, which cannot hold the entry, is applied.
+        let began = cache.save_seq();
+        cache.note_saved(&[k], &[]);
+        assert_ne!(cache.save_seq(), began);
+        cache.note_read_from(without_entry(), true, began);
+        assert_eq!(cache.sent_this_session(), 0, "no put-back for a stale read");
+        assert!(cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+        // The count was not spent: all of the puts-back are still there.
+        for round in 1..=MAX_RESAVES {
+            cache.note_read(without_entry(), true);
+            assert_eq!(cache.sent_this_session(), 1, "round {round}");
+            cache.note_saved(&[k], &[]);
+        }
+        cache.note_read(without_entry(), true);
+        assert_eq!(cache.sent_this_session(), 0);
+    }
+
+    #[test]
+    fn the_saved_set_is_bounded_and_forgets_the_counts_of_what_it_drops() {
+        let mut cache = read_empty();
+        for n in 0..=MAX_LOCAL as u64 {
+            let token = (n % 200) as u8;
+            let room = 1 + (n / 200) as u8;
+            sent(&mut cache, room, 2, token, n, "x");
+            cache.resaves.insert(key_of(room, 2, token), 1);
+            cache.note_saved(&[key_of(room, 2, token)], &[]);
+        }
+        assert!(cache.saved.len() <= MAX_LOCAL);
+        assert!(cache.resaves.keys().all(|k| cache.saved.contains_key(k)));
+        // The oldest went, and its text with it.
+        assert_eq!(cache.plaintext(&vk(1), id(2), &PurgeToken([0; 16])), None);
+    }
+
+    #[test]
+    fn newer_entries_of_a_pair_are_counted_across_what_the_cache_holds() {
+        let mut cache = read_empty();
+        for token in 1..=5u8 {
+            sent(&mut cache, 1, 2, token, 100 + u64::from(token), "x");
+        }
+        cache.note_saved(&[key_of(1, 2, 1), key_of(1, 2, 2)], &[]);
+        // Another recipient and another room are other pairs, and so is another sender.
+        sent(&mut cache, 1, 3, 9, 500, "other recipient");
+        sent(&mut cache, 4, 2, 9, 500, "other room");
+        let k = key_of(1, 2, 1);
+        assert_eq!(cache.newer_in_pair(&k, id(99), 101), 4);
+        assert_eq!(cache.newer_in_pair(&k, id(98), 101), 0);
+        assert_eq!(cache.newer_in_pair(&key_of(1, 2, 5), id(99), 105), 0);
+    }
+
+    #[test]
+    fn a_text_given_up_on_is_not_reported_saved_and_the_full_set_drops_held_texts_first() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "mine");
+        for _ in 0..MAX_RESAVES {
+            cache.note_saved(&[key_of(1, 2, 7)], &[]);
+            cache.note_read(without_entry(), true);
+        }
+        cache.note_saved(&[key_of(1, 2, 7)], &[]);
+        cache.note_read(without_entry(), true);
+        // Held in memory only, shown, and not saved.
+        assert_eq!(
+            cache.plaintext(&vk(1), id(2), &PurgeToken([7; 16])),
+            Some("mine")
+        );
+        assert!(!cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+        // A read that holds it again makes it saved.
+        cache.note_read(with_entry(), true);
+        assert!(cache.is_saved(&vk(1), id(2), &PurgeToken([7; 16])));
+
+        // At the bound the oldest text the delegate holds goes before an older one that is the
+        // only copy.
+        let mut cache = read_empty();
+        sent(&mut cache, 9, 2, 1, 1, "only copy");
+        cache.note_saved(&[key_of(9, 2, 1)], &[]);
+        cache.resaves.insert(key_of(9, 2, 1), MAX_RESAVES);
+        sent(&mut cache, 1, 2, 7, 500, "held");
+        cache.note_saved(&[key_of(1, 2, 7)], &[]);
+        cache.note_read(with_entry(), true);
+        let fill = |cache: &mut OutboundCache, n: u64| {
+            let (room, token) = (20 + (n / 200) as u8, (n % 200) as u8);
+            sent(cache, room, 2, token, 1000 + n, "x");
+            cache.note_saved(&[key_of(room, 2, token)], &[]);
+        };
+        for n in 0..MAX_LOCAL as u64 - 2 {
+            fill(&mut cache, n);
+        }
+        assert_eq!(cache.saved.len(), MAX_LOCAL);
+        fill(&mut cache, MAX_LOCAL as u64);
+        assert!(
+            !cache.saved.contains_key(&key_of(1, 2, 7)),
+            "the held one went"
+        );
+        assert_eq!(
+            cache.plaintext(&vk(9), id(2), &PurgeToken([1; 16])),
+            Some("only copy")
+        );
+        assert!(cache.saved.len() <= MAX_LOCAL);
+    }
+
+    #[test]
+    fn debug_output_never_contains_a_saved_text() {
+        let mut cache = read_empty();
+        sent(&mut cache, 1, 2, 7, 10, "TOP-SECRET-WORDS");
+        cache.note_saved(&[key_of(1, 2, 7)], &[]);
+        let shown = format!("{cache:?}");
+        assert!(!shown.contains("TOP-SECRET"));
+        assert!(shown.contains("saved_this_session: 1"));
     }
 
     /// The key is the one the web UI reads and the delegate's index holds.

@@ -6198,3 +6198,1055 @@ fn a_direct_message_answered_before_any_report_still_shows_its_text() {
     );
     assert!(snap.threads[0].messages[0].pending.is_none());
 }
+
+// Saving the text of sent direct messages ------------------------------------------------------
+
+mod dm_saves {
+    use super::*;
+    use crate::rooms::dm_save::{DmSaver, MAX_FAILURES};
+    use crate::rooms::dm_store::EntryKey;
+    use river_core::chat_delegate::{HiddenDmThreadEntry, OutboundDmEntry, OutboundDmStore};
+    use river_core::room_state::direct_messages::{PurgeToken, advance_recipient_purges};
+
+    type BeforeCas = Box<dyn FnOnce(&mut Store)>;
+
+    /// The chat delegate's `outbound_dms` key as the fake holds it: the value and generation, and
+    /// what was asked of it.
+    #[derive(Default)]
+    struct Store {
+        value: Option<Vec<u8>>,
+        generation: u64,
+        /// What the delegate was asked, in order: "read", "store".
+        log: Vec<&'static str>,
+        /// Answer every store with a refusal.
+        refuse: bool,
+        /// Refuse a store that holds fewer entries than the value does (a removal).
+        refuse_shrink: bool,
+        /// Run just before the next store is checked (another writer getting in first).
+        before_cas: Option<BeforeCas>,
+    }
+
+    impl Store {
+        /// What another writer stores, as the web UI's plain `StoreRequest` does: over whatever
+        /// is there, one generation higher.
+        fn web_writes(&mut self, store: &OutboundDmStore) {
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(store, &mut out).unwrap();
+            self.value = Some(out);
+            self.generation += 1;
+        }
+
+        fn store(&self) -> OutboundDmStore {
+            ciborium::de::from_reader(self.value.as_deref().expect("a stored value")).unwrap()
+        }
+
+        fn stores(&self) -> usize {
+            self.log.iter().filter(|l| **l == "store").count()
+        }
+    }
+
+    fn answer(store: &mut Store, request: &ClientRequest<'_>) -> ChatDelegateResponseMsg {
+        let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) =
+            request
+        else {
+            panic!("not a delegate request");
+        };
+        let [InboundDelegateMsg::ApplicationMessage(m)] = inbound.as_slice() else {
+            panic!("one message");
+        };
+        match ciborium::de::from_reader(m.payload.as_slice()).unwrap() {
+            ChatDelegateRequestMsg::GetVersionedRequest { key } => {
+                assert_eq!(key.as_bytes(), b"outbound_dms");
+                store.log.push("read");
+                ChatDelegateResponseMsg::GetVersionedResponse {
+                    key,
+                    value: store.value.clone(),
+                    generation: store.generation,
+                }
+            }
+            ChatDelegateRequestMsg::CasStoreRequest {
+                key,
+                value,
+                expected_generation,
+            } => {
+                assert_eq!(key.as_bytes(), b"outbound_dms");
+                store.log.push("store");
+                if let Some(hook) = store.before_cas.take() {
+                    hook(store);
+                }
+                let shrinks = store.refuse_shrink
+                    && store.value.as_deref().is_some_and(|old| {
+                        let count = |b: &[u8]| {
+                            ciborium::de::from_reader::<OutboundDmStore, _>(b)
+                                .map_or(0, |s| s.entries.len())
+                        };
+                        count(&value) < count(old)
+                    });
+                let result = if store.refuse || shrinks {
+                    CasStoreResult::Failed("disk".into())
+                } else if expected_generation == store.generation {
+                    store.value = Some(value);
+                    store.generation += 1;
+                    CasStoreResult::Stored {
+                        generation: store.generation,
+                    }
+                } else {
+                    CasStoreResult::Conflict {
+                        current_generation: store.generation,
+                        current_value: store.value.clone(),
+                    }
+                };
+                ChatDelegateResponseMsg::CasStoreResponse { key, result }
+            }
+            other => panic!("the sent-message save sent {other:?}"),
+        }
+    }
+
+    /// Run the session's save step against the fake until it has nothing more to do.
+    fn run(rooms: &mut Rooms, store: &mut Store, now: &mut Instant, writes: bool) {
+        for _ in 0..500 {
+            rooms.dm_save_tick(writes, *now);
+            if let Some(request) = rooms.outbox.work.next_request(false, *now) {
+                let a = answer(store, &request);
+                assert!(rooms.outbox.work.on_delegate(&a));
+                continue;
+            }
+            if rooms.outbox.work.has_dm() {
+                // A wait after a conflict.
+                *now += Duration::from_millis(50);
+                continue;
+            }
+            return;
+        }
+        panic!("the save never settled");
+    }
+
+    /// A session's rooms with the fixture's private room, whose sent messages have been read.
+    fn rooms_hydrated() -> (Rooms, crate::rooms::room_tests::Fixture, String, String) {
+        let (mut rooms, f, key, peer) = dm_rooms();
+        rooms.dm_cache.note_read(DmRead::NotListed, true);
+        assert!(rooms.dm_cache().hydrated());
+        (rooms, f, key, peer)
+    }
+
+    fn owner_of(rooms: &Rooms) -> VerifyingKey {
+        rooms.list[0].stored.owner_vk
+    }
+
+    /// The key of the one direct message in the outbox of the room.
+    fn queued_key(rooms: &Rooms) -> EntryKey {
+        let owner = owner_of(rooms);
+        let rows = rooms.outbox.dm_rows(&owner);
+        (owner.to_bytes(), rows[0].recipient, rows[0].token)
+    }
+
+    fn deliver(rooms: &mut Rooms) {
+        let mut changed = false;
+        rooms
+            .outbox
+            .next_update(&rooms.list[0], Instant::now(), &mut changed)
+            .expect("goes out");
+        assert!(rooms.update_answered(&rooms.list[0].contract_id(), Ok(())));
+    }
+
+    fn send(rooms: &mut Rooms, key: &str, peer: &str, text: &str) {
+        assert_eq!(take(rooms, send_dm(key, peer, text, 1)), vec![(1, Ok(()))]);
+    }
+
+    fn texts(store: &OutboundDmStore) -> Vec<&str> {
+        store.entries.iter().map(|e| e.plaintext.as_str()).collect()
+    }
+
+    /// What a web UI tab holds and saves: entries of its own, an archived thread and nothing of
+    /// what this app sent since the tab loaded.
+    fn web_copy(room: &VerifyingKey) -> OutboundDmStore {
+        OutboundDmStore {
+            entries: vec![OutboundDmEntry {
+                room_owner_vk: room.to_bytes(),
+                sender: MemberId::from(&vk(60)),
+                recipient: MemberId::from(&vk(61)),
+                purge_token: PurgeToken([61; 16]),
+                timestamp: 1,
+                plaintext: "from the web".into(),
+            }],
+            hidden_threads: vec![HiddenDmThreadEntry {
+                room_owner_vk: room.to_bytes(),
+                peer: MemberId::from(&vk(61)),
+                hidden_at_ts: 9,
+            }],
+        }
+    }
+
+    /// A read of the store applied to the cache, as the session's re-read does.
+    fn read_again(rooms: &mut Rooms, store: &Store) {
+        let cache = OutboundCache::from_bytes(store.value.as_deref().unwrap()).unwrap();
+        rooms
+            .dm_cache
+            .note_read(DmRead::Read(Box::new(cache)), true);
+    }
+
+    #[test]
+    fn a_sent_message_is_saved_and_its_text_is_there_after_a_restart() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "hello owner");
+        let k = queued_key(&rooms);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1);
+
+        run(&mut rooms, &mut store, &mut now, true);
+        // The delegate holds it: one read, one store, the message's own entry.
+        assert_eq!(store.log, vec!["read", "store"]);
+        let saved = store.store();
+        assert_eq!(texts(&saved), vec!["hello owner"]);
+        assert_eq!(
+            (saved.entries[0].room_owner_vk, saved.entries[0].recipient),
+            (k.0, k.1)
+        );
+        assert_eq!(saved.entries[0].purge_token, k.2);
+        // Held apart from the unsaved now, and still shown.
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+        let owner = owner_of(&rooms);
+        assert!(rooms.dm_cache().is_saved(&owner, k.1, &k.2));
+        assert_eq!(
+            rooms.dm_cache().plaintext(&owner, k.1, &k.2),
+            Some("hello owner")
+        );
+        // Nothing more is written while nothing changes.
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.log.len(), 2);
+
+        // The node takes the message; the app restarts: fresh rooms, the same delegate.
+        deliver(&mut rooms);
+        let room = rooms.list.remove(0);
+        let mut again = Rooms {
+            loaded: true,
+            complete: true,
+            ..Rooms::default()
+        };
+        again.network_seen.insert(room.stored.owner_vk);
+        again.list.push(room);
+        assert_eq!(again.dm_cache().sent_this_session(), 0);
+        read_again(&mut again, &store);
+        let snap = again.dm_snapshot().expect("a thread");
+        let row = &snap.threads[0].messages[0];
+        assert!(row.outgoing);
+        assert_eq!(
+            row.body,
+            crate::chat::dm_model::DmBody::Text("hello owner".into())
+        );
+        assert!(row.pending.is_none());
+    }
+
+    #[test]
+    fn nothing_is_written_until_the_sent_messages_were_read_and_decoded() {
+        let (mut rooms, _f, key, peer) = dm_rooms();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "wait for me");
+        // Never read: the latch is not set.
+        assert!(!rooms.dm_cache().hydrated());
+        run(&mut rooms, &mut store, &mut now, true);
+        // A list that named no rooms proves nothing about the key.
+        rooms.dm_cache.note_read(DmRead::NotListed, false);
+        run(&mut rooms, &mut store, &mut now, true);
+        // A value that did not decode unlatches it.
+        rooms.dm_cache.note_read(DmRead::Unreadable, true);
+        assert!(!rooms.dm_cache().hydrated());
+        run(&mut rooms, &mut store, &mut now, true);
+        assert!(store.log.is_empty(), "no request at all: {:?}", store.log);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1);
+
+        // A read that decoded, after one that did not: now it may.
+        store.web_writes(&web_copy(&owner_of(&rooms)));
+        read_again(&mut rooms, &store);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), 1);
+        assert_eq!(texts(&store.store()), vec!["from the web", "wait for me"]);
+    }
+
+    #[test]
+    fn a_save_never_starts_while_the_session_may_not_write() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "held");
+
+        // The connection's write gate is closed.
+        run(&mut rooms, &mut store, &mut now, false);
+        // River has moved on.
+        rooms.update_required = true;
+        run(&mut rooms, &mut store, &mut now, true);
+        rooms.update_required = false;
+        // The store is gone from this node, or the rooms were not read.
+        rooms.store_missing = true;
+        run(&mut rooms, &mut store, &mut now, true);
+        rooms.store_missing = false;
+        rooms.loaded = false;
+        run(&mut rooms, &mut store, &mut now, true);
+        rooms.loaded = true;
+        assert!(store.log.is_empty(), "{:?}", store.log);
+
+        // Open again: it goes.
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), 1);
+    }
+
+    #[test]
+    fn a_save_working_when_river_moves_on_is_failed_and_stores_nothing() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let now = Instant::now();
+        send(&mut rooms, &key, &peer, "held");
+        rooms.dm_save_tick(true, now);
+        assert!(rooms.outbox.work.has_dm());
+        // The session's loop halts what waits with nothing out when it finds River moved on.
+        assert!(
+            rooms
+                .outbox
+                .work
+                .halt(crate::rooms::generation::UPDATE_REQUIRED_WORK)
+        );
+        rooms.update_required = true;
+        assert!(rooms.outbox.work.next_request(false, now).is_none());
+        rooms.dm_save_tick(true, now);
+        assert!(!rooms.outbox.work.has_dm());
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1, "the text is kept");
+        // And nothing starts again while it holds.
+        rooms.dm_saver = DmSaver::default();
+        rooms.dm_save_tick(true, now + Duration::from_secs(100_000));
+        assert!(!rooms.outbox.work.has_dm());
+    }
+
+    #[test]
+    fn a_merge_keeps_what_the_web_ui_wrote_even_when_it_writes_between_our_read_and_store() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        let owner = owner_of(&rooms);
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        send(&mut rooms, &key, &peer, "ours");
+
+        // Another tab saves a second entry after we read and before our store is checked.
+        let mut second = web_copy(&owner);
+        second.entries.push(OutboundDmEntry {
+            plaintext: "newer from the web".into(),
+            purge_token: PurgeToken([62; 16]),
+            ..second.entries[0].clone()
+        });
+        store.before_cas = Some(Box::new(move |s| s.web_writes(&second)));
+        run(&mut rooms, &mut store, &mut now, true);
+
+        // Our store lost the swap, read again, and merged into what the other tab wrote.
+        assert_eq!(store.log, vec!["read", "store", "read", "store"]);
+        let out = store.store();
+        assert_eq!(
+            texts(&out),
+            vec!["from the web", "newer from the web", "ours"]
+        );
+        assert_eq!(out.hidden_threads.len(), 1, "the archive list is kept");
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_text_tries_later_a_bounded_number_of_times_and_never_blocks_sending()
+    {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        rooms.dm_saver = DmSaver::with_waits(Duration::from_secs(10), Duration::from_secs(40));
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        store.refuse = true;
+        send(&mut rooms, &key, &peer, "first");
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), 1);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1, "text kept");
+        assert!(!rooms.dm_cache().is_saved(
+            &owner_of(&rooms),
+            queued_key(&rooms).1,
+            &queued_key(&rooms).2
+        ));
+
+        // Not again at once, however often the loop turns.
+        for _ in 0..20 {
+            run(&mut rooms, &mut store, &mut now, true);
+        }
+        assert_eq!(store.stores(), 1, "waits for its turn");
+        // After the wait, once; the wait then doubles.
+        now += Duration::from_secs(10);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), 2);
+        now += Duration::from_secs(10);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), 2, "the second wait is longer");
+        now += Duration::from_secs(10);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), 3);
+
+        // Sending is not held back by any of it, and the next message resets the count.
+        send(&mut rooms, &key, &peer, "second");
+        assert_eq!(rooms.dm_cache().sent_this_session(), 2);
+        store.refuse = false;
+        run(&mut rooms, &mut store, &mut now, true);
+        // Both sent in one second, so their order in the store is the order of their tokens.
+        let both = store.store();
+        let mut held = texts(&both);
+        held.sort_unstable();
+        assert_eq!(held, vec!["first", "second"]);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+    }
+
+    #[test]
+    fn saves_that_keep_failing_stop_until_the_next_message() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        store.refuse = true;
+        send(&mut rooms, &key, &peer, "stuck");
+        for _ in 0..MAX_FAILURES + 5 {
+            run(&mut rooms, &mut store, &mut now, true);
+            now += Duration::from_secs(60 * 60);
+        }
+        assert_eq!(store.stores(), MAX_FAILURES as usize);
+        // A message sent later tries again.
+        send(&mut rooms, &key, &peer, "later");
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), MAX_FAILURES as usize + 1);
+    }
+
+    /// The room holds the message, as it does once the node took it, so a lost entry may be
+    /// put back.
+    fn saved_and_delivered() -> (
+        Rooms,
+        Store,
+        Instant,
+        EntryKey,
+        crate::rooms::room_tests::Fixture,
+    ) {
+        let (mut rooms, f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        store.web_writes(&web_copy(&owner_of(&rooms)));
+        read_again(&mut rooms, &store);
+        send(&mut rooms, &key, &peer, "mine");
+        let k = queued_key(&rooms);
+        run(&mut rooms, &mut store, &mut now, true);
+        deliver(&mut rooms);
+        assert_eq!(texts(&store.store()), vec!["from the web", "mine"]);
+        (rooms, store, now, k, f)
+    }
+
+    #[test]
+    fn an_entry_a_web_tab_overwrote_is_put_back_a_bounded_number_of_times() {
+        let (mut rooms, mut store, mut now, k, _f) = saved_and_delivered();
+        let owner = owner_of(&rooms);
+        for round in 1..=crate::rooms::dm_cache::MAX_RESAVES {
+            // A tab that loaded before our save saves its copy, without our entry.
+            store.web_writes(&web_copy(&owner));
+            read_again(&mut rooms, &store);
+            assert_eq!(rooms.dm_cache().sent_this_session(), 1, "round {round}");
+            // The text is still shown while it is put back.
+            assert_eq!(rooms.dm_cache().plaintext(&owner, k.1, &k.2), Some("mine"));
+            run(&mut rooms, &mut store, &mut now, true);
+            let out = store.store();
+            assert_eq!(texts(&out), vec!["from the web", "mine"], "round {round}");
+            assert_eq!(out.hidden_threads.len(), 1);
+            read_again(&mut rooms, &store);
+        }
+        // It keeps happening: past the bound, the entry is left out.
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+        let stores = store.stores();
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), stores);
+        assert_eq!(texts(&store.store()), vec!["from the web"]);
+    }
+
+    #[test]
+    fn a_lost_entry_is_not_put_back_when_it_was_purged_or_is_not_the_users_now() {
+        // Purged by its recipient: the web UI drops such an entry on purpose.
+        let (mut rooms, mut store, mut now, k, f) = saved_and_delivered();
+        let owner = owner_of(&rooms);
+        let envelope = advance_recipient_purges(&f.owner, &owner, None, [k.2]).unwrap();
+        rooms.list[0]
+            .stored
+            .room_state
+            .direct_messages
+            .purges
+            .push(envelope);
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web"]);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0, "dropped, not kept");
+
+        // The user's identity in the room was replaced: the old one's text is not put back.
+        let (mut rooms, mut store, mut now, _k, _f) = saved_and_delivered();
+        rooms.list[0].stored.self_sk = Some(SigningKey::from_bytes(&[77; 32]));
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web"]);
+
+        // The message is no longer in the room (the contract's cap dropped it).
+        let (mut rooms, mut store, mut now, _k, _f) = saved_and_delivered();
+        rooms.list[0]
+            .stored
+            .room_state
+            .direct_messages
+            .messages
+            .clear();
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web"]);
+    }
+
+    #[test]
+    fn a_lost_entry_waits_for_the_room_to_be_read_from_the_network() {
+        let (mut rooms, mut store, mut now, _k, _f) = saved_and_delivered();
+        let owner = owner_of(&rooms);
+        rooms.network_seen.clear();
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web"], "not yet");
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1, "and not given up");
+        rooms.network_seen.insert(owner);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web", "mine"]);
+    }
+
+    #[test]
+    fn discarding_a_saved_message_removes_only_its_entry() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        let owner = owner_of(&rooms);
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        send(&mut rooms, &key, &peer, "will fail");
+        send(&mut rooms, &key, &peer, "will stay");
+        run(&mut rooms, &mut store, &mut now, true);
+        let both = store.store();
+        let mut held = texts(&both);
+        held.sort_unstable();
+        assert_eq!(held, vec!["from the web", "will fail", "will stay"]);
+
+        // The first one's update is refused; the user discards it.
+        let mut changed = false;
+        rooms
+            .outbox
+            .next_update(&rooms.list[0], Instant::now(), &mut changed)
+            .expect("goes out");
+        assert!(rooms.update_answered(&rooms.list[0].contract_id(), Err("refused".into())));
+        let failed = rooms
+            .outbox
+            .dm_rows(&owner)
+            .into_iter()
+            .find(|r| r.pending.failed.is_some())
+            .expect("the failed one");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Command {
+            room: key.clone(),
+            action: Action::Discard {
+                entry: failed.pending.entry,
+            },
+        })
+        .unwrap();
+        assert!(rooms.take_commands(&rx));
+        run(&mut rooms, &mut store, &mut now, true);
+
+        let out = store.store();
+        assert_eq!(texts(&out), vec!["from the web", "will stay"]);
+        assert_eq!(out.hidden_threads.len(), 1);
+    }
+
+    #[test]
+    fn discarding_a_message_that_was_never_saved_writes_nothing() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        let owner = owner_of(&rooms);
+        send(&mut rooms, &key, &peer, "never saved");
+        let row = rooms.outbox.dm_rows(&owner).remove(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The room refuses it first, so there is something to discard.
+        let mut changed = false;
+        rooms
+            .outbox
+            .next_update(&rooms.list[0], Instant::now(), &mut changed)
+            .expect("goes out");
+        assert!(rooms.update_answered(&rooms.list[0].contract_id(), Err("no".into())));
+        tx.send(Command {
+            room: key,
+            action: Action::Discard {
+                entry: row.pending.entry,
+            },
+        })
+        .unwrap();
+        assert!(rooms.take_commands(&rx));
+        run(&mut rooms, &mut store, &mut now, true);
+        assert!(store.log.is_empty(), "no read, no store: {:?}", store.log);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+    }
+
+    #[test]
+    fn discarding_a_message_whose_save_is_working_removes_it_once_it_lands() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        let owner = owner_of(&rooms);
+        send(&mut rooms, &key, &peer, "in flight");
+        let row = rooms.outbox.dm_rows(&owner).remove(0);
+        // The save has started (its read is out) when the user discards.
+        rooms.dm_save_tick(true, now);
+        let request = rooms.outbox.work.next_request(false, now).unwrap();
+        let a = answer(&mut store, &request);
+        assert!(rooms.outbox.work.on_delegate(&a));
+
+        let mut changed = false;
+        rooms
+            .outbox
+            .next_update(&rooms.list[0], Instant::now(), &mut changed)
+            .expect("goes out");
+        assert!(rooms.update_answered(&rooms.list[0].contract_id(), Err("no".into())));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Command {
+            room: key,
+            action: Action::Discard {
+                entry: row.pending.entry,
+            },
+        })
+        .unwrap();
+        assert!(rooms.take_commands(&rx));
+        // The add lands, then the removal follows.
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), 2);
+        assert!(store.store().entries.is_empty());
+    }
+
+    #[test]
+    fn a_value_the_app_cannot_read_is_not_written_over_and_the_text_stays() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        // The cache read nothing; the key then holds something this app cannot decode (a newer
+        // web UI's format, or damage).
+        store.value = Some(b"\xa1\x67entries\x01".to_vec());
+        send(&mut rooms, &key, &peer, "careful");
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(
+            store.log,
+            vec!["read"],
+            "read, found it unreadable, stopped"
+        );
+        assert_eq!(store.value.as_deref(), Some(&b"\xa1\x67entries\x01"[..]));
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1);
+    }
+
+    /// The user's member id in the first room.
+    fn me_in(rooms: &Rooms) -> MemberId {
+        MemberId::from(&rooms.list[0].stored.self_verifying_key().unwrap())
+    }
+
+    /// Drive the save's requests until nothing is out, without taking its end.
+    fn drive(rooms: &mut Rooms, store: &mut Store, now: Instant) {
+        while let Some(request) = rooms.outbox.work.next_request(false, now) {
+            let a = answer(store, &request);
+            assert!(rooms.outbox.work.on_delegate(&a));
+        }
+    }
+
+    #[test]
+    fn a_read_that_lands_between_the_store_and_the_taking_of_its_end_still_tracks_the_text() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "mine");
+        let k = queued_key(&rooms);
+        rooms.dm_save_tick(true, now);
+        drive(&mut rooms, &mut store, now);
+        assert_eq!(store.stores(), 1);
+        // The re-read (a reconnect's, say) sees the entry before the end of the save was taken.
+        read_again(&mut rooms, &store);
+        let owner = owner_of(&rooms);
+        assert!(rooms.dm_cache().is_saved(&owner, k.1, &k.2));
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+        // The end is taken: nothing changes.
+        rooms.dm_save_tick(true, now);
+        assert!(rooms.dm_cache().is_saved(&owner, k.1, &k.2));
+
+        // So a web tab's later overwrite is noticed, and the text put back.
+        deliver(&mut rooms);
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        let mut now = now;
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web", "mine"]);
+
+        // And a discard of it removes it.
+        rooms.dm_saver.owes_removal(k);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web"]);
+    }
+
+    #[test]
+    fn a_read_that_began_before_a_save_ended_is_not_a_loss() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "first");
+        run(&mut rooms, &mut store, &mut now, true);
+        let before = store.value.clone();
+        // A read begins as the session starts one ...
+        rooms.dm_read_began = Some(rooms.dm_cache.save_seq());
+        // ... a second message is saved meanwhile ...
+        send(&mut rooms, &key, &peer, "second");
+        run(&mut rooms, &mut store, &mut now, true);
+        // ... and the read, taken before either, is applied after.
+        let mut stale = loaded(vec![rooms.list[0].stored.clone()]);
+        stale.dms = DmRead::Read(Box::new(
+            OutboundCache::from_bytes(&{
+                let mut out = Vec::new();
+                ciborium::ser::into_writer(&OutboundDmStore::default(), &mut out).unwrap();
+                out
+            })
+            .unwrap(),
+        ));
+        rooms.replace(stale);
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0, "nothing put back");
+        let stores = store.stores();
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), stores);
+        assert_ne!(before, store.value);
+    }
+
+    #[test]
+    fn more_than_the_cap_unsaved_for_one_pair_are_cut_to_the_cap_and_not_saved_again() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        store.refuse = true;
+        let total = river_core::room_state::direct_messages::MAX_DM_MESSAGES_PER_PAIR + 1;
+        for n in 0..total {
+            send(&mut rooms, &key, &peer, &format!("message {n}"));
+        }
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(rooms.dm_cache().sent_this_session(), total);
+        store.refuse = false;
+        now += Duration::from_secs(3600);
+        run(&mut rooms, &mut store, &mut now, true);
+        let out = store.store();
+        assert_eq!(out.entries.len(), total - 1, "back at the cap, one batch");
+        // The one cut is not kept to be saved again.
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+        let stores = store.stores();
+        read_again(&mut rooms, &store);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.stores(), stores, "nothing more to save");
+        assert_eq!(store.store().entries.len(), total - 1);
+    }
+
+    #[test]
+    fn an_entry_the_web_ui_evicted_by_its_own_cap_is_not_fought_over() {
+        let (mut rooms, mut store, mut now, k, f) = saved_and_delivered();
+        let owner = owner_of(&rooms);
+        // The same pair: the user to the room's owner. 100 newer messages are in the store.
+        let me = me_in(&rooms);
+        let mut web = web_copy(&owner);
+        for n in 0..100u64 {
+            web.entries.push(OutboundDmEntry {
+                room_owner_vk: owner.to_bytes(),
+                sender: me,
+                recipient: f.owner_id(),
+                purge_token: PurgeToken([n as u8; 16]),
+                timestamp: u64::MAX / 2 + n,
+                plaintext: format!("newer {n}"),
+            });
+        }
+        let stores = store.stores();
+        for _ in 0..5 {
+            store.web_writes(&web);
+            read_again(&mut rooms, &store);
+            run(&mut rooms, &mut store, &mut now, true);
+        }
+        assert_eq!(store.stores(), stores, "never written again");
+        assert!(store.store().entries.iter().all(|e| e.plaintext != "mine"));
+        // Its text is still shown for the session, and nothing is waiting to be saved.
+        assert_eq!(rooms.dm_cache().plaintext(&owner, k.1, &k.2), Some("mine"));
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+    }
+
+    #[test]
+    fn a_purge_by_another_recipient_does_not_stop_the_put_back() {
+        let (mut rooms, mut store, mut now, k, _f) = saved_and_delivered();
+        let owner = owner_of(&rooms);
+        // Someone else's purge envelope naming the same token: it is not this message's
+        // recipient's, so it says nothing about it.
+        let other = SigningKey::from_bytes(&[55; 32]);
+        let envelope = advance_recipient_purges(&other, &owner, None, [k.2]).unwrap();
+        assert_ne!(envelope.recipient_id, k.1);
+        rooms.list[0]
+            .stored
+            .room_state
+            .direct_messages
+            .purges
+            .push(envelope);
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["from the web", "mine"]);
+    }
+
+    #[test]
+    fn a_lost_entry_is_wanted_only_for_the_message_with_its_recipient_sender_and_token() {
+        use river_core::room_state::direct_messages::compose_direct_message;
+        let (mut rooms, _f, k_sender_recipient) = {
+            let (rooms, _s, _n, k, f) = saved_and_delivered();
+            (rooms, f, k)
+        };
+        let k = k_sender_recipient;
+        let me = me_in(&rooms);
+        assert_eq!(rooms.resave_wanted(&k, me), Some(true));
+        // Another recipient with the same token is not that message.
+        let other_recipient = MemberId::from(&vk(70));
+        assert_eq!(
+            rooms.resave_wanted(&(k.0, other_recipient, k.2), me),
+            Some(false)
+        );
+        // A message of someone else's to the user, asked after as if the user sent it: the
+        // recipient is the user's own id, but the sender is not.
+        let f = crate::rooms::room_tests::Fixture::new();
+        let owner = owner_of(&rooms);
+        let me_vk = rooms.list[0].stored.self_verifying_key().unwrap();
+        let inbound = compose_direct_message(&f.owner, &me_vk, &owner, 777, 777, b"hi").unwrap();
+        let token = inbound.purge_token();
+        rooms.list[0]
+            .stored
+            .room_state
+            .direct_messages
+            .messages
+            .push(inbound);
+        assert_eq!(rooms.resave_wanted(&(k.0, me, token), me), Some(false));
+        // And an identity that is not the user's now.
+        assert_eq!(
+            rooms.resave_wanted(&k, MemberId::from(&vk(71))),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_store_that_vanished_is_asked_about_again_and_created_once_the_list_says_it_is_gone() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        let owner = owner_of(&rooms);
+        store.web_writes(&web_copy(&owner));
+        read_again(&mut rooms, &store);
+        assert!(rooms.dm_cache().listed());
+        send(&mut rooms, &key, &peer, "ours");
+        // The value has gone from the delegate.
+        store.value = None;
+        store.generation = 0;
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(store.log, vec!["read"], "refused, written over nothing");
+        assert!(store.value.is_none());
+        assert!(
+            rooms.outbox.work.reload_pending(),
+            "the rooms are read again"
+        );
+
+        // The read of the rooms: a list that names rooms and not the key. It is gone.
+        rooms.dm_cache.note_read(DmRead::NotListed, true);
+        assert!(!rooms.dm_cache().listed());
+        now += Duration::from_secs(3600);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["ours"]);
+    }
+
+    #[test]
+    fn a_removal_is_made_alone_and_first_so_an_add_that_is_refused_cannot_hold_it_back() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        let owner = owner_of(&rooms);
+        send(&mut rooms, &key, &peer, "will fail");
+        run(&mut rooms, &mut store, &mut now, true);
+        // Its update is refused, and the user discards it.
+        let mut changed = false;
+        rooms
+            .outbox
+            .next_update(&rooms.list[0], Instant::now(), &mut changed)
+            .expect("goes out");
+        assert!(rooms.update_answered(&rooms.list[0].contract_id(), Err("no".into())));
+        let row = rooms.outbox.dm_rows(&owner).remove(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Command {
+            room: key.clone(),
+            action: Action::Discard {
+                entry: row.pending.entry,
+            },
+        })
+        .unwrap();
+        assert!(rooms.take_commands(&rx));
+        // Another message waits as well.
+        send(&mut rooms, &key, &peer, "next");
+        // The first write is the removal alone.
+        rooms.dm_save_tick(true, now);
+        drive(&mut rooms, &mut store, now);
+        assert_eq!(
+            store.store().entries.len(),
+            0,
+            "removed, and nothing added yet"
+        );
+        rooms.dm_save_tick(true, now);
+        drive(&mut rooms, &mut store, now);
+        assert_eq!(texts(&store.store()), vec!["next"]);
+
+        // A removal still goes when the adds are refused for size or shape: the add fails the
+        // task it is in, and that is not the removal's.
+        let k = queued_key(&rooms);
+        rooms.dm_saver.owes_removal(k);
+        rooms.dm_save_tick(true, now);
+        drive(&mut rooms, &mut store, now);
+        assert!(store.store().entries.is_empty());
+    }
+
+    #[test]
+    fn leaving_a_room_while_its_text_is_being_saved_leaves_no_entry_behind() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "from a room about to be left");
+        rooms.dm_save_tick(true, now);
+        // The read is out ...
+        let request = rooms.outbox.work.next_request(false, now).unwrap();
+        // ... and the room is left before it is answered.
+        rooms.list.clear();
+        rooms.dm_save_tick(true, now);
+        let a = answer(&mut store, &request);
+        assert!(rooms.outbox.work.on_delegate(&a));
+        assert!(
+            rooms.outbox.work.next_request(false, now).is_none(),
+            "no store"
+        );
+        assert_eq!(store.log, vec!["read"]);
+        assert!(store.value.is_none());
+        // The save ends well with nothing added, and the text goes with the room.
+        rooms.dm_save_tick(true, now);
+        rooms.dm_snapshot();
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+    }
+
+    #[test]
+    fn a_removal_that_keeps_failing_does_not_hold_the_adds_back_for_good() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "saved, then discarded");
+        run(&mut rooms, &mut store, &mut now, true);
+        let k = queued_key(&rooms);
+        // Its removal is owed, and the delegate refuses every write that removes something.
+        rooms.dm_saver.owes_removal(k);
+        store.refuse_shrink = true;
+        send(&mut rooms, &key, &peer, "waiting behind it");
+        for _ in 0..8 {
+            run(&mut rooms, &mut store, &mut now, true);
+            now += Duration::from_secs(3600);
+        }
+        let both = store.store();
+        let held = texts(&both);
+        assert!(held.contains(&"waiting behind it"), "{held:?}");
+        assert!(
+            held.contains(&"saved, then discarded"),
+            "the removal did not work"
+        );
+        // It was tried again after the adds had their turn.
+        let after = store.stores();
+        store.refuse_shrink = false;
+        now += Duration::from_secs(3600);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert!(store.stores() > after);
+        assert_eq!(texts(&store.store()), vec!["waiting behind it"]);
+    }
+
+    #[test]
+    fn a_partial_read_of_the_rooms_prunes_no_unsaved_text_and_it_is_saved_when_the_room_is_back() {
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        let (mut store, mut now) = (Store::default(), Instant::now());
+        send(&mut rooms, &key, &peer, "keep me");
+        let stored = rooms.list[0].stored.clone();
+        let owner = owner_of(&rooms);
+
+        // A read in which the room's slot could not be decoded: it is not in the list, and the
+        // read is not complete.
+        let mut partial = loaded(vec![]);
+        partial.listed = 1;
+        partial.unreadable = 1;
+        rooms.replace(partial);
+        assert!(rooms.list.is_empty() && !rooms.complete);
+        rooms.dm_snapshot();
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1, "nothing pruned");
+        // And nothing is written for a room that is not in the list.
+        run(&mut rooms, &mut store, &mut now, true);
+        assert!(store.log.is_empty(), "{:?}", store.log);
+
+        // The room is back, in a complete read: the text is still there, and is saved.
+        rooms.replace(loaded(vec![stored]));
+        assert!(rooms.complete);
+        rooms.dm_snapshot();
+        assert_eq!(rooms.dm_cache().sent_this_session(), 1);
+        run(&mut rooms, &mut store, &mut now, true);
+        assert_eq!(texts(&store.store()), vec!["keep me"]);
+        assert!(rooms.dm_cache().is_saved(
+            &owner,
+            rooms.outbox.dm_rows(&owner)[0].recipient,
+            &rooms.outbox.dm_rows(&owner)[0].token
+        ));
+
+        // A complete read that does not have the room (it was left) does prune.
+        let (mut rooms, _f, key, peer) = rooms_hydrated();
+        send(&mut rooms, &key, &peer, "left");
+        rooms.list.clear();
+        rooms.dm_snapshot();
+        assert_eq!(rooms.dm_cache().sent_this_session(), 0);
+    }
+
+    #[test]
+    fn a_new_session_starts_with_a_cache_that_has_read_and_saved_nothing() {
+        // A node switch ends the session and starts another: `Rooms` is built afresh from the
+        // outbox alone, so `listed`, the saved set and the put-back counts of the old node are
+        // not carried to the new one.
+        let norm = |s: &str| s.replace("\r\n", "\n");
+        let session = norm(include_str!("session.rs"));
+        let start = session
+            .find("let mut kept = KeepOutbox {")
+            .expect("run_with");
+        let built = &session[start..start + 400];
+        assert!(built.contains("..Rooms::default()"), "{built}");
+        assert!(!built.contains("dm_cache"));
+        // A read that was out when the connection dropped leaves no stamp for the next one.
+        let follow = session.split("fn follow_on").nth(1).unwrap();
+        assert!(follow.contains("rooms.dm_read_began = None;"));
+        // And the failures are named, without a word of what was written.
+        let tick = session.split("fn dm_save_tick").nth(1).unwrap();
+        assert!(tick.contains("saving sent direct messages failed ({})"));
+        assert!(tick.contains("r.kind()"));
+    }
+
+    #[test]
+    fn the_save_is_the_only_writer_of_the_key_and_is_gated_in_the_session_loop() {
+        let norm = |s: &str| s.replace("\r\n", "\n");
+        let session = norm(include_str!("session.rs"));
+        let loop_body = session
+            .split("#[cfg(test)]\n#[path = \"session_tests.rs\"]")
+            .next()
+            .unwrap();
+        let tick = loop_body
+            .find("rooms.dm_save_tick(writes, Instant::now())")
+            .expect("the loop starts the save");
+        let send = loop_body[tick..]
+            .find("rooms.send_updates(socket)")
+            .expect("before updates");
+        assert!(send < 400, "the tick sits with the other writes");
+        // The tick is given the write gate and checks River's hold itself.
+        let tick_fn = loop_body.split("fn dm_save_tick").nth(1).unwrap();
+        let tick_fn = tick_fn.split("\n    }\n").next().unwrap();
+        for guard in [
+            "!writes",
+            "self.update_required",
+            "!self.dm_cache.hydrated()",
+            "self.store_missing",
+        ] {
+            assert!(tick_fn.contains(guard), "{guard}");
+        }
+        // No unconditional store request exists in this crate's delegate requests.
+        let delegate = norm(include_str!("delegate.rs"));
+        assert!(!delegate.contains("ChatDelegateRequestMsg::StoreRequest"));
+        // The key is only written through the work queue's compare-and-swap.
+        assert!(norm(include_str!("work.rs")).contains("dm_cache::KEY.to_vec()"));
+    }
+}

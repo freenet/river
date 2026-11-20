@@ -40,12 +40,12 @@
 //! the one it carries ([`generation`]): it would be writing where the web UI no longer reads.
 //! It then only shows the rooms and asks the user to update it.
 //!
-//! It also reads, and never writes, the plaintext of the direct messages the user sent (the
-//! delegate's `outbound_dms` key, [`dm_cache`]), and builds direct-message threads from it and
-//! the rooms ([`dm`]). It sends a direct message as an UPDATE of the room contract like any other
-//! change ([`dm_send`], [`outbox`]); what it sent is kept as text in memory only, so after a
-//! restart its own sent messages read "text not available" until a later change saves them to
-//! `outbound_dms`.
+//! It also reads the plaintext of the direct messages the user sent (the delegate's
+//! `outbound_dms` key, [`dm_cache`]), and builds direct-message threads from it and the rooms
+//! ([`dm`]). It sends a direct message as an UPDATE of the room contract like any other change
+//! ([`dm_send`], [`outbox`]), and saves the text it sent to `outbound_dms` ([`dm_save`]), the one
+//! way it writes that key: a read-merge-compare-and-swap that adds or removes its own entries and
+//! keeps everything else in the value as it found it ([`dm_store`]).
 
 pub mod bans;
 pub mod create;
@@ -53,7 +53,9 @@ pub mod delegate;
 pub mod deputies;
 pub mod dm;
 pub mod dm_cache;
+pub mod dm_save;
 pub mod dm_send;
+pub mod dm_store;
 #[cfg(test)]
 mod dm_tests;
 pub mod generation;
