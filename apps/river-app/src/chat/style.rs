@@ -37,6 +37,10 @@ pub struct Palette {
     pub warning_text: Color,
     pub warning_bg: Color,
     pub warning: Color,
+    /// A danger notice's fill, and the filled danger button with its hover.
+    pub danger_bg: Color,
+    pub danger_fill: Color,
+    pub danger_fill_hover: Color,
     /// The connection dot: connected and failed (the web UI's `--color-success` and
     /// `--color-error`).
     pub success: Color,
@@ -81,6 +85,9 @@ pub fn palette() -> Palette {
         warning_text: hex("#e3a845"),
         warning_bg: hex("#422006"),
         warning: hex("#eab308"),
+        danger_bg: hex("#3b1513"),
+        danger_fill: hex("#b42318"),
+        danger_fill_hover: hex("#d0392d"),
         success: hex("#22c55e"),
         error: hex("#ef4444"),
     }

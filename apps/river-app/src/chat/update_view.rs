@@ -2,8 +2,9 @@
 //! [`crate::update::UpdateUi`]).
 
 use rune::{El, col, row, text};
-use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit};
+use rune_kit::{Button, ButtonVariant, Checkbox, Kit};
 
+use super::dialog_kit::DialogSpec;
 use super::style::{self as st, Palette};
 use super::view::label;
 use crate::RiverApp;
@@ -312,26 +313,26 @@ fn heading(s: &str, p: &Palette) -> El {
 /// The settings dialog: River's version and updates, and Freenet's version.
 pub(super) fn settings_dialog(ui: &UpdateUi, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
-    let mut body = col()
-        .key("settings-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(16.0)
-        .child(
-            col()
-                .w_full()
-                .gap(8.0)
-                .child(heading("RIVER", &p))
-                .child(river_section(ui, &p, k)),
-        )
-        .child(
-            col()
-                .w_full()
-                .gap(8.0)
-                .child(heading("FREENET", &p))
-                .child(node_section(ui, &p, k)),
-        );
+    let mut body = DialogSpec::new("settings", "Settings", |s: &mut RiverApp| {
+        s.chat.update.settings_open = false
+    })
+    .body_key("settings-body")
+    .width(440.0)
+    .gap(16.0)
+    .child(
+        col()
+            .w_full()
+            .gap(8.0)
+            .child(heading("RIVER", &p))
+            .child(river_section(ui, &p, k)),
+    )
+    .child(
+        col()
+            .w_full()
+            .gap(8.0)
+            .child(heading("FREENET", &p))
+            .child(node_section(ui, &p, k)),
+    );
     if let Some(n) = &ui.notice {
         body = body.child(
             label(n.clone(), st::SMALL, p.warning_text)
@@ -340,11 +341,5 @@ pub(super) fn settings_dialog(ui: &UpdateUi, k: &Kit, layer: &mut Vec<El>) {
                 .key("settings-notice"),
         );
     }
-    Dialog::new("settings", "Settings")
-        .width(440.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.update.settings_open = false)
-        .child(body)
-        .build(k, layer);
+    body.build(k, layer);
 }

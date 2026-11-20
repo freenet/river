@@ -8,9 +8,10 @@
 //! "Browser permission" section has no counterpart: the operating system asks the first time
 //! this app shows a notification.
 
-use rune::{El, col};
-use rune_kit::{Dialog, Kit, RadioGroup, RadioItem};
+use rune::El;
+use rune_kit::{Kit, RadioGroup, RadioItem};
 
+use super::dialog_kit::DialogSpec;
 use super::icons;
 use super::model::Room;
 use super::style::{self as st};
@@ -42,29 +43,22 @@ pub(super) fn notify_dialog(room: &Room, mode: NotificationMode, k: &Kit, layer:
                 .on_select(move |s: &mut RiverApp| s.chat.set_mode(&key, m)),
         );
     }
-    let body = col()
-        .key("notify-modes")
+    DialogSpec::new("notify", "Notifications", |s: &mut RiverApp| {
+        s.chat.close_notify_dialog()
+    })
+    .subtitle(room.name.clone())
+    .body_key("notify-modes")
+    .width(400.0)
+    .child(group.build(k).key("notify-mode-options"))
+    .child(
+        label(
+            "Applies to this room and syncs across your devices.",
+            st::SMALL,
+            p.text_muted,
+        )
+        .wrap()
         .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(group.build(k).key("notify-mode-options"))
-        .child(
-            label(
-                "Applies to this room and syncs across your devices.",
-                st::SMALL,
-                p.text_muted,
-            )
-            .wrap()
-            .w_full()
-            .key("notify-modes-note"),
-        );
-    Dialog::new("notify", "Notifications")
-        .description(room.name.clone())
-        .width(400.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_notify_dialog())
-        .child(body)
-        .build(k, layer);
+        .key("notify-modes-note"),
+    )
+    .build(k, layer);
 }

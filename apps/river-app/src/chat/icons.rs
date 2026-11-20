@@ -141,3 +141,24 @@ pub static MOON: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M13.4 9.6A5.6 5.6 0 0 1 6.4 2.6a5.6 5.6 0 1 0 7 7z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/>"#,
 };
+
+/// A circle with an "i", for an informational notice.
+pub static INFO: Icon = Icon {
+    name: "river-info",
+    view: 16.0,
+    body: r#"<circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.4"/><path d="M8 7.2v3.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="5" r="0.9" fill="currentColor"/>"#,
+};
+
+/// A triangle with an exclamation mark, for a warning notice.
+pub static WARNING: Icon = Icon {
+    name: "river-warning",
+    view: 16.0,
+    body: r#"<path d="M8 2.2 14.4 13.2H1.6L8 2.2Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 6.4v3.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="11.6" r="0.9" fill="currentColor"/>"#,
+};
+
+/// An octagon with an exclamation mark, for a danger notice: a stop sign, not a caution sign.
+pub static DANGER: Icon = Icon {
+    name: "river-danger",
+    view: 16.0,
+    body: r#"<path d="M5.2 1.8h5.6l3.4 3.4v5.6l-3.4 3.4H5.2l-3.4-3.4V5.2l3.4-3.4Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 5v3.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="10.8" r="0.9" fill="currentColor"/>"#,
+};

@@ -8,9 +8,10 @@
 
 use std::sync::Arc;
 
-use rune::{El, col};
-use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit};
+use rune::El;
+use rune_kit::{Button, ButtonVariant, Checkbox, Kit};
 
+use super::dialog_kit::{self as dk, DialogSpec};
 use super::style::{self as st};
 use super::view::label;
 use crate::RiverApp;
@@ -109,12 +110,13 @@ pub(super) fn background_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>
         return;
     };
     let p = st::palette();
-    let mut body = col()
-        .key("background-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0);
+    let mut body = DialogSpec::new(
+        "background",
+        "Background and startup",
+        |s: &mut RiverApp| s.chat.close_background(),
+    )
+    .body_key("background-body")
+    .width(460.0);
     body = body.child(
         Checkbox::new(b.tray && b.close_to_tray)
             .label("Keep River running when the window is closed")
@@ -164,33 +166,23 @@ pub(super) fn background_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>
                 .key("background-error"),
         );
     }
-    body = body.child(
-        rune::row()
-            .w_full()
-            .gap(8.0)
-            .justify_end()
-            .child(
-                Button::new("Quit River")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press_tx(|_: &mut RiverApp, tx: &mut rune::Tx| tx.quit())
-                    .build(k)
-                    .key("background-quit"),
-            )
-            .child(
-                Button::new("Close")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.chat.close_background())
-                    .build(k)
-                    .key("background-close"),
-            ),
-    );
-    Dialog::new("background", "Background and startup")
-        .width(460.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_background())
-        .child(body)
-        .build(k, layer);
+    // Quit River ends the app, so it is set apart at the left; Close is where Close always is.
+    body.footer(dk::footer(
+        vec![
+            Button::new("Quit River")
+                .variant(ButtonVariant::Ghost)
+                .on_press_tx(|_: &mut RiverApp, tx: &mut rune::Tx| tx.quit())
+                .build(k)
+                .key("background-quit"),
+        ],
+        vec![dk::quiet_button(
+            k,
+            "Close",
+            "background-close",
+            |s: &mut RiverApp| s.chat.close_background(),
+        )],
+    ))
+    .build(k, layer);
 }
 
 #[cfg(test)]

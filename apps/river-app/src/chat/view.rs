@@ -4,9 +4,10 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, Pixels, ScrollSpec, col, el, icon, row, spacer, text};
-use rune_kit::{Button, ButtonVariant, Checkbox, Dialog, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, Checkbox, Kit, TextInput};
 
 use super::conversation::{avatar, conversation, mention_overlay, picker_overlay};
+use super::dialog_kit::{self as dk, DialogSpec};
 use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
@@ -214,7 +215,10 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .key(key.to_owned())
             .w_full()
     };
-    let mut body = col().key("form").w_full().px(16.0).pb(16.0).gap(12.0);
+    let mut body = DialogSpec::new(key, title, |s: &mut RiverApp| s.chat.close_dialog())
+        .subtitle(description)
+        .body_key("form")
+        .width(440.0);
     match kind {
         DialogKind::Import => unreachable!("handled above"),
         DialogKind::Create => {
@@ -312,45 +316,29 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 .key("form-error"),
         );
     }
-    body = body.child(
-        row()
-            .w_full()
-            .gap(8.0)
-            .justify_end()
-            .child(
-                Button::new("Cancel")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.chat.close_dialog())
-                    .build(k)
-                    .key("form-cancel"),
-            )
-            .child(
-                Button::new(
-                    if kind == DialogKind::Join
-                        && matches!(
-                            chat.form.join,
-                            JoinPreview::Member { .. } | JoinPreview::Have { .. }
-                        )
-                    {
-                        "Open room"
-                    } else {
-                        submit_label
-                    },
-                )
+    let submit_text = if kind == DialogKind::Join
+        && matches!(
+            chat.form.join,
+            JoinPreview::Member { .. } | JoinPreview::Have { .. }
+        ) {
+        "Open room"
+    } else {
+        submit_label
+    };
+    body.footer(dk::footer(
+        Vec::new(),
+        vec![
+            dk::quiet_button(k, "Cancel", "form-cancel", |s: &mut RiverApp| {
+                s.chat.close_dialog()
+            }),
+            Button::new(submit_text)
                 .variant(ButtonVariant::Contrast)
                 .on_press(move |s: &mut RiverApp| submit(s))
                 .build(k)
                 .key("form-submit"),
-            ),
-    );
-    Dialog::new(key, title)
-        .description(description)
-        .width(440.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_dialog())
-        .child(body)
-        .build(k, layer);
+        ],
+    ))
+    .build(k, layer);
 }
 
 pub(super) fn vline(p: &Palette) -> El {

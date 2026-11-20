@@ -16,7 +16,7 @@
 //! - The description is shown as rendered markdown, in full, to everyone; the owner edits its
 //!   source after pressing the pencil beside its heading.
 //!
-//! - "Leave Room" is at the foot of the dialog below a rule, as a danger button, for the owner
+//! - "Leave room" is at the foot of the dialog below a rule, as a danger button, for the owner
 //!   and for members, as in the web UI,
 //!   with the same confirmation wording plus a line saying the room's saved signing key goes
 //!   too. Leaving is [`Action::LeaveRoom`] ([`crate::rooms::leave`]).
@@ -26,8 +26,12 @@
 //! Privacy is shown, never changed: the web UI cannot change it either.
 
 use rune::{El, TextEdit, col, el, icon, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextArea, TextInput};
+use rune_kit::{Button, ButtonVariant, Kit, TextArea, TextInput};
 
+use super::dialog_kit::{
+    self as dk, DialogSpec, KEY_TEXT, NoticeKind, copy_field, disclosure, label_value, notice,
+    notice_text, rule, value_text,
+};
 use super::icons;
 use super::markdown;
 use super::model::{Details, Editable, Limits, Role, Room, RotateOffer};
@@ -65,7 +69,7 @@ pub struct DetailsForm {
     /// Save would lower a limit below what the room uses: the consequences, waiting for the
     /// owner to confirm.
     pub confirming: Option<Vec<String>>,
-    /// Leave Room was pressed: the confirmation is showing.
+    /// Leave room was pressed: the confirmation is showing.
     pub leaving: bool,
     /// The "Room limits" fold-out (read-only view) is open. It starts closed.
     pub limits_open: bool,
@@ -136,7 +140,7 @@ impl Chat {
         self.details = None;
     }
 
-    /// Leave Room was pressed: show what leaving does, and ask. Nothing is sent yet.
+    /// Leave room was pressed: show what leaving does, and ask. Nothing is sent yet.
     pub fn ask_leave(&mut self) {
         if let Some(form) = &mut self.details {
             form.leaving = true;
@@ -369,7 +373,7 @@ impl Chat {
         let Some(room) = self.room() else {
             return;
         };
-        // Not while Leave Room is being confirmed: the room is about to go.
+        // Not while Leave room is being confirmed: the room is about to go.
         if self.details.as_ref().is_some_and(|f| f.leaving)
             || room.details.rotate != RotateOffer::Allowed
             || room
@@ -523,12 +527,6 @@ fn badge(p: &Palette) -> El {
         .border(1.0, p.line_strong)
         .child(label("PRIVATE", st::TAG, p.text_secondary))
 }
-
-/// The width of the name column of the one-line rows.
-const LABEL_W: f32 = 110.0;
-
-/// Key and address text, a little under the body size so a 44-character key fits one line.
-const KEY_TEXT: rune::tok::TextStyle = rune::tok::TextStyle::new(12.0, 400.0);
 
 /// The description, rendered as markdown (links open as in messages), under its heading. The
 /// owner has a pencil beside the heading that turns it into the text area.
@@ -793,147 +791,9 @@ fn grid(cells: Vec<El>, cols: usize) -> El {
     }
 }
 
-/// A divider line.
-fn rule(p: &Palette) -> El {
-    el().w_full().h(1.0).fill(p.line)
-}
-
 /// A small heading over a group of fields.
 fn group_heading(text: &str, p: &Palette) -> El {
     label(text.to_owned(), st::SMALL_STRONG, p.text_muted)
-}
-
-/// A name column and its value on the same line.
-fn fact(key: &str, name: &str, value: El, p: &Palette) -> El {
-    row()
-        .key(key.to_owned())
-        .w_full()
-        .gap(8.0)
-        .child(
-            label(name.to_owned(), st::SMALL_STRONG, p.text_muted)
-                .w(LABEL_W)
-                .shrink(),
-        )
-        .child(value.grow(1.0).shrink().min_w(0.0))
-}
-
-/// A value that is plain text.
-fn fact_text(key: &str, text: String, p: &Palette) -> El {
-    label(text, st::BODY, p.text).wrap().key(key.to_owned())
-}
-
-/// A heading that folds `body` in and out. Closed by default; the heading is a button that
-/// Enter, Space and a click all press.
-fn disclosure(
-    key: &str,
-    title: &str,
-    open: bool,
-    toggle: fn(&mut RiverApp),
-    body: Vec<El>,
-    p: &Palette,
-) -> El {
-    let header = row()
-        .key(format!("{key}-toggle"))
-        .role("button")
-        .label(format!(
-            "{title}, {}",
-            if open { "shown" } else { "hidden" }
-        ))
-        .focusable(true)
-        .w_full()
-        .h(32.0)
-        .gap(6.0)
-        .center_y()
-        .radius(6.0)
-        .hover(p.surface_hover)
-        .cursor(rune::Cursor::Pointer)
-        .on_press(toggle)
-        .on_key(move |s: &mut RiverApp, ev, _| {
-            let enter = ev.key == rune::Key::Enter;
-            if enter {
-                toggle(s);
-            }
-            enter
-        })
-        .child(
-            icon(&icons::CHEVRON_DOWN, 12.0)
-                .color(p.text_muted)
-                .rotate(if open {
-                    0.0
-                } else {
-                    -std::f32::consts::FRAC_PI_2
-                }),
-        )
-        .child(label(title.to_owned(), st::SMALL_STRONG, p.text_secondary));
-    let mut out = col().key(key.to_owned()).w_full().gap(4.0).child(header);
-    if open {
-        out = out.child(
-            row().w_full().child(el().w(18.0).shrink()).child(
-                col()
-                    .key(format!("{key}-body"))
-                    .grow(1.0)
-                    .shrink()
-                    .min_w(0.0)
-                    .gap(8.0)
-                    .children(body),
-            ),
-        );
-    }
-    out
-}
-
-/// A name, what it is for in a sentence, its value on one line, and a copy button.
-fn id_field(
-    key: &str,
-    name: &str,
-    what: &str,
-    value: &str,
-    copy_what: &'static str,
-    p: &Palette,
-) -> El {
-    let copied = value.to_owned();
-    col()
-        .key(key.to_owned())
-        .w_full()
-        .gap(2.0)
-        .child(label(name.to_owned(), st::SMALL_STRONG, p.text_muted))
-        .child(
-            label(what.to_owned(), st::SMALL, p.text_muted)
-                .wrap()
-                .w_full()
-                .key(format!("{key}-what")),
-        )
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .center_y()
-                .child(
-                    label(value.to_owned(), KEY_TEXT, p.text)
-                        .wrap_anywhere()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .key(format!("{key}-value")),
-                )
-                .child(
-                    row()
-                        .key(format!("{key}-copy"))
-                        .role("button")
-                        .label(copy_what)
-                        .help(copy_what)
-                        .focusable(true)
-                        .size(24.0, 24.0)
-                        .radius(6.0)
-                        .center()
-                        .hover(p.surface_hover)
-                        .cursor(rune::Cursor::Pointer)
-                        .on_press_tx(move |_: &mut RiverApp, tx: &mut rune::Tx| {
-                            tx.copy(copied.clone())
-                        })
-                        .child(icon(&icons::COPY, 14.0).color(p.text_muted)),
-                ),
-        )
 }
 
 /// The room's two identifiers, folded away: members rarely need them.
@@ -944,20 +804,26 @@ fn technical(d: &Details, form: &DetailsForm, p: &Palette) -> El {
         form.technical_open,
         |s| s.chat.toggle_details_technical(),
         vec![
-            id_field(
+            copy_field(
                 "details-owner-key",
                 "Room ID",
-                "The room owner's public key. It names the room: give it to anyone who needs to refer to this room.",
+                Some(
+                    "The room owner's public key. It names the room: give it to anyone who needs to refer to this room.",
+                ),
                 &d.owner_key,
                 "Copy room ID",
+                KEY_TEXT,
                 p,
             ),
-            id_field(
+            copy_field(
                 "details-contract-id",
                 "Contract ID",
-                "The room's address on the Freenet network. Support and developer tools ask for this one.",
+                Some(
+                    "The room's address on the Freenet network. Support and developer tools ask for this one.",
+                ),
                 &d.contract_id,
                 "Copy contract ID",
+                KEY_TEXT,
                 p,
             ),
         ],
@@ -968,9 +834,9 @@ fn technical(d: &Details, form: &DetailsForm, p: &Palette) -> El {
 /// What a member sees of the limits: one plain line each, in the room's own units.
 fn limit_rows(d: &Details, p: &Palette) -> Vec<El> {
     let l = &d.limits;
-    let value = |i: usize, text: String| fact_text(&format!("details-limit-{i}"), text, p);
+    let value = |i: usize, text: String| value_text(&format!("details-limit-{i}"), text, p);
     vec![
-        fact(
+        label_value(
             "details-limit-row-1",
             "Messages kept",
             value(
@@ -982,7 +848,7 @@ fn limit_rows(d: &Details, p: &Palette) -> Vec<El> {
             ),
             p,
         ),
-        fact(
+        label_value(
             "details-limit-row-3",
             "Ban list",
             value(
@@ -995,19 +861,19 @@ fn limit_rows(d: &Details, p: &Palette) -> Vec<El> {
             ),
             p,
         ),
-        fact(
+        label_value(
             "details-limit-row-4",
             "Nickname",
             value(4, format!("Up to {} bytes", l.max_nickname_size)),
             p,
         ),
-        fact(
+        label_value(
             "details-limit-row-5",
             "Room name",
             value(5, format!("Up to {} bytes", l.max_room_name)),
             p,
         ),
-        fact(
+        label_value(
             "details-limit-row-6",
             "Description length",
             value(6, format!("Up to {} bytes", l.max_room_description)),
@@ -1158,32 +1024,14 @@ fn secret_version(d: &Details, form: &DetailsForm, p: &Palette, k: &Kit) -> El {
             ));
         }
     }
-    fact("details-secret", "Secret version", version, p)
+    label_value("details-secret", "Secret version", version, p)
 }
 
-/// "Leave Room": a danger action, set apart from the rest of the dialog.
-fn leave_button(p: &Palette) -> El {
-    row()
-        .key("details-leave")
-        .role("button")
-        .label("Leave Room")
-        .focusable(true)
-        .h(32.0)
-        .px(12.0)
-        .radius(6.0)
-        .center()
-        .border(1.0, p.danger)
-        .hover(p.surface_hover)
-        .cursor(rune::Cursor::Pointer)
-        .on_press(|s: &mut RiverApp| s.chat.ask_leave())
-        .on_key(|s: &mut RiverApp, ev, _| {
-            let enter = ev.key == rune::Key::Enter;
-            if enter {
-                s.chat.ask_leave();
-            }
-            enter
-        })
-        .child(label("Leave Room", st::SMALL_STRONG, p.danger))
+/// "Leave room": a danger action, set apart from the rest of the dialog.
+fn leave_button(k: &Kit) -> El {
+    dk::danger_outline_button(k, "Leave room", "details-leave", |s: &mut RiverApp| {
+        s.chat.ask_leave()
+    })
 }
 
 /// The owner's name field.
@@ -1219,15 +1067,10 @@ with the Freenet delegate, which this app cannot remove. If you have no other co
 key, you cannot post as yourself in the room again, and an owner cannot get ownership back.";
 
 fn leave_confirm(owner: bool, p: &Palette, k: &Kit) -> El {
-    col()
-        .key("details-leave-ask")
-        .w_full()
-        .padding(12.0)
-        .gap(10.0)
-        .radius(8.0)
-        .fill(p.warning_bg)
-        .border(1.0, p.warning)
-        .child(
+    notice(
+        NoticeKind::Danger,
+        "details-leave-ask",
+        vec![
             label(
                 if owner { LEAVE_OWNER } else { LEAVE_MEMBER },
                 st::SMALL,
@@ -1236,33 +1079,26 @@ fn leave_confirm(owner: bool, p: &Palette, k: &Kit) -> El {
             .wrap()
             .w_full()
             .key("details-leave-text"),
-        )
-        .child(
             label(LEAVE_KEY, st::SMALL, p.text)
                 .wrap()
                 .w_full()
                 .key("details-leave-key"),
-        )
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .justify_end()
-                .child(
-                    Button::new("Cancel")
-                        .variant(ButtonVariant::Ghost)
-                        .on_press(|s: &mut RiverApp| s.chat.cancel_leave())
-                        .build(k)
-                        .key("details-leave-cancel"),
-                )
-                .child(
-                    Button::new("Confirm Leave")
-                        .variant(ButtonVariant::Danger)
-                        .on_press(|s: &mut RiverApp| s.chat.confirm_leave())
-                        .build(k)
-                        .key("details-leave-confirm"),
-                ),
-        )
+            dk::footer(
+                Vec::new(),
+                vec![
+                    dk::quiet_button(k, "Cancel", "details-leave-cancel", |s: &mut RiverApp| {
+                        s.chat.cancel_leave()
+                    }),
+                    dk::danger_button(
+                        k,
+                        "Leave room",
+                        "details-leave-confirm",
+                        |s: &mut RiverApp| s.chat.confirm_leave(),
+                    ),
+                ],
+            ),
+        ],
+    )
 }
 
 pub(super) fn details_modal(
@@ -1310,16 +1146,7 @@ pub(super) fn details_modal(
         );
     }
     if let Editable::Blocked(why) = &d.editable {
-        body = body.child(
-            col()
-                .key("details-blocked")
-                .w_full()
-                .padding(12.0)
-                .radius(8.0)
-                .fill(p.warning_bg)
-                .border(1.0, p.warning)
-                .child(label(why.clone(), st::SMALL, p.text).wrap().w_full()),
-        );
+        body = body.child(notice_text(NoticeKind::Warning, "details-blocked", why));
     }
     if editable {
         body = body.child(name_field(form, &p, k));
@@ -1328,7 +1155,7 @@ pub(super) fn details_modal(
 
     // Who owns the room, by name, and a private room's secret version.
     let mut facts = col().key("details-facts").w_full().gap(8.0);
-    facts = facts.child(fact(
+    facts = facts.child(label_value(
         "details-owner",
         "Owner",
         owner_link(room, editable, &p),
@@ -1336,7 +1163,7 @@ pub(super) fn details_modal(
     ));
     if !editable {
         // What matters to a member: how full the room is and how big a message may be.
-        let mut members = col().gap(2.0).child(fact_text(
+        let mut members = col().gap(2.0).child(value_text(
             "details-limit-0",
             format!(
                 "{} members (not counting the owner)",
@@ -1352,11 +1179,11 @@ pub(super) fn details_modal(
                     .key("details-room-full"),
             );
         }
-        facts = facts.child(fact("details-members", "Members", members, &p));
-        facts = facts.child(fact(
+        facts = facts.child(label_value("details-members", "Members", members, &p));
+        facts = facts.child(label_value(
             "details-message-size",
             "Messages",
-            fact_text(
+            value_text(
                 "details-limit-2",
                 format!("Up to {} bytes each", d.limits.max_message_size),
                 &p,
@@ -1364,7 +1191,7 @@ pub(super) fn details_modal(
             &p,
         ));
         if bans_full(d) {
-            facts = facts.child(fact(
+            facts = facts.child(label_value(
                 "details-bans",
                 "Bans",
                 label(
@@ -1438,78 +1265,59 @@ pub(super) fn details_modal(
         // The owner is warned even when the room's details cannot be edited from here yet.
         footer = footer.child(leave_confirm(d.editable != Editable::No, &p, k));
     } else if let Some(warnings) = form.confirming.as_ref().filter(|_| editable) {
-        let mut sure = col()
-            .key("details-confirm")
-            .w_full()
-            .padding(12.0)
-            .gap(6.0)
-            .radius(8.0)
-            .fill(p.warning_bg)
-            .border(1.0, p.warning);
-        for w in warnings {
-            sure = sure.child(label(w.clone(), st::SMALL, p.text).wrap().w_full());
-        }
-        footer = footer.child(sure).child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .justify_end()
-                .child(
-                    Button::new("Back")
-                        .variant(ButtonVariant::Ghost)
-                        .on_press(|s: &mut RiverApp| s.chat.back_from_confirm())
-                        .build(k)
-                        .key("details-back"),
-                )
-                .child(
-                    Button::new("Lower and save")
-                        .variant(ButtonVariant::Contrast)
-                        .on_press(|s: &mut RiverApp| s.chat.confirm_details())
-                        .build(k)
-                        .key("details-confirm-save"),
-                ),
+        let sure = notice(
+            NoticeKind::Warning,
+            "details-confirm",
+            warnings
+                .iter()
+                .map(|w| label(w.clone(), st::SMALL, p.text).wrap().w_full())
+                .collect(),
         );
+        footer = footer.child(sure).child(dk::footer(
+            Vec::new(),
+            vec![
+                dk::quiet_button(k, "Back", "details-back", |s: &mut RiverApp| {
+                    s.chat.back_from_confirm()
+                }),
+                dk::primary_button(
+                    k,
+                    "Lower and save",
+                    "details-confirm-save",
+                    |s: &mut RiverApp| s.chat.confirm_details(),
+                ),
+            ],
+        ));
     } else if editable {
-        let mut save = Button::new("Save")
-            .variant(ButtonVariant::Contrast)
-            .on_press(|s: &mut RiverApp| s.chat.submit_details())
-            .build(k)
-            .key("details-save");
+        let mut save = dk::primary_button(k, "Save", "details-save", |s: &mut RiverApp| {
+            s.chat.submit_details()
+        });
         if !chat.can_save_details() || chat.details_edit().is_err() {
             save = save.disabled(true).opacity(0.45);
         }
-        footer = footer.child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .justify_end()
-                .child(
-                    Button::new("Cancel")
-                        .variant(ButtonVariant::Ghost)
-                        .on_press(|s: &mut RiverApp| s.chat.close_details())
-                        .build(k)
-                        .key("details-cancel"),
-                )
-                .child(save),
-        );
+        footer = footer.child(dk::footer(
+            Vec::new(),
+            vec![
+                dk::quiet_button(k, "Cancel", "details-cancel", |s: &mut RiverApp| {
+                    s.chat.close_details()
+                }),
+                save,
+            ],
+        ));
     }
     if !form.leaving {
         // Set apart from Save and Cancel: it is the one action here that cannot be undone.
         footer = footer
             .child(rule(&p).key("details-leave-rule"))
-            .child(row().w_full().child(leave_button(&p)));
+            .child(row().w_full().child(leave_button(k)));
     }
-    let dialog_body = col()
-        .key("details-body")
-        .w_full()
-        .gap(10.0)
-        .child(scroll)
-        .child(footer);
-    Dialog::new("room-details", "Room Details")
-        .width(560.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_details())
-        .child(dialog_body)
-        .build(k, layer);
+    DialogSpec::new("room-details", "Room details", |s: &mut RiverApp| {
+        s.chat.close_details()
+    })
+    .body_key("details-body")
+    .width(560.0)
+    .gap(10.0)
+    .flush()
+    .child(scroll)
+    .child(footer)
+    .build(k, layer);
 }

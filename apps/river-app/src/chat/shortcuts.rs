@@ -10,9 +10,10 @@
 //! provides (copy, paste, undo) cannot be found that way; they are in the table by hand.
 
 use rune::{El, KeyEvent, col, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit};
+use rune_kit::Kit;
 
 use super::Chat;
+use super::dialog_kit::{self as dk, DialogSpec};
 use super::style::{self as st, Palette};
 use super::view::label;
 use crate::RiverApp;
@@ -275,38 +276,27 @@ pub(super) fn shortcuts_dialog(chat: &Chat, win_h: f32, k: &Kit, layer: &mut Vec
                 ),
         );
     }
-    let body = col()
-        .key("shortcuts-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(
-            col()
-                .key("shortcuts-scroll")
-                .w_full()
-                .max_h(scroll_height(win_h))
-                .scroll(rune::ScrollSpec {
-                    stick_bottom: false,
-                })
-                .child(list),
-        )
-        .child(
-            row().w_full().justify_end().child(
-                Button::new("Close")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.chat.close_shortcuts())
-                    .build(k)
-                    .key("shortcuts-close"),
-            ),
-        );
-    Dialog::new("shortcuts", "Keyboard shortcuts")
-        .width(560.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_shortcuts())
-        .child(body)
-        .build(k, layer);
+    DialogSpec::new("shortcuts", "Keyboard shortcuts", |s: &mut RiverApp| {
+        s.chat.close_shortcuts()
+    })
+    .body_key("shortcuts-body")
+    .width(560.0)
+    .child(
+        col()
+            .key("shortcuts-scroll")
+            .w_full()
+            .max_h(scroll_height(win_h))
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(list),
+    )
+    .footer(dk::close_footer(
+        k,
+        "shortcuts-close",
+        |s: &mut RiverApp| s.chat.close_shortcuts(),
+    ))
+    .build(k, layer);
 }
 
 #[cfg(test)]

@@ -1,13 +1,13 @@
 //! Export ID and Import ID, as the web UI has them (`ExportIdentityModal` and
 //! `ImportIdentityModal` in `ui/src/components/members.rs`).
 //!
-//! **Export ID** is a quiet button at the foot of the members panel. It opens "Export Identity"
+//! **Export ID** is a quiet button at the foot of the members panel. It opens "Export identity"
 //! over the open room: the token in a box, the web UI's warning that it holds your private key,
-//! Close and "Copy to Clipboard" (which reads "Copied!" after). Nothing is copied until the
+//! Close and "Copy to clipboard" (which reads "Copied!" after). Nothing is copied until the
 //! user presses it. The token is made by the background work ([`crate::rooms::identity`]) and
 //! lives only in the open dialog: closing it drops it.
 //!
-//! **Import ID** is a quiet button in the room list's footer. It opens "Import Identity": a
+//! **Import ID** is a quiet button in the room list's footer. It opens "Import identity": a
 //! box to paste into, the web UI's error ("Invalid token: ...") for a token that does not
 //! check, and, when the room is already in the list, the web UI's two warnings (importing
 //! REPLACES the identity you have in it; close other sessions first) with "Replace identity".
@@ -20,9 +20,10 @@
 //! not loaded for a new one. Here the decision is made against the stored slot itself, under
 //! the storage's compare-and-swap, so it does not depend on the list.
 
-use rune::{El, col, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit, TextArea};
+use rune::{El, col};
+use rune_kit::{Button, ButtonVariant, Kit, TextArea};
 
+use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, notice_text};
 use super::style::{self as st};
 use super::view::label;
 use super::{Chat, DialogKind};
@@ -49,7 +50,7 @@ pub enum ExportState {
     Failed(String),
 }
 
-/// The open "Export Identity" dialog.
+/// The open "Export identity" dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportDialog {
     /// The room's key.
@@ -86,7 +87,7 @@ pub const REPLACE_WARNING: &str = "This room already has an identity. Importing 
 pub const REPLACE_SESSIONS_WARNING: &str = "Close any other tabs or devices open to this room first. A session still using the old identity can write it back and undo the switch.";
 
 impl Chat {
-    /// Open "Export Identity" for the open room, and ask for its token.
+    /// Open "Export identity" for the open room, and ask for its token.
     pub fn open_export(&mut self) {
         if !self.can_change_rooms() {
             return;
@@ -124,12 +125,12 @@ impl Chat {
         }
     }
 
-    /// Close "Export Identity", dropping the token.
+    /// Close "Export identity", dropping the token.
     pub fn close_export(&mut self) {
         self.export = None;
     }
 
-    /// Open "Import Identity", empty.
+    /// Open "Import identity", empty.
     pub fn open_import(&mut self) {
         self.open_dialog(DialogKind::Import);
     }
@@ -198,40 +199,33 @@ impl Chat {
     }
 }
 
-fn warning_box(key: &str, text: &str, p: &st::Palette) -> El {
-    col()
-        .key(key.to_owned())
-        .w_full()
-        .padding(12.0)
-        .radius(8.0)
-        .fill(p.warning_bg)
-        .border(1.0, p.warning)
-        .child(label(text.to_owned(), st::SMALL, p.text).wrap().w_full())
-}
-
-/// "Export Identity", when open.
+/// "Export identity", when open.
 pub(super) fn export_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     let Some(dialog) = &chat.export else {
         return;
     };
     let p = st::palette();
-    let mut body = col()
-        .key("export-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(
-            label(EXPORT_INTRO, st::BODY, p.text_secondary)
-                .wrap()
-                .w_full()
-                .key("export-intro"),
-        )
-        .child(warning_box("export-warning", EXPORT_WARNING, &p));
+    let mut body = DialogSpec::new("export-identity", "Export identity", |s: &mut RiverApp| {
+        s.chat.close_export()
+    })
+    .body_key("export-body")
+    .width(520.0)
+    .child(
+        label(EXPORT_INTRO, st::BODY, p.text_secondary)
+            .wrap()
+            .w_full()
+            .key("export-intro"),
+    )
+    .child(notice_text(
+        NoticeKind::Warning,
+        "export-warning",
+        // The notice draws its own warning icon in place of the text's leading one.
+        EXPORT_WARNING.trim_start_matches('\u{26a0}').trim_start(),
+    ));
     let mut copy = Button::new(if dialog.copied {
         "Copied!"
     } else {
-        "Copy to Clipboard"
+        "Copy to clipboard"
     })
     .variant(ButtonVariant::Contrast);
     match &dialog.state {
@@ -282,70 +276,58 @@ pub(super) fn export_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             });
         }
     }
-    body = body.child(
-        row()
-            .w_full()
-            .gap(8.0)
-            .justify_end()
-            .child(
-                Button::new("Close")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.chat.close_export())
-                    .build(k)
-                    .key("export-close"),
-            )
-            .child(copy.build(k).key("export-copy")),
-    );
-    Dialog::new("export-identity", "Export Identity")
-        .width(520.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_export())
-        .child(body)
-        .build(k, layer);
+    body.footer(dk::footer(
+        Vec::new(),
+        vec![
+            dk::quiet_button(k, "Close", "export-close", |s: &mut RiverApp| {
+                s.chat.close_export()
+            }),
+            copy.build(k).key("export-copy"),
+        ],
+    ))
+    .build(k, layer);
 }
 
-/// "Import Identity", when it is the open dialog.
+/// "Import identity", when it is the open dialog.
 pub(super) fn import_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
-    let mut body = col()
-        .key("import-body")
-        .w_full()
-        .px(16.0)
-        .pb(16.0)
-        .gap(12.0)
-        .child(
-            label(IMPORT_INTRO, st::BODY, p.text_secondary)
-                .wrap()
-                .w_full()
-                .key("import-intro"),
-        )
-        .child(
-            TextArea::new(&chat.form.token)
-                .label("Identity token".to_owned())
-                .placeholder(
-                    "-----BEGIN RIVER IDENTITY-----\n...\n-----END RIVER IDENTITY-----".to_owned(),
-                )
-                .width(None)
-                .rows(6)
-                .max_height(180.0)
-                .wrap_anywhere()
-                .on_edit(|s: &mut RiverApp| &mut s.chat.form.token)
-                .on_change(|s: &mut RiverApp, _| s.chat.import_token_edited())
-                .on_key(|s: &mut RiverApp, ev, _| {
-                    // The word keys edit without the field's change hook, so the change is
-                    // noticed here: a warning raised for the text before it no longer applies.
-                    let before = s.chat.form.token.text.clone();
-                    let handled = super::keys::word_keys(&mut s.chat.form.token, ev);
-                    if handled && s.chat.form.token.text != before {
-                        s.chat.import_token_edited();
-                    }
-                    handled
-                })
-                .build(k)
-                .key("import-token")
-                .w_full(),
-        );
+    let mut body = DialogSpec::new("import-identity", "Import identity", |s: &mut RiverApp| {
+        s.chat.close_dialog()
+    })
+    .body_key("import-body")
+    .width(520.0)
+    .child(
+        label(IMPORT_INTRO, st::BODY, p.text_secondary)
+            .wrap()
+            .w_full()
+            .key("import-intro"),
+    )
+    .child(
+        TextArea::new(&chat.form.token)
+            .label("Identity token".to_owned())
+            .placeholder(
+                "-----BEGIN RIVER IDENTITY-----\n...\n-----END RIVER IDENTITY-----".to_owned(),
+            )
+            .width(None)
+            .rows(6)
+            .max_height(180.0)
+            .wrap_anywhere()
+            .on_edit(|s: &mut RiverApp| &mut s.chat.form.token)
+            .on_change(|s: &mut RiverApp, _| s.chat.import_token_edited())
+            .on_key(|s: &mut RiverApp, ev, _| {
+                // The word keys edit without the field's change hook, so the change is
+                // noticed here: a warning raised for the text before it no longer applies.
+                let before = s.chat.form.token.text.clone();
+                let handled = super::keys::word_keys(&mut s.chat.form.token, ev);
+                if handled && s.chat.form.token.text != before {
+                    s.chat.import_token_edited();
+                }
+                handled
+            })
+            .build(k)
+            .key("import-token")
+            .w_full(),
+    );
     if let Some(error) = &chat.form.error {
         body = body.child(
             label(error.clone(), st::BODY, p.danger)
@@ -354,11 +336,6 @@ pub(super) fn import_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 .key("form-error"),
         );
     }
-    let cancel = Button::new("Cancel")
-        .variant(ButtonVariant::Ghost)
-        .on_press(|s: &mut RiverApp| s.chat.close_dialog())
-        .build(k)
-        .key("form-cancel");
     if let Some(confirm) = &chat.form.replace {
         if let Some(name) = &confirm.room_name {
             body = body.child(
@@ -372,53 +349,46 @@ pub(super) fn import_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 .key("import-replace-room"),
             );
         }
-        body = body
-            .child(warning_box(
-                "import-identity-replace-warning",
-                REPLACE_WARNING,
-                &p,
-            ))
-            .child(warning_box(
-                "import-identity-replace-multitab-warning",
-                REPLACE_SESSIONS_WARNING,
-                &p,
-            ))
-            .child(
-                row()
-                    .w_full()
-                    .gap(8.0)
-                    .justify_end()
-                    .child(
-                        Button::new("Cancel")
-                            .variant(ButtonVariant::Ghost)
-                            .on_press(|s: &mut RiverApp| s.chat.cancel_replace())
-                            .build(k)
-                            .key("import-identity-replace-cancel"),
-                    )
-                    .child(
-                        Button::new("Replace identity")
-                            .variant(ButtonVariant::Danger)
-                            .on_press(|s: &mut RiverApp| s.chat.confirm_replace())
-                            .build(k)
-                            .key("import-identity-replace-confirm"),
-                    ),
-            );
-    } else {
-        body = body.child(
-            row().w_full().gap(8.0).justify_end().child(cancel).child(
-                Button::new("Import")
-                    .variant(ButtonVariant::Contrast)
-                    .on_press(|s: &mut RiverApp| s.chat.submit_import())
-                    .build(k)
-                    .key("form-submit"),
-            ),
-        );
-    }
-    Dialog::new("import-identity", "Import Identity")
-        .width(520.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_dialog())
-        .child(body)
+        body.child(notice_text(
+            NoticeKind::Danger,
+            "import-identity-replace-warning",
+            REPLACE_WARNING,
+        ))
+        .child(notice_text(
+            NoticeKind::Warning,
+            "import-identity-replace-multitab-warning",
+            REPLACE_SESSIONS_WARNING,
+        ))
+        .footer(dk::footer(
+            Vec::new(),
+            vec![
+                dk::quiet_button(
+                    k,
+                    "Cancel",
+                    "import-identity-replace-cancel",
+                    |s: &mut RiverApp| s.chat.cancel_replace(),
+                ),
+                dk::danger_button(
+                    k,
+                    "Replace identity",
+                    "import-identity-replace-confirm",
+                    |s: &mut RiverApp| s.chat.confirm_replace(),
+                ),
+            ],
+        ))
         .build(k, layer);
+    } else {
+        body.footer(dk::footer(
+            Vec::new(),
+            vec![
+                dk::quiet_button(k, "Cancel", "form-cancel", |s: &mut RiverApp| {
+                    s.chat.close_dialog()
+                }),
+                dk::primary_button(k, "Import", "form-submit", |s: &mut RiverApp| {
+                    s.chat.submit_import()
+                }),
+            ],
+        ))
+        .build(k, layer);
+    }
 }

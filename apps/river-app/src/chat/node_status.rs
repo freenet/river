@@ -26,9 +26,10 @@
 
 use std::time::{Duration, Instant};
 
-use rune::{El, col, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Kit};
+use rune::{El, col};
+use rune_kit::{Button, ButtonVariant, Kit};
 
+use super::dialog_kit::{self as dk, DialogSpec, label_value};
 use super::style::{self as st, Palette};
 use super::view::label;
 use super::{LinkStatus, Source};
@@ -1140,17 +1141,12 @@ fn line(
     p: &Palette,
 ) -> El {
     let mut v = col()
-        .grow(1.0)
         .gap(2.0)
         .child(label(value, st::BODY, color).wrap().w_full().key(key));
     if let Some(n) = note {
         v = v.child(label(n, st::SMALL, p.text_muted).wrap().w_full());
     }
-    row()
-        .w_full()
-        .gap(12.0)
-        .child(label(name.to_owned(), st::SMALL, p.text_muted).w(130.0))
-        .child(v)
+    label_value(&format!("{key}-row"), name, v, p)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1328,7 +1324,12 @@ pub(crate) fn dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
         return;
     }
     let p = st::palette();
-    let mut body = col().key("ns-body").w_full().px(16.0).pb(16.0).gap(10.0);
+    let mut spec = DialogSpec::new("node-status", "Node status", |s: &mut RiverApp| {
+        s.chat.close_node_status()
+    })
+    .body_key("ns-body")
+    .width(520.0)
+    .gap(10.0);
     for l in lines(chat) {
         let color = match l.tone {
             Tone::Plain => p.text,
@@ -1336,9 +1337,9 @@ pub(crate) fn dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
             Tone::Bad => p.danger,
             Tone::Muted => p.text_muted,
         };
-        body = body.child(line(l.key, l.name, l.value, color, l.note, &p));
+        spec = spec.child(line(l.key, l.name, l.value, color, l.note, &p));
     }
-    body = body.child(
+    spec.child(
         label(
             "Copy diagnostics copies versions, the OS, the node's host and port, the connection \
              state, counts and the kind and time of recent errors. It leaves out room names, \
@@ -1349,41 +1350,28 @@ pub(crate) fn dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
         .wrap()
         .w_full()
         .key("ns-copy-note"),
-    );
-    body = body.child(
-        row()
-            .w_full()
-            .gap(8.0)
-            .justify_end()
-            .child(
-                Button::new(if chat.status.copied {
-                    "Copied"
-                } else {
-                    COPY_LABEL
-                })
-                .variant(ButtonVariant::Contrast)
-                .on_press_tx(|s: &mut RiverApp, tx: &mut rune::Tx| {
-                    tx.copy(format_diagnostics(&Diagnostics::of(&s.chat)));
-                    s.chat.status.copied = true;
-                })
-                .build(k)
-                .key("ns-copy"),
-            )
-            .child(
-                Button::new("Close")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut RiverApp| s.chat.close_node_status())
-                    .build(k)
-                    .key("ns-close"),
-            ),
-    );
-    Dialog::new("node-status", "Node status")
-        .width(520.0)
-        .fit()
-        .open(true)
-        .on_close(|s: &mut RiverApp| s.chat.close_node_status())
-        .child(body)
-        .build(k, layer);
+    )
+    .footer(dk::footer(
+        Vec::new(),
+        vec![
+            dk::quiet_button(k, "Close", "ns-close", |s: &mut RiverApp| {
+                s.chat.close_node_status()
+            }),
+            Button::new(if chat.status.copied {
+                "Copied"
+            } else {
+                COPY_LABEL
+            })
+            .variant(ButtonVariant::Contrast)
+            .on_press_tx(|s: &mut RiverApp, tx: &mut rune::Tx| {
+                tx.copy(format_diagnostics(&Diagnostics::of(&s.chat)));
+                s.chat.status.copied = true;
+            })
+            .build(k)
+            .key("ns-copy"),
+        ],
+    ))
+    .build(k, layer);
 }
 
 #[cfg(test)]
