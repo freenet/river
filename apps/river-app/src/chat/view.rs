@@ -55,6 +55,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     super::background::background_dialog(chat, &k, &mut layer);
     super::node_status::dialog(chat, &k, &mut layer);
     super::dnd::dnd_dialog(chat, &k, &mut layer);
+    super::dm_purge::confirm_dialog(chat, &k, &mut layer);
     super::node_ui::node_dialog(chat, &k, &mut layer);
     if chat.update.settings_open {
         super::update_view::settings_dialog(&chat.update, &k, &mut layer);

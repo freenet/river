@@ -337,7 +337,7 @@ impl Chat {
     /// Mark the sends not answered within [`ANSWER_WAIT`] of `now`. True when that changed what
     /// shows.
     pub fn dm_tick(&mut self, now: Instant) -> bool {
-        let mut changed = false;
+        let mut changed = self.dm_purge_tick(now);
         for s in self.dm.compose.sends.iter_mut().filter(|s| !s.silent) {
             if now.saturating_duration_since(s.at) >= ANSWER_WAIT {
                 s.silent = true;

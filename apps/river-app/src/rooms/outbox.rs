@@ -65,6 +65,15 @@
 //!   and a late answer all send the same signed message, because composing again seals with new
 //!   randomness and the node, which may hold the first, would show both.
 //!
+//! - **Deleting their messages** (`Action::PurgeDm`, [`super::dm_purge`]): one signed purge
+//!   envelope, queued like the rest (one update per room, in order, the same Retry and Discard,
+//!   held when River has moved on). It is not a room message and has no row in the conversation:
+//!   the thread shows it ([`Outbox::purge_rows`]). The room keeps one purge list per person, and
+//!   a new envelope that omits a token the room holds lifts that tombstone, so the envelope is
+//!   built from the room's current one and **one rule** decides when it is built again: while it
+//!   has not gone out, and when a refused or unconfirmed one is retried (kept as it is when still
+//!   right); one that is out or unanswered is sent again byte for byte.
+//!
 //! Where this differs: the web UI marks a room to sync and never hears whether the node took
 //! the update. Here one update per room is out at a time, and its answer decides: an
 //! `UpdateResponse` means sent (if the room then holds the messages), an update error means
@@ -220,6 +229,17 @@ pub enum Action {
         text: String,
         ticket: u64,
     },
+    /// Delete the direct messages the member `peer` sent the user in the command's room, the
+    /// ones with these purge tokens ([`super::dm_purge`]): what the thread showed when the user
+    /// confirmed. The session answers it, by `ticket`, with
+    /// [`super::session::RoomsUpdate::DmPurge`]: whether the deletion was queued, or why not.
+    /// Only messages `peer` sent the user and the room still holds are deleted, whatever the
+    /// tokens name.
+    PurgeDm {
+        peer: MemberId,
+        tokens: Vec<PurgeToken>,
+        ticket: u64,
+    },
 }
 
 impl std::fmt::Debug for Action {
@@ -288,6 +308,16 @@ impl std::fmt::Debug for Action {
                 .debug_struct("SendDm")
                 .field("peer", &super::dm::peer_key(*peer))
                 .field("text", &"<hidden>")
+                .field("ticket", ticket)
+                .finish(),
+            Action::PurgeDm {
+                peer,
+                tokens,
+                ticket,
+            } => f
+                .debug_struct("PurgeDm")
+                .field("peer", &super::dm::peer_key(*peer))
+                .field("tokens", &tokens.len())
                 .field("ticket", ticket)
                 .finish(),
         }
@@ -1158,6 +1188,7 @@ const CONFIG_LABEL: &str = "Your change to the room's details";
 const BAN_LABEL: &str = "Your ban";
 const ROTATE_LABEL: &str = "Your secret rotation";
 const DM_LABEL: &str = "Your direct message";
+const PURGE_LABEL: &str = "Your deletion of their messages";
 
 pub(super) const CONFIG_SUPERSEDED: &str =
     "A newer change to the room's details, made elsewhere, replaced this one.";
@@ -1331,6 +1362,15 @@ impl std::fmt::Debug for DmRow {
     }
 }
 
+/// A deletion of someone's messages that the room does not hold yet, as the thread shows it.
+#[derive(Clone, Debug)]
+pub struct PurgeRow {
+    pub peer: MemberId,
+    /// How many messages it deletes.
+    pub count: usize,
+    pub pending: Pending,
+}
+
 /// What the user wrote or did, kept so it can be built again (on Retry, or sealed again).
 #[derive(Clone)]
 enum Intent {
@@ -1352,6 +1392,9 @@ enum Intent {
     Rotate,
     /// A direct message to this member. The signed message is in the entry's `dm`.
     Dm(MemberId),
+    /// A deletion of the messages this member sent the user. The signed envelope is in the
+    /// entry's `purge`.
+    Purge(MemberId),
 }
 
 /// As derived, except a nickname is not printed.
@@ -1373,6 +1416,7 @@ impl std::fmt::Debug for Intent {
             Intent::Ban(target) => f.debug_tuple("Ban").field(target).finish(),
             Intent::Rotate => f.write_str("Rotate"),
             Intent::Dm(peer) => f.debug_tuple("Dm").field(peer).finish(),
+            Intent::Purge(peer) => f.debug_tuple("Purge").field(peer).finish(),
         }
     }
 }
@@ -1388,6 +1432,7 @@ impl Intent {
             Intent::Ban(_) => BAN_LABEL,
             Intent::Rotate => ROTATE_LABEL,
             Intent::Dm(_) => DM_LABEL,
+            Intent::Purge(_) => PURGE_LABEL,
         }
     }
 
@@ -1424,6 +1469,8 @@ impl Intent {
             Intent::Ban(_) | Intent::Rotate => Vec::new(),
             // Not a room message: composed once, by `dm_send::prepare`.
             Intent::Dm(_) => Vec::new(),
+            // Not a room message: built by `dm_purge::prepare`.
+            Intent::Purge(_) => Vec::new(),
         }
     }
 }
@@ -1607,6 +1654,11 @@ struct Entry {
     /// For a direct message: what was written. Sealed to the recipient, so the sender cannot
     /// read their own message back; the thread shows this until the sent text is saved.
     dm_text: Option<super::dm_cache::Plaintext>,
+    /// For a deletion of someone's messages ([`super::dm_purge`]): the signed envelope and the
+    /// tokens it is for. Built again from the room as it is (`dm_purge::refresh`, which keeps
+    /// it when still right) while it has not gone out and when a refused or unconfirmed one is
+    /// retried; once out, only ever sent again as it is.
+    purge: Option<super::dm_purge::Work>,
     /// For a direct message whose recipient the room no longer lists (the typed
     /// `Refusal::NotMember`, the only refusal that cannot heal): sending it again can only be
     /// refused again, so only Discard is offered. Other refusals keep Retry.
@@ -1674,6 +1726,9 @@ impl Entry {
         if let Some(dm) = &self.dm {
             return super::dm_send::delta(room, dm);
         }
+        if let Some(work) = &self.purge {
+            return super::dm_purge::delta(&work.envelope);
+        }
         match (&self.info, &self.config) {
             (Some(info), _) => info_delta(room, info),
             (None, Some(config)) => config_delta(config),
@@ -1685,6 +1740,10 @@ impl Entry {
     fn applied(&self, room: &LiveRoom) -> Result<LiveRoom, String> {
         if let Some(dm) = &self.dm {
             return super::dm_send::applied(room, dm).map_err(|r| r.text());
+        }
+        if let Some(work) = &self.purge {
+            return super::dm_purge::applied(room, &work.envelope, &work.tokens)
+                .map_err(|r| r.text());
         }
         if let Some(ban) = &self.ban {
             let mut next = room.clone();
@@ -1724,6 +1783,10 @@ impl Entry {
         if let Some(dm) = &self.dm {
             return super::dm_send::landed(room, dm);
         }
+        // Deleted is deleted, whoever's envelope lists the tokens.
+        if let Some(work) = &self.purge {
+            return super::dm_purge::covers(room, work.envelope.recipient_id, &work.tokens);
+        }
         // A nickname the room replaced is settled too: there is nothing more to send.
         held(room, &self.messages)
             && self.ban.as_ref().is_none_or(|b| b.held_in(room))
@@ -1759,16 +1822,20 @@ impl Entry {
             || self.config.is_some()
             || self.ban.is_some()
             || self.dm.is_some()
+            || self.purge.is_some()
     }
 
     /// Whether Retry can do anything for it.
     fn retryable(&self) -> bool {
         self.intent.is_some()
             && !self.no_retry
-            && matches!(
+            && (matches!(
                 self.status,
                 Status::Failed(_) | Status::InFlight { late: true, .. }
             )
+                // The node took a deletion and the room does not hold it (another device
+                // deleted with a higher version that this copy had not seen, most likely): it is built again from the room.
+                || (self.purge.is_some() && matches!(self.status, Status::Unconfirmed(_))))
     }
 
     /// Sealed under a secret version older than `current` (the web UI only seals forward).
@@ -1839,6 +1906,9 @@ impl Default for Outbox {
 /// An entry for a direct message that has no message in it. Not reachable from here (a
 /// message is composed before its entry is made); said instead of sending nothing.
 const DM_LOST: &str = "This direct message could not be prepared again. Write it again.";
+
+/// An entry for a deletion that has no envelope in it. Not reachable from here.
+const PURGE_LOST: &str = "This deletion could not be prepared again. Delete again.";
 
 const IDENTITY_CHANGED: &str =
     "This room's identity changed after it was written, so it was not sent.";
@@ -1955,6 +2025,7 @@ impl Outbox {
             after_ban: None,
             dm: None,
             dm_text: None,
+            purge: None,
             no_retry: false,
             status: Status::Unconfirmed(reason),
             sent: false,
@@ -1980,6 +2051,7 @@ impl Outbox {
             after_ban: None,
             dm: None,
             dm_text: None,
+            purge: None,
             no_retry: false,
             status: Status::Failed(reason),
             sent: false,
@@ -2259,6 +2331,7 @@ impl Outbox {
             after_ban: None,
             dm: None,
             dm_text: None,
+            purge: None,
             no_retry: false,
             status: Status::Queued,
             sent: false,
@@ -2308,6 +2381,7 @@ impl Outbox {
             after_ban: None,
             dm: Some(message),
             dm_text: Some(super::dm_cache::Plaintext::new(text.to_owned())),
+            purge: None,
             no_retry: false,
             status: Status::Queued,
             sent: false,
@@ -2351,6 +2425,76 @@ impl Outbox {
                 (Some(dm), Some(Intent::Dm(r))) => Some((*r, dm.purge_token())),
                 _ => None,
             })
+    }
+
+    /// Check, build, sign and queue a deletion of the messages `peer` sent the user in `room`
+    /// whose purge tokens are `tokens` ([`super::dm_purge`]). Nothing is queued unless the room
+    /// would keep it, so a refusal leaves nothing behind.
+    pub fn purge_dm(
+        &mut self,
+        room: &LiveRoom,
+        peer: MemberId,
+        tokens: &[PurgeToken],
+    ) -> Result<(), String> {
+        let work = super::dm_purge::prepare(room, peer, tokens).map_err(|r| r.text())?;
+        // The same deletion asked for again (after the window gave up waiting for the answer)
+        // while it is still queued or out is that deletion: not a second entry.
+        if self.entries.iter().any(|e| {
+            e.room == room.stored.owner_vk
+                && matches!(e.status, Status::Queued | Status::InFlight { .. })
+                && e.purge.as_ref().is_some_and(|w| {
+                    w.peer == peer && work.tokens.iter().all(|t| w.tokens.contains(t))
+                })
+        }) {
+            return Ok(());
+        }
+        self.push_purge(room, work);
+        Ok(())
+    }
+
+    fn push_purge(&mut self, room: &LiveRoom, work: super::dm_purge::Work) {
+        self.next += 1;
+        self.entries.push(Entry {
+            id: self.next,
+            room: room.stored.owner_vk,
+            intent: Some(Intent::Purge(work.peer)),
+            label: PURGE_LABEL,
+            author: room.stored.self_verifying_key(),
+            time: (self.clock)(),
+            messages: Vec::new(),
+            info: None,
+            config: None,
+            ban: None,
+            after_ban: None,
+            dm: None,
+            dm_text: None,
+            purge: Some(work),
+            no_retry: false,
+            status: Status::Queued,
+            sent: false,
+            forced: 0,
+        });
+    }
+
+    /// The deletions of `room` still in the outbox, oldest first: what the thread of the peer
+    /// shows for them.
+    pub fn purge_rows(&self, room: &VerifyingKey) -> Vec<PurgeRow> {
+        self.entries
+            .iter()
+            .filter(|e| e.room == *room)
+            .filter_map(|e| {
+                let work = e.purge.as_ref()?;
+                Some(PurgeRow {
+                    peer: work.peer,
+                    count: work.tokens.len(),
+                    pending: Pending {
+                        entry: e.id,
+                        failed: e.trouble().map(str::to_owned),
+                        retry: e.retryable(),
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Take a command for `room`. `false` for a command that changed nothing.
@@ -2612,7 +2756,8 @@ impl Outbox {
             | Action::LeaveRoom
             | Action::ExportId
             | Action::ImportId { .. }
-            | Action::SendDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
+            | Action::SendDm { .. }
+            | Action::PurgeDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 
@@ -2767,21 +2912,40 @@ impl Outbox {
                     *changed = true;
                     continue;
                 }
-                if entry.sealed_before(current) {
-                    // Sealed again under the room's current secret, keeping its time.
+                if let Some(work) = &entry.purge
+                    && super::dm_purge::covers(room, work.envelope.recipient_id, &work.tokens)
+                {
+                    // The room already lists these tokens (this envelope reached it from the
+                    // network): done, not to be sent or failed. `reconcile` settles it.
+                    continue;
+                }
+                if entry.purge.is_some() {
+                    // The room's envelope may have changed since this was built (a deletion
+                    // from another device): one that would lift a tombstone is built again from
+                    // the room as it is now, and one that is still right goes out as it is.
+                    // Checks the room would keep it, as the other entries are checked below.
                     rebuild(entry, room, None, ctx);
-                    *changed = true;
                     if entry.status != Status::Queued {
+                        *changed = true;
                         continue;
                     }
-                }
-                if let Err(e) = entry.applied(room) {
-                    entry.status = Status::Failed(e);
-                    entry.no_retry = entry
-                        .dm_refusal(room)
-                        .is_some_and(|r| super::dm_send::is_permanent(&r));
-                    *changed = true;
-                    continue;
+                } else {
+                    if entry.sealed_before(current) {
+                        // Sealed again under the room's current secret, keeping its time.
+                        rebuild(entry, room, None, ctx);
+                        *changed = true;
+                        if entry.status != Status::Queued {
+                            continue;
+                        }
+                    }
+                    if let Err(e) = entry.applied(room) {
+                        entry.status = Status::Failed(e);
+                        entry.no_retry = entry
+                            .dm_refusal(room)
+                            .is_some_and(|r| super::dm_send::is_permanent(&r));
+                        *changed = true;
+                        continue;
+                    }
                 }
             }
             entry.status = Status::InFlight {
@@ -2898,6 +3062,8 @@ impl Outbox {
                                 super::bans::NOT_KEPT.to_owned()
                             } else if entry.dm.is_some() {
                                 super::dm_send::NOT_KEPT.to_owned()
+                            } else if entry.purge.is_some() {
+                                super::dm_purge::NOT_KEPT.to_owned()
                             } else if entry.info.is_some() || entry.config.is_some() {
                                 REMOVED.to_owned()
                             } else {
@@ -3175,7 +3341,7 @@ impl Outbox {
         for e in self
             .entries
             .iter()
-            .filter(|e| e.room == room.stored.owner_vk && e.dm.is_none())
+            .filter(|e| e.room == room.stored.owner_vk && e.dm.is_none() && e.purge.is_none())
         {
             let trouble = e.trouble().map(str::to_owned);
             // A failed edit, deletion or reaction has no effect to show. One that is only
@@ -3420,6 +3586,29 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: 
             entry.no_retry = entry
                 .dm_refusal(room)
                 .is_some_and(|r| super::dm_send::is_permanent(&r));
+        }
+        return;
+    }
+    if let Intent::Purge(_) = intent {
+        // The one rule: called while it has not gone out, and when a refused or unconfirmed one
+        // is retried; never for one that is out or unanswered ([`dm_purge::refresh`] keeps the
+        // envelope as it is when it is still right).
+        let Some(work) = entry.purge.clone() else {
+            entry.status = Status::Failed(PURGE_LOST.into());
+            return;
+        };
+        if entry.author.is_some() && entry.author != room.stored.self_verifying_key() {
+            entry.status = Status::Failed(IDENTITY_CHANGED.into());
+            return;
+        }
+        match super::dm_purge::refresh(room, &work) {
+            Ok(None) => {}
+            Ok(Some(next)) => entry.purge = Some(next),
+            Err(refusal) => {
+                entry.status = Status::Failed(refusal.text());
+                // Nothing left to delete cannot be sent again.
+                entry.no_retry = refusal == super::dm_purge::Refusal::Nothing;
+            }
         }
         return;
     }

@@ -7250,3 +7250,359 @@ mod dm_saves {
         assert!(norm(include_str!("work.rs")).contains("dm_cache::KEY.to_vec()"));
     }
 }
+
+// Deleting their messages ---------------------------------------------------------------------
+
+mod deleting_their_messages {
+    use super::*;
+    use crate::rooms::dm_purge;
+    use river_core::room_state::ChatRoomStateV1Delta;
+    use river_core::room_state::direct_messages::{
+        DirectMessagesDelta, PurgeToken, advance_recipient_purges, compose_direct_message,
+    };
+
+    /// The room of `dm_rooms`, with `n` messages from the owner to the user taken by it, and
+    /// their tokens.
+    fn with_inbound(
+        n: u64,
+    ) -> (
+        Rooms,
+        crate::rooms::room_tests::Fixture,
+        String,
+        String,
+        Vec<PurgeToken>,
+    ) {
+        let (mut rooms, f, key, peer) = dm_rooms();
+        let mut tokens = Vec::new();
+        for i in 0..n {
+            let ts = 1_700_000_000 + i;
+            let m = compose_direct_message(
+                &f.owner,
+                &f.me.verifying_key(),
+                &f.owner.verifying_key(),
+                ts,
+                ts,
+                format!("owner says {i}").as_bytes(),
+            )
+            .unwrap();
+            tokens.push(m.purge_token());
+            rooms.list[0]
+                .apply_delta(ChatRoomStateV1Delta {
+                    direct_messages: Some(DirectMessagesDelta {
+                        new_messages: vec![m],
+                        advanced_purges: Vec::new(),
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        (rooms, f, key, peer, tokens)
+    }
+
+    fn purge(room: &str, peer: &str, tokens: &[PurgeToken], ticket: u64) -> Command {
+        Command {
+            room: room.to_owned(),
+            action: Action::PurgeDm {
+                peer: crate::rooms::dm::peer_from_key(peer).expect("a member key"),
+                tokens: tokens.to_vec(),
+                ticket,
+            },
+        }
+    }
+
+    fn take_purge(rooms: &mut Rooms, command: Command) -> Vec<(u64, Result<(), String>)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(command).unwrap();
+        rooms.take_commands(&rx);
+        std::mem::take(&mut rooms.dm_purge_results)
+            .into_iter()
+            .map(|r| (r.ticket, r.result))
+            .collect()
+    }
+
+    #[test]
+    fn a_deletion_is_answered_shown_as_under_way_and_takes_the_messages_out_once_the_room_holds_it()
+    {
+        let (mut rooms, _f, key, peer, tokens) = with_inbound(2);
+        let before = rooms.dm_snapshot().expect("the thread");
+        assert_eq!(before.threads[0].messages.len(), 2);
+        assert!(before.purges.is_empty());
+
+        assert_eq!(
+            take_purge(&mut rooms, purge(&key, &peer, &tokens, 4)),
+            vec![(4, Ok(()))]
+        );
+        // On its way: the messages are still the room's, the thread says a deletion is out.
+        let under = rooms.dm_snapshot().expect("the state changed");
+        assert_eq!(under.threads[0].messages.len(), 2);
+        assert_eq!(under.purges.len(), 1);
+        assert_eq!(under.purges[0].room, key);
+        assert_eq!(under.purges[0].peer_key, peer);
+        assert_eq!(under.purges[0].count, 2);
+        assert_eq!(under.purges[0].pending.failed, None);
+        assert!(rooms.dm_snapshot().is_none(), "nothing changed");
+
+        // Sent and taken: the room holds it, the messages are gone, and so is the line.
+        let mut changed = false;
+        let delta = rooms
+            .outbox
+            .next_update(&rooms.list[0], Instant::now(), &mut changed)
+            .expect("goes out");
+        assert_eq!(
+            delta
+                .direct_messages
+                .as_ref()
+                .unwrap()
+                .advanced_purges
+                .len(),
+            1
+        );
+        assert!(rooms.update_answered(&rooms.list[0].contract_id(), Ok(())));
+        let after = rooms.dm_snapshot().expect("the thread changed");
+        assert!(after.threads.is_empty(), "{:?}", after.threads);
+        assert!(after.purges.is_empty());
+        assert!(rooms.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_deletion_the_session_cannot_take_is_answered_with_why_and_leaves_nothing() {
+        let (mut rooms, f, key, peer, tokens) = with_inbound(1);
+        // River has moved on: nothing is written.
+        rooms.update_required = true;
+        assert_eq!(
+            take_purge(&mut rooms, purge(&key, &peer, &tokens, 1)),
+            vec![(
+                1,
+                Err(crate::rooms::generation::UPDATE_REQUIRED_PURGE.to_owned())
+            )]
+        );
+        rooms.update_required = false;
+        assert!(rooms.outbox.is_empty());
+
+        // A room only the store has read may lack a deletion made elsewhere, which this one
+        // would lift: it is refused until the network has given the state.
+        let owner = rooms.list[0].stored.owner_vk;
+        rooms.network_seen.remove(&owner);
+        let answers = take_purge(&mut rooms, purge(&key, &peer, &tokens, 2));
+        assert_eq!(answers.len(), 1);
+        assert!(answers[0].1.as_ref().unwrap_err().contains("hasn't loaded"));
+        assert!(rooms.outbox.is_empty());
+        rooms.network_seen.insert(owner);
+
+        // Nothing of theirs left to delete, and a token that is not theirs.
+        let answers = take_purge(&mut rooms, purge(&key, &peer, &[], 3));
+        assert_eq!(answers, vec![(3, Err(dm_purge::Refusal::Nothing.text()))]);
+        let stranger = PurgeToken([9; 16]);
+        assert_eq!(
+            take_purge(&mut rooms, purge(&key, &peer, &[stranger], 4)),
+            vec![(4, Err(dm_purge::Refusal::Nothing.text()))]
+        );
+        assert!(rooms.outbox.is_empty());
+
+        // A room that is gone says so; one that may only be unread yet waits.
+        assert_eq!(
+            take_purge(&mut rooms, purge("nope", &peer, &tokens, 5)),
+            vec![(5, Err("This room is no longer here.".to_owned()))]
+        );
+        rooms.complete = false;
+        assert!(take_purge(&mut rooms, purge("nope", &peer, &tokens, 6)).is_empty());
+        assert_eq!(rooms.outbox.waiting.len(), 1);
+        rooms.complete = true;
+
+        // No key on this computer: the room's own words.
+        rooms.list[0].stored.self_sk = None;
+        let answers = take_purge(&mut rooms, purge(&key, &peer, &tokens, 7));
+        // (The command that waited is taken again now that the read is complete.)
+        assert_eq!(
+            answers,
+            vec![
+                (6, Err("This room is no longer here.".to_owned())),
+                (
+                    7,
+                    Err(crate::rooms::outbox::Blocked::NoKey.reason().to_owned())
+                )
+            ]
+        );
+        let _ = f;
+    }
+
+    #[test]
+    fn a_deletion_waiting_when_river_moves_on_fails_with_why_and_is_kept_to_retry_or_discard() {
+        let (mut rooms, _f, key, peer, tokens) = with_inbound(1);
+        take_purge(&mut rooms, purge(&key, &peer, &tokens, 1));
+        rooms.dm_snapshot().expect("first");
+        // The held gate fails what waits, as for a message.
+        assert!(
+            rooms
+                .outbox
+                .fail_queued(crate::rooms::generation::UPDATE_REQUIRED)
+        );
+        let snap = rooms.dm_snapshot().expect("the state changed");
+        let p = &snap.purges[0];
+        assert!(
+            p.pending
+                .failed
+                .as_deref()
+                .is_some_and(|w| w.contains("newer version of River"))
+        );
+        // Its messages are still shown, and it is not sent while River is ahead.
+        assert_eq!(snap.threads[0].messages.len(), 1);
+        let mut changed = false;
+        assert!(
+            rooms
+                .outbox
+                .next_update(&rooms.list[0], Instant::now(), &mut changed)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_message_the_recipient_deleted_loses_its_saved_text_only_by_the_envelope_that_names_it() {
+        let (mut rooms, f, _key, _peer, _tokens) = with_inbound(0);
+        let owner_vk = rooms.list[0].stored.owner_vk;
+        let owner_id = f.owner_id();
+        let named = PurgeToken([1; 16]);
+        let unnamed = PurgeToken([2; 16]);
+        let elsewhere = PurgeToken([3; 16]);
+        rooms
+            .dm_cache
+            .insert_for_test(&owner_vk, owner_id, named, "named");
+        rooms
+            .dm_cache
+            .insert_for_test(&owner_vk, owner_id, unnamed, "unnamed");
+        // The same token to someone else is another entry.
+        let third = river_core::room_state::member::MemberId::from(
+            &ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key(),
+        );
+        rooms
+            .dm_cache
+            .insert_for_test(&owner_vk, third, named, "other recipient");
+        rooms
+            .dm_cache
+            .insert_for_test(&owner_vk, owner_id, elsewhere, "gone from the room");
+
+        // No envelope: a message missing from the room says nothing, so nothing is dropped.
+        rooms.prune_purged_texts();
+        assert_eq!(rooms.dm_cache.len(), 4);
+        assert!(rooms.dm_saver.removals().is_empty());
+
+        // The owner's envelope names two tokens of the pair, in a room read from the network.
+        let envelope =
+            advance_recipient_purges(&f.owner, &f.owner.verifying_key(), None, [named]).unwrap();
+        rooms.list[0]
+            .apply_delta(dm_purge::delta(&envelope))
+            .unwrap();
+        rooms.network_seen.remove(&owner_vk);
+        rooms.prune_purged_texts();
+        assert_eq!(
+            rooms.dm_cache.len(),
+            4,
+            "a room not read from the network is not trusted"
+        );
+        rooms.network_seen.insert(owner_vk);
+        rooms.prune_purged_texts();
+        assert_eq!(rooms.dm_cache.plaintext(&owner_vk, owner_id, &named), None);
+        for (who, token, text) in [
+            (owner_id, unnamed, "unnamed"),
+            (third, named, "other recipient"),
+            (owner_id, elsewhere, "gone from the room"),
+        ] {
+            assert_eq!(rooms.dm_cache.plaintext(&owner_vk, who, &token), Some(text));
+        }
+        // The store is owed the removal of that one entry, once.
+        assert_eq!(
+            rooms.dm_saver.removals(),
+            &[(owner_vk.to_bytes(), owner_id, named)]
+        );
+        rooms.prune_purged_texts();
+        assert_eq!(rooms.dm_saver.removals().len(), 1);
+    }
+
+    #[test]
+    fn a_text_a_save_is_adding_is_removed_after_the_save_when_its_recipient_deletes_it() {
+        let (mut rooms, f, _key, _peer, _tokens) = with_inbound(0);
+        let owner_vk = rooms.list[0].stored.owner_vk;
+        let owner_id = f.owner_id();
+        let token = PurgeToken([4; 16]);
+        let key = (owner_vk.to_bytes(), owner_id, token);
+        // The user sent it, its text is unsaved, and a write that adds it is out.
+        rooms
+            .dm_cache
+            .remember_sent(&owner_vk, owner_id, token, f.me_id(), 5, "text".into());
+        rooms.dm_saver.started(vec![key], Vec::new());
+        // Its recipient deletes it.
+        let envelope =
+            advance_recipient_purges(&f.owner, &f.owner.verifying_key(), None, [token]).unwrap();
+        rooms.list[0]
+            .apply_delta(dm_purge::delta(&envelope))
+            .unwrap();
+        rooms.prune_purged_texts();
+        assert_eq!(rooms.dm_cache.plaintext(&owner_vk, owner_id, &token), None);
+        // The write puts it in the store, so its removal is owed, to follow the write.
+        assert_eq!(rooms.dm_saver.removals(), &[key]);
+        // The save's end does not bring it back or lose track of the removal.
+        rooms.dm_cache.note_saved(&[key], &[]);
+        assert_eq!(rooms.dm_cache.plaintext(&owner_vk, owner_id, &token), None);
+        assert_eq!(rooms.dm_saver.removals(), &[key]);
+    }
+
+    #[test]
+    fn the_prune_runs_again_only_when_an_envelope_or_the_cache_changed() {
+        let (mut rooms, f, _key, _peer, _tokens) = with_inbound(0);
+        let owner_vk = rooms.list[0].stored.owner_vk;
+        rooms.prune_purged_texts();
+        let first = rooms.purge_pruned;
+        assert_eq!(first, Some(rooms.purge_fingerprint()));
+        // Nothing changed: the same fingerprint, so the next tick skips.
+        rooms.prune_purged_texts();
+        assert_eq!(rooms.purge_pruned, first);
+        // A new envelope changes it.
+        let envelope = advance_recipient_purges(
+            &f.owner,
+            &f.owner.verifying_key(),
+            None,
+            [PurgeToken([1; 16])],
+        )
+        .unwrap();
+        rooms.list[0]
+            .apply_delta(dm_purge::delta(&envelope))
+            .unwrap();
+        assert_ne!(Some(rooms.purge_fingerprint()), first);
+        // So does the cache (a read that brings an entry back).
+        rooms.prune_purged_texts();
+        let second = rooms.purge_fingerprint();
+        rooms
+            .dm_cache
+            .insert_for_test(&owner_vk, f.owner_id(), PurgeToken([5; 16]), "x");
+        assert_ne!(rooms.purge_fingerprint(), second);
+    }
+
+    #[test]
+    fn nothing_here_logs_a_token_and_a_deletion_is_refused_for_a_room_the_network_has_not_given() {
+        let norm = |s: &str| s.replace("\r\n", "\n");
+        let session = norm(include_str!("session.rs"));
+        let body = session
+            .split("#[cfg(test)]\n#[path = \"session_tests.rs\"]")
+            .next()
+            .unwrap();
+        // The deletion is refused for a room the network has not given.
+        let purge_fn = body.split("fn purge_dm").nth(1).unwrap();
+        let purge_fn = purge_fn.split("\n    }\n").next().unwrap();
+        assert!(purge_fn.contains("self.network_seen.contains"));
+        assert!(purge_fn.contains("self.update_required"));
+        for file in [
+            include_str!("dm_purge.rs"),
+            include_str!("../chat/dm_purge.rs"),
+        ] {
+            let file = norm(file);
+            for line in file.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                assert!(
+                    !line.contains("println!")
+                        && !line.contains("dbg!")
+                        && !line.contains("tracing::"),
+                    "{line}"
+                );
+            }
+        }
+    }
+}

@@ -9,7 +9,9 @@
 # it, each receives the other's message, each sends the other a direct message (an empty one
 # is refused) that the other opens with its own key and the sender reads back as its own; each
 # node's chat delegate then holds the sent text, and after the first app's link restarts it reads
-# its own sent message back as text from there; and each changes its own nickname and the other sees
+# its own sent message back as text from there; the peer deletes the gateway's message (a deletion
+# of its own is refused), both threads lose it, the gateway's saved copy of its text is removed
+# from the delegate, and it stays deleted after a restart; and each changes its own nickname and the other sees
 # it; the owner makes the joiner a deputy, whose app shows the Deputy tag, and revokes it. Last,
 # the example asks each node's chat delegate for
 # the room's signing key and requires it to be that app's own member key (the app's background

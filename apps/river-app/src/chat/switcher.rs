@@ -234,6 +234,7 @@ impl Chat {
             || self.member_modal.is_some()
             || self.details.is_some()
             || self.notify_dialog.is_some()
+            || self.dm.purge.confirming()
             || self.export.is_some()
             || self.node.form.is_some()
             || self.update.settings_open

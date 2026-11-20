@@ -531,6 +531,35 @@ impl OutboundCache {
         self.saved.remove(&key).is_some()
     }
 
+    /// Drop every text `named` names (the messages their recipient deleted), wherever it is
+    /// held, and so never put one back. Returns each key dropped, with whether the delegate's
+    /// store holds it or was given it (`entries` or `saved`), which still has to be removed from
+    /// it ([`super::dm_save`]). A key held only as unsaved text may still be in a write now
+    /// working: the caller checks that. **Only what a purge names**: a message missing from the
+    /// room says nothing, because an early read finds the room's messages not yet caught up.
+    pub fn prune_named(&mut self, named: impl Fn(&EntryKey) -> bool) -> Vec<(EntryKey, bool)> {
+        let keys: std::collections::HashSet<EntryKey> = self
+            .entries
+            .keys()
+            .chain(self.saved.keys())
+            .chain(self.local.keys())
+            .filter(|k| named(k))
+            .copied()
+            .collect();
+        let mut dropped = Vec::new();
+        for key in &keys {
+            let stored = self.entries.remove(key).is_some();
+            let saved = self.saved.remove(key).is_some();
+            self.local.remove(key);
+            self.resaves.remove(key);
+            dropped.push((*key, stored || saved));
+        }
+        if !keys.is_empty() {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        dropped
+    }
+
     /// After a read: what this app saved and the delegate no longer holds was overwritten (the
     /// web UI saves its whole copy blind). It goes back to being unsaved, to be saved again, up
     /// to [`MAX_RESAVES`] times. After that the text stays in memory for the session (the row

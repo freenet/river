@@ -760,6 +760,12 @@ impl RiverApp {
                     tx.scroll_to_bottom(chat::dm_view::scroll_key(&room, &peer));
                 }
             }
+            RoomsUpdate::DmPurge {
+                room,
+                peer,
+                ticket,
+                result,
+            } => self.chat.dm_purged(&room, &peer, ticket, result),
             RoomsUpdate::Status(status) => {
                 let at = self.chat.node.choice.address.authority();
                 self.chat
@@ -1635,6 +1641,84 @@ pub const SCENES: &[Scene] = &[
             c.dm_write("Thanks, I'll read it tonight.\nWant to compare notes tomorrow?")
         });
     }),
+    // Deleting their messages: the thread's header action (narrow: the trash icon alone), its
+    // confirmation (wide and narrow), a deletion on its way, one the room did not take, one
+    // refused before it was queued, and the action off with its reason: nothing to delete, River
+    // has moved on, a room that does not let you write, a room not read from the network yet.
+    ("chat-dm-purge", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {})
+    }),
+    ("chat-dm-purge-narrow", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {})
+    }),
+    ("chat-dm-purge-confirm", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {});
+        assert!(s.chat.dm_purge_ask());
+    }),
+    ("chat-dm-purge-confirm-narrow", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {});
+        assert!(s.chat.dm_purge_ask());
+    }),
+    ("chat-dm-purge-under", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |d| {
+            d.purges.push(example_purge(None))
+        })
+    }),
+    ("chat-dm-purge-failed", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |d| {
+            d.purges.push(example_purge(Some((
+                "Freenet refused it: the node was busy.",
+                true,
+            ))))
+        })
+    }),
+    ("chat-dm-purge-refused", |s| {
+        dm_send_scene(s, |c| {
+            assert!(c.dm_purge_ask());
+            assert!(c.dm_purge_confirm());
+            let ticket = c
+                .dm_purge_waiting_ticket()
+                .expect("the ask waits for its answer");
+            c.dm_purged(
+                "town-square",
+                chat::example::DM_PEER,
+                ticket,
+                Err(rooms::dm_purge::Refusal::Cap {
+                    held: 995,
+                    adding: 12,
+                }
+                .text()),
+            );
+        });
+    }),
+    ("chat-dm-purge-off-nothing", |s| {
+        dm_scene(s, Some(("town-square", "30")), |_| {})
+    }),
+    ("chat-dm-purge-off-held", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {});
+        s.chat.issues.update_required = true;
+    }),
+    ("chat-dm-purge-off-key", |s| {
+        dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {});
+        let rooms: Vec<_> = s
+            .chat
+            .rooms()
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.send_block = Some(rooms::outbox::Blocked::NoKey.reason().into());
+                r
+            })
+            .collect();
+        s.chat.set_rooms(rooms);
+    }),
+    ("chat-dm-purge-off-loading", |s| {
+        dm_send_scene(s, |c| {
+            let mut snapshot = c.dm.snapshot().clone();
+            snapshot.room_keys.clear();
+            c.apply_dms(snapshot);
+        });
+    }),
     // Scenes named `*narrow*` are rendered at a narrow size (`--size 820x720`, see
     // `.github/workflows/apps.yml`): the layout follows the window's width, which a scene
     // cannot set. At the default size they look like the wide layout.
@@ -2408,6 +2492,20 @@ fn pending_dm(s: &mut RiverApp, failed: Option<(&str, bool)>) {
         }),
     });
     s.chat.apply_dms(snapshot);
+}
+
+/// A deletion of the example thread's messages from Priya that the room does not hold yet.
+fn example_purge(failed: Option<(&str, bool)>) -> chat::dm_model::DmPurge {
+    chat::dm_model::DmPurge {
+        room: "town-square".into(),
+        peer_key: chat::example::DM_PEER.into(),
+        count: 2,
+        pending: chat::model::Pending {
+            entry: 1,
+            failed: failed.map(|(why, _)| why.to_owned()),
+            retry: failed.is_some_and(|(_, retry)| retry),
+        },
+    }
 }
 
 fn connect(s: &mut RiverApp) {

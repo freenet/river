@@ -1,5 +1,6 @@
 //! Direct messages on screen: the rail's "Direct messages" section and the thread view in the
-//! main pane. Sending is in [`super::dm_compose`]; nothing here deletes or saves anything.
+//! main pane. Sending is in [`super::dm_compose`] and deleting the peer's messages in
+//! [`super::dm_purge`]; nothing here saves anything.
 //!
 //! The threads come from the background work as a [`DmSnapshot`] (built by `rooms::dm`, which
 //! verifies and opens the messages). This module never sees a key or a ciphertext.
@@ -45,6 +46,9 @@ use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label};
 use crate::RiverApp;
 use crate::rooms::room::local_minutes_of_secs;
+
+/// The most deletions whose messages are waited for to leave the read positions.
+const MAX_DELETING: usize = 20;
 
 /// The most rows the rail lists. A user with more threads than this sees the newest and unread
 /// ones, and is told how many are not shown.
@@ -113,6 +117,13 @@ pub struct DmUi {
     pub at_bottom: bool,
     /// The composer had the keyboard when the thread opened: Back gives it back.
     restore_focus: bool,
+    /// Deleting the peer's messages ([`super::dm_purge`]).
+    pub(super) purge: super::dm_purge::DmPurgeUi,
+    /// Deletions the background work took, whose messages the room still held at the last
+    /// snapshot: `(room key, peer, message keys)`. The read position forgets a key once the
+    /// thread no longer has it ([`DmUi::forget_deleted`]), so the badge does not count messages
+    /// that are on their way out as unread. Bounded by [`MAX_DELETING`].
+    deleting: Vec<(String, String, Vec<String>)>,
     /// How many times the rail rows were rebuilt, for tests.
     rebuilds: usize,
 }
@@ -219,7 +230,41 @@ impl DmUi {
             }
         }
         self.snapshot = snapshot;
+        self.forget_deleted();
         self.rebuild();
+    }
+
+    /// Note that the messages `keys` of the thread `(room, peer)` are being deleted: once the
+    /// thread no longer holds one, the read position forgets it.
+    pub(super) fn note_deleting(&mut self, room: &str, peer: &str, keys: Vec<String>) {
+        self.deleting.push((room.to_owned(), peer.to_owned(), keys));
+        if self.deleting.len() > MAX_DELETING {
+            self.deleting.remove(0);
+        }
+        self.forget_deleted();
+    }
+
+    /// Forget, from the read positions, the keys of messages being deleted that the last
+    /// snapshot of a loaded room no longer holds. A key the thread still has waits.
+    fn forget_deleted(&mut self) {
+        let snapshot = &self.snapshot;
+        let seen = &mut self.seen;
+        self.deleting.retain_mut(|(room, peer, keys)| {
+            if !snapshot.room_keys.iter().any(|k| k == room) {
+                return true;
+            }
+            let present: HashSet<&str> = snapshot
+                .threads
+                .iter()
+                .filter(|t| &t.room == room && &t.peer_key == peer)
+                .flat_map(|t| t.messages.iter().map(|m| m.key.as_str()))
+                .collect();
+            if let Some(set) = seen.get_mut(&(room.clone(), peer.clone())) {
+                set.retain(|k| !keys.contains(k) || present.contains(k.as_str()));
+            }
+            keys.retain(|k| present.contains(k.as_str()));
+            !keys.is_empty()
+        });
     }
 
     /// Record that the open thread's inbound messages have been seen, when they have: the
@@ -339,6 +384,11 @@ fn name(s: &str) -> String {
     crate::rooms::room::clean(s)
 }
 
+/// [`name`], for the deletion's confirmation.
+pub(super) fn clean_name(s: &str) -> String {
+    name(s)
+}
+
 /// The rail's one-line preview of a thread's newest message: plain text, bounded, with no
 /// markup and no invitation payload.
 fn preview(t: &DmThread, hydrated: bool) -> String {
@@ -404,6 +454,9 @@ impl Chat {
     /// peer has no messages and is not a member of the room.
     pub(super) fn dm_settle(&mut self) {
         self.dm_forget_gone();
+        // A confirmation belongs to the thread that was open when it was asked.
+        let open = self.dm.open.clone();
+        self.dm.purge.keep_confirm_for(open.as_ref());
         let Some((room, uid)) = self.dm.open.clone() else {
             return;
         };
@@ -414,6 +467,7 @@ impl Chat {
         });
         if !known {
             self.dm.open = None;
+            self.dm.purge.keep_confirm_for(None);
         }
     }
 
@@ -423,6 +477,7 @@ impl Chat {
         self.dm
             .compose
             .forget_rooms(|r| keys.iter().any(|k| k == r));
+        self.dm.purge.forget_rooms(|r| keys.iter().any(|k| k == r));
     }
 
     /// Open the conversation with the member `uid` of the room keyed `room`, in the main pane.
@@ -476,6 +531,7 @@ impl Chat {
         let Some(closed) = self.dm.open.take() else {
             return;
         };
+        self.dm.purge.keep_confirm_for(None);
         // What was typed stays as the thread's draft; the box gives up the keyboard.
         if let Some(d) = self.dm.compose.drafts_mut().get_mut(&closed) {
             d.focused = false;
@@ -664,7 +720,7 @@ pub(super) fn thread_pane(chat: &Chat, narrow: bool, p: &Palette, k: &Kit) -> El
         .grow(1.0)
         .min_w(0.0)
         .h_full()
-        .child(header(&shown, narrow, p, k))
+        .child(header(chat, &shown, narrow, p, k))
         .child(hline(p));
     // Said once, above the messages, whatever the pane's width.
     let mut notes = col().key("dm-notes").w_full().px(20.0).gap(4.0);
@@ -685,6 +741,12 @@ pub(super) fn thread_pane(chat: &Chat, narrow: bool, p: &Palette, k: &Kit) -> El
         );
         any = true;
     }
+    // About deleting their messages: why it is off when that needs saying, what is under way or
+    // was refused.
+    for line in super::dm_purge::notes(chat, &shown.peer_name, p) {
+        notes = notes.child(line);
+        any = true;
+    }
     if any {
         c = c.child(notes.pt(8.0));
     }
@@ -693,7 +755,7 @@ pub(super) fn thread_pane(chat: &Chat, narrow: bool, p: &Palette, k: &Kit) -> El
         .child(super::dm_compose::composer(chat, p, k))
 }
 
-fn header(shown: &Shown<'_>, narrow: bool, p: &Palette, k: &Kit) -> El {
+fn header(chat: &Chat, shown: &Shown<'_>, narrow: bool, p: &Palette, k: &Kit) -> El {
     let back = Button::new("Back")
         .variant(ButtonVariant::Ghost)
         .on_press(|s: &mut RiverApp| s.chat.close_dm())
@@ -726,6 +788,13 @@ fn header(shown: &Shown<'_>, narrow: bool, p: &Palette, k: &Kit) -> El {
                         .shrink(),
                 ),
         )
+        .child(super::dm_purge::header_action(
+            chat,
+            narrow,
+            &shown.peer_name,
+            p,
+            k,
+        ))
 }
 
 /// A message time (unix seconds) as the conversation's clock counts it: local minutes since the
