@@ -676,6 +676,70 @@ mod tests {
         assert_eq!(n[0].body, "3 new messages");
     }
 
+    // Do not disturb ----------------------------------------------------------------------
+
+    fn dnd_on(s: &mut RiverApp) {
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.now = 12 * 60;
+        s.chat.dnd.settings.manual = true;
+    }
+
+    #[test]
+    fn do_not_disturb_shows_nothing_but_unread_still_counts_and_nothing_is_replayed() {
+        let (mut s, rec, rooms) = live();
+        dnd_on(&mut s);
+        let before = s.unread();
+        let m = from_other(&rooms[0], "n1", "supper is ready");
+        let held = with(&rooms, 0, vec![m]);
+        deliver(&mut s, held.clone());
+        assert!(shown(&rec).is_empty());
+        assert!(s.unread() > before, "unread still counts");
+        // Turned off, nothing held back comes out later, and the next message notifies.
+        s.chat.dnd.settings.manual = false;
+        s.flush_held(minute_later());
+        assert!(shown(&rec).is_empty(), "not replayed");
+        let again = with(&held, 0, vec![from_other(&rooms[0], "n2", "second")]);
+        deliver(&mut s, again);
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
+    #[test]
+    fn allow_mentions_lets_only_mentions_through_do_not_disturb() {
+        let (mut s, rec, rooms) = live();
+        dnd_on(&mut s);
+        let mut next = with(&rooms, 0, vec![mention_of_you(&rooms[0], "m")]);
+        next[1].messages.push(from_other(&rooms[1], "p", "plain"));
+        deliver(&mut s, next.clone());
+        assert!(shown(&rec).is_empty(), "off by default");
+        s.chat.dnd.settings.allow_mentions = true;
+        next[0].messages.push(mention_of_you(&rooms[0], "m2"));
+        next[1].messages.push(from_other(&rooms[1], "p2", "plain"));
+        deliver(&mut s, next);
+        let n = shown(&rec);
+        assert_eq!(n.len(), 1);
+        assert!(n[0].mention);
+    }
+
+    #[test]
+    fn a_schedule_holds_back_notifications_only_inside_its_window() {
+        let (mut s, rec, rooms) = live();
+        s.chat.dnd.pinned = true;
+        s.chat.dnd.settings.schedule = Some(crate::chat::DndSchedule {
+            start: 22 * 60,
+            end: 7 * 60,
+        });
+        s.chat.dnd.now = 23 * 60;
+        let a = with(&rooms, 1, vec![from_other(&rooms[1], "n1", "late")]);
+        deliver(&mut s, a.clone());
+        assert!(shown(&rec).is_empty());
+        s.chat.dnd.now = 8 * 60;
+        deliver(
+            &mut s,
+            with(&a, 1, vec![from_other(&rooms[1], "n2", "morning")]),
+        );
+        assert_eq!(shown(&rec).len(), 1);
+    }
+
     #[test]
     fn a_mention_of_you_is_flagged() {
         let (mut s, rec, rooms) = live();

@@ -127,3 +127,10 @@ pub static BACKGROUND: Icon = Icon {
     view: 24.0,
     body: r#"<rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M3 10h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>"#,
 };
+
+/// A crescent moon, for "Do not disturb" (a 16 point grid).
+pub static MOON: Icon = Icon {
+    name: "river-moon",
+    view: 16.0,
+    body: r#"<path d="M13.4 9.6A5.6 5.6 0 0 1 6.4 2.6a5.6 5.6 0 1 0 7 7z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/>"#,
+};

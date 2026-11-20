@@ -52,6 +52,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     dialogs(chat, &k, &mut layer);
     super::identity::export_dialog(chat, &k, &mut layer);
     super::background::background_dialog(chat, &k, &mut layer);
+    super::dnd::dnd_dialog(chat, &k, &mut layer);
     super::node_ui::node_dialog(chat, &k, &mut layer);
     if chat.update.settings_open {
         super::update_view::settings_dialog(&chat.update, &k, &mut layer);
@@ -305,6 +306,33 @@ fn outlined(key: &str, name: &str, glyph: &'static rune::Icon, h: f32, p: &Palet
         .child(label(name.to_owned(), st::ROOM, p.text_secondary))
 }
 
+/// The footer's "Do not disturb" button. While it is on the button says so and takes the
+/// accent colour, so the state is visible without opening anything.
+fn dnd_entry(chat: &Chat, p: &Palette) -> El {
+    let on = chat.dnd.active();
+    let name = if on {
+        "Do not disturb is on"
+    } else {
+        "Do not disturb"
+    };
+    let ink = if on { p.accent } else { p.text_secondary };
+    row()
+        .key("dnd")
+        .role("button")
+        .label(name.to_owned())
+        .w_full()
+        .h(34.0)
+        .gap(8.0)
+        .radius(8.0)
+        .center()
+        .border(1.0, if on { p.accent } else { p.line_strong })
+        .child(icon(&icons::MOON, 15.0).color(ink))
+        .child(label(name.to_owned(), st::ROOM, ink))
+        .hover(p.surface_hover)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut RiverApp| s.chat.open_dnd())
+}
+
 // The room list -------------------------------------------------------------------------------
 
 fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit) -> El {
@@ -378,6 +406,7 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         } else {
             not_yet(import)
         });
+    footer = footer.child(dnd_entry(chat, p));
     if chat.background.is_some() {
         footer = footer.child(
             outlined(

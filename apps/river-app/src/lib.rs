@@ -68,6 +68,9 @@ pub struct RiverApp {
     missed: (String, usize),
     /// What holds notifications back: cooldowns, the per-minute cap, rooms still filling.
     limiter: notify::Limiter,
+    /// Whether do not disturb is kept in this device's preferences. Off in snapshots and tests,
+    /// which must not write the real ones.
+    dnd_persist: bool,
     /// Whether a private room's notification may show the message text. Off unless the
     /// `notification_previews` preference is set (there is no switch for it yet).
     private_previews: bool,
@@ -138,6 +141,7 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
+            dnd_persist: false,
             private_previews: false,
             node_generation: 0,
             pending_save: None,
@@ -177,6 +181,8 @@ impl RiverApp {
             0,
             0,
         );
+        chat.dnd
+            .load(prefs.get(chat::dnd::PREF).unwrap_or_default());
         chat.node.choice = node;
         chat.node.notice = startup.notice;
         chat.node.problem = startup.problem;
@@ -203,6 +209,7 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
+            dnd_persist: true,
             private_previews: prefs.get("notification_previews").unwrap_or(false),
             node_generation: link_generation,
             pending_save: None,
@@ -238,6 +245,7 @@ impl RiverApp {
             UpdateEvent::Status(status) => {
                 if let Some((title, body)) = self.chat.update.apply(status)
                     && !self.focused
+                    && self.dnd_allows(false)
                 {
                     // Not a room's notification: nothing to open when it is clicked.
                     self.notifier.notify(notify::Notification {
@@ -297,6 +305,11 @@ impl RiverApp {
                 u.check_now();
             }
         }
+        // `Prefs` rewrites the whole file from what it loaded, so reload before writing or
+        // another key saved since (do not disturb) would be lost.
+        if self.update_prefs.path().is_some() {
+            self.update_prefs = rune::prefs::Prefs::open("org.freenet.River");
+        }
         let _ = self.update_prefs.set(UPDATE_AUTO_PREF, &auto);
     }
 
@@ -343,9 +356,42 @@ impl RiverApp {
         });
     }
 
-    /// Show what the limits let through.
+    /// Whether do not disturb lets a notification through (`mention`: it is about a message
+    /// that mentions you). Unread counts do not depend on this.
+    fn dnd_allows(&mut self, mention: bool) -> bool {
+        self.refresh_dnd_clock();
+        self.chat.dnd.settings.allows(mention, self.chat.dnd.now)
+    }
+
+    fn refresh_dnd_clock(&mut self) {
+        if !self.chat.dnd.pinned {
+            self.chat.dnd.now = chat::dnd::local_minute();
+        }
+    }
+
+    /// Keep do not disturb in step: the clock it is judged by, the times typed in its dialog,
+    /// the saved copy, and a wake-up while a schedule is set so the indicator changes on time.
+    fn sync_dnd(&mut self, tx: &mut Tx) {
+        self.refresh_dnd_clock();
+        self.chat.dnd.sync_inputs();
+        if let Some(settings) = self.chat.dnd.take_dirty()
+            && self.dnd_persist
+        {
+            let mut prefs = rune::prefs::Prefs::open("org.freenet.River");
+            let _ = prefs.set(chat::dnd::PREF, &settings);
+        }
+        if self.chat.dnd.settings.schedule.is_some() && !self.chat.dnd.pinned {
+            tx.wake_after(std::time::Duration::from_secs(30));
+        }
+    }
+
+    /// Show what the limits let through, minus what do not disturb holds back. What it holds
+    /// back is dropped, not kept for later.
     fn show(&mut self, admitted: Vec<notify::Arrival>, now: std::time::Instant) {
         for (n, from) in notify::compose_from(admitted, self.private_previews) {
+            if !self.dnd_allows(n.mention) {
+                continue;
+            }
             if !self.notifier.notify(n) {
                 self.limiter.refund(from, now);
             }
@@ -385,7 +431,7 @@ impl RiverApp {
                 }
                 self.missed.1 += a.count;
             }
-            if !a.quiet {
+            if !a.quiet && self.dnd_allows(a.mention) {
                 shown.push(a);
             }
         }
@@ -407,6 +453,7 @@ impl RiverApp {
     /// Keep the window title and the notifier's unread count in step with the rooms. Runs at
     /// the start of every frame, so it sees every change however it came about.
     fn sync_unread(&mut self, tx: &mut Tx) {
+        self.sync_dnd(tx);
         if self.chat.apply_reveal(tx) {
             tx.wake_after(std::time::Duration::from_millis(30));
         }
@@ -789,6 +836,23 @@ fn background_scene(s: &mut RiverApp, tray: bool) {
         PreviewBackground { tray },
     )));
     s.chat.open_background();
+}
+
+/// The chat screen with a scheduled do not disturb, at 23:00 (inside the 22:00 to 07:00
+/// window), with its dialog open or, for `closed`, just the room list's indicator.
+fn dnd_scene(s: &mut RiverApp, closed: bool) {
+    identity_scene(s, |_| {});
+    let d = &mut s.chat.dnd;
+    d.pinned = true;
+    d.now = 23 * 60;
+    d.settings.schedule = Some(chat::DndSchedule {
+        start: 22 * 60,
+        end: 7 * 60,
+    });
+    d.settings.allow_mentions = !closed;
+    if !closed {
+        s.chat.open_dnd();
+    }
 }
 
 /// The chat screen for the identity scenes: the example rooms as rooms from the node, so the
@@ -1520,6 +1584,8 @@ pub const SCENES: &[Scene] = &[
         })
     }),
     ("chat-background", |s| background_scene(s, true)),
+    ("chat-dnd", |s| dnd_scene(s, false)),
+    ("chat-dnd-on", |s| dnd_scene(s, true)),
     ("chat-background-no-tray", |s| background_scene(s, false)),
     ("chat-import-id", |s| identity_scene(s, |c| c.open_import())),
     ("chat-import-id-pasted", |s| {
@@ -3250,6 +3316,30 @@ mod tests {
             invitation_secrets: Default::default(),
         };
         (export.to_armored_string(), owner.verifying_key())
+    }
+
+    #[test]
+    fn the_do_not_disturb_entry_opens_its_dialog_and_the_switch_shows_in_the_footer() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| {
+            s.chat.dnd.pinned = true;
+            s.chat.dnd.now = 12 * 60;
+        });
+        settle(&mut rt);
+        assert!(!rt.state.chat.dnd.active());
+        press(&mut rt, "dnd");
+        assert!(rt.find("dnd-dialog").is_some());
+        press(&mut rt, "dnd-switch");
+        assert!(rt.state.chat.dnd.active());
+        press(&mut rt, "dnd-schedule");
+        assert!(rt.find("dnd-start").is_some());
+        press(&mut rt, "dnd-close");
+        assert!(rt.find("dnd-dialog").is_none());
+        assert!(
+            rt.state.chat.dnd.settings.manual,
+            "kept after the dialog closes"
+        );
     }
 
     #[test]
