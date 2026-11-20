@@ -19,9 +19,13 @@
 //!
 //! **An invitation is a bearer credential**: it carries the invitee's signing key and, for a
 //! private room, the room's secrets. It exists in the clear only in the sealed envelope on the
-//! wire and, briefly, in memory while sending or accepting. Here it is never logged, never
-//! printed (nothing in this module derives or writes a `Debug` of one, and the words of every
-//! refusal are fixed ones), never saved, and its byte buffers are wiped when done with.
+//! wire and in memory: while sending (until the message is composed), and while accepting, in the
+//! join task that holds it until the join ends (all its retries and its failed states that can be
+//! tried again, [`super::work`]; the task wipes it when the join finishes, fails for good or is
+//! put away). It is never logged, never printed (nothing in this module derives or writes a
+//! `Debug` of one, and the words of every refusal are fixed ones), never saved, and the buffers
+//! and secrets it was in are wiped when done with. Not covered: copies the allocator freed
+//! while a buffer grew (the CBOR encoding), and the operating system's own paging.
 //!
 //! **What an invitation in a message proves.** Anything sealed to a user's key can be put in a
 //! message by any member, and the envelope has no sender binding, so a member can re-sign a

@@ -656,37 +656,150 @@ fn production(src: &str) -> String {
     }
 }
 
+/// The body of `fn name` in `src`: from its signature to the closing brace at its own indent.
+fn function<'a>(src: &'a str, name: &str) -> &'a str {
+    let from = src
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("no fn {name}"));
+    let rest = &src[from..];
+    let indent = src[..from]
+        .rsplit('\n')
+        .next()
+        .map_or(0, |l| l.len() - l.trim_start().len());
+    let close = format!("\n{}}}\n", " ".repeat(indent));
+    &rest[..rest.find(&close).unwrap_or(rest.len())]
+}
+
+/// `river_core::invitation::Invitation` has a hand-written `Debug` that redacts its room secrets
+/// and prints no key (`SigningKey`'s own `Debug` does not either), so a stray `{:?}` of one would
+/// not print the credential. The scrape below is the second guard: none of the code that holds
+/// an invitation prints anything.
 #[test]
 fn nothing_in_the_invitation_paths_logs_or_prints() {
+    let comments_out = |code: &str| -> String {
+        code.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let banned = [
+        "println!",
+        "eprintln!",
+        "dbg!",
+        "tracing::",
+        " log::",
+        ":?}",
+        "{:#?}",
+    ];
     for (name, src) in [
         ("rooms/dm_invite.rs", include_str!("dm_invite.rs")),
         ("chat/dm_invite.rs", include_str!("../chat/dm_invite.rs")),
         ("chat/dm_picker.rs", include_str!("../chat/dm_picker.rs")),
     ] {
-        let code = production(src);
-        // Comments are allowed to name what is not done.
-        let code: String = code
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for banned in [
-            "println!",
-            "eprintln!",
-            "dbg!",
-            "tracing::",
-            " log::",
-            ":?}",
-            "{:#?}",
-        ] {
-            assert!(!code.contains(banned), "{name} has {banned}");
+        let code = comments_out(&production(src));
+        for b in banned {
+            assert!(!code.contains(b), "{name} has {b}");
         }
     }
-    // The session's invitation handler prints no invitation either: its one line is the existing
-    // sent-text drop notice.
+    // The functions of shared files that hold or move an invitation.
+    for (file, src, names) in [
+        (
+            "rooms/create.rs",
+            include_str!("create.rs"),
+            &["mint_invitation"][..],
+        ),
+        (
+            "rooms/work.rs",
+            include_str!("work.rs"),
+            &["join_invitation", "wipe_credential"][..],
+        ),
+        (
+            "rooms/outbox.rs",
+            include_str!("outbox.rs"),
+            &["send_invite_dm"][..],
+        ),
+        (
+            "rooms/dm_send.rs",
+            include_str!("dm_send.rs"),
+            &["prepare_body", "seal"][..],
+        ),
+    ] {
+        let src = production(src);
+        for name in names {
+            let body = comments_out(function(&src, name));
+            for b in banned {
+                assert!(!body.contains(b), "{file} fn {name} has {b}");
+            }
+        }
+    }
+    // The session's handler has one print: the existing notice about unsaved sent texts.
     let session = production(include_str!("session.rs"));
-    let from = session.find("fn invite_dm").expect("the handler");
-    let handler = &session[from..from + session[from..].find("\n    }\n").unwrap()];
+    let handler = comments_out(function(&session, "invite_dm"));
     assert_eq!(handler.matches("eprintln!").count(), 1);
     assert!(handler.contains("too many sent direct messages"));
+    assert!(!handler.contains(":?}"));
+    // The window's handler of the answers prints nothing either.
+    let lib = production(include_str!("../lib.rs"));
+    let arm = &lib[lib.find("RoomsUpdate::DmInvite {").expect("the handler")..];
+    let arm = comments_out(&arm[..arm.find("RoomsUpdate::Status").unwrap_or(600).min(900)]);
+    for b in banned {
+        assert!(!arm.contains(b), "lib.rs DmInvite handler has {b}");
+    }
+}
+
+// The web UI's literals, as an oracle ----------------------------------------------------------------
+
+/// The summary strings the web UI's own tests pin (`ui/src/components/direct_messages.rs`:
+/// `a_sent_invite_is_recognisable_in_the_senders_own_thread`, `a_sent_invite_summary_stays_one_line`
+/// and `a_multi_line_note_survives_the_round_trip_intact`), copied as literals.
+#[test]
+fn the_summaries_and_their_reading_are_the_web_uis_literals() {
+    use crate::chat::dm_model::DmBody;
+    assert_eq!(summary(None), "[Invitation]");
+    assert_eq!(summary(Some("come say hi")), "[Invitation] come say hi");
+    assert!(!summary(Some("come say hi")).contains('\n'));
+    assert_eq!(
+        summary(Some("Hey!\n\nThing on Friday.")),
+        "[Invitation] Hey!\n\nThing on Friday."
+    );
+    assert_eq!(
+        crate::rooms::dm::sent_body("[Invitation]"),
+        DmBody::SentInvite { note: None }
+    );
+    assert_eq!(
+        crate::rooms::dm::sent_body("[Invitation] come say hi"),
+        DmBody::SentInvite {
+            note: Some("come say hi".into())
+        }
+    );
+    assert_eq!(
+        crate::rooms::dm::sent_body("[Invitation] Hey!\n\nThing on Friday."),
+        DmBody::SentInvite {
+            note: Some("Hey!\n\nThing on Friday.".into())
+        }
+    );
+}
+
+/// `encode_body` of a fixed invitation body, as bytes: `0x80`, then the CBOR of the enum (a map
+/// with the variant's name) holding the room's key (32 bytes), the payload bytes and the note.
+/// Fixed here so a change in river-core's encoding, which the web UI and `riverctl` read, fails.
+#[test]
+fn the_invite_body_has_one_fixed_wire_form() {
+    let body = DirectMessageBody::Invite(Box::new(InvitePayload {
+        room_owner_vk: SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        invitation_payload: vec![1, 2, 3],
+        personal_message: Some("hi".into()),
+    }));
+    // 80 | a1 "Invite" | a3 "room_owner_vk" 5820<key> "invitation_payload" 83 01 02 03 (an array of
+    // integers: how serde writes a `Vec<u8>` here) "personal_message" "hi".
+    let expected = concat!(
+        "80a166496e76697465a36d726f6f6d5f6f776e65725f766b5820",
+        "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+        "72696e7669746174696f6e5f7061796c6f6164830102037",
+        "0706572736f6e616c5f6d657373616765626869",
+    );
+    let bytes = encode_body(&body).unwrap();
+    let got: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(got, expected);
+    assert_eq!(decode_body(&bytes).unwrap(), body);
 }

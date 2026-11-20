@@ -2371,3 +2371,80 @@ mod dm_saves {
         assert_eq!(w.tasks[0].phase, Phase::Read);
     }
 }
+
+// Joining from an invitation already decoded ([`Work::join_invitation`]) -----------------------------
+
+fn an_invitation() -> (Invitation, SigningKey) {
+    let owner_sk = SigningKey::from_bytes(&[62; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let room = LiveRoom::new(stored(&plan.room));
+    let (inv, _) = invitation(&room, "http://x/").unwrap();
+    (inv, owner_sk)
+}
+
+#[test]
+fn join_invitation_says_why_at_once_and_queues_nothing_for_each_refusal() {
+    let mut w = Work::default();
+    // A nickname that can't be used.
+    let (inv, _) = an_invitation();
+    assert!(w.join_invitation(inv, "  ", false, &|_| false).is_err());
+    // A room already in the list.
+    let (inv, _) = an_invitation();
+    let why = w.join_invitation(inv, "Bea", false, &|_| true).unwrap_err();
+    assert!(why.contains("already a member"), "{why}");
+    assert!(
+        w.views().is_empty(),
+        "nothing is shown as failed: the caller says it"
+    );
+    // A join of the room under way.
+    let (inv, _) = an_invitation();
+    w.join_invitation(inv, "Bea", false, &|_| false).unwrap();
+    let (inv, _) = an_invitation();
+    let why = w
+        .join_invitation(inv, "Bea", false, &|_| false)
+        .unwrap_err();
+    assert!(why.contains("already joining"), "{why}");
+    assert_eq!(w.views().len(), 1);
+}
+
+#[test]
+fn only_a_join_names_its_room_so_a_leave_does_not_look_like_one() {
+    let mut w = Work::default();
+    let (inv, _) = an_invitation();
+    let room = inv.room;
+    w.join_invitation(inv, "Bea", false, &|_| false).unwrap();
+    assert_eq!(
+        w.views()[0].room,
+        Some(bs58::encode(room.to_bytes()).into_string())
+    );
+    let mut w = Work::default();
+    assert!(w.leave(room, "Open".into(), None));
+    assert_eq!(w.views()[0].room, None);
+}
+
+#[test]
+fn a_nickname_made_for_the_user_is_cut_to_what_the_room_allows() {
+    use river_core::room_state::configuration::AuthorizedConfigurationV1;
+    for (only_new, failed) in [(true, false), (false, true)] {
+        let mut w = Work::default();
+        let (inv, owner_sk) = an_invitation();
+        let owner = owner_sk.verifying_key();
+        w.join_invitation(inv, "Cipher Daylight \u{e9}\u{e9}\u{e9}", only_new, &|_| {
+            false
+        })
+        .unwrap();
+        next(&mut w);
+        let plan =
+            crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+        let mut state = plan.room.room_state;
+        let mut config = state.configuration.configuration.clone();
+        config.max_nickname_size = 7;
+        state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
+        get_answer(&mut w, crate::rooms::create::contract_key(&owner), &state);
+        let failed_now = w
+            .views()
+            .iter()
+            .any(|v| matches!(v.state, WorkState::Failed { .. }));
+        assert_eq!(failed_now, failed, "only_new = {only_new}");
+    }
+}

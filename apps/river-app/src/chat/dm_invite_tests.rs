@@ -521,3 +521,77 @@ fn a_room_that_is_not_on_offer_cannot_be_picked_and_cancel_forgets_the_note() {
     rt.update(|s, _| assert!(!s.chat.open_invite_picker(ROOM, "12345")));
     rt.update(|s, _| assert!(!s.chat.open_invite_picker("nope", "12345")));
 }
+
+fn work_of(id: u64, room: Option<&str>, state: WorkState) -> WorkView {
+    WorkView {
+        id,
+        what: "Joining a room".into(),
+        room: room.map(str::to_owned),
+        state,
+    }
+}
+
+#[test]
+fn a_running_join_wins_over_an_older_one_that_failed() {
+    let (mut rt, uid) = with_cards(None);
+    rt.update(|s, _| {
+        s.chat.show_work(vec![
+            work_of(
+                1,
+                Some(INVITED),
+                WorkState::Failed {
+                    why: "This room is full.".into(),
+                    retry: false,
+                },
+            ),
+            work_of(2, Some(INVITED), WorkState::Working),
+        ])
+    });
+    assert_eq!(state_of(&rt, &uid), CardState::Accepting);
+    // Only the failed one: nothing to try again, so Accept starts a new join.
+    rt.update(|s, _| {
+        s.chat.show_work(vec![work_of(
+            1,
+            Some(INVITED),
+            WorkState::Failed {
+                why: "This room is full.".into(),
+                retry: false,
+            },
+        )])
+    });
+    assert!(matches!(state_of(&rt, &uid), CardState::Refused(w) if w.contains("full")));
+    rt.frame(0.2);
+    assert!(rt.find(&accept_key()).is_some());
+}
+
+#[test]
+fn work_that_is_not_a_join_of_the_room_does_not_make_the_card_say_joining() {
+    let (mut rt, uid) = with_cards(None);
+    // A leave names no room (the work view carries a room only for a join).
+    rt.update(|s, _| {
+        s.chat.show_work(vec![work_of(
+            3,
+            None,
+            WorkState::Failed {
+                why: "Unsent messages for this room were discarded.".into(),
+                retry: true,
+            },
+        )])
+    });
+    assert_eq!(state_of(&rt, &uid), CardState::New);
+}
+
+#[test]
+fn the_label_is_the_senders_claim_and_says_so_when_it_is_a_room_you_have() {
+    let (mut rt, _) = with_cards(None);
+    assert!(shows(&rt, "Room:"));
+    assert!(!shows(&rt, "Claims to be for:"));
+    let mut rooms = rt.state.chat.rooms().to_vec();
+    let mut have = rooms[0].clone();
+    have.key = INVITED.to_owned();
+    have.name = "Chess Club".to_owned();
+    rooms.push(have);
+    rt.update(move |s, _| s.chat.set_rooms(rooms));
+    rt.frame(0.2);
+    assert!(shows(&rt, "Claims to be for:"));
+}

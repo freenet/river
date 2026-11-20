@@ -433,6 +433,19 @@ pub fn decode_invitation(pasted: &str) -> Result<Invitation, String> {
     }
 }
 
+/// `nickname` cut, on a character boundary, to the longest the room takes. Only for a nickname
+/// made for the user: a typed one is refused when too long, not changed.
+pub fn fit_nickname(nickname: &str, config: &Configuration) -> String {
+    let limit = config
+        .max_nickname_size
+        .min(river_core::room_state::member_info::NICKNAME_CEILING);
+    let mut end = nickname.len().min(limit);
+    while !nickname.is_char_boundary(end) {
+        end -= 1;
+    }
+    nickname[..end].trim_end().to_owned()
+}
+
 /// Why `nickname` can't be used to join, before the room is read.
 pub fn join_refusal(nickname: &str) -> Option<String> {
     if nickname.trim().is_empty() {

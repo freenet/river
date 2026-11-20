@@ -597,7 +597,13 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
         .into_iter()
         .enumerate()
     {
-        let ticket = 20 + 2 * n as u64;
+        let mut tickets = 20 + 10 * n as u64;
+        let mut ticket = || {
+            tickets += 1;
+            tickets
+        };
+        let (send_ticket, missing_ticket, accept_ticket, again_ticket) =
+            (ticket(), ticket(), ticket(), ticket());
         let note = format!("come along to {name}");
         alice.send(
             "",
@@ -618,13 +624,13 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
                 peer: bob_id,
                 target: target.clone(),
                 note: Some(note.clone()),
-                ticket,
+                ticket: send_ticket,
             },
         );
         alice.until("the invitation is queued", |app| {
             app.dm_invite_results
                 .iter()
-                .any(|(t, r)| *t == ticket && r.is_ok())
+                .any(|(t, r)| *t == send_ticket && r.is_ok())
         });
         // A's own card: sent, with the note, nothing pending.
         alice.until("A shows the invitation it sent", |app| {
@@ -663,11 +669,11 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
         let summary = format!("[Invitation] {note}");
         wait_until_saved("A", &alice.authority, &alice.dir, &summary);
         let (texts, _) = stored_sent_texts(&alice.authority, &alice.dir).expect("A's store");
+        let mine: Vec<_> = texts.iter().filter(|t| t.contains(&note)).collect();
         assert!(
-            texts.iter().all(|t| t.starts_with("[Invitation]")),
-            "{texts:?}"
+            !mine.is_empty() && mine.iter().all(|t| **t == summary),
+            "the entries naming the note are exactly the summary: {texts:?}"
         );
-        assert!(texts.iter().all(|t| t.len() < 200), "no payload: {texts:?}");
 
         // An accept naming a message that is not there is refused, and joins nothing.
         let none = river_core::room_state::direct_messages::PurgeToken([7; 16]);
@@ -676,14 +682,14 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
             Action::AcceptInviteDm {
                 peer: alice_id,
                 token: none,
-                ticket: ticket + 100,
+                ticket: missing_ticket,
             },
         );
         bob.until(
             "an accept of a message that is not there is refused",
             |app| {
                 app.dm_invite_results.iter().any(|(t, r)| {
-                    *t == ticket + 100 && r.as_ref().is_err_and(|e| e.contains("no longer"))
+                    *t == missing_ticket && r.as_ref().is_err_and(|e| e.contains("no longer"))
                 })
             },
         );
@@ -696,13 +702,13 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
             Action::AcceptInviteDm {
                 peer: alice_id,
                 token,
-                ticket: ticket + 1,
+                ticket: accept_ticket,
             },
         );
         bob.until("the accept is started", |app| {
             app.dm_invite_results
                 .iter()
-                .any(|(t, r)| *t == ticket + 1 && r.is_ok())
+                .any(|(t, r)| *t == accept_ticket && r.is_ok())
         });
         bob.until(&format!("B joined {name} from the card"), |app| {
             if let Some(t) = app
@@ -717,22 +723,39 @@ fn invitations_in_direct_messages(alice: &mut App, bob: &mut App, room: &str, ke
         alice.until(&format!("A sees B join {name}"), |app| {
             app.room(name).is_some_and(|r| r.members.len() >= 2)
         });
+        // The room works both ways: B is a member with an entry of its own, and what A posts is
+        // read in plaintext by B (in the private room, with the secrets the invitation carried).
+        let hello = format!("Welcome to {name}");
+        alice.send(
+            &target,
+            Action::Send {
+                text: hello.clone(),
+                reply_to: None,
+            },
+        );
+        bob.until(&format!("B reads A's message in {name}"), |app| {
+            app.has_text(name, &hello)
+                && app
+                    .room(name)
+                    .is_some_and(|r| r.members.iter().any(|m| m.id == r.me))
+        });
         // Accepting again: B is a member now.
         bob.send(
             key,
             Action::AcceptInviteDm {
                 peer: alice_id,
                 token,
-                ticket: ticket + 2,
+                ticket: again_ticket,
             },
         );
         bob.until("a second accept is refused", |app| {
             app.dm_invite_results.iter().any(|(t, r)| {
-                *t == ticket + 2 && r.as_ref().is_err_and(|e| e.contains("already a member"))
+                *t == again_ticket && r.as_ref().is_err_and(|e| e.contains("already a member"))
             })
         });
         println!("B: accepted the invitation to {name} from the direct message");
 
+        bob.until("B's join work is done", |app| app.work.is_empty());
         // Both leave the room again, so the steps after this start from the rooms they had.
         let (b_authority, b_dir) = (bob.authority.clone(), bob.dir.clone());
         leave_room(bob, &b_authority, &b_dir, name, &target, Some(room));

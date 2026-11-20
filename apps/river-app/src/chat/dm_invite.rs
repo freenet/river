@@ -134,10 +134,21 @@ impl Chat {
             JoinPreview::Have { name, .. } => return CardState::Have { name },
             _ => {}
         }
-        // A join of this room under way or failed, started from here or from anywhere (the join
-        // dialog, another card): the room is one, so its card says so.
-        // A join that finished and whose room is not in the list yet is still the join.
-        if let Some(w) = self.work.iter().find(|w| w.room.as_deref() == Some(target)) {
+        // A join of this room under way, finished (its room not in the list yet) or failed,
+        // started from here or from anywhere (the join dialog, another card): the room is one,
+        // so its card says so. An active join wins over an older one that failed.
+        let joins: Vec<_> = self
+            .work
+            .iter()
+            .filter(|w| w.room.as_deref() == Some(target))
+            .collect();
+        if joins
+            .iter()
+            .any(|w| !matches!(w.state, WorkState::Failed { .. }))
+        {
+            return CardState::Accepting;
+        }
+        if let Some(w) = joins.last() {
             return match &w.state {
                 // A join that failed with nothing to try again is over: Accept starts a new one.
                 WorkState::Failed { why, retry: false } => CardState::Refused(why.clone()),
@@ -304,10 +315,21 @@ pub(super) fn card(
                 .child(label(title.to_owned(), st::NAME, p.text)),
         );
     if let Some(room) = room_label {
+        // The label is the sender's claim: when it is the name of a room the user has, the
+        // card says it only claims to be for that room, so a deceptive one cannot pass as it.
+        let claimed = received.is_some_and(|(_, t)| chat.rooms().iter().any(|r| r.key == t));
         c = c.child(
             row()
                 .gap(6.0)
-                .child(label("Room:", st::SMALL, p.text_muted))
+                .child(label(
+                    if claimed {
+                        "Claims to be for:"
+                    } else {
+                        "Room:"
+                    },
+                    st::SMALL,
+                    p.text_muted,
+                ))
                 .child(
                     label(room.to_owned(), st::SMALL_STRONG, p.text)
                         .key(format!("dm-invite-room-{key}"))
