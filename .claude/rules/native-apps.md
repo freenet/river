@@ -45,11 +45,14 @@ The chat screen (`src/chat/`) shows the rooms. Snapshots and tests use built-in 
 | Write | Where | Guard |
 |---|---|---|
 | Messages, replies, edits and deletions of own messages, reactions | Room contract UPDATE, built and signed as the web UI does | `src/rooms/outbox.rs` |
+| Direct messages (text), each an UPDATE of the room contract, composed and signed once with the room's `self_sk` and sent as raw UTF-8 like the web UI | `src/rooms/dm_send.rs`, `src/rooms/outbox.rs` |
 | A room it creates | Seed PUT under that room's own contract (its only PUT) | `src/rooms/create.rs` |
 | Joining from an invitation | UPDATE (the web UI PUTs instead) | `src/rooms/work.rs` |
 | New or joined room | Chat delegate, by the web UI's generation compare-and-swap (`GetVersionedRequest`, then `CasStoreRequest`, re-read on conflict). Only ADDS a room where the key holds nothing, or a tombstone when joining | `river_core::stored_rooms` |
 | `rooms_meta` | Chat delegate, changing only the open room | `river_core::stored_rooms` |
 | Each room's signing key (`self_sk`) | Delegate `signing_key:` namespace, only when the delegate holds none. Never replaces a key. Lowest priority, one request at a time, backed off on failure | `src/rooms/keys.rs` |
+
+Direct messages are addressed by the recipient's FULL member id (`MemberId`, 64 bits), never by `MemberId`'s `Display` form, which is a 40-bit label a member can grind to match another's. A sent DM cannot be read back by its sender (it is sealed to the recipient), so the sent text must be saved to the delegate's `outbound_dms` key; until that change lands the text is kept in memory only and is lost on restart. **Sending DMs must not ship in a release without that save.**
 
 Those are its only writes to the chat delegate, which the web UI writes at the same time. The `stored_rooms_drift` tests in `ui/src/room_data.rs` pin the bytes it stores to the web UI's types.
 

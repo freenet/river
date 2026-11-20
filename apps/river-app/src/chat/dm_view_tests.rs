@@ -10,7 +10,7 @@ use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
 use rune::{Env, Key, KeyEvent, Runtime};
 
 use super::dm_model::{DmBody, DmSnapshot, DmThread, Placeholder};
-use super::dm_view::{DmUi, LOADING_SENT, NO_SEND, TRUNCATED};
+use super::dm_view::{DmUi, LOADING_SENT, TRUNCATED};
 use crate::rooms::dm::{self, Source};
 use crate::rooms::dm_cache::OutboundCache;
 use crate::{RiverApp, Setup, WINDOW_SIZE, view};
@@ -117,8 +117,8 @@ fn empty_rooms() -> DmSnapshot {
     }
 }
 
-fn peer_uid() -> String {
-    id(PEER).to_string()
+fn peer_key() -> String {
+    dm::peer_key(id(PEER))
 }
 
 fn app() -> Runtime<RiverApp> {
@@ -197,7 +197,7 @@ fn keys_with(rt: &Runtime<RiverApp>, prefix: &str) -> Vec<String> {
 }
 
 fn row_key() -> String {
-    format!("dm-{ROOM}-{}", peer_uid())
+    format!("dm-{ROOM}-{}", peer_key())
 }
 
 /// A room with a conversation: the peer writes first and last, the user answers between.
@@ -252,8 +252,8 @@ fn the_rail_lists_the_thread_and_a_press_opens_it_in_the_main_pane() {
     assert!(a < b && b < c, "{a} {b} {c}");
     assert!(!shows(&rt, "**bold**"));
     assert!(shows(&rt, "You"));
-    // Nothing to type into yet, and it says so.
-    assert!(shows(&rt, NO_SEND));
+    // A box of its own to write in, not the room's composer.
+    assert!(rt.find("dm-composer-field").is_some());
     assert!(rt.find("composer").is_none());
 }
 
@@ -327,7 +327,7 @@ fn the_message_button_opens_an_empty_thread_for_a_member_with_no_history() {
     assert!(rt.find("dm-thread").is_some());
     assert!(shows(&rt, "Jonas"));
     assert!(shows(&rt, "No messages yet"));
-    assert!(shows(&rt, NO_SEND));
+    assert!(rt.find("dm-composer-field").is_some());
     // The user is not a person to message.
     let me = rt.state.chat.room().unwrap().me;
     assert!(!rt.state.chat.open_dm(ROOM, "nobody"));
@@ -339,8 +339,8 @@ fn the_message_button_opens_an_empty_thread_for_a_member_with_no_history() {
         .unwrap()
         .member(me)
         .unwrap()
-        .uid
-        .clone();
+        .full_id
+        .to_string();
     assert!(!rt.state.chat.open_dm(&own, &my_uid));
 }
 
@@ -374,7 +374,7 @@ fn a_thread_is_read_only_when_open_in_front_and_at_its_newest_message() {
     // Not open: nothing is read, in front or not.
     assert!(!ui.mark_read(true));
     ui.at_bottom = true;
-    ui.open = Some((ROOM.to_owned(), peer_uid()));
+    ui.open = Some((ROOM.to_owned(), peer_key()));
     // Open but the window is away.
     assert!(!ui.mark_read(false));
     assert_eq!(ui.unread_total(), unread);
@@ -420,7 +420,7 @@ fn a_thread_covering_the_room_does_not_mark_the_room_read() {
     let mut rooms = chat.rooms().to_vec();
     chat.show_node_rooms(rooms.clone(), None, super::LinkStatus::Live, 29_000_000);
     chat.apply_dms(conversation().snapshot(true));
-    assert!(chat.open_dm(&key, &peer_uid()));
+    assert!(chat.open_dm(&key, &peer_key()));
     // A message arrives in the covered room.
     let last = rooms
         .iter_mut()
@@ -467,10 +467,10 @@ fn the_rail_orders_unread_first_then_newest_and_is_not_rebuilt_per_frame() {
         .into_iter()
         .map(|(_, p)| p.to_owned())
         .collect();
-    assert_eq!(order, [id(OWNER).to_string(), peer_uid()]);
+    assert_eq!(order, [dm::peer_key(id(OWNER)), peer_key()]);
     // Reading the newer one puts the other first, as it is the one still unread.
     rt.update(|s, _| {
-        s.chat.open_dm(ROOM, &id(OWNER).to_string());
+        s.chat.open_dm(ROOM, &dm::peer_key(id(OWNER)));
         s.chat.dm.at_bottom = true;
         s.chat.dm_sync(true);
     });
@@ -482,7 +482,7 @@ fn the_rail_orders_unread_first_then_newest_and_is_not_rebuilt_per_frame() {
         .into_iter()
         .map(|(_, p)| p.to_owned())
         .collect();
-    assert_eq!(order, [peer_uid(), id(OWNER).to_string()]);
+    assert_eq!(order, [peer_key(), dm::peer_key(id(OWNER))]);
     // Frames build nothing: the rows are made when the data changes.
     let before = rt.state.chat.dm.rebuilds();
     for i in 0..10 {
@@ -547,7 +547,7 @@ fn a_rail_preview_is_one_bounded_plain_line() {
     let thread = |body: DmBody, outgoing: bool| DmThread {
         room: ROOM.into(),
         room_name: "Town Square".into(),
-        peer_uid: "7".into(),
+        peer_key: "7".into(),
         peer: id(PEER),
         peer_name: "Priya".into(),
         peer_is_member: true,
@@ -556,6 +556,7 @@ fn a_rail_preview_is_one_bounded_plain_line() {
             outgoing,
             timestamp: T0,
             body,
+            pending: None,
         }],
         last_ts: T0,
         last_inbound_ts: T0,
@@ -635,18 +636,32 @@ fn the_direct_message_view_neither_logs_nor_feeds_titles_notifications_or_status
             .collect::<Vec<_>>()
             .join("\n")
     }
-    let view = code(&read("chat/dm_view.rs"));
+    for file in ["chat/dm_view.rs", "chat/dm_compose.rs"] {
+        let view = code(&read(file));
+        for banned in [
+            "println!",
+            "eprintln!",
+            "dbg!",
+            "tracing::",
+            "log::",
+            "{:?}",
+            "{p:?}",
+            "{m:?}",
+        ] {
+            assert!(!view.contains(banned), "{file} uses {banned}");
+        }
+    }
+    // The composer never touches a delegate or signs: it only hands a command to the work.
+    let compose = code(&read("chat/dm_compose.rs"));
     for banned in [
-        "println!",
-        "eprintln!",
-        "dbg!",
-        "tracing::",
-        "log::",
-        "{:?}",
-        "{p:?}",
-        "{m:?}",
+        "ClientRequest",
+        "StoreRequest",
+        "SigningKey",
+        "compose_direct_message",
+        "rooms::delegate",
+        "rooms::socket",
     ] {
-        assert!(!view.contains(banned), "dm_view.rs uses {banned}");
+        assert!(!compose.contains(banned), "dm_compose.rs uses {banned}");
     }
     // What can leave the window with a thread's words in it. (`dm.is_open()` is a flag, not a
     // thread, and may be read.)
@@ -750,7 +765,7 @@ fn what_is_unread_does_not_depend_on_what_the_sender_signed() {
     f.compose(PEER, ME, T0, b"old");
     ui.apply(f.snapshot(true));
     assert_eq!(ui.unread_total(), 0);
-    ui.open = Some((ROOM.to_owned(), peer_uid()));
+    ui.open = Some((ROOM.to_owned(), peer_key()));
     ui.at_bottom = true;
     // A forged far-future message is unread, and reading it does not hide later ones.
     f.compose(PEER, ME, u64::MAX, b"forged future");
@@ -918,7 +933,7 @@ fn opening_a_thread_clears_what_belonged_to_the_room_s_screen() {
         s.chat.deputy_confirm = Some(("x".into(), true));
     });
     rt.update(|s, _| {
-        assert!(s.chat.open_dm(ROOM, &peer_uid()));
+        assert!(s.chat.open_dm(ROOM, &peer_key()));
         assert!(s.chat.deputy_confirm.is_none() && s.chat.details.is_none());
     });
     rt.frame(0.1);
@@ -1057,7 +1072,7 @@ fn the_seen_sets_are_cut_to_present_threads_and_an_empty_snapshot_keeps_them() {
 /// Open the thread as a shortcut does (a click on the rail would itself take the keyboard from
 /// the composer before the thread opened).
 fn open(rt: &mut Runtime<RiverApp>) {
-    rt.update(|s, _| assert!(s.chat.open_dm(ROOM, &peer_uid())));
+    rt.update(|s, _| assert!(s.chat.open_dm(ROOM, &peer_key())));
     rt.frame(0.1);
 }
 
@@ -1124,4 +1139,1061 @@ fn the_composer_gets_the_keyboard_back_when_a_thread_closes() {
     open(&mut rt);
     rt.update(|s, _| s.chat.start_edit("anything"));
     assert!(!rt.state.chat.composer.focused);
+}
+
+// Sending ----------------------------------------------------------------------------------------
+
+mod sending {
+    use rune::{Key, KeyEvent, Mods, Runtime};
+
+    use super::super::dm_model::{DmBody, DmMessage, DmSnapshot, DmThread};
+    use super::super::model::Pending;
+    use super::super::{LinkStatus, Mode, Source};
+    use super::{T0, app, esc, give, id, press, shows, texts};
+    use crate::RiverApp;
+    use crate::rooms::outbox::Action;
+
+    const ROOM: &str = "town-square";
+
+    fn type_text(rt: &mut Runtime<RiverApp>, text: &str) {
+        rt.key(KeyEvent {
+            key: Key::Text(text.into()),
+            mods: Mods::default(),
+        });
+        rt.frame(0.3);
+    }
+
+    fn enter(rt: &mut Runtime<RiverApp>, shift: bool) {
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods {
+                shift,
+                ..Mods::default()
+            },
+        });
+        rt.frame(0.3);
+    }
+
+    /// The example room's members other than the user, by nickname.
+    fn uid_of(rt: &Runtime<RiverApp>, name: &str) -> String {
+        rt.state
+            .chat
+            .room()
+            .unwrap()
+            .members
+            .iter()
+            .find(|m| m.nickname == name)
+            .unwrap()
+            .full_id
+            .to_string()
+    }
+
+    /// The app reading rooms from a node, with the thread with `name` open and its box focused.
+    fn open_with(name: &str) -> (Runtime<RiverApp>, String) {
+        let mut rt = app();
+        rt.update(|s, _| s.chat.source = Source::Node(LinkStatus::Live));
+        let uid = uid_of(&rt, name);
+        let room = rt.state.chat.room().unwrap().key.clone();
+        {
+            let uid = uid.clone();
+            rt.update(move |s, _| assert!(s.chat.open_dm(&room, &uid)));
+        }
+        rt.frame(0.1);
+        rt.frame(0.2);
+        (rt, uid)
+    }
+
+    fn sent(rt: &Runtime<RiverApp>) -> Vec<(String, Action)> {
+        rt.state
+            .chat
+            .queued_commands()
+            .iter()
+            .map(|c| (c.room.clone(), c.action.clone()))
+            .collect()
+    }
+
+    fn the_box(rt: &Runtime<RiverApp>, room: &str, peer: &str) -> String {
+        rt.state
+            .chat
+            .dm
+            .compose
+            .draft(room, peer)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test]
+    fn the_box_sends_on_enter_keeps_its_text_until_the_answer_and_clears_on_success() {
+        let (mut rt, uid) = open_with("Jonas");
+        assert!(rt.find("dm-composer-field").is_some());
+        assert!(rt.state.chat.dm.compose_edit_focused());
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, "  Hello Jonas  ");
+        assert_eq!(the_box(&rt, ROOM, &uid), "  Hello Jonas  ");
+        assert!(sent(&rt).is_empty());
+        enter(&mut rt, false);
+
+        // One command, with the trimmed text and the thread's room and peer. Nothing went to the
+        // room's own send.
+        let commands = sent(&rt);
+        assert_eq!(commands.len(), 1);
+        let (room, action) = commands[0].clone();
+        assert_eq!(room, ROOM);
+        let Action::SendDm { peer, text, ticket } = action else {
+            panic!("a direct message, not {action:?}")
+        };
+        assert_eq!(
+            (crate::rooms::dm::peer_key(peer).as_str(), text.as_str()),
+            (uid.as_str(), "  Hello Jonas  ")
+        );
+        // The text stays in the box while the answer is awaited, and a second Enter sends
+        // nothing more.
+        assert_eq!(the_box(&rt, ROOM, &uid), "  Hello Jonas  ");
+        assert!(rt.find("dm-sending").is_some());
+        enter(&mut rt, false);
+        assert_eq!(sent(&rt).len(), 1);
+        // An answer to another send is not this one's.
+        rt.update(|s, _| {
+            s.chat.dm_sent(ROOM, "x", 999, Ok(()));
+        });
+        assert_eq!(the_box(&rt, ROOM, &uid), "  Hello Jonas  ");
+
+        let peer = crate::rooms::dm::peer_key(peer);
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &peer, ticket, Ok(()));
+        });
+        rt.frame(0.2);
+        assert_eq!(the_box(&rt, ROOM, &uid), "");
+        assert!(rt.find("dm-sending").is_none());
+        assert!(rt.state.chat.dm.compose.refusal_for(ROOM, &uid).is_none());
+    }
+
+    #[test]
+    fn a_refused_send_keeps_the_text_and_says_why_and_it_can_be_sent_again() {
+        let (mut rt, uid) = open_with("Jonas");
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, "keep this");
+        enter(&mut rt, false);
+        let Action::SendDm { peer, ticket, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        let why = "That person is not a member of this room now.".to_owned();
+        let peer = crate::rooms::dm::peer_key(peer);
+        {
+            let (peer, why) = (peer.clone(), why.clone());
+            rt.update(move |s, _| {
+                s.chat.dm_sent(ROOM, &peer, ticket, Err(why));
+            });
+        }
+        rt.frame(0.2);
+        assert_eq!(the_box(&rt, ROOM, &uid), "keep this");
+        assert!(shows(&rt, &why), "the reason is on screen");
+        assert!(rt.find("dm-error").is_some());
+        // Sending again clears the old reason and sends with a new ticket.
+        enter(&mut rt, false);
+        let commands = sent(&rt);
+        assert_eq!(commands.len(), 2);
+        let Action::SendDm { ticket: again, .. } = commands[1].1.clone() else {
+            panic!()
+        };
+        assert_ne!(again, ticket);
+        assert!(rt.find("dm-error").is_none());
+        // The reason belongs to its thread: another thread does not show it.
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &peer, again, Err("again".into()));
+        });
+        rt.frame(0.2);
+        assert!(rt.find("dm-error").is_some());
+        let other = {
+            let r = rt.state.chat.room().unwrap();
+            r.members
+                .iter()
+                .find(|m| m.id != r.me && m.full_id.to_string() != uid)
+                .unwrap()
+                .full_id
+                .to_string()
+        };
+        rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &other)));
+        rt.frame(0.2);
+        assert!(rt.find("dm-error").is_none());
+    }
+
+    #[test]
+    fn shift_enter_adds_a_line_and_blank_text_sends_nothing() {
+        let (mut rt, uid) = open_with("Jonas");
+        press(&mut rt, "dm-composer-field");
+        enter(&mut rt, false);
+        type_text(&mut rt, "   ");
+        enter(&mut rt, false);
+        assert!(sent(&rt).is_empty(), "nothing to say");
+        rt.update(|s, _| s.chat.dm.compose_edit().replace_text(""));
+        type_text(&mut rt, "one");
+        enter(&mut rt, true);
+        type_text(&mut rt, "two");
+        assert_eq!(the_box(&rt, ROOM, &uid), "one\ntwo");
+        assert!(sent(&rt).is_empty());
+        enter(&mut rt, false);
+        let Action::SendDm { text, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        assert_eq!(text, "one\ntwo");
+    }
+
+    #[test]
+    fn the_cap_is_counted_in_bytes_and_blocks_the_send_with_its_reason() {
+        let (mut rt, uid) = open_with("Jonas");
+        let cap = crate::rooms::dm_send::BODY_CAP;
+        press(&mut rt, "dm-composer-field");
+        // Under the cap but near it: a counter, no complaint.
+        rt.update(move |s, _| s.chat.dm.compose_edit().replace_text("a".repeat(cap - 5)));
+        rt.frame(0.2);
+        assert!(shows(&rt, &format!("{}/{cap}", cap - 5)));
+        assert!(!rt.state.chat.dm_over_limit());
+        // A character of three bytes pushes it over: counted in bytes, not characters.
+        rt.update(move |s, _| {
+            s.chat
+                .dm
+                .compose_edit()
+                .replace_text(format!("{}\u{20ac}\u{20ac}", "a".repeat(cap - 5)))
+        });
+        rt.frame(0.2);
+        assert!(rt.state.chat.dm_over_limit());
+        assert!(shows(&rt, "Message too long"));
+        enter(&mut rt, false);
+        assert!(sent(&rt).is_empty(), "too long is not sent");
+        assert!(!the_box(&rt, ROOM, &uid).is_empty(), "and the text stays");
+        // Exactly the cap is sent.
+        rt.update(move |s, _| s.chat.dm.compose_edit().replace_text("a".repeat(cap)));
+        enter(&mut rt, false);
+        assert_eq!(sent(&rt).len(), 1);
+    }
+
+    #[test]
+    fn a_room_that_does_not_let_you_send_gives_a_box_that_cannot_and_says_why() {
+        for block in [
+            "This computer doesn't hold your key for this room, so you can't send messages here.",
+            crate::rooms::generation::UPDATE_REQUIRED_SEND,
+        ] {
+            let (mut rt, uid) = open_with("Jonas");
+            let mut rooms = rt.state.chat.rooms().to_vec();
+            for r in &mut rooms {
+                r.send_block = Some(block.into());
+            }
+            rt.update(move |s, _| s.chat.set_rooms(rooms));
+            rt.frame(0.2);
+            assert!(rt.find("dm-thread").is_some(), "the thread is still there");
+            assert!(shows(&rt, block));
+            assert!(rt.find("dm-block").is_some());
+            rt.update(|s, _| s.chat.dm.compose_edit().replace_text("hello"));
+            assert!(!rt.state.chat.dm_send(), "nothing is sent");
+            enter(&mut rt, false);
+            assert!(sent(&rt).is_empty());
+            assert_eq!(the_box(&rt, ROOM, &uid), "hello", "and the text stays");
+        }
+    }
+
+    #[test]
+    fn the_message_button_still_opens_the_thread_where_the_room_does_not_let_you_send() {
+        let mut rt = app();
+        rt.update(|s, _| s.chat.source = Source::Node(LinkStatus::Live));
+        let uid = uid_of(&rt, "Jonas");
+        let id = rt
+            .state
+            .chat
+            .room()
+            .unwrap()
+            .member_by_peer_key(&uid)
+            .unwrap()
+            .id;
+        let mut rooms = rt.state.chat.rooms().to_vec();
+        for r in &mut rooms {
+            r.send_block = Some("A newer version of River is out.".into());
+        }
+        rt.update(move |s, _| s.chat.set_rooms(rooms));
+        rt.frame(0.2);
+        press(&mut rt, &format!("member-{id}"));
+        let button = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("member-dm"))
+            .expect("the Message button");
+        assert!(button.opacity > 0.9, "not dimmed");
+        press(&mut rt, "member-dm");
+        // The thread opens to be read; the composer is what refuses.
+        assert!(rt.find("dm-thread").is_some());
+        assert!(rt.find("dm-block").is_some());
+        rt.update(|s, _| s.chat.dm_write("kept"));
+        assert!(!rt.state.chat.dm_send());
+        assert!(sent(&rt).is_empty());
+        assert_eq!(the_box(&rt, ROOM, &uid), "kept");
+    }
+
+    /// Two members with the same label (`uid`, the first 40 bits of the id) and different full
+    /// ids, as a member who ground a key to imitate another would make. The test builds them by
+    /// giving two members one label.
+    fn with_twin_labels(rt: &mut Runtime<RiverApp>) -> (String, String) {
+        let mut rooms = rt.state.chat.rooms().to_vec();
+        let room = rooms.iter_mut().find(|r| r.key == ROOM).unwrap();
+        let (a, b) = (
+            room.members
+                .iter()
+                .position(|m| m.nickname == "Jonas")
+                .unwrap(),
+            room.members
+                .iter()
+                .position(|m| m.nickname == "Priya Raman")
+                .unwrap(),
+        );
+        room.members[b].uid = room.members[a].uid.clone();
+        let keys = (
+            room.members[a].full_id.to_string(),
+            room.members[b].full_id.to_string(),
+        );
+        assert_ne!(keys.0, keys.1);
+        rt.update(move |s, _| s.chat.set_rooms(rooms));
+        rt.frame(0.2);
+        keys
+    }
+
+    #[test]
+    fn members_with_one_label_have_their_own_threads_and_dialogs() {
+        let mut rt = app();
+        rt.update(|s, _| s.chat.source = Source::Node(LinkStatus::Live));
+        let (a, b) = with_twin_labels(&mut rt);
+        // Their threads are two, whatever their label: each opens with its own messages and
+        // sends to its own full id.
+        let thread = |key: &str, text: &str| DmThread {
+            room: ROOM.into(),
+            room_name: "Town Square".into(),
+            peer_key: key.to_owned(),
+            peer: crate::rooms::dm::peer_from_key(key).unwrap(),
+            peer_name: "Same Name".into(),
+            peer_is_member: true,
+            messages: vec![DmMessage {
+                key: format!("m-{key}"),
+                outgoing: false,
+                timestamp: T0,
+                body: DmBody::Text(text.into()),
+                pending: None,
+            }],
+            last_ts: T0,
+            last_inbound_ts: T0,
+        };
+        give(
+            &mut rt,
+            DmSnapshot {
+                threads: vec![
+                    thread(&a, "for the first").into(),
+                    thread(&b, "for the second").into(),
+                ],
+                room_keys: vec![ROOM.to_owned()],
+                hydrated: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(rt.state.chat.dm.rail_order().len(), 2, "not merged");
+        // Two rows with one name are told apart by a slice of the full id.
+        assert!(
+            shows(&rt, "Same Name ("),
+            "the rail suffixes the shared name"
+        );
+        let rows = texts(&rt)
+            .iter()
+            .filter(|t| t.starts_with("Same Name ("))
+            .count();
+        assert_eq!(rows, 2);
+        for (key, text, other) in [
+            (&a, "for the first", "for the second"),
+            (&b, "for the second", "for the first"),
+        ] {
+            let k = key.clone();
+            rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &k)));
+            rt.frame(0.2);
+            assert!(shows(&rt, text));
+            assert!(
+                !rt.state
+                    .chat
+                    .dm_block()
+                    .is_some_and(|w| w.contains("not a member"))
+            );
+            rt.update(|s, _| s.chat.dm_write("hello"));
+            assert!(rt.state.chat.dm_send());
+            let Action::SendDm { peer, .. } = sent(&rt).last().unwrap().1.clone() else {
+                panic!()
+            };
+            assert_eq!(
+                crate::rooms::dm::peer_key(peer),
+                *key,
+                "to the intended full id"
+            );
+            // (the pane lists the other thread's text only in the rail's preview)
+            let _ = other;
+            rt.update(|s, _| s.chat.close_dm());
+            rt.frame(0.2);
+            rt.frame(0.6);
+        }
+        // Each twin has their own dialog, found by full id, and its Message button goes to that
+        // twin: the second one's dialog shows the second one, whatever the label is shared with.
+        for (full, name) in [(&a, "Jonas"), (&b, "Priya Raman"), (&a, "Jonas")] {
+            let id = rt
+                .state
+                .chat
+                .room()
+                .unwrap()
+                .member_by_peer_key(full)
+                .unwrap()
+                .id;
+            press(&mut rt, &format!("member-{id}"));
+            assert_eq!(
+                rt.state.chat.member_modal_full,
+                Some(full.parse::<i64>().unwrap())
+            );
+            let dialog = rt.find("member-info-dialog").expect("the dialog");
+            let _ = dialog;
+            assert!(shows(&rt, name), "the dialog shows {name}");
+            let button = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("member-dm"))
+                .expect("the Message button");
+            assert!(button.opacity > 0.9, "enabled for {name}");
+            // The label is shared, and the dialog says so; moderation is not offered for it.
+            assert!(rt.find("member-dm-ambiguous").is_some());
+            assert!(rt.find("member-ban").is_none());
+            press(&mut rt, "member-dm");
+            assert_eq!(
+                rt.state.chat.dm.open_key(),
+                Some((ROOM, full.as_str())),
+                "the message goes to {name}"
+            );
+            rt.update(|s, _| s.chat.close_dm());
+            rt.frame(0.2);
+            rt.frame(0.6);
+        }
+    }
+
+    #[test]
+    fn each_thread_keeps_its_draft_and_the_rooms_own_composer_is_never_touched() {
+        let mut rt = app();
+        rt.update(|s, _| s.chat.source = Source::Node(LinkStatus::Live));
+        // A reply started in the room, with text, before any thread is opened.
+        let target = rt.state.chat.room().unwrap().messages[0].key.clone();
+        {
+            let target = target.clone();
+            rt.update(move |s, _| {
+                s.chat.start_reply(&target);
+                s.chat.composer.replace_text("the room's reply");
+            });
+        }
+        let (jonas, maya) = (uid_of(&rt, "Jonas"), uid_of(&rt, "Priya Raman"));
+        let open = |rt: &mut Runtime<RiverApp>, uid: &str| {
+            let uid = uid.to_owned();
+            rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &uid)));
+            rt.frame(0.2);
+        };
+        open(&mut rt, &jonas);
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, "to Jonas");
+        open(&mut rt, &maya);
+        assert_eq!(
+            the_box(&rt, ROOM, &jonas),
+            "to Jonas",
+            "kept in the other thread"
+        );
+        assert_eq!(the_box(&rt, ROOM, &maya), "");
+        type_text(&mut rt, "to Maya");
+        open(&mut rt, &jonas);
+        assert_eq!(the_box(&rt, ROOM, &jonas), "to Jonas");
+        assert_eq!(the_box(&rt, ROOM, &maya), "to Maya");
+        enter(&mut rt, false);
+        // The direct message went as one, to Jonas; the room's reply is exactly as it was.
+        let commands = sent(&rt);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(&commands[0].1, Action::SendDm { peer, text, .. }
+            if crate::rooms::dm::peer_key(*peer) == jonas && text == "to Jonas"));
+        assert_eq!(rt.state.chat.composer.text, "the room's reply");
+        assert!(matches!(&rt.state.chat.mode, Mode::Reply(t) if *t == target));
+        // Closing the thread keeps the drafts, and the room is as it was.
+        press(&mut rt, "dm-back");
+        assert_eq!(rt.state.chat.composer.text, "the room's reply");
+        assert!(matches!(&rt.state.chat.mode, Mode::Reply(t) if *t == target));
+        assert_eq!(the_box(&rt, ROOM, &maya), "to Maya");
+        // Sending in the room sends the reply, not a direct message.
+        press(&mut rt, "composer-field");
+        assert!(rt.state.chat.send());
+        let commands = sent(&rt);
+        assert!(matches!(
+            &commands[1].1,
+            Action::Send { text, reply_to: Some(t) } if text == "the room's reply" && *t == target
+        ));
+        // A draft that holds nothing is not kept.
+        open(&mut rt, &jonas);
+        rt.update(|s, _| s.chat.dm.compose_edit().clear());
+        press(&mut rt, "dm-back");
+        assert!(rt.state.chat.dm.compose.draft(ROOM, &jonas).is_none());
+    }
+
+    fn pending_thread(rt: &mut Runtime<RiverApp>, uid: &str, p: Option<Pending>, text: &str) {
+        let me_thread = DmThread {
+            room: ROOM.into(),
+            room_name: "Town Square".into(),
+            peer_key: uid.to_owned(),
+            peer: id(3),
+            peer_name: "Jonas".into(),
+            peer_is_member: true,
+            messages: vec![DmMessage {
+                key: "tok".into(),
+                outgoing: true,
+                timestamp: T0,
+                body: DmBody::Text(text.into()),
+                pending: p,
+            }],
+            last_ts: T0,
+            last_inbound_ts: 0,
+        };
+        let snapshot = DmSnapshot {
+            threads: vec![me_thread.into()],
+            room_keys: vec![ROOM.to_owned()],
+            hydrated: true,
+            ..Default::default()
+        };
+        give(rt, snapshot);
+    }
+
+    #[test]
+    fn a_message_on_its_way_says_so_and_a_failed_one_offers_retry_and_discard() {
+        let (mut rt, uid) = open_with("Jonas");
+        pending_thread(
+            &mut rt,
+            &uid,
+            Some(Pending {
+                entry: 4,
+                failed: None,
+                retry: false,
+            }),
+            "on its way",
+        );
+        assert!(shows(&rt, "on its way"));
+        assert!(shows(&rt, "Sending\u{2026}"));
+        assert!(rt.find("dm-retry-4").is_none());
+
+        pending_thread(
+            &mut rt,
+            &uid,
+            Some(Pending {
+                entry: 4,
+                failed: Some("Freenet refused it: no".into()),
+                retry: true,
+            }),
+            "on its way",
+        );
+        assert!(shows(&rt, "Not sent. Freenet refused it: no"));
+        press(&mut rt, "dm-retry-4");
+        press(&mut rt, "dm-discard-4");
+        let commands = sent(&rt);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], (ROOM.to_owned(), Action::Retry { entry: 4 }));
+        assert_eq!(commands[1], (ROOM.to_owned(), Action::Discard { entry: 4 }));
+
+        // One that cannot be retried offers only Discard, and says what became of it.
+        pending_thread(
+            &mut rt,
+            &uid,
+            Some(Pending {
+                entry: 5,
+                failed: Some("Freenet took it, but the room here doesn't show it.".into()),
+                retry: false,
+            }),
+            "on its way",
+        );
+        assert!(rt.find("dm-retry-5").is_none());
+        assert!(rt.find("dm-discard-5").is_some());
+        // Once the room holds it, no state is shown.
+        pending_thread(&mut rt, &uid, None, "on its way");
+        assert!(!shows(&rt, "Sending"));
+        assert!(rt.find("dm-not-sent").is_none());
+    }
+
+    #[test]
+    fn an_answer_only_empties_a_box_that_still_holds_exactly_what_was_sent() {
+        let (mut rt, uid) = open_with("Jonas");
+        let answer = |rt: &mut Runtime<RiverApp>, ticket: u64, result: Result<(), String>| {
+            let uid = uid.clone();
+            rt.update(move |s, _| {
+                s.chat.dm_sent(ROOM, &uid, ticket, result);
+            });
+        };
+        let ticket = |rt: &Runtime<RiverApp>, n: usize| {
+            let Action::SendDm { ticket, .. } = sent(rt)[n].1.clone() else {
+                panic!()
+            };
+            ticket
+        };
+        // Untouched since Send: emptied.
+        rt.update(|s, _| s.chat.dm_write("first"));
+        assert!(rt.state.chat.dm_send());
+        let t1 = ticket(&rt, 0);
+        answer(&mut rt, t1, Ok(()));
+        assert_eq!(the_box(&rt, ROOM, &uid), "");
+
+        // Typed into since Send: left exactly as it is. The answer does not guess what is
+        // already sent and what is new.
+        rt.update(|s, _| s.chat.dm_write("second"));
+        assert!(rt.state.chat.dm_send());
+        let t2 = ticket(&rt, 1);
+        rt.update(|s, _| s.chat.dm_write("second and then more"));
+        answer(&mut rt, t2, Ok(()));
+        assert_eq!(the_box(&rt, ROOM, &uid), "second and then more");
+
+        // A late answer for an older send never mutates what was written after a newer one.
+        rt.update(|s, _| s.chat.dm_write("ok"));
+        assert!(rt.state.chat.dm_send());
+        let t3 = ticket(&rt, 2);
+        rt.update(|s, _| s.chat.dm_write("ok thanks"));
+        answer(&mut rt, t3, Ok(()));
+        assert_eq!(the_box(&rt, ROOM, &uid), "ok thanks");
+    }
+
+    #[test]
+    fn the_box_is_read_only_while_a_send_waits_and_editable_again_when_it_is_answered_or_times_out()
+    {
+        use std::time::Instant;
+        let (mut rt, uid) = open_with("Jonas");
+        let t0 = Instant::now();
+        let ticket = |rt: &Runtime<RiverApp>, n: usize| {
+            let Action::SendDm { ticket, .. } = sent(rt)[n].1.clone() else {
+                panic!()
+            };
+            ticket
+        };
+        let field_dim = |rt: &Runtime<RiverApp>| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("dm-composer-input"))
+                .map(|e| e.opacity < 0.9)
+                .unwrap()
+        };
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, "first");
+        assert!(!field_dim(&rt));
+        assert!(rt.state.chat.dm_send_at(t0));
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        // Pending: typing goes nowhere, the box looks it, and says so.
+        assert!(field_dim(&rt));
+        assert!(rt.find("dm-sending").is_some());
+        type_text(&mut rt, " more");
+        assert_eq!(the_box(&rt, ROOM, &uid), "first");
+        // Ok: the box is cleared and editable.
+        let t1 = ticket(&rt, 0);
+        {
+            let u = uid.clone();
+            rt.update(move |s, _| {
+                s.chat.dm_sent(ROOM, &u, t1, Ok(()));
+            });
+        }
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        assert_eq!(the_box(&rt, ROOM, &uid), "");
+        assert!(!field_dim(&rt));
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, "second");
+        assert_eq!(the_box(&rt, ROOM, &uid), "second");
+
+        // Err: the draft stays, and is editable, with the refusal shown.
+        assert!(rt.state.chat.dm_send_at(t0));
+        let t2 = ticket(&rt, 1);
+        {
+            let u = uid.clone();
+            rt.update(move |s, _| {
+                s.chat.dm_sent(ROOM, &u, t2, Err("refused".into()));
+            });
+        }
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        assert_eq!(the_box(&rt, ROOM, &uid), "second");
+        assert!(!field_dim(&rt));
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, " edit");
+        assert_eq!(the_box(&rt, ROOM, &uid), "second edit");
+
+        // Timeout: editable again, with the text kept.
+        assert!(rt.state.chat.dm_send_at(t0));
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        assert!(field_dim(&rt));
+        rt.update(move |s, _| {
+            s.chat.dm_tick(t0 + super::super::dm_compose::ANSWER_WAIT);
+        });
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        assert!(!field_dim(&rt));
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, "!");
+        assert_eq!(the_box(&rt, ROOM, &uid), "second edit!");
+    }
+
+    #[test]
+    fn a_late_refusal_of_an_older_send_does_not_show_over_a_newer_one_that_went_through() {
+        let (mut rt, uid) = open_with("Jonas");
+        let t0 = std::time::Instant::now();
+        rt.update(|s, _| s.chat.dm_write("one"));
+        assert!(rt.state.chat.dm_send_at(t0));
+        let Action::SendDm { ticket: one, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        // It is not answered in time; the user changes the text and sends another.
+        rt.update(|s, _| {
+            s.chat.dm_tick(t0 + super::super::dm_compose::ANSWER_WAIT);
+            s.chat.dm_write("two");
+        });
+        assert!(
+            rt.state
+                .chat
+                .dm_send_at(t0 + super::super::dm_compose::ANSWER_WAIT)
+        );
+        let Action::SendDm { ticket: two, .. } = sent(&rt)[1].1.clone() else {
+            panic!()
+        };
+        let u = uid.clone();
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &u, two, Ok(()));
+        });
+        let u = uid.clone();
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &u, one, Err("old news".into()));
+        });
+        assert!(rt.state.chat.dm.compose.refusal_for(ROOM, &uid).is_none());
+        // Without a newer success, a refusal shows, and a newer refusal is not replaced by an
+        // older one.
+        rt.update(|s, _| s.chat.dm_write("three"));
+        assert!(rt.state.chat.dm_send());
+        rt.update(|s, _| s.chat.dm_write("four"));
+        let Action::SendDm { ticket: three, .. } = sent(&rt)[2].1.clone() else {
+            panic!()
+        };
+        let u = uid.clone();
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &u, three, Err("refused three".into()));
+        });
+        assert_eq!(
+            rt.state.chat.dm.compose.refusal_for(ROOM, &uid),
+            Some("refused three")
+        );
+    }
+
+    #[test]
+    fn a_send_is_per_thread_and_an_unanswered_one_says_so_keeps_the_text_and_can_be_sent_again() {
+        use std::time::{Duration, Instant};
+        let (mut rt, jonas) = open_with("Jonas");
+        let priya = uid_of(&rt, "Priya Raman");
+        let t0 = Instant::now();
+        rt.update(|s, _| s.chat.dm_write("to Jonas"));
+        assert!(rt.state.chat.dm_send_at(t0));
+        let Action::SendDm { ticket: first, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        // Waiting in one thread does not hold another's Send.
+        {
+            let priya = priya.clone();
+            rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &priya)));
+        }
+        rt.update(|s, _| s.chat.dm_write("to Priya"));
+        assert!(rt.state.chat.dm_send_at(t0 + Duration::from_secs(1)));
+        // Within the wait nothing is said; at the limit the first is marked, and only it (the
+        // second was sent a second later).
+        assert!(!rt.state.chat.dm_tick(t0 + Duration::from_secs(5)));
+        assert!(
+            rt.state
+                .chat
+                .dm_tick(t0 + super::super::dm_compose::ANSWER_WAIT)
+        );
+        assert!(
+            !rt.state
+                .chat
+                .dm_tick(t0 + super::super::dm_compose::ANSWER_WAIT)
+        );
+        let jk = (ROOM.to_owned(), jonas.clone());
+        let pk = (ROOM.to_owned(), priya.clone());
+        assert!(rt.state.chat.dm.compose.is_silent_in(&jk));
+        assert!(!rt.state.chat.dm.compose.is_silent_in(&pk));
+        assert!(rt.state.chat.dm.compose.is_sending_in(&pk));
+        // Back in the first thread: the words, the text kept, and Send works again.
+        {
+            let jonas = jonas.clone();
+            rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &jonas)));
+        }
+        rt.frame(0.2);
+        assert!(rt.find("dm-no-answer").is_some());
+        assert!(shows(&rt, super::super::dm_compose::NO_ANSWER));
+        assert!(rt.find("dm-sending").is_none());
+        assert_eq!(the_box(&rt, ROOM, &jonas), "to Jonas");
+        // The same text as the one that was not answered: composing it again would be a second,
+        // different message, so Enter and the plain button do not, and the button says so.
+        assert!(rt.state.chat.dm_needs_confirm());
+        assert!(!rt.state.chat.dm_send_at(t0 + Duration::from_secs(30)));
+        assert_eq!(sent(&rt).len(), 2, "Enter did not send it again");
+        assert!(shows(&rt, "Send again anyway"));
+        press(&mut rt, "dm-send");
+        assert_eq!(sent(&rt).len(), 3, "the explicit press did");
+        // A late answer to the first still takes its text out, if the box still holds it.
+        let peer = jonas.clone();
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &peer, first, Ok(()));
+        });
+        assert_eq!(the_box(&rt, ROOM, &jonas), "");
+        // A room that goes takes what waited for it.
+        let keep: Vec<_> = rt
+            .state
+            .chat
+            .rooms()
+            .iter()
+            .filter(|r| r.key != ROOM)
+            .cloned()
+            .collect();
+        rt.update(move |s, _| s.chat.set_rooms(keep));
+        assert!(!rt.state.chat.dm.compose.is_sending_in(&pk));
+        assert!(!rt.state.chat.dm.compose.is_silent_in(&jk));
+    }
+
+    #[test]
+    fn an_own_send_goes_to_the_end_of_its_thread_and_never_moves_another() {
+        use super::super::dm_view::scroll_key;
+        let (mut rt, uid) = open_with("Jonas");
+        let many = |extra: Option<Pending>| {
+            let mut messages: Vec<DmMessage> = (0..40)
+                .map(|n| DmMessage {
+                    key: format!("old-{n}"),
+                    outgoing: n % 2 == 0,
+                    timestamp: T0 + n,
+                    body: DmBody::Text(format!("message number {n}")),
+                    pending: None,
+                })
+                .collect();
+            if let Some(p) = extra {
+                messages.push(DmMessage {
+                    key: "fresh".into(),
+                    outgoing: true,
+                    timestamp: T0 + 100,
+                    body: DmBody::Text("just sent".into()),
+                    pending: Some(p),
+                });
+            }
+            DmSnapshot {
+                threads: vec![
+                    DmThread {
+                        room: ROOM.into(),
+                        room_name: "Town Square".into(),
+                        peer_key: uid.clone(),
+                        peer: crate::rooms::dm::peer_from_key(&uid).unwrap(),
+                        peer_name: "Jonas".into(),
+                        peer_is_member: true,
+                        last_ts: T0 + 100,
+                        last_inbound_ts: T0 + 99,
+                        messages,
+                    }
+                    .into(),
+                ],
+                room_keys: vec![ROOM.to_owned()],
+                hydrated: true,
+                ..Default::default()
+            }
+        };
+        give(&mut rt, many(None));
+        let key = scroll_key(ROOM, &uid);
+        assert_eq!(rt.scroll_at_bottom(&key), Some(true), "opened at the end");
+        let (x, y) = rt.find(&key).expect("the thread's scroll area");
+        rt.wheel(x, y, 600.0);
+        rt.frame(0.2);
+        rt.frame(0.4);
+        assert_eq!(rt.scroll_at_bottom(&key), Some(false), "scrolled up");
+
+        // Send; the thread shows the row on its way; the node's answer is the queue.
+        rt.update(|s, _| s.chat.dm_write("just sent"));
+        assert!(rt.state.chat.dm_send());
+        let Action::SendDm { peer, ticket, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        give(
+            &mut rt,
+            many(Some(Pending {
+                entry: 1,
+                failed: None,
+                retry: false,
+            })),
+        );
+        let answer = crate::rooms::RoomsUpdate::DmSend {
+            room: ROOM.into(),
+            peer: crate::rooms::dm::peer_key(peer),
+            ticket,
+            result: Ok(()),
+        };
+        rt.update(move |s, tx| s.apply_rooms(answer, tx));
+        rt.frame(0.2);
+        rt.frame(0.4);
+        assert_eq!(rt.scroll_at_bottom(&key), Some(true), "at the end");
+        assert!(
+            rt.find("dm-row-fresh").is_some(),
+            "the row on its way is there"
+        );
+        assert!(shows(&rt, "Sending\u{2026}"));
+
+        // The thread the user left is not moved by its answer, and nothing else is.
+        rt.update(|s, _| s.chat.dm_write("second"));
+        assert!(rt.state.chat.dm_send());
+        let Action::SendDm { peer, ticket, .. } = sent(&rt)[1].1.clone() else {
+            panic!()
+        };
+        let priya = uid_of(&rt, "Priya Raman");
+        rt.update(move |s, _| assert!(s.chat.open_dm(ROOM, &priya)));
+        let moved = rt
+            .state
+            .chat
+            .dm_sent(ROOM, &crate::rooms::dm::peer_key(peer), ticket, Ok(()));
+        assert_eq!(
+            moved, None,
+            "no thread is scrolled for the one that is left"
+        );
+    }
+
+    #[test]
+    fn escape_leaves_the_thread_and_keeps_the_draft() {
+        let (mut rt, uid) = open_with("Jonas");
+        press(&mut rt, "dm-composer-field");
+        type_text(&mut rt, "half a thought");
+        esc(&mut rt);
+        assert!(rt.find("dm-thread").is_none());
+        assert_eq!(the_box(&rt, ROOM, &uid), "half a thought");
+    }
+
+    #[test]
+    fn the_example_sends_nothing_but_empties_the_box() {
+        let mut rt = app();
+        let uid = uid_of(&rt, "Jonas");
+        rt.update({
+            let uid = uid.clone();
+            move |s, _| assert!(s.chat.open_dm(ROOM, &uid))
+        });
+        rt.frame(0.2);
+        rt.update(|s, _| s.chat.dm.compose_edit().replace_text("hello"));
+        assert!(rt.state.chat.dm_send());
+        assert_eq!(the_box(&rt, ROOM, &uid), "");
+        assert!(sent(&rt).is_empty());
+    }
+
+    #[test]
+    fn nothing_the_composer_holds_is_printed() {
+        let (mut rt, _) = open_with("Jonas");
+        rt.update(|s, _| s.chat.dm.compose_edit().replace_text("PLAINTEXT-SECRET"));
+        assert!(rt.state.chat.dm_send());
+        let shown = format!("{:?}{:#?}", rt.state.chat.dm, rt.state.chat.dm);
+        assert!(!shown.contains("PLAINTEXT"), "{shown}");
+        let commands = format!("{:?}", rt.state.chat.queued_commands());
+        assert!(!commands.contains("PLAINTEXT"), "{commands}");
+    }
+}
+
+/// Each composer scene draws what it is for: the thread, its composer, and the state it shows.
+#[test]
+fn every_composer_scene_draws_its_content() {
+    use crate::{RiverApp, SCENES, scene_size, view};
+    let drawn = |rt: &Runtime<RiverApp>, key: &str| rt.find(key).is_some();
+    for (name, wants, texts_wanted, absent) in [
+        (
+            "chat-dm-composer",
+            &["dm-composer-field", "dm-send"][..],
+            &[][..],
+            &["dm-error", "dm-byte-counter", "dm-not-sent"][..],
+        ),
+        (
+            "chat-dm-typed",
+            &["dm-composer-field"],
+            &["Want to compare notes tomorrow?"],
+            &["dm-error"],
+        ),
+        (
+            "chat-dm-near-limit",
+            &["dm-byte-counter"],
+            &["/32512"],
+            &["dm-error"],
+        ),
+        (
+            "chat-dm-over-limit",
+            &["dm-byte-counter"],
+            &["Message too long"],
+            &[],
+        ),
+        (
+            "chat-dm-sending",
+            &["dm-sending", "dm-sending-row"],
+            &["Sending\u{2026}"],
+            &["dm-retry-1"],
+        ),
+        (
+            "chat-dm-failed",
+            &["dm-not-sent", "dm-retry-1", "dm-discard-1"],
+            &["Not sent. Freenet refused it"],
+            &[],
+        ),
+        (
+            "chat-dm-unconfirmed",
+            &["dm-not-sent", "dm-discard-1"],
+            &["Freenet took it"],
+            &["dm-retry-1"],
+        ),
+        (
+            "chat-dm-refused",
+            &["dm-error", "dm-composer-field"],
+            &["The room didn't keep this message"],
+            &[],
+        ),
+        (
+            "chat-dm-send-again",
+            &["dm-no-answer", "dm-send"][..],
+            &["Send again anyway"][..],
+            &["dm-sending"][..],
+        ),
+        (
+            "chat-dm-blocked",
+            &["dm-block"],
+            &["A newer version of River is out"],
+            &[],
+        ),
+        (
+            "chat-dm-narrow-typed",
+            &["dm-composer-field"],
+            &["Want to compare notes tomorrow?"],
+            &[],
+        ),
+    ] {
+        let scene = SCENES.iter().find(|(n, _)| *n == name).expect(name).1;
+        let mut state = RiverApp::detached();
+        scene(&mut state);
+        let mut rt = Runtime::new(
+            state,
+            view,
+            scene_size(name),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.0);
+        rt.frame(0.5);
+        assert!(drawn(&rt, "dm-thread"), "{name}: the thread");
+        for key in wants {
+            assert!(drawn(&rt, key), "{name}: {key} is drawn");
+        }
+        for key in absent {
+            assert!(!drawn(&rt, key), "{name}: {key} is not drawn");
+        }
+        for text in texts_wanted {
+            assert!(shows(&rt, text), "{name}: {text:?} is on screen");
+        }
+    }
 }

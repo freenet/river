@@ -6,7 +6,9 @@
 # chat delegate), then runs apps/river-app/examples/fresh_node_e2e.rs against them: on each
 # node the app approves its grant, registers the chat delegate and reads an empty room list;
 # the app on the gateway creates a room and an invitation, the app on the peer joins from
-# it, each receives the other's message, and each changes its own nickname and the other sees
+# it, each receives the other's message, each sends the other a direct message (an empty one
+# is refused) that the other opens with its own key and the sender reads back as its own, and
+# each changes its own nickname and the other sees
 # it; the owner makes the joiner a deputy, whose app shows the Deputy tag, and revokes it. Last,
 # the example asks each node's chat delegate for
 # the room's signing key and requires it to be that app's own member key (the app's background

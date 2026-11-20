@@ -4,7 +4,8 @@
 //! work ([`Link`]) asks for a grant (approved here as the user would approve it on the page),
 //! registers the chat delegate, and reads an empty room list. Then the app on node A creates a
 //! room and makes an invitation, the app on node B joins from it, and each sends a message the
-//! other receives; each then changes its own nickname and the other sees it everywhere, and the
+//! other receives; each sends the other a direct message, which the other opens and the sender
+//! reads back as its own; each then changes its own nickname and the other sees it everywhere, and the
 //! owner makes the joiner a deputy (the joiner's app shows the Deputy tag) and revokes it. Last,
 //! each node's chat delegate is asked directly (on a connection of its own with the app's
 //! grant) for the room's signing key, and must hold the key of that app's own
@@ -67,6 +68,10 @@ struct App {
     invites: Vec<(String, Result<String, String>)>,
     /// Identity tokens reported, by room. The e2e holds them only as long as it needs them.
     exports: Vec<(String, Result<String, String>)>,
+    /// The direct-message threads last reported, of every room.
+    dms: Vec<std::sync::Arc<river_app::chat::dm_model::DmThread>>,
+    /// Answers to direct messages asked to be sent, by ticket.
+    dm_results: Vec<(u64, Result<(), String>)>,
     access: Option<Access>,
 }
 
@@ -98,6 +103,8 @@ impl App {
             modes: Default::default(),
             invites: Vec::new(),
             exports: Vec::new(),
+            dms: Vec::new(),
+            dm_results: Vec::new(),
             access: None,
         }
     }
@@ -109,9 +116,10 @@ impl App {
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !left.is_zero(),
-                "{}: never: {what} (last: {:?})",
+                "{}: never: {what} (last: {:?}; direct messages: {:?})",
                 self.name,
-                self.access
+                self.access,
+                self.dms.iter().map(|t| &t.messages).collect::<Vec<_>>()
             );
             let Ok(update) = self.updates.recv_timeout(left.min(Duration::from_secs(1))) else {
                 continue;
@@ -139,7 +147,11 @@ impl App {
                 }
                 RoomsUpdate::Invite { room, link } => self.invites.push((room, link)),
                 RoomsUpdate::Export { room, token } => self.exports.push((room, token)),
-                RoomsUpdate::Status(_) | RoomsUpdate::Dms(_) => {}
+                RoomsUpdate::Dms(snapshot) => self.dms = snapshot.threads,
+                RoomsUpdate::DmSend { ticket, result, .. } => {
+                    self.dm_results.push((ticket, result))
+                }
+                RoomsUpdate::Status(_) => {}
             }
         }
         println!("{}: {what}", self.name);
@@ -164,10 +176,125 @@ impl App {
         self.rooms.iter().find(|r| r.name == name)
     }
 
+    /// The thread of the room keyed `room` with the member `peer` (`Member::uid`).
+    fn thread(&self, room: &str, peer: &str) -> Option<&river_app::chat::dm_model::DmThread> {
+        self.dms
+            .iter()
+            .find(|t| t.room == room && t.peer_key == peer)
+            .map(|t| &**t)
+    }
+
+    /// Whether that thread holds a message with this text, as sent (`outgoing`) or received.
+    /// A message of the user's own counts only when the room holds it and nothing is pending.
+    fn dm_text(&self, room: &str, peer: &str, text: &str, outgoing: bool) -> bool {
+        use river_app::chat::dm_model::DmBody;
+        self.thread(room, peer).is_some_and(|t| {
+            t.messages.iter().any(|m| {
+                m.outgoing == outgoing
+                    && m.pending.is_none()
+                    && matches!(&m.body, DmBody::Text(body) if body == text)
+            })
+        })
+    }
+
     fn has_text(&self, room: &str, text: &str) -> bool {
         self.room(room)
             .is_some_and(|r| r.messages.iter().any(|m| m.text == text))
     }
+}
+
+/// Direct messages in `room` (key `key`), both ways: each app sends one to the other member, the
+/// other opens it with its own key and shows the text, and the sender's own thread shows what it
+/// sent (sealed to the other, so it comes from the sent-text kept in memory) with nothing pending.
+/// The text has a multi-byte character, a second line and spaces at both ends, and is sent as written.
+fn direct_messages(alice: &mut App, bob: &mut App, room: &str, key: &str) {
+    // The recipient is named by River's full member id, as the screen does: never the label.
+    let id_in = |app: &App, name: &str| {
+        let full = app
+            .room(room)
+            .and_then(|r| r.members.iter().find(|m| m.nickname == name))
+            .map(|m| m.full_id)
+            .unwrap_or_else(|| panic!("{name} is not a member in {}'s view", app.name));
+        river_core::room_state::member::MemberId(freenet_scaffold::util::FastHash(full))
+    };
+    let (bob_id, alice_id) = (id_in(alice, "Bob"), id_in(bob, "Alice"));
+    let (bob_in_a, alice_in_b) = (
+        river_app::rooms::dm::peer_key(bob_id),
+        river_app::rooms::dm::peer_key(alice_id),
+    );
+    // Sent as written, with its spaces: the web UI sends the draft as typed.
+    let from_a = "  DM from A \u{1f44b}\nsecond line  ";
+    let from_b = "DM from B, with a \u{20ac} sign";
+    // A refused send says why, leaves nothing queued and sends nothing.
+    alice.send(
+        key,
+        Action::SendDm {
+            peer: bob_id,
+            text: "   ".into(),
+            ticket: 1,
+        },
+    );
+    alice.until("an empty direct message is refused", |app| {
+        app.dm_results
+            .iter()
+            .any(|(t, r)| *t == 1 && r.as_ref().is_err_and(|e| e.contains("Write something")))
+    });
+    alice.send(
+        key,
+        Action::SendDm {
+            peer: bob_id,
+            text: from_a.into(),
+            ticket: 2,
+        },
+    );
+    alice.until("node A's direct message is queued", |app| {
+        app.dm_results.iter().any(|(t, r)| *t == 2 && r.is_ok())
+    });
+    alice.until("node A shows its own direct message, sent", |app| {
+        app.dm_text(key, &bob_in_a, from_a, true)
+    });
+    bob.until("node B opens node A's direct message", |app| {
+        app.dm_text(key, &alice_in_b, from_a, false)
+    });
+    // A second later: two messages in one second are ordered by purge token, so the order sent
+    // is only the order shown when their times differ.
+    std::thread::sleep(Duration::from_millis(1100));
+    bob.send(
+        key,
+        Action::SendDm {
+            peer: alice_id,
+            text: from_b.into(),
+            ticket: 3,
+        },
+    );
+    bob.until("node B's direct message is queued", |app| {
+        app.dm_results.iter().any(|(t, r)| *t == 3 && r.is_ok())
+    });
+    bob.until("node B shows its own direct message, sent", |app| {
+        app.dm_text(key, &alice_in_b, from_b, true)
+    });
+    alice.until("node A opens node B's direct message", |app| {
+        app.dm_text(key, &bob_in_a, from_b, false)
+    });
+    // Both threads hold both messages, A's first (it was sent and settled before B's), and the
+    // sender's view of what it sent is the text and not a placeholder.
+    for (app, peer) in [(&*alice, &bob_in_a), (&*bob, &alice_in_b)] {
+        use river_app::chat::dm_model::DmBody;
+        let t = app.thread(key, peer).expect("a thread");
+        assert_eq!(t.messages.len(), 2, "{}: {:?}", app.name, t);
+        assert!(t.messages.iter().all(|m| m.pending.is_none()));
+        let bodies: Vec<&str> = t
+            .messages
+            .iter()
+            .map(|m| match &m.body {
+                DmBody::Text(body) => body.as_str(),
+                other => panic!("{}: not text: {other:?}", app.name),
+            })
+            .collect();
+        assert_eq!(bodies, [from_a, from_b], "{}: in the order sent", app.name);
+    }
+    // The room's own conversation is untouched by direct messages.
+    assert!(!alice.has_text(room, from_a) && !bob.has_text(room, from_b));
 }
 
 /// Allow the grant on its approval page, as the user would: read the page's nonce, wait out
@@ -1422,6 +1549,7 @@ fn main() {
     // Changing your own nickname: a signed update the other node's app sees, for the joiner (a
     // member's record, signed by their own key) and for the creator (the owner's, which the
     // room checks against the owner's key).
+    direct_messages(&mut alice, &mut bob, ROOM, &key);
     rename_both_ways(&mut alice, &mut bob, ROOM, &key, "Bob", "Alice");
     deputize_and_revoke(&mut alice, &mut bob, ROOM, &key);
     // A nickname over the room's limit (50 bytes) is refused by the app and said, and is

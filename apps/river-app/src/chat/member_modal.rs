@@ -2,7 +2,7 @@
 //! `MemberInfoModal` (`ui/src/components/members/member_info_modal.rs`): who the member is, how
 //! they came to be in the room, and a warning when their name imitates the owner's.
 //!
-//! Its Message button opens the conversation with the member (read only for now). What it leaves
+//! Its Message button opens the conversation with the member (for the member the dialog shows, by full id). What it leaves
 //! out is sharing an invite by direct message, which the web UI offers too. Your own dialog edits your nickname
 //! (`nickname_editor`), as the web UI's `NicknameField` does. Deputize and Revoke deputy
 //! (`deputy_block`) work as the web UI's `DeputyButton` does, with a confirmation first. Ban
@@ -329,13 +329,13 @@ fn deputized_by_row(
             .border(1.0, p.line)
             .child(label(text.clone(), st::SMALL, p.accent).truncate().shrink());
         if let Some(t) = target {
-            let uid = t.uid.clone();
+            let uid = t.full_id;
             chip = chip
                 .role("button")
                 .label(format!("Member info: {text}"))
                 .focusable(true)
                 .cursor(rune::Cursor::Pointer)
-                .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid));
+                .on_press(move |s: &mut RiverApp| s.chat.open_member_full(uid));
         }
         names = names.child(chip);
     }
@@ -647,9 +647,17 @@ fn ban_confirmation(
 
 pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
-    let Some(m) = room.member_by_uid(uid) else {
+    // The member the dialog was opened for, by full id; by label only where nothing said.
+    let Some(m) = chat
+        .member_modal_full
+        .and_then(|f| room.member_by_full_id(f))
+        .or_else(|| room.member_by_uid(uid))
+    else {
         return;
     };
+    // Another member has this member's short label. Moderation here is looked up by label (not
+    // part of this change), so it is not offered for either of them; Message uses the full id.
+    let shared = room.label_shared(m);
     let by_id: HashMap<MemberId, &Member> = room.members.iter().rev().map(|m| (m.id, m)).collect();
     let is_me = m.id == room.me;
     let is_owner = m.role == Role::Owner;
@@ -794,7 +802,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         invited_by.child(label("N/A (Room Owner)", st::BODY, p.text))
     } else if let Some(i) = m.invited_by.and_then(|i| by_id.get(&i)) {
         // As in the web UI, the inviter's name opens the inviter's own dialog.
-        let uid = i.uid.clone();
+        let uid = i.full_id;
         invited_by.child(
             row()
                 .key("member-inviter")
@@ -804,7 +812,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
                 .cursor(rune::Cursor::Pointer)
                 .shrink()
                 .min_w(0.0)
-                .on_press(move |s: &mut RiverApp| s.chat.open_member(&uid))
+                .on_press(move |s: &mut RiverApp| s.chat.open_member_full(uid))
                 .child(
                     label(i.nickname.clone(), st::BODY, p.accent)
                         .wrap_anywhere()
@@ -825,18 +833,21 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
 
     let mut actions = row().key("member-actions").w_full().gap(8.0).flex_wrap();
     if !is_me {
-        // Opens the conversation, which is read only for now.
-        let (room_key, peer) = (room.key.clone(), uid.to_owned());
-        actions = actions.child(
-            Button::new("Message")
-                .variant(ButtonVariant::Ghost)
-                .on_press(move |s: &mut RiverApp| {
-                    s.chat.open_dm(&room_key, &peer);
-                })
-                .build(k)
-                .key("member-dm"),
-        );
-        if matches!(room.ban_offers.get(uid), Some(BanOffer::Allowed)) && chat.ban_confirm.is_none()
+        // Opens the conversation, which can be read whatever the room lets you send; the
+        // composer says why it cannot send. The thread is named by the member's full id, so
+        // the right member gets it even where another shares their short label.
+        let (room_key, peer) = (room.key.clone(), m.full_id.to_string());
+        let message = Button::new("Message")
+            .variant(ButtonVariant::Ghost)
+            .on_press(move |s: &mut RiverApp| {
+                s.chat.open_dm(&room_key, &peer);
+            })
+            .build(k)
+            .key("member-dm");
+        actions = actions.child(message);
+        if !shared
+            && matches!(room.ban_offers.get(uid), Some(BanOffer::Allowed))
+            && chat.ban_confirm.is_none()
         {
             actions = actions.child(
                 Button::new("Ban user")
@@ -848,7 +859,21 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         }
     }
     body = body.child(el().w_full().h(1.0).fill(p.line)).child(actions);
-    if !is_me {
+    if !is_me && shared {
+        body = body.child(
+            label(
+                "Another member has the same short name (ID). Check the key before you trust \
+                 either of them. Ban and deputy actions are not offered here while two members \
+                 share it.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("member-dm-ambiguous"),
+        );
+    }
+    if !is_me && !shared {
         match room.ban_offers.get(uid) {
             // As the web UI's `ban-withheld-reason`: owed to one who would otherwise have had Ban.
             Some(BanOffer::Withheld(why)) => {
@@ -865,7 +890,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             _ => {}
         }
     }
-    if let Some((offer, why_not)) = chat.deputy_offer().filter(|_| !is_me) {
+    if let Some((offer, why_not)) = chat.deputy_offer().filter(|_| !is_me && !shared) {
         body = body.child(deputy_block(chat, room, m, offer, why_not, &p, k));
     }
 

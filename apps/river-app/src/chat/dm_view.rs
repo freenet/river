@@ -1,5 +1,5 @@
 //! Direct messages on screen: the rail's "Direct messages" section and the thread view in the
-//! main pane. Read only: nothing here sends, deletes or saves anything.
+//! main pane. Sending is in [`super::dm_compose`]; nothing here deletes or saves anything.
 //!
 //! The threads come from the background work as a [`DmSnapshot`] (built by `rooms::dm`, which
 //! verifies and opens the messages). This module never sees a key or a ciphertext.
@@ -57,9 +57,6 @@ const AVATAR: f32 = 36.0;
 const GUTTER: f32 = 60.0;
 const COLUMN_MAX_W: f32 = GUTTER + BODY_MAX_W + 24.0;
 
-/// The words under the thread when there is nothing to type into. PR 3 replaces this with a
-/// composer.
-pub const NO_SEND: &str = "Sending is not available yet in this build.";
 /// What a thread says when this app's bounds left older messages out.
 pub const TRUNCATED: &str = "Older messages may be missing. River shows only the newest \
      messages of a conversation.";
@@ -70,7 +67,7 @@ pub const LOADING_SENT: &str = "Your sent messages are still loading from River'
 /// One rail row: a thread, with what the rail shows of it.
 struct RailRow {
     room: String,
-    peer_uid: String,
+    peer_key: String,
     peer_name: String,
     room_name: String,
     preview: String,
@@ -90,19 +87,20 @@ struct Preview {
 
 /// The direct-message state of the chat screen.
 ///
-/// **For the composer (PR 3).** Opening a thread covers the room's own screen but leaves its
-/// state in place: the composer, `mode` (a reply or an edit in progress) and the room's draft
-/// belong to the room. `open_dm` clears what would show over the thread, and must stash and
-/// restore `mode` and the draft when the DM composer takes the keyboard, or a reply started in
-/// the room would be sent as a direct message.
+/// Opening a thread covers the room's own screen but leaves its state in place: the composer,
+/// `mode` (a reply or an edit in progress) and the room's draft belong to the room and are not
+/// touched. The thread has a composer of its own ([`DmUi::compose`]), so a reply started in the
+/// room cannot be sent as a direct message and is still there when the thread closes.
 #[derive(Default)]
 pub struct DmUi {
+    /// The thread's own composer: text, drafts and send state.
+    pub(super) compose: super::dm_compose::DmCompose,
     snapshot: DmSnapshot,
     /// What the rail lists, in order. Rebuilt when the snapshot or the read state changes, never
     /// per frame.
     rows: Vec<RailRow>,
     previews: HashMap<(String, String), Preview>,
-    /// Per room (key) and peer (`peer_uid`): the messages (by purge token) the user has seen. Never
+    /// Per room (key) and peer (`peer_key`): the messages (by purge token) the user has seen. Never
     /// shrinks (see [`DmUi::apply`]).
     /// By message and not by time, because a time is whatever its sender signed: a forged
     /// future time must not hide later messages, and an old one must still count. In memory only.
@@ -146,7 +144,7 @@ impl DmUi {
         self.snapshot
             .threads
             .iter()
-            .find(|t| t.room == room && t.peer_uid == uid)
+            .find(|t| t.room == room && t.peer_key == uid)
             .map(|t| &**t)
     }
 
@@ -157,7 +155,7 @@ impl DmUi {
         if !self.known_rooms.contains(&t.room) {
             return 0;
         }
-        let seen = self.seen.get(&(t.room.clone(), t.peer_uid.clone()));
+        let seen = self.seen.get(&(t.room.clone(), t.peer_key.clone()));
         t.messages
             .iter()
             .filter(|m| !m.outgoing && !seen.is_some_and(|s| s.contains(&m.key)))
@@ -199,7 +197,7 @@ impl DmUi {
             }
             for t in snapshot.threads.iter().filter(|t| &t.room == room) {
                 self.seen
-                    .entry((t.room.clone(), t.peer_uid.clone()))
+                    .entry((t.room.clone(), t.peer_key.clone()))
                     .or_default()
                     .extend(
                         t.messages
@@ -215,7 +213,7 @@ impl DmUi {
             .iter()
             .filter(|t| !t.messages.is_empty() && self.known_rooms.contains(&t.room))
         {
-            if let Some(seen) = self.seen.get_mut(&(t.room.clone(), t.peer_uid.clone())) {
+            if let Some(seen) = self.seen.get_mut(&(t.room.clone(), t.peer_key.clone())) {
                 let present: HashSet<&str> = t.messages.iter().map(|m| m.key.as_str()).collect();
                 seen.retain(|k| present.contains(k.as_str()));
             }
@@ -260,7 +258,7 @@ impl DmUi {
         let mut kept = HashMap::new();
         let mut rows = Vec::with_capacity(self.snapshot.threads.len());
         for t in &self.snapshot.threads {
-            let id = (t.room.clone(), t.peer_uid.clone());
+            let id = (t.room.clone(), t.peer_key.clone());
             let p = match previews.remove(&id) {
                 Some(p) if std::sync::Arc::ptr_eq(&p.thread, t) && p.hydrated == hydrated => p,
                 _ => Preview {
@@ -271,7 +269,7 @@ impl DmUi {
             };
             rows.push(RailRow {
                 room: t.room.clone(),
-                peer_uid: t.peer_uid.clone(),
+                peer_key: t.peer_key.clone(),
                 peer_name: name(&t.peer_name),
                 room_name: name(&t.room_name),
                 preview: p.text.clone(),
@@ -281,12 +279,26 @@ impl DmUi {
             kept.insert(id, p);
         }
         self.previews = kept;
+        // Two rows in one room with one name (two members can have the same nickname, or the
+        // same short ID) are told apart by a slice of their full id, which differs where the
+        // short ID, the id's low bits, does not.
+        let mut count: HashMap<(String, String), usize> = HashMap::new();
+        for r in &rows {
+            *count
+                .entry((r.room.clone(), r.peer_name.clone()))
+                .or_default() += 1;
+        }
+        for r in &mut rows {
+            if count[&(r.room.clone(), r.peer_name.clone())] > 1 {
+                r.peer_name = format!("{} ({})", r.peer_name, id_slice(&r.peer_key));
+            }
+        }
         rows.sort_by(|a, b| {
             (b.unread > 0)
                 .cmp(&(a.unread > 0))
                 .then_with(|| b.last_ts.cmp(&a.last_ts))
                 .then_with(|| a.room.cmp(&b.room))
-                .then_with(|| a.peer_uid.cmp(&b.peer_uid))
+                .then_with(|| a.peer_key.cmp(&b.peer_key))
         });
         self.rows = rows;
     }
@@ -295,7 +307,7 @@ impl DmUi {
     pub fn rail_order(&self) -> Vec<(&str, &str)> {
         self.rows
             .iter()
-            .map(|r| (r.room.as_str(), r.peer_uid.as_str()))
+            .map(|r| (r.room.as_str(), r.peer_key.as_str()))
             .collect()
     }
 
@@ -308,6 +320,18 @@ impl DmUi {
     pub fn rebuilds(&self) -> usize {
         self.rebuilds
     }
+}
+
+/// The key of a thread's scroll area: what an own send scrolls to the end of.
+pub fn scroll_key(room: &str, peer: &str) -> String {
+    format!("dm-scroll-{room}-{peer}")
+}
+
+/// Six hex digits of a peer's full id taken from its high bits (the low bits are what the short
+/// ID shows), for telling two rows with one name apart.
+fn id_slice(peer_key: &str) -> String {
+    let n = peer_key.parse::<i64>().unwrap_or(0) as u64;
+    format!("{:06x}", n >> 40)
 }
 
 /// A name a peer or a room chose, as one line with nothing hidden or reordering in it.
@@ -379,17 +403,26 @@ impl Chat {
     /// Close the open thread when there is nothing left to show it as: its room is gone, or its
     /// peer has no messages and is not a member of the room.
     pub(super) fn dm_settle(&mut self) {
+        self.dm_forget_gone();
         let Some((room, uid)) = self.dm.open.clone() else {
             return;
         };
         let known = self.rooms().iter().any(|r| {
             r.key == room
                 && (self.dm.thread(&room, &uid).is_some()
-                    || r.member_by_uid(&uid).is_some_and(|m| m.id != r.me))
+                    || r.member_by_peer_key(&uid).is_some_and(|m| m.id != r.me))
         });
         if !known {
             self.dm.open = None;
         }
+    }
+
+    /// What waits for an answer for a room that is gone will not get one.
+    fn dm_forget_gone(&mut self) {
+        let keys: Vec<String> = self.rooms().iter().map(|r| r.key.clone()).collect();
+        self.dm
+            .compose
+            .forget_rooms(|r| keys.iter().any(|k| k == r));
     }
 
     /// Open the conversation with the member `uid` of the room keyed `room`, in the main pane.
@@ -403,7 +436,7 @@ impl Chat {
         let known = self.rooms().iter().any(|r| {
             r.key == room
                 && (self.dm.thread(room, uid).is_some()
-                    || r.member_by_uid(uid).is_some_and(|m| m.id != r.me))
+                    || r.member_by_peer_key(uid).is_some_and(|m| m.id != r.me))
         });
         if !known {
             return false;
@@ -431,14 +464,23 @@ impl Chat {
         self.composer.focused = false;
         self.dm.open = Some((room.to_owned(), uid.to_owned()));
         self.dm.at_bottom = true;
+        // The thread's own box takes the keyboard, with the draft it kept.
+        let open = self.dm.open.clone();
+        self.dm.compose.tidy(open.as_ref());
+        self.dm.compose_edit().focused = true;
         true
     }
 
     /// Back to the room that was open.
     pub fn close_dm(&mut self) {
-        if self.dm.open.take().is_none() {
+        let Some(closed) = self.dm.open.take() else {
             return;
+        };
+        // What was typed stays as the thread's draft; the box gives up the keyboard.
+        if let Some(d) = self.dm.compose.drafts_mut().get_mut(&closed) {
+            d.focused = false;
         }
+        self.dm.compose.tidy(None);
         // The room is in front again: what arrived in it meanwhile is being read now, and the
         // composer gets the keyboard back if it had it, unless a dialog or the switcher has it
         // now. (A thread that another room or a dialog closes gives nothing back: they took
@@ -488,7 +530,7 @@ pub(super) fn rail(chat: &Chat, p: &Palette) -> Vec<El> {
             .child(rune::spacer()),
     ];
     for r in dm.rows.iter().take(RAIL_MAX) {
-        let selected = dm.open_key() == Some((r.room.as_str(), r.peer_uid.as_str()));
+        let selected = dm.open_key() == Some((r.room.as_str(), r.peer_key.as_str()));
         out.push(rail_row(r, selected, p));
     }
     if dm.rows.len() > RAIL_MAX {
@@ -510,7 +552,7 @@ fn rail_row(r: &RailRow, selected: bool, p: &Palette) -> El {
     // The badge is the count `DmUi::unread_total` adds up, selected or not.
     let unread = r.unread > 0;
     let strong = unread || selected;
-    let (room, uid) = (r.room.clone(), r.peer_uid.clone());
+    let (room, uid) = (r.room.clone(), r.peer_key.clone());
     let name = row()
         .gap(6.0)
         .center_y()
@@ -530,7 +572,7 @@ fn rail_row(r: &RailRow, selected: bool, p: &Palette) -> El {
                 .shrink(),
         );
     let mut out = row()
-        .key(format!("dm-{}-{}", r.room, r.peer_uid))
+        .key(format!("dm-{}-{}", r.room, r.peer_key))
         .role("button")
         .label(format!(
             "Direct messages with {} in {}",
@@ -597,7 +639,7 @@ pub(super) fn thread_pane(chat: &Chat, narrow: bool, p: &Palette, k: &Kit) -> El
         uid,
         peer_name: name(&thread.map_or_else(
             || {
-                room.and_then(|r| r.member_by_uid(uid))
+                room.and_then(|r| r.member_by_peer_key(uid))
                     .map_or_else(String::new, |m| m.nickname.clone())
             },
             |t| t.peer_name.clone(),
@@ -648,13 +690,7 @@ pub(super) fn thread_pane(chat: &Chat, narrow: bool, p: &Palette, k: &Kit) -> El
     }
     c.child(history(chat, &shown, hydrated, p, k))
         .child(hline(p))
-        .child(
-            row().key("dm-footer").w_full().px(20.0).py(14.0).child(
-                label(NO_SEND, st::BODY, p.text_muted)
-                    .key("dm-no-send")
-                    .wrap(),
-            ),
-        )
+        .child(super::dm_compose::composer(chat, p, k))
 }
 
 fn header(shown: &Shown<'_>, narrow: bool, p: &Palette, k: &Kit) -> El {
@@ -793,7 +829,7 @@ fn history(chat: &Chat, shown: &Shown<'_>, hydrated: bool, p: &Palette, k: &Kit)
         ));
         at += n;
     }
-    let scroll_key = format!("dm-scroll-{}-{}", shown.room, shown.uid);
+    let scroll_key = scroll_key(shown.room, shown.uid);
     let mut frame = col().key("dm-frame").grow(1.0).min_h(0.0).w_full().child(
         col()
             .key(scroll_key.clone())
@@ -977,7 +1013,11 @@ fn body_el(m: &Message, dm: &DmMessage, hydrated: bool, p: &Palette, k: &Kit) ->
         ),
         DmBody::Placeholder(ph) => plain(placeholder_text(*ph, hydrated), p.text_muted),
     };
-    col().key(format!("dm-msg-{}", m.key)).w_full().child(body)
+    let mut c = col().key(format!("dm-msg-{}", m.key)).w_full().child(body);
+    if let Some(pending) = &dm.pending {
+        c = c.gap(4.0).child(super::dm_compose::delivery(pending, p));
+    }
+    c
 }
 
 /// A read-only invitation card. `room` and `note` are a peer's words: plain text.

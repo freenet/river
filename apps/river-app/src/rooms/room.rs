@@ -506,6 +506,7 @@ impl LiveRoom {
                     role
                 },
                 uid: id.to_string(),
+                full_id: id.0.0,
                 invited_by: None,
                 key,
                 claimed: self.claimed_nickname(id),
@@ -605,6 +606,7 @@ impl LiveRoom {
         for (river_id, id) in ids.extra(members.iter().map(|m| m.id)) {
             members.push(Member {
                 uid: river_id.to_string(),
+                full_id: river_id.0.0,
                 claimed: false,
                 order: river_id.0.0,
                 ..Member::new(id, self.nickname(river_id, me), Role::Member)

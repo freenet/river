@@ -12,6 +12,7 @@
 mod background;
 mod conversation;
 mod details;
+pub mod dm_compose;
 pub mod dm_model;
 pub mod dm_view;
 pub mod dnd;
@@ -286,6 +287,11 @@ pub struct Chat {
     pub at_bottom: bool,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
+    /// The open dialog's member by full River id, when it was opened from somewhere that knows
+    /// the member (a row, an author, an inviter). `member_modal` (the `uid` label) is kept for the
+    /// moderation paths that look a member up by label; where two members share a label this
+    /// says which of them the dialog shows.
+    pub member_modal_full: Option<i64>,
     /// In the open member dialog: the deputy change being confirmed, by member (`Member::uid`)
     /// and whether it makes them a deputy (`true`) or ends that.
     pub deputy_confirm: Option<(String, bool)>,
@@ -469,6 +475,7 @@ impl Chat {
             mention_off: None,
             at_bottom: true,
             member_modal: None,
+            member_modal_full: None,
             deputy_confirm: None,
             ban_confirm: None,
             ban_seen: None,
@@ -1219,11 +1226,33 @@ impl Chat {
 
     /// Open the info dialog of the member with `uid` in the open room.
     pub fn open_member(&mut self, uid: &str) {
-        if self.room().and_then(|r| r.member_by_uid(uid)).is_none() {
+        self.open_member_as(uid, None);
+    }
+
+    /// Open the dialog of the member with this full River id. Unlike [`Chat::open_member`] it
+    /// shows exactly that member, whatever their `uid` label is shared with.
+    pub fn open_member_full(&mut self, full_id: i64) {
+        let Some(uid) = self
+            .room()
+            .and_then(|r| r.member_by_full_id(full_id))
+            .map(|m| m.uid.clone())
+        else {
             return;
-        }
+        };
+        self.open_member_as(&uid, Some(full_id));
+    }
+
+    fn open_member_as(&mut self, uid: &str, full: Option<i64>) {
+        let found = self.room().and_then(|r| match full {
+            Some(f) => r.member_by_full_id(f),
+            None => r.member_by_uid(uid),
+        });
+        let Some(found) = found else {
+            return;
+        };
+        let full = found.full_id;
         // Already open for this member: leave it as it is, so a nickname being typed stays.
-        if self.member_modal.as_deref() == Some(uid) {
+        if self.member_modal.as_deref() == Some(uid) && self.member_modal_full == Some(full) {
             return;
         }
         // What else is open (opened from a message, which a dialog does not cover) closes.
@@ -1231,7 +1260,7 @@ impl Chat {
         self.link_menu = None;
         self.notify_dialog = None;
         self.picker = None;
-        let Some(member) = self.room().and_then(|r| r.member_by_uid(uid)) else {
+        let Some(member) = self.room().and_then(|r| r.member_by_full_id(full)) else {
             return;
         };
         // Your own dialog edits your nickname, starting from the one you chose; with none
@@ -1244,10 +1273,12 @@ impl Chat {
         self.clear_ban_confirm();
         self.details = None;
         self.member_modal = Some(uid.to_owned());
+        self.member_modal_full = Some(full);
     }
 
     pub fn close_member(&mut self) {
         self.member_modal = None;
+        self.member_modal_full = None;
         self.clear_ban_confirm();
         self.nickname_error = None;
         self.deputy_confirm = None;

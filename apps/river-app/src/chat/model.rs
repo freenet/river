@@ -31,6 +31,10 @@ pub struct Member {
     /// River's member id in decimal, which the web UI shows as "Member ID". Stable across
     /// updates, unlike `id`.
     pub uid: String,
+    /// River's full 64-bit member id (the hash a `MemberId` wraps), which `uid` abbreviates to a
+    /// label of 40 bits. What a direct message is addressed by: never `uid`, which two members
+    /// can be made to share. Equal to `order` for a room read from the node.
+    pub full_id: i64,
     /// Who invited them. `None` for the owner, and when the inviter is no longer a member.
     pub invited_by: Option<MemberId>,
     /// Their verifying key, in base58. Empty when this computer does not know it.
@@ -109,6 +113,7 @@ impl Member {
             nickname: nickname.into(),
             role,
             uid: id.to_string(),
+            full_id: i64::from(id),
             invited_by: None,
             key: String::new(),
             claimed: true,
@@ -362,6 +367,22 @@ pub struct Room {
 impl Room {
     pub fn member(&self, id: MemberId) -> Option<&Member> {
         self.members.iter().find(|m| m.id == id)
+    }
+
+    /// The member a direct-message thread names (`DmThread::peer_key`): by their full id, which
+    /// no two members share.
+    pub fn member_by_peer_key(&self, key: &str) -> Option<&Member> {
+        self.members.iter().find(|m| m.full_id.to_string() == key)
+    }
+
+    /// Whether another member has the same `uid` label as `m`.
+    pub fn label_shared(&self, m: &Member) -> bool {
+        self.members.iter().filter(|x| x.uid == m.uid).count() > 1
+    }
+
+    /// The member with this full River id, which no two members share.
+    pub fn member_by_full_id(&self, full_id: i64) -> Option<&Member> {
+        self.members.iter().find(|m| m.full_id == full_id)
     }
 
     pub fn member_by_uid(&self, uid: &str) -> Option<&Member> {

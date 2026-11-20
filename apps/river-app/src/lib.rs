@@ -749,6 +749,17 @@ impl RiverApp {
                 self.sync_unread(tx);
             }
             RoomsUpdate::Dms(dms) => self.chat.apply_dms(dms),
+            RoomsUpdate::DmSend {
+                room,
+                peer,
+                ticket,
+                result,
+            } => {
+                // An own send goes to the end of its thread, if that thread is the one open.
+                if let Some((room, peer)) = self.chat.dm_sent(&room, &peer, ticket, result) {
+                    tx.scroll_to_bottom(chat::dm_view::scroll_key(&room, &peer));
+                }
+            }
             RoomsUpdate::Status(status) => {
                 let at = self.chat.node.choice.address.authority();
                 self.chat
@@ -1539,6 +1550,91 @@ pub const SCENES: &[Scene] = &[
     ("chat-dm-narrow", |s| {
         dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {})
     }),
+    // The thread's composer: empty, with text (several lines), over the cap, a send waiting for
+    // its answer, a send the room refused, a room that does not let you send, and narrow.
+    ("chat-dm-composer", |s| {
+        dm_send_scene(s, |_| {});
+    }),
+    ("chat-dm-typed", |s| {
+        dm_send_scene(s, |c| {
+            c.dm_write("Thanks, I'll read it tonight.\nWant to compare notes tomorrow?")
+        });
+    }),
+    ("chat-dm-near-limit", |s| {
+        dm_send_scene(s, |c| {
+            c.dm_write(&"x".repeat(rooms::dm_send::BODY_CAP * 9 / 10))
+        });
+    }),
+    ("chat-dm-over-limit", |s| {
+        dm_send_scene(s, |c| {
+            c.dm_write(&"Sounds good. ".repeat(2600));
+        });
+    }),
+    ("chat-dm-sending", |s| {
+        dm_send_scene(s, |c| {
+            c.dm_write("Sounds good, send me the notes.");
+            assert!(c.dm_send());
+        });
+        pending_dm(s, None);
+    }),
+    ("chat-dm-failed", |s| {
+        dm_send_scene(s, |_| {});
+        pending_dm(s, Some(("Freenet refused it: the node was busy.", true)));
+    }),
+    ("chat-dm-unconfirmed", |s| {
+        dm_send_scene(s, |_| {});
+        pending_dm(
+            s,
+            Some((
+                "Freenet took it, but the room here doesn't show it. The room didn't keep this \
+                 message.",
+                false,
+            )),
+        );
+    }),
+    ("chat-dm-refused", |s| {
+        dm_send_scene(s, |c| {
+            c.dm_write("Are you around later?");
+            assert!(c.dm_send());
+            let ticket = c
+                .dm_waiting_ticket()
+                .expect("the send waits for its answer");
+            c.dm_sent(
+                "town-square",
+                chat::example::DM_PEER,
+                ticket,
+                Err(rooms::dm_send::Refusal::NotKept.text()),
+            );
+        });
+    }),
+    ("chat-dm-send-again", |s| {
+        dm_send_scene(s, |c| {
+            c.dm_write("Are you around later?");
+            let t0 = std::time::Instant::now();
+            assert!(c.dm_send_at(t0));
+            c.dm_tick(t0 + chat::dm_compose::ANSWER_WAIT);
+        });
+    }),
+    ("chat-dm-blocked", |s| {
+        dm_send_scene(s, |_| {});
+        let block = rooms::generation::UPDATE_REQUIRED_SEND;
+        let rooms: Vec<_> = s
+            .chat
+            .rooms()
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.send_block = Some(block.into());
+                r
+            })
+            .collect();
+        s.chat.set_rooms(rooms);
+    }),
+    ("chat-dm-narrow-typed", |s| {
+        dm_send_scene(s, |c| {
+            c.dm_write("Thanks, I'll read it tonight.\nWant to compare notes tomorrow?")
+        });
+    }),
     // Scenes named `*narrow*` are rendered at a narrow size (`--size 820x720`, see
     // `.github/workflows/apps.yml`): the layout follows the window's width, which a scene
     // cannot set. At the default size they look like the wide layout.
@@ -2287,6 +2383,33 @@ fn dm_scene(
     }
 }
 
+/// The example thread with Priya open, as a node's room (so the composer sends), then `tweak`.
+fn dm_send_scene(s: &mut RiverApp, tweak: impl FnOnce(&mut Chat)) {
+    dm_scene(s, Some(("town-square", chat::example::DM_PEER)), |_| {});
+    s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+    tweak(&mut s.chat);
+}
+
+/// Add to the open thread a message of the user's that has not been taken: on its way, or with
+/// `(why, retry)`.
+fn pending_dm(s: &mut RiverApp, failed: Option<(&str, bool)>) {
+    use chat::dm_model::{DmBody, DmMessage};
+    let mut snapshot = s.chat.dm.snapshot().clone();
+    let thread = std::sync::Arc::make_mut(&mut snapshot.threads[0]);
+    thread.messages.push(DmMessage {
+        key: "pending".into(),
+        outgoing: true,
+        timestamp: thread.last_ts + 600,
+        body: DmBody::Text("Sounds good, send me the notes.".into()),
+        pending: Some(chat::model::Pending {
+            entry: 1,
+            failed: failed.map(|(why, _)| why.to_owned()),
+            retry: failed.is_some_and(|(_, retry)| retry),
+        }),
+    });
+    s.chat.apply_dms(snapshot);
+}
+
 fn connect(s: &mut RiverApp) {
     s.setup = Setup::Connected {
         version: "0.2.155".into(),
@@ -2317,7 +2440,8 @@ pub fn spec() -> AppSpec<RiverApp> {
         setup: Some(load_logo),
         poll: Some(|s, _, tx| {
             s.sync_unread(tx);
-            false
+            // A send nobody answered says so, on the clock's time and not on a frame count.
+            s.chat.dm_tick(std::time::Instant::now())
         }),
         // Keys no focused control took, or any key while nothing has focus: Escape abandons a
         // reply or an edit even when the composer is not focused.
