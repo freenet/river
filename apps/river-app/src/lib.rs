@@ -4798,6 +4798,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Linux: Ctrl+Right stops at the end of the word in the fields of the dialogs opened here
+    /// (the do-not-disturb times, the join dialog's code and nickname), as in the composer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ctrl_right_stops_at_the_end_of_the_word_in_these_dialogs_fields() {
+        fn ctrl_right(rt: &mut Runtime<RiverApp>, shift: bool) {
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Right,
+                mods: rune::Mods {
+                    shift,
+                    cmd: true,
+                    ctrl: true,
+                    ..rune::Mods::default()
+                },
+            });
+            rt.frame(0.3);
+        }
+        fn check(
+            rt: &mut Runtime<RiverApp>,
+            field: &str,
+            get: fn(&mut RiverApp) -> &mut rune::TextEdit,
+        ) {
+            press(rt, field);
+            rt.update(move |s, _| {
+                let e = get(s);
+                e.replace_text("one two");
+                e.set_caret(0);
+            });
+            rt.frame(0.3);
+            ctrl_right(rt, false);
+            let mut at = (0, 0);
+            rt.update(|s, _| at = (get(s).anchor, get(s).focus));
+            assert_eq!(at, (3, 3), "{field}");
+            ctrl_right(rt, true);
+            rt.update(|s, _| at = (get(s).anchor, get(s).focus));
+            assert_eq!(at, (3, 7), "{field}, Shift");
+        }
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        check(&mut rt, "invite-code", |s| &mut s.chat.form.code);
+        check(&mut rt, "join-nickname", |s| &mut s.chat.form.nickname);
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| {
+            s.chat.dnd.pinned = true;
+            s.chat.dnd.now = 12 * 60;
+        });
+        settle(&mut rt);
+        press(&mut rt, "dnd");
+        press(&mut rt, "dnd-schedule");
+        check(&mut rt, "dnd-start", |s| &mut s.chat.dnd.start);
+        check(&mut rt, "dnd-end", |s| &mut s.chat.dnd.end);
+    }
+
     #[test]
     fn the_do_not_disturb_entry_opens_its_dialog_and_the_switch_shows_in_the_footer() {
         let board = rune::clipboard::memory();

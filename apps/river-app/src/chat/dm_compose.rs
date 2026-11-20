@@ -35,6 +35,7 @@ use super::model::Pending;
 use super::quick_reply::{MAX_DRAFT_CHARS, NO_ROOM, ReplyRefusal, appended, clean_reply};
 use super::style::{self as st, Palette};
 use super::view::label;
+use super::word_end::{Get, word_end_after};
 use super::{Chat, Source};
 use crate::RiverApp;
 use crate::rooms::dm_send::{self, BODY_CAP};
@@ -710,6 +711,7 @@ pub(super) fn composer(chat: &Chat, p: &Palette, k: &Kit) -> El {
         .as_ref()
         .and_then(|key| chat.dm.compose.drafts.get(key))
         .unwrap_or(&empty);
+    let get: Get = |s| s.chat.dm.compose_edit();
     let mut input = rune::text_input(edit, st::MESSAGE.lh(24.0))
         .key("dm-composer-field")
         .w_full()
@@ -720,15 +722,15 @@ pub(super) fn composer(chat: &Chat, p: &Palette, k: &Kit) -> El {
         .disabled(!editable);
     if editable {
         input = input
-            .on_input_key(|s: &mut RiverApp, ev, _| {
+            .on_input_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
                 // Escape leaves the thread, as it does from anywhere else in it; the draft stays.
                 let escape = ev.key == rune::Key::Escape;
                 if escape {
                     s.chat.close_dm();
                 }
                 escape
-            })
-            .on_edit(|s: &mut RiverApp| s.chat.dm.compose_edit())
+            }))
+            .on_edit(get)
             .on_submit(|s: &mut RiverApp, _| {
                 s.chat.dm_send();
             });

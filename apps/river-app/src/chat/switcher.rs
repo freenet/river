@@ -13,6 +13,7 @@ use super::conversation::avatar;
 use super::dialog_kit::DialogSpec;
 use super::style::{self as st, Palette};
 use super::view::label;
+use super::word_end::{Get, word_end_after};
 use crate::RiverApp;
 
 /// The most results one search returns.
@@ -411,19 +412,20 @@ pub(super) fn switcher_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
     let hits = chat.switcher_hits();
     let sel = chat.switcher_selected(&hits);
+    let get: Get = |s| &mut s.chat.switcher.as_mut().expect("open").query;
     let input = TextInput::new(&sw.query)
         .placeholder("Jump to a room or member")
         .width(None)
-        .on_edit(|s: &mut RiverApp| &mut s.chat.switcher.as_mut().expect("open").query)
+        .on_edit(get)
         .on_change(|s: &mut RiverApp, _| s.chat.switcher_edited())
-        .on_key(|s: &mut RiverApp, ev, _| {
+        .on_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
             if is_chord(ev) {
                 // Taken here whatever it does, so it never also reaches the window's handler.
                 s.chat.switcher_chord(std::time::Instant::now());
                 return true;
             }
             s.chat.switcher_key(ev)
-        })
+        }))
         .on_submit(|s: &mut RiverApp, _| s.chat.switcher_choose_selected())
         .build(k)
         .key("switcher-input")

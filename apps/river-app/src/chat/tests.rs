@@ -1213,7 +1213,9 @@ fn ctrl(rt: &mut Runtime<RiverApp>, key: Key, shift: bool) {
     rt.frame(0.3);
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: Ctrl+Right stops at the start of the next word. (Linux stops at the end of the word,
+/// see the next test; macOS uses Option and is not run here.)
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[test]
 fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
     let mut rt = render(connected(), WINDOW_SIZE);
@@ -1241,6 +1243,35 @@ fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
     ctrl(&mut rt, Key::Right, true);
     key(&mut rt, Key::Text("!".into()));
     assert_eq!(rt.state.chat.composer.text, "!Xthree");
+}
+
+/// Linux: Ctrl+Right stops at the end of the word (`word_end.rs`), Ctrl+Left and Ctrl+Backspace
+/// at the start of it, as in GTK and Chromium.
+#[cfg(target_os = "linux")]
+#[test]
+fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "composer-field");
+    key(&mut rt, Key::Text("one two three".into()));
+    ctrl(&mut rt, Key::Left, false);
+    key(&mut rt, Key::Text("X".into()));
+    assert_eq!(rt.state.chat.composer.text, "one two Xthree");
+    ctrl(&mut rt, Key::Left, false);
+    ctrl(&mut rt, Key::Left, false);
+    ctrl(&mut rt, Key::Left, false);
+    key(&mut rt, Key::Text("Y".into()));
+    assert_eq!(rt.state.chat.composer.text, "Yone two Xthree");
+    ctrl(&mut rt, Key::Right, false);
+    key(&mut rt, Key::Text("Z".into()));
+    // Forward by word goes to the end of the word: Z joins "Yone".
+    assert_eq!(rt.state.chat.composer.text, "YoneZ two Xthree");
+    // Ctrl+Backspace deletes the word before the caret, not the line before it.
+    ctrl(&mut rt, Key::Backspace, false);
+    assert_eq!(rt.state.chat.composer.text, " two Xthree");
+    // Ctrl+Shift+Right selects by word, up to the end of the next word.
+    ctrl(&mut rt, Key::Right, true);
+    key(&mut rt, Key::Text("!".into()));
+    assert_eq!(rt.state.chat.composer.text, "! Xthree");
 }
 
 #[test]
@@ -6145,13 +6176,13 @@ mod rune_bump {
         );
     }
 
-    /// Forward word keys: off macOS (Windows and Linux alike, for now) the start of the next
-    /// word, Rune's rule since 2026-11-12; on macOS the end of the word. Backwards is the start
-    /// of the word everywhere. Ian wants end-of-word on Linux too (GTK, Qt, Chromium); that
-    /// lands in a follow-up change, which will give Linux its own block here.
-    #[cfg(target_os = "macos")]
+    /// Forward word keys: on Windows the start of the next word (Rune's rule since 2026-11-12);
+    /// on macOS (Option) the end of the word, and on Linux too (GTK, Qt and Chromium do):
+    /// River's `word_end.rs` gives Linux what Rune gives macOS. Backwards is the start of the
+    /// word everywhere. Ctrl+Delete is Rune's on Linux (the start of the next word).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FORWARD_STOPS: [usize; 5] = [3, 14, 19, 27, 29];
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     const FORWARD_STOPS: [usize; 5] = [5, 15, 22, 28, 29];
 
     fn to_start(rt: &mut Runtime<RiverApp>) {
@@ -6207,9 +6238,9 @@ mod rune_bump {
         to_start(&mut rt);
         word_key(&mut rt, Key::Right, true);
         word_key(&mut rt, Key::Delete, false);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
     }
 
@@ -6547,5 +6578,354 @@ mod rune_bump {
             "Some(Rtl)",
             "the next draft is still right to left"
         );
+    }
+    // ---- end-of-word Ctrl+Right on Linux (`word_end.rs`) -------------------------------------
+
+    /// Linux only: the other platforms keep Rune's rule, which `ctrl_right_moves_a_word_forward_by_the_platforms_rule`
+    /// above pins per platform (the start of the next word on Windows, the end on macOS).
+    #[cfg(target_os = "linux")]
+    mod linux_end_of_word {
+        use super::*;
+
+        fn set(rt: &mut Runtime<RiverApp>, text: &str, anchor: usize, focus: usize) {
+            let text = text.to_owned();
+            rt.update(move |s, _| {
+                s.chat.composer.replace_text(text);
+                s.chat.composer.set_selection(anchor, focus);
+            });
+            rt.frame(0.3);
+        }
+
+        fn fresh(text: &str, anchor: usize, focus: usize) -> Runtime<RiverApp> {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            press(&mut rt, "composer-field");
+            set(&mut rt, text, anchor, focus);
+            rt
+        }
+
+        fn right(rt: &mut Runtime<RiverApp>, shift: bool) {
+            word_key(rt, Key::Right, shift);
+        }
+
+        /// Ctrl+Right from the start steps through the words' ends, whatever the text holds.
+        #[test]
+        fn ctrl_right_stops_at_the_end_of_each_unicode_word() {
+            let mut rt = fresh(LINE, 0, 0);
+            let mut stops = Vec::new();
+            for _ in 0..5 {
+                right(&mut rt, false);
+                stops.push(composer(&rt).2);
+            }
+            assert_eq!(stops, [3, 14, 19, 27, 29]);
+            // Ctrl+Shift+Right is the same stop, with the anchor kept.
+            let mut rt = fresh(LINE, 0, 0);
+            right(&mut rt, true);
+            assert_eq!((composer(&rt).1, composer(&rt).2), (0, 3));
+            right(&mut rt, true);
+            assert_eq!((composer(&rt).1, composer(&rt).2), (0, 14));
+        }
+
+        /// A key that moves the caret in Rune's own way and one of ours land in the same state:
+        /// the text, the focus and the anchor.
+        #[test]
+        fn the_caret_lands_off_the_middle_of_a_grapheme_cluster() {
+            for (text, end) in [
+                ("cafe\u{301} au", "cafe\u{301}".len()),
+                ("1\u{FE0F}\u{20E3} x", "1\u{FE0F}\u{20E3}".len()),
+                (
+                    "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} hi",
+                    "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} hi".len(),
+                ),
+            ] {
+                let mut rt = fresh(text, 0, 0);
+                right(&mut rt, false);
+                assert_eq!(composer(&rt).2, end, "{text:?}");
+            }
+        }
+
+        /// A selection collapses to its end, as Rune does on every platform; Shift extends it.
+        #[test]
+        fn ctrl_right_with_a_selection_collapses_it_and_shift_extends_it() {
+            let mut rt = fresh("one two three", 0, 3);
+            right(&mut rt, false);
+            assert_eq!(composer(&rt), ("one two three", 3, 3));
+            let mut rt = fresh("one two three", 7, 4);
+            right(&mut rt, false);
+            assert_eq!(
+                (composer(&rt).1, composer(&rt).2),
+                (7, 7),
+                "to the larger end"
+            );
+            let mut rt = fresh("one two three", 2, 4);
+            right(&mut rt, true);
+            assert_eq!((composer(&rt).1, composer(&rt).2), (2, 7));
+        }
+
+        /// Text with right-to-left characters moves by Rune's rule (the line as drawn). A
+        /// forced direction too, either way.
+        #[test]
+        fn right_to_left_text_and_forced_direction_keep_runes_rule() {
+            for text in [
+                "\u{5E9}\u{5DC}\u{5D5}\u{5DD} \u{5E2}\u{5D5}\u{5DC}\u{5DD} hello there",
+                "hello \u{645}\u{631}\u{62D}\u{628}\u{627} there",
+            ] {
+                let mut rt = fresh(text, 0, 0);
+                right(&mut rt, false);
+                let rune_at = composer(&rt).2;
+                // The override's answer would be the logical end of the first word.
+                let end_of_first = rune::TextEdit::new(text);
+                let ours =
+                    super::super::super::word_end::forward_word_end(&end_of_first, 0).unwrap();
+                assert!(
+                    rune_at != ours || text.starts_with("hello"),
+                    "{text:?}: the caret went to {rune_at}, the end-of-word rule's {ours}"
+                );
+            }
+            // Latin text, direction forced to right to left: Ctrl+Right moves visually, which
+            // here is back; the override's stop would be 3.
+            let mut rt = fresh("one two", 0, 0);
+            chord(&mut rt, PhysicalKeyCode::ShiftRight);
+            assert!(rt.state.chat.composer.forced_dir().is_some());
+            set(&mut rt, "one two", 0, 0);
+            right(&mut rt, false);
+            assert_ne!(composer(&rt).2, 3, "Rune's rule, not the override's");
+        }
+
+        /// Typing after the move is an undo step of its own, as after any caret move in Rune.
+        #[test]
+        fn typing_after_ctrl_right_is_a_separate_undo_step() {
+            let mut rt = fresh("one two", 0, 0);
+            key(&mut rt, Key::Text("X".into()));
+            right(&mut rt, false);
+            key(&mut rt, Key::Text("Y".into()));
+            assert_eq!(composer(&rt).0, "XoneY two");
+            command(&mut rt, 'z');
+            assert_eq!(composer(&rt).0, "Xone two");
+            command(&mut rt, 'z');
+            assert_eq!(composer(&rt).0, "one two");
+            // Where the caret has nowhere to go, the key still closes the step (Rune's does).
+            let mut rt = fresh("one", 3, 3);
+            key(&mut rt, Key::Text("X".into()));
+            right(&mut rt, false);
+            key(&mut rt, Key::Text("Y".into()));
+            command(&mut rt, 'z');
+            assert_eq!(composer(&rt).0, "oneX");
+        }
+
+        /// Ctrl+Delete is Rune's on Linux (to the start of the next word), with Rune's undo: one
+        /// step per press, the caret collapsed where it was.
+        #[test]
+        fn ctrl_delete_is_runes_and_undoes_to_a_collapsed_caret() {
+            let mut rt = fresh("one two three", 0, 0);
+            word_key(&mut rt, Key::Delete, false);
+            assert_eq!(composer(&rt), ("two three", 0, 0));
+            word_key(&mut rt, Key::Delete, false);
+            assert_eq!(composer(&rt), ("three", 0, 0));
+            command(&mut rt, 'z');
+            assert_eq!(composer(&rt), ("two three", 0, 0));
+            command(&mut rt, 'z');
+            assert_eq!(composer(&rt), ("one two three", 0, 0));
+        }
+
+        /// Alt+Right and Ctrl+Alt+Right are Rune's: the start of the next word.
+        #[test]
+        fn alt_right_chords_are_runes() {
+            for (alt, ctrl) in [(true, false), (true, true)] {
+                let mut rt = fresh("one two three", 0, 0);
+                rt.key(KeyEvent {
+                    key: Key::Right,
+                    mods: rune::Mods {
+                        alt,
+                        ctrl,
+                        cmd: ctrl,
+                        ..rune::Mods::default()
+                    },
+                });
+                rt.frame(0.3);
+                assert_eq!(composer(&rt).2, 4, "alt {alt} ctrl {ctrl}");
+            }
+        }
+
+        /// Up, Ctrl+Right, Down goes where the same Down would from a caret set there: the
+        /// move forgets the column the earlier Up and Down kept.
+        #[test]
+        fn the_column_a_run_of_up_and_down_kept_is_forgotten() {
+            let text = "abcdefghij\nkl mn opqr\nstuvwxyzab";
+            let down_from = |through_ctrl_right: bool| {
+                let mut rt = fresh(text, 8, 8);
+                key(&mut rt, Key::Down);
+                assert!(composer(&rt).2 > 11, "the second line");
+                if through_ctrl_right {
+                    right(&mut rt, false);
+                    assert_eq!(composer(&rt).2, 21, "the end of opqr");
+                } else {
+                    set(&mut rt, text, 21, 21);
+                }
+                key(&mut rt, Key::Down);
+                composer(&rt).2
+            };
+            assert_eq!(down_from(true), down_from(false));
+        }
+
+        /// With the @mention popup open, Ctrl+Right moves the caret and the popup stays what it
+        /// was for the text before the caret.
+        #[test]
+        fn the_mention_popup_is_unchanged_by_ctrl_right() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            type_text(&mut rt, "hi @ma");
+            assert!(rt.state.chat.mention_popup().is_some());
+            key(&mut rt, Key::Left);
+            key(&mut rt, Key::Left);
+            let before = mention_names(&rt);
+            assert!(!before.is_empty());
+            right(&mut rt, false);
+            assert_eq!(composer(&rt).2, 6, "the end of @ma");
+            assert!(rt.state.chat.mention_popup().is_some());
+            let mut reference = render(connected(), WINDOW_SIZE);
+            type_text(&mut reference, "hi @ma");
+            assert_eq!(mention_names(&rt), mention_names(&reference));
+        }
+
+        /// While an input method composition is open the override stays out of it: Rune's rule
+        /// answers (the start of the next word, 4), not the end of the word (3).
+        #[test]
+        fn a_composition_in_progress_is_left_alone() {
+            let mut rt = fresh("one two", 0, 0);
+            composing(&mut rt);
+            right(&mut rt, false);
+            assert_eq!(composer(&rt).2, 4);
+        }
+
+        /// The import box's word keys still clear its warning: nothing about the text changed
+        /// for Ctrl+Right, and Ctrl+Delete and Ctrl+Backspace are Rune's own edits.
+        #[test]
+        fn ctrl_right_in_the_import_box_moves_and_leaves_its_warning() {
+            const BAD: &str =
+                "-----BEGIN RIVER IDENTITY-----\n3mJr7AoUXx2Wqd\n-----END RIVER IDENTITY-----";
+            let mut app = connected();
+            let rooms = super::super::super::example::data().rooms;
+            app.chat.source =
+                super::super::super::Source::Node(super::super::super::LinkStatus::Live);
+            app.chat.show_node_rooms(
+                rooms,
+                None,
+                super::super::super::LinkStatus::Live,
+                29_000_000,
+            );
+            let mut rt = render(app, WINDOW_SIZE);
+            rt.update(|s, _| {
+                s.chat.open_import();
+                s.chat.form.token.replace_text(BAD);
+                s.chat.submit_import();
+            });
+            rt.frame(0.3);
+            assert!(rt.state.chat.form.error.is_some());
+            press(&mut rt, "import-token");
+            rt.update(|s, _| s.chat.form.token.set_caret(0));
+            right(&mut rt, false);
+            assert_eq!(rt.state.chat.form.token.focus, 10, "the end of BEGIN");
+            assert!(
+                rt.state.chat.form.error.is_some(),
+                "a caret move is no edit"
+            );
+            word_key(&mut rt, Key::Delete, false);
+            assert!(rt.state.chat.form.error.is_none(), "an edit clears it");
+        }
+
+        /// What each field does with Ctrl+Right: the end of "one", from the start of "one two".
+        fn assert_end_of_word(
+            rt: &mut Runtime<RiverApp>,
+            field: &str,
+            get: super::super::super::word_end::Get,
+        ) {
+            press(rt, field);
+            rt.update(move |s, _| {
+                let e = get(s);
+                e.replace_text("one two");
+                e.set_caret(0);
+            });
+            rt.frame(0.3);
+            right(rt, false);
+            let mut at = (0, 0);
+            rt.update(|s, _| at = (get(s).anchor, get(s).focus));
+            assert_eq!(at, (3, 3), "{field}");
+            right(rt, true);
+            rt.update(|s, _| at = (get(s).anchor, get(s).focus));
+            assert_eq!(at, (3, 7), "{field}, Shift");
+        }
+
+        #[test]
+        fn the_nickname_field_stops_at_the_end_of_the_word() {
+            let mut rt = own_dialog(|_| {});
+            assert_end_of_word(&mut rt, "member-nickname-input", |s| &mut s.chat.nickname);
+        }
+
+        #[test]
+        fn the_room_details_fields_stop_at_the_end_of_the_word() {
+            let mut rt = details_open(OWNED);
+            assert_end_of_word(&mut rt, "details-name-input", |s| {
+                &mut s.chat.details.as_mut().unwrap().name
+            });
+            assert_end_of_word(&mut rt, "details-limit-0", |s| {
+                &mut s.chat.details.as_mut().unwrap().limits[0]
+            });
+        }
+
+        #[test]
+        fn the_search_box_stops_at_the_end_of_the_word() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            rt.update(|s, _| {
+                s.chat.search_chord();
+            });
+            rt.frame(0.3);
+            assert_end_of_word(&mut rt, "search-input", |s| {
+                &mut s.chat.search.as_mut().unwrap().query
+            });
+        }
+
+        #[test]
+        fn the_switcher_box_stops_at_the_end_of_the_word() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            rt.update(|s, _| {
+                s.chat.switcher_chord(std::time::Instant::now());
+            });
+            rt.frame(0.3);
+            assert_end_of_word(&mut rt, "switcher-input", |s| {
+                &mut s.chat.switcher.as_mut().unwrap().query
+            });
+        }
+
+        /// A bare caret move in the search and quick switcher boxes does not send the
+        /// highlight back to the top; an edit does.
+        #[test]
+        fn a_caret_move_keeps_the_search_and_switcher_highlight() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            rt.update(|s, _| {
+                s.chat.source =
+                    super::super::super::Source::Node(super::super::super::LinkStatus::Live);
+                s.chat.switcher_chord(std::time::Instant::now());
+            });
+            rt.frame(0.3);
+            press(&mut rt, "switcher-input");
+            rt.update(|s, _| {
+                let sw = s.chat.switcher.as_mut().unwrap();
+                sw.query.replace_text("a e");
+                sw.query.set_caret(0);
+                s.chat.switcher_edited();
+                s.chat.switcher_move(1);
+            });
+            rt.frame(0.3);
+            let sel = |rt: &Runtime<RiverApp>| {
+                let hits = rt.state.chat.switcher_hits();
+                (hits.len(), rt.state.chat.switcher_selected(&hits))
+            };
+            let (n, before) = sel(&rt);
+            assert!(n > 1 && before == 1, "{n} hits, selected {before}");
+            right(&mut rt, false);
+            assert_eq!(rt.state.chat.switcher.as_ref().unwrap().query.focus, 1);
+            assert_eq!(sel(&rt).1, 1, "a caret move keeps the highlight");
+            key(&mut rt, Key::Text("z".into()));
+            assert_eq!(sel(&rt).1, 0, "an edit starts again at the top");
+        }
     }
 }

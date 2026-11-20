@@ -15,6 +15,7 @@ use super::Chat;
 use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, notice_text, notice_text_in};
 use super::style::{self as st, Palette};
 use super::view::label;
+use super::word_end::{Get, word_end};
 use crate::RiverApp;
 use crate::address::{NodeAddress, NodeChoice, Source};
 
@@ -220,12 +221,14 @@ pub fn screen(chat: &Chat, connected: bool, k: &Kit) -> Option<Screen> {
             ],
         });
     }
+    let get: Get = |s| &mut s.chat.node.form.as_mut().expect("open").input;
     let mut content = vec![
         TextInput::new(&form.input)
             .label("Node address".to_owned())
             .placeholder("localhost:7509".to_owned())
             .width(None)
-            .on_edit(|s: &mut RiverApp| &mut s.chat.node.form.as_mut().expect("open").input)
+            .on_edit(get)
+            .on_key(word_end(get))
             .on_submit(|s: &mut RiverApp, _| s.node_submit())
             .build(k)
             .key("node-input")

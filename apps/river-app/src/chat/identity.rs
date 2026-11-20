@@ -26,6 +26,7 @@ use rune_kit::{Button, ButtonVariant, Kit, TextArea};
 use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, notice_text};
 use super::style::{self as st};
 use super::view::label;
+use super::word_end::{Get, word_end};
 use super::{Chat, DialogKind};
 use crate::RiverApp;
 use crate::rooms::Action;
@@ -291,6 +292,7 @@ pub(super) fn export_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
 /// "Import identity", when it is the open dialog.
 pub(super) fn import_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     let p = st::palette();
+    let get: Get = |s| &mut s.chat.form.token;
     let mut body = DialogSpec::new("import-identity", "Import identity", |s: &mut RiverApp| {
         s.chat.close_dialog()
     })
@@ -312,7 +314,8 @@ pub(super) fn import_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .rows(6)
             .max_height(180.0)
             .wrap_anywhere()
-            .on_edit(|s: &mut RiverApp| &mut s.chat.form.token)
+            .on_edit(get)
+            .on_key(word_end(get))
             .on_change(|s: &mut RiverApp, _| s.chat.import_token_edited())
             .build(k)
             .key("import-token")

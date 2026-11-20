@@ -32,6 +32,7 @@ use super::overview::Reveal;
 use super::style::{self as st, Palette};
 use super::switcher::{fold_char, window};
 use super::view::label;
+use super::word_end::{Get, word_end_after};
 use super::{Chat, markdown};
 use crate::RiverApp;
 
@@ -544,19 +545,20 @@ pub(super) fn search_panel(
     let s = chat.search.as_ref()?;
     let found = chat.search_results();
     let sel = chat.search_selected(&found.hits);
+    let get: Get = |s| &mut s.chat.search.as_mut().expect("open").query;
     let input = TextInput::new(&s.query)
         .placeholder("Search this room")
         .width(None)
-        .on_edit(|s: &mut RiverApp| &mut s.chat.search.as_mut().expect("open").query)
+        .on_edit(get)
         .on_change(|s: &mut RiverApp, _| s.chat.search_edited())
-        .on_key(|s: &mut RiverApp, ev, _| {
+        .on_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
             if is_chord(ev) {
                 // Taken here whatever it does, so it never also reaches the window's handler.
                 s.chat.search_chord();
                 return true;
             }
             s.chat.search_key(ev)
-        })
+        }))
         .on_submit(|s: &mut RiverApp, _| s.chat.search_jump_selected(Instant::now()))
         .build(k)
         .key("search-input")

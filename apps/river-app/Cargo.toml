@@ -47,6 +47,9 @@ blake3 = "1"
 toml = "0.8"
 # Names (:smile:) for the emoji the picker lists; the glyph list itself stays in src/chat/emoji.rs.
 emojis = "0.9.1"
+# Word boundaries (UAX #29) for end-of-word Ctrl+Right on Linux (src/chat/word_end.rs): the crate
+# and version Rune uses, so the two cut a word the same way.
+unicode-segmentation = "1"
 
 [dev-dependencies]
 # Encrypting test rooms needs the randomized helpers.

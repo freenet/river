@@ -28,6 +28,7 @@ use super::icons;
 use super::model::Room;
 use super::style::{self as st, Palette};
 use super::view::label;
+use super::word_end::{Get, word_end};
 use super::{Chat, Source};
 use crate::RiverApp;
 use crate::rooms::dm_invite::{MAX_NOTE_CHARS, note_refusal};
@@ -352,12 +353,14 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             st::SMALL_STRONG,
             p.text_muted,
         ));
+        let get: Get = |s| &mut s.chat.dm.invite.picker.note;
         body = body.child(
             TextInput::new(&chat.dm.invite.picker.note)
                 .label("Personal note (optional)")
                 .placeholder("e.g. Thought you would enjoy this room")
                 .width(None)
-                .on_edit(|s: &mut RiverApp| &mut s.chat.dm.invite.picker.note)
+                .on_edit(get)
+                .on_key(word_end(get))
                 .on_submit(|s: &mut RiverApp, _| {
                     s.chat.invite_send();
                 })

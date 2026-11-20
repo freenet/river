@@ -1195,6 +1195,41 @@ mod sending {
             .to_string()
     }
 
+    /// Linux: Ctrl+Right in a direct message box stops at the end of the word, as in the
+    /// room's composer, and Ctrl+Shift+Right extends to it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ctrl_right_in_the_direct_message_box_stops_at_the_end_of_the_word() {
+        let (mut rt, _) = open_with("Jonas");
+        type_text(&mut rt, "one two");
+        rt.update(|s, _| s.chat.dm.compose_edit().set_caret(0));
+        rt.frame(0.3);
+        let word_right = |rt: &mut Runtime<RiverApp>, shift| {
+            rt.key(KeyEvent {
+                key: Key::Right,
+                mods: Mods {
+                    shift,
+                    cmd: true,
+                    ctrl: true,
+                    ..Mods::default()
+                },
+            });
+            rt.frame(0.3);
+        };
+        let at = |rt: &mut Runtime<RiverApp>| {
+            let mut at = (0, 0);
+            rt.update(|s, _| {
+                let e = s.chat.dm.compose_edit();
+                at = (e.anchor, e.focus);
+            });
+            at
+        };
+        word_right(&mut rt, false);
+        assert_eq!(at(&mut rt), (3, 3));
+        word_right(&mut rt, true);
+        assert_eq!(at(&mut rt), (3, 7));
+    }
+
     /// The app reading rooms from a node, with the thread with `name` open and its box focused.
     fn open_with(name: &str) -> (Runtime<RiverApp>, String) {
         let mut rt = app();

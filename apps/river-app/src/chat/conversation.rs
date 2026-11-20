@@ -11,6 +11,7 @@ use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label};
+use super::word_end::{Get, word_end_after};
 use super::{Chat, Mode};
 use crate::RiverApp;
 use crate::rooms::modes::NotificationMode;
@@ -847,6 +848,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     };
     // A multi-line field that grows with its text (up to eight lines), so Shift+Enter (or
     // Option+Enter) inserts a newline and plain Enter sends, as in the web UI.
+    let get: Get = |s| &mut s.chat.composer;
     let mut input = rune::text_input(&chat.composer, st::MESSAGE.lh(24.0))
         .key("composer-field")
         .w_full()
@@ -857,8 +859,10 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .disabled(!can_send);
     if can_send {
         input = input
-            .on_input_key(|s: &mut RiverApp, ev, _| composer_key(s, ev))
-            .on_edit(|s: &mut RiverApp| &mut s.chat.composer)
+            .on_input_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
+                composer_key(s, ev)
+            }))
+            .on_edit(get)
             .on_submit(|s: &mut RiverApp, _| {
                 s.chat.send();
             });

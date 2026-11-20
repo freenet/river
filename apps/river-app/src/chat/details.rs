@@ -37,6 +37,7 @@ use super::markdown;
 use super::model::{Details, Editable, Limits, Role, Room, RotateOffer};
 use super::style::{self as st, Palette};
 use super::view::label;
+use super::word_end::{Get, word_end};
 use super::{Chat, Mode, Source};
 use crate::RiverApp;
 use crate::rooms::outbox::{Action, ConfigEdit, LIMIT_LABELS, details_refusal, lowering_warnings};
@@ -577,13 +578,15 @@ fn description_section(
         section = section.child(head);
     }
     if editable && form.editing_description {
+        let get: Get = |s| &mut s.chat.details.as_mut().expect("open").description;
         return section.child(
             TextArea::new(&form.description)
                 .label("Room Description".to_owned())
                 .placeholder("Optional room description".to_owned())
                 .width(None)
                 .auto_grow(2, 4)
-                .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").description)
+                .on_edit(get)
+                .on_key(word_end(get))
                 .build(k)
                 .key("details-description-input")
                 .w_full(),
@@ -692,8 +695,6 @@ fn rotation_status(room: &Room, p: &Palette, k: &Kit) -> Option<El> {
     Some(status)
 }
 
-type Get = fn(&mut RiverApp) -> &mut rune::TextEdit;
-
 fn limit_input(i: usize, label_text: &str, form: &DetailsForm, k: &Kit) -> El {
     let get: Get = match i {
         0 => |s| &mut s.chat.details.as_mut().expect("open").limits[0],
@@ -708,6 +709,7 @@ fn limit_input(i: usize, label_text: &str, form: &DetailsForm, k: &Kit) -> El {
         .label(label_text.to_owned())
         .width(None)
         .on_edit(get)
+        .on_key(word_end(get))
         .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
         .build(k)
         .key(format!("details-limit-{i}"))
@@ -1029,13 +1031,15 @@ fn leave_button(k: &Kit) -> El {
 
 /// The owner's name field.
 fn name_field(form: &DetailsForm, p: &Palette, k: &Kit) -> El {
+    let get: Get = |s| &mut s.chat.details.as_mut().expect("open").name;
     captioned(
         "Room Name".into(),
         TextInput::new(&form.name)
             .label("Room Name".to_owned())
             .placeholder("Room name".to_owned())
             .width(None)
-            .on_edit(|s: &mut RiverApp| &mut s.chat.details.as_mut().expect("open").name)
+            .on_edit(get)
+            .on_key(word_end(get))
             .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
             .build(k)
             .key("details-name-input")

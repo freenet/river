@@ -21,6 +21,7 @@ use super::icons;
 use super::model::{Appointer, BanOffer, Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::label;
+use super::word_end::{Get, word_end};
 use super::{Chat, Source};
 use crate::RiverApp;
 
@@ -141,12 +142,14 @@ fn nickname_editor(room: &Room, m: &Member, chat: &Chat, p: &Palette, k: &Kit) -
             .clone()
             .filter(|_| chat.nickname.text.trim().is_empty())
     });
+    let get: Get = |s| &mut s.chat.nickname;
     let mut editor = col().key("member-nickname-edit").w_full().gap(8.0).child(
         TextInput::new(&chat.nickname)
             .label("Nickname".to_owned())
             .placeholder("Your nickname in this room".to_owned())
             .width(None)
-            .on_edit(|s: &mut RiverApp| &mut s.chat.nickname)
+            .on_edit(get)
+            .on_key(word_end(get))
             .on_submit(|s: &mut RiverApp, _| s.chat.submit_nickname())
             .build(k)
             .key("member-nickname-input")

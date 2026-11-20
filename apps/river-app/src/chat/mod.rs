@@ -64,6 +64,7 @@ mod tests;
 mod update_view;
 mod view;
 pub(crate) mod visual_fold;
+pub(crate) mod word_end;
 pub mod zoom;
 
 pub use background::{BackgroundHost, BackgroundUi};

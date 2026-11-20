@@ -135,6 +135,32 @@ fn node_of(rt: &Runtime<RiverApp>) -> NodeChoice {
     rt.state.chat.node.choice.clone()
 }
 
+/// Linux: Ctrl+Right stops at the end of the word in the node address box too.
+#[cfg(target_os = "linux")]
+#[test]
+fn ctrl_right_in_the_node_address_box_stops_at_the_end_of_the_word() {
+    let (mut rt, _) = app_with(Setup::NotInstalled, Access::Connecting);
+    press(&mut rt, "use-node");
+    press(&mut rt, "node-input");
+    rt.update(|s, _| {
+        let e = &mut s.chat.node.form.as_mut().expect("open").input;
+        e.replace_text("one two");
+        e.set_caret(0);
+    });
+    rt.frame(0.3);
+    rt.key(rune::KeyEvent {
+        key: rune::Key::Right,
+        mods: rune::Mods {
+            cmd: true,
+            ctrl: true,
+            ..rune::Mods::default()
+        },
+    });
+    rt.frame(0.3);
+    let form = rt.state.chat.node.form.as_ref().expect("open");
+    assert_eq!((form.input.anchor, form.input.focus), (3, 3));
+}
+
 #[test]
 fn first_run_offers_a_node_the_person_already_has_next_to_installing() {
     let (mut rt, _) = app_with(Setup::NotInstalled, Access::Connecting);

@@ -12,6 +12,7 @@ use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
 use super::visual_fold;
+use super::word_end::{Get, word_end, word_end_after};
 use super::{Chat, DialogKind, InviteState, JoinPreview, LinkStatus, Source};
 use crate::RiverApp;
 use crate::rooms::work::{WorkState, WorkView};
@@ -149,17 +150,17 @@ fn link_menu(chat: &Chat, k: &Kit, layer: &mut Vec<El>) -> El {
     .build(k, layer)
 }
 
-type Get = fn(&mut RiverApp) -> &mut rune::TextEdit;
-
 /// The join dialog's invite code box. Each edit decides what the code is
 /// ([`Chat::join_code_edited`]). The word keys edit without the field's change hook, so the
 /// change is noticed there, as in the import dialog.
 fn join_code_field(chat: &Chat, k: &Kit) -> El {
+    let get: Get = |s| &mut s.chat.form.code;
     TextInput::new(&chat.form.code)
         .label("Invite code")
         .placeholder("Invite code or link")
         .width(None)
-        .on_edit(|s: &mut RiverApp| &mut s.chat.form.code)
+        .on_edit(get)
+        .on_key(word_end(get))
         .on_change(|s: &mut RiverApp, _| s.chat.join_code_edited())
         .on_submit(|s: &mut RiverApp, _| s.chat.submit_join())
         .build(k)
@@ -201,6 +202,7 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .placeholder(placeholder.to_owned())
             .width(None)
             .on_edit(get)
+            .on_key(word_end(get))
             .on_submit(move |s: &mut RiverApp, _| submit(s))
             .build(k)
             .key(key.to_owned())
@@ -1059,11 +1061,14 @@ fn member_search_box(chat: &Chat, p: &Palette, k: &Kit) -> Option<El> {
     if !s.open {
         return None;
     }
+    let get: Get = |s| &mut s.chat.member_search.query;
     let input = TextInput::new(&s.query)
         .placeholder("Search members")
         .width(None)
-        .on_edit(|s: &mut RiverApp| &mut s.chat.member_search.query)
-        .on_key(|s: &mut RiverApp, ev, _| ev.key == rune::Key::Escape && s.chat.escape())
+        .on_edit(get)
+        .on_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
+            ev.key == rune::Key::Escape && s.chat.escape()
+        }))
         .build(k)
         .key("member-search-input")
         .grow(1.0)

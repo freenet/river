@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::dialog_kit::{self as dk, DialogSpec};
 use super::style::{self as st};
 use super::view::label;
+use super::word_end::{Get, word_end};
 use crate::RiverApp;
 use crate::notify::Arrival;
 
@@ -318,6 +319,8 @@ pub(super) fn dnd_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
             .key("dnd-schedule"),
     );
     if d.settings.schedule.is_some() {
+        let start: Get = |s| &mut s.chat.dnd.start;
+        let end: Get = |s| &mut s.chat.dnd.end;
         body = body.child(
             rune::row()
                 .key("dnd-times")
@@ -328,7 +331,8 @@ pub(super) fn dnd_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
                         .label("From".to_owned())
                         .placeholder("22:00".to_owned())
                         .width(None)
-                        .on_edit(|s: &mut RiverApp| &mut s.chat.dnd.start)
+                        .on_edit(start)
+                        .on_key(word_end(start))
                         .build(k)
                         .key("dnd-start")
                         .grow(1.0),
@@ -338,7 +342,8 @@ pub(super) fn dnd_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
                         .label("Until".to_owned())
                         .placeholder("07:00".to_owned())
                         .width(None)
-                        .on_edit(|s: &mut RiverApp| &mut s.chat.dnd.end)
+                        .on_edit(end)
+                        .on_key(word_end(end))
                         .build(k)
                         .key("dnd-end")
                         .grow(1.0),

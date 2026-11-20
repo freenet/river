@@ -3657,6 +3657,7 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "tungstenite",
+ "unicode-segmentation",
  "ureq",
  "zeroize",
 ]
