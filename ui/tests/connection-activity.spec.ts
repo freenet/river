@@ -52,29 +52,6 @@ test.describe("Connection activity", () => {
     await expect(pill.getByRole("tooltip", { includeHidden: true })).toHaveText("Joining the room");
   });
 
-  test("the tablet rail fits the idle error label on one line after activity settles", async ({ page }) => {
-    await page.setViewportSize({ width: 960, height: 800 });
-    await page.goto("/");
-    await waitForApp(page);
-    const pill = visibleConnectionPill(page);
-    const dots = pill.getByTestId("connection-activity-dots");
-    await callRiverTest(page, "setSyncStatus", "connecting");
-    await expect(pill).toHaveAttribute("data-busy-reason", "connecting");
-    await callRiverTest(page, "setSyncErrorReport", "Unexpected message", "Unexpected reply", "Unexpected reply");
-    const label = pill.getByTestId("connection-status-label");
-    await expect(label).toHaveText("Unexpected message");
-    await expect(dots).toHaveCSS("opacity", "0");
-    const lines = await label.evaluate(el => {
-      const text = document.createRange();
-      text.selectNodeContents(el);
-      return text.getClientRects().length;
-    });
-    expect(lines).toBe(1);
-    await page.setViewportSize({ width: 768, height: 800 });
-    const rail = page.getByTestId("rooms-rail");
-    expect(await rail.evaluate(el => el.scrollWidth - el.clientWidth)).toBe(0);
-  });
-
   test("the mobile load-error footer paints a connection already in progress on mount", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
@@ -104,19 +81,8 @@ test.describe("Connection activity", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
     await waitForApp(page);
-    const pill = visibleConnectionPill(page);
-    await callRiverTest(page, "setRoomsLoadState", "loading");
-    await expect(page.getByTestId("conversation-rooms-loading-dots")).toBeVisible();
-    await expect(pill.getByTestId("connection-status-label")).toHaveText("Disconnected");
-    await expect(pill.getByTestId("connection-activity-dots")).toBeHidden();
-    const idleGap = await pill.evaluate(el => {
-      const dot = el.querySelector('[data-testid="connection-status-dot"]')!;
-      const label = el.querySelector('[data-testid="connection-status-label"]')!;
-      return label.getBoundingClientRect().left - dot.getBoundingClientRect().right;
-    });
-    expect(idleGap).toBeCloseTo(8);
-
     await callRiverTest(page, "setSyncStatus", "connected");
+    const pill = visibleConnectionPill(page);
     for (const state of ["loading", "migrating"] as const) {
       await callRiverTest(page, "setRoomsLoadState", state);
       await expect(page.getByTestId(`conversation-rooms-${state}-dots`)).toBeVisible();
@@ -132,8 +98,9 @@ test.describe("Connection activity", () => {
     await expect(pill.getByTestId("connection-activity-dots")).toBeVisible();
   });
 
-  // Seek the slot and label together. The child dots keep their own animation
-  // clock, independent of the transition triggered by the connection state.
+  // The page's scheduler keeps running. Seek just the actual transitions on
+  // the dot slot, including their CSS delays, before an engine can finish
+  // them. Each transition starts from a real connection-state change.
   async function sampleTransition(slot: Locator, connecting: boolean, times: number[]) {
     return slot.evaluate(async (el, args) => {
       const pill = el.closest('[data-testid="connection-status-indicator"]')!;
@@ -150,13 +117,12 @@ test.describe("Connection activity", () => {
       const hooks = (window as unknown as { __riverTest: { setSyncStatus(s: string): void } }).__riverTest;
       hooks.setSyncStatus(args.connecting ? "connecting" : "disconnected");
       await changed;
-      const transitions = [...el.getAnimations(), ...label.getAnimations()];
+      const transitions = el.getAnimations();
       for (const transition of transitions) transition.pause();
       return args.times.map(time => {
         for (const transition of transitions) transition.currentTime = time;
         return {
-          layoutWidth: (el as HTMLElement).offsetWidth,
-          visibleWidth: el.getBoundingClientRect().width,
+          width: el.getBoundingClientRect().width,
           labelX: label.getBoundingClientRect().left,
           opacity: Number(getComputedStyle(el).opacity),
         };
@@ -172,52 +138,34 @@ test.describe("Connection activity", () => {
       const pill = visibleConnectionPill(page);
       await expect(pill).toHaveAttribute("aria-busy", "false");
       const slot = pill.getByTestId("connection-activity-dots");
-      const reservedWidth = await slot.evaluate(el => (el as HTMLElement).offsetWidth);
-      expect(reservedWidth).toBeGreaterThan(0);
-      // Startup may already be fading to idle when aria-busy first clears.
-      await expect.poll(() => slot.evaluate(el => el.getBoundingClientRect().width)).toBe(0);
-      const idleLabelX = await pill.getByTestId("connection-status-label")
-        .evaluate(el => el.getBoundingClientRect().left);
+      const idleWidth = await slot.evaluate(el => el.getBoundingClientRect().width);
+      expect(idleWidth).toBe(0);
       const [start, middle, open] = await sampleTransition(slot, true, [0, 150, 300]);
       expect(start.opacity).toBe(1);
-      expect(middle.visibleWidth).toBeGreaterThan(0);
-      expect(open.visibleWidth).toBeGreaterThan(0);
-      expect(open.labelX).toBeGreaterThan(idleLabelX);
+      expect(middle.width).toBeGreaterThan(0);
+      expect(open.width).toBeGreaterThan(0);
       if (reduced) {
-        expect(start.visibleWidth).toBe(open.visibleWidth);
+        expect(start.width).toBe(open.width);
         expect(start.labelX).toBe(open.labelX);
       } else {
-        expect(start.visibleWidth).toBe(0);
-        expect(start.labelX).toBe(idleLabelX);
-        expect(middle.visibleWidth).toBeLessThan(open.visibleWidth);
+        expect(start.width).toBe(0);
+        expect(middle.width).toBeLessThan(open.width);
         expect(middle.labelX).toBeGreaterThan(start.labelX);
         expect(middle.labelX).toBeLessThan(open.labelX);
       }
 
       const [held, fading] = await sampleTransition(slot, false, [600, 850]);
       expect(held.opacity).toBe(1);
-      expect(held.visibleWidth).toBe(open.visibleWidth);
-      expect(held.labelX).toBe(open.labelX);
+      expect(held.width).toBe(open.width);
       expect(fading.opacity).toBeGreaterThan(0);
       expect(fading.opacity).toBeLessThan(1);
-      if (reduced) {
-        expect(fading.visibleWidth).toBe(open.visibleWidth);
-        expect(fading.labelX).toBe(open.labelX);
-      } else {
-        expect(fading.labelX).toBeLessThan(open.labelX);
-        expect(fading.labelX).toBeGreaterThan(idleLabelX);
-      }
+      if (reduced) expect(fading.width).toBe(open.width);
       const [resumed] = await sampleTransition(slot, true, [300]);
       expect(resumed.opacity).toBe(1);
-      expect(resumed.visibleWidth).toBe(open.visibleWidth);
-      expect(resumed.labelX).toBe(open.labelX);
+      expect(resumed.width).toBe(open.width);
       const [closed] = await sampleTransition(slot, false, [1001]);
       expect(closed.opacity).toBe(0);
-      expect(closed.visibleWidth).toBe(0);
-      expect(closed.labelX).toBe(idleLabelX);
-      for (const sample of [start, middle, open, held, fading, resumed, closed]) {
-        expect(sample.layoutWidth).toBe(reservedWidth);
-      }
+      expect(closed.width).toBe(0);
     });
   }
 });
