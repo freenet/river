@@ -297,6 +297,13 @@ impl RiverApp {
         let _ = self.update_prefs.set(UPDATE_AUTO_PREF, &auto);
     }
 
+    /// Offer "Background and startup" in the room list, backed by `host` (the desktop shell's
+    /// tray icon and login item).
+    pub fn with_background(mut self, host: std::sync::Arc<dyn chat::BackgroundHost>) -> Self {
+        self.chat.background = Some(chat::BackgroundUi::new(host));
+        self
+    }
+
     /// The window gained or lost focus.
     pub fn focus_changed(&mut self, focused: bool) {
         self.focused = focused;
@@ -744,6 +751,38 @@ fn scene_token() -> String {
         invitation_secrets: Default::default(),
     }
     .to_armored_string()
+}
+
+/// A shell's answers for the "Background and startup" scenes: a tray, or none.
+struct PreviewBackground {
+    tray: bool,
+}
+
+impl chat::BackgroundHost for PreviewBackground {
+    fn tray_available(&self) -> bool {
+        self.tray
+    }
+    fn close_to_tray(&self) -> bool {
+        true
+    }
+    fn set_close_to_tray(&self, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn start_at_login(&self) -> bool {
+        false
+    }
+    fn set_start_at_login(&self, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The chat screen with "Background and startup" open, for a desktop with or without a tray.
+fn background_scene(s: &mut RiverApp, tray: bool) {
+    identity_scene(s, |_| {});
+    s.chat.background = Some(chat::BackgroundUi::new(std::sync::Arc::new(
+        PreviewBackground { tray },
+    )));
+    s.chat.open_background();
 }
 
 /// The chat screen for the identity scenes: the example rooms as rooms from the node, so the
@@ -1436,6 +1475,8 @@ pub const SCENES: &[Scene] = &[
             );
         })
     }),
+    ("chat-background", |s| background_scene(s, true)),
+    ("chat-background-no-tray", |s| background_scene(s, false)),
     ("chat-import-id", |s| identity_scene(s, |c| c.open_import())),
     ("chat-import-id-pasted", |s| {
         identity_scene(s, |c| {
@@ -1693,9 +1734,18 @@ pub fn spec() -> AppSpec<RiverApp> {
         }),
         // Keys no focused control took, or any key while nothing has focus: Escape abandons a
         // reply or an edit even when the composer is not focused.
-        on_key: Some(|s, ev, _| {
-            (chat::switcher::is_chord(ev) && s.chat.switcher_chord(std::time::Instant::now()))
-                || (ev.key == rune::Key::Escape && s.chat.escape())
+        on_key: Some(|s, ev, tx| {
+            if chat::switcher::is_chord(ev) && s.chat.switcher_chord(std::time::Instant::now()) {
+                return true;
+            }
+            // Ctrl+Q (Cmd+Q on a Mac) quits where the window's close button only hides it to
+            // the tray, so a hidden River is never the only way out. It quits whatever dialog
+            // is open: a dialog is no reason to keep a River running that someone is quitting.
+            if ev.is_command('q') && s.chat.background.is_some() {
+                tx.quit();
+                return true;
+            }
+            ev.key == rune::Key::Escape && s.chat.escape()
         }),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
     }
@@ -3156,6 +3206,51 @@ mod tests {
             invitation_secrets: Default::default(),
         };
         (export.to_armored_string(), owner.verifying_key())
+    }
+
+    #[test]
+    fn the_background_entry_opens_the_dialog_and_its_boxes_reach_the_shell() {
+        struct Recorder(std::sync::Mutex<Vec<String>>);
+        impl chat::BackgroundHost for Recorder {
+            fn tray_available(&self) -> bool {
+                true
+            }
+            fn close_to_tray(&self) -> bool {
+                true
+            }
+            fn set_close_to_tray(&self, on: bool) -> Result<(), String> {
+                self.0.lock().unwrap().push(format!("close {on}"));
+                Ok(())
+            }
+            fn start_at_login(&self) -> bool {
+                false
+            }
+            fn set_start_at_login(&self, on: bool) -> Result<(), String> {
+                self.0.lock().unwrap().push(format!("login {on}"));
+                Ok(())
+            }
+        }
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        assert!(
+            rt.find("background").is_none(),
+            "no entry without a shell that offers one"
+        );
+        let host = std::sync::Arc::new(Recorder(Default::default()));
+        let shell = host.clone();
+        rt.update(move |s, _| s.chat.background = Some(chat::BackgroundUi::new(shell)));
+        settle(&mut rt);
+        press(&mut rt, "background");
+        assert!(rt.find("background-dialog").is_some());
+        press(&mut rt, "background-start-at-login");
+        press(&mut rt, "background-close-to-tray");
+        assert_eq!(*host.0.lock().unwrap(), ["login true", "close false"]);
+        assert!(
+            rt.find("background-quit").is_some(),
+            "a way out of a hidden River"
+        );
+        press(&mut rt, "background-close");
+        assert!(rt.find("background-dialog").is_none());
     }
 
     #[test]

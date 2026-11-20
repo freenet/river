@@ -30,11 +30,23 @@ flate2 = "1"
 tar = "0.4"
 tempfile = "3"
 directories = "6"
+# The tray icon's pixels, decoded from the packaging PNG.
+png = "0.18"
+# The single-instance token.
+getrandom = "0.3"
 
 # OS notifications (src/notify/). MIT OR Apache-2.0. Linux speaks D-Bus through zbus (the `z`
 # feature, no libdbus); the notification images feature is off.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 notify-rust = { version = "4.19", default-features = false, features = ["z"] }
+# The tray icon on Linux: the StatusNotifierItem protocol over D-Bus, in pure Rust (no GTK, no
+# libappindicator), on the same zbus and async-io the notifications use. Unlicense.
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
+
+# The tray icon on Windows and macOS (MIT OR Apache-2.0); its Linux backend needs GTK, so Linux
+# uses ksni above instead.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
 
 # macOS uses UNUserNotificationCenter (the default NSUserNotification backend is deprecated).
 [target.'cfg(target_os = "macos")'.dependencies]

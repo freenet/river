@@ -786,14 +786,20 @@ impl Updater {
         });
     }
 
-    /// The new binary is up: tell the launcher, and end probation.
-    pub fn confirm_started(&self, handshake: Option<&Path>) {
+    /// Write the marker a waiting launcher looks for, and nothing else: probation is left to a
+    /// start that really ran (see [`confirm_started`](Self::confirm_started)).
+    pub fn signal_started(&self, handshake: Option<&Path>) {
         if let Some(path) = handshake
             && path.parent() == Some(self.dir().as_path())
         {
             let _ = fs::File::create(path)
                 .and_then(|mut f| f.write_all(self.cfg.running.to_string().as_bytes()));
         }
+    }
+
+    /// The new binary is up: tell the launcher, and end probation.
+    pub fn confirm_started(&self, handshake: Option<&Path>) {
+        self.signal_started(handshake);
         let _ = state::modify(&self.cfg.data_dir, |st| {
             if st
                 .probation

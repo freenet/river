@@ -51,6 +51,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     let mut layer = Vec::new();
     dialogs(chat, &k, &mut layer);
     super::identity::export_dialog(chat, &k, &mut layer);
+    super::background::background_dialog(chat, &k, &mut layer);
     super::node_ui::node_dialog(chat, &k, &mut layer);
     if chat.update.settings_open {
         super::update_view::settings_dialog(&chat.update, &k, &mut layer);
@@ -373,6 +374,20 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         } else {
             not_yet(import)
         });
+    if chat.background.is_some() {
+        footer = footer.child(
+            outlined(
+                "background",
+                "Background and startup",
+                &icons::BACKGROUND,
+                34.0,
+                p,
+            )
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut RiverApp| s.chat.open_background()),
+        );
+    }
     for w in &chat.work {
         footer = footer.child(work_row(w, p, k));
     }

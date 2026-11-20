@@ -1152,6 +1152,87 @@ fn a_restart_lets_go_of_the_lock_so_the_next_update_can_start() {
 }
 
 #[test]
+fn a_launch_that_only_shows_the_other_river_releases_the_updater_and_is_not_counted() {
+    let ports = Ports::lock();
+    let server = ports.serve(vec![]);
+    Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
+    let rig = Rig::new();
+    let old = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
+    old.check().unwrap();
+    old.download(&mut |_, _| {}).unwrap();
+    old.apply().unwrap();
+    let starts = || state::load(rig.data.path()).probation.unwrap().starts;
+    assert_eq!(starts(), 0);
+
+    // The new binary starts while a River already holds the instance lock (a GUI open when
+    // `river --self-update` ran): its launch reaches that River and then leaves.
+    let config = tempfile::tempdir().unwrap();
+    let running = match crate::single::acquire(config.path(), None).unwrap() {
+        crate::single::Start::First(g) => g,
+        _ => panic!("expected to be first"),
+    };
+    running.serve(|_| {}).unwrap();
+    assert!(matches!(
+        crate::single::acquire(config.path(), None).unwrap(),
+        crate::single::Start::Running { asked: true }
+    ));
+    let new = host::DesktopUpdate::with_parts(
+        rig.updater("0.2.0", &server.url("/manifest.json"), 1),
+        pubkey(1),
+    );
+
+    // Run by hand (no handshake): nothing is confirmed and nothing is counted.
+    new.second_launch(None);
+    assert_eq!(starts(), 0, "a second launch is not an unconfirmed start");
+    assert!(state::load(rig.data.path()).probation.is_some());
+
+    // Run by an updater: the waiting launcher is released, but probation stays for a start
+    // that really ran.
+    let marker = rig.data.path().join("update/handshake-second");
+    new.second_launch(Some(&marker));
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "0.2.0");
+    assert!(state::load(rig.data.path()).probation.is_some());
+    assert_eq!(starts(), 0);
+}
+
+/// `main` takes the instance lock before the updater counts the start, and the restart hands
+/// the lock over between `apply` and `launch` and takes it back on failure. These orders are
+/// what keep a second launch from counting against a good update and a failed restart from
+/// leaving two Rivers, and nothing else would notice them move.
+#[test]
+fn the_instance_lock_is_taken_before_the_start_is_counted_and_handed_over_around_launch() {
+    let main = include_str!("../main.rs").replace("\r\n", "\n");
+    let acquire = main.find("single::acquire(").unwrap();
+    let counted = main.find("u.on_start()").unwrap();
+    assert!(acquire < counted, "acquire the lock, then count the start");
+
+    let host = include_str!("host.rs").replace("\r\n", "\n");
+    let f = &host[host.find("fn restart_and_release").unwrap()..];
+    let f = &f[..f.find("\n    }\n").unwrap()];
+    let apply = f.find("self.updater.apply()").unwrap();
+    let handover = f.find("hand_over_instance(").unwrap();
+    let launch = f.find("self.updater.launch(").unwrap();
+    assert!(apply < handover && handover < launch);
+
+    let h = &host[host.find("fn hand_over_instance").unwrap()..];
+    let h = &h[..h.find("\n}\n").unwrap()];
+    let release = h.find("release_current()").unwrap();
+    let start = h.find("start()").unwrap();
+    let back = h.find("reacquire_current()").unwrap();
+    assert!(release < start && start < back);
+    assert!(h[back - 40..back].contains("is_err"), "only on failure");
+}
+
+#[test]
+fn a_restart_keeps_the_arguments_but_not_the_tray_only_flag() {
+    let args = ["--node", "h:1", "--background", "x"].map(std::ffi::OsString::from);
+    assert_eq!(
+        host::restart_args(args.into_iter()),
+        ["--node", "h:1", "x"].map(std::ffi::OsString::from)
+    );
+}
+
+#[test]
 fn a_state_file_from_a_newer_build_is_read_but_never_written_over() {
     let ports = Ports::lock();
     let server = ports.serve(vec![]);

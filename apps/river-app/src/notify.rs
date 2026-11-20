@@ -709,6 +709,28 @@ mod tests {
         assert_eq!(s.missed.1, 0);
     }
 
+    /// The desktop shell hides the window to the tray on close, which sends no focus event, so
+    /// it reports `focus_changed(false)` itself (`background::on_close`). A message in the room
+    /// that was open then notifies, where it was silent a moment before.
+    #[test]
+    fn a_hidden_window_does_not_keep_the_open_room_silent() {
+        let (mut s, rec, rooms) = live();
+        let open = s.chat.room().unwrap().key.clone();
+        let i = rooms.iter().position(|r| r.key == open).unwrap();
+        s.focus_changed(true);
+        let first = with(&rooms, i, vec![from_other(&rooms[i], "a", "x")]);
+        deliver(&mut s, first.clone());
+        assert!(shown(&rec).is_empty(), "focused: silent");
+        // The window is hidden to the tray.
+        s.focus_changed(false);
+        deliver(
+            &mut s,
+            with(&first, i, vec![from_other(&rooms[i], "b", "y")]),
+        );
+        assert_eq!(shown(&rec).len(), 1);
+        assert_eq!(shown(&rec)[0].room_key, open);
+    }
+
     fn arrival(i: usize, mention: bool) -> Arrival {
         Arrival {
             room_key: format!("r{i}"),
