@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { waitForApp, nextFrames, selectRoom } from "./example-room";
+import { waitForApp, nextFrames, selectRoom, visibleConnectionPill as pill } from "./example-room";
 import { callRiverTest, SyncStatus } from "./river-test";
 import { DM_PEER } from "./dm-thread";
 import { captureClipboardWrites, clipboardWrites } from "./clipboard";
@@ -14,13 +14,8 @@ import { captureClipboardWrites, clipboardWrites } from "./clipboard";
 // ordering of display writes across connection attempts are unit tests in
 // `error_report.rs` and `app.rs`; this checks what the reader sees.
 
-const PILL = '[data-testid="connection-status-indicator"]:visible';
 const PILL_NAME = "WebSocket connection status";
 const LONG_TOKEN = "x".repeat(400);
-
-function pill(page: Page): Locator {
-  return page.locator(PILL);
-}
 
 function detailsButton(page: Page): Locator {
   return pill(page).getByRole("button");

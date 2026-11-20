@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { visibleConnectionPill, waitForApp } from "./example-room";
 import { callRiverTest, RoomsLoadState } from "./river-test";
 
 // Regression coverage for freenet/river#509.
@@ -77,9 +77,7 @@ for (const { label, viewport, isMobile } of [
       // matches, because below 768px the rail is `display:none` and its pill
       // is in the DOM either way.
       if (isMobile) {
-        await expect(
-          page.locator('[data-testid="connection-status-indicator"]:visible')
-        ).toHaveCount(1);
+        await expect(visibleConnectionPill(page)).toHaveCount(1);
       }
 
       // …and so must the #159 quickstart invite link: a brand-new user has no
@@ -129,9 +127,7 @@ for (const { label, viewport, isMobile } of [
       // "Check your connection and try again" is only actionable if the
       // connection status is on the same screen.
       if (isMobile) {
-        await expect(
-          page.locator('[data-testid="connection-status-indicator"]:visible')
-        ).toHaveCount(1);
+        await expect(visibleConnectionPill(page)).toHaveCount(1);
       }
     });
 

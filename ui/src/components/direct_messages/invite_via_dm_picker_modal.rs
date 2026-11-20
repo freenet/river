@@ -291,19 +291,16 @@ pub fn InviteViaDmPickerModal() -> Element {
         // same two checks as the `selected_room_value` render filter.
         // Guarding the send path directly means it never depends on the
         // Send button's disabled state (Codex P2 on PR #291).
-        let candidate_room_vk = match *selected_room.peek() {
-            Some((peer, room))
-                if peer == target_peer && candidates_for_send.iter().any(|c| c.room_vk == room) =>
-            {
-                room
-            }
-            _ => {
-                crate::util::defer(move || {
-                    send_error.set(Some("Pick a room to invite them to first.".into()));
-                });
-                return;
-            }
+        let Some(candidate) = (*selected_room.peek())
+            .filter(|(peer, _)| *peer == target_peer)
+            .and_then(|(_, room)| candidates_for_send.iter().find(|c| c.room_vk == room))
+        else {
+            crate::util::defer(move || {
+                send_error.set(Some("Pick a room to invite them to first.".into()));
+            });
+            return;
         };
+        let candidate_room_vk = candidate.room_vk;
 
         let pmessage = personal_message.peek().clone();
         let pmessage_opt = if pmessage.trim().is_empty() {
@@ -326,11 +323,7 @@ pub fn InviteViaDmPickerModal() -> Element {
             });
             return;
         };
-        let candidate_label = candidates_for_send
-            .iter()
-            .find(|c| c.room_vk == candidate_room_vk)
-            .map(|c| c.label.clone())
-            .unwrap_or_else(|| "Unknown room".to_string());
+        let candidate_label = candidate.label.clone();
 
         let my_generation = PICK_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 

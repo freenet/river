@@ -1,9 +1,7 @@
-import { expect, Locator, Page, test } from "@playwright/test";
+import { expect, Locator, test } from "@playwright/test";
 import { INVITATION_CODE } from "./dialog-cases";
-import { waitForApp } from "./example-room";
+import { visibleConnectionPill, waitForApp } from "./example-room";
 import { callRiverTest } from "./river-test";
-
-const visiblePill = (page: Page) => page.locator('[data-testid="connection-status-indicator"]:visible');
 
 test.describe("Connection activity", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
@@ -11,7 +9,7 @@ test.describe("Connection activity", () => {
   test("explains live room work, and clears when the work settles", { tag: "@chromium-only" }, async ({ page }) => {
     await page.goto("/");
     await waitForApp(page);
-    const pill = visiblePill(page);
+    const pill = visibleConnectionPill(page);
     await expect(pill).toHaveAttribute("aria-busy", "false"); // no-sync starts Disconnected
     await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "loaded");
     await callRiverTest(page, "setSyncStatus", "connected");
@@ -44,7 +42,7 @@ test.describe("Connection activity", () => {
   test("accepting a real invitation shows joining while subscribed room data is pending", { tag: "@chromium-only" }, async ({ page }) => {
     await page.goto("/?invitation=" + INVITATION_CODE);
     await waitForApp(page);
-    const pill = visiblePill(page);
+    const pill = visibleConnectionPill(page);
     await callRiverTest(page, "setRoomsLoadStateKeepingRooms", "loaded");
     await callRiverTest(page, "setSyncStatus", "connected");
     await expect(pill).toHaveAttribute("aria-busy", "false");
@@ -116,7 +114,7 @@ test.describe("Connection activity", () => {
       await page.emulateMedia({ reducedMotion: reduced ? "reduce" : "no-preference" });
       await page.goto("/");
       await waitForApp(page);
-      const pill = visiblePill(page);
+      const pill = visibleConnectionPill(page);
       await expect(pill).toHaveAttribute("aria-busy", "false");
       const slot = pill.getByTestId("connection-activity-dots");
       const idleWidth = await slot.evaluate(el => el.getBoundingClientRect().width);
