@@ -1987,6 +1987,18 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat.source = chat::Source::Node(chat::LinkStatus::Loading);
     }),
+    // The longest footer: a node on another computer, disconnected, with its warning.
+    ("chat-connection-lost-remote-narrow", |s| {
+        connect(s);
+        use_node(s, "home.example.org:7509");
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
+    }),
+    ("chat-connection-remote-zoom-200", |s| {
+        connect(s);
+        use_node(s, "home.example.org:7509");
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
+        s.chat.zoom.load(200);
+    }),
     ("chat-connection-lost", |s| {
         connect(s);
         s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
@@ -2076,10 +2088,6 @@ pub const SCENES: &[Scene] = &[
         s.chat.node.notice = Some(
             "Your saved node address http://x/ is not valid; using this computer's Freenet.".into(),
         );
-    }),
-    ("chat-node-entry", |s| {
-        node_change_scene(s, Some("localhost:40302"), None);
-        s.chat.node.close();
     }),
     ("chat-node-change", |s| {
         node_change_scene(s, Some("localhost:40302"), None)

@@ -6458,7 +6458,8 @@ mod rune_bump {
     /// keyboard, the thread's box takes it and Escape gives it back to the composer; Rune's
     /// focus agrees at each step. Opened by a click on its row the composer has already lost
     /// the keyboard to the click, so nothing is handed back and Rune puts the keyboard on the
-    /// control it can (a control of the room list footer's connection row: the "Change node" link while the example rooms show, the connection pill otherwise), which River's flag also reports as not the
+    /// control it can (see the assertion: the "Change node" link when the connection is not
+    /// live, the connection pill when it is), which River's flag also reports as not the
     /// composer.
     #[test]
     fn a_dm_thread_takes_the_keyboard_and_gives_it_back_as_documented() {
@@ -6495,10 +6496,18 @@ mod rune_bump {
         settle_frames(&mut rt);
         assert!(rt.find("dm-thread").is_none());
         assert!(!rt.state.chat.composer.focused);
-        let landed = rune_focus(&mut rt);
-        assert!(
-            matches!(landed.as_deref(), Some("connection-pill" | "node-change")),
-            "{landed:?}"
+        // Rune puts the keyboard on a control of the footer's connection row, and which one
+        // follows from the source: the quiet "Change node" link exists in every state but a
+        // live connection, and then the pill is the row's only control.
+        let expected = match rt.state.chat.source {
+            crate::chat::Source::Node(crate::chat::LinkStatus::Live) => "connection-pill",
+            _ => "node-change",
+        };
+        assert_eq!(
+            rune_focus(&mut rt).as_deref(),
+            Some(expected),
+            "source {:?}",
+            rt.state.chat.source
         );
         assert_composer_focus_agrees(&mut rt, "after a click-opened thread closes");
     }

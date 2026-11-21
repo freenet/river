@@ -667,7 +667,8 @@ fn source_status(chat: &Chat, p: &Palette, k: &Kit) -> El {
         .min_w(0.0)
         .help(format!("{} Press for node status.", pill.tip))
         .role("button")
-        .label("Node status")
+        // The state is in the name, so a screen reader announces it without the status dialog.
+        .label(format!("Node status: {}", pill.text))
         .focusable(true)
         .py(6.0)
         .cursor(rune::Cursor::Pointer)
