@@ -378,17 +378,20 @@ fn outlined(key: &str, name: &str, glyph: &'static rune::Icon, h: f32, p: &Palet
 }
 
 /// The footer's quiet Do not disturb row: the moon, and the state in two words. Pressing it
-/// flips do not disturb on or off (see `Chat::quick_dnd`); the schedule and the rest are in
-/// Settings > Notifications. While it is on the row takes the accent colour.
+/// flips the switch (see `Chat::quick_dnd`); the schedule and the rest are in Settings >
+/// Notifications. A switch to assistive technology, named "Do not disturb", on when it is on
+/// whatever the reason. While on the row takes the accent colour.
 fn dnd_entry(chat: &Chat, p: &Palette) -> El {
     let on = chat.dnd.active();
-    let name = super::dnd::quick_label(on);
-    let ink = if on { p.accent } else { p.text_muted };
+    let shown = super::dnd::quick_label(on);
+    let ink = if on { p.accent } else { p.text_secondary };
     row()
         .key("dnd")
-        .role("button")
-        .label(name.to_owned())
+        .role("switch")
+        .checked(on)
+        .label("Do not disturb")
         .help(super::dnd::quick_help(chat))
+        .focusable(true)
         .w_full()
         .h(30.0)
         .px(8.0)
@@ -396,10 +399,36 @@ fn dnd_entry(chat: &Chat, p: &Palette) -> El {
         .radius(6.0)
         .center_y()
         .child(icon(&icons::MOON, 14.0).color(ink))
-        .child(label(name.to_owned(), st::SMALL_STRONG, ink))
+        .child(label(shown, st::SMALL_STRONG, ink).key("dnd-text"))
         .hover(p.surface_hover)
         .cursor(rune::Cursor::Pointer)
         .on_press(|s: &mut RiverApp| s.chat.quick_dnd())
+}
+
+/// What the room list says after the schedule's times were left as something that is not a
+/// time: one line and a Dismiss button, above the Do not disturb row.
+fn dnd_notice(chat: &Chat, p: &Palette, k: &Kit) -> Option<El> {
+    let text = chat.dnd.notice.as_ref()?;
+    Some(
+        col()
+            .key("dnd-notice-block")
+            .w_full()
+            .px(4.0)
+            .gap(4.0)
+            .child(
+                label(text.clone(), st::SMALL, p.warning_text)
+                    .wrap()
+                    .w_full()
+                    .key("dnd-notice"),
+            )
+            .child(
+                rune_kit::Button::new("Dismiss")
+                    .variant(rune_kit::ButtonVariant::Ghost)
+                    .on_press(|s: &mut RiverApp| s.chat.dnd.notice = None)
+                    .build(k)
+                    .key("dnd-notice-dismiss"),
+            ),
+    )
 }
 
 // The room list -------------------------------------------------------------------------------
@@ -484,6 +513,9 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         } else {
             not_yet(import)
         });
+    if let Some(n) = dnd_notice(chat, p, k) {
+        footer = footer.child(n);
+    }
     footer = footer.child(dnd_entry(chat, p));
     for w in &chat.work {
         footer = footer.child(work_row(w, p, k));

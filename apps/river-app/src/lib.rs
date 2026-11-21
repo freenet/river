@@ -2476,6 +2476,21 @@ pub const SCENES: &[Scene] = &[
         s.chat.private_previews = true;
     }),
     ("chat-dnd-on", |s| dnd_scene(s, DND_AT_NIGHT, false)),
+    // The schedule's times were left as something that is not a time: the room list's notice,
+    // and the section again with the text and the error kept.
+    ("chat-dnd-notice", |s| {
+        dnd_scene(s, DND_AT_NIGHT, true);
+        s.chat.dnd.start.replace_text("late");
+        s.chat.dnd.sync_inputs();
+        s.chat.close_settings();
+    }),
+    ("chat-settings-notifications-invalid", |s| {
+        dnd_scene(s, DND_AT_NIGHT, true);
+        s.chat.dnd.start.replace_text("late");
+        s.chat.dnd.sync_inputs();
+        s.chat.close_settings();
+        s.chat.open_dnd();
+    }),
     ("chat-settings-background", |s| background_scene(s, true)),
     ("chat-settings-background-narrow", |s| {
         background_scene(s, true)
@@ -4960,8 +4975,8 @@ mod tests {
         let text = |rt: &Runtime<RiverApp>| {
             rt.elements()
                 .into_iter()
-                .find(|e| e.key.as_deref() == Some("dnd"))
-                .and_then(|e| e.label)
+                .find(|e| e.key.as_deref() == Some("dnd-text"))
+                .and_then(|e| e.text)
         };
         assert_eq!(text(&rt).as_deref(), Some("Do not disturb: off"));
         press(&mut rt, "dnd");

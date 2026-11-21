@@ -31,6 +31,9 @@ use crate::notify::Arrival;
 /// The preference key the settings are stored under.
 pub const PREF: &str = "do_not_disturb";
 
+/// Said after leaving the schedule's times with something that is not a time.
+const INVALID_NOTICE: &str = "Do not disturb schedule not changed: the times were not valid.";
+
 /// Minutes in a day; a schedule time is below this.
 const DAY: u16 = 24 * 60;
 
@@ -196,6 +199,12 @@ pub struct DndUi {
     times_pending: bool,
     /// The schedule last in use, offered again when the schedule is turned back on.
     last_schedule: Schedule,
+    /// The section was left while the typed times were not valid: the text and the error are
+    /// kept for when it comes back, so the person can fix them.
+    kept_invalid: bool,
+    /// What the room list and the dialog say after such a leave, until it is dismissed or the
+    /// times are fixed.
+    pub notice: Option<String>,
 }
 
 impl Default for DndUi {
@@ -211,6 +220,8 @@ impl Default for DndUi {
             dirty: false,
             times_pending: false,
             last_schedule: DEFAULT_SCHEDULE,
+            kept_invalid: false,
+            notice: None,
         }
     }
 }
@@ -242,6 +253,8 @@ impl DndUi {
         self.start.replace_text(format_time(s.start));
         self.end.replace_text(format_time(s.end));
         self.error = None;
+        self.kept_invalid = false;
+        self.notice = None;
     }
 
     /// Take the times typed into the schedule when both are valid; say so when not. The
@@ -253,6 +266,8 @@ impl DndUi {
         match (parse_time(&self.start.text), parse_time(&self.end.text)) {
             (Some(start), Some(end)) => {
                 self.error = None;
+                self.kept_invalid = false;
+                self.notice = None;
                 let new = Schedule { start, end };
                 let editing = self.start.focused || self.end.focused;
                 if self.settings.schedule != Some(new) {
@@ -287,21 +302,30 @@ impl super::Chat {
         }
     }
 
-    /// Keep the schedule's text fields in step with the Settings dialog: filled from the saved
-    /// schedule when Notifications comes on screen, and, when it goes (another section, or the
-    /// dialog closed), the typed times are taken if they read as times and dropped if not (the
-    /// schedule in force stays what it was). Run every frame and by the opening functions.
+    /// Keep the schedule's text fields in step with the Settings dialog. Filled from the saved
+    /// schedule when Notifications comes on screen, unless times that were not valid were left
+    /// there (those stay, with their error, so they can be fixed). When the section goes (another
+    /// section, Esc, the X) the typed times are taken if they read as times. If they do not, the
+    /// schedule in force is left as it was, the text and error are kept, and a notice says the
+    /// schedule was not changed. Run every frame and by the opening functions.
     pub fn track_dnd_editor(&mut self) {
         let showing =
             self.settings.open && self.settings.section == super::settings::Section::Notifications;
         if showing && !self.dnd.open {
-            self.dnd.fill_inputs();
+            if !self.dnd.kept_invalid {
+                self.dnd.fill_inputs();
+            }
             self.dnd.open = true;
         } else if !showing && self.dnd.open {
             self.dnd.sync_inputs();
-            self.dnd.error = None;
             if std::mem::take(&mut self.dnd.times_pending) {
                 self.dnd.dirty = true;
+            }
+            if self.dnd.error.is_some() && self.dnd.settings.schedule.is_some() {
+                self.dnd.kept_invalid = true;
+                self.dnd.notice = Some(INVALID_NOTICE.into());
+            } else {
+                self.dnd.error = None;
             }
             self.dnd.open = false;
         }
@@ -313,13 +337,12 @@ impl super::Chat {
         self.dnd.dirty = true;
     }
 
-    /// The room list's quick control. Off: turn it on until it is turned off. On only because of
-    /// the switch: turn it off. On because of the daily schedule (alone or with the switch):
-    /// flipping the switch would change nothing you could see, so open the settings where the
-    /// schedule can be changed.
+    /// The room list's quick control. If the switch is on, turn it off (the schedule may still
+    /// have it on; the row and the tooltip say so). If the daily schedule alone has it on,
+    /// flipping the switch on would change nothing you could see, so open the settings where the
+    /// schedule can be changed. Off: turn the switch on, until it is turned off.
     pub fn quick_dnd(&mut self) {
-        let schedule_on = self.dnd.settings.reason_schedule(self.dnd.now);
-        if self.dnd.active() && schedule_on {
+        if !self.dnd.settings.manual && self.dnd.active() {
             self.open_dnd();
         } else {
             self.toggle_dnd();
@@ -375,14 +398,18 @@ pub(super) fn quick_label(on: bool) -> &'static str {
 }
 
 /// What pressing the room list's row does, for its tooltip.
-pub(super) fn quick_help(chat: &super::Chat) -> &'static str {
+pub(super) fn quick_help(chat: &super::Chat) -> String {
     let d = &chat.dnd;
-    if d.active() && d.settings.reason_schedule(d.now) {
-        "On because of your daily schedule. Press to change the schedule."
+    if d.settings.manual {
+        if d.settings.reason_schedule(d.now) {
+            "Press to turn off the switch. Your daily schedule still has do not disturb on.".into()
+        } else {
+            "Press to turn do not disturb off.".into()
+        }
     } else if d.active() {
-        "Press to turn do not disturb off."
+        "On because of your daily schedule. Press to change the schedule.".into()
     } else {
-        "Press to turn do not disturb on until you turn it off."
+        "Press to turn do not disturb on until you turn it off.".into()
     }
 }
 
@@ -487,7 +514,7 @@ pub(super) fn dnd_group(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
         "dnd-mentions-row",
         label("Let mentions and replies through", st::BODY, p.text),
         Some(note(
-            "While do not disturb is on, messages that mention you or reply to you still notify.",
+            "Messages that mention you or reply to you still notify.",
             "dnd-mentions-note",
             p,
         )),
@@ -502,17 +529,12 @@ pub(super) fn dnd_group(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
     col()
         .key("settings-dnd")
         .w_full()
-        .gap(12.0)
+        .gap(10.0)
         .child(label("Do not disturb", st::ROOM_STRONG, p.text))
         .child(state)
         .child(section_rows(
             "settings-dnd-rows",
             vec![switch, schedule, mentions],
-            p,
-        ))
-        .child(note(
-            "These settings stay on this device. Messages held back are not shown later.",
-            "dnd-note",
             p,
         ))
 }
@@ -663,8 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn leaving_the_section_keeps_the_old_schedule_for_times_that_do_not_parse_and_saves_good_ones_once()
-     {
+    fn leaving_with_times_that_do_not_parse_keeps_the_schedule_says_so_and_keeps_the_text() {
         let mut chat = crate::chat::Chat::example();
         chat.dnd.settings.schedule = Some(DEFAULT_SCHEDULE);
         chat.open_dnd();
@@ -674,24 +695,45 @@ mod tests {
         assert!(chat.dnd.error.is_some(), "the reason shows while editing");
         chat.close_settings();
         assert!(!chat.dnd.open);
-        assert!(chat.dnd.error.is_none(), "and goes with the section");
         assert_eq!(
             chat.dnd.settings.schedule,
             Some(DEFAULT_SCHEDULE),
             "the schedule in force is untouched"
         );
+        assert_eq!(chat.dnd.notice.as_deref(), Some(INVALID_NOTICE));
         assert!(chat.dnd.take_dirty().is_none(), "nothing to save");
+        // Coming back shows what was typed, and why it is not in use.
         chat.open_dnd();
-        assert_eq!(chat.dnd.start.text, "22:00", "reopened from the saved one");
+        assert_eq!(chat.dnd.start.text, "nope");
+        assert!(chat.dnd.error.is_some());
+        // Fixing it applies it and takes the notice away.
         chat.dnd.start.replace_text("21:00");
+        chat.dnd.sync_inputs();
+        assert!(chat.dnd.error.is_none() && chat.dnd.notice.is_none());
         chat.close_settings();
         let saved = chat.dnd.take_dirty().expect("saved on leaving");
         assert_eq!(saved.schedule.unwrap().start, at(21, 0));
         assert!(chat.dnd.take_dirty().is_none());
+        assert!(chat.dnd.notice.is_none());
         // Off and on again offers the times that were in use.
         chat.toggle_dnd_schedule();
         chat.toggle_dnd_schedule();
         assert_eq!(chat.dnd.settings.schedule.unwrap().start, at(21, 0));
+    }
+
+    #[test]
+    fn turning_the_schedule_off_forgets_kept_invalid_times() {
+        let mut chat = crate::chat::Chat::example();
+        chat.dnd.settings.schedule = Some(DEFAULT_SCHEDULE);
+        chat.open_dnd();
+        chat.dnd.end.replace_text("x");
+        chat.dnd.sync_inputs();
+        chat.close_settings();
+        assert!(chat.dnd.notice.is_some());
+        chat.open_dnd();
+        chat.toggle_dnd_schedule();
+        assert!(chat.dnd.notice.is_none() && chat.dnd.error.is_none());
+        assert_eq!(chat.dnd.settings.schedule, None);
     }
 
     #[test]
@@ -845,6 +887,15 @@ mod tests {
         // The row's words and tooltip agree with what it does.
         assert_eq!(quick_label(true), "Do not disturb: on");
         assert!(quick_help(&chat).contains("schedule"));
+        // The switch on during the schedule: the press turns the switch off first, and the
+        // tooltip says the schedule still applies.
+        chat.close_settings();
+        chat.dnd.settings.manual = true;
+        assert!(quick_help(&chat).contains("schedule still has"));
+        chat.quick_dnd();
+        assert!(!chat.dnd.settings.manual, "the switch goes off");
+        assert!(!chat.settings.open, "without opening Settings");
+        assert!(chat.dnd.active(), "the schedule still has it on");
     }
 
     #[test]

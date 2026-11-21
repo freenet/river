@@ -660,6 +660,7 @@ fn notifications_at(minute: u16, manual: bool, schedule: Option<(u16, u16)>) -> 
     s.chat.dnd.settings.manual = manual;
     s.chat.dnd.settings.schedule = schedule.map(|(start, end)| super::DndSchedule { start, end });
     s.chat.settings.open_at(Section::Notifications);
+    s.chat.track_settings_sections();
     s
 }
 
@@ -696,10 +697,10 @@ fn the_state_line_on_screen_is_true_for_off_switch_schedule_and_both() {
             let sw = find(&rt, "dnd-switch");
             assert_eq!(sw.role, "switch");
             // The room list's row agrees with the line.
-            let row = find(&rt, "dnd");
+            let row = find(&rt, "dnd-text");
             let on = line.contains("is on");
             assert_eq!(
-                row.label.as_deref(),
+                row.text.as_deref(),
                 Some(if on {
                     "Do not disturb: on"
                 } else {
@@ -725,7 +726,7 @@ fn the_state_line_changes_when_the_schedule_ends_while_the_section_is_open() {
         "Do not disturb is off. Your daily schedule turns it on at 09:00."
     );
     assert_eq!(
-        find(&rt, "dnd").label.as_deref(),
+        find(&rt, "dnd-text").text.as_deref(),
         Some("Do not disturb: off")
     );
 }
@@ -801,14 +802,14 @@ fn the_previews_preference_keeps_its_key_and_format() {
 fn the_notifications_section_points_to_the_rooms_bell_and_has_no_global_switch() {
     let rt = render(notifications_at(12 * 60, false, None), WINDOW_SIZE);
     assert!(shows(&rt, "set from the bell in that room's header"));
-    // Three switches for do not disturb and one for previews: nothing that turns every
-    // notification on or off as a whole.
+    // Three switches for do not disturb, one for previews and the room list's quick row:
+    // nothing that turns every notification on or off as a whole.
     let switches = rt
         .elements()
         .into_iter()
         .filter(|e| e.role == "switch")
         .count();
-    assert_eq!(switches, 4);
+    assert_eq!(switches, 5);
 }
 
 #[test]
@@ -872,7 +873,7 @@ fn the_room_lists_row_toggles_and_a_schedule_sends_you_to_settings() {
     });
     settle(&mut rt);
     assert_eq!(
-        find(&rt, "dnd").label.as_deref(),
+        find(&rt, "dnd-text").text.as_deref(),
         Some("Do not disturb: on")
     );
     press(&mut rt, "dnd");
@@ -974,4 +975,143 @@ fn every_scene_of_these_sections_exists() {
             "{gone} is a dialog that no longer exists"
         );
     }
+}
+
+#[test]
+fn the_room_lists_row_is_a_named_switch_with_readable_off_text() {
+    let mut s = connected();
+    s.chat.dnd.pinned = true;
+    s.chat.dnd.now = 12 * 60;
+    let rt = render(s, WINDOW_SIZE);
+    let row = find(&rt, "dnd");
+    assert_eq!(row.role, "switch");
+    assert_eq!(row.label.as_deref(), Some("Do not disturb"));
+    assert!(row.focusable);
+    let p = super::style::palette();
+    assert_eq!(
+        find(&rt, "dnd-text").text_color,
+        Some(p.text_secondary),
+        "off text is at least the secondary ink"
+    );
+}
+
+/// Types something that is not a time into the schedule's From field of an open section.
+fn type_bad_time(rt: &mut Runtime<RiverApp>) {
+    rt.update(|s, _| {
+        s.chat.dnd.start.replace_text("late");
+        s.chat.dnd.sync_inputs();
+    });
+    settle(rt);
+    assert!(
+        rt.find("dnd-error").is_some(),
+        "the reason shows while typing"
+    );
+}
+
+fn schedule_night() -> RiverApp {
+    notifications_at(12 * 60, false, Some((22 * 60, 7 * 60)))
+}
+
+#[test]
+fn leaving_with_times_that_are_not_times_says_so_however_you_leave() {
+    for leave in ["section", "escape", "x"] {
+        let mut rt = render(schedule_night(), WINDOW_SIZE);
+        type_bad_time(&mut rt);
+        match leave {
+            "section" => {
+                press(&mut rt, "settings-section-connection");
+                assert!(is_open(&rt));
+                assert!(
+                    shows(&rt, "Do not disturb schedule not changed"),
+                    "said inside the dialog"
+                );
+                assert!(rt.find("settings-dnd-notice").is_some());
+                press(&mut rt, "close");
+            }
+            "escape" => key(&mut rt, Key::Escape),
+            _ => press(&mut rt, "close"),
+        }
+        assert!(!is_open(&rt), "{leave}");
+        // The room list says it, with a way to dismiss it.
+        assert!(rt.find("dnd-notice").is_some(), "{leave}");
+        assert_eq!(
+            find(&rt, "dnd-notice").text.as_deref(),
+            Some("Do not disturb schedule not changed: the times were not valid.")
+        );
+        assert_eq!(
+            rt.state.chat.dnd.settings.schedule.unwrap().start,
+            22 * 60,
+            "{leave}: the schedule in force is unchanged"
+        );
+        // Back in the section the invalid text and the error are still there.
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-notifications");
+        assert_eq!(rt.state.chat.dnd.start.text, "late", "{leave}");
+        assert!(rt.find("dnd-error").is_some(), "{leave}");
+        // Fixing it applies it and clears the notice.
+        rt.update(|s, _| {
+            s.chat.dnd.start.replace_text("21:30");
+            s.chat.dnd.sync_inputs();
+        });
+        settle(&mut rt);
+        assert!(rt.find("dnd-error").is_none(), "{leave}");
+        press(&mut rt, "close");
+        assert!(rt.find("dnd-notice").is_none(), "{leave}");
+        assert_eq!(
+            rt.state.chat.dnd.settings.schedule.unwrap().start,
+            21 * 60 + 30
+        );
+    }
+}
+
+#[test]
+fn the_dnd_notice_can_be_dismissed() {
+    let mut rt = render(schedule_night(), WINDOW_SIZE);
+    type_bad_time(&mut rt);
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("dnd-notice").is_some());
+    press(&mut rt, "dnd-notice-dismiss");
+    assert!(rt.find("dnd-notice").is_none());
+    assert!(rt.state.chat.dnd.settings.schedule.is_some());
+}
+
+#[test]
+fn the_privacy_switch_is_in_view_at_the_default_size_and_tab_reveals_it_in_a_short_window() {
+    // Default window: every control of the section is visible without scrolling.
+    let mut s = notifications_at(12 * 60, false, Some((22 * 60, 7 * 60)));
+    s.chat.dnd.start.replace_text("22:00");
+    let rt = render(s, WINDOW_SIZE);
+    assert!(visible(&rt, "settings-previews"), "no scrolling needed");
+    // A short window scrolls; Tab to the last control brings it into view.
+    let mut rt = render(
+        notifications_at(12 * 60, false, Some((22 * 60, 7 * 60))),
+        (640.0, 480.0),
+    );
+    for _ in 0..12 {
+        if focused(&rt).as_deref() == Some("settings-previews") {
+            break;
+        }
+        key(&mut rt, Key::Tab);
+    }
+    assert_eq!(focused(&rt).as_deref(), Some("settings-previews"));
+    assert!(
+        visible(&rt, "settings-previews"),
+        "Tab scrolled the last control into view"
+    );
+}
+
+#[test]
+fn the_notifications_pane_has_a_scroll_bar_and_is_taller_in_a_tall_window() {
+    let rt = render(schedule_night(), WINDOW_SIZE);
+    let pane = find(&rt, "settings-pane");
+    assert!(
+        pane.rect[3] > 520.0,
+        "uses the window's height: {:?}",
+        pane.rect
+    );
+    let src = include_str!("settings.rs");
+    assert!(
+        src.matches(".scroll_bar(k)").count() >= 2,
+        "wide and narrow"
+    );
 }

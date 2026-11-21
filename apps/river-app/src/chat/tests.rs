@@ -2442,9 +2442,9 @@ fn a_link_in_the_header_description_opens_the_page_not_the_dialog() {
 #[test]
 fn the_room_name_opens_the_details_from_the_keyboard() {
     let mut rt = render(connected(), WINDOW_SIZE);
-    // Tab reaches the name (after the connection dot in the room list); Space presses it, as
-    // it does any button.
-    for _ in 0..3 {
+    // Tab reaches the name (after the Do not disturb row and the connection dot in the room
+    // list); Space presses it, as it does any button.
+    for _ in 0..4 {
         key(&mut rt, Key::Tab);
         if rt
             .elements()

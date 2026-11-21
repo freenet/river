@@ -28,7 +28,7 @@
 use std::rc::Rc;
 
 use rune::{El, Key, col, el, icon, row};
-use rune_kit::{Button, ButtonVariant, Kit, Switch};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar, Switch};
 
 use super::dialog_kit::{DialogSpec, rule};
 use super::icons;
@@ -229,7 +229,7 @@ pub(super) fn setting_row(key: &str, title: El, note: Option<El>, control: El, _
 
 /// The rows of a section with a thin rule between each.
 pub(super) fn section_rows(key: &'static str, rows: Vec<El>, p: &Palette) -> El {
-    let mut s = col().key(key).w_full().gap(14.0);
+    let mut s = col().key(key).w_full().gap(10.0);
     for (i, r) in rows.into_iter().enumerate() {
         if i > 0 {
             s = s.child(rule(p));
@@ -391,7 +391,7 @@ fn notifications_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
     col()
         .key("settings-notifications")
         .w_full()
-        .gap(18.0)
+        .gap(14.0)
         .child(super::dnd::dnd_group(chat, p, k))
         .child(
             col()
@@ -405,7 +405,8 @@ fn notifications_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
             label(
                 "Notifications for one room (all messages, mentions only, or muted) are set from \
                  the bell in that room's header. Do not disturb is the one setting that silences \
-                 every room at once.",
+                 every room at once. Both settings here stay on this device, and messages held \
+                 back are not shown later.",
                 st::SMALL,
                 p.text_muted,
             )
@@ -572,9 +573,28 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
             .build(k, layer);
         return;
     }
-    let content = section_content(ui.section, chat, &p, k);
+    let mut content = section_content(ui.section, chat, &p, k);
+    // The schedule's times were left as something that is not a time: say so wherever the
+    // person went, not only in the room list behind the dialog.
+    if let Some(n) = chat
+        .dnd
+        .notice
+        .as_ref()
+        .filter(|_| ui.section != Section::Notifications)
+    {
+        content = col()
+            .w_full()
+            .gap(10.0)
+            .child(
+                label(n.clone(), st::SMALL, p.warning_text)
+                    .wrap()
+                    .w_full()
+                    .key("settings-dnd-notice"),
+            )
+            .child(content);
+    }
     // What the dialog leaves of the window: its title and margins.
-    let pane_h = (win_h - 170.0).clamp(240.0, 460.0);
+    let pane_h = (win_h - 160.0).clamp(240.0, 640.0);
     if narrow {
         DialogSpec::new("settings", "Settings", close)
             .body_key("settings-body")
@@ -602,7 +622,8 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
                         stick_bottom: false,
                     })
                     .child(heading)
-                    .child(content),
+                    .child(content)
+                    .scroll_bar(k),
             )
             .build(k, layer);
         return;
@@ -633,7 +654,8 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
                             stick_bottom: false,
                         })
                         .child(heading)
-                        .child(content),
+                        .child(content)
+                        .scroll_bar(k),
                 ),
         )
         .build(k, layer);
