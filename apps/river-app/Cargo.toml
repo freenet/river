@@ -12,6 +12,11 @@ rune.workspace = true
 rune-kit = { workspace = true, features = ["markdown"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 
+# Waiting for the node socket to have data without a socket timeout (src/rooms/socket.rs):
+# epoll, kqueue or Windows' AFD poll, whichever the platform has. MIT OR Apache-2.0, from the
+# smol project; already in the lock file through the Linux accessibility stack.
+polling = "3"
+
 # Reading the user's rooms from the local node (src/rooms/). River's own types, with the
 # client-only features the room-contract and chat-delegate WASM builds never enable.
 # `ecies-randomized` seals what is sent to a private room (it needs a random nonce).

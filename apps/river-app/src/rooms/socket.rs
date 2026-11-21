@@ -6,9 +6,12 @@
 //! that times out (`SO_RCVTIMEO`, which is what `TcpStream::set_read_timeout` sets) leaves the
 //! connection "in an indeterminate state" that "should be closed". A read timeout that races
 //! with arriving data can lose that data, and on Windows it can end with os error 997 instead
-//! of a timeout. So the stream is non-blocking, and [`NodeSocket::recv`] waits by trying a
-//! read and sleeping at most [`POLL`] between tries, until its own deadline. A read that finds
-//! nothing is a plain `WouldBlock` on every platform, and nothing is ever cancelled in flight.
+//! of a timeout. So the stream is non-blocking: a read that finds nothing is a plain
+//! `WouldBlock` on every platform, and [`NodeSocket::recv`] then waits for the socket to become
+//! readable with the `polling` crate (epoll, kqueue, or AFD poll on Windows) for no longer than
+//! its own deadline, and reads again. The wait is a separate readiness query, not a read, so a
+//! deadline that passes cancels nothing and cannot take bytes. If the poller cannot be made or
+//! used, the wait is a short sleep between reads instead ([`POLL`]).
 //!
 //! A large response may arrive in `StreamChunk`s (announced by a `StreamHeader` or not); they
 //! are put back together here, so the caller only ever sees whole responses.
@@ -67,9 +70,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the WebSocket upgrade may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The longest [`NodeSocket::recv`] sleeps between reads of a socket with nothing to give: the
-/// most delay it adds to a frame that arrives while it sleeps (about 10 ms on average), and
-/// 50 wakeups a second while the connection is idle. Sleeps are cut short at the deadline.
+/// The longest [`NodeSocket::recv`] sleeps between reads when the readiness poller is not
+/// available (see the module docs): the most delay that fallback adds to a frame, and 50
+/// wakeups a second while the connection is idle. Sleeps are cut short at the deadline.
 const POLL: Duration = Duration::from_millis(20);
 
 /// How long a write that found the socket full sleeps before it tries again.
@@ -128,6 +131,10 @@ impl std::fmt::Display for SocketError {
 struct GrantPresented(());
 
 pub struct NodeSocket {
+    /// Tells when the socket has data. It is registered with the stream in `ws`, and
+    /// [`Drop`] removes the registration before the stream closes.
+    poller: Option<polling::Poller>,
+    events: polling::Events,
     ws: WebSocket<TcpStream>,
     /// Every connection presented a grant: what lets it register the chat delegate.
     grant: GrantPresented,
@@ -141,8 +148,6 @@ pub struct NodeSocket {
     heard_anything: bool,
     /// How long [`recv`](NodeSocket::recv) waits for anything before it reports `Timeout`.
     read_wait: Duration,
-    /// The longest sleep between reads while waiting (see [`POLL`]).
-    poll: Duration,
 }
 
 struct Chunks {
@@ -208,7 +213,15 @@ impl NodeSocket {
         request.headers_mut().insert("Authorization", bearer);
         let grant = GrantPresented(());
         let (ws, _) = finish_handshake(tungstenite::client(request, stream), HANDSHAKE_TIMEOUT)?;
+        // The registration lives as long as the stream: `Drop` below deletes it first.
+        let poller = polling::Poller::new().ok().filter(|p| {
+            // SAFETY: the stream is owned by `ws`, which the returned `NodeSocket` keeps alive
+            // for as long as the poller, and `Drop` deletes the registration before it closes.
+            unsafe { p.add(ws.get_ref(), polling::Event::readable(0)) }.is_ok()
+        });
         Ok(NodeSocket {
+            poller,
+            events: polling::Events::with_capacity(std::num::NonZeroUsize::MIN),
             ws,
             grant,
             writes: writes.clone(),
@@ -216,8 +229,25 @@ impl NodeSocket {
             last_heard: Instant::now(),
             heard_anything: false,
             read_wait: Duration::from_secs(10),
-            poll: POLL,
         })
+    }
+
+    /// Wait until the socket has data to read, or `left` has passed, whichever comes first. A
+    /// wakeup with nothing to read is harmless: the caller reads again and finds `WouldBlock`.
+    fn wait_for_data(&mut self, left: Duration) {
+        let waited = self.poller.as_ref().is_some_and(|poller| {
+            // One-shot interest: arm it again for each wait. Data that is already there
+            // makes the wait return at once, so none can arrive unnoticed between the read
+            // that found nothing and this call.
+            self.events.clear();
+            poller
+                .modify(self.ws.get_ref(), polling::Event::readable(0))
+                .and_then(|()| poller.wait(&mut self.events, Some(left)))
+                .is_ok()
+        });
+        if !waited {
+            std::thread::sleep(left.min(POLL));
+        }
     }
 
     /// How long [`recv`](Self::recv) waits before reporting [`SocketError::Timeout`]. The
@@ -335,7 +365,7 @@ impl NodeSocket {
                     if left.is_zero() {
                         return Err(SocketError::Timeout);
                     }
-                    std::thread::sleep(left.min(self.poll));
+                    self.wait_for_data(left);
                     continue;
                 }
                 Err(e) => return Err(map_ws_error(e, true)),
@@ -650,6 +680,14 @@ fn map_ws_error_with(e: tungstenite::Error, reading: bool, pending: Option<i32>)
             }
         }
         other => SocketError::Failed(other.to_string()),
+    }
+}
+
+impl Drop for NodeSocket {
+    fn drop(&mut self) {
+        if let Some(poller) = &self.poller {
+            let _ = poller.delete(self.ws.get_ref());
+        }
     }
 }
 
@@ -1339,6 +1377,39 @@ mod tests {
         );
         drop(socket);
         server.join().unwrap();
+    }
+
+    /// A frame is read as soon as it arrives, not at the end of a wait or a sleep: with a 30 s
+    /// wait and a frame sent after 50 ms, `recv` returns well inside a second. With the
+    /// readiness poller gone (its fallback is a sleep of at most [`POLL`]) it still does.
+    #[test]
+    fn a_frame_wakes_the_wait_and_the_fallback_sleep_is_short() {
+        for poller in [true, false] {
+            let ok: HostResult = Ok(HostResponse::Ok);
+            let bytes = bincode::serialize(&ok).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let authority = listener.local_addr().unwrap().to_string();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                thread::sleep(Duration::from_millis(50));
+                ws.send(Message::Binary(bytes.into())).unwrap();
+                while ws.read().is_ok() {}
+            });
+            let mut socket =
+                NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+            assert!(socket.poller.is_some(), "the poller could not be made");
+            if !poller {
+                socket.poller = None;
+            }
+            socket.set_read_timeout(Duration::from_secs(30)).unwrap();
+            let start = Instant::now();
+            assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
+            let took = start.elapsed();
+            assert!(took < Duration::from_secs(1), "poller {poller}: {took:?}");
+            drop(socket);
+            server.join().unwrap();
+        }
     }
 
     /// A frame that arrives in two parts with a wait that runs out between them is delivered
