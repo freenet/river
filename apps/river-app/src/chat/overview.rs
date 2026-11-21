@@ -131,6 +131,9 @@ pub struct Reveal {
     pub message: String,
     /// Frames to wait first: the room's history has to be laid out before it can be scrolled.
     wait: u8,
+    /// Centre the message in the history (a jump from a quoted reply, as the web UI does)
+    /// instead of only bringing it into view.
+    centre: bool,
 }
 
 impl Reveal {
@@ -140,6 +143,15 @@ impl Reveal {
             room: room.to_owned(),
             message: message.to_owned(),
             wait: 0,
+            centre: false,
+        }
+    }
+
+    /// [`Reveal::at_once`], centring the message in the history without a glide.
+    pub fn centred(room: &str, message: &str) -> Self {
+        Reveal {
+            centre: true,
+            ..Self::at_once(room, message)
         }
     }
 }
@@ -187,6 +199,7 @@ impl Chat {
             return;
         }
         self.reveal = reveal.map(|m| Reveal {
+            centre: false,
             room: room.to_owned(),
             message: m.to_owned(),
             wait: if already_open { 0 } else { 1 },
@@ -231,10 +244,15 @@ impl Chat {
             r.wait -= 1;
             return true;
         }
-        tx.scroll_into_view_in(
+        let (scope, row) = (
             format!("history-scroll-{}", r.room),
             format!("msg-{}", r.message),
         );
+        if r.centre {
+            tx.scroll_center_in_instant(scope, row);
+        } else {
+            tx.scroll_into_view_in(scope, row);
+        }
         self.reveal = None;
         false
     }

@@ -49,6 +49,8 @@ pub(crate) mod node_ui;
 mod notify_dialog;
 pub mod overview;
 mod quick_reply;
+#[cfg(test)]
+mod reply_jump_tests;
 pub mod search;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
@@ -385,6 +387,8 @@ pub struct Chat {
     pub(crate) narrow: bool,
     /// A message marked for a moment after a jump from the search panel.
     flash: Option<search::Flash>,
+    /// A drag that began on a reply's strip travelled past a click.
+    reply_dragged: bool,
     /// Whether the unread and mentions overview is open ([`overview`]).
     pub overview: bool,
     /// A message to scroll to once the room it is in is on screen.
@@ -526,6 +530,7 @@ impl Chat {
             member_search: Default::default(),
             narrow: false,
             flash: None,
+            reply_dragged: false,
             overview: false,
             reveal: None,
             reply_notices: Default::default(),
