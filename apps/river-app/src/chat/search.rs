@@ -54,6 +54,9 @@ const SNIPPET_CHARS: usize = 110;
 /// How many characters of context a snippet keeps before the first match.
 const LEAD_CHARS: usize = 28;
 
+/// How far (points) the pointer may travel on a reply's strip and still be a click.
+pub const REPLY_CLICK_SLOP: f32 = 4.0;
+
 /// How long a jumped-to message stays marked.
 pub const FLASH_FOR: Duration = Duration::from_millis(1800);
 
@@ -476,6 +479,62 @@ impl Chat {
             message: key.to_owned(),
             until: now + FLASH_FOR,
         });
+    }
+
+    /// Jump to the message a reply quotes (a press on the reply's strip), as the web UI does:
+    /// centre it in the open room's history and mark it for a moment. The room holds its whole
+    /// history, so there is nothing to load; a message that is not in the room does nothing
+    /// (its strip is not drawn pressable then, see [`Chat::reply_target_is_here`]).
+    pub fn reply_jump(&mut self, target: model::MessageId, now: Instant) {
+        let Some(room) = self.room() else {
+            return;
+        };
+        let Some(key) = room
+            .messages
+            .iter()
+            .find(|m| m.id == target)
+            .map(|m| m.key.clone())
+        else {
+            return;
+        };
+        let room = room.key.clone();
+        self.reveal = Some(Reveal::centred(&room, &key));
+        self.flash = Some(Flash {
+            room,
+            message: key,
+            until: now + FLASH_FOR,
+        });
+    }
+
+    /// A drag that began on a reply's strip: remembers whether the pointer travelled past
+    /// [`REPLY_CLICK_SLOP`], so the press Rune runs when it ends over the strip is not a click.
+    pub fn reply_press_drag(&mut self, d: &rune::Drag) {
+        match d.phase {
+            rune::Phase::Down => self.reply_dragged = false,
+            rune::Phase::Move => {
+                self.reply_dragged |=
+                    d.dx.abs() > REPLY_CLICK_SLOP || d.dy.abs() > REPLY_CLICK_SLOP;
+            }
+            rune::Phase::Up => {
+                // Released off the strip: no press follows, so nothing is left to swallow.
+                let inside = (0.0..=d.w).contains(&d.x) && (0.0..=d.h).contains(&d.y);
+                if !inside {
+                    self.reply_dragged = false;
+                }
+            }
+        }
+    }
+
+    /// Whether the press now running ended a drag (taking the mark, so a key press that
+    /// follows is a click).
+    pub fn reply_press_was_drag(&mut self) -> bool {
+        std::mem::take(&mut self.reply_dragged)
+    }
+
+    /// Whether the message a reply quotes is in the open room.
+    pub fn reply_target_is_here(&self, target: model::MessageId) -> bool {
+        self.room()
+            .is_some_and(|r| r.messages.iter().any(|m| m.id == target))
     }
 
     /// Jump to the highlighted row (Enter). With nothing listed it does nothing.

@@ -653,30 +653,66 @@ fn message_el(room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
     let mut c = col().key(format!("msg-{}", m.key)).w_full().gap(5.0);
     if let Some(reply) = &m.reply_to {
         let author = room.nickname(reply.author).to_owned();
-        let line = format!("{author}  {}", reply.preview);
-        c = c.child(
-            row()
-                .key("reply")
-                .max_w(BODY_MAX_W)
-                .gap(6.0)
-                .center_y()
-                .min_w(0.0)
-                .child(icon(&icons::REPLY, 13.0).color(p.text_muted))
-                .child(
-                    rune::rich(
-                        line,
-                        vec![
-                            rune::Span::new(0, author.len())
-                                .bold()
-                                .color(p.text_secondary),
-                        ],
-                    )
-                    .font(st::QUOTE)
-                    .color(p.quote)
-                    .truncate()
-                    .shrink(),
-                ),
-        );
+        let target = reply.message;
+        let here = room.messages.iter().any(|t| t.id == target);
+        // As the web UI: a quote of a message that is in the room jumps to it; one that is
+        // not (deleted, moderated) says so and is not pressable.
+        let line = if here {
+            format!("{author}  {}", reply.preview)
+        } else {
+            "Original message unavailable".to_owned()
+        };
+        let mut text = if here {
+            rune::rich(
+                line,
+                vec![
+                    rune::Span::new(0, author.len())
+                        .bold()
+                        .color(p.text_secondary),
+                ],
+            )
+        } else {
+            label(line, st::QUOTE, p.quote)
+        };
+        text = text.font(st::QUOTE).color(p.quote).truncate().shrink();
+        let mut strip = row()
+            .key("reply")
+            .max_w(BODY_MAX_W)
+            .gap(6.0)
+            .center_y()
+            .min_w(0.0)
+            .child(icon(&icons::REPLY, 13.0).color(p.text_muted))
+            .child(text);
+        if here {
+            strip = strip
+                .role("button")
+                .label(format!("Jump to the message from {author}"))
+                .focusable(true)
+                .help("Jump to the original message")
+                .radius(4.0)
+                .hover(p.surface_hover)
+                .cursor(rune::Cursor::Pointer)
+                // A drag that began here (to select the quote) must not jump when it ends
+                // over the strip: Rune runs a press after a drag, so the drag marks itself.
+                .on_drag(|s: &mut RiverApp, d: &mut rune::Drag, _| {
+                    s.chat.reply_press_drag(d);
+                })
+                .on_press(move |s: &mut RiverApp| {
+                    if !s.chat.reply_press_was_drag() {
+                        s.chat.reply_jump(target, std::time::Instant::now());
+                    }
+                })
+                // Space presses a focused control; Return is the app's to take (as the
+                // archive button does), and an HTML button takes it too.
+                .on_key(move |s: &mut RiverApp, ev, _| {
+                    let enter = ev.key == rune::Key::Enter && ev.mods == rune::Mods::default();
+                    if enter {
+                        s.chat.reply_jump(target, std::time::Instant::now());
+                    }
+                    enter
+                });
+        }
+        c = c.child(strip);
     }
     c = c.child(message_body(m, p, k));
     if let Some(pending) = &m.pending {
