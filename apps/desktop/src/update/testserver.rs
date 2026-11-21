@@ -110,6 +110,9 @@ impl Drop for TestServer {
 
 fn handle(mut stream: TcpStream, routes: Routes, hits: Hits, stop: Arc<AtomicBool>) {
     let _ = stream.set_nonblocking(false);
+    // A test double on loopback. A read that times out or fails returns and drops the
+    // connection (never read from again), as Windows requires of a socket whose receive
+    // timed out, so the timeout cannot lose bytes that a later read would need.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = Vec::new();
     let mut buf = [0u8; 1024];

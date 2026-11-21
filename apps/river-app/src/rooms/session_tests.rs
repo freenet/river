@@ -551,6 +551,8 @@ struct World {
     /// What each connection was sent, in order, by connection: "register", "list", "get",
     /// "versioned", "cas", "contract".
     sent: Vec<(usize, &'static str)>,
+    /// When each registration reached the node.
+    register_times: Vec<Instant>,
     /// Take registrations but answer nothing (the delegate stays unregistered).
     silence_register: bool,
     /// Called for every listing, as it arrives.
@@ -847,10 +849,16 @@ fn serve_ws(mut stream: TcpStream, head: String, n: usize, play: Play, world: Ar
     }
 }
 
+/// The fake node's side of one connection. Its socket has NO receive timeout: Windows documents
+/// that a receive that times out leaves the connection in an indeterminate state (the same
+/// reason the app's own socket has none), so this one is non-blocking and sleeps between reads.
+/// Any read error other than "nothing yet" and a normal close is printed with its raw OS code,
+/// so a connection the node drops on its own account never looks like the app's doing.
 fn serve(mut ws: tungstenite::WebSocket<TcpStream>, n: usize, world: &Mutex<World>) {
-    let _ = ws
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_millis(5)));
+    if let Err(e) = ws.get_mut().set_nonblocking(true) {
+        eprintln!("fake node: cannot make the socket non-blocking: {e}");
+        return;
+    }
     loop {
         {
             let mut w = world.lock().unwrap();
@@ -862,7 +870,7 @@ fn serve(mut ws: tungstenite::WebSocket<TcpStream>, n: usize, world: &Mutex<Worl
                 return;
             }
             for m in std::mem::take(&mut w.push) {
-                if ws.send(m).is_err() {
+                if !sent_or_queued(ws.send(m)) {
                     return;
                 }
             }
@@ -876,15 +884,48 @@ fn serve(mut ws: tungstenite::WebSocket<TcpStream>, n: usize, world: &Mutex<Worl
             Ok(Message::Binary(b)) => {
                 let replies = answer(world, n, &b);
                 for r in replies {
-                    if ws.send(Message::Binary(r.into())).is_err() {
+                    if !sent_or_queued(ws.send(Message::Binary(r.into()))) {
                         return;
                     }
                 }
             }
             Ok(_) => {}
-            Err(tungstenite::Error::Io(e))
-                if matches!(e.kind(), IoErrorKind::WouldBlock | IoErrorKind::TimedOut) => {}
-            Err(_) => return,
+            Err(tungstenite::Error::Io(e)) if e.kind() == IoErrorKind::WouldBlock => {
+                // Nothing yet: push anything left queued, then sleep a little.
+                if !sent_or_queued(ws.flush()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return;
+            }
+            Err(e) => {
+                let code = match &e {
+                    tungstenite::Error::Io(io) => io.raw_os_error(),
+                    _ => None,
+                };
+                eprintln!("fake node: connection {n} read ended: {e} (os error {code:?})");
+                return;
+            }
+        }
+    }
+}
+
+/// Whether a write on the fake node's non-blocking socket went out or is queued to go out on
+/// the next flush (`WouldBlock`); a real failure is printed with its raw OS code.
+fn sent_or_queued(result: Result<(), tungstenite::Error>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(tungstenite::Error::Io(e)) if e.kind() == IoErrorKind::WouldBlock => true,
+        Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => false,
+        Err(e) => {
+            let code = match &e {
+                tungstenite::Error::Io(io) => io.raw_os_error(),
+                _ => None,
+            };
+            eprintln!("fake node: a write ended: {e} (os error {code:?})");
+            false
         }
     }
 }
@@ -901,6 +942,7 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
         // The node's answer to a registration: an empty response for the delegate's key.
         ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate, .. }) => {
             w.sent.push((n, "register"));
+            w.register_times.push(Instant::now());
             assert_eq!(delegate.key(), delegate::chat_delegate_key());
             if w.silence_register {
                 // No answer, and nothing registered.
@@ -4762,15 +4804,34 @@ fn a_store_refused_at_first_is_set_up_later_by_itself_on_a_backoff() {
     session.wait_rooms("the store is said to be missing", |r, issues, _| {
         r.is_empty() && issues.store_missing
     });
-    // Many re-reads while the node still refuses.
-    let lists = node.with(|w| w.lists);
-    session.wait_until("forty more reads", || node.with(|w| w.lists >= lists + 40));
-    let (refused, reads) = node.with(|w| (registrations(w), w.lists - lists));
-    assert!(refused >= 2, "the app retried by itself: {refused}");
-    assert!(
-        refused * 4 <= reads,
-        "{refused} registrations over {reads} re-reads"
-    );
+    // The node keeps refusing: the app's own retries follow the backoff schedule. The test
+    // compares the gaps between the registrations the node saw with the schedule, not read
+    // counts: reads and registrations run on different clocks, which scale differently on a
+    // loaded machine. First retry after at least `register_retry_first` (150 ms), then the
+    // wait doubles up to `register_retry_max` (600 ms).
+    session.wait_until("four registrations", || {
+        node.with(|w| w.register_times.len() >= 4)
+    });
+    // The stamp is when the node RECEIVED the registration, which comes after the app's
+    // reconnect, so each gap is the scheduled wait plus the difference between two reconnect
+    // delays: allow 25% under the schedule, and require the growth itself (the third wait
+    // is at least 200 ms longer than the first), which is what the backoff is for.
+    node.with(|w| {
+        let times = &w.register_times;
+        let gaps: Vec<Duration> = (0..3)
+            .map(|i| times[i + 1].duration_since(times[i]))
+            .collect();
+        for (gap, scheduled) in gaps.iter().zip([150u64, 300, 600]) {
+            assert!(
+                *gap >= Duration::from_millis(scheduled * 3 / 4),
+                "registration gaps {gaps:?} against the schedule 150/300/600 ms"
+            );
+        }
+        assert!(
+            gaps[2] >= gaps[0] + Duration::from_millis(200),
+            "the backoff did not grow: {gaps:?}"
+        );
+    });
     // The node is healthy now: the next retry sets the store up, with no command sent.
     node.with(|w| w.delegate_missing = false);
     session.wait_rooms("the store is found", |r, issues, s| {
