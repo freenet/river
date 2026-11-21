@@ -325,13 +325,14 @@ fn node_status_is_still_one_press_from_the_status_pill_and_from_settings() {
     s.chat
         .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_000);
     let mut rt = render(s, WINDOW_SIZE);
-    // The old entry points: the connection pill opens the status, and the node entry under it
-    // still shows the address with a Change button.
-    assert!(rt.find("node-address").is_some());
-    assert!(rt.find("node-change").is_some());
+    // The old entry points: the connection pill opens the status. While connected there is no
+    // Change node link in the footer; it appears when the link is lost.
+    assert!(rt.find("node-change").is_none());
     press(&mut rt, "connection-pill");
     assert!(rt.find("node-status-dialog").is_some());
     press(&mut rt, "ns-close");
+    rt.update(|s, _| s.chat.source = super::Source::Node(super::LinkStatus::Reconnecting));
+    settle(&mut rt);
     press(&mut rt, "node-change");
     assert!(rt.find("node-dialog").is_some());
     press(&mut rt, "node-cancel");
@@ -351,8 +352,7 @@ fn the_old_entry_points_are_still_in_the_source() {
     let node_ui = include_str!("node_ui.rs");
     for (file, src, key) in [
         ("view.rs", view, ".key(\"connection-pill\")"),
-        ("view.rs", view, "node_ui::node_entry("),
-        ("node_ui.rs", node_ui, ".key(\"node-address\")"),
+        ("view.rs", view, "node_ui::change_link("),
         ("node_ui.rs", node_ui, ".key(\"node-change\")"),
     ] {
         assert!(src.contains(key), "{key} left {file}");

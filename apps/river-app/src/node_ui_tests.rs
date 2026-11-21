@@ -249,15 +249,29 @@ fn a_node_the_person_has_is_never_offered_an_install() {
     assert!(shows(&rt, "Nothing answered at x:1."));
 }
 
+/// Open the change-node form the way a connected person does: Settings, Connection, Change node.
+fn change_node_from_settings(rt: &mut Runtime<RiverApp>) {
+    press(rt, "settings");
+    press(rt, "settings-section-connection");
+    press(rt, "settings-node-change");
+}
+
 #[test]
-fn the_rooms_screen_has_a_node_entry_that_opens_the_form() {
+fn while_connected_the_footer_is_only_the_status_and_settings_has_change_node() {
     let (mut rt, _) = rooms_app();
-    assert!(rt.find("node-entry").is_some());
-    assert!(shows(&rt, "Node: 127.0.0.1:7509"));
-    // The default node reads as it always has.
+    // The default node reads as it always has, with no second row and no button.
     assert!(shows(&rt, "Connected"));
     assert!(!shows(&rt, "Connected to"));
-    press(&mut rt, "node-change");
+    assert!(rt.find("node-change").is_none());
+    assert!(rt.find("node-entry").is_none());
+    assert!(rt.find("node-address").is_none());
+    assert!(!shows(&rt, "Node: "));
+    assert!(rt.find("connection-pill").is_some());
+    // The address and the way to change it are in Settings.
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-connection");
+    assert!(shows(&rt, "127.0.0.1:7509"));
+    press(&mut rt, "settings-node-change");
     assert!(rt.find("node-input").is_some());
     // Over the rooms, not replacing them.
     assert!(rt.find("rooms").is_some());
@@ -266,25 +280,86 @@ fn the_rooms_screen_has_a_node_entry_that_opens_the_form() {
 }
 
 #[test]
-fn a_node_that_is_not_the_default_is_named_beside_the_connection() {
+fn the_footer_never_shows_the_nodes_address_and_says_remote_in_a_word() {
     let (mut rt, _) = rooms_app();
-    rt.update(|s, _| {
-        s.chat.node.choice = NodeChoice::saved(NodeAddress::parse("localhost:40302").unwrap());
-    });
-    rt.frame(0.3);
-    assert!(shows(&rt, "Connected to localhost:40302"));
-    assert!(shows(&rt, "Node: localhost:40302"));
-    for (status, words) in [
-        (LinkStatus::Loading, "Connecting to localhost:40302..."),
-        (
-            LinkStatus::Reconnecting,
-            "Disconnected from localhost:40302",
-        ),
+    for (address, remote) in [
+        ("127.0.0.1:7509", false),
+        ("localhost:40302", false),
+        ("home.example.org:7509", true),
     ] {
-        rt.update(move |s, _| s.chat.note_status(status));
+        for (status, plain) in [
+            (LinkStatus::Live, "Connected"),
+            (LinkStatus::Loading, "Connecting..."),
+            (LinkStatus::Reconnecting, "Disconnected"),
+        ] {
+            rt.update(move |s, _| {
+                s.chat.node.choice = NodeChoice::saved(NodeAddress::parse(address).unwrap());
+                s.chat.source = chat::Source::Node(status);
+            });
+            rt.frame(0.4);
+            let want = if remote {
+                format!("{plain} (remote)")
+            } else {
+                plain.to_owned()
+            };
+            assert!(shows(&rt, &want), "{address} {status:?}: {want}");
+            let host = address.split(':').next().unwrap();
+            assert!(!shows(&rt, host), "{address} {status:?} shows the address");
+            assert!(!shows(&rt, "Node: "));
+            assert_eq!(
+                rt.find("node-change").is_some(),
+                status != LinkStatus::Live,
+                "{address} {status:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_quiet_link_is_there_when_not_connected_and_opens_the_form() {
+    for source in [
+        chat::Source::Example,
+        chat::Source::Node(LinkStatus::Loading),
+        chat::Source::Node(LinkStatus::Reconnecting),
+    ] {
+        let (mut rt, _) = rooms_app();
+        rt.update(move |s, _| s.chat.source = source);
+        rt.frame(0.4);
+        assert!(rt.find("node-change").is_some(), "{source:?}");
+        assert!(shows(&rt, "Change node"), "{source:?}");
+        assert!(rt.find("node-address").is_none(), "{source:?}");
+        press(&mut rt, "node-change");
+        assert!(rt.find("node-input").is_some(), "{source:?}");
+    }
+}
+
+#[test]
+fn the_footer_does_not_move_when_the_connection_state_changes() {
+    let (mut rt, _) = rooms_app();
+    let at = |rt: &Runtime<RiverApp>, key: &str| {
+        let e = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no {key}"));
+        e.rect
+    };
+    rt.update(|s, _| s.chat.source = chat::Source::Node(LinkStatus::Live));
+    rt.frame(0.4);
+    let keys = ["enter-invite", "import-id", "connection-row"];
+    let live: Vec<_> = keys.iter().map(|k| at(&rt, k)).collect();
+    for status in [
+        LinkStatus::Loading,
+        LinkStatus::Reconnecting,
+        LinkStatus::Live,
+    ] {
         rt.update(move |s, _| s.chat.source = chat::Source::Node(status));
         rt.frame(0.4);
-        assert!(shows(&rt, words), "{words}");
+        let now: Vec<_> = keys.iter().map(|k| at(&rt, k)).collect();
+        // Equal to a hundredth of a point (text layout rounds a line's height).
+        for (a, b) in now.iter().flatten().zip(live.iter().flatten()) {
+            assert!((a - b).abs() < 0.05, "{status:?}: {now:?} vs {live:?}");
+        }
     }
 }
 
@@ -292,7 +367,7 @@ fn a_node_that_is_not_the_default_is_named_beside_the_connection() {
 fn changing_the_node_says_what_it_means_and_replaces_the_rooms_only_when_confirmed() {
     let (mut rt, host) = rooms_app();
     assert!(shows(&rt, "Town Square"));
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     type_address(&mut rt, "localhost:40302");
     press(&mut rt, "node-connect");
     // On this computer, so no network warning, but the change is explained.
@@ -320,7 +395,7 @@ fn changing_the_node_says_what_it_means_and_replaces_the_rooms_only_when_confirm
 #[test]
 fn changing_to_a_node_on_another_machine_shows_both_notes() {
     let (mut rt, _) = rooms_app();
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     type_address(&mut rt, "home.example.org");
     press(&mut rt, "node-connect");
     assert!(rt.find("node-warning").is_some());
@@ -347,7 +422,7 @@ fn going_back_to_the_freenet_on_this_computer() {
         s.access = Access::Ready;
     });
     rt.frame(0.3);
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     press(&mut rt, "node-use-local");
     assert_eq!(node_of(&rt), NodeChoice::local());
     assert!(!rt.state.ctl.as_ref().unwrap().node().is_existing_node());
@@ -368,7 +443,7 @@ fn a_node_given_on_the_command_line_says_so_in_the_form() {
             source: Source::Flag,
         };
     });
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     assert!(rt.find("node-override-note").is_some());
     assert!(shows(&rt, "--node"));
     // The field starts with the address in use, to edit.

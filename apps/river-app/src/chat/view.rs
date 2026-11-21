@@ -616,15 +616,15 @@ pub(super) struct Pill {
 /// The web UI's connection pill (`ConnectionStatusIndicator`): a green dot and "Connected", an
 /// amber dot and "Connecting...", a red dot and "Disconnected" in the error colour. The app
 /// has no per-attempt error report to explain, so the tooltip says what the state means.
-pub(super) fn connection_pill(source: Source, node: Option<&str>, p: &Palette) -> Pill {
-    // A node other than the default is named, so the person can see which one River is on.
-    let named = |plain: &str, with: &dyn Fn(&str) -> String| match node {
-        Some(n) => with(n),
-        None => plain.to_owned(),
-    };
-    let tip = |t: &str| match node {
-        Some(n) => format!("{t} The node is at {n}."),
-        None => t.to_owned(),
+pub(super) fn connection_pill(source: Source, remote: bool, p: &Palette) -> Pill {
+    // The node's address is never shown here: it is in Settings, Connection, and in the node
+    // status. A node on another computer says so in one word.
+    let named = |plain: &str| {
+        if remote {
+            format!("{plain} (remote)")
+        } else {
+            plain.to_owned()
+        }
     };
     match source {
         Source::Example => Pill {
@@ -635,23 +635,22 @@ pub(super) fn connection_pill(source: Source, node: Option<&str>, p: &Palette) -
         },
         Source::Node(LinkStatus::Loading) => Pill {
             dot: p.warning,
-            text: named("Connecting...", &|n| format!("Connecting to {n}...")),
+            text: named("Connecting..."),
             color: p.text_muted,
-            tip: tip("Showing your stored rooms while River catches up with Freenet."),
+            tip: "Showing your stored rooms while River catches up with Freenet.".into(),
         },
         Source::Node(LinkStatus::Live) => Pill {
             dot: p.success,
-            text: named("Connected", &|n| format!("Connected to {n}")),
+            text: named("Connected"),
             color: p.text_muted,
-            tip: tip("Connected to Freenet."),
+            tip: "Connected to Freenet.".into(),
         },
         Source::Node(LinkStatus::Reconnecting) => Pill {
             dot: p.error,
-            text: named("Disconnected", &|n| format!("Disconnected from {n}")),
+            text: named("Disconnected"),
             color: p.danger,
-            tip: tip(
-                "Connection to Freenet lost. The rooms shown are as last seen. River is reconnecting.",
-            ),
+            tip: "Connection to Freenet lost. The rooms shown are as last seen. River is reconnecting."
+                .into(),
         },
     }
 }
@@ -659,43 +658,62 @@ pub(super) fn connection_pill(source: Source, node: Option<&str>, p: &Palette) -
 /// Where the rooms come from, at the foot of the room list, and for rooms from the node the
 /// connection's state, as the web UI's connection pill shows it.
 fn source_status(chat: &Chat, p: &Palette, k: &Kit) -> El {
-    let pill = connection_pill(chat.source, chat.node.label().as_deref(), p);
-    let mut status = col().key("source-status").px(4.0).gap(4.0).child(
-        row()
-            .key("connection-pill")
-            .gap(8.0)
-            .center_y()
-            .help(format!("{} Press for node status.", pill.tip))
-            .role("button")
-            .label("Node status")
-            .focusable(true)
-            .py(6.0)
-            .cursor(rune::Cursor::Pointer)
-            .on_press(|s: &mut RiverApp| s.chat.status.open())
-            // Space presses a focused control; Enter does too, as on a button.
-            .on_key(|s: &mut RiverApp, ev, _| {
-                let enter = ev.key == rune::Key::Enter;
-                if enter {
-                    s.chat.status.open();
-                }
-                enter
-            })
-            .child(
-                el().key("connection-dot")
-                    .size(7.0, 7.0)
-                    .radius(3.5)
-                    .fill(pill.dot),
-            )
-            .child(
-                label(pill.text.clone(), st::SMALL_STRONG, pill.color)
-                    .key("connection-label")
-                    .wrap()
-                    .w_full(),
-            ),
-    );
+    let pill = connection_pill(chat.source, !chat.node.choice.address.is_loopback(), p);
+    let pill_row = row()
+        .key("connection-pill")
+        .gap(8.0)
+        .center_y()
+        .grow(1.0)
+        .min_w(0.0)
+        .help(format!("{} Press for node status.", pill.tip))
+        .role("button")
+        .label("Node status")
+        .focusable(true)
+        .py(6.0)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut RiverApp| s.chat.status.open())
+        // Space presses a focused control; Enter does too, as on a button.
+        .on_key(|s: &mut RiverApp, ev, _| {
+            let enter = ev.key == rune::Key::Enter;
+            if enter {
+                s.chat.status.open();
+            }
+            enter
+        })
+        .child(
+            el().key("connection-dot")
+                .size(7.0, 7.0)
+                .radius(3.5)
+                .fill(pill.dot),
+        )
+        .child(
+            label(pill.text.clone(), st::SMALL_STRONG, pill.color)
+                .key("connection-label")
+                .wrap()
+                .grow(1.0)
+                .min_w(0.0),
+        );
+    // One row whatever the state, so nothing below it moves when the connection changes. While
+    // connected the row is only the status: the node's address and "Change node" are in
+    // Settings, Connection. Otherwise, which is when a person needs to change the node, a quiet
+    // "Change node" link sits at the end of the same row.
+    let connected = matches!(chat.source, Source::Node(LinkStatus::Live));
+    let mut status_row = row()
+        .key("connection-row")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(pill_row);
+    if !connected {
+        status_row = status_row.child(super::node_ui::change_link(p));
+    }
+    let mut status = col()
+        .key("source-status")
+        .px(4.0)
+        .gap(4.0)
+        .child(status_row);
     if matches!(chat.source, Source::Node(_)) {
-        status = status.child(super::node_ui::node_entry(chat, p, k));
-        for banner in super::node_ui::banners(&chat.node, p) {
+        for banner in super::node_ui::banners(&chat.node, false, p) {
             status = status.child(banner);
         }
     }

@@ -3005,7 +3005,7 @@ fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
         }
     };
     // A node that is not on this computer is said on every screen, at every start.
-    let banners = chat::node_ui::banners(&s.chat.node, &palette);
+    let banners = chat::node_ui::banners(&s.chat.node, true, &palette);
     let mut root = col()
         .key("root")
         .w_full()
