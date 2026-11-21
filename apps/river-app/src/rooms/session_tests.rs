@@ -4812,16 +4812,25 @@ fn a_store_refused_at_first_is_set_up_later_by_itself_on_a_backoff() {
     session.wait_until("four registrations", || {
         node.with(|w| w.register_times.len() >= 4)
     });
+    // The stamp is when the node RECEIVED the registration, which comes after the app's
+    // reconnect, so each gap is the scheduled wait plus the difference between two reconnect
+    // delays: allow 25% under the schedule, and require the growth itself (the third wait
+    // is at least 200 ms longer than the first), which is what the backoff is for.
     node.with(|w| {
         let times = &w.register_times;
-        for (i, minimum) in [150u64, 300, 600].into_iter().enumerate() {
-            let gap = times[i + 1].duration_since(times[i]);
+        let gaps: Vec<Duration> = (0..3)
+            .map(|i| times[i + 1].duration_since(times[i]))
+            .collect();
+        for (gap, scheduled) in gaps.iter().zip([150u64, 300, 600]) {
             assert!(
-                gap >= Duration::from_millis(minimum),
-                "registration {} came {gap:?} after the one before; the backoff says at least {minimum} ms",
-                i + 2
+                *gap >= Duration::from_millis(scheduled * 3 / 4),
+                "registration gaps {gaps:?} against the schedule 150/300/600 ms"
             );
         }
+        assert!(
+            gaps[2] >= gaps[0] + Duration::from_millis(200),
+            "the backoff did not grow: {gaps:?}"
+        );
     });
     // The node is healthy now: the next retry sets the store up, with no command sent.
     node.with(|w| w.delegate_missing = false);
