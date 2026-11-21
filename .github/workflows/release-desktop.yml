@@ -68,6 +68,7 @@ on:
       - '.github/workflows/release-desktop.yml'
       - 'apps/desktop/packaging/**'
       - 'apps/desktop/build.rs'
+      - 'apps/desktop/update-pubkey.hex'
       - 'apps/desktop/Cargo.toml'
       # The release profile lives here.
       - 'apps/Cargo.toml'
@@ -156,30 +157,36 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Tests
         run: cargo test --locked
+      # The update key this build trusts is committed in apps/desktop/update-pubkey.hex (a
+      # public key, changed only by a reviewed PR). Read and validate it here, then export it
+      # for the Build step; nothing from outside the repository is interpolated into a script.
+      - name: Read the update key
+        run: |
+          key=$(cat desktop/update-pubkey.hex)
+          if ! echo "$key" | grep -Eq '^[0-9a-f]{64}$' || [ "$key" = "$(printf '%064d' 0)" ]; then
+            echo "::error::apps/desktop/update-pubkey.hex must hold exactly 64 lowercase hex digits and not be all zeros."
+            exit 1
+          fi
+          echo "RIVER_UPDATE_PUBKEY_HEX=$key" >> "$GITHUB_ENV"
       - name: Build
-        env:
-          RIVER_UPDATE_PUBKEY_HEX: ${{ vars.RIVER_UPDATE_PUBKEY_HEX }}
         run: cargo build --release --locked -p river-desktop
       # A real release (a tag) that cannot verify updates can never be updated: fail when the
       # update key is the placeholder, and when the key compiled into the binary is not the one
-      # in the repository variable (`--update-status` prints it). Pull requests and dry runs
-      # build with whatever the variable holds (empty for a fork pull request, which is the
-      # placeholder) and skip this check.
+      # committed in apps/desktop/update-pubkey.hex (`--update-status` prints it). Pull requests
+      # and dry runs skip this check.
       - name: Check the build has an update key
         if: github.ref_type == 'tag'
-        env:
-          RIVER_UPDATE_PUBKEY_HEX: ${{ vars.RIVER_UPDATE_PUBKEY_HEX }}
         run: |
           if ! status=$(target/release/river --update-status); then
             echo "$status"
-            echo "::error::This build has the placeholder update key, so it could never update itself. The repository variable RIVER_UPDATE_PUBKEY_HEX is missing or empty. Set it to the public key printed by update_tool keygen (64 hex digits, not a secret)."
+            echo "::error::This build has the placeholder update key, so it could never update itself: the committed key file is missing or the env was not passed to the Build step."
             exit 1
           fi
           echo "$status"
           built=$(echo "$status" | sed -n 's/^update key bytes: //p')
-          expected=$(echo "$RIVER_UPDATE_PUBKEY_HEX" | tr 'A-F' 'a-f')
+          expected=$(cat desktop/update-pubkey.hex)
           if [ "$built" != "$expected" ]; then
-            echo "::error::The update key compiled into this build ($built) is not the repository variable RIVER_UPDATE_PUBKEY_HEX. The Build step must pass that variable as an environment variable."
+            echo "::error::The update key compiled into this build ($built) is not the committed apps/desktop/update-pubkey.hex ($expected)."
             exit 1
           fi
       - name: Validate river.desktop
@@ -215,32 +222,39 @@ jobs:
       # Native arm64 only: the runner cannot execute x86_64 test binaries.
       - name: Tests
         run: cargo test --locked
+      # The update key this build trusts is committed in apps/desktop/update-pubkey.hex (a
+      # public key, changed only by a reviewed PR). Read and validate it here, then export it
+      # for the Build step; nothing from outside the repository is interpolated into a script.
+      - name: Read the update key
+        run: |
+          key=$(cat desktop/update-pubkey.hex)
+          if ! echo "$key" | grep -Eq '^[0-9a-f]{64}$' || [ "$key" = "$(printf '%064d' 0)" ]; then
+            echo "::error::apps/desktop/update-pubkey.hex must hold exactly 64 lowercase hex digits and not be all zeros."
+            exit 1
+          fi
+          echo "RIVER_UPDATE_PUBKEY_HEX=$key" >> "$GITHUB_ENV"
       - name: Build arm64 and x86_64
-        env:
-          RIVER_UPDATE_PUBKEY_HEX: ${{ vars.RIVER_UPDATE_PUBKEY_HEX }}
         run: |
           cargo build --release --locked -p river-desktop --target aarch64-apple-darwin
           cargo build --release --locked -p river-desktop --target x86_64-apple-darwin
       # A real release (a tag) that cannot verify updates can never be updated: fail when the
       # update key is the placeholder, and when the key compiled into the binary is not the one
-      # in the repository variable (`--update-status` prints it). Pull requests and dry runs
-      # build with whatever the variable holds (empty for a fork pull request, which is the
-      # placeholder) and skip this check.
+      # committed in apps/desktop/update-pubkey.hex (`--update-status` prints it). Pull requests
+      # and dry runs skip this check. Only the arm64 binary is run: the x86_64 build shares this
+      # job's env, and the runner cannot execute it.
       - name: Check the build has an update key
         if: github.ref_type == 'tag'
-        env:
-          RIVER_UPDATE_PUBKEY_HEX: ${{ vars.RIVER_UPDATE_PUBKEY_HEX }}
         run: |
           if ! status=$(target/aarch64-apple-darwin/release/river --update-status); then
             echo "$status"
-            echo "::error::This build has the placeholder update key, so it could never update itself. The repository variable RIVER_UPDATE_PUBKEY_HEX is missing or empty. Set it to the public key printed by update_tool keygen (64 hex digits, not a secret)."
+            echo "::error::This build has the placeholder update key, so it could never update itself: the committed key file is missing or the env was not passed to the Build step."
             exit 1
           fi
           echo "$status"
           built=$(echo "$status" | sed -n 's/^update key bytes: //p')
-          expected=$(echo "$RIVER_UPDATE_PUBKEY_HEX" | tr 'A-F' 'a-f')
+          expected=$(cat desktop/update-pubkey.hex)
           if [ "$built" != "$expected" ]; then
-            echo "::error::The update key compiled into this build ($built) is not the repository variable RIVER_UPDATE_PUBKEY_HEX. The Build step must pass that variable as an environment variable."
+            echo "::error::The update key compiled into this build ($built) is not the committed apps/desktop/update-pubkey.hex ($expected)."
             exit 1
           fi
       - name: Assemble River.app (unsigned)
@@ -284,30 +298,36 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Tests
         run: cargo test --locked
+      # The update key this build trusts is committed in apps/desktop/update-pubkey.hex (a
+      # public key, changed only by a reviewed PR). Read and validate it here, then export it
+      # for the Build step; nothing from outside the repository is interpolated into a script.
+      - name: Read the update key
+        run: |
+          key=$(cat desktop/update-pubkey.hex)
+          if ! echo "$key" | grep -Eq '^[0-9a-f]{64}$' || [ "$key" = "$(printf '%064d' 0)" ]; then
+            echo "::error::apps/desktop/update-pubkey.hex must hold exactly 64 lowercase hex digits and not be all zeros."
+            exit 1
+          fi
+          echo "RIVER_UPDATE_PUBKEY_HEX=$key" >> "$GITHUB_ENV"
       - name: Build
-        env:
-          RIVER_UPDATE_PUBKEY_HEX: ${{ vars.RIVER_UPDATE_PUBKEY_HEX }}
         run: cargo build --release --locked -p river-desktop
       # A real release (a tag) that cannot verify updates can never be updated: fail when the
       # update key is the placeholder, and when the key compiled into the binary is not the one
-      # in the repository variable (`--update-status` prints it). Pull requests and dry runs
-      # build with whatever the variable holds (empty for a fork pull request, which is the
-      # placeholder) and skip this check.
+      # committed in apps/desktop/update-pubkey.hex (`--update-status` prints it). Pull requests
+      # and dry runs skip this check.
       - name: Check the build has an update key
         if: github.ref_type == 'tag'
-        env:
-          RIVER_UPDATE_PUBKEY_HEX: ${{ vars.RIVER_UPDATE_PUBKEY_HEX }}
         run: |
           if ! status=$(target/release/river --update-status); then
             echo "$status"
-            echo "::error::This build has the placeholder update key, so it could never update itself. The repository variable RIVER_UPDATE_PUBKEY_HEX is missing or empty. Set it to the public key printed by update_tool keygen (64 hex digits, not a secret)."
+            echo "::error::This build has the placeholder update key, so it could never update itself: the committed key file is missing or the env was not passed to the Build step."
             exit 1
           fi
           echo "$status"
           built=$(echo "$status" | sed -n 's/^update key bytes: //p')
-          expected=$(echo "$RIVER_UPDATE_PUBKEY_HEX" | tr 'A-F' 'a-f')
+          expected=$(cat desktop/update-pubkey.hex)
           if [ "$built" != "$expected" ]; then
-            echo "::error::The update key compiled into this build ($built) is not the repository variable RIVER_UPDATE_PUBKEY_HEX. The Build step must pass that variable as an environment variable."
+            echo "::error::The update key compiled into this build ($built) is not the committed apps/desktop/update-pubkey.hex ($expected)."
             exit 1
           fi
       # Checks the version resource and the zip on pull requests too. A release
