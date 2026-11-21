@@ -228,7 +228,9 @@ pub fn screen(chat: &Chat, connected: bool, k: &Kit) -> Option<Screen> {
             .placeholder("localhost:7509".to_owned())
             .width(None)
             .on_edit(get)
-            .on_key(word_end(get))
+            .on_key(word_end(|s: &mut RiverApp| {
+                s.chat.node.form.as_mut().map(|f| &mut f.input)
+            }))
             .on_submit(|s: &mut RiverApp, _| s.node_submit())
             .build(k)
             .key("node-input")

@@ -28,7 +28,7 @@ use super::icons;
 use super::model::Room;
 use super::style::{self as st, Palette};
 use super::view::label;
-use super::word_end::{Get, word_end};
+use super::word_end::{Get, always, word_end};
 use super::{Chat, Source};
 use crate::RiverApp;
 use crate::rooms::dm_invite::{MAX_NOTE_CHARS, note_refusal};
@@ -360,7 +360,7 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                 .placeholder("e.g. Thought you would enjoy this room")
                 .width(None)
                 .on_edit(get)
-                .on_key(word_end(get))
+                .on_key(word_end(always(get)))
                 .on_submit(|s: &mut RiverApp, _| {
                     s.chat.invite_send();
                 })

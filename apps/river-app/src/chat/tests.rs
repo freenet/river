@@ -6617,12 +6617,13 @@ mod rune_bump {
                 stops.push(composer(&rt).2);
             }
             assert_eq!(stops, [3, 14, 19, 27, 29]);
-            // Ctrl+Shift+Right is the same stop, with the anchor kept.
+            // Ctrl+Shift+Right is Rune's: it selects to the start of the next word, a different
+            // stop from Ctrl+Right's (see `word_end.rs`), with the anchor kept.
             let mut rt = fresh(LINE, 0, 0);
             right(&mut rt, true);
-            assert_eq!((composer(&rt).1, composer(&rt).2), (0, 3));
+            assert_eq!((composer(&rt).1, composer(&rt).2), (0, 5));
             right(&mut rt, true);
-            assert_eq!((composer(&rt).1, composer(&rt).2), (0, 14));
+            assert_eq!((composer(&rt).1, composer(&rt).2), (0, 15));
         }
 
         /// The caret never lands inside a grapheme cluster: after an accent, a keycap, a ZWJ emoji.
@@ -6642,7 +6643,8 @@ mod rune_bump {
             }
         }
 
-        /// A selection collapses to its end, as Rune does on every platform; Shift extends it.
+        /// A selection collapses to its end, as Rune does on every platform; Shift extends it by
+        /// Rune's rule.
         #[test]
         fn ctrl_right_with_a_selection_collapses_it_and_shift_extends_it() {
             let mut rt = fresh("one two three", 0, 3);
@@ -6657,7 +6659,7 @@ mod rune_bump {
             );
             let mut rt = fresh("one two three", 2, 4);
             right(&mut rt, true);
-            assert_eq!((composer(&rt).1, composer(&rt).2), (2, 7));
+            assert_eq!((composer(&rt).1, composer(&rt).2), (2, 8));
         }
 
         /// Text with right-to-left characters moves by Rune's rule (the line as drawn). A
@@ -6850,7 +6852,7 @@ mod rune_bump {
             assert_eq!(at, (3, 3), "{field}");
             right(rt, true);
             rt.update(|s, _| at = (get(s).anchor, get(s).focus));
-            assert_eq!(at, (3, 7), "{field}, Shift");
+            assert_eq!(at, (3, 4), "{field}, Shift is Rune's");
         }
 
         #[test]
@@ -6867,6 +6869,34 @@ mod rune_bump {
             });
             assert_end_of_word(&mut rt, "details-limit-0", |s| {
                 &mut s.chat.details.as_mut().unwrap().limits[0]
+            });
+        }
+
+        #[test]
+        fn the_room_description_stops_at_the_end_of_the_word() {
+            let mut rt = details_open(OWNED);
+            rt.update(|s, _| s.chat.details.as_mut().unwrap().editing_description = true);
+            rt.frame(0.3);
+            assert_end_of_word(&mut rt, "details-description-input", |s| {
+                &mut s.chat.details.as_mut().unwrap().description
+            });
+        }
+
+        #[test]
+        fn the_create_room_dialog_fields_stop_at_the_end_of_the_word() {
+            let mut rt = node_rooms(|_| {});
+            press(&mut rt, "create-room");
+            assert_end_of_word(&mut rt, "room-name", |s| &mut s.chat.form.name);
+            assert_end_of_word(&mut rt, "room-nickname", |s| &mut s.chat.form.nickname);
+        }
+
+        #[test]
+        fn the_members_search_box_stops_at_the_end_of_the_word() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            rt.update(|s, _| s.chat.toggle_member_search());
+            rt.frame(0.3);
+            assert_end_of_word(&mut rt, "member-search-input", |s| {
+                &mut s.chat.member_search.query
             });
         }
 
@@ -6892,6 +6922,92 @@ mod rune_bump {
             assert_end_of_word(&mut rt, "switcher-input", |s| {
                 &mut s.chat.switcher.as_mut().unwrap().query
             });
+        }
+
+        /// Whether the focused field's caret is inside what its clips leave visible.
+        fn caret_in_view(rt: &Runtime<RiverApp>, field: &str) -> bool {
+            let els = rt.elements();
+            let c = els
+                .iter()
+                .find_map(|e| e.caret)
+                .expect("a field has the caret");
+            // The field as keyed: its own box, which the caret has to stay inside.
+            let v = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some(field))
+                .expect("the field")
+                .visible;
+            c[0] >= v[0] - 1.0
+                && c[0] <= v[0] + v[2] + 1.0
+                && c[1] >= v[1] - 1.0
+                && c[1] + c[3] <= v[1] + v[3] + 1.0
+        }
+
+        /// A composer past eight lines scrolls, and Ctrl+Right down through it keeps the caret
+        /// in view: the key is Rune's, so its scroll follow-up runs.
+        #[test]
+        fn ctrl_right_keeps_the_caret_in_view_in_a_composer_that_scrolls() {
+            let text = "alpha beta\n".repeat(30);
+            let mut rt = fresh(&text, 0, 0);
+            for i in 0..50 {
+                right(&mut rt, false);
+                assert!(
+                    caret_in_view(&rt, "composer-field"),
+                    "press {i}, at {}",
+                    composer(&rt).2
+                );
+            }
+            assert!(composer(&rt).2 > 200, "it went down the lines");
+        }
+
+        /// Ctrl+Right past the right edge of a one-line field scrolls it.
+        #[test]
+        fn ctrl_right_keeps_the_caret_in_view_in_a_one_line_field() {
+            let mut rt = own_dialog(|_| {});
+            press(&mut rt, "member-nickname-input");
+            rt.update(|s, _| {
+                s.chat.nickname.replace_text("word ".repeat(80));
+                s.chat.nickname.set_caret(0);
+            });
+            rt.frame(0.3);
+            for i in 0..70 {
+                right(&mut rt, false);
+                assert!(
+                    caret_in_view(&rt, "member-nickname-input"),
+                    "press {i}, at {}",
+                    rt.state.chat.nickname.focus
+                );
+            }
+            assert!(rt.state.chat.nickname.focus > 300);
+        }
+
+        /// The mention popup stays open and keeps its own keys after a Ctrl+Right.
+        #[test]
+        fn the_mention_popup_still_takes_its_keys_after_ctrl_right() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            type_text(&mut rt, "hi @ma");
+            key(&mut rt, Key::Left);
+            key(&mut rt, Key::Left);
+            right(&mut rt, false);
+            let before = rt.state.chat.mention_popup().expect("open").selected;
+            key(&mut rt, Key::Down);
+            let after = rt.state.chat.mention_popup().expect("still open").selected;
+            assert_ne!(before, after, "Down moved the popup's choice");
+            assert_eq!(composer(&rt).0, "hi @ma", "and typed nothing");
+        }
+
+        /// A key that finds its panel gone is Rune's, not a panic.
+        #[test]
+        fn a_key_after_the_panel_closed_does_not_panic() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            rt.update(|s, _| {
+                s.chat.search_chord();
+            });
+            rt.frame(0.3);
+            press(&mut rt, "search-input");
+            rt.update(|s, _| s.chat.drop_search());
+            // Straight away, before a frame rebuilds the tree.
+            right(&mut rt, false);
         }
 
         /// A bare caret move in the search and quick switcher boxes does not send the
@@ -6925,6 +7041,48 @@ mod rune_bump {
             assert_eq!(sel(&rt).1, 1, "a caret move keeps the highlight");
             key(&mut rt, Key::Text("z".into()));
             assert_eq!(sel(&rt).1, 0, "an edit starts again at the top");
+        }
+
+        #[test]
+        fn a_caret_move_keeps_the_message_search_highlight() {
+            let mut rt = render(connected(), WINDOW_SIZE);
+            rt.update(|s, _| {
+                s.chat.search_chord();
+            });
+            rt.frame(0.3);
+            press(&mut rt, "search-input");
+            let found = |rt: &mut Runtime<RiverApp>| {
+                let hits = rt.state.chat.search_results().hits.len();
+                (
+                    hits,
+                    rt.state
+                        .chat
+                        .search_selected(&rt.state.chat.search_results().hits),
+                )
+            };
+            // A query the example room answers with several messages.
+            let query = ["a e", "e a", "the a", "a o", "i a"]
+                .into_iter()
+                .find(|q| {
+                    rt.update(|s, _| {
+                        s.chat.search.as_mut().unwrap().query.replace_text(*q);
+                        s.chat.search_edited();
+                    });
+                    found(&mut rt).0 > 1
+                })
+                .expect("a query with two hits");
+            rt.update(|s, _| {
+                let sr = s.chat.search.as_mut().unwrap();
+                sr.query.replace_text(query);
+                sr.query.set_caret(0);
+                s.chat.search_edited();
+                s.chat.search_move(1);
+            });
+            rt.frame(0.3);
+            assert_eq!(found(&mut rt).1, 1);
+            right(&mut rt, false);
+            assert!(rt.state.chat.search.as_ref().unwrap().query.focus > 0);
+            assert_eq!(found(&mut rt).1, 1, "a caret move keeps the highlight");
         }
     }
 }

@@ -418,14 +418,17 @@ pub(super) fn switcher_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
         .width(None)
         .on_edit(get)
         .on_change(|s: &mut RiverApp, _| s.chat.switcher_edited())
-        .on_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
-            if is_chord(ev) {
-                // Taken here whatever it does, so it never also reaches the window's handler.
-                s.chat.switcher_chord(std::time::Instant::now());
-                return true;
-            }
-            s.chat.switcher_key(ev)
-        }))
+        .on_key(word_end_after(
+            |s: &mut RiverApp| s.chat.switcher.as_mut().map(|w| &mut w.query),
+            |s: &mut RiverApp, ev, _| {
+                if is_chord(ev) {
+                    // Taken here whatever it does, so it never also reaches the window's handler.
+                    s.chat.switcher_chord(std::time::Instant::now());
+                    return true;
+                }
+                s.chat.switcher_key(ev)
+            },
+        ))
         .on_submit(|s: &mut RiverApp, _| s.chat.switcher_choose_selected())
         .build(k)
         .key("switcher-input")

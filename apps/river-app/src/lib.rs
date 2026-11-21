@@ -4833,7 +4833,7 @@ mod tests {
             assert_eq!(at, (3, 3), "{field}");
             ctrl_right(rt, true);
             rt.update(|s, _| at = (get(s).anchor, get(s).focus));
-            assert_eq!(at, (3, 7), "{field}, Shift");
+            assert_eq!(at, (3, 4), "{field}, Shift is Rune's");
         }
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
@@ -4850,6 +4850,49 @@ mod tests {
         press(&mut rt, "dnd-schedule");
         check(&mut rt, "dnd-start", |s| &mut s.chat.dnd.start);
         check(&mut rt, "dnd-end", |s| &mut s.chat.dnd.end);
+    }
+
+    /// Linux: Ctrl+Right through a long invite code scrolls the one-line field, so the caret
+    /// stays in view (the key is Rune's, so its scroll follow-up runs).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ctrl_right_keeps_the_caret_in_view_in_the_invite_code_field() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        press(&mut rt, "invite-code");
+        rt.update(|s, _| {
+            s.chat.form.code.replace_text("word ".repeat(80));
+            s.chat.form.code.set_caret(0);
+        });
+        rt.frame(0.3);
+        for i in 0..70 {
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Right,
+                mods: rune::Mods {
+                    cmd: true,
+                    ctrl: true,
+                    ..rune::Mods::default()
+                },
+            });
+            rt.frame(0.3);
+            let els = rt.elements();
+            let c = els
+                .iter()
+                .find_map(|e| e.caret)
+                .expect("the field has the caret");
+            let v = els
+                .iter()
+                .find(|e| e.key.as_deref() == Some("invite-code"))
+                .expect("the field")
+                .visible;
+            assert!(
+                c[0] >= v[0] - 1.0 && c[0] <= v[0] + v[2] + 1.0,
+                "press {i}: the caret at x {} is outside {v:?}",
+                c[0]
+            );
+        }
+        assert!(rt.state.chat.form.code.focus > 300);
     }
 
     #[test]

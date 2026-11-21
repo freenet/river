@@ -35,7 +35,7 @@ use super::model::Pending;
 use super::quick_reply::{MAX_DRAFT_CHARS, NO_ROOM, ReplyRefusal, appended, clean_reply};
 use super::style::{self as st, Palette};
 use super::view::label;
-use super::word_end::{Get, word_end_after};
+use super::word_end::{Get, always, word_end_after};
 use super::{Chat, Source};
 use crate::RiverApp;
 use crate::rooms::dm_send::{self, BODY_CAP};
@@ -722,7 +722,7 @@ pub(super) fn composer(chat: &Chat, p: &Palette, k: &Kit) -> El {
         .disabled(!editable);
     if editable {
         input = input
-            .on_input_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
+            .on_input_key(word_end_after(always(get), |s: &mut RiverApp, ev, _| {
                 // Escape leaves the thread, as it does from anywhere else in it; the draft stays.
                 let escape = ev.key == rune::Key::Escape;
                 if escape {

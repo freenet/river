@@ -12,7 +12,7 @@ use super::icons;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
 use super::visual_fold;
-use super::word_end::{Get, word_end, word_end_after};
+use super::word_end::{Get, always, word_end, word_end_after};
 use super::{Chat, DialogKind, InviteState, JoinPreview, LinkStatus, Source};
 use crate::RiverApp;
 use crate::rooms::work::{WorkState, WorkView};
@@ -160,7 +160,7 @@ fn join_code_field(chat: &Chat, k: &Kit) -> El {
         .placeholder("Invite code or link")
         .width(None)
         .on_edit(get)
-        .on_key(word_end(get))
+        .on_key(word_end(always(get)))
         .on_change(|s: &mut RiverApp, _| s.chat.join_code_edited())
         .on_submit(|s: &mut RiverApp, _| s.chat.submit_join())
         .build(k)
@@ -202,7 +202,7 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .placeholder(placeholder.to_owned())
             .width(None)
             .on_edit(get)
-            .on_key(word_end(get))
+            .on_key(word_end(always(get)))
             .on_submit(move |s: &mut RiverApp, _| submit(s))
             .build(k)
             .key(key.to_owned())
@@ -1066,7 +1066,7 @@ fn member_search_box(chat: &Chat, p: &Palette, k: &Kit) -> Option<El> {
         .placeholder("Search members")
         .width(None)
         .on_edit(get)
-        .on_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
+        .on_key(word_end_after(always(get), |s: &mut RiverApp, ev, _| {
             ev.key == rune::Key::Escape && s.chat.escape()
         }))
         .build(k)

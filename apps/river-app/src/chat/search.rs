@@ -551,14 +551,17 @@ pub(super) fn search_panel(
         .width(None)
         .on_edit(get)
         .on_change(|s: &mut RiverApp, _| s.chat.search_edited())
-        .on_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
-            if is_chord(ev) {
-                // Taken here whatever it does, so it never also reaches the window's handler.
-                s.chat.search_chord();
-                return true;
-            }
-            s.chat.search_key(ev)
-        }))
+        .on_key(word_end_after(
+            |s: &mut RiverApp| s.chat.search.as_mut().map(|w| &mut w.query),
+            |s: &mut RiverApp, ev, _| {
+                if is_chord(ev) {
+                    // Taken here whatever it does, so it never also reaches the window's handler.
+                    s.chat.search_chord();
+                    return true;
+                }
+                s.chat.search_key(ev)
+            },
+        ))
         .on_submit(|s: &mut RiverApp, _| s.chat.search_jump_selected(Instant::now()))
         .build(k)
         .key("search-input")

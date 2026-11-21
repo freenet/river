@@ -586,7 +586,9 @@ fn description_section(
                 .width(None)
                 .auto_grow(2, 4)
                 .on_edit(get)
-                .on_key(word_end(get))
+                .on_key(word_end(|s: &mut RiverApp| {
+                    s.chat.details.as_mut().map(|d| &mut d.description)
+                }))
                 .build(k)
                 .key("details-description-input")
                 .w_full(),
@@ -709,7 +711,9 @@ fn limit_input(i: usize, label_text: &str, form: &DetailsForm, k: &Kit) -> El {
         .label(label_text.to_owned())
         .width(None)
         .on_edit(get)
-        .on_key(word_end(get))
+        .on_key(word_end(move |s: &mut RiverApp| {
+            s.chat.details.as_mut().and_then(|d| d.limits.get_mut(i))
+        }))
         .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
         .build(k)
         .key(format!("details-limit-{i}"))
@@ -1039,7 +1043,9 @@ fn name_field(form: &DetailsForm, p: &Palette, k: &Kit) -> El {
             .placeholder("Room name".to_owned())
             .width(None)
             .on_edit(get)
-            .on_key(word_end(get))
+            .on_key(word_end(|s: &mut RiverApp| {
+                s.chat.details.as_mut().map(|d| &mut d.name)
+            }))
             .on_submit(|s: &mut RiverApp, _| s.chat.submit_details())
             .build(k)
             .key("details-name-input")

@@ -378,6 +378,31 @@ fn the_member_dialog_offers_share_invite_and_it_opens_the_picker() {
     assert!(rt.state.chat.member_modal.is_none(), "the dialog gives way");
 }
 
+/// Linux: Ctrl+Right in the note box stops at the end of the word.
+#[cfg(target_os = "linux")]
+#[test]
+fn ctrl_right_in_the_picker_note_stops_at_the_end_of_the_word() {
+    let (mut rt, _) = open_picker();
+    press(&mut rt, "dm-invite-note");
+    rt.update(|s, _| s.chat.invite_write("one two"));
+    rt.frame(0.3);
+    let key = |rt: &mut Runtime<RiverApp>, key, ctrl| {
+        rt.key(rune::KeyEvent {
+            key,
+            mods: rune::Mods {
+                cmd: ctrl,
+                ctrl,
+                ..rune::Mods::default()
+            },
+        });
+        rt.frame(0.3);
+    };
+    key(&mut rt, rune::Key::Home, false);
+    key(&mut rt, rune::Key::Right, true);
+    let range = rt.elements().into_iter().find_map(|e| e.edit_range);
+    assert_eq!(range, Some([3, 3]));
+}
+
 #[test]
 fn the_picker_lists_your_other_rooms_and_sends_the_chosen_one_with_the_note() {
     let (mut rt, uid) = open_picker();

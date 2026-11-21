@@ -21,7 +21,7 @@ use super::icons;
 use super::model::{Appointer, BanOffer, Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::label;
-use super::word_end::{Get, word_end};
+use super::word_end::{Get, always, word_end};
 use super::{Chat, Source};
 use crate::RiverApp;
 
@@ -149,7 +149,7 @@ fn nickname_editor(room: &Room, m: &Member, chat: &Chat, p: &Palette, k: &Kit) -
             .placeholder("Your nickname in this room".to_owned())
             .width(None)
             .on_edit(get)
-            .on_key(word_end(get))
+            .on_key(word_end(always(get)))
             .on_submit(|s: &mut RiverApp, _| s.chat.submit_nickname())
             .build(k)
             .key("member-nickname-input")

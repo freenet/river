@@ -11,7 +11,7 @@ use super::markdown;
 use super::model::{self, Group, MINUTES_PER_DAY, Member, Message, Notice, Pending, Role, Room};
 use super::style::{self as st, Palette};
 use super::view::{HEADER_H, hline, label};
-use super::word_end::{Get, word_end_after};
+use super::word_end::{Get, always, word_end_after};
 use super::{Chat, Mode};
 use crate::RiverApp;
 use crate::rooms::modes::NotificationMode;
@@ -859,7 +859,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .disabled(!can_send);
     if can_send {
         input = input
-            .on_input_key(word_end_after(get, |s: &mut RiverApp, ev, _| {
+            .on_input_key(word_end_after(always(get), |s: &mut RiverApp, ev, _| {
                 composer_key(s, ev)
             }))
             .on_edit(get)

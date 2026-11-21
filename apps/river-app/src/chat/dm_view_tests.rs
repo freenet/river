@@ -1196,7 +1196,7 @@ mod sending {
     }
 
     /// Linux: Ctrl+Right in a direct message box stops at the end of the word, as in the
-    /// room's composer, and Ctrl+Shift+Right extends to it.
+    /// room's composer; Ctrl+Shift+Right is Rune's.
     #[cfg(target_os = "linux")]
     #[test]
     fn ctrl_right_in_the_direct_message_box_stops_at_the_end_of_the_word() {
@@ -1227,7 +1227,7 @@ mod sending {
         word_right(&mut rt, false);
         assert_eq!(at(&mut rt), (3, 3));
         word_right(&mut rt, true);
-        assert_eq!(at(&mut rt), (3, 7));
+        assert_eq!(at(&mut rt), (3, 4), "Shift is Rune's");
     }
 
     /// The app reading rooms from a node, with the thread with `name` open and its box focused.

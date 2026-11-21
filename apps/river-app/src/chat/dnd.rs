@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::dialog_kit::{self as dk, DialogSpec};
 use super::style::{self as st};
 use super::view::label;
-use super::word_end::{Get, word_end};
+use super::word_end::{Get, always, word_end};
 use crate::RiverApp;
 use crate::notify::Arrival;
 
@@ -332,7 +332,7 @@ pub(super) fn dnd_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
                         .placeholder("22:00".to_owned())
                         .width(None)
                         .on_edit(start)
-                        .on_key(word_end(start))
+                        .on_key(word_end(always(start)))
                         .build(k)
                         .key("dnd-start")
                         .grow(1.0),
@@ -343,7 +343,7 @@ pub(super) fn dnd_dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
                         .placeholder("07:00".to_owned())
                         .width(None)
                         .on_edit(end)
-                        .on_key(word_end(end))
+                        .on_key(word_end(always(end)))
                         .build(k)
                         .key("dnd-end")
                         .grow(1.0),
