@@ -73,6 +73,9 @@ pub mod zoom;
 
 pub use background::{BackgroundHost, BackgroundUi};
 pub use dm_model::DmArrival;
+/// The preference key of [`Chat::private_previews`], unchanged from before it had a switch.
+pub const PREVIEWS_PREF: &str = "notification_previews";
+
 pub use dnd::{DndUi, Schedule as DndSchedule, Settings as DndSettings};
 pub use quick_reply::{MAX_REPLY_CHARS, ReplyRefusal};
 use std::collections::{HashMap, HashSet};
@@ -363,6 +366,11 @@ pub struct Chat {
     pub status: node_status::NodeStatusUi,
     /// Do not disturb: this device's switch and schedule ([`dnd`]).
     pub dnd: dnd::DndUi,
+    /// Whether a private room's and a direct message's notification may show the sender and
+    /// text: the `notification_previews` preference, off unless set in Settings > Notifications.
+    pub private_previews: bool,
+    /// Set when [`Chat::private_previews`] changed and has not been saved.
+    previews_dirty: bool,
     /// Whether the last status was not live, so the next live update is catch-up rather than
     /// news (see [`Chat::show_node_rooms`]).
     catching_up: bool,
@@ -521,6 +529,8 @@ impl Chat {
             background: None,
             status: Default::default(),
             dnd: Default::default(),
+            private_previews: false,
+            previews_dirty: false,
             shortcode: Default::default(),
             zoom: Default::default(),
             shortcuts_open: false,
@@ -1117,9 +1127,7 @@ impl Chat {
             || self.details.is_some()
             || self.notify_dialog.is_some()
             || self.switcher.is_some()
-            || self.background.as_ref().is_some_and(|b| b.open)
             || self.status.open
-            || self.dnd.open
             || self.settings.open
             || self.overview
             || self.shortcuts_open

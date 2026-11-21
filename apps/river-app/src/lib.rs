@@ -76,10 +76,6 @@ pub struct RiverApp {
     /// An update notice do not disturb held back, shown once it is off (and the window is not
     /// in front, which counts as told).
     pending_notice: Option<(String, String)>,
-    /// Whether a private room's notification may show the message text. Off unless the
-    /// `notification_previews` preference is set (there is no switch for it yet). Also governs
-    /// direct messages: off, their notifications name no sender and show no text.
-    private_previews: bool,
     /// The unread count last given to the notifier, so it hears only changes.
     reported_unread: Option<usize>,
     /// The number of the node in use ([`rooms::Link::generation`]). What a node the app has left
@@ -207,7 +203,6 @@ impl RiverApp {
             limiter: Default::default(),
             dnd_persist: false,
             pending_notice: None,
-            private_previews: false,
             node_generation: 0,
             pending_save: None,
         }
@@ -248,6 +243,7 @@ impl RiverApp {
         );
         chat.dnd
             .load(prefs.get(chat::dnd::PREF).unwrap_or_default());
+        chat.private_previews = prefs.get(chat::PREVIEWS_PREF).unwrap_or(false);
         chat.zoom.load(
             prefs
                 .get(chat::zoom::PREF)
@@ -281,7 +277,6 @@ impl RiverApp {
             limiter: Default::default(),
             dnd_persist: true,
             pending_notice: None,
-            private_previews: prefs.get("notification_previews").unwrap_or(false),
             node_generation: link_generation,
             pending_save: None,
         }
@@ -485,11 +480,17 @@ impl RiverApp {
     fn sync_dnd(&mut self, tx: &mut Tx) {
         self.refresh_dnd_clock();
         self.flush_pending_notice();
+        self.chat.track_settings_sections();
         self.chat.dnd.sync_inputs();
         if let Some(settings) = self.chat.dnd.take_dirty()
             && self.dnd_persist
         {
             save_pref(chat::dnd::PREF, &settings);
+        }
+        if let Some(on) = self.chat.take_previews_dirty()
+            && self.dnd_persist
+        {
+            save_pref(chat::PREVIEWS_PREF, &on);
         }
         self.chat.close_shortcuts_under_dialog();
         if let Some(percent) = self.chat.zoom.take_dirty()
@@ -522,7 +523,7 @@ impl RiverApp {
 
     /// Show what the limits let through.
     fn show(&mut self, admitted: Vec<notify::Arrival>, now: std::time::Instant) {
-        for (n, from) in notify::compose_from(admitted, self.private_previews) {
+        for (n, from) in notify::compose_from(admitted, self.chat.private_previews) {
             if !self.notifier.notify(n) {
                 self.limiter.refund(from, now);
             }
@@ -564,7 +565,7 @@ impl RiverApp {
             if !here || muted || on_screen {
                 continue;
             }
-            let a = notify::dm_arrival(&d, self.private_previews);
+            let a = notify::dm_arrival(&d, self.chat.private_previews);
             if let Some(a) = self.dnd_filter(a) {
                 shown.push(a);
             }
@@ -1183,7 +1184,8 @@ fn node_answered(ui: &mut chat::node_status::NodeStatusUi, at: &str, version: &s
     );
 }
 
-/// The chat screen with "Background and startup" open, for a desktop with or without a tray.
+/// The chat screen with Settings open on "Background and startup", for a desktop with or
+/// without a tray.
 fn background_scene(s: &mut RiverApp, tray: bool) {
     identity_scene(s, |_| {});
     s.chat.background = Some(chat::BackgroundUi::new(std::sync::Arc::new(
@@ -1192,22 +1194,36 @@ fn background_scene(s: &mut RiverApp, tray: bool) {
     s.chat.open_background();
 }
 
-/// The chat screen with a scheduled do not disturb, at 23:00 (inside the 22:00 to 07:00
-/// window), with its dialog open or, for `closed`, just the room list's indicator.
-fn dnd_scene(s: &mut RiverApp, closed: bool) {
+/// What a notifications scene sets up: the local time (pinned) and the do not disturb choices.
+struct DndScene {
+    minute: u16,
+    manual: bool,
+    schedule: Option<(u16, u16)>,
+}
+
+/// The chat screen with Settings open on Notifications, at a pinned time of day. `settings`:
+/// the dialog is open; otherwise only the room list's quiet row shows the state.
+fn dnd_scene(s: &mut RiverApp, scene: DndScene, settings: bool) {
     identity_scene(s, |_| {});
     let d = &mut s.chat.dnd;
     d.pinned = true;
-    d.now = 23 * 60;
-    d.settings.schedule = Some(chat::DndSchedule {
-        start: 22 * 60,
-        end: 7 * 60,
-    });
-    d.settings.allow_mentions = !closed;
-    if !closed {
+    d.now = scene.minute;
+    d.settings.manual = scene.manual;
+    d.settings.schedule = scene
+        .schedule
+        .map(|(start, end)| chat::DndSchedule { start, end });
+    d.settings.allow_mentions = settings;
+    if settings {
         s.chat.open_dnd();
     }
 }
+
+/// 23:00, inside a 22:00 to 07:00 schedule.
+const DND_AT_NIGHT: DndScene = DndScene {
+    minute: 23 * 60,
+    manual: false,
+    schedule: Some((22 * 60, 7 * 60)),
+};
 
 /// The chat screen for the identity scenes: the example rooms as rooms from the node, so the
 /// export and import buttons are live.
@@ -2416,10 +2432,60 @@ pub const SCENES: &[Scene] = &[
             );
         })
     }),
-    ("chat-background", |s| background_scene(s, true)),
-    ("chat-dnd", |s| dnd_scene(s, false)),
-    ("chat-dnd-on", |s| dnd_scene(s, true)),
-    ("chat-background-no-tray", |s| background_scene(s, false)),
+    // Settings > Notifications in each state its first line can describe, and the room list's
+    // quiet Do not disturb row on its own. Settings > Background and startup, with and without
+    // a tray.
+    ("chat-settings-notifications", |s| {
+        dnd_scene(s, DND_AT_NIGHT, true)
+    }),
+    ("chat-settings-notifications-narrow", |s| {
+        dnd_scene(s, DND_AT_NIGHT, true)
+    }),
+    ("chat-settings-notifications-switch", |s| {
+        dnd_scene(
+            s,
+            DndScene {
+                minute: 12 * 60,
+                manual: true,
+                schedule: None,
+            },
+            true,
+        )
+    }),
+    ("chat-settings-notifications-off", |s| {
+        dnd_scene(
+            s,
+            DndScene {
+                minute: 12 * 60,
+                manual: false,
+                schedule: Some((22 * 60, 7 * 60)),
+            },
+            true,
+        )
+    }),
+    ("chat-settings-notifications-previews", |s| {
+        dnd_scene(
+            s,
+            DndScene {
+                minute: 12 * 60,
+                manual: false,
+                schedule: None,
+            },
+            true,
+        );
+        s.chat.private_previews = true;
+    }),
+    ("chat-dnd-on", |s| dnd_scene(s, DND_AT_NIGHT, false)),
+    ("chat-settings-background", |s| background_scene(s, true)),
+    ("chat-settings-background-narrow", |s| {
+        background_scene(s, true)
+    }),
+    ("chat-settings-background-no-tray", |s| {
+        background_scene(s, false)
+    }),
+    ("chat-settings-background-no-tray-narrow", |s| {
+        background_scene(s, false)
+    }),
     ("chat-import-id", |s| identity_scene(s, |c| c.open_import())),
     ("chat-import-id-pasted", |s| {
         identity_scene(s, |c| {
@@ -4882,7 +4948,7 @@ mod tests {
     }
 
     #[test]
-    fn the_do_not_disturb_entry_opens_its_dialog_and_the_switch_shows_in_the_footer() {
+    fn the_footer_row_flips_do_not_disturb_and_settings_holds_the_rest() {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
         rt.update(|s, _| {
@@ -4891,14 +4957,28 @@ mod tests {
         });
         settle(&mut rt);
         assert!(!rt.state.chat.dnd.active());
+        let text = |rt: &Runtime<RiverApp>| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("dnd"))
+                .and_then(|e| e.label)
+        };
+        assert_eq!(text(&rt).as_deref(), Some("Do not disturb: off"));
         press(&mut rt, "dnd");
-        assert!(rt.find("dnd-dialog").is_some());
+        assert!(rt.state.chat.dnd.active(), "one press turns it on");
+        assert!(rt.find("settings-dialog").is_none(), "no dialog for it");
+        assert_eq!(text(&rt).as_deref(), Some("Do not disturb: on"));
+        press(&mut rt, "dnd");
+        assert!(!rt.state.chat.dnd.active(), "a second press turns it off");
+        // The rest is in Settings > Notifications.
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-notifications");
         press(&mut rt, "dnd-switch");
         assert!(rt.state.chat.dnd.active());
         press(&mut rt, "dnd-schedule");
         assert!(rt.find("dnd-start").is_some());
-        press(&mut rt, "dnd-close");
-        assert!(rt.find("dnd-dialog").is_none());
+        press(&mut rt, "close");
+        assert!(rt.find("settings-dialog").is_none());
         assert!(
             rt.state.chat.dnd.settings.manual,
             "kept after the dialog closes"
@@ -4929,16 +5009,20 @@ mod tests {
         }
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
+        press(&mut rt, "settings");
         assert!(
-            rt.find("background").is_none(),
-            "no entry without a shell that offers one"
+            rt.find("settings-section-background").is_none(),
+            "no section without a shell that offers one"
         );
+        press(&mut rt, "close");
         let host = std::sync::Arc::new(Recorder(Default::default()));
         let shell = host.clone();
         rt.update(move |s, _| s.chat.background = Some(chat::BackgroundUi::new(shell)));
         settle(&mut rt);
-        press(&mut rt, "background");
-        assert!(rt.find("background-dialog").is_some());
+        assert!(rt.find("background").is_none(), "no footer button any more");
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-background");
+        assert!(rt.find("settings-background").is_some());
         press(&mut rt, "background-start-at-login");
         press(&mut rt, "background-close-to-tray");
         assert_eq!(*host.0.lock().unwrap(), ["login true", "close false"]);
@@ -4946,8 +5030,8 @@ mod tests {
             rt.find("background-quit").is_some(),
             "a way out of a hidden River"
         );
-        press(&mut rt, "background-close");
-        assert!(rt.find("background-dialog").is_none());
+        press(&mut rt, "close");
+        assert!(rt.find("settings-dialog").is_none());
     }
 
     #[test]

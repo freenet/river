@@ -400,7 +400,7 @@ fn world() -> World {
 
 fn world_with_previews() -> World {
     let mut w = world();
-    w.s.private_previews = true;
+    w.s.chat.private_previews = true;
     w
 }
 
