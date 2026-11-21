@@ -1531,35 +1531,35 @@ pub const SCENES: &[Scene] = &[
         );
         s.chat.settings.open();
     }),
-    ("settings-updates", |s| {
+    ("chat-settings-updates", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
         s.chat.settings.open_at(chat::settings::Section::Updates);
     }),
-    ("settings-connection", |s| {
+    ("chat-settings-connection", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
         s.chat.update.node_note =
             Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
         s.chat.settings.open_at(chat::settings::Section::Connection);
     }),
-    ("settings-connection-remote", |s| {
+    ("chat-settings-connection-remote", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
         use_node(s, "192.168.1.20:7509");
         s.chat.settings.open_at(chat::settings::Section::Connection);
     }),
-    ("settings-updates-narrow", |s| {
+    ("chat-settings-updates-narrow", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
         s.chat.settings.open_at(chat::settings::Section::Updates);
     }),
-    ("settings-connection-narrow", |s| {
+    ("chat-settings-connection-narrow", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
         s.chat.settings.open_at(chat::settings::Section::Connection);
     }),
-    ("settings-list-narrow", |s| {
+    ("chat-settings-list-narrow", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
         s.chat.settings.open();
