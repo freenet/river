@@ -912,7 +912,18 @@ fn the_background_switches_reach_the_shell_and_quit_is_set_apart_as_danger() {
     press(&mut rt, "background-close-to-tray");
     assert!(*host.login.lock().unwrap());
     assert!(!*host.close_to_tray.lock().unwrap());
-    assert!(shows(&rt, "Ctrl+Q"));
+    // The hint names the platform's own chord (Cmd+Q on a Mac), the one `app_key` binds as
+    // `Mod+Q` through `is_command('q')`.
+    let chord = if cfg!(target_os = "macos") {
+        "Cmd+Q"
+    } else {
+        "Ctrl+Q"
+    };
+    assert_eq!(
+        super::shortcuts::shown("Mod+Q", cfg!(target_os = "macos")),
+        chord
+    );
+    assert!(shows(&rt, chord));
     // Quit River is below every switch and no switch is its neighbour.
     let quit_y = find(&rt, "background-quit").rect[1];
     for k in ["background-close-to-tray", "background-start-at-login"] {
