@@ -80,6 +80,10 @@ fn fake_node() -> FakeNode {
             );
             // Close politely: stop sending, then wait for the client to finish and close.
             let _ = stream.shutdown(std::net::Shutdown::Write);
+            // Only the wait for the client to close after this node has answered and shut its
+            // write side. A timeout ends the loop and the stream is dropped at once; nothing
+            // is read from it afterwards, so a socket left indeterminate by the timeout is
+            // never reused.
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             while matches!(stream.read(&mut buf), Ok(k) if k > 0) {}
         }

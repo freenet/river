@@ -10,8 +10,10 @@
 //! `WouldBlock` on every platform, and [`NodeSocket::recv`] then waits for the socket to become
 //! readable with the `polling` crate (epoll, kqueue, or AFD poll on Windows) for no longer than
 //! its own deadline, and reads again. The wait is a separate readiness query, not a read, so a
-//! deadline that passes cancels nothing and cannot take bytes. If the poller cannot be made or
-//! used, the wait is a short sleep between reads instead ([`POLL`]).
+//! deadline that passes cancels nothing and cannot take bytes: after a wait that timed out the
+//! caller reads once more before it reports `Timeout`. If the poller cannot be made or used,
+//! the wait is a sleep of at most [`POLL`] between reads instead, and that is said once on
+//! stderr.
 //!
 //! A large response may arrive in `StreamChunk`s (announced by a `StreamHeader` or not); they
 //! are put back together here, so the caller only ever sees whole responses.
@@ -40,8 +42,9 @@
 //! session stops asking for writes on its own; this is what holds if a path ever does not.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use freenet_stdlib::client_api::{
@@ -126,16 +129,136 @@ impl std::fmt::Display for SocketError {
     }
 }
 
+/// The TCP stream, counting the bytes read from it. tungstenite reports only whole messages, so
+/// without this a large frame arriving in pieces looks like silence until its last byte.
+struct Counted {
+    tcp: TcpStream,
+    read: u64,
+}
+
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.tcp.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+
+impl Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+type Ws = WebSocket<Counted>;
+type HandshakeResult = Result<
+    (Ws, tungstenite::handshake::client::Response),
+    tungstenite::HandshakeError<tungstenite::ClientHandshake<Counted>>,
+>;
+
+/// How a wait for data ended.
+enum Waited {
+    /// The socket has data (or the wait was interrupted): read again.
+    Ready,
+    /// The wait's time ran out with no data reported. The caller reads once more before it
+    /// reports a timeout, so data that arrived at that very moment is not missed.
+    TimedOut,
+    /// The wait itself failed; the caller sleeps instead.
+    Failed(String),
+}
+
+/// Waits for a socket to have data to read. The only implementation in use is [`PollWaiter`];
+/// tests put their own in to make a wait time out at the exact moment data arrives, and to
+/// count the waits.
+trait Waiter: Send {
+    fn wait(&mut self, tcp: &TcpStream, left: Duration) -> Waited;
+    /// Called once before the stream closes.
+    fn release(&mut self, tcp: &TcpStream);
+    /// Which waiter this is, so a test can tell the poller from a stand-in.
+    #[cfg(test)]
+    fn name(&self) -> &'static str;
+}
+
+/// The readiness poller (epoll, kqueue or AFD poll) registered with one stream.
+struct PollWaiter {
+    poller: polling::Poller,
+    events: polling::Events,
+}
+
+impl PollWaiter {
+    fn new(tcp: &TcpStream) -> Result<PollWaiter, String> {
+        let poller = polling::Poller::new().map_err(|e| format!("creating the poller: {e}"))?;
+        // SAFETY: the stream is owned by the `NodeSocket` that owns this waiter, and
+        // `NodeSocket::drop` calls `release` (which deletes the registration) before the
+        // stream closes.
+        unsafe { poller.add(tcp, polling::Event::readable(0)) }
+            .map_err(|e| format!("registering the socket with the poller: {e}"))?;
+        Ok(PollWaiter {
+            poller,
+            events: polling::Events::with_capacity(std::num::NonZeroUsize::MIN),
+        })
+    }
+}
+
+impl Waiter for PollWaiter {
+    fn wait(&mut self, tcp: &TcpStream, left: Duration) -> Waited {
+        // One-shot interest: arm it again for each wait. Data that is already there makes
+        // the wait return at once, so none can arrive unnoticed between the read that found
+        // nothing and this call.
+        self.events.clear();
+        let result = self
+            .poller
+            .modify(tcp, polling::Event::readable(0))
+            .and_then(|()| self.poller.wait(&mut self.events, Some(left)));
+        match result {
+            Ok(_) if self.events.iter().next().is_some() => Waited::Ready,
+            Ok(_) => Waited::TimedOut,
+            Err(e) if e.kind() == ErrorKind::Interrupted => Waited::Ready,
+            Err(e) => Waited::Failed(e.to_string()),
+        }
+    }
+
+    fn release(&mut self, tcp: &TcpStream) {
+        let _ = self.poller.delete(tcp);
+    }
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "poll"
+    }
+}
+
+/// Say once per process that waiting falls back to sleeping, and why: the fallback adds up to
+/// [`POLL`] of delay to every answer, so it must not go unnoticed.
+fn note_poller_failure(why: &str) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "River: the readiness poller for the Freenet connection failed ({why}); waiting for \
+             Freenet by sleeping {}ms at a time instead, which slows every answer",
+            POLL.as_millis()
+        );
+    }
+}
+
 /// Proof that a connection presented a grant token in its upgrade. Only
 /// [`NodeSocket::connect`] makes one, after setting the `Authorization` header.
 struct GrantPresented(());
 
 pub struct NodeSocket {
-    /// Tells when the socket has data. It is registered with the stream in `ws`, and
-    /// [`Drop`] removes the registration before the stream closes.
-    poller: Option<polling::Poller>,
-    events: polling::Events,
-    ws: WebSocket<TcpStream>,
+    /// Tells when the socket has data (`None`: sleep between reads, see [`POLL`]). It is
+    /// registered with the stream in `ws`, and [`Drop`] removes the registration before the
+    /// stream closes.
+    waiter: Option<Box<dyn Waiter>>,
+    /// Times the sleep fallback was used (for tests: the poller path must use none).
+    #[cfg(test)]
+    fallback_sleeps: u64,
+    /// How long a write may wait for room in the socket ([`WRITE_TIMEOUT`]).
+    write_timeout: Duration,
+    ws: Ws,
     /// Every connection presented a grant: what lets it register the chat delegate.
     grant: GrantPresented,
     /// Closed once River has moved on: then only reads leave.
@@ -186,6 +309,16 @@ impl NodeSocket {
         token: &GrantToken,
         writes: &WriteGate,
     ) -> Result<NodeSocket, SocketError> {
+        Self::connect_within(authority, token, writes, HANDSHAKE_TIMEOUT)
+    }
+
+    /// [`connect`](Self::connect) with the upgrade bounded by `handshake_timeout`.
+    fn connect_within(
+        authority: &str,
+        token: &GrantToken,
+        writes: &WriteGate,
+        handshake_timeout: Duration,
+    ) -> Result<NodeSocket, SocketError> {
         let fail = |e: &dyn std::fmt::Display| SocketError::Failed(e.to_string());
         let addrs = authority.to_socket_addrs().map_err(|e| fail(&e))?;
         let stream = connect_any(addrs, Duration::from_secs(5)).map_err(|e| fail(&e))?;
@@ -212,16 +345,23 @@ impl NodeSocket {
         bearer.set_sensitive(true);
         request.headers_mut().insert("Authorization", bearer);
         let grant = GrantPresented(());
-        let (ws, _) = finish_handshake(tungstenite::client(request, stream), HANDSHAKE_TIMEOUT)?;
-        // The registration lives as long as the stream: `Drop` below deletes it first.
-        let poller = polling::Poller::new().ok().filter(|p| {
-            // SAFETY: the stream is owned by `ws`, which the returned `NodeSocket` keeps alive
-            // for as long as the poller, and `Drop` deletes the registration before it closes.
-            unsafe { p.add(ws.get_ref(), polling::Event::readable(0)) }.is_ok()
-        });
+        let counted = Counted {
+            tcp: stream,
+            read: 0,
+        };
+        let (ws, _) = finish_handshake(tungstenite::client(request, counted), handshake_timeout)?;
+        let waiter: Option<Box<dyn Waiter>> = match PollWaiter::new(&ws.get_ref().tcp) {
+            Ok(w) => Some(Box::new(w)),
+            Err(why) => {
+                note_poller_failure(&why);
+                None
+            }
+        };
         Ok(NodeSocket {
-            poller,
-            events: polling::Events::with_capacity(std::num::NonZeroUsize::MIN),
+            waiter,
+            #[cfg(test)]
+            fallback_sleeps: 0,
+            write_timeout: WRITE_TIMEOUT,
             ws,
             grant,
             writes: writes.clone(),
@@ -235,23 +375,37 @@ impl NodeSocket {
     /// Wait until the socket has data to read, or `left` has passed, whichever comes first. A
     /// wakeup with nothing to read is harmless: the caller reads again and finds `WouldBlock`.
     fn wait_for_data(&mut self, left: Duration) {
-        let waited = self.poller.as_ref().is_some_and(|poller| {
-            // One-shot interest: arm it again for each wait. Data that is already there
-            // makes the wait return at once, so none can arrive unnoticed between the read
-            // that found nothing and this call.
-            self.events.clear();
-            poller
-                .modify(self.ws.get_ref(), polling::Event::readable(0))
-                .and_then(|()| poller.wait(&mut self.events, Some(left)))
-                .is_ok()
-        });
-        if !waited {
-            std::thread::sleep(left.min(POLL));
+        let waited = match self.waiter.as_mut() {
+            Some(waiter) => waiter.wait(&self.ws.get_ref().tcp, left),
+            None => Waited::Failed(String::new()),
+        };
+        match waited {
+            Waited::Ready | Waited::TimedOut => {}
+            Waited::Failed(why) => {
+                if !why.is_empty() {
+                    note_poller_failure(&why);
+                }
+                #[cfg(test)]
+                {
+                    self.fallback_sleeps += 1;
+                }
+                std::thread::sleep(left.min(POLL));
+            }
         }
     }
 
-    /// How long [`recv`](Self::recv) waits before reporting [`SocketError::Timeout`]. The
-    /// wait starts again each time a message arrives.
+    /// Whether the connection still has unsent bytes queued (a pong or close reply that
+    /// tungstenite queued inside a read, or part of a frame). Pushing them is retried here
+    /// because a wait for readability would never notice the socket becoming writable.
+    fn write_pending(&mut self) -> bool {
+        matches!(
+            self.ws.flush(),
+            Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock
+        )
+    }
+
+    /// How long [`recv`](Self::recv) waits before reporting [`SocketError::Timeout`]. The wait
+    /// runs from the start of each `recv`, whatever arrives meanwhile (see there).
     pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), SocketError> {
         self.read_wait = timeout;
         Ok(())
@@ -294,10 +448,14 @@ impl NodeSocket {
 
     /// Queue `message` and push it out. The socket is non-blocking, so when it is full the
     /// frame stays queued in tungstenite (`send` queues before it flushes) and is flushed
-    /// again until it is out or [`WRITE_TIMEOUT`] passes, which fails the connection.
+    /// again until it is out or the write timeout passes, which fails the connection.
+    ///
+    /// Known limit: while it waits, this does not read, so a node that is itself blocked
+    /// sending to us cannot be drained meanwhile. On loopback, with a bound of 10 s after which
+    /// the connection fails and is opened again, that costs a reconnect and no data.
     fn write_message(&mut self, message: Message) -> Result<(), SocketError> {
         let mut result = self.ws.send(message);
-        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let deadline = Instant::now() + self.write_timeout;
         loop {
             match result {
                 Ok(()) => return Ok(()),
@@ -349,28 +507,46 @@ impl NodeSocket {
         }
     }
 
-    /// When anything last arrived from the node, pongs included.
+    /// When anything last arrived from the node: a message of any kind, pongs included, or
+    /// bytes of one still arriving.
     pub fn last_heard(&self) -> Instant {
         self.last_heard
     }
 
-    /// The next whole response.
+    /// The next whole response, or [`SocketError::Timeout`] once the read wait has passed since
+    /// this call began.
+    ///
+    /// The deadline is fixed when the call starts and does not move when messages arrive: a
+    /// node that only sends pongs (or a trickle of a large frame) cannot keep the caller from
+    /// getting `Timeout` and doing its housekeeping on schedule. What does move is
+    /// [`last_heard`](Self::last_heard): any bytes read, whole message or not, count as
+    /// hearing from the node, so a big frame arriving slowly does not trip a ping/pong
+    /// watchdog. A `Timeout` in the middle of a frame loses nothing: the next call carries on.
     pub fn recv(&mut self) -> Result<HostResult, SocketError> {
-        let mut deadline = Instant::now() + self.read_wait;
+        let deadline = Instant::now() + self.read_wait;
+        let mut seen = self.ws.get_ref().read;
         loop {
-            let message = match self.ws.read() {
+            let result = self.ws.read();
+            if self.ws.get_ref().read != seen {
+                seen = self.ws.get_ref().read;
+                self.last_heard = Instant::now();
+            }
+            let message = match result {
                 Ok(m) => m,
                 Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return Err(SocketError::Timeout);
                     }
-                    self.wait_for_data(left);
+                    if self.write_pending() {
+                        std::thread::sleep(left.min(WRITE_POLL));
+                    } else {
+                        self.wait_for_data(left);
+                    }
                     continue;
                 }
                 Err(e) => return Err(map_ws_error(e, true)),
             };
-            deadline = Instant::now() + self.read_wait;
             self.last_heard = Instant::now();
             self.heard_anything = true;
             let bytes = match message {
@@ -482,21 +658,9 @@ impl NodeSocket {
 /// Run an upgrade on a non-blocking stream to its end: try again after a short sleep until it
 /// is done or `limit` passes.
 fn finish_handshake(
-    first: Result<
-        (
-            WebSocket<TcpStream>,
-            tungstenite::handshake::client::Response,
-        ),
-        tungstenite::HandshakeError<tungstenite::ClientHandshake<TcpStream>>,
-    >,
+    first: HandshakeResult,
     limit: Duration,
-) -> Result<
-    (
-        WebSocket<TcpStream>,
-        tungstenite::handshake::client::Response,
-    ),
-    SocketError,
-> {
+) -> Result<(Ws, tungstenite::handshake::client::Response), SocketError> {
     let deadline = Instant::now() + limit;
     let mut step = first;
     loop {
@@ -685,8 +849,8 @@ fn map_ws_error_with(e: tungstenite::Error, reading: bool, pending: Option<i32>)
 
 impl Drop for NodeSocket {
     fn drop(&mut self) {
-        if let Some(poller) = &self.poller {
-            let _ = poller.delete(self.ws.get_ref());
+        if let Some(mut waiter) = self.waiter.take() {
+            waiter.release(&self.ws.get_ref().tcp);
         }
     }
 }
@@ -1306,16 +1470,158 @@ mod tests {
         assert_eq!(IO_PENDING, 997);
     }
 
+    // ---- helpers for the wait and framing tests ----
+
+    /// What happened to the waits of a socket whose waiter is a [`Recording`].
+    #[derive(Default)]
+    struct Counters {
+        calls: AtomicUsize,
+        ready: AtomicUsize,
+        timed_out: AtomicUsize,
+        failed: AtomicUsize,
+    }
+
+    /// Wraps the socket's real waiter and counts what each wait did.
+    struct Recording {
+        inner: Box<dyn Waiter>,
+        counters: Arc<Counters>,
+    }
+
+    impl Waiter for Recording {
+        fn wait(&mut self, tcp: &TcpStream, left: Duration) -> Waited {
+            self.counters.calls.fetch_add(1, Ordering::SeqCst);
+            let w = self.inner.wait(tcp, left);
+            let slot = match &w {
+                Waited::Ready => &self.counters.ready,
+                Waited::TimedOut => &self.counters.timed_out,
+                Waited::Failed(_) => &self.counters.failed,
+            };
+            slot.fetch_add(1, Ordering::SeqCst);
+            w
+        }
+        fn release(&mut self, tcp: &TcpStream) {
+            self.inner.release(tcp)
+        }
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+    }
+
+    /// Put a [`Recording`] around the socket's poller; panics if it has none (the poller
+    /// could not be made on this machine, which a test must not pass over silently).
+    fn record(socket: &mut NodeSocket) -> Arc<Counters> {
+        let counters = Arc::new(Counters::default());
+        let inner = socket.waiter.take().expect("the poller could not be made");
+        assert_eq!(inner.name(), "poll");
+        socket.waiter = Some(Box::new(Recording {
+            inner,
+            counters: counters.clone(),
+        }));
+        counters
+    }
+
+    /// A waiter that makes the race happen by construction: its first wait has the node send
+    /// a frame, and only then reports that the wait ran out.
+    struct Inject {
+        go: std::sync::mpsc::Sender<()>,
+        done: std::sync::mpsc::Receiver<()>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Waiter for Inject {
+        fn wait(&mut self, _tcp: &TcpStream, _left: Duration) -> Waited {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.go.send(()).unwrap();
+                self.done.recv().unwrap();
+            }
+            Waited::TimedOut
+        }
+        fn release(&mut self, _tcp: &TcpStream) {}
+        fn name(&self) -> &'static str {
+            "inject"
+        }
+    }
+
+    /// A waiter whose every wait fails.
+    struct Broken;
+
+    impl Waiter for Broken {
+        fn wait(&mut self, _tcp: &TcpStream, _left: Duration) -> Waited {
+            Waited::Failed("injected failure".into())
+        }
+        fn release(&mut self, _tcp: &TcpStream) {}
+        fn name(&self) -> &'static str {
+            "broken"
+        }
+    }
+
+    /// The `i`th distinguishable answer.
+    fn numbered(i: u32) -> HostResult {
+        Err(NodeErrorKind::Unhandled {
+            cause: format!("frame {i}").into(),
+        }
+        .into())
+    }
+
+    fn text_of(r: &HostResult) -> String {
+        match r {
+            Err(e) => match e.kind() {
+                NodeErrorKind::Unhandled { cause } => cause.to_string(),
+                other => format!("{other:?}"),
+            },
+            Ok(r) => format!("{r:?}"),
+        }
+    }
+
+    /// The bytes of a server-to-client binary frame (unmasked) carrying `r`.
+    fn frame_bytes(r: &HostResult) -> Vec<u8> {
+        let payload = bincode::serialize(r).unwrap();
+        let mut f = vec![0x82];
+        match payload.len() {
+            n if n < 126 => f.push(n as u8),
+            n if n < 65536 => {
+                f.push(126);
+                f.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            n => {
+                f.push(127);
+                f.extend_from_slice(&(n as u64).to_be_bytes());
+            }
+        }
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    /// A node that accepts one connection, completes the upgrade and runs `play` on it.
+    fn node_that<T: Send + 'static>(
+        play: impl FnOnce(WebSocket<TcpStream>) -> T + Send + 'static,
+    ) -> (String, thread::JoinHandle<T>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            play(tungstenite::accept(stream).unwrap())
+        });
+        (authority, handle)
+    }
+
+    fn open(authority: &str) -> NodeSocket {
+        NodeSocket::connect_open(authority, &GrantToken::new("t".into())).unwrap()
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::channel;
+
     /// No receive or send timeout is set on the node socket, before or after the wait is
     /// configured: that option is what Windows documents as leaving a timed-out socket
     /// indeterminate. This fails on the code that set `SO_RCVTIMEO` / `SO_SNDTIMEO`.
     #[test]
     fn the_node_socket_has_no_os_timeouts() {
         let (authority, server) = serve(Vec::new());
-        let mut socket =
-            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+        let mut socket = open(&authority);
         let check = |socket: &NodeSocket| {
-            let tcp = socket.ws.get_ref();
+            let tcp = &socket.ws.get_ref().tcp;
             assert_eq!(tcp.read_timeout().unwrap(), None);
             assert_eq!(tcp.write_timeout().unwrap(), None);
         };
@@ -1327,119 +1633,520 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// A frame sent at every offset around the moment the client's wait runs out is received
-    /// exactly once, in order, and the connection is never dropped. The client waits 1 ms per
-    /// `recv`; the node sends each frame after a delay that sweeps from 0 to 3 ms, so frames
-    /// land before, during and after a wait. (On Windows, with a receive timeout set, this is
-    /// the race that lost data.)
+    /// The original race, by construction and with no timing involved: the wait runs out at
+    /// the moment a frame arrives (the stand-in waiter has the node send it, and only then
+    /// reports the timeout). `recv` must read once more and return the frame, not `Timeout`.
+    /// A later wait with nothing sent does time out.
     #[test]
-    fn frames_sent_as_the_wait_runs_out_are_never_lost_or_repeated() {
-        const FRAMES: u32 = 2000;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let authority = listener.local_addr().unwrap().to_string();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(stream).unwrap();
-            for i in 0..FRAMES {
-                thread::sleep(Duration::from_micros(u64::from(i % 30) * 100));
-                let r: HostResult = Err(NodeErrorKind::Unhandled {
-                    cause: format!("frame {i}").into(),
-                }
-                .into());
-                ws.send(Message::Binary(bincode::serialize(&r).unwrap().into()))
-                    .unwrap();
-            }
-            // Hold the connection open until the client has everything.
+    fn a_wait_that_runs_out_as_data_arrives_loses_nothing() {
+        let (go_tx, go_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let (authority, server) = node_that(move |mut ws| {
+            go_rx.recv().unwrap();
+            ws.send(Message::Binary(
+                bincode::serialize(&numbered(1)).unwrap().into(),
+            ))
+            .unwrap();
+            done_tx.send(()).unwrap();
             while ws.read().is_ok() {}
         });
-        let mut socket =
-            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
-        socket.set_read_timeout(Duration::from_millis(1)).unwrap();
-        let mut got: Vec<String> = Vec::new();
-        let give_up = Instant::now() + Duration::from_secs(60);
-        let mut timeouts = 0u32;
-        while (got.len() as u32) < FRAMES {
-            assert!(Instant::now() < give_up, "only {} of {FRAMES}", got.len());
-            match socket.recv() {
-                Ok(Err(e)) => got.push(e.to_string()),
-                Ok(Ok(r)) => panic!("an answer that was not sent: {r:?}"),
-                Err(SocketError::Timeout) => timeouts += 1,
-                Err(e) => panic!("the connection was lost after {} frames: {e}", got.len()),
-            }
-        }
-        assert_eq!(got.len() as u32, FRAMES);
-        for (i, text) in got.iter().enumerate() {
-            assert!(text.contains(&format!("frame {i}")), "frame {i} was {text}");
-        }
-        assert!(
-            timeouts > 0,
-            "the waits never ran out, so nothing was raced"
-        );
+        let mut socket = open(&authority);
+        let calls = Arc::new(AtomicUsize::new(0));
+        socket.waiter = Some(Box::new(Inject {
+            go: go_tx,
+            done: done_rx,
+            calls: calls.clone(),
+        }));
+        socket.set_read_timeout(Duration::from_secs(30)).unwrap();
+        let got = socket.recv().expect("the frame was lost to the timeout");
+        assert_eq!(text_of(&got), "frame 1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        socket.set_read_timeout(Duration::from_millis(20)).unwrap();
+        assert_eq!(socket.recv().unwrap_err(), SocketError::Timeout);
         drop(socket);
         server.join().unwrap();
     }
 
-    /// A frame is read as soon as it arrives, not at the end of a wait or a sleep: with a 30 s
-    /// wait and a frame sent after 50 ms, `recv` returns well inside a second. With the
-    /// readiness poller gone (its fallback is a sleep of at most [`POLL`]) it still does.
+    /// The poller path is the one in use: a frame sent after 50 ms ends a 30 s wait at once,
+    /// by a wait that reported `Ready`, and the sleep fallback is never taken. A poller that
+    /// failed on every call would fail this test instead of passing silently. With no poller
+    /// the fallback still delivers the frame within [`POLL`].
     #[test]
-    fn a_frame_wakes_the_wait_and_the_fallback_sleep_is_short() {
+    fn the_poller_wakes_the_wait_and_the_fallback_sleep_is_short() {
         for poller in [true, false] {
-            let ok: HostResult = Ok(HostResponse::Ok);
-            let bytes = bincode::serialize(&ok).unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let authority = listener.local_addr().unwrap().to_string();
-            let server = thread::spawn(move || {
-                let (stream, _) = listener.accept().unwrap();
-                let mut ws = tungstenite::accept(stream).unwrap();
+            let (authority, server) = node_that(move |mut ws| {
                 thread::sleep(Duration::from_millis(50));
-                ws.send(Message::Binary(bytes.into())).unwrap();
+                ws.send(Message::Binary(
+                    bincode::serialize(&numbered(2)).unwrap().into(),
+                ))
+                .unwrap();
                 while ws.read().is_ok() {}
             });
-            let mut socket =
-                NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
-            assert!(socket.poller.is_some(), "the poller could not be made");
-            if !poller {
-                socket.poller = None;
-            }
+            let mut socket = open(&authority);
+            let counters = if poller {
+                Some(record(&mut socket))
+            } else {
+                assert!(socket.waiter.is_some(), "the poller could not be made");
+                socket.waiter = None;
+                None
+            };
             socket.set_read_timeout(Duration::from_secs(30)).unwrap();
             let start = Instant::now();
-            assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
+            let got = socket.recv().unwrap();
             let took = start.elapsed();
+            assert_eq!(text_of(&got), "frame 2");
             assert!(took < Duration::from_secs(1), "poller {poller}: {took:?}");
+            match counters {
+                Some(c) => {
+                    assert!(
+                        c.calls.load(Ordering::SeqCst) >= 1,
+                        "the poller was not used"
+                    );
+                    assert!(c.ready.load(Ordering::SeqCst) >= 1);
+                    assert_eq!(c.failed.load(Ordering::SeqCst), 0);
+                    assert_eq!(socket.fallback_sleeps, 0, "the sleep fallback ran");
+                }
+                None => assert!(socket.fallback_sleeps >= 1),
+            }
             drop(socket);
             server.join().unwrap();
         }
     }
 
-    /// A frame that arrives in two parts with a wait that runs out between them is delivered
-    /// whole by a later `recv`: nothing is lost to the timeout in between.
+    /// A poller whose every wait fails falls back to sleeping, delivers the frame, and does
+    /// not panic.
     #[test]
-    fn a_frame_in_two_parts_across_a_timeout_arrives_whole() {
-        use std::io::Write;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let authority = listener.local_addr().unwrap().to_string();
-        let ok: HostResult = Ok(HostResponse::Ok);
-        let payload = bincode::serialize(&ok).unwrap();
-        let mut frame = vec![0x82, payload.len() as u8];
-        frame.extend_from_slice(&payload);
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(stream).unwrap();
-            let (head, tail) = frame.split_at(2);
-            ws.get_mut().write_all(head).unwrap();
-            ws.get_mut().flush().unwrap();
-            thread::sleep(Duration::from_millis(150));
-            ws.get_mut().write_all(tail).unwrap();
-            ws.get_mut().flush().unwrap();
+    fn a_poller_that_fails_falls_back_to_sleeping() {
+        let (authority, server) = node_that(move |mut ws| {
+            thread::sleep(Duration::from_millis(30));
+            ws.send(Message::Binary(
+                bincode::serialize(&numbered(3)).unwrap().into(),
+            ))
+            .unwrap();
             while ws.read().is_ok() {}
         });
-        let mut socket =
-            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
-        socket.set_read_timeout(Duration::from_millis(30)).unwrap();
-        assert_eq!(socket.recv().unwrap_err(), SocketError::Timeout);
+        let mut socket = open(&authority);
+        socket.waiter = Some(Box::new(Broken));
         socket.set_read_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
+        assert_eq!(text_of(&socket.recv().unwrap()), "frame 3");
+        assert!(socket.fallback_sleeps >= 1);
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// Frames that arrive together are returned one `recv` at a time without waiting in
+    /// between: three small frames in ONE write, and no wait at all is made, because
+    /// tungstenite already holds the other two. (Waiting for the socket while a frame sits in
+    /// tungstenite's buffer would stall until the next byte or the deadline.)
+    #[test]
+    fn frames_already_buffered_are_returned_without_waiting() {
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let (authority, server) = node_that(move |mut ws| {
+            go_rx.recv().unwrap();
+            let all: Vec<u8> = (10..13).flat_map(|i| frame_bytes(&numbered(i))).collect();
+            ws.get_mut().write_all(&all).unwrap();
+            ws.get_mut().flush().unwrap();
+            done_tx.send(()).unwrap();
+            while ws.read().is_ok() {}
+        });
+        let mut socket = open(&authority);
+        let counters = record(&mut socket);
+        socket.set_read_timeout(Duration::from_secs(1)).unwrap();
+        go_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+        let start = Instant::now();
+        let texts: Vec<String> = (0..3).map(|_| text_of(&socket.recv().unwrap())).collect();
+        assert_eq!(texts, ["frame 10", "frame 11", "frame 12"]);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(counters.calls.load(Ordering::SeqCst), 0, "a wait was made");
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A 4 MiB message, which takes many reads, arrives byte for byte.
+    #[test]
+    fn a_four_megabyte_message_arrives_whole() {
+        let cause = "abcdefgh".repeat(512 * 1024);
+        let expected = cause.clone();
+        let (authority, server) = node_that(move |mut ws| {
+            let r: HostResult = Err(NodeErrorKind::Unhandled {
+                cause: cause.into(),
+            }
+            .into());
+            ws.send(Message::Binary(bincode::serialize(&r).unwrap().into()))
+                .unwrap();
+            while ws.read().is_ok() {}
+        });
+        let mut socket = open(&authority);
+        socket.set_read_timeout(Duration::from_secs(20)).unwrap();
+        let got = socket.recv().unwrap();
+        assert!(text_of(&got) == expected, "the message differs");
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A frame cut inside its 2-byte header and again inside its payload, each part released
+    /// only after the client's previous `recv` returned `Timeout`, arrives whole on the third
+    /// `recv`. Bytes that arrive count as hearing from the node (`last_heard` moves) even
+    /// though no message is complete: a large frame trickling in must not look like silence.
+    #[test]
+    fn a_frame_in_three_parts_across_timeouts_arrives_whole_and_counts_as_heard() {
+        let bytes = frame_bytes(&numbered(7));
+        let (sent_tx, sent_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let (connected_tx, connected_rx) = channel::<()>();
+        let (authority, server) = node_that(move |mut ws| {
+            // Nothing is sent before the client has finished the upgrade: bytes that came
+            // with the upgrade answer would be consumed by it, not by `recv`.
+            connected_rx.recv().unwrap();
+            let tcp = ws.get_mut();
+            for (i, part) in [&bytes[..1], &bytes[1..5], &bytes[5..]].iter().enumerate() {
+                if i > 0 {
+                    release_rx.recv().unwrap();
+                }
+                tcp.write_all(part).unwrap();
+                tcp.flush().unwrap();
+                sent_tx.send(()).unwrap();
+            }
+            while ws.read().is_ok() {}
+        });
+        let mut socket = open(&authority);
+        connected_tx.send(()).unwrap();
+        socket.set_read_timeout(Duration::from_millis(50)).unwrap();
+        for _ in 0..2 {
+            sent_rx.recv().unwrap();
+            let before = socket.last_heard();
+            assert_eq!(socket.recv().unwrap_err(), SocketError::Timeout);
+            assert!(socket.last_heard() > before, "the bytes were not counted");
+            release_tx.send(()).unwrap();
+        }
+        sent_rx.recv().unwrap();
+        socket.set_read_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(text_of(&socket.recv().unwrap()), "frame 7");
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// Intended behaviour, stated: the read wait runs from the start of each `recv` and does
+    /// NOT restart when messages arrive. A node that sends a pong every 5 ms must not keep the
+    /// session from its tick; `recv` still reports `Timeout` at the wait, while `last_heard`
+    /// keeps moving so the watchdog sees a live node.
+    #[test]
+    fn a_steady_stream_of_pongs_does_not_starve_the_timeout() {
+        let (authority, server) = node_that(move |mut ws| {
+            for _ in 0..120 {
+                if ws.send(Message::Pong(Vec::new().into())).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            while ws.read().is_ok() {}
+        });
+        let mut socket = open(&authority);
+        socket.set_read_timeout(Duration::from_millis(100)).unwrap();
+        let before = socket.last_heard();
+        let start = Instant::now();
+        assert_eq!(socket.recv().unwrap_err(), SocketError::Timeout);
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(100), "{took:?}");
+        assert!(took < Duration::from_millis(400), "starved: {took:?}");
+        assert!(socket.last_heard() > before);
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A node that never reads: writes fail with `Failed` after the write timeout (shortened
+    /// here to 200 ms) and never hang.
+    #[test]
+    fn a_write_the_node_never_takes_fails_after_the_write_timeout() {
+        let (end_tx, end_rx) = channel::<()>();
+        let (authority, server) = node_that(move |ws| {
+            end_rx.recv().unwrap();
+            drop(ws);
+        });
+        let mut socket = open(&authority);
+        socket.write_timeout = Duration::from_millis(200);
+        let big = vec![1u8; 1024 * 1024];
+        let start = Instant::now();
+        let mut failed = None;
+        for _ in 0..400 {
+            if let Err(e) = socket.write_message(Message::Binary(big.clone().into())) {
+                failed = Some(e);
+                break;
+            }
+        }
+        match failed {
+            Some(SocketError::Failed(why)) => assert!(why.contains("not taking data"), "{why}"),
+            other => panic!("expected a failed write, got {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(20));
+        drop(socket);
+        end_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    /// A node that closes in the middle of a frame, and one that resets the connection (it
+    /// closes with the client's request unread), end `recv` with an error promptly and
+    /// without spinning on the waiter.
+    #[test]
+    fn a_connection_that_ends_mid_frame_or_by_reset_is_an_error_not_a_hang() {
+        // Closed in the middle of a frame.
+        let bytes = frame_bytes(&numbered(5));
+        let (authority, server) = node_that(move |mut ws| {
+            ws.get_mut().write_all(&bytes[..6]).unwrap();
+            ws.get_mut().flush().unwrap();
+        });
+        let mut socket = open(&authority);
+        let counters = record(&mut socket);
+        socket.set_read_timeout(Duration::from_secs(10)).unwrap();
+        let start = Instant::now();
+        let err = socket.recv().unwrap_err();
+        assert!(!matches!(err, SocketError::Timeout), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            counters.calls.load(Ordering::SeqCst) < 50,
+            "spun on the waiter"
+        );
+        drop(socket);
+        server.join().unwrap();
+
+        // Reset: the node closes with the client's request still unread.
+        let (sent_tx, sent_rx) = channel::<()>();
+        let (authority, server) = node_that(move |ws| {
+            sent_rx.recv().unwrap();
+            drop(ws);
+        });
+        let mut socket = open(&authority);
+        let counters = record(&mut socket);
+        socket.set_read_timeout(Duration::from_secs(10)).unwrap();
+        socket
+            .send(&every_request_kind().remove(2).1)
+            .expect("the request fits the socket");
+        sent_tx.send(()).unwrap();
+        let start = Instant::now();
+        let err = socket.recv().unwrap_err();
+        assert!(!matches!(err, SocketError::Timeout), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            counters.calls.load(Ordering::SeqCst) < 50,
+            "spun on the waiter"
+        );
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A pong that tungstenite queued inside a read while the client's send buffer was full
+    /// still goes out once the node reads again, though nothing more arrives from the node:
+    /// the wait is for readability, so `recv` also retries the queued write itself.
+    #[test]
+    fn a_queued_pong_is_flushed_when_the_socket_becomes_writable() {
+        let (filled_tx, filled_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let (authority, server) = node_that(move |mut ws| {
+            filled_rx.recv().unwrap();
+            ws.send(Message::Ping(Vec::new().into())).unwrap();
+            go_rx.recv().unwrap();
+            let mut pong = false;
+            loop {
+                match ws.read() {
+                    Ok(Message::Pong(_)) => {
+                        pong = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            if pong {
+                let ok: HostResult = Ok(HostResponse::Ok);
+                let _ = ws.send(Message::Binary(bincode::serialize(&ok).unwrap().into()));
+            }
+            pong
+        });
+        let mut socket = open(&authority);
+        // Fill the client's send buffer: the node reads nothing yet.
+        let chunk = vec![0u8; 256 * 1024];
+        let mut full = false;
+        for _ in 0..2000 {
+            match socket.ws.write(Message::Binary(chunk.clone().into())) {
+                Ok(()) => {}
+                Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(full, "the send buffer never filled");
+        filled_tx.send(()).unwrap();
+        // Read the ping by hand: the pong it queues cannot be written yet.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        loop {
+            match socket.ws.read() {
+                Ok(Message::Ping(_)) => break,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < give_up, "no ping");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        go_tx.send(()).unwrap();
+        socket.set_read_timeout(Duration::from_secs(20)).unwrap();
+        assert!(
+            matches!(socket.recv(), Ok(Ok(HostResponse::Ok))),
+            "the queued pong never went out"
+        );
+        drop(socket);
+        assert!(server.join().unwrap());
+    }
+
+    /// The upgrade answer arriving in 5-byte pieces still completes the connection; one that
+    /// never comes fails at the (shortened) handshake timeout instead of hanging.
+    #[test]
+    fn the_handshake_survives_split_segments_and_a_stalled_one_fails() {
+        struct Split(TcpStream);
+        impl Read for Split {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        impl Write for Split {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(5);
+                let k = self.0.write(&buf[..n])?;
+                self.0.flush()?;
+                thread::sleep(Duration::from_millis(1));
+                Ok(k)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.flush()
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(Split(stream)).unwrap();
+            ws.send(Message::Binary(
+                bincode::serialize(&numbered(9)).unwrap().into(),
+            ))
+            .unwrap();
+            while ws.read().is_ok() {}
+        });
+        let mut socket = open(&authority);
+        socket.set_read_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(text_of(&socket.recv().unwrap()), "frame 9");
+        drop(socket);
+        server.join().unwrap();
+
+        // A node that accepts and never answers the upgrade.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let (end_tx, end_rx) = channel::<()>();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            end_rx.recv().unwrap();
+            drop(stream);
+        });
+        let start = Instant::now();
+        let err = NodeSocket::connect_within(
+            &authority,
+            &GrantToken::new("t".into()),
+            &WriteGate::default(),
+            Duration::from_millis(300),
+        )
+        .err()
+        .expect("a stalled upgrade must fail");
+        assert!(matches!(err, SocketError::Failed(_)), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        end_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    /// Opening and dropping connections leaves no file descriptors behind (the socket and the
+    /// poller's own descriptor are both closed). Other tests in this process open and close
+    /// descriptors meanwhile, so the bound is loose: a leak of even one descriptor per cycle
+    /// is 200.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connections_do_not_leak_descriptors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        const CYCLES: usize = 200;
+        let server = thread::spawn(move || {
+            for _ in 0..=CYCLES {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = tungstenite::accept(stream);
+            }
+        });
+        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        drop(open(&authority));
+        let warm = count();
+        for _ in 0..CYCLES {
+            drop(open(&authority));
+        }
+        let after = count();
+        server.join().unwrap();
+        assert!(
+            after < warm + 100,
+            "descriptors grew from {warm} to {after} over {CYCLES} connections"
+        );
+    }
+
+    /// Frames sent at every offset around the moment the client's wait runs out are received
+    /// exactly once, in order, and the connection is never dropped. The client waits 1 ms per
+    /// `recv`; the node sends each frame after a delay that sweeps from 0 to 3 ms.
+    ///
+    /// This is a probabilistic check and it passes on the old receive-timeout code on Linux:
+    /// the data-loss race it is aimed at is Windows-specific. It guards the new code only. The
+    /// deterministic regression test is `a_wait_that_runs_out_as_data_arrives_loses_nothing`.
+    #[test]
+    fn frames_sent_as_the_wait_runs_out_are_never_lost_or_repeated() {
+        const FRAMES: u32 = 2000;
+        let (authority, server) = node_that(move |mut ws| {
+            ws.get_ref().set_nodelay(true).unwrap();
+            for i in 0..FRAMES {
+                thread::sleep(Duration::from_micros(u64::from(i % 30) * 100));
+                ws.send(Message::Binary(
+                    bincode::serialize(&numbered(i)).unwrap().into(),
+                ))
+                .unwrap();
+            }
+            // Hold the connection open until the client has everything.
+            while ws.read().is_ok() {}
+        });
+        let mut socket = open(&authority);
+        socket.set_read_timeout(Duration::from_millis(1)).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        let started = Instant::now();
+        let give_up = started + Duration::from_secs(60);
+        let mut timeouts = 0u32;
+        while (got.len() as u32) < FRAMES {
+            assert!(
+                Instant::now() < give_up,
+                "only {} of {FRAMES} after {:?}, {timeouts} timeouts",
+                got.len(),
+                started.elapsed()
+            );
+            match socket.recv() {
+                Ok(r) => got.push(text_of(&r)),
+                Err(SocketError::Timeout) => timeouts += 1,
+                Err(e) => panic!(
+                    "the connection was lost after {} frames ({:?}, {timeouts} timeouts): {e}",
+                    got.len(),
+                    started.elapsed()
+                ),
+            }
+        }
+        for (i, text) in got.iter().enumerate() {
+            assert!(text.contains(&format!("frame {i}")), "frame {i} was {text}");
+        }
+        if timeouts == 0 {
+            eprintln!("note: no wait ran out, so nothing was raced (a coarse-timer runner)");
+        }
         drop(socket);
         server.join().unwrap();
     }
@@ -1448,13 +2155,10 @@ mod tests {
     /// flushed again), and arrives once and whole.
     #[test]
     fn a_write_into_a_full_socket_is_kept_until_the_node_reads() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let authority = listener.local_addr().unwrap().to_string();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(stream).unwrap();
-            // Not reading: the client's sends fill the pipe first.
-            thread::sleep(Duration::from_millis(400));
+        let (go_tx, go_rx) = channel::<()>();
+        let (authority, server) = node_that(move |mut ws| {
+            // Not reading until the client has been blocked on a full socket.
+            go_rx.recv().unwrap();
             let mut sizes = Vec::new();
             while let Ok(m) = ws.read() {
                 if let Message::Binary(b) = m {
@@ -1463,15 +2167,21 @@ mod tests {
             }
             sizes
         });
-        let mut socket =
-            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+        let mut socket = open(&authority);
         let big = vec![7u8; 4 * 1024 * 1024];
+        // The first writes cannot finish until the node reads, so release it from another
+        // thread once the client has had time to block.
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            go_tx.send(()).unwrap();
+        });
         let sent = 6;
         for _ in 0..sent {
             socket
                 .write_message(Message::Binary(big.clone().into()))
                 .unwrap();
         }
+        release.join().unwrap();
         drop(socket);
         let sizes = server.join().unwrap();
         assert_eq!(sizes, vec![big.len(); sent]);
