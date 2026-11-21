@@ -25,20 +25,11 @@
 //! room the local user is in; the local user is the one with context to
 //! pick the right destination.
 //!
-//! In-flight state lives at module scope (`INVITE_VIA_DM_PICKER_INFLIGHT`,
-//! defined in the parent module) so the watchdog task and the
-//! terminal-defer block can coordinate even after the picker has been
-//! closed or reopened for a different member. (The component itself is
-//! mounted unconditionally in `app.rs` and never unmounts — it just
-//! returns an empty element when `INVITE_VIA_DM_PICKER` is `None`.)
-//! A monotonic generation counter lets stale watchdogs from prior picks
-//! short-circuit immediately when a newer pick has taken over.
+//! A send claims its generation in the click handler. The button, backdrop,
+//! completion callback and watchdog all consult the same claim.
 
 use crate::components::app::{MEMBER_INFO_MODAL, ROOMS};
-use crate::components::direct_messages::{
-    send_structured_dm, InvitePickInflight, SendDmOutcome, INVITE_VIA_DM_PICKER,
-    INVITE_VIA_DM_PICKER_INFLIGHT,
-};
+use crate::components::direct_messages::{send_structured_dm, SendDmOutcome, INVITE_VIA_DM_PICKER};
 use dioxus::logger::tracing::{error, info, warn};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fa_solid_icons::FaLock, Icon};
@@ -46,6 +37,8 @@ use ed25519_dalek::VerifyingKey;
 use river_core::room_state::dm_body::{DirectMessageBody, InvitePayload};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::privacy::PrivacyMode;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-render snapshot of a candidate room.
@@ -92,10 +85,7 @@ fn watchdog_wait() -> std::time::Duration {
 /// chat composer enforces.
 const PERSONAL_MESSAGE_CHAR_CAP: usize = 4_000;
 
-/// Monotonic pick generation. Each row-click bumps this; watchdogs
-/// capture the value at scheduling time and short-circuit if it has
-/// moved on. Lives outside any component scope so it can never panic
-/// on access (Codex P2 + Skeptical M1 / L3 on PR #260).
+/// Distinguishes a timed-out send from a later send in the same picker.
 static PICK_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[component]
@@ -119,6 +109,9 @@ pub fn InviteViaDmPickerModal() -> Element {
     let mut selected_room: Signal<Option<(MemberId, VerifyingKey)>> = use_signal(|| None);
     let mut personal_message = use_signal(String::new);
     let mut send_error: Signal<Option<String>> = use_signal(|| None);
+    // The handler must claim the send synchronously, before a second click or
+    // dismissal can run. A deferred signal write would leave that window open.
+    let active_send = use_hook(|| Rc::new(Cell::new(None::<u64>)));
 
     // Reset the scratch state on every `INVITE_VIA_DM_PICKER` transition
     // (open / close / switch target) so a reopened picker doesn't show
@@ -149,12 +142,10 @@ pub fn InviteViaDmPickerModal() -> Element {
         return rsx! {};
     };
 
-    let in_flight = *INVITE_VIA_DM_PICKER_INFLIGHT.read();
-    let any_pending = in_flight.is_some();
-
+    let any_pending = active_send.get().is_some();
+    let closing_send = active_send.clone();
     let close = move |_| {
-        // Don't close while a send is in flight.
-        if INVITE_VIA_DM_PICKER_INFLIGHT.read().is_some() {
+        if closing_send.get().is_some() {
             return;
         }
         crate::util::defer(move || {
@@ -289,9 +280,10 @@ pub fn InviteViaDmPickerModal() -> Element {
     // structured DM containing it. On success the picker closes and the
     // member-info modal closes too. On failure we surface an inline
     // error and let the user retry.
+    let refresh_picker = dioxus::core::schedule_update();
     let do_send = move |_| {
         // Re-check pending; click can race the disabled-attribute on the button.
-        if INVITE_VIA_DM_PICKER_INFLIGHT.peek().is_some() {
+        if active_send.get().is_some() {
             return;
         }
         // The selection must belong to THIS session (tagged with the
@@ -299,18 +291,16 @@ pub fn InviteViaDmPickerModal() -> Element {
         // same two checks as the `selected_room_value` render filter.
         // Guarding the send path directly means it never depends on the
         // Send button's disabled state (Codex P2 on PR #291).
-        let candidate_room_vk = match *selected_room.peek() {
-            Some((peer, room))
-                if peer == target_peer && candidates_for_send.iter().any(|c| c.room_vk == room) =>
-            {
-                room
-            }
-            _ => {
+        let Some(candidate) = (*selected_room.peek())
+            .filter(|(peer, _)| *peer == target_peer)
+            .and_then(|(_, room)| candidates_for_send.iter().find(|c| c.room_vk == room))
+        else {
+            crate::util::defer(move || {
                 send_error.set(Some("Pick a room to invite them to first.".into()));
-                return;
-            }
+            });
+            return;
         };
-        send_error.set(None);
+        let candidate_room_vk = candidate.room_vk;
 
         let pmessage = personal_message.peek().clone();
         let pmessage_opt = if pmessage.trim().is_empty() {
@@ -326,51 +316,28 @@ pub fn InviteViaDmPickerModal() -> Element {
             .and_then(|r| r.map.get(&candidate_room_vk).cloned())
         else {
             error!("invite-via-DM: candidate room data missing");
-            send_error.set(Some(
-                "The room you picked is no longer loaded. Try again.".into(),
-            ));
+            crate::util::defer(move || {
+                send_error.set(Some(
+                    "The room you picked is no longer loaded. Try again.".into(),
+                ));
+            });
             return;
         };
-        let candidate_label = candidates_for_send
-            .iter()
-            .find(|c| c.room_vk == candidate_room_vk)
-            .map(|c| c.label.clone())
-            .unwrap_or_else(|| "Unknown room".to_string());
+        let candidate_label = candidate.label.clone();
 
         let my_generation = PICK_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
 
-        crate::util::defer(move || {
-            *INVITE_VIA_DM_PICKER_INFLIGHT.write() = Some(InvitePickInflight {
-                generation: my_generation,
-                room_vk: candidate_room_vk,
-            });
-        });
+        active_send.set(Some(my_generation));
+        refresh_picker();
 
-        let candidate_label_for_task = candidate_label.clone();
+        let send_for_completion = active_send.clone();
         crate::util::safe_spawn_local(async move {
             #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
             crate::test_hooks::invite_send_gate().await;
             let outcome = drive_send(current_room, target_peer, candidate_data, pmessage_opt).await;
 
             crate::util::defer(move || {
-                // This pick may have been superseded while `drive_send`
-                // was awaiting: the watchdog (timeout) may have fired and
-                // cleared INFLIGHT, or the user may have started a newer
-                // pick. The generation check below detects that. If this
-                // task's pick is no longer the active one, skip the
-                // picker-local UI updates (`send_error` / closing the
-                // picker and the member modal) — applying them
-                // would clobber a newer picker session or resurrect an
-                // already-closed one — and do only the global INFLIGHT
-                // cleanup. (The component itself never unmounts, so the
-                // `use_signal`s are always valid to write; the gate is
-                // about pick-generation correctness, not panic-safety.)
-                // (Codex P2 on round-4 review of PR #278.)
-                let still_mine = matches!(
-                    *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
-                    Some(p) if p.generation == my_generation
-                );
-                clear_inflight_if_matches(my_generation);
+                let still_mine = finish_send(&send_for_completion, my_generation);
                 match outcome {
                     Ok(()) => {
                         info!(
@@ -382,7 +349,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                         // after the watchdog closed the picker, which
                         // otherwise left the user with no word of it.
                         crate::components::toast::show_toast(
-                            format!("Invitation to \"{candidate_label_for_task}\" sent"),
+                            format!("Invitation to \"{candidate_label}\" sent"),
                             None,
                         );
                         if still_mine {
@@ -422,7 +389,7 @@ pub fn InviteViaDmPickerModal() -> Element {
             });
         });
 
-        schedule_watchdog(my_generation);
+        schedule_watchdog(active_send.clone(), my_generation);
     };
 
     rsx! {
@@ -430,7 +397,7 @@ pub fn InviteViaDmPickerModal() -> Element {
             class: "fixed inset-0 z-50 flex items-center justify-center",
             div {
                 class: "absolute inset-0 bg-black/50",
-                onclick: close,
+                onclick: close.clone(),
             }
             div {
                 class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border flex flex-col max-h-[80vh]",
@@ -522,22 +489,14 @@ pub fn InviteViaDmPickerModal() -> Element {
                             }
                         }
                     }
-                    if let Some(err) = send_error_value.as_ref() {
+                    if let Some(err) = send_error_value.as_ref().filter(|_| !any_pending) {
                         div { class: "text-xs text-danger", "{err}" }
                     }
                 }
                 // Footer: Send button only enabled once a room is picked
                 // and no send is in flight.
                 if !candidates_value.is_empty() {
-                    div { class: "border-t border-border px-5 py-3 flex items-center justify-between",
-                        if any_pending {
-                            div { class: "flex items-center gap-2 text-[13px] text-text-muted",
-                                div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full" }
-                                "Sending invite…"
-                            }
-                        } else {
-                            span { class: "text-[10px] text-text-muted" }
-                        }
+                    div { class: "border-t border-border px-5 py-3 flex justify-end",
                         button {
                             class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover disabled:opacity-50 disabled:cursor-not-allowed text-text text-[15px] font-medium rounded-lg transition-colors",
                             disabled: !can_send,
@@ -612,18 +571,13 @@ fn CandidateRow(
     }
 }
 
-/// Clear `INVITE_VIA_DM_PICKER_INFLIGHT` only if it still names this
-/// pick's generation. Prevents a stale terminal-defer from wiping a
-/// newer pick's marker (defensive — same generation-gating used by
-/// the watchdog).
-fn clear_inflight_if_matches(my_generation: u64) {
-    let still_mine = matches!(
-        *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
-        Some(p) if p.generation == my_generation
-    );
-    if still_mine {
-        *INVITE_VIA_DM_PICKER_INFLIGHT.write() = None;
+/// A late completion or watchdog cannot release a newer send.
+fn finish_send(active_send: &Cell<Option<u64>>, generation: u64) -> bool {
+    if active_send.get() != Some(generation) {
+        return false;
     }
+    active_send.set(None);
+    true
 }
 
 /// Sign the invitation, encode it, and dispatch a structured
@@ -685,13 +639,13 @@ async fn drive_send(
     }
 }
 
-/// Schedule a one-shot watchdog that clears `INVITE_VIA_DM_PICKER_INFLIGHT`
+/// Schedule a one-shot watchdog that releases the active send
 /// AND force-closes the picker if `my_generation` is still in flight
 /// after `PICKER_WATCHDOG_SECS`. Belt-and-suspenders against a stuck
 /// spawn_local task (Skeptical-review M1 on PR #260).
 ///
 /// **Why force-close on expiry** (Codex P2 on round-5 review of PR #278):
-/// the previous shape left the picker open after clearing INFLIGHT,
+/// the previous shape left the picker open after releasing the send,
 /// but the still-mine generation gate (added on round-4 so a superseded
 /// pick's late completion can't apply UI updates) then silenced the
 /// eventual late completion's UI updates — leaving the user with no
@@ -700,28 +654,23 @@ async fn drive_send(
 ///
 /// Force-closing on expiry eliminates the "open picker, but its pick
 /// already abandoned by the watchdog" state entirely: every late
-/// completion finds INFLIGHT already cleared, so the still-mine gate
+/// completion finds its generation already released, so the still-mine gate
 /// skips its picker-local updates. A late success is still reported, in
 /// the app toast; a late failure is only logged. The trade-off is losing
 /// the user's typed personal message on timeout, which is strictly better than the prior
 /// shape (no feedback + possible duplicate sends).
-fn schedule_watchdog(my_generation: u64) {
+fn schedule_watchdog(active_send: Rc<Cell<Option<u64>>>, my_generation: u64) {
     let wait = watchdog_wait();
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(wait).await;
         crate::util::defer(move || {
-            let still_mine = matches!(
-                *INVITE_VIA_DM_PICKER_INFLIGHT.peek(),
-                Some(p) if p.generation == my_generation
-            );
-            if !still_mine {
+            if !finish_send(&active_send, my_generation) {
                 return;
             }
             warn!(
                 "invite-via-DM: watchdog fired after {:?}; force-closing picker",
                 wait
             );
-            clear_inflight_if_matches(my_generation);
             // Force-close the picker. See doc-comment above for why
             // we accept losing the user's typed personal message here.
             *INVITE_VIA_DM_PICKER.write() = None;

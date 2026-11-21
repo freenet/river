@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { waitForApp, nextFrames, selectRoom } from "./example-room";
+import { waitForApp, nextFrames, selectRoom, visibleConnectionPill as pill } from "./example-room";
 import { callRiverTest, SyncStatus } from "./river-test";
 import { DM_PEER } from "./dm-thread";
 import { captureClipboardWrites, clipboardWrites } from "./clipboard";
@@ -14,12 +14,11 @@ import { captureClipboardWrites, clipboardWrites } from "./clipboard";
 // ordering of display writes across connection attempts are unit tests in
 // `error_report.rs` and `app.rs`; this checks what the reader sees.
 
-const PILL = '[data-testid="connection-status-indicator"]:visible';
 const PILL_NAME = "WebSocket connection status";
 const LONG_TOKEN = "x".repeat(400);
 
-function pill(page: Page): Locator {
-  return page.locator(PILL);
+function detailsButton(page: Page): Locator {
+  return pill(page).getByRole("button");
 }
 
 function pillLabel(page: Page): Locator {
@@ -195,8 +194,7 @@ test.describe("Connection error details", () => {
     await open(page);
     // Offline example data starts Disconnected with no error to explain.
     await expect(pillLabel(page)).toHaveText("Disconnected");
-    await expect(pill(page)).toHaveJSProperty("tagName", "DIV");
-    // A generic div has no naming semantics of its own: check the attribute.
+    await expect(detailsButton(page)).toHaveCount(0);
     await expect(pill(page)).toHaveAttribute("aria-label", `${PILL_NAME}: Disconnected`);
     await expect(tooltipOf(pill(page))).toHaveCount(0);
 
@@ -205,10 +203,10 @@ test.describe("Connection error details", () => {
     await expect(pillLabel(page)).toHaveText("Disconnected");
     // The button's name carries the status it shows, not just what it is.
     await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Disconnected`);
-    await expect(pill(page)).toHaveJSProperty("tagName", "BUTTON");
+    await expect(detailsButton(page)).toHaveAccessibleName(`${PILL_NAME}: Disconnected`);
     const card = tooltipOf(pill(page));
     await expect(card).toBeHidden();
-    await expect(pill(page)).toHaveAttribute("aria-describedby", (await card.getAttribute("id"))!);
+    await expect(detailsButton(page)).toHaveAttribute("aria-describedby", (await card.getAttribute("id"))!);
 
     await pill(page).hover();
     await expectShownAtOnce(card);
@@ -233,7 +231,7 @@ test.describe("Connection error details", () => {
     await expect(pillLabel(page)).toHaveText("Disconnected");
 
     // No pointer has been used on the page, so script focus is focus-visible.
-    await pill(page).focus();
+    await detailsButton(page).focus();
     await expectShownAtOnce(tooltipOf(pill(page)));
     await expect(tooltipOf(pill(page))).toContainText("The node went away");
     await page.keyboard.press("Enter");
@@ -246,10 +244,10 @@ test.describe("Connection error details", () => {
     await setStatus(page, "error");
     await setStatus(page, "connecting");
 
-    await expect(pillLabel(page)).toHaveText("Connecting...");
+    await expect(pillLabel(page)).toHaveText("Connecting");
     // Named for what it shows now, though the report it copies is the
     // earlier Disconnected one.
-    await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Connecting...`);
+    await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Connecting`);
     await pill(page).hover();
     await expect(tooltipOf(pill(page))).toContainText("Connection closed");
     await pill(page).click();
@@ -261,15 +259,17 @@ test.describe("Connection error details", () => {
     await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Disconnected`);
     await expect(tooltipOf(pill(page))).toContainText("Connection closed");
 
+    await callRiverTest(page, "setRoomsLoadState", "loaded");
     await setStatus(page, "connected");
     await expect(pillLabel(page)).toHaveText("Connected");
-    await expect(pill(page)).toHaveJSProperty("tagName", "DIV");
+    await expect(detailsButton(page)).toHaveCount(0);
     await expect(pill(page)).toHaveAttribute("aria-label", `${PILL_NAME}: Connected`);
     await expect(tooltipOf(pill(page))).toHaveCount(0);
   });
 
   test("display writes apply in order: an error then Connected leaves no error", { tag: "@chromium-only" }, async ({ page }) => {
     await open(page);
+    await callRiverTest(page, "setRoomsLoadState", "loaded");
     await page.evaluate(() => {
       const hooks = (window as unknown as { __riverTest: Record<string, (s: string) => void> })
         .__riverTest;
@@ -282,17 +282,17 @@ test.describe("Connection error details", () => {
     await expect(tooltipOf(pill(page))).toHaveCount(0);
   });
 
-  test("an auth reload reads Refreshing... with the progress dot", { tag: "@chromium-only" }, async ({ page }) => {
+  test("an auth reload reads Refreshing with the progress dot", { tag: "@chromium-only" }, async ({ page }) => {
     await open(page);
     await callRiverTest(
       page,
       "setSyncErrorReport",
-      "Refreshing...",
+      "Refreshing",
       "Authentication expired. Refreshing the page.",
       "AUTH_TOKEN_INVALID"
     );
-    await expect(pillLabel(page)).toHaveText("Refreshing...");
-    await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Refreshing...`);
+    await expect(pillLabel(page)).toHaveText("Refreshing");
+    await expect(pill(page)).toHaveAccessibleName(`${PILL_NAME}: Refreshing`);
     await expect(pill(page).getByTestId("connection-status-dot")).toHaveClass(/(^|\s)bg-warning(\s|$)/);
   });
 

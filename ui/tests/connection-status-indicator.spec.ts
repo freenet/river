@@ -1,5 +1,5 @@
 import { test, expect, Locator, Page } from "@playwright/test";
-import { resolveColor, selectRoom } from "./example-room";
+import { resolveColor, selectRoom, visibleConnectionPill } from "./example-room";
 
 // Regression tests for Bug #5 (Ivvor, Matrix 2026-05-17): the WebSocket
 // connection indicator must remain visible when the user has no rooms —
@@ -27,7 +27,6 @@ import { resolveColor, selectRoom } from "./example-room";
 // rather than a stuck/blank pill.
 
 const PILL = '[data-testid="connection-status-indicator"]';
-const VISIBLE_PILL = `${PILL}:visible`;
 const ROOMS_RAIL = '[data-testid="rooms-rail"]';
 const MEMBERS_RAIL = '[data-testid="members-rail"]';
 
@@ -50,11 +49,11 @@ async function waitForApp(page: Page) {
 // painted colour, which must be the token's (status-contrast.spec.ts pins
 // the tokens themselves).
 // An error report shows its own short label (error_report.rs): the error
-// dot, except "Refreshing..." (an auth reload under way), which is progress.
+// dot, except "Refreshing" (an auth reload under way), which is progress.
 const STATUS_STATES = [
   { dot: "bg-success", token: "--color-success", label: "Connected" },
-  { dot: "bg-warning", token: "--color-warning", label: "Connecting..." },
-  { dot: "bg-warning", token: "--color-warning", label: "Refreshing..." },
+  { dot: "bg-warning", token: "--color-warning", label: "Connecting" },
+  { dot: "bg-warning", token: "--color-warning", label: "Refreshing" },
   { dot: "bg-error", token: "--color-error", label: "Disconnected" },
   { dot: "bg-error", token: "--color-error", label: "Invalid operation" },
   { dot: "bg-error", token: "--color-error", label: "Unexpected message" },
@@ -123,7 +122,7 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     // left-rail copy. The Welcome-screen inline copy is `md:hidden`, so a
     // count of 2 here would mean `md:hidden` inverted; a count of 0 would
     // mean the rail copy got hidden. `.first()` masked both.
-    await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(visibleConnectionPill(page)).toHaveCount(1);
 
     // Both placements still exist in the DOM (one shown, one hidden); this
     // guards against the rail copy being dropped entirely — which would
@@ -131,11 +130,9 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     // weren't `md:hidden`.
     await expect(page.locator(PILL)).toHaveCount(2);
 
-    // Offline example data starts Disconnected with no error report, so the
-    // pill is a generic div: its name is the attribute, which carries the
-    // status it shows.
-    const visiblePill = page.locator(VISIBLE_PILL);
-    await expect(visiblePill).toHaveJSProperty("tagName", "DIV");
+    // Offline example data starts Disconnected with no error report, so the pill has no interactive details.
+    const visiblePill = visibleConnectionPill(page);
+    await expect(visiblePill.getByRole("button")).toHaveCount(0);
     await expect(visiblePill).toHaveAttribute(
       "aria-label",
       "WebSocket connection status: Disconnected"
@@ -152,14 +149,14 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(visibleConnectionPill(page)).toHaveCount(1);
 
     const roomsRail = page.locator(ROOMS_RAIL);
     const membersRail = page.locator(MEMBERS_RAIL);
 
     // The single visible pill at desktop width must be inside the Rooms
     // rail, and it must be the rail's only pill.
-    await expect(roomsRail.locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(visibleConnectionPill(roomsRail)).toHaveCount(1);
     await expect(roomsRail.locator(PILL)).toHaveCount(1);
     // The Members rail must NOT carry an indicator at all (pre-fix
     // location).
@@ -176,7 +173,7 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     await page.goto("/");
     await waitForApp(page);
 
-    const visiblePill = page.locator(VISIBLE_PILL);
+    const visiblePill = visibleConnectionPill(page);
     await expect(visiblePill).toHaveCount(1);
     await expectCoherentState(visiblePill);
   });
@@ -193,7 +190,7 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
       timeout: 5_000,
     });
 
-    await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(visibleConnectionPill(page)).toHaveCount(1);
   });
 
   test("still exactly one indicator when a room IS selected", async ({
@@ -214,8 +211,8 @@ test.describe("Connection status indicator on desktop (Bug #5)", () => {
     // is selected — that was the Bug #5 root cause).
     await expect(page.locator(MEMBERS_RAIL)).toHaveCount(1);
 
-    await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
-    await expect(page.locator(ROOMS_RAIL).locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(visibleConnectionPill(page)).toHaveCount(1);
+    await expect(visibleConnectionPill(page.locator(ROOMS_RAIL))).toHaveCount(1);
     await expect(page.locator(MEMBERS_RAIL).locator(PILL)).toHaveCount(0);
   });
 });
@@ -249,18 +246,15 @@ test.describe("Connection status indicator on mobile (Bug #5)", () => {
     // A count of 2 would mean the rail wrapper failed to hide; a count of
     // 0 would mean the inline `md:hidden` copy is hidden at mobile width
     // too (the original Bug #5 on mobile).
-    await expect(page.locator(VISIBLE_PILL)).toHaveCount(1);
+    await expect(visibleConnectionPill(page)).toHaveCount(1);
     // Both placements still exist in the DOM.
     await expect(page.locator(PILL)).toHaveCount(2);
 
     // Confirm we're looking at the inline (not left-rail) copy: it sits
     // inside the Welcome-screen heading's container, NOT the Rooms rail.
-    const inWelcomeScreen = page
-      .locator("h1", { hasText: "Welcome to River" })
-      .locator("..")
-      .locator(VISIBLE_PILL);
-    await expect(inWelcomeScreen).toHaveCount(1);
-    await expect(page.locator(ROOMS_RAIL).locator(VISIBLE_PILL)).toHaveCount(0);
+    const welcomeScreen = page.locator("h1", { hasText: "Welcome to River" }).locator("..");
+    await expect(visibleConnectionPill(welcomeScreen)).toHaveCount(1);
+    await expect(visibleConnectionPill(page.locator(ROOMS_RAIL))).toHaveCount(0);
   });
 
   test("the mobile indicator renders a real connection state", async ({
@@ -275,7 +269,7 @@ test.describe("Connection status indicator on mobile (Bug #5)", () => {
       timeout: 5_000,
     });
 
-    const visiblePill = page.locator(VISIBLE_PILL);
+    const visiblePill = visibleConnectionPill(page);
     await expect(visiblePill).toHaveCount(1);
     await expectCoherentState(visiblePill);
   });

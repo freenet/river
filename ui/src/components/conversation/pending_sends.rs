@@ -83,7 +83,7 @@ pub(super) fn PendingSends(room: VerifyingKey, author: VerifyingKey) -> Element 
                                                 "data-testid": "pending-message-status",
                                                 role: "status",
                                                 class: "text-xs text-text-muted",
-                                                "Sending…"
+                                                "Sending"
                                             }
                                         }
                                     }

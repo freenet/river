@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { visibleConnectionPill, waitForApp } from "./example-room";
 import { callRiverTest, RoomsLoadState } from "./river-test";
 
 // Regression coverage for freenet/river#509.
@@ -54,12 +54,14 @@ for (const { label, viewport, isMobile } of [
       // mode violation rather than a signal.
       const loading = page.getByTestId("conversation-rooms-loading");
       await expect(loading).toBeVisible({ timeout: 5_000 });
-      await expect(loading.getByText("Loading your rooms…")).toBeVisible();
+      await expect(loading.getByText("Loading your rooms", { exact: true })).toBeVisible();
 
       // The two surfaces read one shared state, so the rail must agree. This
       // is also the first browser coverage #397's rail states have ever had —
       // their absence is why #509 went unnoticed.
       await expect(page.getByTestId("room-list-loading")).toHaveCount(1);
+      await expect(loading.getByTestId("conversation-rooms-loading-dots")).toBeVisible();
+      await expect(page.getByTestId("room-list-loading-dots")).toHaveCount(1);
 
       // The bug: the false-empty invitation to create a room.
       await expect(page.getByText(WELCOME)).toHaveCount(0);
@@ -75,9 +77,7 @@ for (const { label, viewport, isMobile } of [
       // matches, because below 768px the rail is `display:none` and its pill
       // is in the DOM either way.
       if (isMobile) {
-        await expect(
-          page.locator('[data-testid="connection-status-indicator"]:visible')
-        ).toHaveCount(1);
+        await expect(visibleConnectionPill(page)).toHaveCount(1);
       }
 
       // …and so must the #159 quickstart invite link: a brand-new user has no
@@ -98,8 +98,10 @@ for (const { label, viewport, isMobile } of [
 
       const migrating = page.getByTestId("conversation-rooms-migrating");
       await expect(migrating).toBeVisible({ timeout: 5_000 });
-      await expect(migrating.getByText("Migrating your rooms…")).toBeVisible();
+      await expect(migrating.getByText("Migrating your rooms", { exact: true })).toBeVisible();
       await expect(page.getByTestId("room-list-migrating")).toHaveCount(1);
+      await expect(migrating.getByTestId("conversation-rooms-migrating-dots")).toBeVisible();
+      await expect(page.getByTestId("room-list-migrating-dots")).toHaveCount(1);
       await expect(page.getByText(WELCOME)).toHaveCount(0);
     });
 
@@ -125,9 +127,7 @@ for (const { label, viewport, isMobile } of [
       // "Check your connection and try again" is only actionable if the
       // connection status is on the same screen.
       if (isMobile) {
-        await expect(
-          page.locator('[data-testid="connection-status-indicator"]:visible')
-        ).toHaveCount(1);
+        await expect(visibleConnectionPill(page)).toHaveCount(1);
       }
     });
 

@@ -18,7 +18,7 @@ async function send(page: Page, text: string) {
 }
 
 // Footer actions (React, Reply, Edit, Delete) act on a signed message. A
-// row still being signed keeps "Sending…", a failed one Retry and Discard,
+// row still being signed keeps "Sending", a failed one Retry and Discard,
 // and neither has a footer; once signed, the one message has its footer.
 const FOOTER = ['[data-testid="message-footer"]', ...FOOTER_CONTROLS.map((id) => `[data-testid="${id}"]`)].join(", ");
 
@@ -30,7 +30,7 @@ test("a sent message shows at once, pending, and commits once when signed", asyn
   const row = pending(page).filter({ hasText: "pending until signed" });
   await expect(row).toBeVisible();
   await expect(row).toHaveAttribute("data-pending-state", "sending");
-  await expect(row.getByTestId("pending-message-status")).toHaveText("Sending…");
+  await expect(row.getByTestId("pending-message-status")).toHaveText("Sending");
   await expect(row, "the pending row is in view").toBeInViewport();
   await expect(row.locator(FOOTER), "no footer while unsigned").toHaveCount(0);
 

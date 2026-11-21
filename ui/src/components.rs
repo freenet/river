@@ -1,10 +1,12 @@
 pub mod app;
 pub mod back_to_chat;
+pub(crate) mod connection_activity;
 pub mod conversation;
 pub mod direct_messages;
 pub mod foreground;
 pub(crate) mod icons;
 pub mod invite_click_interceptor;
+pub(crate) mod loading_dots;
 pub mod members;
 pub mod mention_click_interceptor;
 pub mod room_list;

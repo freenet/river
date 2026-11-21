@@ -44,6 +44,15 @@ type RiverTestHooks = {
   setRoomsLoadStateKeepingRooms(state: RoomsLoadState): void;
   // A journaled walk that may still bring rooms back starts (true) or ends (false).
   setWalkRestoringRooms(on: boolean): void;
+  // begin_load_attempt plus an outstanding current-delegate list.
+  beginListedLoad(): void;
+  // on_current_list_refused with LIST_REFUSED_MARKER. No-op unless the list is outstanding.
+  refuseOutstandingList(): void;
+  // Answers the outstanding list with only rooms_data; the blob read then fails (no node).
+  deliverStoredRoomsBlobListing(): void;
+  // Production room setup. false lists first; true is Retry (register first).
+  // This build has no node, so the outgoing send fails.
+  reloadRooms(registerFirst: boolean): void;
   // The held load worker settles; the load state is left as it is.
   releaseHeldLoadWorker(): void;
   switchRoom(name: string): void;
@@ -75,6 +84,8 @@ type RiverTestHooks = {
   setSyncStatus(status: SyncStatus): void;
   // A connection error report with one of the report labels.
   setSyncErrorReport(label: ReportLabel, summary: string, detail: string): void;
+  // The current room as a placeholder subscribing to receive its signed state.
+  showRoomInitialSync(): void;
   // The current room as a placeholder awaiting its initial sync that ended in this error.
   // With failBannerRead, the room banner's first read of it fails as a contended read does.
   showRoomSyncError(label: ReportLabel, summary: string, detail: string, failBannerRead: boolean): void;
@@ -89,7 +100,7 @@ type ReportLabel =
   | "Disconnected"
   | "Invalid operation"
   | "Unexpected message"
-  | "Refreshing..."
+  | "Refreshing"
   | "Room not found"
   | "Room is full";
 

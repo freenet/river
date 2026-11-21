@@ -1,6 +1,10 @@
 import { CDPSession, expect, Locator, Page, test } from "@playwright/test";
 import { callRiverTest } from "./river-test";
 
+export function visibleConnectionPill(scope: Page | Locator): Locator {
+  return scope.locator('[data-testid="connection-status-indicator"]:visible');
+}
+
 export async function waitForApp(page: Page) {
   await page.waitForSelector(".app-root", { timeout: 30_000 });
   await expect(page.locator("aside, .app-root button")).not.toHaveCount(0);

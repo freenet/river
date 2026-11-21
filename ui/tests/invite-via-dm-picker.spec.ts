@@ -78,6 +78,8 @@ async function pickFirstCandidate(page: Page): Promise<string> {
   return name!;
 }
 
+const sendButton = (page: Page) => page.getByRole("button", { name: /^send invite$/i });
+
 test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -95,9 +97,9 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await expect(textarea).toBeVisible();
 
     // The Send button starts disabled until a room is picked.
-    const sendButton = page.getByRole("button", { name: /^send invite$/i });
-    await expect(sendButton).toBeVisible();
-    await expect(sendButton).toBeDisabled();
+    const send = sendButton(page);
+    await expect(send).toBeVisible();
+    await expect(send).toBeDisabled();
 
     // Selecting a candidate row enables the Send button. Candidate rows
     // carry aria-pressed; before selection none are pressed.
@@ -108,7 +110,7 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
 
     await candidateRow.click();
     await expect(candidateRow).toHaveAttribute("aria-pressed", "true");
-    await expect(sendButton).toBeEnabled();
+    await expect(send).toBeEnabled();
 
     // Typing in the personal-message textarea is reflected.
     await textarea.fill("Want to join us?");
@@ -245,13 +247,68 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await openShareInvitePicker(page);
 
     const roomName = await pickFirstCandidate(page);
-    await page.getByRole("button", { name: /^send invite$/i }).click();
+    await sendButton(page).click();
 
     await expect(page.getByTestId("toast-message")).toHaveText(`Invitation to "${roomName}" sent`, {
       timeout: 15_000,
     });
     await expect(pickerHeading(page)).toHaveCount(0);
     await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+  });
+
+  test("rapid Send invite activations deliver one invitation", { tag: "@chromium-only" }, async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await openMemberInfoForFirstNonSelf(page);
+    await page.getByTestId("member-info-dm-button").click();
+    const cards = page.getByTestId("dm-sent-invite-card");
+    await expect(cards).toHaveCount(0);
+    await page.getByTestId("dm-thread-share-invite-button").click();
+    const roomName = await pickFirstCandidate(page);
+    await callRiverTest(page, "holdInviteSends");
+
+    const send = sendButton(page);
+    await expect(send).toBeEnabled();
+    // Both activations reach the live button before its deferred disabled
+    // render. Playwright's ordinary second click would wait for re-enablement.
+    await send.evaluate((button: HTMLButtonElement) => {
+      button.click();
+      button.click();
+    });
+    await expect(send).toBeDisabled();
+    const footer = send.locator("..");
+    await expect(footer).toHaveText("Send invite");
+    await expect(footer.locator(".animate-spin")).toHaveCount(0);
+
+    await callRiverTest(page, "releaseInviteSends");
+    await expect(page.getByTestId("toast-message")).toHaveText(`Invitation to "${roomName}" sent`, {
+      timeout: 15_000,
+    });
+    await expect(pickerHeading(page)).toHaveCount(0);
+    await expect(cards).toHaveCount(1);
+  });
+
+  test("a failed invite enables retry in the open picker", { tag: "@chromium-only" }, async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    // The example identity only observes this room and cannot send a DM in it.
+    await selectRoom(page, "Public Discussion Room");
+    await nonSelfMemberRows(page).first().click();
+    await openShareInvitePicker(page);
+    await pickFirstCandidate(page);
+    const send = sendButton(page);
+    await send.click();
+    const error = page.getByText(/not currently in this room's member list/);
+    await expect(error).toBeVisible();
+    await expect(send).toBeEnabled();
+
+    await callRiverTest(page, "holdInviteSends");
+    await send.click();
+    await expect(send).toBeDisabled();
+    await expect(error).toHaveCount(0);
+    await callRiverTest(page, "releaseInviteSends");
+    await expect(error).toBeVisible();
+    await expect(send).toBeEnabled();
   });
 
   // A send still running when the picker's watchdog gives up used to complete
@@ -268,8 +325,8 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await openShareInvitePicker(page);
 
     const roomName = await pickFirstCandidate(page);
-    await page.getByRole("button", { name: /^send invite$/i }).click();
-    await expect(page.getByText("Sending invite…")).toBeVisible();
+    await sendButton(page).click();
+    await expect(sendButton(page)).toBeDisabled();
 
     // The watchdog closes the picker, saying nothing.
     await expect(pickerHeading(page)).toHaveCount(0, { timeout: 5_000 });
@@ -310,9 +367,7 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
       .first();
     await firstCandidate.click();
     await expect(firstCandidate).toHaveAttribute("aria-pressed", "true");
-    await expect(
-      page.getByRole("button", { name: /^send invite$/i }),
-    ).toBeEnabled();
+    await expect(sendButton(page)).toBeEnabled();
     await closePickerAndMemberInfo(page);
 
     // Second session: reopen for a different member. No candidate row
@@ -321,8 +376,6 @@ test.describe("Invite-via-DM picker (structured-Invite variant)", () => {
     await expect(
       page.locator('button[aria-label^="Select room"][aria-pressed="true"]'),
     ).toHaveCount(0);
-    await expect(
-      page.getByRole("button", { name: /^send invite$/i }),
-    ).toBeDisabled();
+    await expect(sendButton(page)).toBeDisabled();
   });
 });
