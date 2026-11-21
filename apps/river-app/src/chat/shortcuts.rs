@@ -53,6 +53,7 @@ pub const COMPOSER: &str = "Writing a message";
 pub const SHORTCUTS: &[Shortcut] = &[
     s(GENERAL, "Mod+K", "Jump to a room or member", &['k']),
     s(GENERAL, "Mod+F", "Search the messages in this room", &['f']),
+    s(GENERAL, "Mod+,", "Open the settings", &[',']),
     s(GENERAL, "Mod+/", "Show this list of shortcuts", &['/']),
     s(
         GENERAL,
@@ -199,6 +200,10 @@ impl Chat {
         }
         if is_chord(ev) {
             self.open_shortcuts();
+            return true;
+        }
+        if super::settings::is_chord(ev) {
+            self.open_settings();
             return true;
         }
         false

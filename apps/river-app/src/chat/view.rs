@@ -59,8 +59,9 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     super::dm_purge::confirm_dialog(chat, &k, &mut layer);
     super::dm_picker::dialog(chat, &k, &mut layer);
     super::node_ui::node_dialog(chat, &k, &mut layer);
-    if chat.update.settings_open {
-        super::update_view::settings_dialog(&chat.update, &k, &mut layer);
+    {
+        let win_h = cx.layout_with("chat", |r| r[3]).unwrap_or(800.0);
+        super::settings::dialog(chat, narrow, win_h, &k, &mut layer);
     }
     super::switcher::switcher_dialog(chat, &k, &mut layer);
     super::overview::overview_dialog(chat, &k, &mut layer);
@@ -423,10 +424,15 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         .child(spacer())
         .child(
             icon_button("settings", "Settings", &icons::GEAR, p)
-                .help("Settings")
+                .help(format!(
+                    "Settings ({})",
+                    super::shortcuts::shown("Mod+,", cfg!(target_os = "macos"))
+                ))
                 .hover(p.surface_hover)
                 .cursor(rune::Cursor::Pointer)
-                .on_press(|s: &mut RiverApp| s.chat.update.settings_open = true),
+                .on_press(|s: &mut RiverApp| {
+                    s.chat.open_settings();
+                }),
         );
     let heading = row()
         .pl(18.0)

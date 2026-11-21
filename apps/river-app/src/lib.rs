@@ -1499,7 +1499,7 @@ pub const SCENES: &[Scene] = &[
     ("chat-settings", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
     }),
     ("chat-settings-ready", |s| {
         connect(s);
@@ -1510,7 +1510,7 @@ pub const SCENES: &[Scene] = &[
                 version: "0.2.0".into(),
             },
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
         s.chat.update.node_note =
             Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
     }),
@@ -1520,7 +1520,7 @@ pub const SCENES: &[Scene] = &[
         s.chat.update.support = UpdateSupport::External(
             "River was installed by your package manager, which updates it.".into(),
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
     }),
     ("chat-settings-update-failed", |s| {
         connect(s);
@@ -1529,7 +1529,40 @@ pub const SCENES: &[Scene] = &[
             true,
             UpdateStatus::Failed("the update manifest's signature is not valid".into()),
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
+    }),
+    ("settings-updates", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("settings-connection", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
+        s.chat.settings.open_at(chat::settings::Section::Connection);
+    }),
+    ("settings-connection-remote", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        use_node(s, "192.168.1.20:7509");
+        s.chat.settings.open_at(chat::settings::Section::Connection);
+    }),
+    ("settings-updates-narrow", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("settings-connection-narrow", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.settings.open_at(chat::settings::Section::Connection);
+    }),
+    ("settings-list-narrow", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.settings.open();
     }),
     ("chat-members-hidden", |s| {
         connect(s);
@@ -4900,6 +4933,7 @@ mod tests {
         assert!(rt.find("node-status-dialog").is_none());
         // From Settings.
         press(&mut rt, "settings");
+        press(&mut rt, "settings-section-connection");
         press(&mut rt, "settings-node-status");
         assert!(rt.find("node-status-dialog").is_some());
         assert!(rt.find("settings-dialog").is_none());

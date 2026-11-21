@@ -28,6 +28,12 @@ The window opens at 1280x800 and shrinks to 640x480. Every screen, setup include
 
 Linux builds need `libxkbcommon-dev` and `libwayland-dev`. At run time Rune also `dlopen`s `libfontconfig.so.1` for system fonts (`libfontconfig1`; no build package needed): without it the app starts and draws (checked by hiding the library in a mount namespace), with fewer fallback fonts. The Linux tarball README names it. Headless renders without a GPU need a software Vulkan driver: install `mesa-vulkan-drivers` and point `VK_ICD_FILENAMES` at its `lvp_icd*.json`.
 
+## Settings
+
+One dialog, opened by the gear in the room list header or Ctrl+, (Cmd+, on a Mac): `apps/river-app/src/chat/settings.rs`. A list of sections on the left and the open section on the right; below `NARROW_WIDTH` the list is its own screen and a section opens with a Back button. A section is an entry in `Section::ALL` plus an arm in `section_content`, and exists only when it has content. Today: Updates (`update_view::updates_section`) and Connection (`connection_section` in `settings.rs`). The last section shown is not saved. Every control in Settings acts at once, so the dialog has no Save or Close button; keep element keys (`settings-section-*`, `settings-auto`, `settings-node-*`) stable, the tests and `fresh_node_e2e.sh` find them. The status pill ("Node status") and the node entry under it stay where they were. Do not disturb, Background and startup, Export and Import ID, zoom and shortcuts are still outside Settings.
+
+Linux Ctrl+Right/Ctrl+Delete follow Rune's word rule (start of the next word); an end-of-word override was tried (river#957, closed): it cannot scroll the caret into view nor match Rune's undo records from outside Rune; revisit when Rune has a forward-word-rule setting.
+
 ## How river-app reads rooms
 
 Once setup connects, `src/rooms/` reads the user's rooms from the local node:

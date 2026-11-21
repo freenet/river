@@ -287,8 +287,6 @@ pub struct UpdateUi {
     pub version: String,
     /// Download and prepare updates by themselves.
     pub auto: bool,
-    /// The settings dialog is open.
-    pub settings_open: bool,
     /// A rollback or a node change worth telling the person, in the settings and as a note.
     pub notice: Option<String>,
     /// The Freenet node's version, and whether it changed while River was open.
@@ -317,7 +315,6 @@ impl Default for UpdateUi {
             support: UpdateSupport::Unavailable("River can't update itself here.".into()),
             version: env!("CARGO_PKG_VERSION").into(),
             auto: true,
-            settings_open: false,
             notice: None,
             node_version: None,
             node_note: None,
@@ -919,9 +916,14 @@ mod tests {
         assert!(rt.find("settings-body").is_none());
         press(&mut rt, "settings");
         assert!(shows(&rt, "River 0.1.0"));
-        assert!(shows(&rt, "Freenet 0.2.160"));
         assert!(shows(&rt, "River is up to date"));
+        // Freenet's version is in the Connection section.
+        assert!(!shows(&rt, "Freenet updates itself"));
+        press(&mut rt, "settings-section-connection");
+        assert!(shows(&rt, "Freenet version"));
+        assert!(shows(&rt, "0.2.160"));
         assert!(shows(&rt, "Freenet updates itself"));
+        press(&mut rt, "settings-section-updates");
         assert!(rt.state.chat.update.auto, "on by default");
 
         press(&mut rt, "settings-auto");
@@ -952,7 +954,7 @@ mod tests {
         s.chat.update.support = UpdateSupport::External(
             "River is installed with Flatpak. Update it with `flatpak update`.".into(),
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
         let mut rt = render(s);
         assert!(shows(&rt, "flatpak update"));
         let before = rt.state.chat.update.auto;
@@ -967,15 +969,16 @@ mod tests {
     #[test]
     fn the_settings_explain_an_update_failure_and_a_node_that_updated() {
         let mut s = connected();
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
         s.chat.update.status = UpdateStatus::Failed("the update manifest has expired".into());
         s.chat.update.node_note =
             Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
-        let rt = render(s);
+        let mut rt = render(s);
         assert!(shows(
             &rt,
             "Couldn't update: the update manifest has expired"
         ));
+        press(&mut rt, "settings-section-connection");
         assert!(shows(&rt, "Freenet updated itself from 0.2.158 to 0.2.160"));
     }
 
