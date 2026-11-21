@@ -240,8 +240,6 @@ impl Chat {
             || self.node.form.is_some()
             || self.settings.open
             || self.status.open
-            || self.background.as_ref().is_some_and(|b| b.open)
-            || self.dnd.open
             || self.overview
             || self.shortcuts_open
     }

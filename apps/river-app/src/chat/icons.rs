@@ -136,13 +136,6 @@ pub static CHEVRON_RIGHT: Icon = Icon {
     body: r#"<path d="M6 3.5 10.5 8 6 12.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-/// A window with its corner tucked behind it, for "Background and startup" (a 24 point grid).
-pub static BACKGROUND: Icon = Icon {
-    name: "river-background",
-    view: 24.0,
-    body: r#"<rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M3 10h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>"#,
-};
-
 /// A crescent moon, for "Do not disturb" (a 16 point grid).
 pub static MOON: Icon = Icon {
     name: "river-moon",

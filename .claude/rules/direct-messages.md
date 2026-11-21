@@ -339,7 +339,7 @@ plaintext in the chat delegate.
   first successful merge of any network state, which can be a node's older copy, so a later
   fresher state can bring messages the user never saw here; the age bound limits their
   notifications to the last hour.
-  **Privacy.** With the `notification_previews` preference off (its default; no switch exists yet)
+  **Privacy.** With the `notification_previews` preference off (its default; the switch is Settings > Notifications > "Show the sender and text in notifications")
   the limiter's `notify::Arrival` and every `Notification` built from it hold no sender, no text
   and no room name: title `River`, body `New direct message` (`N new direct messages` for
   several), no Reply button or reply field (the sender is hidden; click and Mark as read stay).

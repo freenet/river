@@ -16,6 +16,49 @@ fn connected() -> RiverApp {
     s
 }
 
+/// A shell with a tray (or without), for the Background and startup section.
+struct Shell {
+    tray: bool,
+    close_to_tray: std::sync::Mutex<bool>,
+    login: std::sync::Mutex<bool>,
+}
+
+impl super::BackgroundHost for Shell {
+    fn tray_available(&self) -> bool {
+        self.tray
+    }
+    fn close_to_tray(&self) -> bool {
+        *self.close_to_tray.lock().unwrap()
+    }
+    fn set_close_to_tray(&self, on: bool) -> Result<(), String> {
+        *self.close_to_tray.lock().unwrap() = on;
+        Ok(())
+    }
+    fn start_at_login(&self) -> bool {
+        *self.login.lock().unwrap()
+    }
+    fn set_start_at_login(&self, on: bool) -> Result<(), String> {
+        *self.login.lock().unwrap() = on;
+        Ok(())
+    }
+}
+
+fn shell(tray: bool) -> std::sync::Arc<Shell> {
+    std::sync::Arc::new(Shell {
+        tray,
+        close_to_tray: std::sync::Mutex::new(true),
+        login: std::sync::Mutex::new(false),
+    })
+}
+
+/// A connected app whose shell offers Background and startup.
+fn with_shell(tray: bool) -> (RiverApp, std::sync::Arc<Shell>) {
+    let mut s = connected();
+    let host = shell(tray);
+    s.chat.background = Some(super::BackgroundUi::new(host.clone()));
+    (s, host)
+}
+
 fn render(state: RiverApp, size: (f32, f32)) -> Runtime<RiverApp> {
     let env = Env {
         system_dark: true,
@@ -97,9 +140,11 @@ fn the_gear_opens_settings_and_the_x_closes_it() {
 }
 
 #[test]
-fn escape_closes_settings_from_either_section() {
+fn escape_closes_settings_from_every_section() {
     for section in Section::ALL {
-        let mut rt = open(WINDOW_SIZE);
+        let (s, _) = with_shell(true);
+        let mut rt = render(s, WINDOW_SIZE);
+        press(&mut rt, "settings");
         press(&mut rt, &format!("settings-section-{}", section.id()));
         assert!(is_open(&rt));
         key(&mut rt, Key::Escape);
@@ -135,7 +180,7 @@ fn pressing_a_section_shows_it_and_only_it() {
 #[test]
 fn every_section_has_content_and_a_name() {
     for section in Section::ALL {
-        let mut s = connected();
+        let (mut s, _) = with_shell(true);
         s.chat.settings.open_at(*section);
         let rt = render(s, WINDOW_SIZE);
         let name = rt
@@ -166,12 +211,20 @@ fn every_section_has_content_and_a_name() {
 fn the_arrow_keys_choose_sections_and_move_the_keyboard_with_them() {
     let mut rt = open(WINDOW_SIZE);
     key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.settings.section, Section::Notifications);
+    assert_eq!(
+        focused(&rt).as_deref(),
+        Some("settings-section-notifications")
+    );
+    assert!(rt.find("dnd-switch").is_some());
+    // Without a shell there is no Background section to step onto.
+    key(&mut rt, Key::Down);
     assert_eq!(rt.state.chat.settings.section, Section::Connection);
-    assert_eq!(focused(&rt).as_deref(), Some("settings-section-connection"));
     assert!(rt.find("settings-node-change").is_some());
     // The list stops at its end.
     key(&mut rt, Key::Down);
     assert_eq!(rt.state.chat.settings.section, Section::Connection);
+    key(&mut rt, Key::Up);
     key(&mut rt, Key::Up);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     assert_eq!(focused(&rt).as_deref(), Some("settings-section-updates"));
@@ -536,7 +589,10 @@ fn space_presses_the_switch_and_enter_or_space_opens_a_narrow_section() {
         let mut rt = open(NARROW_SCENE_SIZE);
         assert_eq!(focused(&rt).as_deref(), Some("settings-section-updates"));
         key(&mut rt, Key::Down);
-        assert_eq!(focused(&rt).as_deref(), Some("settings-section-connection"));
+        assert_eq!(
+            focused(&rt).as_deref(),
+            Some("settings-section-notifications")
+        );
         assert!(
             rt.find("settings-pane").is_none(),
             "arrows only move focus here"
@@ -546,7 +602,7 @@ fn space_presses_the_switch_and_enter_or_space_opens_a_narrow_section() {
             rt.find("settings-pane").is_some(),
             "{open_key:?} opens the section"
         );
-        assert_eq!(rt.state.chat.settings.section, Section::Connection);
+        assert_eq!(rt.state.chat.settings.section, Section::Notifications);
     }
 }
 
@@ -584,4 +640,489 @@ fn resizing_across_the_narrow_width_keeps_the_section_and_the_keyboard() {
     );
     key(&mut rt, Key::Escape);
     assert!(!is_open(&rt));
+}
+
+fn find(rt: &Runtime<RiverApp>, key: &str) -> rune::ElementInfo {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no element {key}"))
+}
+
+fn state_line(rt: &Runtime<RiverApp>) -> String {
+    find(rt, "dnd-state").text.expect("the state line")
+}
+
+fn notifications_at(minute: u16, manual: bool, schedule: Option<(u16, u16)>) -> RiverApp {
+    let mut s = connected();
+    s.chat.dnd.pinned = true;
+    s.chat.dnd.now = minute;
+    s.chat.dnd.settings.manual = manual;
+    s.chat.dnd.settings.schedule = schedule.map(|(start, end)| super::DndSchedule { start, end });
+    s.chat.settings.open_at(Section::Notifications);
+    s.chat.track_settings_sections();
+    s
+}
+
+#[test]
+fn the_state_line_on_screen_is_true_for_off_switch_schedule_and_both() {
+    let night = Some((22 * 60, 7 * 60));
+    let cases = [
+        (12 * 60, false, None, "Do not disturb is off."),
+        (
+            12 * 60,
+            true,
+            None,
+            "Do not disturb is on until you turn it off.",
+        ),
+        (
+            23 * 60,
+            false,
+            night,
+            "Do not disturb is on until 07:00 (your daily schedule).",
+        ),
+        (
+            12 * 60,
+            false,
+            night,
+            "Do not disturb is off. Your daily schedule turns it on at 22:00.",
+        ),
+    ];
+    for size in [WINDOW_SIZE, NARROW_SCENE_SIZE] {
+        for (minute, manual, schedule, line) in cases {
+            let rt = render(notifications_at(minute, manual, schedule), size);
+            assert_eq!(state_line(&rt), line, "{size:?}");
+            // The switch says what the switch is: the schedule being on never reads as the
+            // switch being off in the same breath, because the line comes first and says so.
+            let sw = find(&rt, "dnd-switch");
+            assert_eq!(sw.role, "switch");
+            // The room list's row agrees with the line.
+            let row = find(&rt, "dnd-text");
+            let on = line.contains("is on");
+            assert_eq!(
+                row.text.as_deref(),
+                Some(if on {
+                    "Do not disturb: on"
+                } else {
+                    "Do not disturb: off"
+                }),
+                "{line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_state_line_changes_when_the_schedule_ends_while_the_section_is_open() {
+    let mut rt = render(
+        notifications_at(16 * 60 + 59, false, Some((9 * 60, 17 * 60))),
+        WINDOW_SIZE,
+    );
+    assert!(state_line(&rt).contains("until 17:00"));
+    rt.update(|s, _| s.chat.dnd.now = 17 * 60);
+    settle(&mut rt);
+    assert_eq!(
+        state_line(&rt),
+        "Do not disturb is off. Your daily schedule turns it on at 09:00."
+    );
+    assert_eq!(
+        find(&rt, "dnd-text").text.as_deref(),
+        Some("Do not disturb: off")
+    );
+}
+
+#[test]
+fn the_notifications_controls_work_and_keep_their_keys() {
+    let mut rt = render(notifications_at(12 * 60, false, None), WINDOW_SIZE);
+    for key in [
+        "dnd-switch",
+        "dnd-schedule",
+        "dnd-mentions",
+        "settings-previews",
+    ] {
+        assert_eq!(find(&rt, key).role, "switch", "{key}");
+    }
+    assert!(rt.find("dnd-start").is_none(), "times only with a schedule");
+    press(&mut rt, "dnd-switch");
+    assert!(rt.state.chat.dnd.settings.manual);
+    assert_eq!(
+        state_line(&rt),
+        "Do not disturb is on until you turn it off."
+    );
+    press(&mut rt, "dnd-schedule");
+    assert!(rt.find("dnd-start").is_some() && rt.find("dnd-end").is_some());
+    assert_eq!(
+        rt.state.chat.dnd.start.text, "22:00",
+        "the default schedule is offered"
+    );
+    press(&mut rt, "dnd-mentions");
+    assert!(rt.state.chat.dnd.settings.allow_mentions);
+    // Each change is queued to be saved once.
+    assert!(rt.state.chat.dnd.take_dirty().is_some());
+}
+
+#[test]
+fn the_previews_switch_is_off_by_default_explains_itself_and_is_saved_once() {
+    let mut rt = render(notifications_at(12 * 60, false, None), WINDOW_SIZE);
+    assert!(!rt.state.chat.private_previews, "private by default");
+    let sw = find(&rt, "settings-previews");
+    assert_eq!(
+        sw.label.as_deref(),
+        Some("Show the sender and text in notifications")
+    );
+    assert!(shows(&rt, "Off by default"));
+    assert!(rt.state.chat.take_previews_dirty().is_none());
+    press(&mut rt, "settings-previews");
+    assert!(rt.state.chat.private_previews);
+    assert_eq!(rt.state.chat.take_previews_dirty(), Some(true));
+    assert_eq!(rt.state.chat.take_previews_dirty(), None);
+    press(&mut rt, "settings-previews");
+    assert_eq!(rt.state.chat.take_previews_dirty(), Some(false));
+}
+
+/// The preference keeps the key and the plain true/false format it had when it had no switch.
+#[test]
+fn the_previews_preference_keeps_its_key_and_format() {
+    assert_eq!(crate::chat::PREVIEWS_PREF, "notification_previews");
+    let dir = std::env::temp_dir().join(format!("river-previews-test-{}", std::process::id()));
+    let path = dir.join("prefs.json");
+    rune::prefs::Prefs::at(&path)
+        .set(crate::chat::PREVIEWS_PREF, &true)
+        .unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let back: bool = rune::prefs::Prefs::at(&path)
+        .get(crate::chat::PREVIEWS_PREF)
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(back);
+    assert!(raw.contains("\"notification_previews\""), "{raw}");
+}
+
+#[test]
+fn the_notifications_section_points_to_the_rooms_bell_and_has_no_global_switch() {
+    let rt = render(notifications_at(12 * 60, false, None), WINDOW_SIZE);
+    assert!(shows(&rt, "set from the bell in that room's header"));
+    // Three switches for do not disturb, one for previews and the room list's quick row:
+    // nothing that turns every notification on or off as a whole.
+    let switches = rt
+        .elements()
+        .into_iter()
+        .filter(|e| e.role == "switch")
+        .count();
+    assert_eq!(switches, 5);
+}
+
+#[test]
+fn space_and_tab_work_the_notification_switches() {
+    let mut rt = render(notifications_at(12 * 60, false, None), WINDOW_SIZE);
+    assert_eq!(
+        focused(&rt).as_deref(),
+        Some("settings-section-notifications")
+    );
+    key(&mut rt, Key::Tab);
+    assert_eq!(focused(&rt).as_deref(), Some("dnd-switch"));
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(rt.state.chat.dnd.settings.manual);
+    key(&mut rt, Key::Tab);
+    assert_eq!(focused(&rt).as_deref(), Some("dnd-schedule"));
+    key(&mut rt, Key::Escape);
+    assert!(!is_open(&rt));
+}
+
+#[test]
+fn the_notifications_section_in_a_narrow_window() {
+    let mut rt = open(NARROW_SCENE_SIZE);
+    press(&mut rt, "settings-section-notifications");
+    assert!(rt.find("dnd-state").is_some());
+    assert!(rt.find("settings-previews").is_some());
+    press(&mut rt, "settings-back");
+    assert!(rt.find("dnd-state").is_none());
+    // Typed schedule times are kept when going back.
+    press(&mut rt, "settings-section-notifications");
+    press(&mut rt, "dnd-schedule");
+    rt.update(|s, _| {
+        s.chat.dnd.start.replace_text("21:15");
+        s.chat.dnd.sync_inputs();
+    });
+    press(&mut rt, "settings-back");
+    rt.update(|s, _| {
+        s.chat.select_settings_section(Section::Connection);
+    });
+    settle(&mut rt);
+    assert_eq!(
+        rt.state.chat.dnd.settings.schedule.unwrap().start,
+        21 * 60 + 15
+    );
+}
+
+#[test]
+fn the_room_lists_row_toggles_and_a_schedule_sends_you_to_settings() {
+    let mut rt = render(notifications_at(12 * 60, false, None), WINDOW_SIZE);
+    press(&mut rt, "close");
+    press(&mut rt, "dnd");
+    assert!(rt.state.chat.dnd.settings.manual && !is_open(&rt));
+    press(&mut rt, "dnd");
+    assert!(!rt.state.chat.dnd.settings.manual && !is_open(&rt));
+    // On because of the schedule: the row opens the section that can change it.
+    rt.update(|s, _| {
+        s.chat.dnd.settings.schedule = Some(super::DndSchedule {
+            start: 22 * 60,
+            end: 7 * 60,
+        });
+        s.chat.dnd.now = 23 * 60;
+    });
+    settle(&mut rt);
+    assert_eq!(
+        find(&rt, "dnd-text").text.as_deref(),
+        Some("Do not disturb: on")
+    );
+    press(&mut rt, "dnd");
+    assert!(is_open(&rt));
+    assert_eq!(rt.state.chat.settings.section, Section::Notifications);
+    assert!(
+        !rt.state.chat.dnd.settings.manual,
+        "the switch is left as it was"
+    );
+}
+
+#[test]
+fn background_and_startup_is_listed_only_where_the_shell_offers_it() {
+    let rt = open(WINDOW_SIZE);
+    assert!(rt.find("settings-section-background").is_none());
+    let (s, _) = with_shell(true);
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings");
+    assert!(rt.find("settings-section-background").is_some());
+    assert_eq!(
+        find(&rt, "settings-section-background").label.as_deref(),
+        Some("Background and startup")
+    );
+    // The footer button for it is gone.
+    assert!(rt.find("background").is_none());
+}
+
+#[test]
+fn the_background_switches_reach_the_shell_and_quit_is_set_apart_as_danger() {
+    let (s, host) = with_shell(true);
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-background");
+    assert_eq!(find(&rt, "background-close-to-tray").role, "switch");
+    press(&mut rt, "background-start-at-login");
+    press(&mut rt, "background-close-to-tray");
+    assert!(*host.login.lock().unwrap());
+    assert!(!*host.close_to_tray.lock().unwrap());
+    // The hint names the platform's own chord (Cmd+Q on a Mac), the one `app_key` binds as
+    // `Mod+Q` through `is_command('q')`.
+    let chord = if cfg!(target_os = "macos") {
+        "Cmd+Q"
+    } else {
+        "Ctrl+Q"
+    };
+    assert_eq!(
+        super::shortcuts::shown("Mod+Q", cfg!(target_os = "macos")),
+        chord
+    );
+    assert!(shows(&rt, chord));
+    // Quit River is below every switch and no switch is its neighbour.
+    let quit_y = find(&rt, "background-quit").rect[1];
+    for k in ["background-close-to-tray", "background-start-at-login"] {
+        assert!(find(&rt, k).rect[1] < quit_y, "{k}");
+    }
+    let src = include_str!("background.rs");
+    assert!(src.contains("danger_outline_button_tx"), "styled as danger");
+    // Space reaches a switch from the keyboard.
+    let first = find(&rt, "background-close-to-tray");
+    assert_eq!(first.role, "switch");
+}
+
+#[test]
+fn without_a_tray_there_is_no_tray_control_and_closing_is_explained() {
+    let (s, host) = with_shell(false);
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-background");
+    assert!(rt.find("background-close-to-tray").is_none());
+    assert!(shows(&rt, "closing the window quits River"));
+    assert!(shows(&rt, "there is no tray"));
+    assert!(rt.find("background-quit").is_some(), "Quit stays reachable");
+    // Login still works without a tray.
+    press(&mut rt, "background-start-at-login");
+    assert!(*host.login.lock().unwrap());
+}
+
+#[test]
+fn the_background_section_in_a_narrow_window_and_reopening_reads_the_shell_again() {
+    let (s, host) = with_shell(true);
+    let mut rt = render(s, NARROW_SCENE_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-background");
+    assert!(rt.find("background-quit").is_some());
+    press(&mut rt, "close");
+    // The shell's answer changes behind the app's back (another instance, the OS).
+    *host.login.lock().unwrap() = true;
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-background");
+    assert!(rt.state.chat.background.as_ref().unwrap().start_at_login);
+}
+
+#[test]
+fn every_scene_of_these_sections_exists() {
+    let names: Vec<&str> = crate::SCENES.iter().map(|(n, _)| *n).collect();
+    for want in [
+        "chat-settings-notifications",
+        "chat-settings-notifications-narrow",
+        "chat-settings-background",
+        "chat-settings-background-narrow",
+        "chat-settings-background-no-tray",
+        "chat-settings-background-no-tray-narrow",
+        "chat-dnd-on",
+    ] {
+        assert!(names.contains(&want), "{want}");
+    }
+    for gone in ["chat-dnd", "chat-background", "chat-background-no-tray"] {
+        assert!(
+            !names.contains(&gone),
+            "{gone} is a dialog that no longer exists"
+        );
+    }
+}
+
+#[test]
+fn the_room_lists_row_is_a_named_switch_with_readable_off_text() {
+    let mut s = connected();
+    s.chat.dnd.pinned = true;
+    s.chat.dnd.now = 12 * 60;
+    let rt = render(s, WINDOW_SIZE);
+    let row = find(&rt, "dnd");
+    assert_eq!(row.role, "switch");
+    assert_eq!(row.label.as_deref(), Some("Do not disturb"));
+    assert!(row.focusable);
+    let p = super::style::palette();
+    assert_eq!(
+        find(&rt, "dnd-text").text_color,
+        Some(p.text_secondary),
+        "off text is at least the secondary ink"
+    );
+}
+
+/// Types something that is not a time into the schedule's From field of an open section.
+fn type_bad_time(rt: &mut Runtime<RiverApp>) {
+    rt.update(|s, _| {
+        s.chat.dnd.start.replace_text("late");
+        s.chat.dnd.sync_inputs();
+    });
+    settle(rt);
+    assert!(
+        rt.find("dnd-error").is_some(),
+        "the reason shows while typing"
+    );
+}
+
+fn schedule_night() -> RiverApp {
+    notifications_at(12 * 60, false, Some((22 * 60, 7 * 60)))
+}
+
+#[test]
+fn leaving_with_times_that_are_not_times_says_so_however_you_leave() {
+    for leave in ["section", "escape", "x"] {
+        let mut rt = render(schedule_night(), WINDOW_SIZE);
+        type_bad_time(&mut rt);
+        match leave {
+            "section" => {
+                press(&mut rt, "settings-section-connection");
+                assert!(is_open(&rt));
+                assert!(
+                    shows(&rt, "Do not disturb schedule not changed"),
+                    "said inside the dialog"
+                );
+                assert!(rt.find("settings-dnd-notice").is_some());
+                press(&mut rt, "close");
+            }
+            "escape" => key(&mut rt, Key::Escape),
+            _ => press(&mut rt, "close"),
+        }
+        assert!(!is_open(&rt), "{leave}");
+        // The room list says it, with a way to dismiss it.
+        assert!(rt.find("dnd-notice").is_some(), "{leave}");
+        assert_eq!(
+            find(&rt, "dnd-notice").text.as_deref(),
+            Some("Do not disturb schedule not changed: the times were not valid.")
+        );
+        assert_eq!(
+            rt.state.chat.dnd.settings.schedule.unwrap().start,
+            22 * 60,
+            "{leave}: the schedule in force is unchanged"
+        );
+        // Back in the section the invalid text and the error are still there.
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-notifications");
+        assert_eq!(rt.state.chat.dnd.start.text, "late", "{leave}");
+        assert!(rt.find("dnd-error").is_some(), "{leave}");
+        // Fixing it applies it and clears the notice.
+        rt.update(|s, _| {
+            s.chat.dnd.start.replace_text("21:30");
+            s.chat.dnd.sync_inputs();
+        });
+        settle(&mut rt);
+        assert!(rt.find("dnd-error").is_none(), "{leave}");
+        press(&mut rt, "close");
+        assert!(rt.find("dnd-notice").is_none(), "{leave}");
+        assert_eq!(
+            rt.state.chat.dnd.settings.schedule.unwrap().start,
+            21 * 60 + 30
+        );
+    }
+}
+
+#[test]
+fn the_dnd_notice_can_be_dismissed() {
+    let mut rt = render(schedule_night(), WINDOW_SIZE);
+    type_bad_time(&mut rt);
+    key(&mut rt, Key::Escape);
+    assert!(rt.find("dnd-notice").is_some());
+    press(&mut rt, "dnd-notice-dismiss");
+    assert!(rt.find("dnd-notice").is_none());
+    assert!(rt.state.chat.dnd.settings.schedule.is_some());
+}
+
+#[test]
+fn the_privacy_switch_is_in_view_at_the_default_size_and_tab_reveals_it_in_a_short_window() {
+    // Default window: every control of the section is visible without scrolling.
+    let mut s = notifications_at(12 * 60, false, Some((22 * 60, 7 * 60)));
+    s.chat.dnd.start.replace_text("22:00");
+    let rt = render(s, WINDOW_SIZE);
+    assert!(visible(&rt, "settings-previews"), "no scrolling needed");
+    // A short window scrolls; Tab to the last control brings it into view.
+    let mut rt = render(
+        notifications_at(12 * 60, false, Some((22 * 60, 7 * 60))),
+        (640.0, 480.0),
+    );
+    for _ in 0..12 {
+        if focused(&rt).as_deref() == Some("settings-previews") {
+            break;
+        }
+        key(&mut rt, Key::Tab);
+    }
+    assert_eq!(focused(&rt).as_deref(), Some("settings-previews"));
+    assert!(
+        visible(&rt, "settings-previews"),
+        "Tab scrolled the last control into view"
+    );
+}
+
+#[test]
+fn the_notifications_pane_has_a_scroll_bar_and_is_taller_in_a_tall_window() {
+    let rt = render(schedule_night(), WINDOW_SIZE);
+    let pane = find(&rt, "settings-pane");
+    assert!(
+        pane.rect[3] > 520.0,
+        "uses the window's height: {:?}",
+        pane.rect
+    );
+    let src = include_str!("settings.rs");
+    assert!(
+        src.matches(".scroll_bar(k)").count() >= 2,
+        "wide and narrow"
+    );
 }

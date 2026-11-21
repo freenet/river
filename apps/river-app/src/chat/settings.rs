@@ -4,26 +4,31 @@
 //! In a narrow window (the same width the rest of the app calls narrow, [`NARROW_WIDTH`]) the
 //! list is a screen of its own: pressing a section opens it, and Back returns to the list.
 //!
-//! Sections so far: **Updates** (River's own updates, [`super::update_view::updates_section`])
-//! and **Connection** (the Freenet node, [`connection_section`]). A section exists only when it
-//! has content. A new section is an entry in [`Section::ALL`] and an arm in
-//! [`section_content`]; the rest (list, keys, narrow screens, arrow keys) follows from those.
+//! Sections so far: **Updates** (River's own updates, [`super::update_view::updates_section`]),
+//! **Notifications** (do not disturb and message previews, [`notifications_section`]),
+//! **Background and startup** (the tray and login item, only where the shell offers them,
+//! [`super::background::background_section`]) and **Connection** (the Freenet node,
+//! [`connection_section`]). A section exists only when it has content ([`Section::shown`]). A new
+//! section is an entry in [`Section::ALL`] and an arm in [`section_content`]; the rest (list,
+//! keys, narrow screens, arrow keys) follows from those.
 //! Which section was last shown is not remembered: the dialog opens on the first section, and
 //! nothing about it is saved (the settings themselves keep their own saved choices).
 //!
 //! Esc closes the whole dialog on every screen, including a section screen of a narrow window;
 //! Back is the way to the list. Opening from the keyboard hands the keyboard back to the
 //! composer on close when the composer had it ([`SettingsUi::restore_composer`]; the shortcuts
-//! page does not do this). Not in Settings: Do not disturb, Background and startup, Export and
-//! Import ID, zoom and the shortcuts page, which are still the room list's footer buttons and
-//! their own dialogs.
+//! page does not do this). Not in Settings yet: Export and Import ID, zoom and the shortcuts
+//! page, which are still the room list's footer button and their own dialogs. The room list keeps
+//! one quiet Do not disturb row that flips the switch ([`super::dnd::Chat::quick_dnd`]).
 //!
 //! The dialog has no Save or Close button: every control in it acts at once, and the X closes
 //! it. Keys are stable (`settings-section-{id}`, `settings-back`, and the keys of the controls
 //! inside the sections), because tests and the end-to-end script find elements by key.
 
+use std::rc::Rc;
+
 use rune::{El, Key, col, el, icon, row};
-use rune_kit::{Button, ButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar, Switch};
 
 use super::dialog_kit::{DialogSpec, rule};
 use super::icons;
@@ -35,17 +40,36 @@ use crate::RiverApp;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Updates,
+    Notifications,
+    Background,
     Connection,
 }
 
 impl Section {
     /// Every section, in the order the list shows them.
-    pub const ALL: &'static [Section] = &[Section::Updates, Section::Connection];
+    pub const ALL: &'static [Section] = &[
+        Section::Updates,
+        Section::Notifications,
+        Section::Background,
+        Section::Connection,
+    ];
+
+    /// The sections the list shows: all of them, but Background and startup only where the
+    /// shell offers it.
+    pub fn shown(chat: &super::Chat) -> Vec<Section> {
+        Section::ALL
+            .iter()
+            .copied()
+            .filter(|s| *s != Section::Background || chat.background.is_some())
+            .collect()
+    }
 
     /// The name in the list and the heading of the section (sentence case).
     pub fn title(self) -> &'static str {
         match self {
             Section::Updates => "Updates",
+            Section::Notifications => "Notifications",
+            Section::Background => "Background and startup",
             Section::Connection => "Connection",
         }
     }
@@ -54,19 +78,14 @@ impl Section {
     pub fn id(self) -> &'static str {
         match self {
             Section::Updates => "updates",
+            Section::Notifications => "notifications",
+            Section::Background => "background",
             Section::Connection => "connection",
         }
     }
 
     fn key(self) -> String {
         format!("settings-section-{}", self.id())
-    }
-
-    fn index(self) -> usize {
-        Section::ALL
-            .iter()
-            .position(|s| *s == self)
-            .expect("every section is in ALL")
     }
 }
 
@@ -154,6 +173,7 @@ impl super::Chat {
         self.composer.focused = false;
         self.settings.open();
         self.settings.restore_composer = had_keyboard;
+        self.track_settings_sections();
         true
     }
 
@@ -164,6 +184,30 @@ impl super::Chat {
             self.composer.focused = true;
         }
         self.settings.close();
+        self.track_settings_sections();
+    }
+
+    /// Show `section` (a press, Enter or an arrow key on its row) and bring what it shows up to
+    /// date at once.
+    pub fn select_settings_section(&mut self, section: Section) {
+        self.settings.select(section);
+        self.track_settings_sections();
+    }
+
+    /// Keep what a section shows in step with whether it is on screen: the schedule's text
+    /// fields (Notifications) and what the shell says about the tray and login item
+    /// (Background and startup, read again each time it comes on screen). Run every frame and
+    /// whenever the dialog opens or closes.
+    pub fn track_settings_sections(&mut self) {
+        self.track_dnd_editor();
+        let showing = self.settings.open && self.settings.section == Section::Background;
+        if let Some(b) = &mut self.background {
+            if showing && !b.open {
+                b.opened();
+            } else if !showing && b.open {
+                b.open = false;
+            }
+        }
     }
 }
 
@@ -185,7 +229,7 @@ pub(super) fn setting_row(key: &str, title: El, note: Option<El>, control: El, _
 
 /// The rows of a section with a thin rule between each.
 pub(super) fn section_rows(key: &'static str, rows: Vec<El>, p: &Palette) -> El {
-    let mut s = col().key(key).w_full().gap(14.0);
+    let mut s = col().key(key).w_full().gap(10.0);
     for (i, r) in rows.into_iter().enumerate() {
         if i > 0 {
             s = s.child(rule(p));
@@ -307,8 +351,69 @@ fn connection_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
 fn section_content(section: Section, chat: &super::Chat, p: &Palette, k: &Kit) -> El {
     match section {
         Section::Updates => super::update_view::updates_section(&chat.update, p, k),
+        Section::Notifications => notifications_section(chat, p, k),
+        Section::Background => super::background::background_section(chat, p, k),
         Section::Connection => connection_section(chat, p, k),
     }
+}
+
+/// The Notifications section: do not disturb, whether notifications show who wrote and what,
+/// and where the choices for one room live. There is no switch for notifications as a whole:
+/// each room has its own, and do not disturb is the way to silence all of them at once.
+fn notifications_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
+    let previews = setting_row(
+        "settings-previews-row",
+        label(
+            "Show the sender and text in notifications",
+            st::BODY,
+            p.text,
+        ),
+        Some(
+            label(
+                "Off by default, so nothing private shows on a locked screen or in a shared \
+                 screen. Off: a private room's notification shows only who wrote, and a direct \
+                 message shows no name or text.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-previews-note"),
+        ),
+        Switch::new(chat.private_previews)
+            .label("Show the sender and text in notifications")
+            .hide_label()
+            .on_toggle(|s: &mut RiverApp| s.chat.toggle_previews())
+            .build(k)
+            .key("settings-previews"),
+        p,
+    );
+    col()
+        .key("settings-notifications")
+        .w_full()
+        .gap(14.0)
+        .child(super::dnd::dnd_group(chat, p, k))
+        .child(
+            col()
+                .key("settings-previews-group")
+                .w_full()
+                .gap(12.0)
+                .child(label("Message text", st::ROOM_STRONG, p.text))
+                .child(section_rows("settings-previews-rows", vec![previews], p)),
+        )
+        .child(
+            label(
+                "Notifications for one room (all messages, mentions only, or muted) are set from \
+                 the bell in that room's header. Do not disturb is the one setting that silences \
+                 every room at once. Both settings here stay on this device, and messages held \
+                 back are not shown later.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-notifications-note"),
+        )
 }
 
 /// A key a section row is moved by, as the step it takes in the list.
@@ -330,11 +435,11 @@ enum Step {
     Last,
 }
 
-/// The section a step from `from` lands on. The list stops at its ends.
-fn step_to(from: Section, step: Step) -> Section {
-    let last = Section::ALL.len() - 1;
-    let i = from.index();
-    Section::ALL[match step {
+/// The section a step from `from` lands on in the list `order`. The list stops at its ends.
+fn step_to(order: &[Section], from: Section, step: Step) -> Section {
+    let last = order.len() - 1;
+    let i = order.iter().position(|s| *s == from).unwrap_or(0);
+    order[match step {
         Step::Prev => i.saturating_sub(1),
         Step::Next => (i + 1).min(last),
         Step::First => 0,
@@ -345,7 +450,14 @@ fn step_to(from: Section, step: Step) -> Section {
 /// One row of the list. `wide`: the row shows which section is open, and the arrow keys choose
 /// a section as they move. Narrow: the row is a button that opens the section (arrow keys only
 /// move between rows, and a chevron says it opens a screen).
-fn section_row(section: Section, current: Section, wide: bool, new: bool, p: &Palette) -> El {
+fn section_row(
+    order: Rc<Vec<Section>>,
+    section: Section,
+    current: Section,
+    wide: bool,
+    new: bool,
+    p: &Palette,
+) -> El {
     let on = wide && section == current;
     let ink = if on { p.text } else { p.text_secondary };
     let mut r = row()
@@ -390,7 +502,7 @@ fn section_row(section: Section, current: Section, wide: bool, new: bool, p: &Pa
             r = r.fill(p.surface).autofocus();
         }
     } else {
-        if section == Section::ALL[0] {
+        if section == order[0] {
             r = r.autofocus();
         }
         r = r
@@ -398,11 +510,11 @@ fn section_row(section: Section, current: Section, wide: bool, new: bool, p: &Pa
             .child(icon(&icons::CHEVRON_RIGHT, 14.0).color(p.text_muted))
             .border_sides([0.0, 0.0, 1.0, 0.0], p.line);
     }
-    r.on_press(move |s: &mut RiverApp| s.chat.settings.select(section))
+    r.on_press(move |s: &mut RiverApp| s.chat.select_settings_section(section))
         .on_key(move |s: &mut RiverApp, ev, tx| {
             if ev.key == Key::Enter {
                 // Space presses a focused row; Enter does too, as on a button.
-                s.chat.settings.select(section);
+                s.chat.select_settings_section(section);
                 return true;
             }
             let Some(step) = step_of(&ev.key) else {
@@ -412,10 +524,10 @@ fn section_row(section: Section, current: Section, wide: bool, new: bool, p: &Pa
             if ev.mods.ctrl || ev.mods.alt || ev.mods.shift || ev.mods.logo {
                 return false;
             }
-            let to = step_to(section, step);
+            let to = step_to(&order, section, step);
             if wide {
                 // The list is automatic: the section shows as the row gets the keyboard.
-                s.chat.settings.select(to);
+                s.chat.select_settings_section(to);
             }
             tx.focus(to.key(), true);
             true
@@ -431,6 +543,7 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
     }
     let p = st::palette();
     let close = |s: &mut RiverApp| s.chat.close_settings();
+    let order = Rc::new(Section::shown(chat));
     let list = |wide: bool| {
         // Tabs only where they are tabs: the wide list. The narrow list is a screen of buttons.
         let mut nav = col()
@@ -438,8 +551,9 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
             .role(if wide { "tablist" } else { "group" })
             .label("Settings sections")
             .gap(2.0);
-        for section in Section::ALL {
+        for section in order.iter() {
             nav = nav.child(section_row(
+                order.clone(),
                 *section,
                 ui.section,
                 wide,
@@ -459,9 +573,28 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
             .build(k, layer);
         return;
     }
-    let content = section_content(ui.section, chat, &p, k);
+    let mut content = section_content(ui.section, chat, &p, k);
+    // The schedule's times were left as something that is not a time: say so wherever the
+    // person went, not only in the room list behind the dialog.
+    if let Some(n) = chat
+        .dnd
+        .notice
+        .as_ref()
+        .filter(|_| ui.section != Section::Notifications)
+    {
+        content = col()
+            .w_full()
+            .gap(10.0)
+            .child(
+                label(n.clone(), st::SMALL, p.warning_text)
+                    .wrap()
+                    .w_full()
+                    .key("settings-dnd-notice"),
+            )
+            .child(content);
+    }
     // What the dialog leaves of the window: its title and margins.
-    let pane_h = (win_h - 170.0).clamp(240.0, 340.0);
+    let pane_h = (win_h - 160.0).clamp(240.0, 640.0);
     if narrow {
         DialogSpec::new("settings", "Settings", close)
             .body_key("settings-body")
@@ -489,7 +622,8 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
                         stick_bottom: false,
                     })
                     .child(heading)
-                    .child(content),
+                    .child(content)
+                    .scroll_bar(k),
             )
             .build(k, layer);
         return;
@@ -520,7 +654,8 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
                             stick_bottom: false,
                         })
                         .child(heading)
-                        .child(content),
+                        .child(content)
+                        .scroll_bar(k),
                 ),
         )
         .build(k, layer);

@@ -263,8 +263,8 @@ fn what_is_drawn_zoomed_can_still_be_pressed() {
     // Hit testing follows the scale: pressing the footer button where it is drawn opens it.
     press(&mut rt, "dnd");
     assert!(
-        rt.state.chat.dnd.open,
-        "the press landed on the zoomed button"
+        rt.state.chat.dnd.settings.manual,
+        "the press landed on the zoomed row"
     );
 }
 
@@ -327,10 +327,10 @@ fn the_footer_entry_opens_it_and_close_closes_it() {
 #[test]
 fn it_does_not_open_over_another_dialog_or_the_switcher() {
     let mut rt = app();
-    press(&mut rt, "dnd");
+    press(&mut rt, "settings");
     chord(&mut rt, '/');
     assert!(!rt.state.chat.shortcuts_open, "not over a dialog");
-    rt.update(|s, _| s.chat.close_dnd());
+    rt.update(|s, _| s.chat.close_settings());
     settle(&mut rt);
     chord(&mut rt, 'k');
     assert!(rt.state.chat.switcher.is_some());
@@ -362,12 +362,12 @@ fn another_dialog_opening_closes_it_but_a_link_menu_does_not() {
     assert!(rt.state.chat.shortcuts_open, "a link menu leaves it open");
     rt.update(|s, tx| {
         s.chat.link_menu = None;
-        s.chat.open_dnd();
+        s.chat.settings.open();
         s.sync_dnd(tx);
     });
     settle(&mut rt);
     assert!(!rt.state.chat.shortcuts_open, "a dialog closes it");
-    assert!(rt.state.chat.dnd.open, "and the dialog stays");
+    assert!(rt.state.chat.settings.open, "and the dialog stays");
 }
 
 #[test]
