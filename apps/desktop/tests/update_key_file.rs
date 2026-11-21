@@ -59,5 +59,8 @@ fn every_release_build_job_reads_the_committed_key() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 3, "expected the linux, macos and windows build jobs");
+    assert_eq!(
+        checked, 3,
+        "expected the linux, macos and windows build jobs"
+    );
 }
