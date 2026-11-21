@@ -1077,6 +1077,50 @@ mod tests {
     }
 
     #[test]
+    fn restart_from_settings_asks_inside_the_dialog_and_answers_work() {
+        for (size, narrow) in [((1280.0, 800.0), false), ((820.0, 720.0), true)] {
+            let host = Arc::new(FakeHost::new(UpdateSupport::Automatic, vec![]));
+            let (mut s, rx, ctl) = ready_app(host.clone());
+            s.chat.update.support = UpdateSupport::Automatic;
+            s.chat.composer = rune::TextEdit::new("half a thought");
+            let env = Env {
+                system_dark: true,
+                scale: 1.0,
+            };
+            let mut rt = Runtime::new(s, view, size, env);
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+            press(&mut rt, "settings");
+            if narrow {
+                press(&mut rt, "settings-section-updates");
+            }
+            press(&mut rt, "settings-restart");
+            // The question is in the dialog (a key can be found once: not also behind it).
+            assert!(rt.state.chat.update.confirm_restart.is_some());
+            assert!(rt.find("settings-dialog").is_some());
+            assert!(shows(
+                &rt,
+                "You have text you have not sent. Restart anyway?"
+            ));
+            // Pressing reaches the buttons (a press on the room list behind the modal would
+            // only close the dialog), and the room list does not repeat the question.
+            assert!(rt.find("update-wait").is_some() && rt.find("update-restart-anyway").is_some());
+            assert_eq!(host.restarts.load(Ordering::SeqCst), 0);
+            press(&mut rt, "update-wait");
+            assert!(rt.state.chat.update.confirm_restart.is_none());
+            assert!(
+                rt.find("settings-dialog").is_some(),
+                "Wait keeps the dialog"
+            );
+            assert_eq!(host.restarts.load(Ordering::SeqCst), 0);
+            press(&mut rt, "settings-restart");
+            press(&mut rt, "update-restart-anyway");
+            let _ = settle(&ctl, &rx);
+            assert_eq!(host.restarts.load(Ordering::SeqCst), 1, "narrow: {narrow}");
+        }
+    }
+
+    #[test]
     fn restart_asks_first_while_messages_are_still_being_sent() {
         let host = Arc::new(FakeHost::new(UpdateSupport::Automatic, vec![]));
         let (mut s, _rx, _ctl) = ready_app(host.clone());

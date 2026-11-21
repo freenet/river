@@ -1562,7 +1562,49 @@ pub const SCENES: &[Scene] = &[
     ("chat-settings-list-narrow", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
         s.chat.settings.open();
+    }),
+    ("chat-settings-updates-notice", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.notice = Some(
+            "River 0.2.0 did not start (the new River exited at once), so River went back to \
+             0.1.0."
+                .into(),
+        );
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("chat-settings-restart-confirm", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            },
+        );
+        s.chat.update.confirm_restart = Some(
+            "2 messages or changes are still being sent. You have text you have not sent.".into(),
+        );
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("chat-settings-restart-confirm-narrow", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            },
+        );
+        s.chat.update.confirm_restart = Some(
+            "2 messages or changes are still being sent. You have text you have not sent.".into(),
+        );
+        s.chat.settings.open_at(chat::settings::Section::Updates);
     }),
     ("chat-members-hidden", |s| {
         connect(s);

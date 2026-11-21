@@ -26,7 +26,10 @@ fn megabytes(bytes: u64) -> String {
 }
 
 /// The block in the room list: what is available, downloading or ready, with its button.
-pub(super) fn update_block(ui: &UpdateUi, p: &Palette, k: &Kit) -> Option<El> {
+///
+/// While the Settings dialog is open (`settings_open`) the restart question is asked inside
+/// it, where it can be seen and answered, and not here behind the dialog.
+pub(super) fn update_block(ui: &UpdateUi, settings_open: bool, p: &Palette, k: &Kit) -> Option<El> {
     if !ui.shows_block() {
         return None;
     }
@@ -70,7 +73,9 @@ pub(super) fn update_block(ui: &UpdateUi, p: &Palette, k: &Kit) -> Option<El> {
         if let Some(err) = &ui.restart_error {
             block = block.child(say("update-restart-error", err.clone(), p.danger));
         }
-        if let Some(what) = &ui.confirm_restart {
+        if settings_open && ui.confirm_restart.is_some() {
+            // Asked in the dialog.
+        } else if let Some(what) = &ui.confirm_restart {
             block = block
                 .child(say(
                     "update-confirm",
@@ -261,24 +266,62 @@ pub(super) fn updates_section(ui: &UpdateUi, p: &Palette, k: &Kit) -> El {
             p,
         ),
     ];
-    let mut s = section_rows("settings-river", rows, p);
-    match &ui.support {
-        UpdateSupport::Automatic => {}
-        UpdateSupport::External(why) | UpdateSupport::Unavailable(why) => {
-            s = s.child(
-                label(why.clone(), st::SMALL, p.text_muted)
-                    .wrap()
-                    .w_full()
-                    .key("settings-update-support"),
-            );
-        }
-    }
+    let mut s = col().key("settings-river").w_full().gap(14.0);
+    // What needs attention comes first, so a short or zoomed pane never hides it: a rollback or
+    // failure notice, why the last restart did not happen, and the question a restart with
+    // unsent work asks (the same words and keys as the room list's block).
     if let Some(n) = &ui.notice {
         s = s.child(
             label(n.clone(), st::SMALL, p.warning_text)
                 .wrap()
                 .w_full()
                 .key("settings-notice"),
+        );
+    }
+    if ui.ready().is_some() {
+        if let Some(err) = &ui.restart_error {
+            s = s.child(
+                label(err.clone(), st::SMALL, p.danger)
+                    .wrap()
+                    .w_full()
+                    .key("settings-restart-error"),
+            );
+        }
+        if let Some(what) = &ui.confirm_restart {
+            s = s
+                .child(
+                    label(format!("{what} Restart anyway?"), st::SMALL, p.warning_text)
+                        .wrap()
+                        .w_full()
+                        .key("update-confirm"),
+                )
+                .child(
+                    row()
+                        .gap(8.0)
+                        .child(
+                            Button::new("Wait")
+                                .variant(ButtonVariant::Contrast)
+                                .on_press(|s: &mut RiverApp| s.chat.update.confirm_restart = None)
+                                .build(k)
+                                .key("update-wait"),
+                        )
+                        .child(
+                            Button::new("Restart anyway")
+                                .variant(ButtonVariant::Ghost)
+                                .on_press(|s: &mut RiverApp| s.restart_now())
+                                .build(k)
+                                .key("update-restart-anyway"),
+                        ),
+                );
+        }
+    }
+    s = s.child(section_rows("settings-rows", rows, p));
+    if let UpdateSupport::External(why) | UpdateSupport::Unavailable(why) = &ui.support {
+        s = s.child(
+            label(why.clone(), st::SMALL, p.text_muted)
+                .wrap()
+                .w_full()
+                .key("settings-update-support"),
         );
     }
     s

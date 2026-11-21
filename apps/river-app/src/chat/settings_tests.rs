@@ -245,24 +245,20 @@ fn the_chord_opens_settings_once_and_never_over_another_dialog() {
 }
 
 #[test]
-fn the_shortcuts_page_lists_the_chord() {
+fn the_shortcuts_page_lists_the_chord_and_the_gear_names_it() {
     assert!(
         super::shortcuts::SHORTCUTS
             .iter()
             .any(|s| s.chord == "Mod+," && s.commands == [','])
     );
-    let gear = open_gear_help();
-    assert!(gear.contains("Settings ("), "{gear}");
-}
-
-fn open_gear_help() -> String {
-    // The tooltip is part of the element's help text, which a person reads on hover; the
-    // scenes render it, so read it from the source of the view.
-    let src = include_str!("view.rs");
-    let at = src
-        .find("\"Settings (")
-        .expect("the gear's tooltip names the chord");
-    src[at..at + 20].to_owned()
+    assert_eq!(super::shortcuts::shown("Mod+,", false), "Ctrl+,");
+    assert_eq!(super::shortcuts::shown("Mod+,", true), "Cmd+,");
+    // The gear's tooltip is built from that chord, not from a typed copy of it.
+    let view = include_str!("view.rs");
+    assert!(
+        view.contains("\"Settings ({})\"") && view.contains("shown(\"Mod+,\""),
+        "the gear's help text names the chord through shortcuts::shown"
+    );
 }
 
 #[test]
@@ -349,14 +345,19 @@ fn node_status_is_still_one_press_from_the_status_pill_and_from_settings() {
 
 #[test]
 fn the_old_entry_points_are_still_in_the_source() {
-    // Pins that Settings added a home for these without taking the old ones away (1b and 1c
-    // move the rest of the footer; the connection pill and the node entry stay).
+    // Settings added a home for the node address, Change and Node status without taking the
+    // old ones away. The behaviour is tested above; this pins the exact keys in both files.
     let view = include_str!("view.rs");
-    assert!(view.contains("\"connection-pill\""));
-    assert!(view.contains("node_ui::node_entry"));
-    assert!(view.contains("\"Node status\""));
     let node_ui = include_str!("node_ui.rs");
-    assert!(node_ui.contains("\"node-change\""));
+    for (file, src, key) in [
+        ("view.rs", view, ".key(\"connection-pill\")"),
+        ("view.rs", view, "node_ui::node_entry("),
+        ("node_ui.rs", node_ui, ".key(\"node-address\")"),
+        ("node_ui.rs", node_ui, ".key(\"node-change\")"),
+    ] {
+        assert!(src.contains(key), "{key} left {file}");
+    }
+    // The footer buttons that are still the only way to their dialogs.
     for footer in ["dnd_entry", "\"Enter invite code\"", "\"Import ID\""] {
         assert!(view.contains(footer), "{footer} left the room list");
     }
@@ -400,4 +401,187 @@ fn the_update_switch_is_a_named_switch_and_the_toggle_is_unchanged() {
     assert_eq!(sw.label.as_deref(), Some("Update River automatically"));
     press(&mut rt, "settings-auto");
     assert!(!rt.state.chat.update.auto);
+}
+
+fn role_of(rt: &Runtime<RiverApp>, key: &str) -> (&'static str, Option<String>) {
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no element {key}"));
+    (e.role, e.label)
+}
+
+#[test]
+fn roles_are_tabs_only_where_they_are_tabs() {
+    // Wide: a tab list of tabs, and the section is its panel.
+    let rt = open(WINDOW_SIZE);
+    assert_eq!(role_of(&rt, "settings-nav").0, "tablist");
+    assert_eq!(role_of(&rt, "settings-section-updates").0, "tab");
+    assert_eq!(role_of(&rt, "settings-pane").0, "tabpanel");
+    // Narrow list screen: a group of buttons, no tabs.
+    let mut rt = open(NARROW_SCENE_SIZE);
+    assert_eq!(
+        role_of(&rt, "settings-nav"),
+        ("group", Some("Settings sections".into()))
+    );
+    assert_eq!(
+        role_of(&rt, "settings-section-connection"),
+        ("button", Some("Connection".into()))
+    );
+    // Narrow section screen: a plain group with the section's name, and Back is a button.
+    press(&mut rt, "settings-section-connection");
+    assert_eq!(
+        role_of(&rt, "settings-pane"),
+        ("group", Some("Connection".into()))
+    );
+    assert_eq!(role_of(&rt, "settings-back").0, "button");
+    assert!(
+        !rt.elements()
+            .into_iter()
+            .any(|e| e.role == "tab" || e.role == "tablist" || e.role == "tabpanel"),
+        "no tab roles in the narrow layout"
+    );
+}
+
+#[test]
+fn a_node_note_marks_the_connection_section_and_the_update_notice_comes_first() {
+    // No note: no marker, and the row's name is just its title.
+    let rt = open(WINDOW_SIZE);
+    assert!(rt.find("settings-section-connection-new").is_none());
+    assert_eq!(
+        role_of(&rt, "settings-section-connection").1.as_deref(),
+        Some("Connection")
+    );
+    // A note: a dot on the row and "new" in its accessible name, wide and narrow.
+    for size in [WINDOW_SIZE, NARROW_SCENE_SIZE] {
+        let mut s = connected();
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
+        s.chat.settings.open();
+        let rt = render(s, size);
+        assert!(
+            rt.find("settings-section-connection-new").is_some(),
+            "{size:?}"
+        );
+        assert_eq!(
+            role_of(&rt, "settings-section-connection").1.as_deref(),
+            Some("Connection, new")
+        );
+    }
+    // The rollback notice is above the rows of Updates, so a short pane never hides it.
+    let mut s = connected();
+    s.chat.update.notice = Some("River 0.2.0 did not start, so River went back to 0.1.0.".into());
+    s.chat.settings.open();
+    let rt = render(s, WINDOW_SIZE);
+    let y = |k: &str| rt.find(k).unwrap_or_else(|| panic!("no {k}")).1;
+    assert!(y("settings-notice") < y("settings-version-row"));
+    // And in a short window it is in view.
+    let mut s = connected();
+    s.chat.update.notice = Some("River 0.2.0 did not start, so River went back to 0.1.0.".into());
+    s.chat.settings.open_at(Section::Updates);
+    let rt = render(s, (640.0, 480.0));
+    assert!(visible(&rt, "settings-notice"));
+}
+
+fn visible(rt: &Runtime<RiverApp>, key: &str) -> bool {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key))
+        .is_some_and(|e| e.visible[2] > 0.0 && e.visible[3] > 0.0)
+}
+
+#[test]
+fn closing_from_the_keyboard_chord_gives_the_composer_its_keyboard_back() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "composer-field");
+    assert!(rt.state.chat.composer.focused);
+    rt.key(KeyEvent {
+        key: Key::Command(','),
+        mods: Mods {
+            ctrl: true,
+            cmd: true,
+            ..Mods::default()
+        },
+    });
+    settle(&mut rt);
+    assert!(is_open(&rt));
+    assert!(!rt.state.chat.composer.focused);
+    key(&mut rt, Key::Escape);
+    assert!(!is_open(&rt));
+    assert!(rt.state.chat.composer.focused, "the composer had it");
+    assert_eq!(focused(&rt).as_deref(), Some("composer-field"));
+    // Opened with nothing focused in the composer, closing does not take the keyboard.
+    let mut rt = open(WINDOW_SIZE);
+    key(&mut rt, Key::Escape);
+    assert!(!rt.state.chat.composer.focused);
+}
+
+#[test]
+fn space_presses_the_switch_and_enter_or_space_opens_a_narrow_section() {
+    let mut s = connected();
+    s.chat.update.support = crate::update::UpdateSupport::Automatic;
+    s.chat.update.auto = true;
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings");
+    key(&mut rt, Key::Tab);
+    key(&mut rt, Key::Tab);
+    assert_eq!(focused(&rt).as_deref(), Some("settings-auto"));
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(!rt.state.chat.update.auto, "Space toggles the switch");
+    key(&mut rt, Key::Text(" ".into()));
+    assert!(rt.state.chat.update.auto);
+
+    for open_key in [Key::Enter, Key::Text(" ".into())] {
+        let mut rt = open(NARROW_SCENE_SIZE);
+        assert_eq!(focused(&rt).as_deref(), Some("settings-section-updates"));
+        key(&mut rt, Key::Down);
+        assert_eq!(focused(&rt).as_deref(), Some("settings-section-connection"));
+        assert!(
+            rt.find("settings-pane").is_none(),
+            "arrows only move focus here"
+        );
+        key(&mut rt, open_key.clone());
+        assert!(
+            rt.find("settings-pane").is_some(),
+            "{open_key:?} opens the section"
+        );
+        assert_eq!(rt.state.chat.settings.section, Section::Connection);
+    }
+}
+
+#[test]
+fn resizing_across_the_narrow_width_keeps_the_section_and_the_keyboard() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-connection");
+    assert!(rt.find("settings-pane").is_some() && rt.find("settings-nav").is_some());
+    // Zoom lays the window out narrower, as a smaller window would.
+    rt.update(|s, _| s.chat.zoom.load(150));
+    settle(&mut rt);
+    assert!(rt.state.chat.narrow);
+    assert!(is_open(&rt));
+    // Narrow: the section the person was on is what shows, with Back. (The wide list row
+    // that had the keyboard is gone.)
+    assert!(rt.find("settings-back").is_some());
+    assert!(rt.find("settings-node-change").is_some());
+    let f = focused(&rt);
+    assert!(
+        f.as_deref()
+            .is_some_and(|k| k.starts_with("settings-") || k == "close"),
+        "the keyboard is in the dialog, not lost: {f:?}"
+    );
+    // The keyboard still works: Escape closes.
+    rt.update(|s, _| s.chat.zoom.load(100));
+    settle(&mut rt);
+    assert!(!rt.state.chat.narrow);
+    assert!(rt.find("settings-section-connection").is_some());
+    let f = focused(&rt);
+    assert!(
+        f.as_deref()
+            .is_some_and(|k| k.starts_with("settings-") || k == "close"),
+        "the keyboard is in the dialog, not lost: {f:?}"
+    );
+    key(&mut rt, Key::Escape);
+    assert!(!is_open(&rt));
 }

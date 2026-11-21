@@ -11,6 +11,13 @@
 //! Which section was last shown is not remembered: the dialog opens on the first section, and
 //! nothing about it is saved (the settings themselves keep their own saved choices).
 //!
+//! Esc closes the whole dialog on every screen, including a section screen of a narrow window;
+//! Back is the way to the list. Opening from the keyboard hands the keyboard back to the
+//! composer on close when the composer had it ([`SettingsUi::restore_composer`]; the shortcuts
+//! page does not do this). Not in Settings: Do not disturb, Background and startup, Export and
+//! Import ID, zoom and the shortcuts page, which are still the room list's footer buttons and
+//! their own dialogs.
+//!
 //! The dialog has no Save or Close button: every control in it acts at once, and the X closes
 //! it. Keys are stable (`settings-section-{id}`, `settings-back`, and the keys of the controls
 //! inside the sections), because tests and the end-to-end script find elements by key.
@@ -71,6 +78,8 @@ pub struct SettingsUi {
     /// Narrow window only: the section is open (Back returns to the list). A wide window shows
     /// the list and a section together and ignores this.
     pub in_section: bool,
+    /// The composer had the keyboard when the dialog opened, so closing gives it back.
+    pub restore_composer: bool,
 }
 
 impl Default for SettingsUi {
@@ -79,6 +88,7 @@ impl Default for SettingsUi {
             open: false,
             section: Section::ALL[0],
             in_section: false,
+            restore_composer: false,
         }
     }
 }
@@ -98,6 +108,7 @@ impl SettingsUi {
             open: true,
             section,
             in_section: true,
+            restore_composer: false,
         };
     }
 
@@ -136,10 +147,23 @@ impl super::Chat {
         self.emoji_open = false;
         self.picker = None;
         self.members_overlay = false;
-        // The dialog takes the keyboard.
+        // The dialog takes the keyboard; the composer gets it back when the dialog closes.
+        // (Opening also closes the emoji picker, a reaction picker and the narrow members
+        // panel, which would otherwise sit behind or beside the dialog.)
+        let had_keyboard = self.composer.focused;
         self.composer.focused = false;
         self.settings.open();
+        self.settings.restore_composer = had_keyboard;
         true
+    }
+
+    /// Close the dialog (X, Esc, a press outside), giving the keyboard back to the composer if
+    /// it had it when the dialog opened.
+    pub fn close_settings(&mut self) {
+        if std::mem::take(&mut self.settings.restore_composer) {
+            self.composer.focused = true;
+        }
+        self.settings.close();
     }
 }
 
@@ -260,7 +284,8 @@ fn connection_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
                         p.text_muted,
                     )
                     .wrap()
-                    .w_full(),
+                    .w_full()
+                    .key("settings-node-status-note"),
                 ),
                 Button::new("Node status")
                     .variant(ButtonVariant::Outline)
@@ -320,13 +345,18 @@ fn step_to(from: Section, step: Step) -> Section {
 /// One row of the list. `wide`: the row shows which section is open, and the arrow keys choose
 /// a section as they move. Narrow: the row is a button that opens the section (arrow keys only
 /// move between rows, and a chevron says it opens a screen).
-fn section_row(section: Section, current: Section, wide: bool, p: &Palette) -> El {
+fn section_row(section: Section, current: Section, wide: bool, new: bool, p: &Palette) -> El {
     let on = wide && section == current;
     let ink = if on { p.text } else { p.text_secondary };
     let mut r = row()
         .key(section.key())
         .role(if wide { "tab" } else { "button" })
-        .label(section.title())
+        // A section with something new says so to assistive technology as well as with a dot.
+        .label(if new {
+            format!("{}, new", section.title())
+        } else {
+            section.title().to_owned()
+        })
         .focusable(true)
         .w_full()
         .h(if wide { 32.0 } else { 46.0 })
@@ -341,6 +371,15 @@ fn section_row(section: Section, current: Section, wide: bool, p: &Palette) -> E
             if on { st::ROOM_STRONG } else { st::ROOM },
             ink,
         ));
+    if new {
+        r = r.child(
+            el().key(format!("{}-new", section.key()))
+                .size(7.0, 7.0)
+                .radius(3.5)
+                .fill(p.accent)
+                .a11y_hidden(),
+        );
+    }
     if wide {
         r = r
             .focus_selected(on)
@@ -361,6 +400,11 @@ fn section_row(section: Section, current: Section, wide: bool, p: &Palette) -> E
     }
     r.on_press(move |s: &mut RiverApp| s.chat.settings.select(section))
         .on_key(move |s: &mut RiverApp, ev, tx| {
+            if ev.key == Key::Enter {
+                // Space presses a focused row; Enter does too, as on a button.
+                s.chat.settings.select(section);
+                return true;
+            }
             let Some(step) = step_of(&ev.key) else {
                 return false;
             };
@@ -371,7 +415,7 @@ fn section_row(section: Section, current: Section, wide: bool, p: &Palette) -> E
             let to = step_to(section, step);
             if wide {
                 // The list is automatic: the section shows as the row gets the keyboard.
-                s.chat.settings.section = to;
+                s.chat.settings.select(to);
             }
             tx.focus(to.key(), true);
             true
@@ -386,15 +430,22 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
         return;
     }
     let p = st::palette();
-    let close = |s: &mut RiverApp| s.chat.settings.close();
+    let close = |s: &mut RiverApp| s.chat.close_settings();
     let list = |wide: bool| {
+        // Tabs only where they are tabs: the wide list. The narrow list is a screen of buttons.
         let mut nav = col()
             .key("settings-nav")
-            .role("tablist")
+            .role(if wide { "tablist" } else { "group" })
             .label("Settings sections")
             .gap(2.0);
         for section in Section::ALL {
-            nav = nav.child(section_row(*section, ui.section, wide, &p));
+            nav = nav.child(section_row(
+                *section,
+                ui.section,
+                wide,
+                *section == Section::Connection && chat.update.node_note.is_some(),
+                &p,
+            ));
         }
         nav
     };
@@ -429,7 +480,7 @@ pub(super) fn dialog(chat: &super::Chat, narrow: bool, win_h: f32, k: &Kit, laye
             .child(
                 col()
                     .key("settings-pane")
-                    .role("tabpanel")
+                    .role("group")
                     .label(ui.section.title())
                     .w_full()
                     .gap(14.0)
