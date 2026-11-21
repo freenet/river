@@ -1,6 +1,14 @@
-//! A blocking WebSocket connection to the node's client API, in its native encoding: each
+//! A WebSocket connection to the node's client API, in its native encoding: each
 //! message is the bincode of a freenet-stdlib `ClientRequest` one way and of a
 //! `Result<HostResponse, ClientError>` the other, at the stdlib version River's web UI uses.
+//!
+//! **The socket has no receive or send timeout.** Microsoft documents that a Winsock receive
+//! that times out (`SO_RCVTIMEO`, which is what `TcpStream::set_read_timeout` sets) leaves the
+//! connection "in an indeterminate state" that "should be closed". A read timeout that races
+//! with arriving data can lose that data, and on Windows it can end with os error 997 instead
+//! of a timeout. So the stream is non-blocking, and [`NodeSocket::recv`] waits by trying a
+//! read and sleeping at most [`POLL`] between tries, until its own deadline. A read that finds
+//! nothing is a plain `WouldBlock` on every platform, and nothing is ever cancelled in flight.
 //!
 //! A large response may arrive in `StreamChunk`s (announced by a `StreamHeader` or not); they
 //! are put back together here, so the caller only ever sees whole responses.
@@ -53,8 +61,19 @@ const MAX_CHUNKS: u32 = 256;
 const MAX_STREAMS: usize = 8;
 const STREAM_TTL: Duration = Duration::from_secs(60);
 
-/// How long a write may block before the connection counts as gone.
+/// How long a write may wait for room in the socket before the connection counts as gone.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the WebSocket upgrade may take.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest [`NodeSocket::recv`] sleeps between reads of a socket with nothing to give: the
+/// most delay it adds to a frame that arrives while it sleeps (about 10 ms on average), and
+/// 50 wakeups a second while the connection is idle. Sleeps are cut short at the deadline.
+const POLL: Duration = Duration::from_millis(20);
+
+/// How long a write that found the socket full sleeps before it tries again.
+const WRITE_POLL: Duration = Duration::from_millis(2);
 
 /// The largest response River puts back together from chunks. A room's state is bounded far
 /// below this by the contract; the bound stops a misbehaving node from filling memory.
@@ -78,7 +97,7 @@ pub enum SocketError {
     Closed { code: Option<u16>, reason: String },
     /// The node answered the WebSocket upgrade with this HTTP status instead.
     Handshake(u16),
-    /// Nothing arrived within the read timeout. The connection is still usable.
+    /// Nothing arrived within the read wait. The connection is still usable.
     Timeout,
     /// Anything else: the node went away, or sent something River can't read.
     Failed(String),
@@ -120,8 +139,10 @@ pub struct NodeSocket {
     last_heard: Instant,
     /// Whether anything at all has arrived on this connection.
     heard_anything: bool,
-    /// Pending results in a row from timed reads (see [`PendingStreak`]).
-    pending: PendingStreak,
+    /// How long [`recv`](NodeSocket::recv) waits for anything before it reports `Timeout`.
+    read_wait: Duration,
+    /// The longest sleep between reads while waiting (see [`POLL`]).
+    poll: Duration,
 }
 
 struct Chunks {
@@ -163,13 +184,9 @@ impl NodeSocket {
         let fail = |e: &dyn std::fmt::Display| SocketError::Failed(e.to_string());
         let addrs = authority.to_socket_addrs().map_err(|e| fail(&e))?;
         let stream = connect_any(addrs, Duration::from_secs(5)).map_err(|e| fail(&e))?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| fail(&e))?;
-        stream
-            .set_write_timeout(Some(WRITE_TIMEOUT))
-            .map_err(|e| fail(&e))?;
         stream.set_nodelay(true).map_err(|e| fail(&e))?;
+        // No SO_RCVTIMEO / SO_SNDTIMEO anywhere on this socket (see the module docs).
+        stream.set_nonblocking(true).map_err(|e| fail(&e))?;
         let mut request = format!("ws://{authority}{COMMAND_PATH}")
             .into_client_request()
             .map_err(|e| fail(&e))?;
@@ -190,12 +207,7 @@ impl NodeSocket {
         bearer.set_sensitive(true);
         request.headers_mut().insert("Authorization", bearer);
         let grant = GrantPresented(());
-        let (ws, _) = tungstenite::client(request, stream).map_err(|e| match e {
-            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)) => {
-                SocketError::Handshake(r.status().as_u16())
-            }
-            other => fail(&other),
-        })?;
+        let (ws, _) = finish_handshake(tungstenite::client(request, stream), HANDSHAKE_TIMEOUT)?;
         Ok(NodeSocket {
             ws,
             grant,
@@ -203,16 +215,16 @@ impl NodeSocket {
             chunks: HashMap::new(),
             last_heard: Instant::now(),
             heard_anything: false,
-            pending: PendingStreak::default(),
+            read_wait: Duration::from_secs(10),
+            poll: POLL,
         })
     }
 
-    /// How long [`recv`](Self::recv) waits before reporting [`SocketError::Timeout`].
+    /// How long [`recv`](Self::recv) waits before reporting [`SocketError::Timeout`]. The
+    /// wait starts again each time a message arrives.
     pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), SocketError> {
-        self.ws
-            .get_mut()
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| SocketError::Failed(e.to_string()))
+        self.read_wait = timeout;
+        Ok(())
     }
 
     /// Send a request. A `RegisterDelegate` is refused: it goes only through
@@ -247,17 +259,36 @@ impl NodeSocket {
 
     fn write(&mut self, request: &ClientRequest<'_>) -> Result<(), SocketError> {
         let bytes = bincode::serialize(request).map_err(|e| SocketError::Failed(e.to_string()))?;
-        self.ws
-            .send(Message::Binary(bytes.into()))
-            .map_err(|e| map_ws_error(e, false, &mut self.pending))
+        self.write_message(Message::Binary(bytes.into()))
+    }
+
+    /// Queue `message` and push it out. The socket is non-blocking, so when it is full the
+    /// frame stays queued in tungstenite (`send` queues before it flushes) and is flushed
+    /// again until it is out or [`WRITE_TIMEOUT`] passes, which fails the connection.
+    fn write_message(&mut self, message: Message) -> Result<(), SocketError> {
+        let mut result = self.ws.send(message);
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        loop {
+            match result {
+                Ok(()) => return Ok(()),
+                Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(SocketError::Failed(
+                            "the connection to Freenet is not taking data".into(),
+                        ));
+                    }
+                    std::thread::sleep(WRITE_POLL);
+                    result = self.ws.flush();
+                }
+                Err(e) => return Err(map_ws_error(e, false)),
+            }
+        }
     }
 
     /// Ask the node to show it is still there. The pong, like any message, moves
     /// [`last_heard`](Self::last_heard).
     pub fn ping(&mut self) -> Result<(), SocketError> {
-        self.ws
-            .send(Message::Ping(Vec::new().into()))
-            .map_err(|e| map_ws_error(e, false, &mut self.pending))
+        self.write_message(Message::Ping(Vec::new().into()))
     }
 
     /// Whether anything at all has arrived on this connection.
@@ -295,14 +326,21 @@ impl NodeSocket {
 
     /// The next whole response.
     pub fn recv(&mut self) -> Result<HostResult, SocketError> {
+        let mut deadline = Instant::now() + self.read_wait;
         loop {
             let message = match self.ws.read() {
-                Ok(m) => {
-                    self.pending.reset();
-                    m
+                Ok(m) => m,
+                Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(SocketError::Timeout);
+                    }
+                    std::thread::sleep(left.min(self.poll));
+                    continue;
                 }
-                Err(e) => return Err(map_ws_error(e, true, &mut self.pending)),
+                Err(e) => return Err(map_ws_error(e, true)),
             };
+            deadline = Instant::now() + self.read_wait;
             self.last_heard = Instant::now();
             self.heard_anything = true;
             let bytes = match message {
@@ -411,6 +449,48 @@ impl NodeSocket {
     }
 }
 
+/// Run an upgrade on a non-blocking stream to its end: try again after a short sleep until it
+/// is done or `limit` passes.
+fn finish_handshake(
+    first: Result<
+        (
+            WebSocket<TcpStream>,
+            tungstenite::handshake::client::Response,
+        ),
+        tungstenite::HandshakeError<tungstenite::ClientHandshake<TcpStream>>,
+    >,
+    limit: Duration,
+) -> Result<
+    (
+        WebSocket<TcpStream>,
+        tungstenite::handshake::client::Response,
+    ),
+    SocketError,
+> {
+    let deadline = Instant::now() + limit;
+    let mut step = first;
+    loop {
+        match step {
+            Ok(done) => return Ok(done),
+            Err(tungstenite::HandshakeError::Interrupted(mid)) => {
+                if Instant::now() >= deadline {
+                    return Err(SocketError::Failed(
+                        "Freenet did not answer the connection in time".into(),
+                    ));
+                }
+                std::thread::sleep(WRITE_POLL);
+                step = mid.handshake();
+            }
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r))) => {
+                return Err(SocketError::Handshake(r.status().as_u16()));
+            }
+            Err(tungstenite::HandshakeError::Failure(other)) => {
+                return Err(SocketError::Failed(other.to_string()));
+            }
+        }
+    }
+}
+
 /// What a write refused by a closed gate fails with.
 pub const STALE_REFUSAL: &str = "a newer River is out, so this build no longer writes to Freenet";
 
@@ -485,48 +565,25 @@ fn token_rejection(e: &ClientError) -> Option<SocketError> {
 }
 
 /// Windows' `ERROR_IO_PENDING` / `WSA_IO_PENDING` ("Overlapped I/O operation is in progress").
-/// Both names are 997 (`windows_sys.rs` in std has them as the same value). Rust's std does not
-/// map it to an `ErrorKind` (it is `Uncategorized`), unlike `WSAEWOULDBLOCK` (10035, `WouldBlock`)
-/// and `WSAETIMEDOUT` (10060, `TimedOut`).
+/// Both names are 997. Rust's std does not map it to an `ErrorKind` (it is `Uncategorized`),
+/// unlike `WSAEWOULDBLOCK` (10035, `WouldBlock`) and `WSAETIMEDOUT` (10060, `TimedOut`).
+///
+/// It was seen once on a read that had a receive timeout set (`SO_RCVTIMEO`), and once more
+/// as a reply that never arrived. Microsoft says a socket whose receive timed out "is in an
+/// indeterminate state and should be closed", so the code is a failure: the connection is
+/// dropped and opened again, never carried on with. (Treating it as "nothing yet", as an
+/// earlier change did, lost the bytes that were in flight.) The node socket no longer has a
+/// receive timeout at all (see [`NodeSocket`]), so this is not expected to occur.
 const IO_PENDING: i32 = 997;
 
 /// The platform's raw code for "operation still pending", where there is one. On other
-/// platforms 997 is an unrelated errno. The code is a parameter of the functions below so a
+/// platforms 997 is an unrelated errno. The code is a parameter of [`map_ws_error_with`] so a
 /// test can run the Windows rule anywhere.
 const PLATFORM_PENDING: Option<i32> = if cfg!(windows) {
     Some(IO_PENDING)
 } else {
     None
 };
-
-/// How many pending results in a row, with no bytes read between, the socket takes for "nothing
-/// yet" before it gives the connection up. Each one is followed by [`PENDING_PAUSE`], so 200 is
-/// about a second of a socket that only ever answers pending: long enough to ride out a
-/// momentary one on a loaded machine, short enough that a stuck one reconnects well before the
-/// ping and pong deadlines and never spins.
-const MAX_PENDING_STREAK: u32 = 200;
-
-/// A short sleep after each pending result taken for "nothing yet", so a socket that keeps
-/// answering it cannot make the session loop run at full speed.
-const PENDING_PAUSE: Duration = Duration::from_millis(5);
-
-/// Consecutive pending results from timed reads. A byte read or an ordinary timeout (the socket
-/// answered like a socket) starts the count again.
-#[derive(Debug, Default)]
-struct PendingStreak(u32);
-
-impl PendingStreak {
-    fn reset(&mut self) {
-        self.0 = 0;
-    }
-
-    /// One more pending result; whether the streak is now too long to go on taking it for
-    /// "nothing yet".
-    fn add_and_give_up(&mut self) -> bool {
-        self.0 = self.0.saturating_add(1);
-        self.0 >= MAX_PENDING_STREAK
-    }
-}
 
 /// Whether the `count`th pending result of this run (1 for the first) is logged: the first, each
 /// power of ten, and any other after `since_last` is a minute, so a stuck connection stays
@@ -545,9 +602,9 @@ fn is_power_of_ten(mut n: u64) -> bool {
     n == 1
 }
 
-/// Log a pending result (see [`should_log_pending`]): which call, the raw code, how many so far
-/// this run and in a row, and what was done about it.
-fn note_pending(reading: bool, e: &std::io::Error, streak: u32, gave_up: bool) {
+/// Log a pending result (see [`should_log_pending`]): which call, the raw code, and how many so
+/// far this run.
+fn note_pending(reading: bool, e: &std::io::Error) {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNT: AtomicU64 = AtomicU64::new(0);
@@ -559,57 +616,32 @@ fn note_pending(reading: bool, e: &std::io::Error, streak: u32, gave_up: bool) {
     }
     *last = Some(Instant::now());
     eprintln!(
-        "River: a socket {} ended with os error {:?} ({e}); {} (number {count} this run, {streak} in a row)",
+        "River: a socket {} ended with os error {:?} ({e}); the connection is dropped and opened again (number {count} this run)",
         if reading { "read" } else { "write" },
         e.raw_os_error(),
-        match (reading, gave_up) {
-            (true, false) => "treated as nothing received yet",
-            (true, true) => "too many in a row, the connection is dropped and opened again",
-            (false, _) => "the connection is dropped and opened again",
-        }
     );
 }
 
-/// `reading`: the error came from a timed read, where `Timeout` means "nothing yet, still
-/// usable". tungstenite keeps a half-read frame in its own buffers whatever error the read
-/// ended with (`FrameCodec::read_frame` returns the io error with `?` before touching the
-/// buffered bytes or the parsed header), so the next read carries on from it. A write that
-/// ends in an error leaves the frame half sent, so callers drop the connection on any write
-/// error, `Timeout` included. A write that tungstenite does inside `read` (the pong or close
-/// reply) can end pending too, and then shows up here as a read.
-///
-/// The pending code (Windows' 997) is not known to come from a timed read: the only sighting is
-/// a session log line that `send`, `ping` and `recv` all feed. It is taken for "nothing yet" on a
-/// read as an inference from what the code means, not from a reproduction. `streak` bounds it.
-fn map_ws_error(e: tungstenite::Error, reading: bool, streak: &mut PendingStreak) -> SocketError {
-    map_ws_error_with(e, reading, streak, PLATFORM_PENDING, PENDING_PAUSE)
+/// `reading`: the error came from a read, where `Timeout` means "nothing yet, still usable".
+/// tungstenite keeps a half-read frame in its own buffers whatever error the read ended with
+/// (`FrameCodec::read_frame` returns the io error with `?` before touching the buffered bytes
+/// or the parsed header), so the next read carries on from it. A write that ends in an error
+/// leaves the frame half sent, so callers drop the connection on any write error, `Timeout`
+/// included.
+fn map_ws_error(e: tungstenite::Error, reading: bool) -> SocketError {
+    map_ws_error_with(e, reading, PLATFORM_PENDING)
 }
 
-fn map_ws_error_with(
-    e: tungstenite::Error,
-    reading: bool,
-    streak: &mut PendingStreak,
-    pending: Option<i32>,
-    pause: Duration,
-) -> SocketError {
+fn map_ws_error_with(e: tungstenite::Error, reading: bool, pending: Option<i32>) -> SocketError {
     match e {
         tungstenite::Error::Io(io)
             if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
         {
-            if reading {
-                streak.reset();
-            }
             SocketError::Timeout
         }
         tungstenite::Error::Io(io) if pending.is_some() && io.raw_os_error() == pending => {
-            let gave_up = reading && streak.add_and_give_up();
-            note_pending(reading, &io, streak.0, gave_up);
-            if reading && !gave_up {
-                std::thread::sleep(pause);
-                SocketError::Timeout
-            } else {
-                SocketError::Failed(tungstenite::Error::Io(io).to_string())
-            }
+            note_pending(reading, &io);
+            SocketError::Failed(tungstenite::Error::Io(io).to_string())
         }
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
             SocketError::Closed {
@@ -1212,84 +1244,166 @@ mod tests {
         tungstenite::Error::Io(std::io::Error::from_raw_os_error(code))
     }
 
-    fn pending(
-        e: tungstenite::Error,
-        reading: bool,
-        streak: &mut PendingStreak,
-        code: Option<i32>,
-    ) -> SocketError {
-        map_ws_error_with(e, reading, streak, code, Duration::ZERO)
-    }
-
-    /// The rule, with Windows' code given explicitly so it runs on every platform: a read that
-    /// ends pending is "nothing yet" until too many in a row; a write that does is a failure;
-    /// where the platform has no such code it is an ordinary error. Ordinary timeouts are as
-    /// before.
+    /// Windows' pending code on a read or a write is a failure (the connection is dropped and
+    /// opened again), never "nothing yet": the socket may have lost bytes. Ordinary timeouts
+    /// stay `Timeout`, and without the platform code 997 is an ordinary error.
     #[test]
-    fn a_pending_read_is_nothing_yet_until_too_many_in_a_row() {
-        let mut streak = PendingStreak::default();
-        for _ in 1..MAX_PENDING_STREAK {
-            assert_eq!(
-                pending(io(IO_PENDING), true, &mut streak, Some(IO_PENDING)),
-                SocketError::Timeout
-            );
+    fn the_pending_code_is_a_failure_not_nothing_yet() {
+        for reading in [true, false] {
+            let r = map_ws_error_with(io(IO_PENDING), reading, Some(IO_PENDING));
+            assert!(matches!(r, SocketError::Failed(_)), "{r:?}");
         }
-        let last = pending(io(IO_PENDING), true, &mut streak, Some(IO_PENDING));
-        assert!(matches!(last, SocketError::Failed(_)), "{last:?}");
-        // An ordinary timeout, or bytes read, starts the count again.
-        let mut streak = PendingStreak::default();
-        for _ in 1..MAX_PENDING_STREAK {
-            pending(io(IO_PENDING), true, &mut streak, Some(IO_PENDING));
-        }
+        let r = map_ws_error_with(io(IO_PENDING), true, None);
+        assert!(matches!(r, SocketError::Failed(_)), "{r:?}");
         let timed_out = || tungstenite::Error::Io(ErrorKind::TimedOut.into());
+        let would_block = || tungstenite::Error::Io(ErrorKind::WouldBlock.into());
         assert_eq!(
-            pending(timed_out(), true, &mut streak, Some(IO_PENDING)),
+            map_ws_error_with(timed_out(), true, Some(IO_PENDING)),
             SocketError::Timeout
         );
         assert_eq!(
-            pending(io(IO_PENDING), true, &mut streak, Some(IO_PENDING)),
+            map_ws_error_with(would_block(), true, Some(IO_PENDING)),
             SocketError::Timeout
-        );
-        for _ in 1..MAX_PENDING_STREAK - 1 {
-            pending(io(IO_PENDING), true, &mut streak, Some(IO_PENDING));
-        }
-        streak.reset();
-        assert_eq!(
-            pending(io(IO_PENDING), true, &mut streak, Some(IO_PENDING)),
-            SocketError::Timeout
-        );
-    }
-
-    #[test]
-    fn a_pending_write_fails_and_without_the_platform_code_so_does_a_read() {
-        let mut streak = PendingStreak::default();
-        let write = pending(io(IO_PENDING), false, &mut streak, Some(IO_PENDING));
-        assert!(matches!(write, SocketError::Failed(_)), "{write:?}");
-        let read = pending(io(IO_PENDING), true, &mut streak, None);
-        assert!(matches!(read, SocketError::Failed(_)), "{read:?}");
-        let timed_out = || tungstenite::Error::Io(ErrorKind::TimedOut.into());
-        assert_eq!(
-            pending(timed_out(), false, &mut streak, Some(IO_PENDING)),
-            SocketError::Timeout,
-            "a write that timed out is reported as before"
         );
         assert_eq!(IO_PENDING, 997);
     }
 
-    /// The pause after a pending read is real: a socket that only answers pending cannot spin.
+    /// No receive or send timeout is set on the node socket, before or after the wait is
+    /// configured: that option is what Windows documents as leaving a timed-out socket
+    /// indeterminate. This fails on the code that set `SO_RCVTIMEO` / `SO_SNDTIMEO`.
     #[test]
-    fn a_pending_read_pauses() {
-        let mut streak = PendingStreak::default();
-        let start = Instant::now();
-        let r = map_ws_error_with(
-            io(IO_PENDING),
-            true,
-            &mut streak,
-            Some(IO_PENDING),
-            Duration::from_millis(20),
+    fn the_node_socket_has_no_os_timeouts() {
+        let (authority, server) = serve(Vec::new());
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+        let check = |socket: &NodeSocket| {
+            let tcp = socket.ws.get_ref();
+            assert_eq!(tcp.read_timeout().unwrap(), None);
+            assert_eq!(tcp.write_timeout().unwrap(), None);
+        };
+        check(&socket);
+        socket.set_read_timeout(Duration::from_millis(5)).unwrap();
+        assert_eq!(socket.recv().unwrap_err(), SocketError::Timeout);
+        check(&socket);
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A frame sent at every offset around the moment the client's wait runs out is received
+    /// exactly once, in order, and the connection is never dropped. The client waits 1 ms per
+    /// `recv`; the node sends each frame after a delay that sweeps from 0 to 3 ms, so frames
+    /// land before, during and after a wait. (On Windows, with a receive timeout set, this is
+    /// the race that lost data.)
+    #[test]
+    fn frames_sent_as_the_wait_runs_out_are_never_lost_or_repeated() {
+        const FRAMES: u32 = 2000;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            for i in 0..FRAMES {
+                thread::sleep(Duration::from_micros(u64::from(i % 30) * 100));
+                let r: HostResult = Err(NodeErrorKind::Unhandled {
+                    cause: format!("frame {i}").into(),
+                }
+                .into());
+                ws.send(Message::Binary(bincode::serialize(&r).unwrap().into()))
+                    .unwrap();
+            }
+            // Hold the connection open until the client has everything.
+            while ws.read().is_ok() {}
+        });
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+        socket.set_read_timeout(Duration::from_millis(1)).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        let give_up = Instant::now() + Duration::from_secs(60);
+        let mut timeouts = 0u32;
+        while (got.len() as u32) < FRAMES {
+            assert!(Instant::now() < give_up, "only {} of {FRAMES}", got.len());
+            match socket.recv() {
+                Ok(Err(e)) => got.push(e.to_string()),
+                Ok(Ok(r)) => panic!("an answer that was not sent: {r:?}"),
+                Err(SocketError::Timeout) => timeouts += 1,
+                Err(e) => panic!("the connection was lost after {} frames: {e}", got.len()),
+            }
+        }
+        assert_eq!(got.len() as u32, FRAMES);
+        for (i, text) in got.iter().enumerate() {
+            assert!(text.contains(&format!("frame {i}")), "frame {i} was {text}");
+        }
+        assert!(
+            timeouts > 0,
+            "the waits never ran out, so nothing was raced"
         );
-        assert_eq!(r, SocketError::Timeout);
-        assert!(start.elapsed() >= Duration::from_millis(20));
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A frame that arrives in two parts with a wait that runs out between them is delivered
+    /// whole by a later `recv`: nothing is lost to the timeout in between.
+    #[test]
+    fn a_frame_in_two_parts_across_a_timeout_arrives_whole() {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let ok: HostResult = Ok(HostResponse::Ok);
+        let payload = bincode::serialize(&ok).unwrap();
+        let mut frame = vec![0x82, payload.len() as u8];
+        frame.extend_from_slice(&payload);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let (head, tail) = frame.split_at(2);
+            ws.get_mut().write_all(head).unwrap();
+            ws.get_mut().flush().unwrap();
+            thread::sleep(Duration::from_millis(150));
+            ws.get_mut().write_all(tail).unwrap();
+            ws.get_mut().flush().unwrap();
+            while ws.read().is_ok() {}
+        });
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+        socket.set_read_timeout(Duration::from_millis(30)).unwrap();
+        assert_eq!(socket.recv().unwrap_err(), SocketError::Timeout);
+        socket.set_read_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(socket.recv(), Ok(Ok(HostResponse::Ok))));
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A write while the node is not reading finishes once it does (the frame is kept and
+    /// flushed again), and arrives once and whole.
+    #[test]
+    fn a_write_into_a_full_socket_is_kept_until_the_node_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            // Not reading: the client's sends fill the pipe first.
+            thread::sleep(Duration::from_millis(400));
+            let mut sizes = Vec::new();
+            while let Ok(m) = ws.read() {
+                if let Message::Binary(b) = m {
+                    sizes.push(b.len());
+                }
+            }
+            sizes
+        });
+        let mut socket =
+            NodeSocket::connect_open(&authority, &GrantToken::new("t".into())).unwrap();
+        let big = vec![7u8; 4 * 1024 * 1024];
+        let sent = 6;
+        for _ in 0..sent {
+            socket
+                .write_message(Message::Binary(big.clone().into()))
+                .unwrap();
+        }
+        drop(socket);
+        let sizes = server.join().unwrap();
+        assert_eq!(sizes, vec![big.len(); sent]);
     }
 
     #[test]
@@ -1303,12 +1417,11 @@ mod tests {
         assert!(!should_log_pending(0, None));
     }
 
-    /// Windows only: the real codes. 10035 and 10060 already map to `WouldBlock` and `TimedOut`
-    /// in std; 997 is the one that does not.
+    /// Windows only: the real codes. 10035 and 10060 map to `WouldBlock` and `TimedOut` in
+    /// std; 997 does not, and is a failure.
     #[cfg(windows)]
     #[test]
     fn windows_codes_for_nothing_yet() {
-        let mut streak = PendingStreak::default();
         assert_eq!(
             std::io::Error::from_raw_os_error(10035).kind(),
             ErrorKind::WouldBlock
@@ -1317,22 +1430,14 @@ mod tests {
             std::io::Error::from_raw_os_error(10060).kind(),
             ErrorKind::TimedOut
         );
-        assert_eq!(
-            map_ws_error(io(10035), true, &mut streak),
-            SocketError::Timeout
-        );
-        assert_eq!(
-            map_ws_error(io(10060), true, &mut streak),
-            SocketError::Timeout
-        );
-        assert_eq!(
-            map_ws_error(io(997), true, &mut streak),
-            SocketError::Timeout
-        );
-        assert!(matches!(
-            map_ws_error(io(997), false, &mut streak),
-            SocketError::Failed(_)
-        ));
+        assert_eq!(map_ws_error(io(10035), true), SocketError::Timeout);
+        assert_eq!(map_ws_error(io(10060), true), SocketError::Timeout);
+        for reading in [true, false] {
+            assert!(matches!(
+                map_ws_error(io(997), reading),
+                SocketError::Failed(_)
+            ));
+        }
     }
 
     /// The claim `map_ws_error` relies on: a read that ends in an error halfway through a frame,
