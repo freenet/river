@@ -52,6 +52,9 @@ mod quick_reply;
 #[cfg(test)]
 mod reply_jump_tests;
 pub mod search;
+pub mod settings;
+#[cfg(test)]
+mod settings_tests;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
 #[path = "../../../../ui/src/util/share_link.rs"]
@@ -376,6 +379,8 @@ pub struct Chat {
     notify_dialog: Option<String>,
     /// River's own updates and the settings dialog.
     pub update: crate::update::UpdateUi,
+    /// The settings dialog: whether it is open and which section it shows.
+    pub settings: settings::SettingsUi,
     /// The quick switcher (Ctrl+K), when open ([`switcher`]).
     pub switcher: Option<switcher::Switcher>,
     /// The message search panel (Ctrl+F), when open ([`search`]).
@@ -537,6 +542,7 @@ impl Chat {
             chord_at: None,
             node: Default::default(),
             update: Default::default(),
+            settings: Default::default(),
         };
         chat.set_rooms(rooms);
         chat
@@ -1114,6 +1120,7 @@ impl Chat {
             || self.background.as_ref().is_some_and(|b| b.open)
             || self.status.open
             || self.dnd.open
+            || self.settings.open
             || self.overview
             || self.shortcuts_open
             || self.link_menu.is_some()

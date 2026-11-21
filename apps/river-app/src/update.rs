@@ -287,8 +287,6 @@ pub struct UpdateUi {
     pub version: String,
     /// Download and prepare updates by themselves.
     pub auto: bool,
-    /// The settings dialog is open.
-    pub settings_open: bool,
     /// A rollback or a node change worth telling the person, in the settings and as a note.
     pub notice: Option<String>,
     /// The Freenet node's version, and whether it changed while River was open.
@@ -317,7 +315,6 @@ impl Default for UpdateUi {
             support: UpdateSupport::Unavailable("River can't update itself here.".into()),
             version: env!("CARGO_PKG_VERSION").into(),
             auto: true,
-            settings_open: false,
             notice: None,
             node_version: None,
             node_note: None,
@@ -919,9 +916,14 @@ mod tests {
         assert!(rt.find("settings-body").is_none());
         press(&mut rt, "settings");
         assert!(shows(&rt, "River 0.1.0"));
-        assert!(shows(&rt, "Freenet 0.2.160"));
         assert!(shows(&rt, "River is up to date"));
+        // Freenet's version is in the Connection section.
+        assert!(!shows(&rt, "Freenet updates itself"));
+        press(&mut rt, "settings-section-connection");
+        assert!(shows(&rt, "Freenet version"));
+        assert!(shows(&rt, "0.2.160"));
         assert!(shows(&rt, "Freenet updates itself"));
+        press(&mut rt, "settings-section-updates");
         assert!(rt.state.chat.update.auto, "on by default");
 
         press(&mut rt, "settings-auto");
@@ -952,7 +954,7 @@ mod tests {
         s.chat.update.support = UpdateSupport::External(
             "River is installed with Flatpak. Update it with `flatpak update`.".into(),
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
         let mut rt = render(s);
         assert!(shows(&rt, "flatpak update"));
         let before = rt.state.chat.update.auto;
@@ -967,15 +969,16 @@ mod tests {
     #[test]
     fn the_settings_explain_an_update_failure_and_a_node_that_updated() {
         let mut s = connected();
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
         s.chat.update.status = UpdateStatus::Failed("the update manifest has expired".into());
         s.chat.update.node_note =
             Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
-        let rt = render(s);
+        let mut rt = render(s);
         assert!(shows(
             &rt,
             "Couldn't update: the update manifest has expired"
         ));
+        press(&mut rt, "settings-section-connection");
         assert!(shows(&rt, "Freenet updated itself from 0.2.158 to 0.2.160"));
     }
 
@@ -1071,6 +1074,50 @@ mod tests {
         press(&mut rt, "update-restart-anyway");
         let _ = settle(&ctl, &rx);
         assert_eq!(host.restarts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn restart_from_settings_asks_inside_the_dialog_and_answers_work() {
+        for (size, narrow) in [((1280.0, 800.0), false), ((820.0, 720.0), true)] {
+            let host = Arc::new(FakeHost::new(UpdateSupport::Automatic, vec![]));
+            let (mut s, rx, ctl) = ready_app(host.clone());
+            s.chat.update.support = UpdateSupport::Automatic;
+            s.chat.composer = rune::TextEdit::new("half a thought");
+            let env = Env {
+                system_dark: true,
+                scale: 1.0,
+            };
+            let mut rt = Runtime::new(s, view, size, env);
+            rt.frame(0.0);
+            rt.frame(1.0 / 60.0);
+            press(&mut rt, "settings");
+            if narrow {
+                press(&mut rt, "settings-section-updates");
+            }
+            press(&mut rt, "settings-restart");
+            // The question is in the dialog (a key can be found once: not also behind it).
+            assert!(rt.state.chat.update.confirm_restart.is_some());
+            assert!(rt.find("settings-dialog").is_some());
+            assert!(shows(
+                &rt,
+                "You have text you have not sent. Restart anyway?"
+            ));
+            // Pressing reaches the buttons (a press on the room list behind the modal would
+            // only close the dialog), and the room list does not repeat the question.
+            assert!(rt.find("update-wait").is_some() && rt.find("update-restart-anyway").is_some());
+            assert_eq!(host.restarts.load(Ordering::SeqCst), 0);
+            press(&mut rt, "update-wait");
+            assert!(rt.state.chat.update.confirm_restart.is_none());
+            assert!(
+                rt.find("settings-dialog").is_some(),
+                "Wait keeps the dialog"
+            );
+            assert_eq!(host.restarts.load(Ordering::SeqCst), 0);
+            press(&mut rt, "settings-restart");
+            press(&mut rt, "update-restart-anyway");
+            let _ = settle(&ctl, &rx);
+            assert_eq!(host.restarts.load(Ordering::SeqCst), 1, "narrow: {narrow}");
+        }
     }
 
     #[test]

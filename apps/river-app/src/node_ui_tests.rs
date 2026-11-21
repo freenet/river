@@ -44,6 +44,10 @@ impl NodeHost for Host {
 }
 
 fn app_with(setup: Setup, access: Access) -> (Runtime<RiverApp>, Arc<Host>) {
+    app_sized(setup, access, (900.0, 700.0))
+}
+
+fn app_sized(setup: Setup, access: Access, size: (f32, f32)) -> (Runtime<RiverApp>, Arc<Host>) {
     let host = Arc::new(Host::default());
     let ctl = Controller::reporting_to(host.clone(), |_| {});
     let state = RiverApp {
@@ -56,7 +60,7 @@ fn app_with(setup: Setup, access: Access) -> (Runtime<RiverApp>, Arc<Host>) {
         system_dark: true,
         scale: 1.0,
     };
-    let mut rt = Runtime::new(state, view, (900.0, 700.0), env);
+    let mut rt = Runtime::new(state, view, size, env);
     rt.frame(0.0);
     rt.frame(1.0 / 60.0);
     (rt, host)
@@ -64,11 +68,16 @@ fn app_with(setup: Setup, access: Access) -> (Runtime<RiverApp>, Arc<Host>) {
 
 /// A window on the rooms from a node, as the live app shows them.
 fn rooms_app() -> (Runtime<RiverApp>, Arc<Host>) {
-    let (mut rt, host) = app_with(
+    rooms_app_sized((900.0, 700.0))
+}
+
+fn rooms_app_sized(size: (f32, f32)) -> (Runtime<RiverApp>, Arc<Host>) {
+    let (mut rt, host) = app_sized(
         Setup::Connected {
             version: "0.2.156".into(),
         },
         Access::Ready,
+        size,
     );
     rt.update(|s, tx| {
         s.chat.source = chat::Source::Node(LinkStatus::Live);
@@ -249,15 +258,29 @@ fn a_node_the_person_has_is_never_offered_an_install() {
     assert!(shows(&rt, "Nothing answered at x:1."));
 }
 
+/// Open the change-node form the way a connected person does: Settings, Connection, Change node.
+fn change_node_from_settings(rt: &mut Runtime<RiverApp>) {
+    press(rt, "settings");
+    press(rt, "settings-section-connection");
+    press(rt, "settings-node-change");
+}
+
 #[test]
-fn the_rooms_screen_has_a_node_entry_that_opens_the_form() {
+fn while_connected_the_footer_is_only_the_status_and_settings_has_change_node() {
     let (mut rt, _) = rooms_app();
-    assert!(rt.find("node-entry").is_some());
-    assert!(shows(&rt, "Node: 127.0.0.1:7509"));
-    // The default node reads as it always has.
+    // The default node reads as it always has, with no second row and no button.
     assert!(shows(&rt, "Connected"));
     assert!(!shows(&rt, "Connected to"));
-    press(&mut rt, "node-change");
+    assert!(rt.find("node-change").is_none());
+    assert!(rt.find("node-entry").is_none());
+    assert!(rt.find("node-address").is_none());
+    assert!(!shows(&rt, "Node: "));
+    assert!(rt.find("connection-pill").is_some());
+    // The address and the way to change it are in Settings.
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-connection");
+    assert!(shows(&rt, "127.0.0.1:7509"));
+    press(&mut rt, "settings-node-change");
     assert!(rt.find("node-input").is_some());
     // Over the rooms, not replacing them.
     assert!(rt.find("rooms").is_some());
@@ -266,25 +289,224 @@ fn the_rooms_screen_has_a_node_entry_that_opens_the_form() {
 }
 
 #[test]
-fn a_node_that_is_not_the_default_is_named_beside_the_connection() {
+fn the_footer_never_shows_the_nodes_address_and_says_remote_in_a_word() {
     let (mut rt, _) = rooms_app();
-    rt.update(|s, _| {
-        s.chat.node.choice = NodeChoice::saved(NodeAddress::parse("localhost:40302").unwrap());
+    for (address, remote) in [
+        ("127.0.0.1:7509", false),
+        ("localhost:40302", false),
+        ("home.example.org:7509", true),
+    ] {
+        for (status, plain) in [
+            (LinkStatus::Live, "Connected"),
+            (LinkStatus::Loading, "Connecting..."),
+            (LinkStatus::Reconnecting, "Disconnected"),
+        ] {
+            rt.update(move |s, _| {
+                s.chat.node.choice = NodeChoice::saved(NodeAddress::parse(address).unwrap());
+                s.chat.source = chat::Source::Node(status);
+            });
+            rt.frame(0.4);
+            let want = if remote {
+                format!("{plain} (remote)")
+            } else {
+                plain.to_owned()
+            };
+            assert!(shows(&rt, &want), "{address} {status:?}: {want}");
+            let host = address.split(':').next().unwrap();
+            assert!(!shows(&rt, host), "{address} {status:?} shows the address");
+            assert!(!shows(&rt, "Node: "));
+            assert_eq!(
+                rt.find("node-change").is_some(),
+                status != LinkStatus::Live,
+                "{address} {status:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_quiet_link_is_there_when_not_connected_and_opens_the_form() {
+    for source in [
+        chat::Source::Example,
+        chat::Source::Node(LinkStatus::Loading),
+        chat::Source::Node(LinkStatus::Reconnecting),
+    ] {
+        let (mut rt, _) = rooms_app();
+        rt.update(move |s, _| s.chat.source = source);
+        rt.frame(0.4);
+        assert!(rt.find("node-change").is_some(), "{source:?}");
+        assert!(shows(&rt, "Change node"), "{source:?}");
+        assert!(rt.find("node-address").is_none(), "{source:?}");
+        press(&mut rt, "node-change");
+        assert!(rt.find("node-input").is_some(), "{source:?}");
+    }
+}
+
+/// The rectangle of the element keyed `key`.
+fn rect_of(rt: &Runtime<RiverApp>, key: &str) -> Option<[f32; 4]> {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key))
+        .map(|e| e.rect)
+}
+
+const SIZES: [(f32, f32); 2] = [(1280.0, 800.0), (820.0, 720.0)];
+
+fn set_node(rt: &mut Runtime<RiverApp>, address: &str, source: chat::Source) {
+    let a = address.to_owned();
+    rt.update(move |s, _| {
+        s.chat.node.choice = NodeChoice::saved(NodeAddress::parse(&a).unwrap());
+        s.chat.source = source;
     });
-    rt.frame(0.3);
-    assert!(shows(&rt, "Connected to localhost:40302"));
-    assert!(shows(&rt, "Node: localhost:40302"));
-    for (status, words) in [
-        (LinkStatus::Loading, "Connecting to localhost:40302..."),
-        (
+    rt.frame(0.4);
+}
+
+/// For a node on this computer the status is one line in every state, so the footer does not
+/// move at all when the connection state changes (wide and narrow).
+#[test]
+fn the_footer_of_a_local_node_does_not_move_between_connection_states() {
+    for size in SIZES {
+        let (mut rt, _) = rooms_app_sized(size);
+        let keys = ["enter-invite", "import-id", "dnd", "connection-row"];
+        let rects = |rt: &Runtime<RiverApp>| -> Vec<[f32; 4]> {
+            keys.iter()
+                .map(|k| rect_of(rt, k).unwrap_or_else(|| panic!("no {k}")))
+                .collect()
+        };
+        set_node(
+            &mut rt,
+            "127.0.0.1:7509",
+            chat::Source::Node(LinkStatus::Live),
+        );
+        let live = rects(&rt);
+        for status in [
+            LinkStatus::Loading,
             LinkStatus::Reconnecting,
-            "Disconnected from localhost:40302",
+            LinkStatus::Live,
+        ] {
+            set_node(&mut rt, "127.0.0.1:7509", chat::Source::Node(status));
+            // Equal to a hundredth of a point (text layout rounds a line's height).
+            for (a, b) in rects(&rt).iter().flatten().zip(live.iter().flatten()) {
+                assert!((a - b).abs() < 0.05, "{size:?} {status:?}");
+            }
+        }
+    }
+}
+
+/// With more to say (example rooms, a node on another computer with its warning box) the
+/// footer legitimately grows upward. What must hold: the three buttons keep their order and the
+/// spacing between them and the status row, the status row stays above its warning, and
+/// nothing leaves the footer or the window.
+#[test]
+fn a_taller_footer_keeps_its_order_and_spacing_and_stays_inside() {
+    // The smallest window the app opens at is included: the room list must keep a visible part.
+    for size in [SIZES[0], SIZES[1], (640.0, 480.0)] {
+        let (mut rt, _) = rooms_app_sized(size);
+        set_node(
+            &mut rt,
+            "127.0.0.1:7509",
+            chat::Source::Node(LinkStatus::Live),
+        );
+        let r =
+            |rt: &Runtime<RiverApp>, k: &str| rect_of(rt, k).unwrap_or_else(|| panic!("no {k}"));
+        let spacing = |rt: &Runtime<RiverApp>| {
+            let (e, i, d, c) = (
+                r(rt, "enter-invite"),
+                r(rt, "import-id"),
+                r(rt, "dnd"),
+                r(rt, "connection-row"),
+            );
+            [i[1] - e[1], d[1] - i[1], c[1] - d[1]]
+        };
+        let base = spacing(&rt);
+        let cases: [(&str, chat::Source, bool); 4] = [
+            ("127.0.0.1:7509", chat::Source::Example, false),
+            (
+                "home.example.org:7509",
+                chat::Source::Node(LinkStatus::Live),
+                true,
+            ),
+            (
+                "home.example.org:7509",
+                chat::Source::Node(LinkStatus::Loading),
+                true,
+            ),
+            (
+                "home.example.org:7509",
+                chat::Source::Node(LinkStatus::Reconnecting),
+                true,
+            ),
+        ];
+        for (address, source, boxed) in cases {
+            set_node(&mut rt, address, source);
+            let what = format!("{size:?} {address} {source:?}");
+            for (a, b) in spacing(&rt).iter().zip(base) {
+                assert!((a - b).abs() < 0.05, "{what}: spacing {a} vs {b}");
+            }
+            let footer = r(&rt, "rooms-footer");
+            let row = r(&rt, "connection-row");
+            assert!(row[1] + row[3] <= footer[1] + footer[3] + 0.5, "{what}");
+            assert!(
+                footer[1] + footer[3] <= size.1 + 0.5,
+                "{what}: past the window"
+            );
+            assert!(footer[1] >= 0.0, "{what}: above the window");
+            let list = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("room-list"))
+                .expect("the room list");
+            assert!(
+                list.visible[3] >= 40.0,
+                "{what}: the room list is squeezed out"
+            );
+            assert_eq!(rect_of(&rt, "node-insecure").is_some(), boxed, "{what}");
+            if boxed {
+                let b = r(&rt, "node-insecure");
+                assert!(b[1] >= row[1] + row[3] - 0.5, "{what}: box above the row");
+                assert!(
+                    b[1] + b[3] <= footer[1] + footer[3] + 0.5,
+                    "{what}: box clipped"
+                );
+                assert!(b[0] >= footer[0] && b[0] + b[2] <= footer[0] + footer[2] + 0.5);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_status_names_its_state_for_a_screen_reader() {
+    let (mut rt, _) = rooms_app();
+    for (address, source, name) in [
+        (
+            "127.0.0.1:7509",
+            chat::Source::Node(LinkStatus::Live),
+            "Node status: Connected",
+        ),
+        (
+            "127.0.0.1:7509",
+            chat::Source::Node(LinkStatus::Reconnecting),
+            "Node status: Disconnected",
+        ),
+        (
+            "home.example.org:7509",
+            chat::Source::Node(LinkStatus::Live),
+            "Node status: Connected (remote)",
+        ),
+        (
+            "127.0.0.1:7509",
+            chat::Source::Example,
+            "Node status: Example rooms, not connected to Freenet",
         ),
     ] {
-        rt.update(move |s, _| s.chat.note_status(status));
-        rt.update(move |s, _| s.chat.source = chat::Source::Node(status));
-        rt.frame(0.4);
-        assert!(shows(&rt, words), "{words}");
+        set_node(&mut rt, address, source);
+        let pill = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("connection-pill"))
+            .expect("the pill");
+        assert_eq!(pill.role, "button");
+        assert_eq!(pill.label.as_deref(), Some(name));
     }
 }
 
@@ -292,7 +514,7 @@ fn a_node_that_is_not_the_default_is_named_beside_the_connection() {
 fn changing_the_node_says_what_it_means_and_replaces_the_rooms_only_when_confirmed() {
     let (mut rt, host) = rooms_app();
     assert!(shows(&rt, "Town Square"));
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     type_address(&mut rt, "localhost:40302");
     press(&mut rt, "node-connect");
     // On this computer, so no network warning, but the change is explained.
@@ -320,7 +542,7 @@ fn changing_the_node_says_what_it_means_and_replaces_the_rooms_only_when_confirm
 #[test]
 fn changing_to_a_node_on_another_machine_shows_both_notes() {
     let (mut rt, _) = rooms_app();
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     type_address(&mut rt, "home.example.org");
     press(&mut rt, "node-connect");
     assert!(rt.find("node-warning").is_some());
@@ -347,7 +569,7 @@ fn going_back_to_the_freenet_on_this_computer() {
         s.access = Access::Ready;
     });
     rt.frame(0.3);
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     press(&mut rt, "node-use-local");
     assert_eq!(node_of(&rt), NodeChoice::local());
     assert!(!rt.state.ctl.as_ref().unwrap().node().is_existing_node());
@@ -368,7 +590,7 @@ fn a_node_given_on_the_command_line_says_so_in_the_form() {
             source: Source::Flag,
         };
     });
-    press(&mut rt, "node-change");
+    change_node_from_settings(&mut rt);
     assert!(rt.find("node-override-note").is_some());
     assert!(shows(&rt, "--node"));
     // The field starts with the address in use, to edit.

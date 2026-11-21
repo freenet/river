@@ -121,11 +121,19 @@ pub static IMPORT: Icon = Icon {
     body: r#"<path d="M12 3v12M7 10l5 5 5-5M5 21h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-/// A gear: the settings button.
+/// A gear with eight teeth and a hub: the settings button. (The first version, a circle with
+/// eight short spokes, read as a brightness control.)
 pub static GEAR: Icon = Icon {
     name: "river-gear",
     view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#,
+    body: r#"<path d="M6.48 3.03 L6.95 1.38 L9.05 1.38 L9.52 3.03 L10.44 3.41 L11.94 2.58 L13.42 4.06 L12.59 5.56 L12.97 6.48 L14.62 6.95 L14.62 9.05 L12.97 9.52 L12.59 10.44 L13.42 11.94 L11.94 13.42 L10.44 12.59 L9.52 12.97 L9.05 14.62 L6.95 14.62 L6.48 12.97 L5.56 12.59 L4.06 13.42 L2.58 11.94 L3.41 10.44 L3.03 9.52 L1.38 9.05 L1.38 6.95 L3.03 6.48 L3.41 5.56 L2.58 4.06 L4.06 2.58 L5.56 3.41Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/><circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.3" fill="none"/>"#,
+};
+
+/// A chevron pointing right: a row that opens a screen.
+pub static CHEVRON_RIGHT: Icon = Icon {
+    name: "river-chevron-right",
+    view: 16.0,
+    body: r#"<path d="M6 3.5 10.5 8 6 12.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 /// A window with its corner tucked behind it, for "Background and startup" (a 24 point grid).

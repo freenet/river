@@ -1499,7 +1499,7 @@ pub const SCENES: &[Scene] = &[
     ("chat-settings", |s| {
         connect(s);
         update_scene(s, true, UpdateStatus::UpToDate);
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
     }),
     ("chat-settings-ready", |s| {
         connect(s);
@@ -1510,7 +1510,7 @@ pub const SCENES: &[Scene] = &[
                 version: "0.2.0".into(),
             },
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
         s.chat.update.node_note =
             Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
     }),
@@ -1520,7 +1520,7 @@ pub const SCENES: &[Scene] = &[
         s.chat.update.support = UpdateSupport::External(
             "River was installed by your package manager, which updates it.".into(),
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
     }),
     ("chat-settings-update-failed", |s| {
         connect(s);
@@ -1529,7 +1529,82 @@ pub const SCENES: &[Scene] = &[
             true,
             UpdateStatus::Failed("the update manifest's signature is not valid".into()),
         );
-        s.chat.update.settings_open = true;
+        s.chat.settings.open();
+    }),
+    ("chat-settings-updates", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("chat-settings-connection", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
+        s.chat.settings.open_at(chat::settings::Section::Connection);
+    }),
+    ("chat-settings-connection-remote", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        use_node(s, "192.168.1.20:7509");
+        s.chat.settings.open_at(chat::settings::Section::Connection);
+    }),
+    ("chat-settings-updates-narrow", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("chat-settings-connection-narrow", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.settings.open_at(chat::settings::Section::Connection);
+    }),
+    ("chat-settings-list-narrow", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
+        s.chat.settings.open();
+    }),
+    ("chat-settings-updates-notice", |s| {
+        connect(s);
+        update_scene(s, true, UpdateStatus::UpToDate);
+        s.chat.update.notice = Some(
+            "River 0.2.0 did not start (the new River exited at once), so River went back to \
+             0.1.0."
+                .into(),
+        );
+        s.chat.update.node_note =
+            Some("Freenet updated itself from 0.2.158 to 0.2.160 while River was open.".into());
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("chat-settings-restart-confirm", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            },
+        );
+        s.chat.update.confirm_restart = Some(
+            "2 messages or changes are still being sent. You have text you have not sent.".into(),
+        );
+        s.chat.settings.open_at(chat::settings::Section::Updates);
+    }),
+    ("chat-settings-restart-confirm-narrow", |s| {
+        connect(s);
+        update_scene(
+            s,
+            true,
+            UpdateStatus::Ready {
+                version: "0.2.0".into(),
+            },
+        );
+        s.chat.update.confirm_restart = Some(
+            "2 messages or changes are still being sent. You have text you have not sent.".into(),
+        );
+        s.chat.settings.open_at(chat::settings::Section::Updates);
     }),
     ("chat-members-hidden", |s| {
         connect(s);
@@ -1912,6 +1987,18 @@ pub const SCENES: &[Scene] = &[
         connect(s);
         s.chat.source = chat::Source::Node(chat::LinkStatus::Loading);
     }),
+    // The longest footer: a node on another computer, disconnected, with its warning.
+    ("chat-connection-lost-remote-narrow", |s| {
+        connect(s);
+        use_node(s, "home.example.org:7509");
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
+    }),
+    ("chat-connection-remote-zoom-200", |s| {
+        connect(s);
+        use_node(s, "home.example.org:7509");
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
+        s.chat.zoom.load(200);
+    }),
     ("chat-connection-lost", |s| {
         connect(s);
         s.chat.source = chat::Source::Node(chat::LinkStatus::Reconnecting);
@@ -2001,10 +2088,6 @@ pub const SCENES: &[Scene] = &[
         s.chat.node.notice = Some(
             "Your saved node address http://x/ is not valid; using this computer's Freenet.".into(),
         );
-    }),
-    ("chat-node-entry", |s| {
-        node_change_scene(s, Some("localhost:40302"), None);
-        s.chat.node.close();
     }),
     ("chat-node-change", |s| {
         node_change_scene(s, Some("localhost:40302"), None)
@@ -2930,7 +3013,7 @@ fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
         }
     };
     // A node that is not on this computer is said on every screen, at every start.
-    let banners = chat::node_ui::banners(&s.chat.node, &palette);
+    let banners = chat::node_ui::banners(&s.chat.node, true, &palette);
     let mut root = col()
         .key("root")
         .w_full()
@@ -4900,6 +4983,7 @@ mod tests {
         assert!(rt.find("node-status-dialog").is_none());
         // From Settings.
         press(&mut rt, "settings");
+        press(&mut rt, "settings-section-connection");
         press(&mut rt, "settings-node-status");
         assert!(rt.find("node-status-dialog").is_some());
         assert!(rt.find("settings-dialog").is_none());

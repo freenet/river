@@ -91,20 +91,26 @@ fn the_connection_dot_follows_the_link_status() {
     use super::view::connection_pill;
     use super::{LinkStatus::*, Source};
     let p = super::style::palette();
-    let words = |s| connection_pill(s, None, &p).text;
+    let words = |s| connection_pill(s, false, &p).text;
     assert_eq!(words(Source::Node(Live)), "Connected");
     assert_eq!(words(Source::Node(Loading)), "Connecting...");
     assert_eq!(words(Source::Node(Reconnecting)), "Disconnected");
-    assert_eq!(connection_pill(Source::Node(Live), None, &p).dot, p.success);
     assert_eq!(
-        connection_pill(Source::Node(Loading), None, &p).dot,
+        connection_pill(Source::Node(Live), false, &p).dot,
+        p.success
+    );
+    assert_eq!(
+        connection_pill(Source::Node(Loading), false, &p).dot,
         p.warning
     );
     assert_eq!(
-        connection_pill(Source::Node(Reconnecting), None, &p).dot,
+        connection_pill(Source::Node(Reconnecting), false, &p).dot,
         p.error
     );
-    assert_eq!(connection_pill(Source::Example, None, &p).dot, p.text_muted);
+    assert_eq!(
+        connection_pill(Source::Example, false, &p).dot,
+        p.text_muted
+    );
     // Each state is on screen, with its dot and a tooltip.
     for (status, text) in [
         (Live, "Connected"),
@@ -6455,7 +6461,8 @@ mod rune_bump {
     /// keyboard, the thread's box takes it and Escape gives it back to the composer; Rune's
     /// focus agrees at each step. Opened by a click on its row the composer has already lost
     /// the keyboard to the click, so nothing is handed back and Rune puts the keyboard on the
-    /// first control it can (the connection pill), which River's flag also reports as not the
+    /// control it can (see the assertion: the "Change node" link when the connection is not
+    /// live, the connection pill when it is), which River's flag also reports as not the
     /// composer.
     #[test]
     fn a_dm_thread_takes_the_keyboard_and_gives_it_back_as_documented() {
@@ -6492,7 +6499,19 @@ mod rune_bump {
         settle_frames(&mut rt);
         assert!(rt.find("dm-thread").is_none());
         assert!(!rt.state.chat.composer.focused);
-        assert_eq!(rune_focus(&mut rt).as_deref(), Some("connection-pill"));
+        // Rune puts the keyboard on a control of the footer's connection row, and which one
+        // follows from the source: the quiet "Change node" link exists in every state but a
+        // live connection, and then the pill is the row's only control.
+        let expected = match rt.state.chat.source {
+            crate::chat::Source::Node(crate::chat::LinkStatus::Live) => "connection-pill",
+            _ => "node-change",
+        };
+        assert_eq!(
+            rune_focus(&mut rt).as_deref(),
+            Some(expected),
+            "source {:?}",
+            rt.state.chat.source
+        );
         assert_composer_focus_agrees(&mut rt, "after a click-opened thread closes");
     }
 

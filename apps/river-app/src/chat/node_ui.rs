@@ -67,13 +67,6 @@ impl NodeUi {
         self.form = None;
     }
 
-    /// The address to show beside the connection state: only when it is not the default, so the
-    /// common case reads as it always has.
-    pub fn label(&self) -> Option<String> {
-        (!self.choice.address.is_default() || self.choice.is_existing_node())
-            .then(|| self.choice.address.authority())
-    }
-
     /// What to say, however the node was chosen and at every start, when it is not on this
     /// computer: the warning that goes with such a node.
     pub fn insecure(&self) -> Option<String> {
@@ -314,39 +307,46 @@ pub(super) fn node_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
 /// The lines under the connection state about the node in use: why it can't be trusted with
 /// more than a tunnel, and anything the app had to say at start. Empty for the node on this
 /// computer.
-pub fn banners(node: &NodeUi, _p: &Palette) -> Vec<El> {
+pub fn banners(node: &NodeUi, with_address: bool, _p: &Palette) -> Vec<El> {
     let mut out = Vec::new();
     if let Some(n) = &node.notice {
         out.push(notice_text(NoticeKind::Info, "node-notice", n));
     }
     if let Some(w) = node.insecure() {
+        // The room list's footer never shows the address (it is in Settings), so its warning
+        // is the same words without it.
+        let w = if with_address {
+            w
+        } else {
+            "This node is on another computer: not encrypted, no login. Use an SSH tunnel or a \
+             VPN."
+                .to_owned()
+        };
         out.push(notice_text(NoticeKind::Warning, "node-insecure", &w));
     }
     out
 }
 
-/// The "Node" entry under the connection state: the address in use, and a way to change it.
-pub(super) fn node_entry(chat: &Chat, p: &Palette, k: &Kit) -> El {
+/// The quiet "Change node" link at the end of the connection row, shown only while River is
+/// not connected (connecting, disconnected, or showing example rooms). While connected the
+/// address and the way to change it are in Settings, Connection.
+pub(super) fn change_link(p: &Palette) -> El {
     row()
-        .key("node-entry")
-        .w_full()
-        .gap(8.0)
-        .center_y()
-        .child(
-            label(
-                format!("Node: {}", chat.node.choice.address),
-                st::SMALL,
-                p.text_muted,
-            )
-            .key("node-address")
-            .wrap()
-            .grow(1.0),
-        )
-        .child(
-            Button::new("Change")
-                .variant(ButtonVariant::Ghost)
-                .on_press(|s: &mut RiverApp| s.node_open())
-                .build(k)
-                .key("node-change"),
-        )
+        .key("node-change")
+        .role("button")
+        .label("Change node")
+        .help("Use a different Freenet node")
+        .focusable(true)
+        .py(6.0)
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut RiverApp| s.node_open())
+        // Space presses a focused control; Enter does too, as on a button.
+        .on_key(|s: &mut RiverApp, ev, _| {
+            let enter = ev.key == rune::Key::Enter;
+            if enter {
+                s.node_open();
+            }
+            enter
+        })
+        .child(label("Change node", st::SMALL, p.accent))
 }
