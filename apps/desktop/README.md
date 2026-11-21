@@ -2,7 +2,8 @@
 
 This is a native desktop app for [River](../../README.md), the decentralized group chat that runs on
 [Freenet](https://freenet.org). It is built on the Rune GPU UI toolkit and is separate from the web
-UI: it talks to your Freenet node directly and reads the same rooms and identity the web UI uses.
+UI: it talks to your Freenet node directly, and it uses the same rooms, invite codes and identity
+export format as the web UI.
 
 It is an early version that you build from source today. It already covers rooms, messages, replies,
 reactions, direct messages, invitations, search, notifications with Do not disturb, running in the
@@ -84,10 +85,9 @@ a VPN, and point River at the local end of the tunnel.
 2. **Permission.** The first time, River asks the node for permission to open your rooms. Press the
    button in the app. It opens a page in your browser on your node's own address, not on River.
    Choose Allow there. Your node must be Freenet 0.2.156 or newer.
-3. **Identity and rooms.** River keeps your rooms and identity in your Freenet node, in the same place
-   the web UI does. If you have used River in your browser, open it there once and your rooms show up
-   in the app. To bring an identity over explicitly, use **Import ID** in the footer of the room list
-   and paste the token from **Export ID** in the web UI (or the app).
+3. **Identity and rooms.** River keeps your rooms and identity in your Freenet node. To bring an
+   identity over from the web UI, use **Export ID** there, then **Import ID** in the footer of the
+   room list in the app, and paste the token.
 4. **Join a room.** Choose **Enter invite code**, paste an invite code or link, and press Join room.
    You can also create a room with the plus button.
 
