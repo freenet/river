@@ -171,8 +171,8 @@ fn pressing_the_strip_centres_the_original_and_marks_it() {
     let id = id_of(&rt, "long-10");
     rt.update(move |s, _| {
         s.chat.reply_jump(id, t0);
-        assert!(s.chat.tick_flash(t0 + super::search::FLASH_FOR / 2));
-        assert!(!s.chat.tick_flash(t0 + super::search::FLASH_FOR));
+        assert!(s.chat.tick_flash(t0 + super::search::REPLY_FLASH_FOR / 2));
+        assert!(!s.chat.tick_flash(t0 + super::search::REPLY_FLASH_FOR));
     });
 }
 
@@ -362,4 +362,161 @@ fn a_reply_to_the_newest_message_jumps_without_error() {
     let v = view_rect(&rt);
     let c = centre_of(&rt, "long-59");
     assert!(c >= v[1] && c <= v[1] + v[3], "visible");
+}
+
+fn focus_strip(rt: &mut Runtime<RiverApp>, msg: &str) {
+    for _ in 0..80 {
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(0.3);
+        if rt
+            .elements()
+            .into_iter()
+            .any(|e| e.focused && e.path.ends_with(&format!("msg-{msg}/reply")))
+        {
+            return;
+        }
+    }
+    panic!("Tab never reached the strip");
+}
+
+#[test]
+fn tabbing_to_the_strip_shows_the_focus_ring() {
+    let mut rt = long_room(|_| {});
+    focus_strip(&mut rt, "reply-first");
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.focused && e.path.ends_with("msg-reply-first/reply"))
+        .unwrap();
+    assert!(e.focus_visible, "keyboard focus is drawn");
+}
+
+#[test]
+fn a_reply_to_the_very_first_message_jumps_there() {
+    let mut rt = long_room(|rooms| {
+        // Quote the oldest message from the first reply.
+        let r = rooms.iter_mut().find(|r| r.key == "town-square").unwrap();
+        let first = r.messages.first().unwrap().clone();
+        let reply = r
+            .messages
+            .iter_mut()
+            .find(|m| m.key == "reply-first")
+            .unwrap();
+        reply.reply_to = Some(super::ReplyTo {
+            message: first.id,
+            author: first.author,
+            preview: super::model::preview(&first.text, 100),
+        });
+    });
+    let first = rt.state.chat.room().unwrap().messages[0].key.clone();
+    click(&mut rt, &strip("reply-first"));
+    assert_eq!(rt.state.chat.flashing(), Some(first.as_str()));
+    let v = view_rect(&rt);
+    let c = centre_of(&rt, &first);
+    assert!(
+        c >= v[1] && c <= v[1] + v[3],
+        "the oldest message is in view"
+    );
+}
+
+#[test]
+fn a_target_taller_than_the_view_is_brought_into_view_from_its_top() {
+    let mut rt = long_room(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == "town-square").unwrap();
+        let m = r.messages.iter_mut().find(|m| m.key == "long-10").unwrap();
+        m.text = (0..80)
+            .map(|i| format!("tall line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        m.md = m.text.clone();
+    });
+    click(&mut rt, &strip("reply-first"));
+    let v = view_rect(&rt);
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some("row-long-10"))
+        .expect("drawn");
+    assert!(e.rect[3] > v[3], "the message is taller than the view");
+    // As the web UI: the top of the message is in view, not its middle.
+    assert!(
+        e.rect[1] >= v[1] - 8.0 && e.rect[1] < v[1] + v[3] / 2.0,
+        "its top ({}) is in the upper half of the view {v:?}",
+        e.rect[1]
+    );
+}
+
+#[test]
+fn an_arrival_after_a_jump_near_the_end_leaves_the_target_in_view() {
+    let mut rt = long_room(|_| {});
+    click(&mut rt, &strip("reply-newest"));
+    rt.update(|s, _| {
+        s.chat.edit_rooms(|rooms| {
+            let r = rooms.iter_mut().find(|r| r.key == "town-square").unwrap();
+            let mut m = r.messages.last().unwrap().clone();
+            m.key = "arrival".into();
+            m.id = r.messages.len() as u32 + 50;
+            m.time += 500;
+            m.text = "a new message".into();
+            m.md = m.text.clone();
+            m.reply_to = None;
+            r.messages.push(m);
+        });
+    });
+    settle(&mut rt);
+    let v = view_rect(&rt);
+    let c = centre_of(&rt, "long-59");
+    assert!(c >= v[1] && c <= v[1] + v[3], "the target is still in view");
+}
+
+#[test]
+fn a_press_with_three_points_of_travel_still_jumps() {
+    let mut rt = long_room(|_| {});
+    let target = "long-10".to_owned();
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.path.ends_with("msg-reply-first/reply"))
+        .unwrap();
+    let (x, y) = (e.rect[0] + 20.0, e.rect[1] + e.rect[3] / 2.0);
+    rt.pointer_down(x, y);
+    rt.pointer_move(x + 3.0, y);
+    rt.pointer_up(x + 3.0, y);
+    settle(&mut rt);
+    drive_reveal(&mut rt);
+    assert_eq!(rt.state.chat.flashing(), Some(target.as_str()));
+}
+
+#[test]
+fn a_cancelled_drag_does_not_swallow_the_next_key_press() {
+    let mut rt = long_room(|_| {});
+    let e = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.path.ends_with("msg-reply-first/reply"))
+        .unwrap();
+    let (x, y) = (e.rect[0] + 20.0, e.rect[1] + e.rect[3] / 2.0);
+    rt.pointer_down(x, y);
+    rt.pointer_move(x + 60.0, y);
+    // Escape and losing the window's focus both cancel a held drag.
+    rt.key(KeyEvent {
+        key: Key::Escape,
+        mods: Default::default(),
+    });
+    rt.window_focus(false);
+    rt.window_focus(true);
+    rt.pointer_up(x + 60.0, y);
+    settle(&mut rt);
+    assert_eq!(rt.state.chat.flashing(), None, "a drag is not a click");
+    focus_strip(&mut rt, "reply-first");
+    rt.key(KeyEvent {
+        key: Key::Text(" ".into()),
+        mods: Default::default(),
+    });
+    settle(&mut rt);
+    drive_reveal(&mut rt);
+    assert_eq!(rt.state.chat.flashing(), Some("long-10"));
 }

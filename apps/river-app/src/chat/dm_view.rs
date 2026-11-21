@@ -1090,6 +1090,7 @@ fn as_messages(chat: &Chat, messages: &[DmMessage]) -> Vec<Message> {
                 md: text.clone(),
                 text,
                 reply_to: None,
+                reply_gone: false,
                 reactions: Vec::new(),
                 edited: false,
                 pending: None,
