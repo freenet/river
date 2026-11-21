@@ -1246,7 +1246,8 @@ fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
 }
 
 /// Linux: Ctrl+Right stops at the end of the word (`word_end.rs`), Ctrl+Left and Ctrl+Backspace
-/// at the start of it, as in GTK and Chromium.
+/// at the start of it, as in GTK and Chromium. Ctrl+Shift+Right is Rune's (the start of the
+/// next word).
 #[cfg(target_os = "linux")]
 #[test]
 fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
@@ -1268,10 +1269,10 @@ fn ctrl_arrows_and_ctrl_backspace_work_by_word_in_the_composer() {
     // Ctrl+Backspace deletes the word before the caret, not the line before it.
     ctrl(&mut rt, Key::Backspace, false);
     assert_eq!(rt.state.chat.composer.text, " two Xthree");
-    // Ctrl+Shift+Right selects by word, up to the end of the next word.
+    // Ctrl+Shift+Right is Rune's: it selects to the start of the next word (past the space).
     ctrl(&mut rt, Key::Right, true);
     key(&mut rt, Key::Text("!".into()));
-    assert_eq!(rt.state.chat.composer.text, "! Xthree");
+    assert_eq!(rt.state.chat.composer.text, "!two Xthree");
 }
 
 #[test]
@@ -6179,11 +6180,17 @@ mod rune_bump {
     /// Forward word keys: on Windows the start of the next word (Rune's rule since 2026-11-12);
     /// on macOS (Option) the end of the word, and on Linux too (GTK, Qt and Chromium do):
     /// River's `word_end.rs` gives Linux what Rune gives macOS. Backwards is the start of the
-    /// word everywhere. Ctrl+Delete is Rune's on Linux (the start of the next word).
+    /// word everywhere. On Linux Ctrl+Shift+Right and Ctrl+Delete are Rune's (the start of the
+    /// next word), as on Windows.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const FORWARD_STOPS: [usize; 5] = [3, 14, 19, 27, 29];
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     const FORWARD_STOPS: [usize; 5] = [5, 15, 22, 28, 29];
+    /// The stops of Ctrl+Shift+Right: macOS's, and Rune's on Windows and Linux.
+    #[cfg(target_os = "macos")]
+    const SHIFT_FORWARD_STOPS: [usize; 5] = [3, 14, 19, 27, 29];
+    #[cfg(not(target_os = "macos"))]
+    const SHIFT_FORWARD_STOPS: [usize; 5] = [5, 15, 22, 28, 29];
 
     fn to_start(rt: &mut Runtime<RiverApp>) {
         for _ in 0..5 {
@@ -6213,7 +6220,7 @@ mod rune_bump {
             word_key(&mut rt, Key::Right, true);
             ends.push(composer(&rt).2);
         }
-        assert_eq!(ends, FORWARD_STOPS);
+        assert_eq!(ends, SHIFT_FORWARD_STOPS);
         assert_eq!(composer(&rt).1, 0, "the anchor stays");
         // Ctrl+Shift+Left shrinks it back to the start of a word, on every platform.
         word_key(&mut rt, Key::Left, true);
@@ -6238,9 +6245,9 @@ mod rune_bump {
         to_start(&mut rt);
         word_key(&mut rt, Key::Right, true);
         word_key(&mut rt, Key::Delete, false);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
     }
 
