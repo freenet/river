@@ -162,6 +162,64 @@ fn update_session(f: impl FnOnce(&mut JournalSession)) {
 }
 
 // ---------------------------------------------------------------------------
+// What the legacy-copy cleanup may rely on (`legacy_cleanup`)
+// ---------------------------------------------------------------------------
+
+/// Take the journal lock, so no `begin`, sweep flag or walk runs (or reads a
+/// predecessor) while the caller holds it. The legacy-copy cleanup holds it for
+/// its whole pass: the walk reads predecessors through the same correlation
+/// keys, and its `items_seen` rule must see a predecessor that is not changing
+/// under it.
+pub(crate) async fn lock_journal_ops() -> futures::lock::MutexGuard<'static, ()> {
+    JOURNAL_OPS.lock().await
+}
+
+/// Whether a journaled walk is requested or running on this page load.
+pub(crate) fn walk_in_flight() -> bool {
+    session().walk_in_flight
+}
+
+/// The predecessors the last status `begin` or the walk returned says are
+/// RESOLVED, by delegate key bytes; `None` when that cannot be relied on.
+///
+/// The legacy-copy cleanup deletes a predecessor's keys only when this names
+/// it. A pending predecessor must not shrink: the journal does not believe an
+/// export with fewer items than an interrupted import saw (freenet-migrate#44),
+/// so deleting from one would keep it pending, and the full sweep re-running,
+/// on every load for good. A resolved entry is sticky and the walk does not
+/// export it again.
+///
+/// `None` (delete from nothing) when no status is known, the journal could not
+/// be read, the last walk's status is unknown, or the sweep flagged an import
+/// after the status was computed (that flag may have reopened a resolution).
+pub(crate) fn resolved_predecessors(
+    s: &JournalSession,
+    lineage: &[DelegateLineageEntry],
+) -> Option<std::collections::HashSet<[u8; 32]>> {
+    if s.walk_status_unknown || s.sweep_flagged_since_status {
+        return None;
+    }
+    let all = lineage.iter().map(|e| e.delegate_key);
+    match s.status.as_ref()? {
+        JournalStatus::Complete { .. } => Some(all.collect()),
+        JournalStatus::Incomplete { pending, .. } => {
+            let pending: std::collections::HashSet<[u8; 32]> = pending
+                .iter()
+                .filter_map(|p| <[u8; 32]>::try_from(p.key.bytes()).ok())
+                .collect();
+            Some(all.filter(|k| !pending.contains(k)).collect())
+        }
+        _ => None,
+    }
+}
+
+/// [`resolved_predecessors`] for this page load. Read it while holding
+/// [`lock_journal_ops`], so no journal operation changes it meanwhile.
+pub(crate) fn resolved_predecessors_now() -> Option<std::collections::HashSet<[u8; 32]>> {
+    resolved_predecessors(&session(), &LINEAGE)
+}
+
+// ---------------------------------------------------------------------------
 // The identity-import gate
 // ---------------------------------------------------------------------------
 
@@ -1044,6 +1102,45 @@ mod tests {
             status: Some(status),
             ..Default::default()
         }
+    }
+
+    /// The legacy-copy cleanup deletes only from predecessors this names: a
+    /// pending one must keep exporting what an interrupted import saw.
+    #[test]
+    fn only_resolved_predecessors_are_named_for_deletion() {
+        let lineage: Vec<DelegateLineageEntry> =
+            river_delegate_lineage(&[([1u8; 32], [2u8; 32]), ([3u8; 32], [4u8; 32])]);
+        let both_pending = known(fresh_status());
+        assert_eq!(
+            resolved_predecessors(&both_pending, &lineage),
+            Some(Default::default()),
+            "every predecessor pending: none may shrink"
+        );
+        let JournalStatus::Incomplete { pending, .. } = fresh_status() else {
+            panic!("fresh status is incomplete");
+        };
+        let one_pending = known(incomplete(vec![pending[1].clone()], 0));
+        assert_eq!(
+            resolved_predecessors(&one_pending, &lineage),
+            Some([lineage[0].delegate_key].into_iter().collect())
+        );
+        let complete = known(JournalStatus::Complete { rejected_items: 0 });
+        assert_eq!(
+            resolved_predecessors(&complete, &lineage).map(|s| s.len()),
+            Some(2)
+        );
+        // Nothing to rely on: no status, an unknown walk outcome, or a sweep
+        // flag raised after the status (it may have reopened a resolution).
+        assert_eq!(
+            resolved_predecessors(&JournalSession::default(), &lineage),
+            None
+        );
+        let mut unknown = known(JournalStatus::Complete { rejected_items: 0 });
+        unknown.walk_status_unknown = true;
+        assert_eq!(resolved_predecessors(&unknown, &lineage), None);
+        let mut flagged = known(JournalStatus::Complete { rejected_items: 0 });
+        flagged.sweep_flagged_since_status = true;
+        assert_eq!(resolved_predecessors(&flagged, &lineage), None);
     }
 
     /// freenet/river#802: the rail's "Restoring more rooms" note follows a
