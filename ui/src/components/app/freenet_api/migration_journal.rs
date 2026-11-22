@@ -780,6 +780,20 @@ pub(crate) fn poke_walk() {
     poke_driver();
 }
 
+/// Ask for a walk if the last status says an import was interrupted. The
+/// legacy-copy cleanup calls it after its pass: a walk this load wanted may
+/// have been gated off while the pass held the slot lock (sweep fan-outs
+/// queued behind it keep the load busy past the walk's quiescence wait).
+pub(crate) fn poke_walk_if_interrupted() {
+    let interrupted = session()
+        .status
+        .as_ref()
+        .is_some_and(|s| s.interrupted_import());
+    if interrupted {
+        poke_walk();
+    }
+}
+
 /// Ask for the post-resolve top-up alone (no walk, so the import gate is not
 /// held Pending for it).
 pub(crate) fn poke_topup() {
@@ -977,6 +991,11 @@ pub(crate) async fn run_work_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     carry: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
 ) {
     let ops = JOURNAL_OPS.lock().await;
+    // The top-up and the walk read predecessors' keys; the legacy-copy cleanup
+    // (`legacy_cleanup`) rewrites some of them and reads them under the same
+    // delegate-scoped correlation keys. One at a time. Lock order: journal,
+    // then slot fetch; nothing takes them the other way round.
+    let slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
     if work.topup {
         if let Some(newest) = lineage.iter().max_by_key(|e| e.generation) {
             match top_up_in_window_with(channel, &mut seam(), &successor, newest, now_ms()).await {
@@ -998,11 +1017,6 @@ pub(crate) async fn run_work_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     if RESET_CADENCE_ON_WALK.swap(false, Ordering::Relaxed) {
         let _ = store_walk_cadence(channel, &successor, 0).await;
     }
-    // The walk reads every predecessor's keys; the legacy-copy cleanup
-    // (`legacy_cleanup`) rewrites some of them and reads them under the same
-    // delegate-scoped correlation keys. One at a time. Lock order: journal,
-    // then slot fetch; nothing takes them the other way round.
-    let slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
     let (report, _seam, found_seed) = walk_with(channel, seam(), successor, lineage).await;
     drop(slots);
     log_migration_report(&report);

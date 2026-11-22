@@ -230,7 +230,7 @@ impl PassReport {
 }
 
 /// One pass over `generations` (registry indexes), newest first. The live
-/// caller holds the journal lock and the legacy slot-fetch lock.
+/// caller holds the legacy slot-fetch lock.
 pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usize>) -> PassReport {
     let pairs = legacy_delegate_pairs();
     let mut report = PassReport::default();
@@ -376,9 +376,10 @@ const READS_POLL_MS: u64 = 500;
 /// its last wave have arrived and noted their generations.
 const READS_SETTLE_MS: u64 = 3_000;
 
-/// Note that legacy generation `delegate` answered with room data (the sweep's
-/// merge paths and the walk's reader call this), and start the cleanup for
-/// this page load, once.
+/// Note that legacy generation `delegate` holds room data (the sweep calls
+/// this when a generation lists per-room keys or returns a `rooms_data` blob,
+/// the walk's reader when an export holds room keys), and start the cleanup
+/// for this page load, once.
 pub(crate) fn note_legacy_data_seen(delegate: &[u8]) {
     let Some(index) = legacy_delegate_pairs()
         .iter()
@@ -424,6 +425,10 @@ async fn wait_for_sweep_reads() -> bool {
 }
 
 async fn cleanup_task() {
+    // The load attempt this cleanup was scheduled in: a reconnect or Retry
+    // since then begins another sweep, whose requests the pass must not
+    // displace, so the pass stops (the next load retries).
+    let attempt = chat_delegate::current_load_attempt();
     if !wait_for_sweep_reads().await {
         warn!("legacy cleanup: the legacy sweep did not finish; the next load retries");
         return;
@@ -438,9 +443,7 @@ async fn cleanup_task() {
         // generation for this load only.
         let _slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
         let generations = GENERATIONS_WITH_DATA.with(|g| g.borrow().clone());
-        let io = NodeIo {
-            attempt: chat_delegate::current_load_attempt(),
-        };
+        let io = NodeIo { attempt };
         let report = run_pass(&io, &generations).await;
         info!(
             "legacy cleanup: compacted {} legacy room copies in {} generation(s) ({} failed, ~{} bytes freed)",
@@ -452,6 +455,7 @@ async fn cleanup_task() {
         report
     };
     if report.compacted == 0 {
+        migration_journal::poke_walk_if_interrupted();
         return;
     }
     // Space was freed: commit the rooms merged so far (a save refused for
