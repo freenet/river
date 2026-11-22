@@ -2244,6 +2244,21 @@ fn a_room_without_an_active_policy_ignores_the_provisional_field() {
         closed.apply(delta.clone()).unwrap();
         assert!(ser(&closed.state) == before, "nothing changes");
     }
+    // An owner-issued provisional ban with a bad signature is an `Err` where
+    // the field is processed (its arrival checks it against the owner key),
+    // and changes nothing where it is not.
+    let mut forged_ban = room.prov_ban(None, id_of(&sk(4)), 2);
+    forged_ban.signature = ed25519_dalek::Signature::from_bytes(&[9u8; 64]);
+    let ban_delta = prov_ban_delta(forged_ban);
+    assert!(open.apply(ban_delta.clone()).is_err());
+    for closed in [&mut no_policy, &mut private_room] {
+        let before = ser(&closed.state);
+        closed.apply(ban_delta.clone()).unwrap();
+        assert!(
+            ser(&closed.state) == before,
+            "nothing is checked or changed"
+        );
+    }
     // A policy with no proof of work admits nobody: the forged entry fails
     // the policy (checked first) and is skipped without its signature being
     // checked. Such a room still holds provisional bans (a listed room whose
