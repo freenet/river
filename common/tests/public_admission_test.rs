@@ -16,7 +16,7 @@ use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::provisional::{
-    leading_zero_bits, pow_hash, AdmissionEvidence, AuthorizedProvisionalBan,
+    leading_zero_bits, pow_hash, AdmissionError, AdmissionEvidence, AuthorizedProvisionalBan,
     AuthorizedProvisionalMember, PowPolicy, ProvisionalBan, ProvisionalDelta, ProvisionalMember,
     PublicRoomPolicy,
 };
@@ -307,10 +307,8 @@ pub fn merge2(
     (ab, ba)
 }
 
-/// A key whose `MemberId` equals `victim`'s but whose bytes differ: replace
-/// adjacent bytes `(a, b)` with `(a + 1, b - 31)`, which keeps
-/// `h = h * 31 + byte`, until the bytes decode as a curve point. Costs
-/// nothing and yields no secret key.
+/// A key whose `MemberId` equals `victim`'s and whose bytes differ (see the
+/// `MemberId` docs). It has no secret key.
 pub fn forged_vk_with_id_of(victim: &VerifyingKey) -> VerifyingKey {
     let target: MemberId = victim.into();
     let base = victim.to_bytes();
@@ -1246,22 +1244,25 @@ fn a_collision_converges_in_both_merge_directions() {
 
 #[test]
 fn two_attacker_entries_with_one_id_are_both_dropped() {
-    // C2. A second key with the victim-style id is a free forgery for a
-    // record, but an ENTRY needs the key's own signature, so the attacker
-    // here holds both keys of the forged pair and signs both entries.
-    // (The signing key of a forged vk is unknowable in practice; the
-    // contract only sees two entries with one id and different keys.)
+    // C2. A record for a second key with an existing id needs only its
+    // inviter's signature, but an ENTRY needs the key's own signature, which
+    // nobody holds for a key built to match an id. The contract only ever
+    // sees two entries with one id and different keys when one party holds
+    // both keys.
     let mut room = Room::new(30, 10, Some(policy(1, 7)));
     let a = sk(1);
     let forged = forged_vk_with_id_of(&a.verifying_key());
     let owner = room.params.owner;
     // An entry for `forged` signed by `a` fails entry_sig_ok (an Err), so the
-    // C2 case can only be built with two valid entries; assert that.
+    // C2 case can only be built with two valid entries; assert that. Its
+    // proof of work passes, so the policy check (which runs first) admits it
+    // and the signature check is reached.
+    let nonce = solve(&owner, &forged, 7, 1);
     let fake = AuthorizedProvisionalMember::new(
         &owner,
         ProvisionalMember {
             member_vk: forged,
-            evidence: AdmissionEvidence::Pow { nonce: 0 },
+            evidence: AdmissionEvidence::Pow { nonce },
         },
         &a,
     );
@@ -1283,14 +1284,19 @@ fn two_attacker_entries_with_one_id_are_both_dropped() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_flood_of_future_dated_provisional_messages_cannot_push_members_out() {
+fn a_flood_of_future_dated_provisional_messages_leaves_members_their_share_of_the_window() {
+    // A busy room: the members post more than their share of the window, and
+    // `max_members` binds (four invitees, a cap of three). Future-dated
+    // provisional messages push member messages out of the window only down
+    // to `window - quota` (design D4), no invited member is pruned, and the
+    // cap removes exactly the member it removes without the flood.
     let mut p = policy(0, 1);
     p.max_provisional = 5;
     p.max_provisional_messages = 100;
     let build = |flood: bool| {
         // window 20: quota min(100, 10) = 10; members keep at least 10 slots.
-        let mut room = Room::new(20, 10, Some(p.clone()));
-        let members: Vec<SigningKey> = (2..5).map(sk).collect();
+        let mut room = Room::new(20, 3, Some(p.clone()));
+        let members: Vec<SigningKey> = (2..6).map(sk).collect();
         let mut d = room.members_delta(
             members
                 .iter()
@@ -1300,7 +1306,7 @@ fn a_flood_of_future_dated_provisional_messages_cannot_push_members_out() {
         d.recent_messages = Some(
             members
                 .iter()
-                .flat_map(|k| (1..=3).map(|t| room.msg(k, t, &format!("m{t}"))))
+                .flat_map(|k| (1..=4).map(|t| room.msg(k, t, &format!("m{t}"))))
                 .collect(),
         );
         room.apply(d).unwrap();
@@ -1320,17 +1326,29 @@ fn a_flood_of_future_dated_provisional_messages_cannot_push_members_out() {
     };
     let (clean, _) = build(false);
     let (flooded, members) = build(true);
-    let member_ids: Vec<MemberId> = members.iter().map(id_of).collect();
-    let member_msgs = flooded
-        .state
-        .recent_messages
-        .messages
-        .iter()
-        .filter(|m| member_ids.contains(&m.message.author))
-        .count();
     assert_eq!(
-        member_msgs, 9,
-        "every member message survives: 9 <= 20 - quota"
+        clean.state.members.members.len(),
+        3,
+        "the member cap binds: one of the four invitees is removed"
+    );
+    let members: Vec<SigningKey> = members.into_iter().filter(|k| clean.is_member(k)).collect();
+    let member_ids: Vec<MemberId> = members.iter().map(id_of).collect();
+    let count_member_msgs = |s: &ChatRoomStateV1| {
+        s.recent_messages
+            .messages
+            .iter()
+            .filter(|m| member_ids.contains(&m.message.author))
+            .count()
+    };
+    assert_eq!(
+        count_member_msgs(&clean.state),
+        12,
+        "without the flood all 12 fit"
+    );
+    assert_eq!(
+        count_member_msgs(&flooded.state),
+        10,
+        "the flood takes the quota (10) and members keep the rest of the window (20 - 10)"
     );
     let provisional_msgs = flooded
         .state
@@ -1906,4 +1924,338 @@ fn a_deputy_with_a_provisional_ban_is_not_pruned_for_inactivity() {
     );
     assert!(room.is_member(&d), "the issuer of a kept ban is not pruned");
     assert_eq!(room.state.provisional.bans.len(), 1, "and the ban stays");
+}
+
+/// A member that a ban names directly cannot come back as provisional with
+/// the same key by doing the work, whoever issued the ban: the owner, an owner
+/// deputy, or the member's own inviter. The banned member's record moves to
+/// ban evidence under the entry's own key, so neither C1 (another key) nor P5
+/// (a `members` record) drops the entry; P2 must. Checked with the ban and the
+/// entry in one delta, in two deltas, and with each on a different peer,
+/// merged in both directions.
+fn a_directly_banned_member_stays_out(
+    base: &Room,
+    banner: Option<&SigningKey>,
+    target: &SigningKey,
+) {
+    let ban = base.user_ban(banner, id_of(target), 10);
+    let mut together = base.join_delta(target, 11, "back");
+    together.bans = Some(vec![ban.clone()]);
+    let one = replay(base, &[&together]);
+    let two = replay(
+        base,
+        &[
+            &user_ban_delta(ban.clone()),
+            &base.join_delta(target, 11, "back"),
+        ],
+    );
+    let author = id_of(target);
+    for s in [&one, &two] {
+        assert!(
+            s.bans.0.iter().any(|b| b.ban.banned_user == author),
+            "the ban is held"
+        );
+        assert!(
+            !s.provisional
+                .entries
+                .iter()
+                .any(|e| e.provisional.member_vk == target.verifying_key()),
+            "a directly banned member has no entry"
+        );
+        assert!(
+            !s.recent_messages
+                .messages
+                .iter()
+                .any(|m| m.message.author == author),
+            "and no message"
+        );
+    }
+    assert!(
+        ser(&one) == ser(&two),
+        "one delta and two give the same state"
+    );
+
+    // The entry on a peer that never saw the member's record, the ban on
+    // another: merged either way, the entry goes.
+    let mut fresh = Room::new(40, 20, Some(policy(1, 7)));
+    fresh.apply(fresh.join_delta(target, 11, "back")).unwrap();
+    assert!(fresh.has_entry(target));
+    let banned = replay(base, &[&user_ban_delta(ban)]);
+    let (x, y) = merge2(&banned, &fresh.state, &base.params);
+    assert!(ser(&x) == ser(&y), "a commutative first exchange");
+    assert!(!x
+        .provisional
+        .entries
+        .iter()
+        .any(|e| e.provisional.member_vk == target.verifying_key()));
+}
+
+#[test]
+fn a_member_an_owner_banned_does_not_come_back_as_provisional() {
+    let (base, m, _d) = room_with_member_and_deputy();
+    a_directly_banned_member_stays_out(&base, None, &m);
+}
+
+#[test]
+fn a_member_a_deputy_banned_does_not_come_back_as_provisional() {
+    let (base, m, d) = room_with_member_and_deputy();
+    a_directly_banned_member_stays_out(&base, Some(&d), &m);
+}
+
+#[test]
+fn a_member_their_inviter_banned_does_not_come_back_as_provisional() {
+    let (base, i, v) = room_with_inviter_and_invitee();
+    a_directly_banned_member_stays_out(&base, Some(&i), &v);
+}
+
+/// Review finding 2 (seed 101055 shape 1 of the fork fuzz): an id with a
+/// provisional entry on one peer, and on the other a ban-evidence record for
+/// the same id under another key that sits deeper than the merged room's
+/// evidence depth cap. The merge drops that record (`without_too_deep`), so
+/// the entry stays, and the entry's `member_info` must stay too in BOTH merge
+/// directions. Before the fix, the side receiving the `member_info` resolved
+/// its author through the soon-dropped record and skipped it, while the side
+/// already holding it kept it: `merge(A, B) != merge(B, A)`.
+#[test]
+fn an_evidence_record_the_merge_drops_as_too_deep_does_not_decide_a_provisional_arrival() {
+    let mut a = Room::new(40, 10, Some(policy(1, 7)));
+    let (m1, m2, x) = (sk(2), sk(3), sk(4));
+    // A record for another key with x's id, invited by m2 at depth 3, then
+    // banned by its inviter: it is ban evidence on peer A.
+    let forged = forged_vk_with_id_of(&x.verifying_key());
+    let rec_m2 = AuthorizedMember::new(
+        Member {
+            owner_member_id: a.owner_id(),
+            invited_by: id_of(&m1),
+            member_vk: m2.verifying_key(),
+        },
+        &m1,
+    );
+    let rec_f = AuthorizedMember::new(
+        Member {
+            owner_member_id: a.owner_id(),
+            invited_by: id_of(&m2),
+            member_vk: forged,
+        },
+        &m2,
+    );
+    let mut d = a.members_delta(vec![a.invite(None, &m1.verifying_key()), rec_m2, rec_f]);
+    d.recent_messages = Some(vec![a.msg(&m1, 1, "m1"), a.msg(&m2, 2, "m2")]);
+    d.bans = Some(vec![a.user_ban(Some(&m2), id_of(&x), 3)]);
+    a.apply(d).unwrap();
+    assert!(
+        a.state
+            .ban_evidence
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == forged),
+        "the record is ban evidence on A"
+    );
+
+    // Peer B: the owner lowered `max_members` to 2 (the evidence depth cap
+    // with it), and x joined provisionally with a nickname and a message.
+    let mut b = Room::new(40, 10, Some(policy(1, 7)));
+    b.set_config(|c| c.max_members = 2);
+    b.apply(b.join_delta(&x, 20, "hello")).unwrap();
+    assert!(b.has_entry(&x));
+
+    let (ab, ba) = merge2(&a.state, &b.state, &a.params);
+    assert!(ser(&ab) == ser(&ba), "the first exchange is commutative");
+    let info_of_x = |s: &ChatRoomStateV1| {
+        s.member_info
+            .member_info
+            .iter()
+            .any(|i| i.member_info.member_id == id_of(&x))
+    };
+    assert!(
+        ab.provisional
+            .entries
+            .iter()
+            .any(|e| e.provisional.member_vk == x.verifying_key()),
+        "the too-deep record is dropped, so the entry stays"
+    );
+    assert!(info_of_x(&ab), "and so does its member_info");
+}
+
+/// The proof of work is bound to the room owner and to the member key: a
+/// nonce found for one room, or for one key, does not admit an entry that is
+/// correctly self-signed for another room or another key. The golden vector
+/// pins the hash; this pins that `check_policy` and the room use those inputs.
+#[test]
+fn a_proof_of_work_does_not_carry_to_another_room_or_another_key() {
+    let bits = 12;
+    let room = Room::new(30, 10, Some(policy(bits, 7)));
+    let other_owner = sk(201);
+    let (k1, k2) = (sk(2), sk(3));
+    let nonce = solve(&room.params.owner, &k1.verifying_key(), 7, bits);
+    assert!(room
+        .entry(&k1)
+        .check_policy(room.config(), &room.params.owner)
+        .is_ok());
+
+    // Another room: same key, same nonce, signed for the other owner.
+    let for_other_room = entry_with(&other_owner.verifying_key(), &k1, 7, nonce);
+    let mut other_config = room.config().clone();
+    other_config.owner_member_id = MemberId::from(&other_owner.verifying_key());
+    assert!(matches!(
+        for_other_room.check_policy(&other_config, &other_owner.verifying_key()),
+        Err(AdmissionError::InsufficientWork { .. })
+    ));
+    // Another key: the nonce k1 found, in an entry k2 signs.
+    let for_other_key = entry_with(&room.params.owner, &k2, 7, nonce);
+    assert!(for_other_key.verify_signature(&room.params.owner).is_ok());
+    assert!(matches!(
+        for_other_key.check_policy(room.config(), &room.params.owner),
+        Err(AdmissionError::InsufficientWork { .. })
+    ));
+    // Applied, the borrowed proof is skipped (not an error) with its message.
+    let mut r = Room::new(30, 10, Some(policy(bits, 7)));
+    let mut d = r.join_delta(&k2, 1, "borrowed");
+    d.provisional.as_mut().unwrap().entries = vec![for_other_key];
+    r.apply(d).unwrap();
+    assert!(!r.has_entry(&k2) && !r.has_msg_by(&k2));
+    // A new epoch invalidates it too.
+    let mut r = Room::new(30, 10, Some(policy(bits, 8)));
+    let mut d = r.join_delta(&k1, 1, "old epoch");
+    d.provisional.as_mut().unwrap().entries = vec![entry_with(&r.params.owner, &k1, 7, nonce)];
+    r.apply(d).unwrap();
+    assert!(!r.has_entry(&k1));
+}
+
+/// A small-order key signs nothing that needs a secret, so it is never
+/// admitted: an entry for one fails the policy (skipped, not an error).
+#[test]
+fn a_weak_key_is_never_admitted() {
+    let room = Room::new(30, 10, Some(policy(0, 7)));
+    // The identity point, encoded.
+    let mut bytes = [0u8; 32];
+    bytes[0] = 1;
+    let weak = VerifyingKey::from_bytes(&bytes).unwrap();
+    assert!(weak.is_weak());
+    let entry = AuthorizedProvisionalMember::with_signature(
+        ProvisionalMember {
+            member_vk: weak,
+            evidence: AdmissionEvidence::Pow { nonce: 0 },
+        },
+        ed25519_dalek::Signature::from_bytes(&{
+            let mut s = [0u8; 64];
+            s[0] = 1; // R = identity, S = 0
+            s
+        }),
+    );
+    assert_eq!(
+        entry.check_policy(room.config(), &room.params.owner),
+        Err(AdmissionError::WeakKey)
+    );
+    assert!(
+        entry.verify_signature(&room.params.owner).is_err(),
+        "strict verification refuses it too"
+    );
+    let mut r = Room::new(30, 10, Some(policy(0, 7)));
+    r.apply(ChatRoomStateV1Delta {
+        provisional: Some(ProvisionalDelta {
+            entries: vec![entry],
+            bans: vec![],
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(r.state.provisional.entries.is_empty());
+}
+
+/// A provisional member cannot invite (an `AuthorizedMember` naming a
+/// provisional id as inviter never resolves), and cannot ban in either list.
+#[test]
+fn a_provisional_member_cannot_invite_or_ban() {
+    let (mut room, m, _d) = room_with_member_and_deputy();
+    let (p, q) = (sk(10), sk(11));
+    room.apply(room.join_delta(&p, 5, "hi")).unwrap();
+    assert!(room.has_entry(&p));
+    // An invite signed by the provisional key, with the invitee's message.
+    let invite = AuthorizedMember::new(
+        Member {
+            owner_member_id: room.owner_id(),
+            invited_by: id_of(&p),
+            member_vk: q.verifying_key(),
+        },
+        &p,
+    );
+    let mut d = room.members_delta(vec![invite]);
+    d.recent_messages = Some(vec![room.msg(&q, 6, "invited by a provisional")]);
+    let _ = room.apply(d);
+    assert!(!room.is_member(&q) && !room.has_msg_by(&q));
+    // A `UserBan` and a provisional ban issued by the provisional key.
+    let before = ser(&room.state);
+    let mut d = user_ban_delta(room.user_ban(Some(&p), id_of(&m), 7));
+    d.provisional = Some(ProvisionalDelta {
+        entries: vec![],
+        bans: vec![room.prov_ban(Some(&p), id_of(&q), 7)],
+    });
+    let _ = room.apply(d);
+    assert!(room.is_member(&m), "the member stays");
+    assert!(
+        room.state.provisional.bans.is_empty(),
+        "the provisional ban is swept"
+    );
+    assert!(
+        !room.state.bans.0.iter().any(|b| b.banned_by == id_of(&p)),
+        "the user ban is swept"
+    );
+    assert!(room.has_entry(&p));
+    let _ = before;
+}
+
+/// A room with no active policy pays nothing for the field: entries and
+/// provisional bans in a delta are not processed at all, so even a forged
+/// entry signature, which is an `Err` in an open room, is ignored.
+#[test]
+fn a_room_without_an_active_policy_ignores_the_provisional_field() {
+    let room = Room::new(30, 10, Some(policy(0, 7)));
+    let forged = AuthorizedProvisionalMember::with_signature(
+        room.entry(&sk(2)).provisional,
+        ed25519_dalek::Signature::from_bytes(&[7u8; 64]),
+    );
+    let delta = ChatRoomStateV1Delta {
+        provisional: Some(ProvisionalDelta {
+            entries: vec![forged],
+            bans: vec![room.prov_ban(None, id_of(&sk(3)), 1)],
+        }),
+        ..Default::default()
+    };
+    let mut open = Room::new(30, 10, Some(policy(0, 7)));
+    assert!(
+        open.apply(delta.clone()).is_err(),
+        "a forgery in an open room"
+    );
+    let mut no_policy = Room::new(30, 10, None);
+    let mut private_room = Room::new(30, 10, Some(policy(0, 7)));
+    private_room.set_config(|c| {
+        c.privacy_mode = PrivacyMode::Private;
+        c.display.name = river_core::room_state::privacy::SealedBytes::Private {
+            ciphertext: vec![1; 16],
+            nonce: [0; 12],
+            secret_version: 0,
+            declared_len_bytes: 4,
+        };
+        c.display.description = None;
+    });
+    for closed in [&mut no_policy, &mut private_room] {
+        let before = ser(&closed.state);
+        closed.apply(delta.clone()).unwrap();
+        assert!(ser(&closed.state) == before, "nothing changes");
+    }
+    // A policy with no proof of work admits nobody: the forged entry fails
+    // the policy (checked first) and is skipped without its signature being
+    // checked. Such a room still holds provisional bans (a listed room whose
+    // owner bans ahead of opening it).
+    let mut listed = Room::new(
+        30,
+        10,
+        Some(PublicRoomPolicy {
+            pow: None,
+            ..policy(0, 7)
+        }),
+    );
+    listed.apply(delta).unwrap();
+    assert!(listed.state.provisional.entries.is_empty());
 }

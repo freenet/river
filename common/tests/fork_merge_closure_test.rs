@@ -1047,7 +1047,7 @@ fn random_op_prov(
     } else {
         1
     };
-    match rng.gen_range(0..20) {
+    match rng.gen_range(0..21) {
         // An entry with its member_info and first message, solved against the
         // policy this fork holds.
         0..=4 => {
@@ -1346,6 +1346,74 @@ fn random_op_prov(
             bans: Some(vec![sign_ban(w, None, rng.gen_range(0..n), t)]),
             ..Default::default()
         },
+        // A sponsored provisional key banned directly by its inviter or by
+        // an owner deputy (a `UserBan` that moves its record to ban evidence
+        // under its own key), sometimes with the key's entry, `member_info`
+        // and a message in the same delta: a directly banned member must not
+        // come back as provisional (review finding 1).
+        20 => {
+            let j = rng.gen_range(0..np / 2);
+            let Some(record) = state
+                .members
+                .members
+                .iter()
+                .find(|m| m.member.id() == w.prov_ids[j])
+            else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let inviter = record.member.invited_by;
+            let deputies = state.member_info.deputies_of(w.owner_id);
+            let issuer = if inviter != w.owner_id && rng.gen_bool(0.6) {
+                w.pool.iter().position(|p| p.id == inviter)
+            } else {
+                (0..n).find(|&i| deputies.contains(&w.pool[i].id))
+            };
+            let Some(b) = issuer else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let ban = AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: w.owner_id,
+                    banned_at: w.base_time + Duration::from_secs(t),
+                    banned_user: w.prov_ids[j],
+                },
+                w.pool[b].id,
+                &w.pool[b].sk,
+            );
+            let mut d = ChatRoomStateV1Delta {
+                bans: Some(vec![ban]),
+                ..Default::default()
+            };
+            if let Some(pow) = cfg.public_admission.as_ref().and_then(|p| p.pow.clone()) {
+                if rng.gen_bool(0.5) {
+                    let nonce = (0u64..)
+                        .find(|nn| {
+                            river_core::room_state::provisional::leading_zero_bits(
+                                &river_core::room_state::provisional::pow_hash(
+                                    &w.params.owner,
+                                    &w.prov[j].verifying_key(),
+                                    pow.epoch,
+                                    *nn,
+                                ),
+                            ) >= pow.difficulty_bits as u32
+                        })
+                        .unwrap();
+                    d.provisional = Some(ProvisionalDelta {
+                        entries: vec![AuthorizedProvisionalMember::new(
+                            &w.params.owner,
+                            ProvisionalMember {
+                                member_vk: w.prov[j].verifying_key(),
+                                evidence: AdmissionEvidence::Pow { nonce },
+                            },
+                            &w.prov[j],
+                        )],
+                        bans: vec![],
+                    });
+                    d.recent_messages = Some(vec![prov_msg(j, t, &format!("back {j}@{t}"))]);
+                }
+            }
+            d
+        }
         // A pool member (re)joins with a message, so members and provisional
         // authors compete for the window.
         _ => {
@@ -1366,9 +1434,8 @@ fn random_op_prov(
     }
 }
 
-/// A key with the same `MemberId` as `victim` and different bytes: replace
-/// adjacent bytes `(a, b)` by `(a + 1, b - 31)`, which keeps `h * 31 + byte`,
-/// until the result decodes as a point.
+/// A key whose `MemberId` equals `victim`'s and whose bytes differ (see the
+/// `MemberId` docs), or `None` if none is found. It has no secret key.
 fn forged_vk_with_id_of(
     victim: &ed25519_dalek::VerifyingKey,
 ) -> Option<ed25519_dalek::VerifyingKey> {
@@ -1676,8 +1743,14 @@ fn seeds_from_env(default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// `FORK_SEEDS=N` seeds starting at `FORK_SEED_BASE` (default 0), so a run
+/// can cover a range no earlier run did (`FORK_SEED_BASE=100000`).
 fn default_seeds(n: u64) -> Vec<(u64, usize)> {
-    (0..n)
+    let base: u64 = std::env::var("FORK_SEED_BASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (base..base + n)
         .flat_map(|s| (0..SHAPES.len()).map(move |sh| (s, sh)))
         .collect()
 }
@@ -2235,6 +2308,12 @@ fn split_delivery_converges() {
 /// (`check_idempotent`, which also counts what `validate_state` would refuse
 /// and, under `--cfg river_cleanup_counters`, that no cleanup reaches
 /// `MAX_CLEANUP_PASSES` unconfirmed). `FORK_SEEDS=1000` before merging.
+///
+/// The default (3 seeds) is a smoke test only: the mutation check found that
+/// deleting C2, P2 or the deputy-authority half of P1 is not caught at that
+/// count (the deterministic tests in `public_admission_test.rs` catch each).
+/// Use `FORK_SEED_BASE` to cover seed ranges earlier runs did not: review
+/// finding 2 on #979 was found only at `FORK_SEED_BASE=100000`.
 #[test]
 fn provisional_forks_converge() {
     let seeds = default_seeds(seeds_from_env(3));
