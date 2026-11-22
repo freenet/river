@@ -8544,7 +8544,7 @@ mod migration_recovery_tests {
         let Step::Get(a) = driver.next_action() else {
             panic!()
         };
-        driver.on_timeout(a); // absent generation
+        driver.on_unknown(a); // absent generation
         let Step::Get(b) = driver.next_action() else {
             panic!()
         };
@@ -9156,7 +9156,7 @@ mod migration_recovery_tests {
             panic!("expected a GET")
         };
         assert_eq!(first, cli_id(9));
-        driver.on_timeout(first);
+        driver.on_unknown(first);
         // The re-listed stored key is retried (NOT an older generation) and hits.
         let Step::Get(retry) = driver.next_action() else {
             panic!("expected the retry GET")
@@ -9256,7 +9256,7 @@ mod migration_recovery_tests {
         let Step::Get(a) = driver.next_action() else {
             panic!()
         };
-        driver.on_timeout(a); // absent generation
+        driver.on_unknown(a); // absent generation
         let Step::Get(b) = driver.next_action() else {
             panic!()
         };
@@ -10559,11 +10559,9 @@ mod subscribe_handshake_tests {
     /// each notification only triggers a full-state re-fetch.
     #[test]
     fn the_handshake_queue_is_bounded() {
-        assert!(
-            MAX_PENDING_DURING_HANDSHAKE > 0 && MAX_PENDING_DURING_HANDSHAKE <= 64,
-            "handshake queue must be bounded and small; an unbounded queue fed \
-             by the node is a memory amplification vector"
-        );
+        // The queue must be bounded and small: an unbounded queue fed by the
+        // node is a memory amplification vector.
+        const { assert!(MAX_PENDING_DURING_HANDSHAKE > 0 && MAX_PENDING_DURING_HANDSHAKE <= 64) };
     }
 
     pub(super) fn other_key() -> ContractKey {

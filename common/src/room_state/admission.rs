@@ -31,7 +31,7 @@ use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody
 use crate::room_state::privacy::PrivacyMode;
 use crate::room_state::provisional::{
     active_policy, entry_digest, leading_zero_bits, pow_hash, AdmissionEvidence,
-    AuthorizedProvisionalMember, ProvisionalDelta, ProvisionalMember,
+    AuthorizedProvisionalMember, ProvisionalDelta, ProvisionalMember, MAX_DIFFICULTY_BITS,
 };
 use crate::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -288,6 +288,11 @@ pub enum PowStep {
     Progress { tried: u64, expected: f64 },
 }
 
+/// Highest target a [`PowSolver`] accepts: the contract's difficulty ceiling
+/// plus a few bits of over-solving. A higher request is clamped, since a
+/// target of 40 or more bits does not finish on any machine.
+pub const MAX_TARGET_BITS: u8 = MAX_DIFFICULTY_BITS + 8;
+
 impl PowSolver {
     /// A solver for `req` aiming at `target_bits` (at least the required
     /// bits: a client may over-solve by a bit or two, so a small raise of the
@@ -302,7 +307,7 @@ impl PowSolver {
             owner_vk: *owner_vk,
             member_vk: *member_vk,
             epoch: req.epoch,
-            target_bits: target_bits.max(req.difficulty_bits),
+            target_bits: target_bits.max(req.difficulty_bits).min(MAX_TARGET_BITS),
             start: 0,
             stride: 1,
             next: 0,
@@ -323,7 +328,7 @@ impl PowSolver {
     /// tried that missed the old target misses a higher one too); a new epoch
     /// restarts, since no earlier work counts.
     pub fn retarget(&mut self, req: &PowRequirement, target_bits: u8) {
-        self.target_bits = target_bits.max(req.difficulty_bits);
+        self.target_bits = target_bits.max(req.difficulty_bits).min(MAX_TARGET_BITS);
         if req.epoch != self.epoch {
             self.epoch = req.epoch;
             self.next = self.start;
@@ -709,5 +714,20 @@ mod tests {
         state.apply_delta(&parent, &params, &Some(d)).unwrap();
         let d = admission_delta(&state, &params, &entry, info(&k), message(&k, owner_id, 2));
         assert!(d.provisional.is_none());
+    }
+
+    #[test]
+    fn the_solver_clamps_its_target() {
+        let owner = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let member = SigningKey::from_bytes(&[2; 32]).verifying_key();
+        let req = PowRequirement {
+            difficulty_bits: 1,
+            epoch: 0,
+            expected_hashes: 2.0,
+        };
+        let mut s = PowSolver::new(&owner, &member, &req, 255);
+        assert_eq!(s.target_bits, MAX_TARGET_BITS);
+        s.retarget(&req, 200);
+        assert_eq!(s.target_bits, MAX_TARGET_BITS);
     }
 }

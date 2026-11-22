@@ -19,7 +19,8 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::provisional::{
-    AuthorizedProvisionalMember, ProvisionalDelta, PublicRoomPolicy,
+    AuthorizedProvisionalMember, ProvisionalDelta, PublicRoomPolicy, MAX_DIFFICULTY_BITS,
+    MAX_PROVISIONAL_BANS_CEILING, MAX_PROVISIONAL_CEILING, MAX_PROVISIONAL_MESSAGES_CEILING,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde_json::json;
@@ -212,6 +213,11 @@ pub struct JoinOutcome {
     pub message_id: river_core::room_state::message::MessageId,
 }
 
+/// Most bits `--extra-bits` may add to the room's requirement.
+pub const MAX_EXTRA_BITS: u8 = 8;
+/// Most proof-of-work threads `--threads` may start.
+pub const MAX_THREADS: usize = 256;
+
 /// What `riverctl room join --pow` was asked for.
 pub struct JoinOptions<'a> {
     pub nickname: &'a str,
@@ -232,6 +238,12 @@ pub fn build_join(
     options: &JoinOptions<'_>,
     progress: impl FnMut(u64, f64),
 ) -> Result<(river_core::room_state::ChatRoomStateV1Delta, JoinOutcome)> {
+    if options.extra_bits > MAX_EXTRA_BITS {
+        bail!("--extra-bits must be at most {MAX_EXTRA_BITS}");
+    }
+    if options.threads > MAX_THREADS {
+        bail!("--threads must be at most {MAX_THREADS}");
+    }
     let params = ChatRoomParametersV1 { owner: *owner_key };
     let member_vk = signing_key.verifying_key();
     let config = &room_state.configuration.configuration;
@@ -289,7 +301,7 @@ pub fn build_join(
                 &req,
                 req.difficulty_bits
                     .saturating_add(options.extra_bits)
-                    .min(32),
+                    .min(MAX_DIFFICULTY_BITS),
                 options.threads,
                 progress,
             )?;
@@ -341,6 +353,10 @@ pub fn build_join(
 /// `Ok(None)` when the key is a member or the room already holds its entry (or
 /// no entry is stored, which `authorize_send` then refuses with the way
 /// forward), `Err` when the stored entry cannot be used.
+///
+/// The stored entry is read only when the key is neither a member nor already
+/// held by the room, so an ordinary member send never touches provisional
+/// storage.
 pub fn attachment_for_send(
     storage: &Storage,
     room_state: &ChatRoomStateV1,
@@ -350,8 +366,24 @@ pub fn attachment_for_send(
 ) -> Result<Option<ProvisionalDelta>> {
     let params = ChatRoomParametersV1 { owner: *owner_key };
     let member_vk = signing_key.verifying_key();
+    // These outcomes do not depend on a stored entry.
+    let status = admission_status(room_state, &params, &member_vk, None, send_time);
+    if matches!(
+        status,
+        AdmissionStatus::Owner | AdmissionStatus::Member | AdmissionStatus::Provisional
+    ) {
+        return Ok(None);
+    }
     let stored = storage.get_provisional_entry(owner_key, &member_vk)?;
     let status = admission_status(room_state, &params, &member_vk, stored.as_ref(), send_time);
+    attachment_for_status(status, stored)
+}
+
+/// The decision of [`attachment_for_send`] once the status is known.
+fn attachment_for_status(
+    status: AdmissionStatus,
+    stored: Option<AuthorizedProvisionalMember>,
+) -> Result<Option<ProvisionalDelta>> {
     match status {
         AdmissionStatus::Owner | AdmissionStatus::Member | AdmissionStatus::Provisional => Ok(None),
         AdmissionStatus::Banned => Err(anyhow!("You are banned from this room")),
@@ -409,14 +441,21 @@ impl PolicyEdit {
                 // Editing a policy the room does not have is a no-op.
                 return;
             }
+            // Defaults follow the design: the open-member quota is half the
+            // message window, and the counts start at their ceilings. The
+            // owner may lower them.
             config.public_admission = Some(PublicRoomPolicy {
                 listed: false,
-                max_provisional: 10,
-                max_provisional_messages: 20,
-                max_provisional_bans: 10,
+                max_provisional: MAX_PROVISIONAL_CEILING,
+                max_provisional_messages: (config.max_recent_messages as u32 / 2)
+                    .clamp(1, MAX_PROVISIONAL_MESSAGES_CEILING),
+                max_provisional_bans: MAX_PROVISIONAL_BANS_CEILING,
+                // A random epoch: a fixed one would let proofs for any room be
+                // computed in advance, and would revive old proofs when
+                // admission is disabled and enabled again.
                 pow: Some(PowPolicy {
                     difficulty_bits: 20,
-                    epoch: 1,
+                    epoch: random_epoch(),
                 }),
             });
         }
@@ -436,15 +475,13 @@ impl PolicyEdit {
         if self.difficulty_bits.is_some() || self.new_epoch {
             let held = policy.pow.clone().unwrap_or(PowPolicy {
                 difficulty_bits: 20,
-                epoch: 1,
+                epoch: random_epoch(),
             });
             let mut epoch = held.epoch;
             if self.new_epoch {
                 // A fresh random epoch invalidates every proof, stockpiles
                 // included.
-                let mut bytes = [0u8; 4];
-                getrandom_epoch(&mut bytes);
-                epoch = u32::from_le_bytes(bytes);
+                epoch = random_epoch();
             }
             policy.pow = Some(PowPolicy {
                 difficulty_bits: self.difficulty_bits.unwrap_or(held.difficulty_bits),
@@ -454,9 +491,9 @@ impl PolicyEdit {
     }
 }
 
-fn getrandom_epoch(out: &mut [u8; 4]) {
+fn random_epoch() -> u32 {
     use rand::RngCore;
-    rand::rngs::OsRng.fill_bytes(out);
+    rand::rngs::OsRng.next_u32()
 }
 
 #[cfg(test)]
@@ -639,6 +676,191 @@ mod tests {
         .expect("invite only")
         .to_string();
         assert!(err.contains("invitation"), "{err}");
+    }
+
+    #[test]
+    fn enabling_uses_design_defaults() {
+        let mut c = Configuration {
+            max_recent_messages: 100,
+            ..Configuration::default()
+        };
+        let mut e = edit();
+        e.enable = Some(true);
+        e.apply(&mut c);
+        let p = c.public_admission.unwrap();
+        assert_eq!(p.max_provisional_messages, 50);
+        assert_eq!(p.max_provisional, MAX_PROVISIONAL_CEILING);
+        assert_eq!(p.max_provisional_bans, MAX_PROVISIONAL_BANS_CEILING);
+        // Clamped to the ceiling for a large window and to 1 for a tiny one.
+        let mut big = Configuration {
+            max_recent_messages: 100_000,
+            ..Configuration::default()
+        };
+        e.apply(&mut big);
+        assert_eq!(
+            big.public_admission.unwrap().max_provisional_messages,
+            MAX_PROVISIONAL_MESSAGES_CEILING
+        );
+        let mut tiny = Configuration {
+            max_recent_messages: 1,
+            ..Configuration::default()
+        };
+        e.apply(&mut tiny);
+        assert_eq!(tiny.public_admission.unwrap().max_provisional_messages, 1);
+    }
+
+    #[test]
+    fn re_enabling_picks_a_fresh_epoch_and_other_edits_keep_it() {
+        let mut c = Configuration::default();
+        let mut on = edit();
+        on.enable = Some(true);
+        on.apply(&mut c);
+        let first = c.public_admission.clone().unwrap().pow.unwrap().epoch;
+        let mut other = edit();
+        other.max_provisional = Some(4);
+        other.difficulty_bits = Some(10);
+        other.apply(&mut c);
+        assert_eq!(
+            c.public_admission.clone().unwrap().pow.unwrap().epoch,
+            first
+        );
+        let mut off = edit();
+        off.enable = Some(false);
+        off.apply(&mut c);
+        on.apply(&mut c);
+        let second = c.public_admission.unwrap().pow.unwrap().epoch;
+        assert_ne!(second, 1);
+        assert_ne!(second, first);
+    }
+
+    #[test]
+    fn extra_bits_and_threads_are_capped() {
+        let (state, params, _owner) = open_room(4);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(Some(dir.path().to_str().unwrap())).unwrap();
+        let k = SigningKey::from_bytes(&[5; 32]);
+        for (extra_bits, threads, needle) in [
+            (MAX_EXTRA_BITS + 1, 1, "--extra-bits"),
+            (0, MAX_THREADS + 1, "--threads"),
+        ] {
+            let err = build_join(
+                &storage,
+                &state,
+                &params.owner,
+                &k,
+                &JoinOptions {
+                    nickname: "A",
+                    text: "t",
+                    extra_bits,
+                    threads,
+                },
+                |_, _| {},
+            )
+            .err()
+            .expect("refused")
+            .to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    fn pending_status(reason: NeedsAdmissionReason) -> AdmissionStatus {
+        AdmissionStatus::NeedsAdmission {
+            reason,
+            requirements: AdmissionRequirements::InviteOnly,
+        }
+    }
+
+    fn some_entry() -> AuthorizedProvisionalMember {
+        let (_state, params, _owner) = open_room(1);
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let member = river_core::room_state::provisional::ProvisionalMember {
+            member_vk: k.verifying_key(),
+            evidence: river_core::room_state::provisional::AdmissionEvidence::Pow { nonce: 0 },
+        };
+        let sig = k.sign(&provisional_signing_bytes(&params.owner, &member));
+        assemble_provisional(member, sig)
+    }
+
+    #[test]
+    fn send_attachment_arms() {
+        let entry = some_entry();
+        let held = Some(entry.clone());
+        // Attach only when pruned.
+        let a = attachment_for_status(pending_status(NeedsAdmissionReason::Pruned), held.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.entries, vec![entry.clone()]);
+        // Nothing to attach when nothing is stored.
+        assert!(
+            attachment_for_status(pending_status(NeedsAdmissionReason::Pruned), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(attachment_for_status(
+            pending_status(NeedsAdmissionReason::NeverAdmitted),
+            held.clone()
+        )
+        .unwrap()
+        .is_none());
+        for ok in [
+            AdmissionStatus::Owner,
+            AdmissionStatus::Member,
+            AdmissionStatus::Provisional,
+        ] {
+            assert!(attachment_for_status(ok, held.clone()).unwrap().is_none());
+        }
+        let msg = |r: Result<Option<ProvisionalDelta>>| r.expect_err("refused").to_string();
+        assert!(
+            msg(attachment_for_status(AdmissionStatus::Banned, held.clone())).contains("banned")
+        );
+        assert!(msg(attachment_for_status(
+            pending_status(NeedsAdmissionReason::PolicyChanged(
+                river_core::room_state::admission::AdmissionError::BadSignature
+            )),
+            held.clone()
+        ))
+        .contains("policy changed"));
+        assert!(msg(attachment_for_status(
+            pending_status(NeedsAdmissionReason::RoomFull),
+            held.clone()
+        ))
+        .contains("open-member slots"));
+        assert!(msg(attachment_for_status(
+            pending_status(NeedsAdmissionReason::Shadowed),
+            None
+        ))
+        .contains("member id"));
+    }
+
+    /// A member send must not read provisional storage: a corrupt store does
+    /// not block it.
+    #[test]
+    fn a_member_send_does_not_touch_provisional_storage() {
+        let (mut state, params, owner) = open_room(4);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(Some(dir.path().to_str().unwrap())).unwrap();
+        std::fs::write(dir.path().join("provisional.json"), b"{ not json").unwrap();
+        let k = SigningKey::from_bytes(&[5; 32]);
+        assert!(storage
+            .get_provisional_entry(&params.owner, &k.verifying_key())
+            .is_err());
+        let now = SystemTime::now();
+        // The owner needs no entry.
+        assert!(
+            attachment_for_send(&storage, &state, &params.owner, &owner, now)
+                .unwrap()
+                .is_none()
+        );
+        // A key the room holds as provisional needs none either.
+        state.provisional.entries.push(some_entry());
+        assert!(
+            attachment_for_send(&storage, &state, &params.owner, &k, now)
+                .unwrap()
+                .is_none()
+        );
+        // A key the room has never seen does read the store, and reports it.
+        let other = SigningKey::from_bytes(&[6; 32]);
+        assert!(attachment_for_send(&storage, &state, &params.owner, &other, now).is_err());
     }
 
     #[test]

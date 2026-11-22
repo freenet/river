@@ -180,8 +180,9 @@ fn join_requires_invitation_json(room_id: &str) -> serde_json::Value {
     serde_json::json!({
         "status": "unsupported",
         "room_id": room_id,
-        "reason": "joining a room requires an invitation",
+        "reason": "joining a room requires an invitation, or proof of work in an open public room",
         "hint": "riverctl invite accept <invitation-code>",
+        "pow_hint": format!("riverctl room admission {room_id}; riverctl room join {room_id} --pow"),
     })
 }
 
@@ -385,6 +386,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
+                    .min(crate::admission::MAX_THREADS)
             });
             let quiet = matches!(format, OutputFormat::Json);
             let (delta, outcome) = crate::admission::build_join(
@@ -801,5 +803,9 @@ mod tests {
         assert_eq!(json["room_id"], "ROOMOWNERKEY");
         assert!(json["reason"].as_str().unwrap().contains("invitation"));
         assert_eq!(json["hint"], "riverctl invite accept <invitation-code>");
+        assert!(json["pow_hint"]
+            .as_str()
+            .unwrap()
+            .contains("room join ROOMOWNERKEY --pow"));
     }
 }
