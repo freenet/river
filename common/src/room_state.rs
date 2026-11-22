@@ -738,10 +738,14 @@ impl ChatRoomStateV1 {
             // decides (a member the member cap removes takes its issuer record
             // out of `members`), so up to two passes follow the first. If the
             // third pass still changes the state, its result is returned
-            // unconfirmed: the bound is a safety net, not a guarantee. No
-            // input measured (randomized merges and the captured rooms) has
-            // needed more than the first pass since step 0-sig runs on every
-            // pass.
+            // unconfirmed: the bound is a safety net, not a guarantee. Inputs
+            // that need a second changing pass exist (the fork fuzz records
+            // the most passes any cleanup ran, and CI fails if one reaches
+            // the bound unconfirmed). The provisional step (freenet/river#974)
+            // is written to add no pass of its own: what the member cap
+            // removes in a pass, including a deputy holding provisional bans,
+            // is followed in that same pass (P1 runs again after the member
+            // loop).
             self.cleanup_pass(parameters)?;
             let mut passes = 1;
             let mut last_changed = true;
@@ -770,6 +774,30 @@ impl ChatRoomStateV1 {
         let depth_cap = crate::room_state::ban_evidence::evidence_depth_cap(
             self.configuration.configuration.max_members,
         );
+        // Every key a `members` or ban-evidence record holds for an id at the
+        // start of the pass, before anything below drops a record: the
+        // records the field applies read when they resolved a provisional
+        // author (river#974, C3). An entry whose key differs from one of them
+        // has its content re-checked, so content an apply accepted under the
+        // entry key while such a record was held goes exactly when it would
+        // have gone had the record arrived first.
+        let held_record_keys = if self.provisional.entries.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let mut keys: std::collections::HashMap<MemberId, Vec<ed25519_dalek::VerifyingKey>> =
+                std::collections::HashMap::new();
+            for m in self
+                .members
+                .members
+                .iter()
+                .chain(&self.ban_evidence.members)
+            {
+                keys.entry(m.member.id())
+                    .or_default()
+                    .push(m.member.member_vk);
+            }
+            keys
+        };
         // A lowered `max_members` can leave held evidence deeper than the
         // cap. Drop it before anything reads it, so every step of this pass
         // (and `enforced_ban_set_of`, which drops it the same way) judges the
@@ -857,6 +885,24 @@ impl ChatRoomStateV1 {
             parameters,
         );
         let enforced_banned_ids = resolution.removed.clone();
+        // The targets of the bans that take effect: an id a ban names
+        // directly, by any authority River accepts (the owner, a deputy, the
+        // target's inviter or another ancestor), as opposed to one removed
+        // only because a ban removed its inviter. A provisional entry for a
+        // directly banned id is dropped (P2) even when the id's record is
+        // ban evidence under the entry's own key.
+        let direct_ban_targets: HashSet<MemberId> = if self.provisional.entries.is_empty() {
+            HashSet::new()
+        } else {
+            self.bans
+                .0
+                .iter()
+                .filter(|b| {
+                    resolution.tier(&b.id()) != crate::room_state::member::BanResolution::INERT
+                })
+                .map(|b| b.ban.banned_user)
+                .collect()
+        };
 
         // THE load-bearing invariant of the freenet/river#675 remedy: the ban
         // set `DirectMessagesV1::apply_delta` derived, before this function
@@ -889,7 +935,16 @@ impl ChatRoomStateV1 {
         // provisional bans stand, decided from the same records ban
         // enforcement just used. P6 is the member loop's window scan below
         // and P7 follows it.
-        let plan = self.provisional_step(parameters, owner_id, &enforced_banned_ids, &stable_known);
+        let plan = self.provisional_step(
+            parameters,
+            owner_id,
+            &crate::room_state::provisional::BanInputs {
+                removed: &enforced_banned_ids,
+                direct_targets: &direct_ban_targets,
+                stable_known: &stable_known,
+                held_record_keys: &held_record_keys,
+            },
+        );
 
         // 1-3. Inactivity prune and the `max_members` cap, repeated until the
         //      cap removes no one (`prune_and_cap_members`). Each pass starts
@@ -920,6 +975,18 @@ impl ChatRoomStateV1 {
         self.provisional
             .entries
             .retain(|e| pool.contains(&e.member_id()));
+        // P1 again, after the member cap: a provisional ban whose deputy
+        // issuer the cap just removed goes in this pass, not the next, so
+        // the provisional step adds no pass of its own to the cleanup budget.
+        // (Inactivity cannot remove that issuer: the issuers of kept
+        // provisional bans are required ids in the member loop.)
+        if !plan.ban_issuers.is_empty() {
+            let members_now: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            self.provisional
+                .bans
+                .retain(|b| b.ban.banned_by == owner_id || members_now.contains(&b.ban.banned_by));
+        }
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item

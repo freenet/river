@@ -515,7 +515,9 @@ impl ComposableState for MemberInfoV1 {
             let known = parent_state
                 .ban_evidence
                 .lookup(&parent_state.members, parameters.owner_id());
-            let provisional_keys = parent_state.provisional.key_map();
+            let provisional_keys = parent_state
+                .provisional
+                .admitted_keys(&parent_state.configuration.configuration, &parameters.owner);
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
@@ -552,20 +554,26 @@ impl ComposableState for MemberInfoV1 {
                     // member held in ban evidence counts (freenet/river#702): its
                     // record keeps merging by rank like any other. Freezing it
                     // at removal cannot converge, see `BanEvidenceV1`.
-                    let key = match known.get(member_id) {
-                        Some(m) => m.member.member_vk,
-                        None => match provisional_keys.get(member_id).copied().flatten() {
-                            Some(key) => key,
-                            None => continue,
-                        },
-                    };
-                    // A record that does not verify under the key its author
-                    // id resolves to is skipped, never an error: the id may be
-                    // shared by another key on this peer (a collision costs
-                    // nothing to make, `MemberId` is not a hash of the key's
-                    // strength), and an error would fail every merge with a
-                    // peer holding the other record (freenet/river#974, C3).
-                    if member_info.verify_signature_with_key(&key).is_err() {
+                    // The keys the id may sign with here: its `members` or
+                    // evidence record's, and those of its held entries that
+                    // pass the current policy (freenet/river#974). A record
+                    // that verifies under none of them is skipped, never an
+                    // error: another key may hold the same id on this peer
+                    // (see the `MemberId` docs), and an error would fail every
+                    // merge with a peer holding the other record. Which key
+                    // the id ends with is decided by cleanup (C1, C2, C3), so
+                    // an arrival is never skipped over a record or entry that
+                    // cleanup goes on to drop.
+                    let mut keys = known
+                        .get(member_id)
+                        .map(|m| &m.member.member_vk)
+                        .into_iter()
+                        .chain(provisional_keys.get(member_id).into_iter().flatten())
+                        .peekable();
+                    if keys.peek().is_none() {
+                        continue;
+                    }
+                    if !keys.any(|key| member_info.verify_signature_with_key(key).is_ok()) {
                         continue;
                     }
                 }
@@ -602,13 +610,13 @@ impl ComposableState for MemberInfoV1 {
         let member_map = parent_state
             .ban_evidence
             .lookup(&parent_state.members, parameters.owner_id());
-        let provisional_keys = parent_state.provisional.key_map();
+        let provisional_keys = parent_state
+            .provisional
+            .admitted_keys(&parent_state.configuration.configuration, &parameters.owner);
         self.member_info.retain(|info| {
             parameters.owner_id() == info.member_info.member_id
                 || member_map.contains_key(&info.member_info.member_id)
-                || provisional_keys
-                    .get(&info.member_info.member_id)
-                    .is_some_and(|k| k.is_some())
+                || provisional_keys.contains_key(&info.member_info.member_id)
         });
 
         // Write-side dedup (#411 round 8 Task 2 / item A): the update path above

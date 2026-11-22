@@ -239,21 +239,31 @@ impl ComposableState for MessagesV1 {
         // The provisional field as held at this point of the apply (every
         // entry that passed arrival, including one in this same delta), so a
         // new member's first message is accepted with its entry
-        // (freenet/river#974). An id resolves to its record's key when a
-        // record exists, otherwise to the key its held entries share, and a
-        // message that does not verify under it is skipped, never an error.
-        let provisional_keys = parent_state.provisional.key_map();
-        let author_key = |author: &MemberId| -> Option<&ed25519_dalek::VerifyingKey> {
-            if *author == owner_id {
-                Some(&parameters.owner)
-            } else if let Some(m) = members_by_id.get(author) {
-                Some(&m.member.member_vk)
-            } else {
-                provisional_keys.get(author).and_then(|k| k.as_ref())
-            }
+        // (freenet/river#974). A non-owner message is accepted when it
+        // verifies under its author's `members` record or under any held
+        // entry for the id that passes the current policy, and skipped
+        // otherwise, never an error. Which of those keys the id ends with is
+        // decided by cleanup (C1, C2, C3) from the merged records, so an
+        // arrival is never skipped over a key cleanup drops.
+        let provisional_keys = parent_state
+            .provisional
+            .admitted_keys(&parent_state.configuration.configuration, &parameters.owner);
+        let has_author_key = |author: &MemberId| {
+            *author == owner_id
+                || members_by_id.contains_key(author)
+                || provisional_keys.contains_key(author)
         };
         let signed_by_author = |msg: &AuthorizedMessageV1| {
-            author_key(&msg.message.author).is_some_and(|key| msg.validate(key).is_ok())
+            let author = &msg.message.author;
+            if *author == owner_id {
+                return msg.validate(&parameters.owner).is_ok();
+            }
+            members_by_id
+                .get(author)
+                .map(|m| &m.member.member_vk)
+                .into_iter()
+                .chain(provisional_keys.get(author).into_iter().flatten())
+                .any(|key| msg.validate(key).is_ok())
         };
 
         // Validate message constraints before adding
@@ -319,8 +329,7 @@ impl ComposableState for MessagesV1 {
             .retain(|m| m.message.content.content_len() <= max_message_size);
 
         // Ensure all messages are signed by a valid member or the room owner, remove if not
-        self.messages
-            .retain(|m| m.message.author == owner_id || author_key(&m.message.author).is_some());
+        self.messages.retain(|m| has_author_key(&m.message.author));
 
         // The same admission rule as for arrivals above.
         self.messages

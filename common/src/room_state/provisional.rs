@@ -334,10 +334,12 @@ impl AuthorizedProvisionalMember {
         if let Some(ok) = crate::room_state::ban::signature_memo::lookup_provisional(&key) {
             return ok_or_invalid(ok, "provisional member");
         }
+        // `verify_strict`: also refuses a small-order key or `R`, so no
+        // signature verifies without the key's secret.
         let ok = self
             .provisional
             .member_vk
-            .verify(
+            .verify_strict(
                 &provisional_signing_bytes(owner_vk, &self.provisional),
                 &self.signature,
             )
@@ -362,6 +364,11 @@ impl AuthorizedProvisionalMember {
         let pow = policy.pow.as_ref().ok_or(AdmissionError::PowDisabled)?;
         if self.provisional.member_vk == *owner_vk {
             return Err(AdmissionError::OwnerKey);
+        }
+        // A small-order key: a signature under it can be made without any
+        // secret key, so it proves nothing about who posted.
+        if self.provisional.member_vk.is_weak() {
+            return Err(AdmissionError::WeakKey);
         }
         match &self.provisional.evidence {
             AdmissionEvidence::Pow { nonce } => {
@@ -435,6 +442,8 @@ pub enum AdmissionError {
     PowDisabled,
     /// The entry's key is the room owner's.
     OwnerKey,
+    /// The entry's key has small order, so it signs nothing.
+    WeakKey,
     /// The proof has fewer leading zero bits than the policy requires.
     InsufficientWork { required: u8, achieved: u8 },
     /// The member's self-signature does not verify.
@@ -448,6 +457,7 @@ impl std::fmt::Display for AdmissionError {
             Self::NoPolicy => write!(f, "the room has no open-admission policy"),
             Self::PowDisabled => write!(f, "the room does not admit by proof of work"),
             Self::OwnerKey => write!(f, "the key is the room owner's"),
+            Self::WeakKey => write!(f, "the key is a weak (small-order) key"),
             Self::InsufficientWork { required, achieved } => {
                 write!(f, "proof of work has {achieved} bits, {required} required")
             }
@@ -520,7 +530,9 @@ impl ProvisionalV1 {
     }
 
     /// The key each entry id resolves to: its entries' common key, or `None`
-    /// when the held entries for the id disagree.
+    /// when the held entries for the id disagree. Read by the `verify` of
+    /// `member_info` and messages, on a whole state; an apply reads
+    /// [`Self::admitted_keys`] instead.
     pub fn key_map(&self) -> HashMap<MemberId, Option<VerifyingKey>> {
         let mut map: HashMap<MemberId, Option<VerifyingKey>> = HashMap::new();
         for entry in &self.entries {
@@ -532,6 +544,37 @@ impl ProvisionalV1 {
                     }
                 })
                 .or_insert(Some(vk));
+        }
+        map
+    }
+
+    /// Every key a held entry that passes the CURRENT policy carries, per
+    /// id: the keys a provisional author's message or `member_info` may be
+    /// signed with at this point of an apply (river#974, 2.6).
+    ///
+    /// All of them, not one resolved key: a record that verifies under any
+    /// of them is accepted on arrival, and cleanup (P3, C1, C2, C3) decides
+    /// which survive from the merged records. Resolving to one key here
+    /// would make "skipped on arrival" read records cleanup may drop (an
+    /// entry failing the policy, an evidence record deeper than the cap)
+    /// while "dropped where held" does not, so the first exchange of a merge
+    /// would depend on which side held the record. Entries failing the
+    /// current policy are left out because cleanup drops them (P3) together
+    /// with everything their key signed.
+    pub fn admitted_keys(
+        &self,
+        config: &Configuration,
+        owner_vk: &VerifyingKey,
+    ) -> HashMap<MemberId, Vec<VerifyingKey>> {
+        let mut map: HashMap<MemberId, Vec<VerifyingKey>> = HashMap::new();
+        for entry in &self.entries {
+            if entry.check_policy(config, owner_vk).is_err() {
+                continue;
+            }
+            let keys = map.entry(entry.member_id()).or_default();
+            if !keys.contains(&entry.provisional.member_vk) {
+                keys.push(entry.provisional.member_vk);
+            }
         }
         map
     }
@@ -552,7 +595,7 @@ impl ComposableState for ProvisionalV1 {
     /// Every held entry's self-signature, every held ban signature whose
     /// issuer is known, and the counts against the state's own caps. This is
     /// the cost `validate_state` pays after every changing update, so the
-    /// ceilings are 100 each.
+    /// ceilings are 16 each ([`MAX_PROVISIONAL_CEILING`]).
     fn verify(
         &self,
         parent_state: &Self::ParentState,
@@ -675,7 +718,40 @@ impl ComposableState for ProvisionalV1 {
                     delta.bans.len()
                 ));
             }
+            // A room with no active policy (no policy, or not `Public`)
+            // holds no entry and no provisional ban after cleanup (P0), so
+            // nothing in the delta is hashed or checked: a room that never
+            // enabled open admission pays nothing for this field.
+            if active_policy(config).is_some() {
+                self.apply_new_records(parent_state, parameters, delta, lifted)?;
+            }
+        }
 
+        // Held twice (a state `verify` accepts but no apply produces): kept once.
+        let mut seen = HashSet::new();
+        self.entries
+            .retain(|e| seen.insert((e.member_id(), entry_digest(e))));
+        let mut seen = HashSet::new();
+        self.bans.retain(|b| seen.insert(ban_digest(b)));
+        self.sort_canonical();
+        Ok(())
+    }
+}
+
+impl ProvisionalV1 {
+    /// The arrival half of [`ComposableState::apply_delta`] for a room with
+    /// an active policy: the records the delta carries that are not held.
+    fn apply_new_records(
+        &mut self,
+        parent_state: &ChatRoomStateV1,
+        parameters: &ChatRoomParametersV1,
+        delta: &ProvisionalDelta,
+        lifted: bool,
+    ) -> Result<(), String> {
+        let config = &parent_state.configuration.configuration;
+        let entry_bound = entries_work_bound(config);
+        let ban_bound = bans_work_bound(config);
+        {
             let held: HashSet<(MemberId, EntryDigest)> = self
                 .entries
                 .iter()
@@ -696,9 +772,11 @@ impl ComposableState for ProvisionalV1 {
                     new_entries.len()
                 ));
             }
+            // The policy check (one BLAKE3 call) runs first, so an entry
+            // that cannot be admitted costs no signature check.
             for entry in new_entries {
-                entry.verify_signature(&parameters.owner)?;
                 if entry.check_policy(config, &parameters.owner).is_ok() {
+                    entry.verify_signature(&parameters.owner)?;
                     self.entries.push(entry.clone());
                 }
             }
@@ -739,14 +817,6 @@ impl ComposableState for ProvisionalV1 {
                 }
             }
         }
-
-        // Held twice (a state `verify` accepts but no apply produces): kept once.
-        let mut seen = HashSet::new();
-        self.entries
-            .retain(|e| seen.insert((e.member_id(), entry_digest(e))));
-        let mut seen = HashSet::new();
-        self.bans.retain(|b| seen.insert(ban_digest(b)));
-        self.sort_canonical();
         Ok(())
     }
 }
@@ -768,20 +838,38 @@ pub(crate) struct ProvisionalPlan {
     pub ban_issuers: HashSet<MemberId>,
 }
 
+/// What ban enforcement fixed for [`ChatRoomStateV1::provisional_step`].
+pub(crate) struct BanInputs<'a> {
+    /// `resolution.removed`: every id a ban the pass enforces removes.
+    pub removed: &'a HashSet<MemberId>,
+    /// The targets of the bans that take effect (any authority River
+    /// accepts), as opposed to ids removed only with a banned inviter.
+    pub direct_targets: &'a HashSet<MemberId>,
+    /// The records the pass reads for ban judgement (`BansV1::stable_known`).
+    pub stable_known: &'a HashMap<MemberId, &'a AuthorizedMember>,
+    /// Every key a `members` or evidence record held for an id at the start
+    /// of the pass, before evidence deeper than the cap was dropped.
+    pub held_record_keys: &'a HashMap<MemberId, Vec<VerifyingKey>>,
+}
+
 impl ChatRoomStateV1 {
     /// Cleanup steps P0 to P5 and C3 (river#974 design, 2.4 and 2.5), run in
     /// `cleanup_pass` after ban enforcement and before the member loop. P6 is
     /// the member loop's window scan and P7 runs after it.
     ///
-    /// `removed` is `resolution.removed` and `stable_known` the records the
-    /// pass reads for ban judgement. Everything here only removes.
+    /// Everything here only removes.
     pub(crate) fn provisional_step(
         &mut self,
         parameters: &ChatRoomParametersV1,
         owner_id: MemberId,
-        removed: &HashSet<MemberId>,
-        stable_known: &HashMap<MemberId, &AuthorizedMember>,
+        bans: &BanInputs<'_>,
     ) -> ProvisionalPlan {
+        let BanInputs {
+            removed,
+            direct_targets,
+            stable_known,
+            held_record_keys,
+        } = bans;
         if self.provisional.is_empty() {
             return ProvisionalPlan::default();
         }
@@ -797,7 +885,7 @@ impl ChatRoomStateV1 {
                 .or_default()
                 .push(m.member.member_vk);
         }
-        for (id, m) in stable_known {
+        for (id, m) in stable_known.iter() {
             record_keys.entry(*id).or_default().push(m.member.member_vk);
         }
 
@@ -806,7 +894,13 @@ impl ChatRoomStateV1 {
         // different keys. Computed over EVERY entry held at the start of the
         // pass, before any rule below drops one, so that whichever rule drops
         // it (a ban, the policy, C1, C2) the content it authored under a key
-        // the id no longer resolves to goes too (C3).
+        // the id no longer resolves to goes too (C3). The records compared
+        // are the C1 set and every record held when the pass started
+        // (`held_record_keys`, read before evidence deeper than the cap is
+        // dropped): the field applies accepted content under any key a held
+        // record or admitted entry carried, so every id whose content could
+        // have been accepted under a key other than the one it ends with is
+        // re-checked here.
         let conflicted: HashSet<MemberId> = {
             let mut keys_by_id: HashMap<MemberId, HashSet<[u8; 32]>> = HashMap::new();
             let mut out = HashSet::new();
@@ -814,10 +908,12 @@ impl ChatRoomStateV1 {
                 let id = e.member_id();
                 let vk = e.provisional.member_vk;
                 keys_by_id.entry(id).or_default().insert(vk.to_bytes());
+                let differs = |keys: Option<&Vec<VerifyingKey>>| {
+                    keys.is_some_and(|keys| keys.iter().any(|k| *k != vk))
+                };
                 if id == owner_id
-                    || record_keys
-                        .get(&id)
-                        .is_some_and(|keys| keys.iter().any(|k| *k != vk))
+                    || differs(record_keys.get(&id))
+                    || differs(held_record_keys.get(&id))
                 {
                     out.insert(id);
                 }
@@ -893,13 +989,22 @@ impl ChatRoomStateV1 {
             .filter(|id| *id != owner_id)
             .collect();
 
-        // P2: banned ids. A ban the pass enforces reaches an entry only where
-        // no record holds the id (an owner or owner-deputy ban on an unknown
-        // id); where a record holds it, the entry is already gone by
-        // sponsorship or C1.
+        // P2: banned ids. An id a ban the pass enforces names directly, by
+        // any authority River accepts (owner, deputy, an ancestor in the
+        // invite tree), is banned whatever record holds it: a member a deputy
+        // or their inviter banned does not come back by doing the work, even
+        // though their record is ban evidence under the entry's own key. An
+        // id removed only because a ban removed its inviter (`reach_in`) is
+        // banned only where no record holds it; where a record holds it under
+        // the entry's key, the entry may stay (design D2, consequence (a)),
+        // and under another key C1 drops it. A ban on an id no record holds
+        // takes effect only from the owner or an owner deputy
+        // (`is_ban_authorized` gives such a target the strict ancestors
+        // `{owner}`), so a non-deputy's ban reaches an entry only through a
+        // record it can be attributed to.
         let banned: HashSet<MemberId> = removed
             .iter()
-            .filter(|id| !record_keys.contains_key(id))
+            .filter(|id| !record_keys.contains_key(id) || direct_targets.contains(id))
             .copied()
             .chain(kept_bans.iter().map(|b| b.ban.target))
             .collect();
