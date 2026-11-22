@@ -12,6 +12,7 @@ pub mod error;
 pub mod error_report;
 pub mod freenet_synchronizer;
 pub mod generation_watch;
+pub mod legacy_cleanup;
 pub mod migration_journal;
 pub mod response_handler;
 pub mod room_synchronizer;

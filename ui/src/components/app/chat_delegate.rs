@@ -8245,7 +8245,7 @@ fn should_defer_cache_only_save(elapsed_ms: f64) -> bool {
 /// inheriting the 5-minute debounce. Getting that backwards could delay
 /// persisting key material, and `self_sk` cannot be re-derived from the network
 /// — losing it loses the user's identity in that room.
-fn critical_hash(room_data: &RoomData) -> Option<u64> {
+pub(crate) fn critical_hash(room_data: &RoomData) -> Option<u64> {
     let mut probe = room_data.clone();
     probe.room_state = Default::default();
     probe.last_read_message_id = None;

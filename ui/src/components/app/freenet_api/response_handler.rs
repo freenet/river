@@ -359,6 +359,11 @@ impl ResponseHandler {
                                                         // (every delegate-WASM bump needs it — freenet/river#345).
                                                         if is_legacy_delegate {
                                                             info!("Successfully loaded rooms from LEGACY delegate - migrating to new delegate");
+                                                            if !loaded_rooms.map.is_empty() {
+                                                                super::legacy_cleanup::note_legacy_data_seen(
+                                                                    responding_delegate.bytes(),
+                                                                );
+                                                            }
                                                             // Journal-gated, so it runs in its own task:
                                                             // `note_app_import_started` is a round trip
                                                             // and must answer before the merge
@@ -814,7 +819,7 @@ impl ResponseHandler {
 const ROOM_LOAD_CONCURRENCY: usize = 16;
 
 /// One legacy generation's per-room slot fan-out at a time (freenet/river#809).
-static LEGACY_SLOT_FETCH: std::sync::LazyLock<futures::lock::Mutex<()>> =
+pub(crate) static LEGACY_SLOT_FETCH: std::sync::LazyLock<futures::lock::Mutex<()>> =
     std::sync::LazyLock::new(|| futures::lock::Mutex::new(()));
 
 // What one client can have in the node's shared delegate admission queue
@@ -1606,6 +1611,9 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
         // find rooms sets `Migrating` and hydrates (`room_count > 0` → `List`).
         return;
     }
+    // This generation still holds rooms: shrink the superseded copies once the
+    // load is quiet (`legacy_cleanup`).
+    super::legacy_cleanup::note_legacy_data_seen(legacy_key.bytes());
 
     // Flag the import in the migration journal BEFORE the merge, with the count
     // read above (freenet/river#763). A refusal skips this delegate on this load;

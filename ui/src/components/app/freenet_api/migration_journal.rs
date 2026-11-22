@@ -162,6 +162,24 @@ fn update_session(f: impl FnOnce(&mut JournalSession)) {
 }
 
 // ---------------------------------------------------------------------------
+// What the legacy-copy cleanup may rely on (`legacy_cleanup`)
+// ---------------------------------------------------------------------------
+
+/// Take the journal lock, so no `begin`, sweep flag or walk runs (or reads a
+/// predecessor) while the caller holds it. The legacy-copy cleanup holds it for
+/// its whole pass: the walk reads predecessors through the same correlation
+/// keys, and its `items_seen` rule must see a predecessor that is not changing
+/// under it.
+pub(crate) async fn lock_journal_ops() -> futures::lock::MutexGuard<'static, ()> {
+    JOURNAL_OPS.lock().await
+}
+
+/// Whether a journaled walk is requested or running on this page load.
+pub(crate) fn walk_in_flight() -> bool {
+    session().walk_in_flight
+}
+
+// ---------------------------------------------------------------------------
 // The identity-import gate
 // ---------------------------------------------------------------------------
 
