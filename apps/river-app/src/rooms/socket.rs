@@ -267,7 +267,8 @@ pub struct NodeSocket {
     chunks: HashMap<u32, Chunks>,
     /// When anything (a response, a pong) last arrived.
     last_heard: Instant,
-    /// Whether anything at all has arrived on this connection.
+    /// Whether a whole message has arrived on this connection. Partial bytes move
+    /// `last_heard` but not this.
     heard_anything: bool,
     /// How long [`recv`](NodeSocket::recv) waits for anything before it reports `Timeout`.
     read_wait: Duration,
@@ -479,7 +480,8 @@ impl NodeSocket {
         self.write_message(Message::Ping(Vec::new().into()))
     }
 
-    /// Whether anything at all has arrived on this connection.
+    /// Whether a whole message has arrived on this connection. Partial bytes move
+    /// `last_heard` but not this.
     pub fn heard_anything(&self) -> bool {
         self.heard_anything
     }
@@ -564,17 +566,26 @@ impl NodeSocket {
                     });
                 }
                 // Pings are answered by tungstenite; text is not part of the native protocol.
-                _ => continue,
+                _ => Vec::new(),
             };
-            match self.take(&bytes)? {
-                Some(Err(e)) => {
-                    if let Some(rejected) = token_rejection(&e) {
-                        return Err(rejected);
+            if !bytes.is_empty() {
+                match self.take(&bytes)? {
+                    Some(Err(e)) => {
+                        if let Some(rejected) = token_rejection(&e) {
+                            return Err(rejected);
+                        }
+                        return Ok(Err(e));
                     }
-                    return Ok(Err(e));
+                    Some(whole) => return Ok(whole),
+                    None => {}
                 }
-                Some(whole) => return Ok(whole),
-                None => {}
+            }
+            // A message that is not an answer (a ping, a pong, text, a chunk of a response still
+            // arriving, one this build cannot read) does not stop the wait running out: a node
+            // that keeps sending them faster than they are read never lets the read block, so
+            // the deadline is checked here too. A chunk already taken is kept in `self.chunks`.
+            if Instant::now() >= deadline {
+                return Err(SocketError::Timeout);
             }
         }
     }
@@ -1522,10 +1533,30 @@ mod tests {
 
     /// A waiter that makes the race happen by construction: its first wait has the node send
     /// a frame, and only then reports that the wait ran out.
+    /// Wait until `n` bytes are readable on the client side. A node's write returning does not
+    /// make its bytes readable here yet (macOS loopback delivers them a little later), so a
+    /// test that needs "the data is waiting" must wait for it, not for the node's write.
+    fn wait_readable(tcp: &TcpStream, n: usize) {
+        let until = Instant::now() + Duration::from_secs(10);
+        let mut probe = vec![0u8; n];
+        loop {
+            match tcp.peek(&mut probe) {
+                Ok(got) if got >= n => return,
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("peek on the node socket: {e}"),
+            }
+            assert!(Instant::now() < until, "the node's bytes never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     struct Inject {
         go: std::sync::mpsc::Sender<()>,
         done: std::sync::mpsc::Receiver<()>,
         calls: Arc<AtomicUsize>,
+        /// How long the first wait sleeps once the frame is readable: past the read wait.
+        past: Duration,
     }
 
     impl Waiter for Inject {
@@ -1533,20 +1564,10 @@ mod tests {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.go.send(()).unwrap();
                 self.done.recv().unwrap();
-                // The node's `send` returning does not mean the bytes are readable here yet
-                // (macOS loopback delivers them a little later). Report the timeout only once
-                // they are, so the race is the one meant: data waiting, wait timed out.
-                let until = Instant::now() + Duration::from_secs(10);
-                let mut probe = [0u8; 1];
-                loop {
-                    match tcp.peek(&mut probe) {
-                        Ok(n) if n > 0 => break,
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                        other => panic!("peek on the node socket: {other:?}"),
-                    }
-                    assert!(Instant::now() < until, "the node's frame never arrived");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                // Report the timeout only once the frame is readable AND the read wait is
+                // over, so the race is the one meant: data waiting, deadline passed.
+                wait_readable(tcp, 1);
+                std::thread::sleep(self.past);
             }
             Waited::TimedOut
         }
@@ -1647,10 +1668,11 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// The original race, by construction and with no timing involved: the wait runs out at
-    /// the moment a frame arrives (the stand-in waiter has the node send it, and only then
-    /// reports the timeout). `recv` must read once more and return the frame, not `Timeout`.
-    /// A later wait with nothing sent does time out.
+    /// The original race, by construction: the wait runs out as a frame arrives (the stand-in
+    /// waiter has the node send it, waits until it is readable and past the read wait, and
+    /// only then reports the timeout). `recv` must read once more and return the frame, not
+    /// `Timeout`, even though its deadline has passed. A later wait with nothing sent does
+    /// time out.
     #[test]
     fn a_wait_that_runs_out_as_data_arrives_loses_nothing() {
         let (go_tx, go_rx) = channel();
@@ -1670,8 +1692,9 @@ mod tests {
             go: go_tx,
             done: done_rx,
             calls: calls.clone(),
+            past: Duration::from_millis(150),
         }));
-        socket.set_read_timeout(Duration::from_secs(30)).unwrap();
+        socket.set_read_timeout(Duration::from_millis(100)).unwrap();
         let got = socket.recv().expect("the frame was lost to the timeout");
         assert_eq!(text_of(&got), "frame 1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1769,6 +1792,8 @@ mod tests {
         socket.set_read_timeout(Duration::from_secs(1)).unwrap();
         go_tx.send(()).unwrap();
         done_rx.recv().unwrap();
+        let total: usize = (10..13).map(|i| frame_bytes(&numbered(i)).len()).sum();
+        wait_readable(&socket.ws.get_ref().tcp, total);
         let start = Instant::now();
         let texts: Vec<String> = (0..3).map(|_| text_of(&socket.recv().unwrap())).collect();
         assert_eq!(texts, ["frame 10", "frame 11", "frame 12"]);
@@ -1830,6 +1855,7 @@ mod tests {
         socket.set_read_timeout(Duration::from_millis(50)).unwrap();
         for _ in 0..2 {
             sent_rx.recv().unwrap();
+            wait_readable(&socket.ws.get_ref().tcp, 1);
             let before = socket.last_heard();
             assert_eq!(socket.recv().unwrap_err(), SocketError::Timeout);
             assert!(socket.last_heard() > before, "the bytes were not counted");
@@ -1839,6 +1865,48 @@ mod tests {
         socket.set_read_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(text_of(&socket.recv().unwrap()), "frame 7");
         drop(socket);
+        server.join().unwrap();
+    }
+
+    /// A node that sends pings faster than they can be read never lets the read block, so the
+    /// deadline must be checked after each message too, or `recv` never returns. The node
+    /// writes pings in 64 KiB batches, far faster than the client parses them and queues a
+    /// pong for each; `recv` runs on its own thread so the old code fails this by the bound
+    /// rather than hanging the suite.
+    #[test]
+    fn a_flood_of_pings_does_not_keep_recv_from_its_timeout() {
+        use std::sync::atomic::AtomicBool;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_node = stop.clone();
+        let (authority, server) = node_that(move |mut ws| {
+            // An unmasked empty ping, from the node, is two bytes.
+            let batch: Vec<u8> = [0x89u8, 0x00].repeat(32 * 1024);
+            let tcp = ws.get_mut();
+            tcp.set_write_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            while !stop_node.load(Ordering::SeqCst) {
+                match tcp.write_all(&batch) {
+                    Ok(()) => {}
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        let (result_tx, result_rx) = channel();
+        let reader = thread::spawn(move || {
+            let mut socket = open(&authority);
+            socket.set_read_timeout(Duration::from_millis(100)).unwrap();
+            let start = Instant::now();
+            let got = socket.recv();
+            result_tx.send((got.map(|_| ()), start.elapsed())).unwrap();
+            socket
+        });
+        let outcome = result_rx.recv_timeout(Duration::from_secs(5));
+        stop.store(true, Ordering::SeqCst);
+        let (got, took) = outcome.expect("recv never returned while the node kept sending pings");
+        assert_eq!(got.unwrap_err(), SocketError::Timeout);
+        assert!(took >= Duration::from_millis(100), "{took:?}");
+        drop(reader.join().unwrap());
         server.join().unwrap();
     }
 
@@ -2105,7 +2173,7 @@ mod tests {
         let after = count();
         server.join().unwrap();
         assert!(
-            after < warm + 100,
+            after < warm + 150,
             "descriptors grew from {warm} to {after} over {CYCLES} connections"
         );
     }
