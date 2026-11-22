@@ -759,13 +759,6 @@ impl ChatRoomStateV1 {
         if self.provisional.is_empty() {
             return ProvisionalPlan::default();
         }
-        let config = &self.configuration.configuration;
-        // P0
-        let Some(policy) = active_policy(config).cloned() else {
-            self.provisional = ProvisionalV1::default();
-            return ProvisionalPlan::default();
-        };
-        let quota = policy.quota(config.max_recent_messages);
         let owner_vk = parameters.owner;
 
         // The records the pass reads, with every key they hold (the C1 set:
@@ -781,6 +774,45 @@ impl ChatRoomStateV1 {
         for (id, m) in stable_known {
             record_keys.entry(*id).or_default().push(m.member.member_vk);
         }
+
+        // The ids whose key is in question: an id with an entry whose key
+        // differs from a record's (or the owner's id), or with entries under
+        // different keys. Computed over EVERY entry held at the start of the
+        // pass, before any rule below drops one, so that whichever rule drops
+        // it (a ban, the policy, C1, C2) the content it authored under a key
+        // the id no longer resolves to goes too (C3).
+        let conflicted: HashSet<MemberId> = {
+            let mut keys_by_id: HashMap<MemberId, HashSet<[u8; 32]>> = HashMap::new();
+            let mut out = HashSet::new();
+            for e in &self.provisional.entries {
+                let id = e.member_id();
+                let vk = e.provisional.member_vk;
+                keys_by_id.entry(id).or_default().insert(vk.to_bytes());
+                if id == owner_id
+                    || record_keys
+                        .get(&id)
+                        .is_some_and(|keys| keys.iter().any(|k| *k != vk))
+                {
+                    out.insert(id);
+                }
+            }
+            out.extend(
+                keys_by_id
+                    .into_iter()
+                    .filter(|(_, keys)| keys.len() > 1)
+                    .map(|(id, _)| id),
+            );
+            out
+        };
+
+        let config = &self.configuration.configuration;
+        // P0
+        let Some(policy) = active_policy(config).cloned() else {
+            self.provisional = ProvisionalV1::default();
+            self.drop_unverifiable(&conflicted, &HashMap::new(), parameters);
+            return ProvisionalPlan::default();
+        };
+        let quota = policy.quota(config.max_recent_messages);
 
         // P1: provisional bans.
         let kept_bans = {
@@ -853,18 +885,13 @@ impl ChatRoomStateV1 {
         entries.retain(|e| e.check_policy(config, &owner_vk).is_ok());
 
         // P4: C1, a record beats an entry (and the owner's id is no entry's).
-        let mut shadowed: HashSet<MemberId> = HashSet::new();
         entries.retain(|e| {
             let id = e.member_id();
             let vk = e.provisional.member_vk;
-            let beaten = id == owner_id
+            !(id == owner_id
                 || record_keys
                     .get(&id)
-                    .is_some_and(|keys| keys.iter().any(|k| *k != vk));
-            if beaten {
-                shadowed.insert(id);
-            }
-            !beaten
+                    .is_some_and(|keys| keys.iter().any(|k| *k != vk)))
         });
         // C2: entries with one id and different keys are all dropped.
         let mut keys_by_id: HashMap<MemberId, HashSet<[u8; 32]>> = HashMap::new();
@@ -874,14 +901,7 @@ impl ChatRoomStateV1 {
                 .or_default()
                 .insert(e.provisional.member_vk.to_bytes());
         }
-        entries.retain(|e| {
-            let id = e.member_id();
-            let conflicted = keys_by_id[&id].len() > 1;
-            if conflicted {
-                shadowed.insert(id);
-            }
-            !conflicted
-        });
+        entries.retain(|e| keys_by_id[&e.member_id()].len() == 1);
         // P5: sponsorship (a members record with the same key), then one entry
         // per key (the smallest digest).
         {
@@ -901,35 +921,13 @@ impl ChatRoomStateV1 {
         }
         entries.retain(|e| best[&e.provisional.member_vk.to_bytes()] == entry_digest(e));
 
-        // C3: what an id that C1 or C2 just shadowed authored, and no longer
-        // verifies under the key the id now resolves to, goes with the entry.
-        if !shadowed.is_empty() {
-            let members_by_id = self.members.members_by_member_id();
-            let key_of = |id: MemberId| -> Option<VerifyingKey> {
-                if id == owner_id {
-                    Some(owner_vk)
-                } else {
-                    members_by_id.get(&id).map(|m| m.member.member_vk)
-                }
-            };
-            self.recent_messages.messages.retain(|m| {
-                !shadowed.contains(&m.message.author)
-                    || key_of(m.message.author).is_some_and(|k| m.validate(&k).is_ok())
-            });
-            let known = self.ban_evidence.lookup(&self.members, owner_id);
-            self.member_info.member_info.retain(|info| {
-                let id = info.member_info.member_id;
-                if !shadowed.contains(&id) {
-                    return true;
-                }
-                let key = if id == owner_id {
-                    Some(owner_vk)
-                } else {
-                    known.get(&id).map(|m| m.member.member_vk)
-                };
-                key.is_some_and(|k| info.verify_signature_with_key(&k).is_ok())
-            });
-        }
+        // C3: what a conflicted id authored under a key it no longer
+        // resolves to goes with the entry.
+        let survivors: HashMap<MemberId, VerifyingKey> = entries
+            .iter()
+            .map(|e| (e.member_id(), e.provisional.member_vk))
+            .collect();
+        self.drop_unverifiable(&conflicted, &survivors, parameters);
 
         let ids: HashSet<MemberId> = entries.iter().map(|e| e.member_id()).collect();
         self.provisional.entries = entries;
@@ -940,6 +938,59 @@ impl ChatRoomStateV1 {
             pool_cap: policy.max_provisional as usize,
             ban_issuers,
         }
+    }
+}
+
+impl ChatRoomStateV1 {
+    /// C3 (river#974 design, 2.4): held messages and `member_info` records
+    /// authored by an id in `conflicted` that do not verify under the key the
+    /// id now resolves to are dropped. An id resolves to the owner's key, else
+    /// its `members` record's (for `member_info`, a record held as ban
+    /// evidence counts), else the key of the surviving entry for it, else to
+    /// none. Only conflicted ids are checked, so the cost is one signature
+    /// check per held message or record of a conflicted id.
+    fn drop_unverifiable(
+        &mut self,
+        conflicted: &HashSet<MemberId>,
+        survivors: &HashMap<MemberId, VerifyingKey>,
+        parameters: &ChatRoomParametersV1,
+    ) {
+        if conflicted.is_empty() {
+            return;
+        }
+        let owner_id = parameters.owner_id();
+        let owner_vk = parameters.owner;
+        let members_by_id = self.members.members_by_member_id();
+        let message_key = |id: MemberId| -> Option<VerifyingKey> {
+            if id == owner_id {
+                Some(owner_vk)
+            } else {
+                members_by_id
+                    .get(&id)
+                    .map(|m| m.member.member_vk)
+                    .or_else(|| survivors.get(&id).copied())
+            }
+        };
+        self.recent_messages.messages.retain(|m| {
+            !conflicted.contains(&m.message.author)
+                || message_key(m.message.author).is_some_and(|k| m.validate(&k).is_ok())
+        });
+        let known = self.ban_evidence.lookup(&self.members, owner_id);
+        self.member_info.member_info.retain(|info| {
+            let id = info.member_info.member_id;
+            if !conflicted.contains(&id) {
+                return true;
+            }
+            let key = if id == owner_id {
+                Some(owner_vk)
+            } else {
+                known
+                    .get(&id)
+                    .map(|m| m.member.member_vk)
+                    .or_else(|| survivors.get(&id).copied())
+            };
+            key.is_some_and(|k| info.verify_signature_with_key(&k).is_ok())
+        });
     }
 }
 

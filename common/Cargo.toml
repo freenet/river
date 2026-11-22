@@ -98,6 +98,13 @@ stored-rooms = []
 # WASM builds do not enable it. It adds no dependencies.
 invitation = []
 
+# Client API for open admission to public rooms (freenet/river#974): the
+# requirements and status of a key in a room, the proof-of-work solver and the
+# admission delta builder. Client only, like `migration` and `mentions`: the
+# room-contract and chat-delegate WASM builds do not enable it, so none of it
+# is compiled into them. It adds no dependencies.
+admission = []
+
 [build-dependencies]
 # Parses legacy_room_contracts.toml, validates every hash, and generates the
 # LEGACY_ROOM_CONTRACT_CODE_HASHES registry (freenet/river#292, #398).
@@ -120,6 +127,12 @@ proptest = { version = "1.11", default-features = false, features = ["std", "bit
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+
+# Cost of `update_state` + `validate_state` per chat message on a room at the
+# provisional ceilings (freenet/river#974). Plain `std::time`, no dependency.
+[[bench]]
+name = "provisional_pair"
+harness = false
 
 # Measurement switches for out-of-tree tools only, set with RUSTFLAGS, never
 # Cargo features, so no published build or feature unification can turn them

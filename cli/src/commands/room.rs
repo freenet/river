@@ -37,9 +37,51 @@ pub enum RoomCommands {
         signing_key: Option<String>,
     },
     /// Join a room
+    ///
+    /// Without `--pow` this explains that a room needs an invitation. With
+    /// `--pow`, an open public room admits you provisionally: the command
+    /// solves the room's proof of work, signs it with your key, and posts it
+    /// with your nickname and a first message. It prints the signing key when
+    /// it made one; pass it to `message send --signing-key` afterwards.
     Join {
         /// Room ID
         room_id: String,
+
+        /// Join an open public room by proof of work (see `room admission`)
+        #[arg(long)]
+        pow: bool,
+
+        /// Your nickname in the room (with --pow)
+        #[arg(short = 'N', long)]
+        nickname: Option<String>,
+
+        /// Your first message (with --pow)
+        #[arg(short, long)]
+        message: Option<String>,
+
+        /// Signing key (base64 32-byte Ed25519 key) to join as (with --pow);
+        /// a new key is made when omitted
+        #[arg(long, env = "RIVER_SIGNING_KEY")]
+        signing_key: Option<String>,
+
+        /// Solve this many bits beyond the requirement (with --pow), so a
+        /// small rise in difficulty does not invalidate the proof
+        #[arg(long, default_value_t = 0)]
+        extra_bits: u8,
+
+        /// Proof-of-work threads (with --pow; default: one per core)
+        #[arg(long)]
+        threads: Option<usize>,
+    },
+    /// Show what a room asks of a newcomer (invitation, or proof of work),
+    /// and, with a signing key, where that key stands in the room
+    Admission {
+        /// Room owner key (base58)
+        room_id: String,
+
+        /// Signing key (base64 32-byte Ed25519 key) to report the status of
+        #[arg(long, env = "RIVER_SIGNING_KEY")]
+        signing_key: Option<String>,
     },
     /// Leave a room
     Leave {
@@ -95,6 +137,37 @@ pub enum RoomCommands {
         /// Set maximum room description length
         #[arg(long)]
         max_room_description: Option<usize>,
+
+        /// Open (true) or close (false) admission by proof of work in a
+        /// public room. Closing clears the room's provisional members and bans.
+        #[arg(long)]
+        public_admission: Option<bool>,
+
+        /// Proof-of-work difficulty, in leading zero bits (0 to 32)
+        #[arg(long)]
+        admission_difficulty: Option<u8>,
+
+        /// Pick a new random proof-of-work epoch: invalidates every proof
+        /// solved so far, stockpiles included
+        #[arg(long)]
+        admission_new_epoch: bool,
+
+        /// Most open (provisional) members the room holds at once (1 to 100)
+        #[arg(long)]
+        max_provisional: Option<u32>,
+
+        /// Message-window slots open members may fill (1 to 500; the room
+        /// also caps it at half its message window)
+        #[arg(long)]
+        max_provisional_messages: Option<u32>,
+
+        /// Most provisional bans the room holds (0 to 100)
+        #[arg(long)]
+        max_provisional_bans: Option<u32>,
+
+        /// List the room for discovery (no effect on admission)
+        #[arg(long)]
+        admission_listed: Option<bool>,
     },
 }
 
@@ -251,18 +324,149 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 }
             }
         }
-        RoomCommands::Join { room_id } => {
-            // River has no "open join": membership requires an invitation
-            // chain back to the room owner (see the State Authorization Rule),
-            // so there is nothing for this command to execute. Make that
-            // explicit in both output modes instead of printing a misleading
-            // "Joining room" line (and, in JSON mode, instead of emitting
-            // nothing at all).
+        RoomCommands::Admission {
+            room_id,
+            signing_key,
+        } => {
+            let owner_key = crate::admission::parse_room_id(&room_id)?;
+            let room_state = api.get_room(&owner_key, false).await?;
+            let req = river_core::room_state::admission::admission_requirements(
+                &room_state.configuration.configuration,
+            );
+            let status = match signing_key.as_deref() {
+                Some(k) => {
+                    let (sk, _) = crate::admission::key_or_new(Some(k))?;
+                    let stored = api
+                        .storage()
+                        .get_provisional_entry(&owner_key, &sk.verifying_key())?;
+                    Some(river_core::room_state::admission::admission_status(
+                        &room_state,
+                        &river_core::room_state::ChatRoomParametersV1 { owner: owner_key },
+                        &sk.verifying_key(),
+                        stored.as_ref(),
+                        std::time::SystemTime::now(),
+                    ))
+                }
+                None => None,
+            };
+            match format {
+                OutputFormat::Human => {
+                    println!("{}", crate::admission::describe_requirements(&req));
+                    if let Some(status) = &status {
+                        println!("your key: {}", crate::admission::status_json(status));
+                    }
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "room_id": room_id,
+                            "requirements": crate::admission::requirements_json(&req),
+                            "status": status.as_ref().map(crate::admission::status_json),
+                        }))?
+                    );
+                }
+            }
+            Ok(())
+        }
+        RoomCommands::Join {
+            room_id,
+            pow: true,
+            nickname,
+            message,
+            signing_key,
+            extra_bits,
+            threads,
+        } => {
+            let owner_key = crate::admission::parse_room_id(&room_id)?;
+            let (sk, generated) = crate::admission::key_or_new(signing_key.as_deref())?;
+            let room_state = api.get_room(&owner_key, false).await?;
+            let threads = threads.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
+            let quiet = matches!(format, OutputFormat::Json);
+            let (delta, outcome) = crate::admission::build_join(
+                api.storage(),
+                &room_state,
+                &owner_key,
+                &sk,
+                &crate::admission::JoinOptions {
+                    nickname: nickname.as_deref().unwrap_or("Anonymous"),
+                    text: message.as_deref().unwrap_or("Hello!"),
+                    extra_bits,
+                    threads,
+                },
+                |tried, expected| {
+                    if !quiet {
+                        eprintln!(
+                            "solving proof of work: {tried} hashes tried, about {expected:.0} expected"
+                        );
+                    }
+                },
+            )?;
+            // The apply the contract will run: refuse to report a join the room
+            // would drop.
+            let mut check = room_state.clone();
+            let params = river_core::room_state::ChatRoomParametersV1 { owner: owner_key };
+            freenet_scaffold::ComposableState::apply_delta(
+                &mut check,
+                &room_state,
+                &params,
+                &Some(delta.clone()),
+            )
+            .map_err(|e| anyhow::anyhow!("The room would refuse this join: {e}"))?;
+            crate::api::refuse_if_dropped(&check, &outcome.message_id)?;
+            api.storage()
+                .put_provisional_entry(&owner_key, &sk.verifying_key(), &outcome.entry)?;
+            api.send_state_delta(&owner_key, &delta).await?;
+            let key_b64 = {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(sk.to_bytes())
+            };
+            match format {
+                OutputFormat::Human => {
+                    println!("{}", "Joined the room as an open member.".green());
+                    println!("member id: {}", outcome.member_id);
+                    if generated {
+                        println!("signing key (keep it; nothing else stores it): {key_b64}");
+                    }
+                    println!(
+                        "send more messages with: riverctl message send {room_id} \"text\" \\
+                         --signing-key <key>"
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "success",
+                            "room_id": room_id,
+                            "member_id": outcome.member_id.to_string(),
+                            "signing_key": generated.then_some(key_b64),
+                            "solved_bits": outcome.nonce_bits,
+                        })
+                    );
+                }
+            }
+            Ok(())
+        }
+        RoomCommands::Join { room_id, .. } => {
+            // River has no "open join" without proof of work: membership
+            // requires an invitation chain back to the room owner (see the
+            // State Authorization Rule), or, in an open public room,
+            // `--pow`. Make that explicit in both output modes instead of
+            // printing a misleading "Joining room" line (and, in JSON mode,
+            // instead of emitting nothing at all).
             match format {
                 OutputFormat::Human => {
                     println!("{}", "Joining a room requires an invitation.".yellow());
                     println!("Ask an existing member for an invitation code, then run:");
                     println!("  riverctl invite accept <invitation-code>");
+                    println!("An open public room can instead be joined by proof of work:");
+                    println!("  riverctl room admission <room-id>");
+                    println!("  riverctl room join <room-id> --pow");
                 }
                 OutputFormat::Json => {
                     println!(
@@ -326,8 +530,25 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             max_nickname_size,
             max_room_name,
             max_room_description,
+            public_admission,
+            admission_difficulty,
+            admission_new_epoch,
+            max_provisional,
+            max_provisional_messages,
+            max_provisional_bans,
+            admission_listed,
         } => {
-            let has_changes = name.is_some()
+            let policy_edit = crate::admission::PolicyEdit {
+                enable: public_admission,
+                difficulty_bits: admission_difficulty,
+                new_epoch: admission_new_epoch,
+                max_provisional,
+                max_provisional_messages,
+                max_provisional_bans,
+                listed: admission_listed,
+            };
+            let has_changes = !policy_edit.is_empty()
+                || name.is_some()
                 || description.is_some()
                 || max_bans.is_some()
                 || max_messages.is_some()
@@ -379,6 +600,12 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 println!("  max_nickname_size: {}", cfg.max_nickname_size);
                 println!("  max_room_name: {}", cfg.max_room_name);
                 println!("  max_room_description: {}", cfg.max_room_description);
+                println!(
+                    "  admission: {}",
+                    crate::admission::describe_requirements(
+                        &river_core::room_state::admission::admission_requirements(cfg)
+                    )
+                );
                 return Ok(());
             }
 
@@ -454,6 +681,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                     if let Some(v) = max_room_description {
                         cfg.max_room_description = v;
                     }
+                    policy_edit.apply(cfg);
                 })
                 .await
             {

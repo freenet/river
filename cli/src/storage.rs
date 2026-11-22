@@ -318,6 +318,12 @@ pub struct Storage {
     /// file, like `outbound_dms.json`, so the anti-rollback floor is never
     /// entangled with the room blob's read-modify-write.
     pointer_floors_path: PathBuf,
+    /// The provisional-admission entries this machine holds
+    /// (`provisional.json`, freenet/river#974): one proof-of-work entry per
+    /// (room, member key), so a key that joined an open room can attach it to
+    /// a later message without solving again. A side file, like
+    /// `outbound_dms.json`, so `rooms.json` stays untouched.
+    provisional_path: PathBuf,
     /// The room-contract code hash resolved from River's pointer record this
     /// run, installed by [`crate::api::ApiClient`] once resolution completes.
     ///
@@ -361,6 +367,7 @@ impl Storage {
         let outbound_dms_path = data_dir.join("outbound_dms.json");
         let lock_path = data_dir.join(".river.lock");
         let pointer_floors_path = data_dir.join("pointer_floors.json");
+        let provisional_path = data_dir.join("provisional.json");
 
         Ok(Self {
             storage_path,
@@ -368,6 +375,7 @@ impl Storage {
             lock_path,
             signing_key_override,
             pointer_floors_path,
+            provisional_path,
             room_code_hash: OnceLock::new(),
         })
     }
@@ -458,6 +466,72 @@ impl Storage {
             store.floors.insert(key.to_string(), chosen);
             Self::atomic_write(
                 &self.pointer_floors_path,
+                &serde_json::to_string_pretty(&store)?,
+            )
+        })
+    }
+
+    fn provisional_key(owner: &VerifyingKey, member: &VerifyingKey) -> String {
+        format!(
+            "{}/{}",
+            bs58::encode(owner.as_bytes()).into_string(),
+            bs58::encode(member.as_bytes()).into_string()
+        )
+    }
+
+    /// The provisional-admission entry stored for `member` in the room owned
+    /// by `owner`, if any (freenet/river#974).
+    pub fn get_provisional_entry(
+        &self,
+        owner: &VerifyingKey,
+        member: &VerifyingKey,
+    ) -> Result<Option<river_core::room_state::provisional::AuthorizedProvisionalMember>> {
+        self.with_lock(|| {
+            if !self.provisional_path.exists() {
+                return Ok(None);
+            }
+            let contents = fs::read_to_string(&self.provisional_path)?;
+            let store: std::collections::BTreeMap<String, String> = serde_json::from_str(&contents)
+                .with_context(|| format!("parsing {}", self.provisional_path.display()))?;
+            let Some(b64) = store.get(&Self::provisional_key(owner, member)) else {
+                return Ok(None);
+            };
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| anyhow!("stored provisional entry is not base64: {e}"))?;
+            Ok(Some(ciborium::de::from_reader(bytes.as_slice()).map_err(
+                |e| anyhow!("stored provisional entry does not decode: {e}"),
+            )?))
+        })
+    }
+
+    /// Store `entry` for (`owner`, `member`), replacing any earlier one.
+    pub fn put_provisional_entry(
+        &self,
+        owner: &VerifyingKey,
+        member: &VerifyingKey,
+        entry: &river_core::room_state::provisional::AuthorizedProvisionalMember,
+    ) -> Result<()> {
+        self.with_lock(|| {
+            let mut store: std::collections::BTreeMap<String, String> =
+                if self.provisional_path.exists() {
+                    let contents = fs::read_to_string(&self.provisional_path)?;
+                    serde_json::from_str(&contents)
+                        .with_context(|| format!("parsing {}", self.provisional_path.display()))?
+                } else {
+                    Default::default()
+                };
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(entry, &mut bytes)
+                .map_err(|e| anyhow!("encoding provisional entry: {e}"))?;
+            use base64::Engine;
+            store.insert(
+                Self::provisional_key(owner, member),
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            );
+            Self::atomic_write(
+                &self.provisional_path,
                 &serde_json::to_string_pretty(&store)?,
             )
         })

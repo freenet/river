@@ -1602,3 +1602,114 @@ fn the_owners_provisional_bans_rank_ahead_of_a_deputys_when_the_list_is_full() {
         .iter()
         .any(|b| b.ban.target == targets[5] && b.ban.banned_by == room.owner_id()));
 }
+
+// ---------------------------------------------------------------------------
+// C2 and C3 in their less common shapes
+// ---------------------------------------------------------------------------
+
+/// An entry for `vk` with a valid proof of work but a garbage signature, built
+/// by hand: only a state that skipped arrival (a full-state PUT) can hold one,
+/// which is exactly what cleanup must still handle.
+fn unsigned_entry(room: &Room, vk: &VerifyingKey) -> AuthorizedProvisionalMember {
+    let p = room.config().public_admission.clone().unwrap().pow.unwrap();
+    let nonce = solve(&room.params.owner, vk, p.epoch, p.difficulty_bits);
+    AuthorizedProvisionalMember::with_signature(
+        ProvisionalMember {
+            member_vk: *vk,
+            evidence: AdmissionEvidence::Pow { nonce },
+        },
+        ed25519_dalek::Signature::from_bytes(&[7; 64]),
+    )
+}
+
+#[test]
+fn two_entries_with_one_id_and_different_keys_are_all_dropped_with_their_content() {
+    let mut room = Room::new(30, 10, Some(policy(1, 7)));
+    let v = sk(10);
+    room.apply(room.join_delta(&v, 5, "victim")).unwrap();
+    assert!(room.has_entry(&v) && room.has_msg_by(&v));
+    // A second entry with V's id under another key (C2). Injected directly.
+    let forged = forged_vk_with_id_of(&v.verifying_key());
+    let mut s = room.state.clone();
+    s.provisional.entries.push(unsigned_entry(&room, &forged));
+    s.post_apply_cleanup(&room.params).unwrap();
+    assert!(
+        s.provisional.entries.is_empty(),
+        "C2: both entries are dropped"
+    );
+    assert!(
+        !s.recent_messages
+            .messages
+            .iter()
+            .any(|m| m.message.author == id_of(&v)),
+        "C3: V's messages go (the id resolves to no key)"
+    );
+    assert!(!s
+        .member_info
+        .member_info
+        .iter()
+        .any(|i| i.member_info.member_id == id_of(&v)));
+    // The result is a cleanup fixpoint and verifies.
+    assert!(validate(&s, &room.params).is_ok());
+}
+
+#[test]
+fn a_shadowed_id_whose_entry_is_dropped_by_another_rule_still_loses_its_content() {
+    // The entry is dropped in the same cleanup by a rule that runs before C1
+    // (here an owner provisional ban), while a record for another key holds
+    // the id: the messages signed by the victim's key must not stay.
+    let (mut room, m, _d) = {
+        let (r, m, d) = room_with_member_and_deputy();
+        (r, m, d)
+    };
+    let v = sk(10);
+    room.apply(room.join_delta(&v, 5, "victim")).unwrap();
+    let forged = forged_vk_with_id_of(&v.verifying_key());
+    let mut delta = room.members_delta(vec![room.invite(Some(&m), &forged)]);
+    delta.direct_messages = dm_delta(vec![dm(&room, &m, id_of(&v), 50)]).direct_messages;
+    delta.provisional = Some(ProvisionalDelta {
+        entries: vec![],
+        bans: vec![room.prov_ban(None, id_of(&v), 51)],
+    });
+    room.apply(delta).expect("applies and validates");
+    assert!(!room.has_entry(&v));
+    assert!(
+        !room.has_msg_by(&v),
+        "V's messages do not outlive the shadowing"
+    );
+    assert!(room.is_member(&v), "the forged record holds the id");
+}
+
+#[test]
+fn a_record_for_another_key_and_a_removed_policy_in_one_merge_leave_a_valid_state() {
+    let (base, m, _d) = room_with_member_and_deputy();
+    let v = sk(10);
+    let mut victim_side = Room {
+        owner: base.owner.clone(),
+        params: base.params.clone(),
+        state: base.state.clone(),
+        version: base.version,
+    };
+    victim_side
+        .apply(victim_side.join_delta(&v, 5, "victim"))
+        .unwrap();
+    let mut other = Room {
+        owner: base.owner.clone(),
+        params: base.params.clone(),
+        state: base.state.clone(),
+        version: base.version,
+    };
+    let forged = forged_vk_with_id_of(&v.verifying_key());
+    let mut shadow = other.members_delta(vec![other.invite(Some(&m), &forged)]);
+    shadow.direct_messages = dm_delta(vec![dm(&other, &m, id_of(&v), 50)]).direct_messages;
+    other.apply(shadow).unwrap();
+    other.set_config(|c| c.public_admission = None);
+    let (x, y) = merge2(&victim_side.state, &other.state, &base.params);
+    assert!(ser(&x) == ser(&y));
+    assert!(x.provisional.is_empty());
+    assert!(!x
+        .recent_messages
+        .messages
+        .iter()
+        .any(|m| m.message.author == id_of(&v)));
+}

@@ -1486,6 +1486,17 @@ pub(crate) fn authorize_send(
     if rejoin_members_delta.is_some() {
         return Ok(());
     }
+    // An open member of a public room (freenet/river#974): the room holds, or
+    // the send attaches, the sender's proof-of-work entry. Not a `members`
+    // record, and never read as one.
+    if room_state
+        .provisional
+        .entries
+        .iter()
+        .any(|e| e.provisional.member_vk == *sender_vk)
+    {
+        return Ok(());
+    }
     Err(anyhow!(
         "Signing key is not a current member of this room and no stored membership \
          credentials were found for automatic rejoin. If you were pruned for inactivity, \
@@ -4925,11 +4936,12 @@ impl ApiClient {
         .map_err(|e| anyhow!(e))?;
 
         // Create the message
+        let message_time = std::time::SystemTime::now();
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: sender_member_id,
             content,
-            time: std::time::SystemTime::now(),
+            time: message_time,
         };
 
         // Sign the message
@@ -4941,6 +4953,21 @@ impl ApiClient {
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
             self.build_rejoin_delta(&room_state, room_owner_key, signing_key);
+
+        // An open member (freenet/river#974): the room holds their entry, or a
+        // stored entry is attached to this message because the room pruned it.
+        let provisional_delta = crate::admission::attachment_for_send(
+            &self.storage,
+            &room_state,
+            room_owner_key,
+            signing_key,
+            message_time,
+        )?;
+        // The authorization below sees the entry as already attached, the
+        // view the contract has once it applies the delta.
+        if let Some(p) = &provisional_delta {
+            room_state.provisional.entries.extend(p.entries.clone());
+        }
 
         authorize_send(
             &room_state,
@@ -4954,6 +4981,7 @@ impl ApiClient {
             recent_messages: Some(vec![auth_message.clone()]),
             members: members_delta,
             member_info: member_info_delta,
+            provisional: provisional_delta,
             ..Default::default()
         };
 

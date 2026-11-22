@@ -1,3 +1,8 @@
+/// Client API for open admission to public rooms (freenet/river#974). Gated
+/// on the `admission` feature (client crates only), so the contract and
+/// delegate WASM do not carry it.
+#[cfg(any(feature = "admission", test))]
+pub mod admission;
 pub mod ban;
 pub mod ban_evidence;
 pub mod configuration;
