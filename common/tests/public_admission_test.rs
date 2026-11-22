@@ -2259,3 +2259,82 @@ fn a_room_without_an_active_policy_ignores_the_provisional_field() {
     listed.apply(delta).unwrap();
     assert!(listed.state.provisional.entries.is_empty());
 }
+
+/// Review finding 7: when the member cap removes a deputy who holds a
+/// provisional ban, the ban goes in the same cleanup pass (P1 runs again after
+/// the member loop), so the provisional step adds no pass of its own. Without
+/// that, the ban stayed one more pass and this cleanup needed all of
+/// `MAX_CLEANUP_PASSES`.
+#[test]
+fn a_provisional_ban_goes_in_the_pass_the_member_cap_removes_its_deputy() {
+    let mut room = Room::new(40, 10, Some(policy(1, 7)));
+    // Two members the owner invited; the cap of one below keeps the one with
+    // the lower id, so the deputy is the one with the higher id.
+    let (mut a, mut d) = (sk(2), sk(3));
+    if id_of(&d) < id_of(&a) {
+        std::mem::swap(&mut a, &mut d);
+    }
+    let mut info = MemberInfo::new_public(room.owner_id(), 2, "owner".into());
+    info.deputies = vec![id_of(&d)];
+    room.apply(ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![
+            room.invite(None, &a.verifying_key()),
+            room.invite(None, &d.verifying_key()),
+        ])),
+        member_info: Some(vec![AuthorizedMemberInfo::new(info, &room.owner)]),
+        recent_messages: Some(vec![room.msg(&a, 1, "a"), room.msg(&d, 2, "d")]),
+        ..Default::default()
+    })
+    .unwrap();
+    room.apply(prov_ban_delta(room.prov_ban(Some(&d), id_of(&sk(40)), 5)))
+        .unwrap();
+    assert_eq!(room.state.provisional.bans.len(), 1);
+    // The owner lowers `max_members` to 1.
+    let lowered = room.config_delta(|c| c.max_members = 1);
+    let mut state = room.state.clone();
+    state.configuration = lowered.configuration.unwrap();
+    let passes = state.post_apply_cleanup_counted(&room.params).unwrap();
+    assert!(!state
+        .members
+        .members
+        .iter()
+        .any(|m| m.member.id() == id_of(&d)));
+    assert!(
+        state.provisional.bans.is_empty(),
+        "the deputy's ban is gone"
+    );
+    assert!(passes.confirmed);
+    assert_eq!(
+        passes.passes, 2,
+        "one changing pass and one confirming pass"
+    );
+}
+
+/// Only a ban that takes effect blocks an entry. The inviter banned their
+/// invitee, then the owner banned the inviter: the inviter's bans take no
+/// effect from then on, so the invitee, now removed only with a banned
+/// inviter, may come back as provisional (design D2 (a)), in the same delta
+/// as the owner's ban and after it.
+#[test]
+fn a_ban_by_an_issuer_the_owner_removed_does_not_block_an_entry() {
+    let (mut base, i, v) = room_with_inviter_and_invitee();
+    base.apply(user_ban_delta(base.user_ban(Some(&i), id_of(&v), 10)))
+        .unwrap();
+    assert!(!base.is_member(&v), "premise: the inviter's ban removed V");
+    let ban_i = base.user_ban(None, id_of(&i), 20);
+    let mut together = base.join_delta(&v, 21, "back");
+    together.bans = Some(vec![ban_i.clone()]);
+    let one = replay(&base, &[&together]);
+    let two = replay(
+        &base,
+        &[&user_ban_delta(ban_i), &base.join_delta(&v, 21, "back")],
+    );
+    for s in [&one, &two] {
+        assert!(s
+            .provisional
+            .entries
+            .iter()
+            .any(|e| e.provisional.member_vk == v.verifying_key()));
+    }
+    assert!(ser(&one) == ser(&two));
+}
