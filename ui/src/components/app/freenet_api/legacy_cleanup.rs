@@ -17,7 +17,8 @@
 //! newest first. A legacy copy of a room is **compacted**, rewritten without its
 //! `room_state` (the room contract's state: messages, members, configuration),
 //! when a NEWER full copy of the room is kept: the current delegate's, or one a
-//! newer generation keeps ([`decide_present_copy`]). Otherwise it is kept as is,
+//! newer generation keeps ([`decide_present_copy`]). A current-delegate
+//! tombstone is not enough: a newer generation's copy can outrank it. Otherwise it is kept as is,
 //! so the newest full snapshot of every room always survives. Everything else is
 //! kept too: per-room tombstones (a few bytes) and compacted copies.
 //!
@@ -63,14 +64,19 @@
 //! # Limits
 //!
 //! * `outbound_dms` and `rooms_meta` are left alone: they are small.
-//! * The compaction is a plain `StoreRequest`. A generation's FULL copies are
-//!   written only by builds for which it was the current delegate, all older
-//!   than or equal to this one, so decoding and re-encoding one with this
-//!   build's types drops no field. A compacted copy is never rewritten again.
-//! * An old-build tab still writing to a superseded generation between this
-//!   pass's read and its write would have that write replaced. Such tabs reload
-//!   into the current build when they see the re-key (`generation_watch`), and
-//!   the replacement keeps every unrecoverable field this pass read.
+//! * The compaction re-encodes a copy with this build's types, which is what
+//!   every migration already does to it: the sweep and the walk merge legacy
+//!   copies into memory and save them with the same types. A compacted copy is
+//!   never rewritten again.
+//! * It is a plain `StoreRequest` (legacy generations predate or do not share
+//!   the current delegate's compare-and-swap), made only if a re-read right
+//!   before it returns the bytes the decision was made on, so a write an
+//!   old-build tab made to that generation since is kept. The window between
+//!   that re-read and the store remains; such tabs reload into the current
+//!   build when they see the re-key (`generation_watch`).
+//! * The pass stops when a new load attempt begins (a reconnect or Retry):
+//!   that load reads the current delegate's slots under the same correlation
+//!   keys as the pass's own reads.
 //! * Every legacy delegate WASM handles `StoreRequest` (in the protocol since
 //!   the first chat delegate, March 2025, before the oldest registered
 //!   generation). The node charges an overwrite only its size delta, so a
@@ -137,16 +143,12 @@ pub(crate) fn compact_room(room: &RoomData) -> RoomData {
 }
 
 /// Decide one legacy `Present` copy: compact a full copy when a newer full copy
-/// of the room is kept, or the current delegate has tombstoned the room (the
-/// load discards a legacy copy under it, and compaction still keeps every
-/// unrecoverable field should the leave ever be undone).
-pub(crate) fn decide_present_copy(
-    newer_full_copy_kept: bool,
-    current: CurrentCopy,
-    candidate: &RoomData,
-) -> CopyAction {
-    let superseded = newer_full_copy_kept || current == CurrentCopy::Tombstone;
-    if has_full_state(candidate) && superseded {
+/// of the room is kept. A current-delegate tombstone does NOT supersede it: a
+/// newer generation's copy can outrank a tombstone imported from an older one
+/// (`MergeRanks::presence_survives_tombstone`), and then this may be the
+/// snapshot the load resurrects the room from.
+pub(crate) fn decide_present_copy(newer_full_copy_kept: bool, candidate: &RoomData) -> CopyAction {
+    if has_full_state(candidate) && newer_full_copy_kept {
         CopyAction::Compact
     } else {
         CopyAction::Keep
@@ -160,17 +162,12 @@ pub(crate) fn decide_present_copy(
 /// keeps in full.
 pub(crate) fn plan_blob(
     blob: &Rooms,
-    current: &HashMap<[u8; 32], CurrentCopy>,
     newer_full_kept: &HashSet<[u8; 32]>,
 ) -> (Option<Vec<u8>>, Vec<VerifyingKey>) {
     let mut kept_full = Vec::new();
     let mut compact = Vec::new();
     for (owner, room) in &blob.map {
-        let cur = current
-            .get(&owner.to_bytes())
-            .copied()
-            .unwrap_or(CurrentCopy::Unknown);
-        match decide_present_copy(newer_full_kept.contains(&owner.to_bytes()), cur, room) {
+        match decide_present_copy(newer_full_kept.contains(&owner.to_bytes()), room) {
             CopyAction::Compact => compact.push(*owner),
             CopyAction::Keep if has_full_state(room) => kept_full.push(*owner),
             CopyAction::Keep => {}
@@ -215,6 +212,26 @@ pub(crate) trait CleanupIo {
     async fn store(&self, delegate: &DelegateKey, key: &[u8], value: Vec<u8>) -> bool;
     /// What the CURRENT delegate holds for `owner`.
     async fn current(&self, owner: &VerifyingKey) -> CurrentCopy;
+    /// Whether the pass must stop now (a new load attempt began: its room load
+    /// reads the current delegate's slots under the correlation keys this pass
+    /// would use).
+    fn superseded(&self) -> bool;
+}
+
+/// Overwrite `key` with `new` only if it still holds `read`: a write that
+/// landed since this pass read it (an old-build tab still on that generation)
+/// is never replaced. Whether it was stored.
+async fn store_if_unchanged<IO: CleanupIo>(
+    io: &IO,
+    delegate: &DelegateKey,
+    key: &[u8],
+    read: &[u8],
+    new: Vec<u8>,
+) -> bool {
+    if io.get(delegate, key).await.as_deref() != Some(read) {
+        return false;
+    }
+    io.store(delegate, key, new).await
 }
 
 /// What one pass changed.
@@ -249,6 +266,9 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
     // Rooms a full copy NEWER than the generation being visited is kept of.
     let mut full_kept: HashSet<[u8; 32]> = HashSet::new();
     for &index in generations.iter().rev() {
+        if io.superseded() {
+            break;
+        }
         let Some((key_bytes, code_hash)) = pairs.get(index) else {
             continue;
         };
@@ -274,6 +294,9 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
         // Per-room slots first: within one generation they are newer than a
         // leftover single blob.
         for (owner, storage_key) in room_keys {
+            if io.superseded() {
+                return report;
+            }
             let Some(bytes) = io.get(&delegate, &storage_key).await else {
                 continue;
             };
@@ -284,7 +307,7 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
             if cur == CurrentCopy::Full {
                 full_kept.insert(owner.to_bytes());
             }
-            match decide_present_copy(full_kept.contains(&owner.to_bytes()), cur, &room) {
+            match decide_present_copy(full_kept.contains(&owner.to_bytes()), &room) {
                 CopyAction::Keep => {
                     if has_full_state(&room) {
                         full_kept.insert(owner.to_bytes());
@@ -293,7 +316,7 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
                 CopyAction::Compact => match compacted_slot_bytes(&room) {
                     Some(new) => {
                         let freed = bytes.len().saturating_sub(new.len()) as u64;
-                        if io.store(&delegate, &storage_key, new).await {
+                        if store_if_unchanged(io, &delegate, &storage_key, &bytes, new).await {
                             report.compacted += 1;
                             report.bytes_freed += freed;
                         } else {
@@ -305,7 +328,7 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
             }
         }
 
-        if has_blob {
+        if has_blob && !io.superseded() {
             let Some(bytes) = io.get(&delegate, ROOMS_STORAGE_KEY).await else {
                 continue;
             };
@@ -318,13 +341,13 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
                     full_kept.insert(owner.to_bytes());
                 }
             }
-            let (rewrite, kept) = plan_blob(&blob, &current, &full_kept);
+            let (rewrite, kept) = plan_blob(&blob, &full_kept);
             for owner in kept {
                 full_kept.insert(owner.to_bytes());
             }
             if let Some(new) = rewrite {
                 let freed = bytes.len().saturating_sub(new.len()) as u64;
-                if io.store(&delegate, ROOMS_STORAGE_KEY, new).await {
+                if store_if_unchanged(io, &delegate, ROOMS_STORAGE_KEY, &bytes, new).await {
                     report.compacted += 1;
                     report.bytes_freed += freed;
                 } else {
@@ -336,8 +359,10 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
     report
 }
 
-/// The live node.
-struct NodeIo;
+/// The live node, for the load attempt the pass started in.
+struct NodeIo {
+    attempt: u32,
+}
 
 impl CleanupIo for NodeIo {
     async fn list(&self, delegate: &DelegateKey) -> Option<Vec<Vec<u8>>> {
@@ -387,6 +412,10 @@ impl CleanupIo for NodeIo {
             },
             _ => CurrentCopy::Unknown,
         }
+    }
+
+    fn superseded(&self) -> bool {
+        !chat_delegate::load_attempt_is_current(self.attempt)
     }
 }
 
@@ -476,7 +505,10 @@ async fn locked_pass() -> Option<PassReport> {
         return None;
     }
     let generations = GENERATIONS_WITH_DATA.with(|g| g.borrow().clone());
-    let report = run_pass(&NodeIo, &generations).await;
+    let io = NodeIo {
+        attempt: chat_delegate::current_load_attempt(),
+    };
+    let report = run_pass(&io, &generations).await;
     info!(
         "legacy cleanup: compacted {} legacy room copies in {} generation(s) ({} failed, ~{} bytes freed)",
         report.compacted,
@@ -496,6 +528,10 @@ async fn cleanup_task() {
         return;
     };
     if first.compacted == 0 {
+        // Nothing here is superseded yet: each room's newest full copy is the
+        // only one, or the current delegate's copies could not be read. A load
+        // that commits rooms to the current delegate lets a later pass compact.
+        info!("legacy cleanup: no superseded legacy copy to compact on this load");
         return;
     }
     // Space was freed: commit the rooms the sweep merged (a save refused for
@@ -624,33 +660,13 @@ mod tests {
     }
 
     #[test]
-    fn decide_compacts_only_under_a_newer_full_copy_or_a_tombstone() {
-        use CurrentCopy::*;
+    fn decide_compacts_only_under_a_newer_full_copy() {
         let full = full_room(&owner_sk(), 3);
         let compacted = compact_room(&full);
-        for current in [Unknown, Absent, Full, Placeholder, Tombstone] {
-            assert_eq!(
-                decide_present_copy(true, current, &full),
-                CopyAction::Compact,
-                "{current:?}"
-            );
-            assert_eq!(
-                decide_present_copy(true, current, &compacted),
-                CopyAction::Keep
-            );
-            assert_eq!(
-                decide_present_copy(false, current, &compacted),
-                CopyAction::Keep
-            );
-        }
-        // Nothing newer kept: this copy is the newest full snapshot.
-        for current in [Unknown, Absent, Full, Placeholder] {
-            assert_eq!(decide_present_copy(false, current, &full), CopyAction::Keep);
-        }
-        assert_eq!(
-            decide_present_copy(false, Tombstone, &full),
-            CopyAction::Compact
-        );
+        assert_eq!(decide_present_copy(true, &full), CopyAction::Compact);
+        assert_eq!(decide_present_copy(false, &full), CopyAction::Keep);
+        assert_eq!(decide_present_copy(true, &compacted), CopyAction::Keep);
+        assert_eq!(decide_present_copy(false, &compacted), CopyAction::Keep);
     }
 
     #[test]
@@ -666,7 +682,7 @@ mod tests {
         blob.room_order = vec![b, a];
         let kept: HashSet<[u8; 32]> = [a.to_bytes()].into_iter().collect();
 
-        let (rewrite, kept_full) = plan_blob(&blob, &HashMap::new(), &kept);
+        let (rewrite, kept_full) = plan_blob(&blob, &kept);
         let back: Rooms = from_reader(&rewrite.expect("a rewrite")[..]).unwrap();
         assert!(!has_full_state(&back.map[&a]), "a has a newer full copy");
         assert!(has_full_state(&back.map[&b]), "b's only full copy is kept");
@@ -679,7 +695,7 @@ mod tests {
             "the compacted room keeps every other field"
         );
 
-        let (rewrite, _) = plan_blob(&blob, &HashMap::new(), &HashSet::new());
+        let (rewrite, _) = plan_blob(&blob, &HashSet::new());
         assert_eq!(rewrite, None, "nothing superseded: kept as is");
     }
 
@@ -693,6 +709,12 @@ mod tests {
         current: HashMap<[u8; 32], CurrentCopy>,
         silent: HashSet<[u8; 32]>,
         stores: RefCell<Vec<[u8; 32]>>,
+        /// Overwrite this generation's keys with other bytes once the pass has
+        /// read them (an old-build tab writing meanwhile).
+        racing_write: Option<usize>,
+        /// Stop the pass after this many current-delegate reads.
+        supersede_after_reads: Option<usize>,
+        current_reads: std::cell::Cell<usize>,
     }
 
     impl FakeIo {
@@ -735,11 +757,14 @@ mod tests {
             )
         }
         async fn get(&self, delegate: &DelegateKey, key: &[u8]) -> Option<Vec<u8>> {
-            self.legacy
-                .borrow()
-                .get(&key_of(delegate))?
-                .get(key)
-                .cloned()
+            let dk = key_of(delegate);
+            let value = self.legacy.borrow().get(&dk)?.get(key).cloned();
+            if self.racing_write.map(|g| legacy_delegate_pairs()[g].0) == Some(dk) {
+                if let Some(store) = self.legacy.borrow_mut().get_mut(&dk) {
+                    store.insert(key.to_vec(), b"written by an old tab".to_vec());
+                }
+            }
+            value
         }
         async fn store(&self, delegate: &DelegateKey, key: &[u8], value: Vec<u8>) -> bool {
             let dk = key_of(delegate);
@@ -751,7 +776,12 @@ mod tests {
                 .insert(key.to_vec(), value);
             true
         }
+        fn superseded(&self) -> bool {
+            self.supersede_after_reads
+                .is_some_and(|n| self.current_reads.get() >= n)
+        }
         async fn current(&self, owner: &VerifyingKey) -> CurrentCopy {
+            self.current_reads.set(self.current_reads.get() + 1);
             self.current
                 .get(&owner.to_bytes())
                 .copied()
@@ -830,6 +860,59 @@ mod tests {
             "tombstones stay"
         );
         assert_eq!(report.compacted, 3);
+    }
+
+    /// A write that lands between the pass's read and its store is kept, and
+    /// a pass stops when a new load attempt begins.
+    #[test]
+    fn a_racing_write_is_kept_and_a_new_load_stops_the_pass() {
+        let sk = owner_sk();
+        let owner = sk.verifying_key();
+        let room = full_room(&sk, 3);
+        let mut io = FakeIo::default();
+        io.current.insert(owner.to_bytes(), CurrentCopy::Full);
+        io.put(12, &owner, slot_bytes(room.clone()));
+        io.racing_write = Some(12);
+        let generations: BTreeSet<usize> = [12].into_iter().collect();
+        let report = futures::executor::block_on(run_pass(&io, &generations));
+        assert_eq!((report.compacted, report.failed), (0, 1));
+        assert!(io.stores.borrow().is_empty(), "nothing overwritten");
+
+        let other = SigningKey::from_bytes(&[2u8; 32]);
+        let mut io = FakeIo::default();
+        io.current.insert(owner.to_bytes(), CurrentCopy::Full);
+        io.current
+            .insert(other.verifying_key().to_bytes(), CurrentCopy::Full);
+        io.put(12, &owner, slot_bytes(room));
+        io.put(11, &other.verifying_key(), slot_bytes(full_room(&other, 2)));
+        io.supersede_after_reads = Some(1);
+        let generations: BTreeSet<usize> = [11, 12].into_iter().collect();
+        let report = futures::executor::block_on(run_pass(&io, &generations));
+        assert_eq!(
+            report.compacted, 1,
+            "the room in hand finishes, then it stops"
+        );
+        assert!(
+            io.is_full(11, &other.verifying_key()),
+            "generation 11 is not visited"
+        );
+    }
+
+    /// A current-delegate tombstone does not supersede the newest full copy: a
+    /// newer generation's copy can outrank an imported tombstone.
+    #[test]
+    fn a_current_tombstone_keeps_the_newest_full_copy() {
+        let sk = owner_sk();
+        let owner = sk.verifying_key();
+        let mut io = FakeIo::default();
+        io.current.insert(owner.to_bytes(), CurrentCopy::Tombstone);
+        io.put(12, &owner, slot_bytes(full_room(&sk, 3)));
+        io.put(11, &owner, slot_bytes(full_room(&sk, 2)));
+        let generations: BTreeSet<usize> = [11, 12].into_iter().collect();
+        let report = futures::executor::block_on(run_pass(&io, &generations));
+        assert!(io.is_full(12, &owner));
+        assert!(!io.is_full(11, &owner));
+        assert_eq!(report.compacted, 1);
     }
 
     #[test]
