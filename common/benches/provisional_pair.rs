@@ -276,4 +276,35 @@ fn main() {
         "added by provisional data: {:.2?} per message",
         medians[1].saturating_sub(medians[0])
     );
+
+    // Where `validate_state` spends it, per field, on the room with provisional
+    // data (each field's `verify`, then the cleanup the whole-state check runs).
+    let (state, params, _member, _owner) = build(true);
+    let time = |name: &str, f: &dyn Fn()| {
+        f();
+        let t = Instant::now();
+        for _ in 0..iterations {
+            f();
+        }
+        println!("  {name:<24} {:>9.2?}", t.elapsed() / iterations as u32);
+    };
+    println!("validate_state, by field:");
+    time("provisional.verify", &|| {
+        state.provisional.verify(&state, &params).unwrap()
+    });
+    time("recent_messages.verify", &|| {
+        state.recent_messages.verify(&state, &params).unwrap()
+    });
+    time("member_info.verify", &|| {
+        state.member_info.verify(&state, &params).unwrap()
+    });
+    time("members.verify", &|| {
+        state.members.verify(&state, &params).unwrap()
+    });
+    time("cleanup (normalized)", &|| {
+        state.normalized(&params).unwrap();
+    });
+    time("decode state", &|| {
+        let _: ChatRoomStateV1 = ciborium::de::from_reader(cbor(&state).as_slice()).unwrap();
+    });
 }
