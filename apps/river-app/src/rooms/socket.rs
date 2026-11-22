@@ -566,6 +566,7 @@ impl NodeSocket {
                     });
                 }
                 // Pings are answered by tungstenite; text is not part of the native protocol.
+                // Empty means "not an answer" below (an empty Binary would not decode either).
                 _ => Vec::new(),
             };
             if !bytes.is_empty() {
@@ -1881,13 +1882,17 @@ mod tests {
         let (authority, server) = node_that(move |mut ws| {
             // An unmasked empty ping, from the node, is two bytes.
             let batch: Vec<u8> = [0x89u8, 0x00].repeat(32 * 1024);
+            // Non-blocking with an explicit offset: a partial write must resume where it
+            // stopped, or a batch restarted mid-frame would split a ping and break the stream.
             let tcp = ws.get_mut();
-            tcp.set_write_timeout(Some(Duration::from_millis(100)))
-                .unwrap();
+            tcp.set_nonblocking(true).unwrap();
+            let mut at = 0;
             while !stop_node.load(Ordering::SeqCst) {
-                match tcp.write_all(&batch) {
-                    Ok(()) => {}
-                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                match tcp.write(&batch[at..]) {
+                    Ok(n) => at = (at + n) % batch.len(),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1))
+                    }
                     Err(_) => return,
                 }
             }
