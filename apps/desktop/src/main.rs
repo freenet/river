@@ -16,6 +16,8 @@
 
 mod autostart;
 mod background;
+#[cfg(windows)]
+mod console;
 mod host;
 mod install;
 mod notify;
@@ -171,6 +173,9 @@ fn main() {
     if let Some(u) = &updater {
         u.on_start();
     }
+    // Started from a console (`cargo run`, PowerShell): Ctrl+C there quits River.
+    #[cfg(windows)]
+    console::quit_on_console_signals(handle.clone());
     let on_exit = updater.clone();
     let started = std::time::Instant::now();
     settings.refresh_login();

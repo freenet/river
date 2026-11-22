@@ -18,6 +18,27 @@ use crate::autostart::LoginItem;
 
 const FILE: &str = "background";
 const KEY: &str = "close-to-tray";
+/// Set once River has told the person that closing the window leaves it running.
+const TOLD_KEY: &str = "close-to-tray-told";
+
+/// The quit chord in the notice (`Mod+Q` in the app).
+#[cfg(target_os = "macos")]
+const QUIT_CHORD: &str = "Cmd+Q";
+#[cfg(not(target_os = "macos"))]
+const QUIT_CHORD: &str = "Ctrl+Q";
+
+fn notice_body() -> String {
+    format!(
+        "River is still running. Open it or quit from the tray icon, or press {QUIT_CHORD} in \
+         the window. Change this in Settings > Background and startup."
+    )
+}
+
+/// Where the settings file is, for the notice's flag. Set by `DesktopBackground::new`.
+static CONFIG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// Whether the person has been told. Kept in the settings file; with no place to keep it, it
+/// holds for this run only.
+static TOLD: AtomicBool = AtomicBool::new(false);
 
 /// Whether the tray icon is showing right now.
 static TRAY_UP: AtomicBool = AtomicBool::new(false);
@@ -51,15 +72,47 @@ pub fn close_action(tray_up: bool, close_to_tray: bool) -> Close {
     }
 }
 
+/// Whether hiding the window should now say that River keeps running: when it hides and the
+/// person has not been told yet. Quitting says nothing (nothing is left running).
+pub fn should_tell(action: Close, told: bool) -> bool {
+    action == Close::Hide && !told
+}
+
 /// `App::on_close`: the window is closing. River keeps running (the app is built to) unless
 /// there is no tray to bring it back from, or the person asked for closing to quit.
 pub fn on_close(s: &mut RiverApp, tx: &mut Tx) {
     match close_action(tray_up(), CLOSE_TO_TRAY.load(Ordering::Acquire)) {
         // A hidden window gets no focus-lost event, and a River that still thinks it has focus
         // would show no notification for a message that arrives.
-        Close::Hide => s.focus_changed(false),
+        Close::Hide => {
+            s.focus_changed(false);
+            tell_once(s);
+        }
         Close::Quit => tx.quit(),
     }
+}
+
+/// Show the notice the first time closing hides the window. The flag is set only when the
+/// notification was queued, so a River with no way to show one tries again next time. Failing
+/// to keep the flag is not an error: the person may see the notice once more.
+fn tell_once(s: &mut RiverApp) {
+    if !should_tell(Close::Hide, TOLD.load(Ordering::Acquire)) {
+        return;
+    }
+    if s.send_notice("River is still running".into(), notice_body()) {
+        TOLD.store(true, Ordering::Release);
+        if let Some(dir) = CONFIG_DIR.get()
+            && let Err(e) = save(dir, load(dir), true)
+        {
+            eprintln!("river: couldn't remember that the close notice was shown: {e}");
+        }
+    }
+}
+
+fn has_value(text: &str, key: &str, is: impl Fn(&str) -> bool) -> bool {
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .any(|(k, v)| k.trim() == key && is(v.trim()))
 }
 
 /// The saved choice, on when there is none.
@@ -67,17 +120,29 @@ pub fn load(dir: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join(FILE)) else {
         return true;
     };
-    !text
-        .lines()
-        .filter_map(|l| l.split_once('='))
-        .any(|(k, v)| k.trim() == KEY && matches!(v.trim(), "off" | "false" | "no" | "0"))
+    !has_value(&text, KEY, |v| matches!(v, "off" | "false" | "no" | "0"))
 }
 
-fn save(dir: &Path, on: bool) -> Result<(), String> {
+/// Whether the person has been told that closing leaves River running; false when unknown.
+pub fn load_told(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(FILE))
+        .is_ok_and(|t| has_value(&t, TOLD_KEY, |v| matches!(v, "on" | "true" | "yes" | "1")))
+}
+
+/// Change the choice, keeping whether the person has been told.
+fn save_choice(dir: &Path, on: bool) -> Result<(), String> {
+    save(dir, on, load_told(dir))
+}
+
+fn save(dir: &Path, on: bool, told: bool) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
     let path = dir.join(FILE);
     let tmp = dir.join(format!(".{FILE}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("{KEY}={}\n", if on { "on" } else { "off" }))
+    let mut text = format!("{KEY}={}\n", if on { "on" } else { "off" });
+    if told {
+        text.push_str(&format!("{TOLD_KEY}=on\n"));
+    }
+    std::fs::write(&tmp, text)
         .and_then(|()| std::fs::rename(&tmp, &path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -96,6 +161,8 @@ impl DesktopBackground {
     pub fn new(dir: Option<PathBuf>) -> Self {
         if let Some(d) = &dir {
             CLOSE_TO_TRAY.store(load(d), Ordering::Release);
+            TOLD.store(load_told(d), Ordering::Release);
+            let _ = CONFIG_DIR.set(d.clone());
         }
         DesktopBackground {
             dir,
@@ -126,7 +193,7 @@ impl BackgroundHost for DesktopBackground {
         // In effect for this run even when it cannot be kept for the next.
         CLOSE_TO_TRAY.store(on, Ordering::Release);
         match &self.dir {
-            Some(d) => save(d, on),
+            Some(d) => save_choice(d, on),
             None => {
                 Err("River has no place to keep settings, so this lasts until it quits.".into())
             }
@@ -193,9 +260,9 @@ mod tests {
     fn closing_to_the_tray_is_on_until_the_person_turns_it_off() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load(dir.path()), "no file: on");
-        save(dir.path(), false).unwrap();
+        save_choice(dir.path(), false).unwrap();
         assert!(!load(dir.path()));
-        save(dir.path(), true).unwrap();
+        save_choice(dir.path(), true).unwrap();
         assert!(load(dir.path()));
     }
 
@@ -211,8 +278,54 @@ mod tests {
     #[test]
     fn saving_leaves_one_file_behind() {
         let dir = tempfile::tempdir().unwrap();
-        save(dir.path(), false).unwrap();
-        save(dir.path(), true).unwrap();
+        save_choice(dir.path(), false).unwrap();
+        save(dir.path(), true, true).unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn the_notice_is_said_when_hiding_and_not_yet_told_only() {
+        assert!(should_tell(Close::Hide, false));
+        assert!(!should_tell(Close::Hide, true), "once per install");
+        assert!(
+            !should_tell(Close::Quit, false),
+            "quitting leaves nothing running"
+        );
+        assert!(!should_tell(Close::Quit, true));
+    }
+
+    #[test]
+    fn hiding_marks_told_only_after_the_notice_was_queued() {
+        let src = include_str!("background.rs").replace("\r\n", "\n");
+        let body = &src[src.find("fn tell_once").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let send = body.find("s.send_notice(").unwrap();
+        let mark = body.find("TOLD.store(true").unwrap();
+        assert!(send < mark, "the flag follows a notice that was queued");
+    }
+
+    #[test]
+    fn the_told_flag_is_kept_beside_the_choice_and_neither_loses_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!load_told(dir.path()), "no file: not told");
+        save_choice(dir.path(), false).unwrap();
+        assert!(!load_told(dir.path()));
+        save(dir.path(), load(dir.path()), true).unwrap();
+        assert!(load_told(dir.path()));
+        assert!(!load(dir.path()), "telling does not change the choice");
+        save_choice(dir.path(), true).unwrap();
+        assert!(load(dir.path()));
+        assert!(
+            load_told(dir.path()),
+            "changing the choice keeps the telling"
+        );
+    }
+
+    #[test]
+    fn the_notice_names_the_quit_chord_and_the_settings_section() {
+        let body = notice_body();
+        assert!(body.contains("still running"));
+        assert!(body.contains(QUIT_CHORD));
+        assert!(body.contains("Settings > Background and startup"));
     }
 }
