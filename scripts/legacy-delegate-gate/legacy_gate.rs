@@ -13,6 +13,10 @@
 //!                        `<blake3> <version> <works|dead> <bytes|array> [reason...]`
 //!   LEGACY_GATE_MIN_WORKING  minimum number of `works` entries that must have run
 //!
+//! Core internals used (keep this list short; each is a way a core refactor breaks the
+//! harness): Runtime::build_with_config, ContractStore/DelegateStore/SecretsStore::new,
+//! Storage::new, SecretsStore::register_delegate, Runtime::inbound_app_message.
+//!
 //! For each entry: hash-verify the bytes, instantiate on the core runtime with a
 //! real file-backed SecretsStore, probe an empty store (`value: None`), store a
 //! secret through River's CBOR StoreRequest, read it back, then drop the runtime,
@@ -112,13 +116,13 @@ async fn open_runtime(dir: &std::path::Path) -> Result<Runtime, String> {
     let contract_store = ContractStore::new(dir.join("c"), 10_000, db.clone()).map_err(|e| format!("{e}"))?;
     let delegate_store = DelegateStore::new(dir.join("d"), 10_000, db.clone()).map_err(|e| format!("{e}"))?;
     let secret_store = SecretsStore::new(dir.join("s"), Default::default(), db).map_err(|e| format!("{e}"))?;
-    Runtime::build_with_config(contract_store, delegate_store, secret_store, false, delegate_fixture_config())
+    Runtime::build_with_config(contract_store, delegate_store, secret_store, false, Default::default())
         .map_err(|e| format!("runtime: {e}"))
 }
 
 /// Run the full tier 1-3 exercise on one WASM. Ok(()) means every step passed.
 async fn exercise(bytes: &[u8], enc: Enc) -> Result<(), String> {
-    let temp = get_temp_dir();
+    let temp = tempfile::tempdir().expect("tempdir");
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
         &bytes.to_vec().into(),
         &vec![].into(),
@@ -259,11 +263,6 @@ async fn legacy_gate_goes_red_on_mangled_wasm() {
         smeared[12 + i] = *b;
     }
     assert!(exercise(&smeared, e.enc).await.is_err(), "mangled WASM passed");
-
-    // Wrong wire encoding must be rejected rather than silently accepted, or the
-    // round-trip comparison is not strict enough to notice a protocol break.
-    let flipped = if e.enc == Enc::Bytes { Enc::Array } else { Enc::Bytes };
-    let _ = exercise(&good, flipped).await; // informational: tolerated either way
 
     // The hash guard is the manifest loop's job: assert it directly.
     assert_ne!(blake3::hash(&truncated).to_hex().to_string(), e.hash);
