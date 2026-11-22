@@ -252,6 +252,11 @@ fn read_line(stream: &mut TcpStream, deadline: Instant) -> Option<String> {
     let mut byte = [0u8; 1];
     loop {
         let left = deadline.checked_duration_since(Instant::now())?;
+        // A socket read timeout is safe here: this is a one-shot loopback request line, and a
+        // read that times out (or ends in any error) returns `None` and the connection is
+        // dropped, which is what Windows documents for a socket whose receive timed out
+        // ("the connection is in an indeterminate state and should be closed"). Nothing
+        // reads from it again.
         stream
             .set_read_timeout(Some(left.max(Duration::from_millis(1))))
             .ok()?;
@@ -331,6 +336,8 @@ fn ask_once(dir: &Path, activation: Option<&str>) -> bool {
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
+    // As in `read_line`: a timeout or any error here ends the attempt and the stream is
+    // dropped, so a socket left indeterminate by a timeout is never read again.
     let _ = stream.set_read_timeout(Some(CONNECTION_DEADLINE));
     let mut answer = [0u8; 1];
     matches!(stream.read(&mut answer), Ok(1) if answer[0] == ACK)

@@ -3648,6 +3648,7 @@ dependencies = [
  "freenet-migrate",
  "freenet-scaffold",
  "freenet-stdlib",
+ "polling",
  "pulldown-cmark",
  "rand 0.8.8",
  "river-core",
