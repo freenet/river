@@ -14,13 +14,12 @@
 //! # What a pass does
 //!
 //! The generations that answered with room data on this page load are visited
-//! newest first. A legacy copy of a room is **compacted**, rewritten without its
-//! `room_state` (the room contract's state: messages, members, configuration),
-//! when a NEWER full copy of the room is kept: the current delegate's, or one a
-//! newer generation keeps ([`decide_present_copy`]). A current-delegate
-//! tombstone is not enough: a newer generation's copy can outrank it. Otherwise it is kept as is,
-//! so the newest full snapshot of every room always survives. Everything else is
-//! kept too: per-room tombstones (a few bytes) and compacted copies.
+//! newest first. The newest legacy copy of each room is kept as it is: it is
+//! the rollback copy, and the room's newest full snapshot outside the current
+//! delegate. Every OLDER copy of the room with a snapshot is **compacted**:
+//! rewritten without its `room_state` (the room contract's state: messages,
+//! members, configuration) ([`decide_present_copy`]). Per-room tombstones (a
+//! few bytes) and already compacted copies are left alone.
 //!
 //! `room_state` is the bulk of a copy's bytes and the one part
 //! [`chat_delegate::critical_hash`] treats as a reconstructible cache.
@@ -29,10 +28,14 @@
 //! legacy `rooms_data` blob is rewritten the same way, room by room
 //! ([`plan_blob`]), with its tombstones and view preferences untouched.
 //!
+//! The decision needs nothing from the current delegate, so the pass reads
+//! only legacy generations, and works when every write to the current
+//! delegate is refused.
+//!
 //! # Why compaction and never deletion
 //!
 //! * **The journal.** freenet-migrate does not believe a predecessor that
-//!   exports fewer items than an interrupted import saw (#44), so deleting a
+//!   exports fewer items than an import already counted (#44), so deleting a
 //!   key from a pending generation keeps it pending, and the full sweep
 //!   re-running, for good. A resolved generation is not safe either: an
 //!   `ImportedWithRejections` entry reopens with its old count when River's
@@ -49,17 +52,11 @@
 //!
 //! # The quota-full case, and why the order cannot lose data
 //!
-//! Compaction never needs a write to the current delegate, so it works when the
-//! quota is full. After a pass that compacted anything the rooms are saved to
-//! the current delegate and the walk is asked to resolve the journal; a second
-//! pass then compacts the copies the newly committed current copy supersedes.
-//! Interrupted at any point:
-//!
-//! * mid-compaction: a compacted copy keeps every unrecoverable field, and a
-//!   newer full copy of the room exists;
-//! * after compaction, before the save: the newest full copy is still in its
-//!   legacy generation (or the current delegate), and the next load merges it
-//!   as before.
+//! After a pass that compacted anything, the rooms are saved to the current
+//! delegate (a save refused for quota earlier left them unrecorded) and the
+//! walk is asked to import what the sweep could not and resolve the journal.
+//! Interrupted at any point, every room keeps its newest legacy copy in full,
+//! and every copy keeps every unrecoverable field.
 //!
 //! # Limits
 //!
@@ -74,20 +71,18 @@
 //!   old-build tab made to that generation since is kept. The window between
 //!   that re-read and the store remains; such tabs reload into the current
 //!   build when they see the re-key (`generation_watch`).
-//! * The pass stops when a new load attempt begins (a reconnect or Retry):
-//!   that load reads the current delegate's slots under the same correlation
-//!   keys as the pass's own reads.
 //! * Every legacy delegate WASM handles `StoreRequest` (in the protocol since
 //!   the first chat delegate, March 2025, before the oldest registered
 //!   generation). The node charges an overwrite only its size delta, so a
-//!   smaller rewrite succeeds with the quota full.
+//!   smaller rewrite succeeds with the quota full. No delegate WASM changes.
 //! * Only generations that answered the sweep or the walk with room data on
 //!   this load are visited, so a pass costs nothing for the generations the
-//!   node does not hold (a silent one would cost a 10 s timeout each).
+//!   node does not hold (a silent one would cost a 10 s timeout each). The
+//!   pass stops when a new load attempt begins (a reconnect or Retry).
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::{BTreeSet, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ciborium::from_reader;
 use dioxus::logger::tracing::{info, warn};
@@ -97,29 +92,14 @@ use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDel
 
 use super::migration_journal;
 use crate::components::app::chat_delegate::{
-    self, legacy_delegate_pairs, parse_room_storage_key, send_delegate_request,
-    send_delegate_request_to, ROOMS_STORAGE_KEY,
+    self, legacy_delegate_pairs, parse_room_storage_key, send_delegate_request_to,
+    ROOMS_STORAGE_KEY,
 };
 use crate::room_data::{RoomData, RoomSlot, Rooms};
 
 // ---------------------------------------------------------------------------
 // Pure decisions
 // ---------------------------------------------------------------------------
-
-/// What the current delegate holds for one room, as this pass read it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CurrentCopy {
-    /// The read failed or did not decode: nothing may be concluded from it.
-    Unknown,
-    /// No slot.
-    Absent,
-    /// The user left the room.
-    Tombstone,
-    /// The room, with a room snapshot.
-    Full,
-    /// The room without a snapshot (compacted, or not yet fetched).
-    Placeholder,
-}
 
 /// What to do with one legacy copy of a room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,11 +122,8 @@ pub(crate) fn compact_room(room: &RoomData) -> RoomData {
     compacted
 }
 
-/// Decide one legacy `Present` copy: compact a full copy when a newer full copy
-/// of the room is kept. A current-delegate tombstone does NOT supersede it: a
-/// newer generation's copy can outrank a tombstone imported from an older one
-/// (`MergeRanks::presence_survives_tombstone`), and then this may be the
-/// snapshot the load resurrects the room from.
+/// Decide one legacy `Present` copy: compact a full copy when a NEWER legacy
+/// copy of the room is kept in full (the rollback copy).
 pub(crate) fn decide_present_copy(newer_full_copy_kept: bool, candidate: &RoomData) -> CopyAction {
     if has_full_state(candidate) && newer_full_copy_kept {
         CopyAction::Compact
@@ -202,7 +179,7 @@ fn compacted_slot_bytes(room: &RoomData) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// The delegate operations a pass needs, so the pass runs against a fake store
-/// in tests.
+/// in tests. Only legacy generations are addressed.
 pub(crate) trait CleanupIo {
     /// The keys `delegate` lists; `None` when it did not answer.
     async fn list(&self, delegate: &DelegateKey) -> Option<Vec<Vec<u8>>>;
@@ -210,11 +187,7 @@ pub(crate) trait CleanupIo {
     async fn get(&self, delegate: &DelegateKey, key: &[u8]) -> Option<Vec<u8>>;
     /// Overwrite `key` in `delegate`. Whether it was stored.
     async fn store(&self, delegate: &DelegateKey, key: &[u8], value: Vec<u8>) -> bool;
-    /// What the CURRENT delegate holds for `owner`.
-    async fn current(&self, owner: &VerifyingKey) -> CurrentCopy;
-    /// Whether the pass must stop now (a new load attempt began: its room load
-    /// reads the current delegate's slots under the correlation keys this pass
-    /// would use).
+    /// Whether the pass must stop now (a new load attempt began).
     fn superseded(&self) -> bool;
 }
 
@@ -243,18 +216,15 @@ pub(crate) struct PassReport {
     pub(crate) bytes_freed: u64,
 }
 
-/// The current delegate's copy of `owner`, read once per pass.
-async fn current_copy<IO: CleanupIo>(
-    io: &IO,
-    cache: &mut HashMap<[u8; 32], CurrentCopy>,
-    owner: &VerifyingKey,
-) -> CurrentCopy {
-    if let Some(copy) = cache.get(&owner.to_bytes()) {
-        return *copy;
+impl PassReport {
+    fn record(&mut self, stored: bool, freed: u64) {
+        if stored {
+            self.compacted += 1;
+            self.bytes_freed += freed;
+        } else {
+            self.failed += 1;
+        }
     }
-    let copy = io.current(owner).await;
-    cache.insert(owner.to_bytes(), copy);
-    copy
 }
 
 /// One pass over `generations` (registry indexes), newest first. The live
@@ -262,8 +232,8 @@ async fn current_copy<IO: CleanupIo>(
 pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usize>) -> PassReport {
     let pairs = legacy_delegate_pairs();
     let mut report = PassReport::default();
-    let mut current: HashMap<[u8; 32], CurrentCopy> = HashMap::new();
-    // Rooms a full copy NEWER than the generation being visited is kept of.
+    // Rooms a legacy copy NEWER than the generation being visited is kept of,
+    // in full.
     let mut full_kept: HashSet<[u8; 32]> = HashSet::new();
     for &index in generations.iter().rev() {
         if io.superseded() {
@@ -303,10 +273,6 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
             let Ok(RoomSlot::Present(room)) = from_reader::<RoomSlot, _>(&bytes[..]) else {
                 continue;
             };
-            let cur = current_copy(io, &mut current, &owner).await;
-            if cur == CurrentCopy::Full {
-                full_kept.insert(owner.to_bytes());
-            }
             match decide_present_copy(full_kept.contains(&owner.to_bytes()), &room) {
                 CopyAction::Keep => {
                     if has_full_state(&room) {
@@ -316,44 +282,32 @@ pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usiz
                 CopyAction::Compact => match compacted_slot_bytes(&room) {
                     Some(new) => {
                         let freed = bytes.len().saturating_sub(new.len()) as u64;
-                        if store_if_unchanged(io, &delegate, &storage_key, &bytes, new).await {
-                            report.compacted += 1;
-                            report.bytes_freed += freed;
-                        } else {
-                            report.failed += 1;
-                        }
+                        let stored =
+                            store_if_unchanged(io, &delegate, &storage_key, &bytes, new).await;
+                        report.record(stored, freed);
                     }
-                    None => report.failed += 1,
+                    None => report.record(false, 0),
                 },
             }
         }
 
-        if has_blob && !io.superseded() {
-            let Some(bytes) = io.get(&delegate, ROOMS_STORAGE_KEY).await else {
-                continue;
-            };
-            let Ok(blob) = from_reader::<Rooms, _>(&bytes[..]) else {
-                continue;
-            };
-            let owners: Vec<VerifyingKey> = blob.map.keys().copied().collect();
-            for owner in &owners {
-                if current_copy(io, &mut current, owner).await == CurrentCopy::Full {
-                    full_kept.insert(owner.to_bytes());
-                }
-            }
-            let (rewrite, kept) = plan_blob(&blob, &full_kept);
-            for owner in kept {
-                full_kept.insert(owner.to_bytes());
-            }
-            if let Some(new) = rewrite {
-                let freed = bytes.len().saturating_sub(new.len()) as u64;
-                if store_if_unchanged(io, &delegate, ROOMS_STORAGE_KEY, &bytes, new).await {
-                    report.compacted += 1;
-                    report.bytes_freed += freed;
-                } else {
-                    report.failed += 1;
-                }
-            }
+        if !has_blob || io.superseded() {
+            continue;
+        }
+        let Some(bytes) = io.get(&delegate, ROOMS_STORAGE_KEY).await else {
+            continue;
+        };
+        let Ok(blob) = from_reader::<Rooms, _>(&bytes[..]) else {
+            continue;
+        };
+        let (rewrite, kept) = plan_blob(&blob, &full_kept);
+        for owner in kept {
+            full_kept.insert(owner.to_bytes());
+        }
+        if let Some(new) = rewrite {
+            let freed = bytes.len().saturating_sub(new.len()) as u64;
+            let stored = store_if_unchanged(io, &delegate, ROOMS_STORAGE_KEY, &bytes, new).await;
+            report.record(stored, freed);
         }
     }
     report
@@ -396,24 +350,6 @@ impl CleanupIo for NodeIo {
         )
     }
 
-    async fn current(&self, owner: &VerifyingKey) -> CurrentCopy {
-        let request = ChatDelegateRequestMsg::GetRequest {
-            key: ChatDelegateKey::new(chat_delegate::room_storage_key(owner)),
-        };
-        match send_delegate_request(request).await {
-            Ok(ChatDelegateResponseMsg::GetResponse { value: None, .. }) => CurrentCopy::Absent,
-            Ok(ChatDelegateResponseMsg::GetResponse {
-                value: Some(bytes), ..
-            }) => match from_reader::<RoomSlot, _>(&bytes[..]) {
-                Ok(RoomSlot::Present(room)) if has_full_state(&room) => CurrentCopy::Full,
-                Ok(RoomSlot::Present(_)) => CurrentCopy::Placeholder,
-                Ok(RoomSlot::Tombstone) => CurrentCopy::Tombstone,
-                Err(_) => CurrentCopy::Unknown,
-            },
-            _ => CurrentCopy::Unknown,
-        }
-    }
-
     fn superseded(&self) -> bool {
         !chat_delegate::load_attempt_is_current(self.attempt)
     }
@@ -428,18 +364,13 @@ thread_local! {
     /// this page load. Only these are visited.
     static GENERATIONS_WITH_DATA: RefCell<BTreeSet<usize>> = const { RefCell::new(BTreeSet::new()) };
 }
-/// The cleanup task has been started on this page load.
+/// The cleanup task has been started on this page load (one pass per load).
 static SCHEDULED: AtomicBool = AtomicBool::new(false);
-/// Passes run on this page load.
-static PASSES: AtomicU32 = AtomicU32::new(0);
 
-/// Passes per page load: one over what the load found, and one after the save
-/// and the walk, which sees the rooms just committed to the current delegate.
-const MAX_PASSES_PER_LOAD: u32 = 2;
-/// How long to wait for the load (or the walk) to go quiet before a pass.
+/// How long to wait for the load to go quiet before the pass.
 const QUIET_WAIT_MAX_MS: u64 = 180_000;
 const QUIET_POLL_MS: u64 = 1_000;
-/// Quiet must hold this long, so a pass does not start in a gap between two
+/// Quiet must hold this long, so the pass does not start in a gap between two
 /// waves of the load.
 const QUIET_SETTLE_MS: u64 = 3_000;
 
@@ -460,29 +391,18 @@ pub(crate) fn note_legacy_data_seen(delegate: &[u8]) {
     crate::util::safe_spawn_local(cleanup_task());
 }
 
-fn load_is_quiet() -> bool {
-    chat_delegate::PENDING_LOADS.load(Ordering::Relaxed) == 0
-}
-
-fn load_and_walk_are_quiet() -> bool {
-    load_is_quiet() && !migration_journal::walk_in_flight()
-}
-
-/// Wait until `quiet` has held for [`QUIET_SETTLE_MS`], or
-/// [`QUIET_WAIT_MAX_MS`]. Whether it did.
-///
-/// A pass and a walk are serialised by the journal lock, not by this wait. The
-/// first pass waits only for the load: a walk that cannot finish (every write
-/// it makes refused for quota, say) must not keep the pass that frees the
-/// quota from running. The second waits for the walk it asked for, then runs
-/// regardless.
-async fn wait_for(quiet: fn() -> bool) -> bool {
+/// Wait until no load worker is in flight for [`QUIET_SETTLE_MS`], or
+/// [`QUIET_WAIT_MAX_MS`]. Whether it did. The walk is serialised against the
+/// pass by the journal lock, not by this wait: a walk that cannot finish
+/// (every write it makes refused for quota, say) must not keep the pass that
+/// frees the quota from running.
+async fn wait_for_quiet_load() -> bool {
     let mut waited = 0u64;
     let mut quiet_for = 0u64;
     while waited < QUIET_WAIT_MAX_MS {
         crate::util::sleep(std::time::Duration::from_millis(QUIET_POLL_MS)).await;
         waited += QUIET_POLL_MS;
-        if quiet() {
+        if chat_delegate::PENDING_LOADS.load(Ordering::Relaxed) == 0 {
             quiet_for += QUIET_POLL_MS;
             if quiet_for >= QUIET_SETTLE_MS {
                 return true;
@@ -494,59 +414,44 @@ async fn wait_for(quiet: fn() -> bool) -> bool {
     false
 }
 
-/// One locked pass, if the page load's budget allows.
-async fn locked_pass() -> Option<PassReport> {
-    // Lock order: journal, then the slot fan-out. The sweep's per-room
-    // migration takes only the slot lock and releases it before its journal
-    // gate, and the walk takes only the journal lock, so no cycle exists.
-    let _ops = migration_journal::lock_journal_ops().await;
-    let _slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
-    if PASSES.fetch_add(1, Ordering::Relaxed) >= MAX_PASSES_PER_LOAD {
-        return None;
-    }
-    let generations = GENERATIONS_WITH_DATA.with(|g| g.borrow().clone());
-    let io = NodeIo {
-        attempt: chat_delegate::current_load_attempt(),
-    };
-    let report = run_pass(&io, &generations).await;
-    info!(
-        "legacy cleanup: compacted {} legacy room copies in {} generation(s) ({} failed, ~{} bytes freed)",
-        report.compacted,
-        generations.len(),
-        report.failed,
-        report.bytes_freed
-    );
-    Some(report)
-}
-
 async fn cleanup_task() {
-    if !wait_for(load_is_quiet).await {
+    if !wait_for_quiet_load().await {
         warn!("legacy cleanup: the load did not go quiet; the next load retries");
         return;
     }
-    let Some(first) = locked_pass().await else {
-        return;
+    let report = {
+        // Lock order: journal, then the slot fan-out. The sweep's per-room
+        // migration takes only the slot lock and releases it before its
+        // journal gate, and the walk takes only the journal lock, so no cycle
+        // exists. Both locks also keep the pass's legacy reads from sharing a
+        // correlation key with the sweep's or the walk's.
+        let _ops = migration_journal::lock_journal_ops().await;
+        let _slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
+        let generations = GENERATIONS_WITH_DATA.with(|g| g.borrow().clone());
+        let io = NodeIo {
+            attempt: chat_delegate::current_load_attempt(),
+        };
+        let report = run_pass(&io, &generations).await;
+        info!(
+            "legacy cleanup: compacted {} legacy room copies in {} generation(s) ({} failed, ~{} bytes freed)",
+            report.compacted,
+            generations.len(),
+            report.failed,
+            report.bytes_freed
+        );
+        report
     };
-    if first.compacted == 0 {
-        // Nothing here is superseded yet: each room's newest full copy is the
-        // only one, or the current delegate's copies could not be read. A load
-        // that commits rooms to the current delegate lets a later pass compact.
-        info!("legacy cleanup: no superseded legacy copy to compact on this load");
+    if report.compacted == 0 {
         return;
     }
     // Space was freed: commit the rooms the sweep merged (a save refused for
     // quota earlier left them unrecorded, so it writes them now), then let the
-    // walk import what the sweep could not and resolve the journal. A second
-    // pass compacts the copies the newly committed current copies supersede.
+    // walk import what the sweep could not and resolve the journal.
     match chat_delegate::save_rooms_to_delegate().await {
         Ok(()) => info!("legacy cleanup: rooms saved to the current delegate"),
         Err(e) => warn!("legacy cleanup: saving rooms after the cleanup failed: {e}"),
     }
     migration_journal::poke_walk();
-    if !wait_for(load_and_walk_are_quiet).await {
-        info!("legacy cleanup: the walk is still running; compacting what is committed so far");
-    }
-    let _ = locked_pass().await;
 }
 
 #[cfg(test)]
@@ -554,6 +459,7 @@ mod tests {
     use super::*;
     use crate::room_data::test_room_with_messages;
     use ed25519_dalek::SigningKey;
+    use std::collections::HashMap;
 
     fn owner_sk() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])
@@ -582,6 +488,17 @@ mod tests {
 
     fn slot_bytes(room: RoomData) -> Vec<u8> {
         encode(&RoomSlot::Present(Box::new(room)))
+    }
+
+    fn empty_rooms() -> Rooms {
+        Rooms {
+            map: HashMap::new(),
+            current_room_key: None,
+            removed_rooms: HashSet::new(),
+            notification_modes: HashMap::new(),
+            room_order: Vec::new(),
+            migrated_rooms: Vec::new(),
+        }
     }
 
     #[test]
@@ -615,17 +532,6 @@ mod tests {
         };
         assert_eq!(encode(&*back), encode(&compacted));
         assert!(bytes.len() < slot_bytes(room).len());
-    }
-
-    fn empty_rooms() -> Rooms {
-        Rooms {
-            map: HashMap::new(),
-            current_room_key: None,
-            removed_rooms: HashSet::new(),
-            notification_modes: HashMap::new(),
-            room_order: Vec::new(),
-            migrated_rooms: Vec::new(),
-        }
     }
 
     /// The load must still read a compacted copy cleanly, in either order
@@ -701,20 +607,18 @@ mod tests {
 
     type KvStore = HashMap<Vec<u8>, Vec<u8>>;
 
-    /// A fake node: legacy generations' key-value stores and the current
-    /// delegate's copies. Stores are applied, and every store is recorded.
+    /// A fake node holding legacy generations' key-value stores. Stores are
+    /// applied, and every store is recorded.
     #[derive(Default)]
     struct FakeIo {
         legacy: RefCell<HashMap<[u8; 32], KvStore>>,
-        current: HashMap<[u8; 32], CurrentCopy>,
         silent: HashSet<[u8; 32]>,
         stores: RefCell<Vec<[u8; 32]>>,
         /// Overwrite this generation's keys with other bytes once the pass has
         /// read them (an old-build tab writing meanwhile).
         racing_write: Option<usize>,
-        /// Stop the pass after this many current-delegate reads.
-        supersede_after_reads: Option<usize>,
-        current_reads: std::cell::Cell<usize>,
+        /// Report a new load attempt after this many stores.
+        supersede_after_stores: Option<usize>,
     }
 
     impl FakeIo {
@@ -777,24 +681,17 @@ mod tests {
             true
         }
         fn superseded(&self) -> bool {
-            self.supersede_after_reads
-                .is_some_and(|n| self.current_reads.get() >= n)
-        }
-        async fn current(&self, owner: &VerifyingKey) -> CurrentCopy {
-            self.current_reads.set(self.current_reads.get() + 1);
-            self.current
-                .get(&owner.to_bytes())
-                .copied()
-                .unwrap_or(CurrentCopy::Unknown)
+            self.supersede_after_stores
+                .is_some_and(|n| self.stores.borrow().len() >= n)
         }
     }
 
-    /// The live case: eight generations hold a full copy of one room, the
-    /// current delegate's copy cannot be read (every write to it is refused).
-    /// The pass needs no current-delegate write: the newest copy stays full,
-    /// the seven older ones are compacted, nothing unrecoverable changes.
+    /// The live case: eight generations hold a full copy of one room, and
+    /// nothing can be written to the current delegate. The pass never needs
+    /// it: the newest copy stays full (the rollback copy), the seven older
+    /// ones are compacted, nothing unrecoverable changes.
     #[test]
-    fn quota_full_pass_compacts_older_duplicates_without_a_current_write() {
+    fn quota_full_pass_compacts_older_duplicates_and_keeps_the_rollback_copy() {
         let sk = owner_sk();
         let owner = sk.verifying_key();
         let room = full_room(&sk, 3);
@@ -806,7 +703,7 @@ mod tests {
         let report = futures::executor::block_on(run_pass(&io, &generations));
         assert_eq!((report.compacted, report.failed), (7, 0));
         assert!(report.bytes_freed > 0);
-        assert!(io.is_full(17, &owner), "the newest full copy survives");
+        assert!(io.is_full(17, &owner), "the newest legacy copy stays full");
         for g in 10..17 {
             let RoomSlot::Present(copy) = io.slot(g, &owner) else {
                 panic!("generation {g} must stay Present");
@@ -829,16 +726,14 @@ mod tests {
         assert_eq!(again, PassReport::default());
     }
 
-    /// Once the current delegate holds the room in full, even the newest legacy
-    /// copy is compacted. A silent generation is skipped, a room only older
-    /// generations hold keeps its newest full copy, and tombstones stay.
+    /// Each room keeps its own newest copy; a silent generation is skipped;
+    /// tombstones stay.
     #[test]
-    fn a_committed_current_copy_supersedes_every_legacy_copy() {
+    fn every_room_keeps_its_newest_copy_and_silence_is_skipped() {
         let a_sk = owner_sk();
         let b_sk = SigningKey::from_bytes(&[2u8; 32]);
         let (a, b) = (a_sk.verifying_key(), b_sk.verifying_key());
         let mut io = FakeIo::default();
-        io.current.insert(a.to_bytes(), CurrentCopy::Full);
         io.put(12, &a, slot_bytes(full_room(&a_sk, 3)));
         io.put(11, &a, slot_bytes(full_room(&a_sk, 2)));
         io.put(11, &b, slot_bytes(full_room(&b_sk, 2)));
@@ -848,18 +743,16 @@ mod tests {
         io.silent.insert(legacy_delegate_pairs()[10].0);
         let generations: BTreeSet<usize> = [9, 10, 11, 12].into_iter().collect();
         let report = futures::executor::block_on(run_pass(&io, &generations));
-        assert!(
-            !io.is_full(12, &a) && !io.is_full(11, &a),
-            "current supersedes both"
-        );
-        assert!(io.is_full(11, &b), "b's newest full copy stays");
+        assert!(io.is_full(12, &a), "a's newest copy");
+        assert!(!io.is_full(11, &a));
+        assert!(io.is_full(11, &b), "b's newest copy");
         assert!(io.is_full(10, &b), "a silent generation is not touched");
         assert!(!io.is_full(9, &b));
         assert!(
             matches!(io.slot(9, &a), RoomSlot::Tombstone),
             "tombstones stay"
         );
-        assert_eq!(report.compacted, 3);
+        assert_eq!(report.compacted, 2);
     }
 
     /// A write that lands between the pass's read and its store is kept, and
@@ -870,49 +763,23 @@ mod tests {
         let owner = sk.verifying_key();
         let room = full_room(&sk, 3);
         let mut io = FakeIo::default();
-        io.current.insert(owner.to_bytes(), CurrentCopy::Full);
         io.put(12, &owner, slot_bytes(room.clone()));
-        io.racing_write = Some(12);
-        let generations: BTreeSet<usize> = [12].into_iter().collect();
+        io.put(11, &owner, slot_bytes(room.clone()));
+        io.racing_write = Some(11);
+        let generations: BTreeSet<usize> = [11, 12].into_iter().collect();
         let report = futures::executor::block_on(run_pass(&io, &generations));
         assert_eq!((report.compacted, report.failed), (0, 1));
         assert!(io.stores.borrow().is_empty(), "nothing overwritten");
 
-        let other = SigningKey::from_bytes(&[2u8; 32]);
         let mut io = FakeIo::default();
-        io.current.insert(owner.to_bytes(), CurrentCopy::Full);
-        io.current
-            .insert(other.verifying_key().to_bytes(), CurrentCopy::Full);
-        io.put(12, &owner, slot_bytes(room));
-        io.put(11, &other.verifying_key(), slot_bytes(full_room(&other, 2)));
-        io.supersede_after_reads = Some(1);
-        let generations: BTreeSet<usize> = [11, 12].into_iter().collect();
+        for g in [10, 11, 12] {
+            io.put(g, &owner, slot_bytes(room.clone()));
+        }
+        io.supersede_after_stores = Some(1);
+        let generations: BTreeSet<usize> = [10, 11, 12].into_iter().collect();
         let report = futures::executor::block_on(run_pass(&io, &generations));
-        assert_eq!(
-            report.compacted, 1,
-            "the room in hand finishes, then it stops"
-        );
-        assert!(
-            io.is_full(11, &other.verifying_key()),
-            "generation 11 is not visited"
-        );
-    }
-
-    /// A current-delegate tombstone does not supersede the newest full copy: a
-    /// newer generation's copy can outrank an imported tombstone.
-    #[test]
-    fn a_current_tombstone_keeps_the_newest_full_copy() {
-        let sk = owner_sk();
-        let owner = sk.verifying_key();
-        let mut io = FakeIo::default();
-        io.current.insert(owner.to_bytes(), CurrentCopy::Tombstone);
-        io.put(12, &owner, slot_bytes(full_room(&sk, 3)));
-        io.put(11, &owner, slot_bytes(full_room(&sk, 2)));
-        let generations: BTreeSet<usize> = [11, 12].into_iter().collect();
-        let report = futures::executor::block_on(run_pass(&io, &generations));
-        assert!(io.is_full(12, &owner));
-        assert!(!io.is_full(11, &owner));
-        assert_eq!(report.compacted, 1);
+        assert_eq!(report.compacted, 1, "it stops after the first store");
+        assert!(io.is_full(10, &owner), "generation 10 is not visited");
     }
 
     #[test]

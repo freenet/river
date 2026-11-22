@@ -251,9 +251,9 @@ existing KV store, so it needs no delegate change and no migration entry.
 Every legacy generation keeps its copy of every room after migration. On a
 hosted node those duplicates share one per-user secret quota and can fill it,
 after which no write to the current delegate succeeds. The UI's
-`freenet_api/legacy_cleanup.rs` therefore rewrites a legacy room copy without
-its `room_state` once a newer full copy of that room is kept (the current
-delegate's, or a newer generation's). Every unrecoverable field stays.
+`freenet_api/legacy_cleanup.rs` therefore keeps the newest legacy copy of each
+room as it is (the rollback copy) and rewrites every older copy without its
+`room_state`. Every unrecoverable field stays.
 
 Two rules hold, and any new code that writes to a legacy generation must keep
 them:
@@ -262,8 +262,10 @@ them:
   predecessor that exports fewer items than an import already counted (#44),
   so a missing key keeps that generation pending, and the full sweep running,
   on every load. Rewriting a value in place keeps every count.
-- **Never compact the newest full copy of a room.** It may be the only
-  snapshot of a room whose contract the network cannot serve.
+- **Never compact a room's newest legacy copy.** It is the rollback copy, and
+  may be the only snapshot of a room whose contract the network cannot serve.
+  The decision reads nothing from the current delegate, so it works when every
+  write there is refused.
 
 The pass holds the journal lock and then the legacy slot-fetch lock, in that
 order, and visits only generations that answered with room data on that load.
