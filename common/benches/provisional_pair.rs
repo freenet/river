@@ -13,6 +13,13 @@
 //! CARGO_PROFILE_BENCH_OPT_LEVEL=3 cargo bench -p river-core --bench provisional_pair
 //! ```
 //!
+//! A second case times the adversarial worst case one delta may carry: 16 NEW
+//! provisional entries, 16 NEW provisional bans, a `member_info` record and a
+//! message for each new author, applied to the room at the ceilings (per-delta
+//! work bounds are `max(cap, 16)`). Set `BENCH_DUMP_DIR=<dir>` to also write
+//! `params.cbor`, `state.cbor`, `delta.cbor` and `adversarial_delta.cbor` for
+//! `tools/wasm-cost-bench`, which times the same calls under wasmtime.
+//!
 //! The contract calls are mirrored exactly: decode the state, decode the delta,
 //! `apply_delta`, encode (update); decode the result, `validate_whole_state`
 //! (validate). Native numbers; the WASM figure is measured under wasmtime by
@@ -22,6 +29,7 @@ use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId, MembersDelta};
+use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::provisional::{
     AdmissionEvidence, AuthorizedProvisionalBan, AuthorizedProvisionalMember, PowPolicy,
@@ -136,7 +144,7 @@ fn build(
         },
     );
     if with_provisional {
-        // 100 provisional authors, each with an entry and one message.
+        // 16 (the ceiling) provisional authors, each with an entry and one message.
         let authors: Vec<SigningKey> = (0..PROVISIONAL as u32).map(|i| sk(500_000 + i)).collect();
         let entries: Vec<AuthorizedProvisionalMember> = authors
             .iter()
@@ -276,6 +284,96 @@ fn main() {
         "added by provisional data: {:.2?} per message",
         medians[1].saturating_sub(medians[0])
     );
+
+    // Adversarial worst case: one delta with 16 new entries, 16 new bans, and a
+    // member_info record plus a message for each new author.
+    {
+        let (state, params, member, owner) = build(true);
+        let owner_id = params.owner_id();
+        let authors: Vec<SigningKey> = (0..PROVISIONAL as u32).map(|i| sk(600_000 + i)).collect();
+        let entries = authors
+            .iter()
+            .map(|k| {
+                AuthorizedProvisionalMember::new(
+                    &params.owner,
+                    ProvisionalMember {
+                        member_vk: k.verifying_key(),
+                        evidence: AdmissionEvidence::Pow { nonce: 0 },
+                    },
+                    k,
+                )
+            })
+            .collect();
+        let bans = (0..PROVISIONAL as u32)
+            .map(|i| {
+                AuthorizedProvisionalBan::new(
+                    &params.owner,
+                    ProvisionalBan {
+                        banned_by: owner_id,
+                        banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                        target: sk(950_000 + i).verifying_key().into(),
+                    },
+                    &owner,
+                )
+            })
+            .collect();
+        let infos = authors
+            .iter()
+            .map(|k| {
+                AuthorizedMemberInfo::new_with_member_key(
+                    MemberInfo::new_public(
+                        k.verifying_key().into(),
+                        1,
+                        "provisional author".to_string(),
+                    ),
+                    k,
+                )
+            })
+            .collect();
+        let msgs = authors
+            .iter()
+            .enumerate()
+            .map(|(i, k)| msg(owner_id, k, 6_000_000 + i as u64))
+            .collect();
+        let delta = ChatRoomStateV1Delta {
+            provisional: Some(ProvisionalDelta { entries, bans }),
+            member_info: Some(infos),
+            recent_messages: Some(msgs),
+            ..Default::default()
+        };
+        let (state_bytes, delta_bytes) = (cbor(&state), cbor(&delta));
+        pair(&state_bytes, &delta_bytes, &params);
+        let (mut u, mut v) = (Vec::new(), Vec::new());
+        let mut out_len = 0;
+        for _ in 0..iterations {
+            let (a, b, l) = pair(&state_bytes, &delta_bytes, &params);
+            u.push(a);
+            v.push(b);
+            out_len = l;
+        }
+        let (mu, mv) = (median(u), median(v));
+        println!(
+            "{:<22} state {:>7} B  delta {:>6} B  update_state {:>8.2?}  validate_state {:>8.2?}  pair {:>8.2?}",
+            "adversarial delta",
+            out_len,
+            delta_bytes.len(),
+            mu,
+            mv,
+            mu + mv
+        );
+        if let Ok(dir) = std::env::var("BENCH_DUMP_DIR") {
+            let one = ChatRoomStateV1Delta {
+                recent_messages: Some(vec![msg(owner_id, &member, 5_000_000)]),
+                ..Default::default()
+            };
+            let dir = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("params.cbor"), cbor(&params)).unwrap();
+            std::fs::write(dir.join("state.cbor"), &state_bytes).unwrap();
+            std::fs::write(dir.join("delta.cbor"), cbor(&one)).unwrap();
+            std::fs::write(dir.join("adversarial_delta.cbor"), &delta_bytes).unwrap();
+        }
+    }
 
     // Where `validate_state` spends it, per field, on the room with provisional
     // data (each field's `verify`, then the cleanup the whole-state check runs).

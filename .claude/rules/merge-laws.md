@@ -50,16 +50,17 @@ follows the same rules.
 
 ## Whole states are held to their own caps; deltas to the work bounds
 
-A whole-state merge refuses an incoming state holding more bans, members or
-ban evidence than its own owner-signed configuration allows (verify's own
-bounds, compared before any signature is checked), then applies EVERY
+A whole-state merge refuses an incoming state holding more bans, members,
+ban evidence, provisional entries or provisional bans than its own
+owner-signed configuration allows (verify's own bounds, compared before any
+signature is checked), then applies EVERY
 incoming record and lets the merged room's caps decide.
 
 It also refuses, before any signature is checked, an incoming state whose
 configuration does not outrank the receiver's (the merge ends in the
-receiver's room) when it holds more bans, members or ban evidence than one
-delta may carry in the receiver's room (each cap at least its per-delta
-floor). A work-bound refusal: without it a replayed older owner-signed
+receiver's room) when it holds more bans, members, ban evidence, provisional
+entries or provisional bans than one delta may carry in the receiver's room
+(each cap at least its per-delta floor). A work-bound refusal: without it a replayed older owner-signed
 configuration with a high cap would admit that many records, each checked
 by the receiver. The honest case it also refuses is a peer still on an
 older, higher cap after the owner lowered it: that peer takes the new
@@ -71,8 +72,9 @@ removals run (a lowered `max_members`, a ban that removes an issuer), so the
 two directions of one exchange differ.
 
 A network delta is sent against a summary, without the receiver's state, so
-it is trimmed (`trim_network_delta`) to the work bounds of the receiver's
-room: the sender's caps when the receiver will end with the sender's
+it is trimmed (`trim_network_delta`, which calls `trim_to_work_bounds`) to
+the work bounds of the receiver's room, for bans, members, ban evidence,
+provisional entries and provisional bans: the sender's caps when the receiver will end with the sender's
 configuration, otherwise the least bounds any room has. The rest follows in
 later rounds. The trim keeps first the authors of the messages it keeps,
 newest message first, each with its WHOLE missing invite chain while the
@@ -80,6 +82,20 @@ chains fit the receiver's member bound; an author whose chain does not fit
 is left out with its messages. So every trimmed delta delivers messages
 with members the receiver keeps, and the exchange always makes progress.
 Anything that adds records to a network delta runs before the trim.
+
+## The provisional field
+
+The `provisional` field (entries and provisional bans of a Public room) is
+unsigned as a whole; each record carries its own signature.
+
+- Arrival only adds. An incoming entry that fails the room's current policy
+  is skipped. A forged self-signature on an entry is an `Err`. With no active
+  policy, nothing in the field is processed.
+- Cleanup re-decides the provisional set on every pass.
+- A provisional author's message or `member_info` is accepted on arrival under
+  any key that a held record, or a held entry that passes the room's current
+  policy, carries. Cleanup (C1, C2, C3) then decides which survive, so
+  "skipped on arrival" never reads a record that cleanup drops.
 
 ## Caps are decided in cleanup, after removals
 
