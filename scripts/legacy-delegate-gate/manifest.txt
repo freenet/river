@@ -1,5 +1,6 @@
 # River legacy chat-delegate release gate manifest (river#630).
-# <version|CURRENT> <works|dead> <bytes|array> [reason]
+# <version|CURRENT> <works|dead> <bytes|array> [err=<substring>] [reason]
+# A dead entry must fail with an error containing its err= token (its failure class).
 # Versions refer to legacy_delegates.toml; the code hash is resolved from there and
 # the WASM bytes are re-extracted from River git history and hash-verified, so this
 # file cannot name bytes that differ from what users hold.
@@ -22,10 +23,10 @@ V26     works array  stdlib 0.8.3 era
 V24     works array  stdlib 0.6.x era
 V17     works array  first clean 0.6.0 build after the wbindgen imports fix
 V10     works array  stdlib 0.3.5, oldest working
-V3      dead  array  class A: stdlib <=0.2.x ApplicationMessage layout, "Invalid size 7212619361848683800"
-V9      dead  array  class C: committed bytes corrupt (UTF-8 replacement char in type section)
-V14     dead  array  class B: unresolvable __wbindgen_placeholder__ imports
-V16     dead  array  class B: unresolvable __wbindgen_placeholder__ imports
+V3      dead  array  err=de/serialization class A: stdlib <=0.2.x ApplicationMessage layout, "Invalid size 7212619361848683800"
+V9      dead  array  err=compile class C: committed bytes corrupt (UTF-8 replacement char in type section)
+V14     dead  array  err=__wbindgen_placeholder__ class B: unresolvable __wbindgen_placeholder__ imports
+V16     dead  array  err=__wbindgen_placeholder__ class B: unresolvable __wbindgen_placeholder__ imports
 V11 works array  stdlib-era generation found via --full-history
 V18 works array  stdlib-era generation found via --full-history
 V19 works array  stdlib-era generation found via --full-history

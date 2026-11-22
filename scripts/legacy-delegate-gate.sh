@@ -12,7 +12,8 @@
 # guard tripped); 2 setup error (harness could not run; NOT a pass).
 #
 # Env: GATE_WORK (scratch dir, default ~/code/scratch/legacy-delegate-gate),
-#      CARGO_TARGET_DIR (reuse a build cache), GATE_KEEP=1 (keep the core copy).
+#      CARGO_TARGET_DIR (reuse a build cache). The core checkout is kept per core rev
+#      under GATE_WORK so repeat runs reuse the compiled core (unchanged mtimes).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RIVER="$(cd "$HERE/.." && pwd)"
@@ -33,11 +34,12 @@ done
 case "$WORK" in ""|/|"$HOME"|"$HOME/code") die "refusing GATE_WORK=$WORK (the script deletes \$WORK/corpus and \$WORK/core)";; esac
 
 mkdir -p "$WORK"
+WORK="$(cd "$WORK" && pwd)"
 # One run at a time per work dir: concurrent runs would delete each other's core copy.
 exec 9>"$WORK/.lock"
 flock -w 3600 9 || die "could not take $WORK/.lock within an hour (another gate run is using it)"
-CORPUS="$WORK/corpus"; CORE="$WORK/core"
-rm -rf "$CORPUS" "$CORE"
+CORPUS="$WORK/corpus"
+rm -rf "$CORPUS"
 "$GATE/extract-corpus.sh" "$CORPUS" || die "corpus extraction failed"
 
 # Resolve manifest versions to hashes.
@@ -46,9 +48,10 @@ min=0
 while read -r ver expect enc rest; do
   case "$ver" in ''|'#'*) continue;; esac
   h=$(awk -v v="$ver" '$2==v{print $1}' "$CORPUS/index.txt")
+  errtok=""; case "$rest" in err=*) errtok="${rest%% *}";; esac
   [ -n "$h" ] || die "manifest names $ver but no WASM with a registry hash was found in git history"
-  echo "$h $ver $expect $enc" >> "$RESOLVED"
-  [ "$expect" = works ] && min=$((min+1))
+  echo "$h $ver $expect $enc $errtok" >> "$RESOLVED"
+  if [ "$expect" = works ]; then min=$((min+1)); fi
 done < "$GATE/manifest.txt"
 # Fail-open guards. The floor is hard-coded here, NOT derived from the manifest, so
 # emptying the manifest cannot lower it.
@@ -64,23 +67,31 @@ untested=$(awk '{print $2}' "$CORPUS/index.txt" | while read -r v; do
 nreg=$(grep -c '^version' "$RIVER/legacy_delegates.toml" || true)
 echo "corpus: $(wc -l < "$RESOLVED") entries ($min expected working); $((nreg - $(wc -l < "$CORPUS/index.txt") + 1)) registry generations have no WASM in git history and cannot be run"
 
-# Fetch the core version under test.
+# Fetch the core version under test into a per-rev checkout that is KEPT, so cargo's
+# mtime-based freshness check reuses the compiled core on repeat runs.
+CORE_UPSTREAM="https://github.com/freenet/freenet-core"
 if [ -n "$CORE_PATH" ]; then
   [ -f "$CORE_PATH/crates/core/src/wasm_runtime/delegate/test.rs" ] || die "$CORE_PATH is not a freenet-core checkout"
-  # Committed HEAD only (git archive): excludes target dirs and nested worktrees.
-  mkdir -p "$CORE"
-  git -C "$CORE_PATH" archive HEAD | tar -C "$CORE" -xf -
+  sha=$(git -C "$CORE_PATH" rev-parse HEAD) || die "$CORE_PATH is not a git checkout"
+  CORE="$WORK/core-$sha"
+  if [ ! -d "$CORE" ]; then
+    # Committed HEAD only (git archive): excludes target dirs and nested worktrees.
+    mkdir -p "$CORE.tmp" && git -C "$CORE_PATH" archive HEAD | tar -C "$CORE.tmp" -xf - && mv "$CORE.tmp" "$CORE"
+  fi
 else
-  git init -q "$CORE"
-  git -C "$CORE" fetch -q --depth 1 https://github.com/freenet/freenet-core "$CORE_REV" || die "cannot fetch freenet-core $CORE_REV"
-  git -C "$CORE" checkout -q FETCH_HEAD
+  CORE="$WORK/core-$(printf %s "$CORE_REV" | tr -c 'A-Za-z0-9._-' _)"
+  [ -d "$CORE/.git" ] || { rm -rf "$CORE"; git init -q "$CORE"; }
+  git -C "$CORE" fetch -q --depth 1 "$CORE_UPSTREAM" "$CORE_REV" || die "cannot fetch freenet-core $CORE_REV"
+  # Check out only when the commit changed (a forced checkout would also revert the harness).
+  [ "$(git -C "$CORE" rev-parse HEAD 2>/dev/null)" = "$(git -C "$CORE" rev-parse FETCH_HEAD^{commit})" ] || git -C "$CORE" checkout -q -f FETCH_HEAD
 fi
 echo "core: $(grep -m1 '^version' "$CORE/crates/core/Cargo.toml") ${CORE_REV:-$CORE_PATH}"
 
 # Inject the harness as a child module of the core delegate test module.
 T="$CORE/crates/core/src/wasm_runtime/delegate"
-cp "$GATE/legacy_gate.rs" "$T/legacy_gate.rs"
-printf '\n#[path = "legacy_gate.rs"]\nmod legacy_gate;\n' >> "$T/test.rs"
+# Touch files only when their content changes (keeps the compiled core warm).
+cmp -s "$GATE/legacy_gate.rs" "$T/legacy_gate.rs" || cp "$GATE/legacy_gate.rs" "$T/legacy_gate.rs"
+grep -q '^mod legacy_gate;' "$T/test.rs" || printf '\n#[path = "legacy_gate.rs"]\nmod legacy_gate;\n' >> "$T/test.rs"
 
 cd "$CORE"
 export LEGACY_GATE_CORPUS="$CORPUS" LEGACY_GATE_MANIFEST="$RESOLVED" LEGACY_GATE_MIN_WORKING="$min"
@@ -94,7 +105,7 @@ if [ $rc -ne 0 ]; then
   # Exit 1 only when the gate tests actually ran and reported (the summary line or a
   # FAILED gate test). Anything else (compile error, setup panic) is exit 2.
   if grep -q 'LEGACY-GATE summary' "$LOG" || grep -qE 'legacy_gate::.* \.\.\. FAILED' "$LOG"; then
-    echo "GATE FAILED (log: $LOG)"; exit 1
+    echo "GATE FAILED (log: $LOG). If the failures are 'storage:', 'runtime:' or 'store_delegate:' errors rather than 'host error:' or HASH MISMATCH, the harness needs fixing against this core: fix scripts/legacy-delegate-gate/ and re-run. Never skip."; exit 1
   fi
   echo "SETUP ERROR: harness did not compile/run against this core (log: $LOG)" >&2; tail -30 "$LOG" >&2; exit 2
 fi

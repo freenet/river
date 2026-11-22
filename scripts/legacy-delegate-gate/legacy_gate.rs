@@ -190,6 +190,8 @@ struct Entry {
     version: String,
     works: bool,
     enc: Enc,
+    /// For `dead` entries: substring the failure must contain (the dead class).
+    err: Option<String>,
 }
 
 fn manifest() -> Vec<Entry> {
@@ -212,6 +214,7 @@ fn manifest() -> Vec<Entry> {
                     "array" => Enc::Array,
                     x => panic!("bad encoding {x}"),
                 },
+                err: f.get(4).and_then(|t| t.strip_prefix("err=")).map(str::to_string),
             }
         })
         .collect()
@@ -254,10 +257,14 @@ async fn legacy_chat_delegate_gate() {
             // A dead delegate must fail while RUNNING (instantiate/call). A failure in
             // our own setup (storage, runtime build, delegate store) says nothing
             // about the delegate and must not be counted as "dead as expected".
-            (false, Err(m)) if m.starts_with("host error:") => dead_ran += 1,
+            (false, Err(m))
+                if m.starts_with("host error:") && e.err.as_deref().is_none_or(|t| m.contains(t)) =>
+            {
+                dead_ran += 1
+            }
             (false, Err(m)) => failures.push(format!(
-                "{}: listed dead, but failed outside the delegate (harness/setup problem?): {m}",
-                e.version
+                "{}: listed dead, but failed differently from its recorded class (err={:?}; harness/setup problem or new failure?): {m}",
+                e.version, e.err
             )),
             (false, Ok(())) => failures.push(format!(
                 "{}: listed as dead in manifest.txt but now WORKS; update the manifest (stale allowlist)",
@@ -283,14 +290,16 @@ async fn legacy_gate_goes_red_on_mangled_wasm() {
 
     let mut truncated = good.clone();
     truncated.truncate(good.len() / 2);
-    assert!(exercise(&truncated, e.enc).await.is_err(), "truncated WASM passed");
+    let t = exercise(&truncated, e.enc).await.expect_err("truncated WASM passed");
+    assert!(t.starts_with("host error:"), "truncated WASM failed outside the delegate: {t}");
 
     // The V9 corruption class: a UTF-8 replacement char smeared into the header region.
     let mut smeared = good.clone();
     for (i, b) in [0xefu8, 0xbf, 0xbd].iter().enumerate() {
         smeared[12 + i] = *b;
     }
-    assert!(exercise(&smeared, e.enc).await.is_err(), "mangled WASM passed");
+    let m = exercise(&smeared, e.enc).await.expect_err("mangled WASM passed");
+    assert!(m.starts_with("host error:"), "mangled WASM failed outside the delegate: {m}");
 
     // The gate's real hash guard goes red on bytes that disagree with the registry.
     assert!(verify_hash(&truncated, &e.hash).is_err(), "hash guard accepted wrong bytes");
