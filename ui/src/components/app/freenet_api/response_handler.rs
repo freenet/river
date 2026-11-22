@@ -1467,6 +1467,10 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
         // EMPTY legacy index must not show Migrating).
         LoadPlan::MigrateCurrentBlob | LoadPlan::ProbeLegacy => return,
     };
+    // This generation holds per-room copies: note it for the legacy-copy
+    // cleanup now, before waiting for the slot fan-out, so the cleanup (which
+    // starts once the sweep stops pacing) includes it (`legacy_cleanup`).
+    super::legacy_cleanup::note_legacy_data_seen(legacy_key.bytes());
 
     // freenet/river#397 Codex review 2/4 (P1): the legacy index is NON-EMPTY, so
     // rooms provably exist under the old delegate key. Announce `Migrating`
@@ -1611,9 +1615,6 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
         // find rooms sets `Migrating` and hydrates (`room_count > 0` → `List`).
         return;
     }
-    // This generation still holds rooms: shrink the superseded copies once the
-    // load is quiet (`legacy_cleanup`).
-    super::legacy_cleanup::note_legacy_data_seen(legacy_key.bytes());
 
     // Flag the import in the migration journal BEFORE the merge, with the count
     // read above (freenet/river#763). A refusal skips this delegate on this load;

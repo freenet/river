@@ -78,7 +78,9 @@
 //! * Only generations that answered the sweep or the walk with room data on
 //!   this load are visited, so a pass costs nothing for the generations the
 //!   node does not hold (a silent one would cost a 10 s timeout each). The
-//!   pass stops when a new load attempt begins (a reconnect or Retry).
+//!   pass starts once the sweep has sent its last wave, not when the whole load
+//!   settles ([`wait_for_sweep_reads`]), and stops when a new load attempt
+//!   begins (a reconnect or Retry).
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
@@ -228,7 +230,7 @@ impl PassReport {
 }
 
 /// One pass over `generations` (registry indexes), newest first. The live
-/// caller holds the journal lock and the legacy slot-fetch lock.
+/// caller holds the legacy slot-fetch lock.
 pub(crate) async fn run_pass<IO: CleanupIo>(io: &IO, generations: &BTreeSet<usize>) -> PassReport {
     let pairs = legacy_delegate_pairs();
     let mut report = PassReport::default();
@@ -367,16 +369,17 @@ thread_local! {
 /// The cleanup task has been started on this page load (one pass per load).
 static SCHEDULED: AtomicBool = AtomicBool::new(false);
 
-/// How long to wait for the load to go quiet before the pass.
-const QUIET_WAIT_MAX_MS: u64 = 180_000;
-const QUIET_POLL_MS: u64 = 1_000;
-/// Quiet must hold this long, so the pass does not start in a gap between two
-/// waves of the load.
-const QUIET_SETTLE_MS: u64 = 3_000;
+/// How long to wait for the sweep's legacy reads before the pass.
+const READS_WAIT_MAX_MS: u64 = 180_000;
+const READS_POLL_MS: u64 = 500;
+/// The sweep must have stopped pacing for this long, so the ListResponses of
+/// its last wave have arrived and noted their generations.
+const READS_SETTLE_MS: u64 = 3_000;
 
-/// Note that legacy generation `delegate` answered with room data (the sweep's
-/// merge paths and the walk's reader call this), and start the cleanup for
-/// this page load, once.
+/// Note that legacy generation `delegate` holds room data (the sweep calls
+/// this when a generation lists per-room keys or returns a `rooms_data` blob,
+/// the walk's reader when an export holds room keys), and start the cleanup
+/// for this page load, once.
 pub(crate) fn note_legacy_data_seen(delegate: &[u8]) {
     let Some(index) = legacy_delegate_pairs()
         .iter()
@@ -391,49 +394,56 @@ pub(crate) fn note_legacy_data_seen(delegate: &[u8]) {
     crate::util::safe_spawn_local(cleanup_task());
 }
 
-/// Wait until no load worker is in flight for [`QUIET_SETTLE_MS`], or
-/// [`QUIET_WAIT_MAX_MS`]. Whether it did. The walk is serialised against the
-/// pass by the journal lock, not by this wait: a walk that cannot finish
-/// (every write it makes refused for quota, say) must not keep the pass that
-/// frees the quota from running.
-async fn wait_for_quiet_load() -> bool {
+/// Wait until the legacy sweep has sent its last wave and stopped pacing for
+/// [`READS_SETTLE_MS`], or [`READS_WAIT_MAX_MS`]. Whether it did.
+///
+/// NOT until the whole load settles. With the quota full that takes about two
+/// minutes (each sweep merge waits on a journal flag whose marker read times
+/// out, and each save fails on quota), and a user closes the tab long before:
+/// the first live run of this pass started 110 s into the load. The pass does
+/// not need the load settled. Its reads go to legacy generations only; the
+/// sweep's per-room fan-out and the walk take the slot-fetch lock the pass
+/// holds, so neither shares a correlation key with it; and nothing the pass
+/// changes alters what those paths import (a compacted copy merges like the
+/// full one, minus a snapshot a newer kept copy carries).
+async fn wait_for_sweep_reads() -> bool {
     let mut waited = 0u64;
-    let mut quiet_for = 0u64;
-    while waited < QUIET_WAIT_MAX_MS {
-        crate::util::sleep(std::time::Duration::from_millis(QUIET_POLL_MS)).await;
-        waited += QUIET_POLL_MS;
-        if chat_delegate::PENDING_LOADS.load(Ordering::Relaxed) == 0 {
-            quiet_for += QUIET_POLL_MS;
-            if quiet_for >= QUIET_SETTLE_MS {
+    let mut idle_for = 0u64;
+    while waited < READS_WAIT_MAX_MS {
+        crate::util::sleep(std::time::Duration::from_millis(READS_POLL_MS)).await;
+        waited += READS_POLL_MS;
+        if chat_delegate::legacy_sweep_pacing() {
+            idle_for = 0;
+        } else {
+            idle_for += READS_POLL_MS;
+            if idle_for >= READS_SETTLE_MS {
                 return true;
             }
-        } else {
-            quiet_for = 0;
         }
     }
     false
 }
 
 async fn cleanup_task() {
-    if !wait_for_quiet_load().await {
-        warn!("legacy cleanup: the load did not go quiet; the next load retries");
+    // The load attempt this cleanup was scheduled in: a reconnect or Retry
+    // since then begins another sweep, whose requests the pass must not
+    // displace, so the pass stops (the next load retries).
+    let attempt = chat_delegate::current_load_attempt();
+    if !wait_for_sweep_reads().await {
+        warn!("legacy cleanup: the legacy sweep did not finish; the next load retries");
         return;
     }
     let report = {
-        // Lock order: journal, then the slot fan-out. The sweep's per-room
-        // migration takes only the slot lock and releases it before its
-        // journal gate, and the walk takes only the journal lock, so no cycle
-        // exists. The locks keep the pass's legacy reads off the walk's and
-        // the per-room migration's waiters. The sweep's fire-and-forget
-        // `ListRequest` and `rooms_data` GET take neither lock, so a late reply
-        // to one can complete the pass's waiter instead: the pass then reads
-        // that reply, and the sweep loses that generation for this load only.
-        let _ops = migration_journal::lock_journal_ops().await;
+        // The slot-fetch lock serialises the pass against the sweep's per-room
+        // fan-out and the walk's predecessor reads (`run_work_with`), which
+        // read the same legacy keys under the same delegate-scoped correlation
+        // keys. The sweep's fire-and-forget `ListRequest` and `rooms_data` GET
+        // take no lock, so a late reply to one can complete the pass's waiter
+        // instead: the pass then reads that reply, and the sweep loses that
+        // generation for this load only.
         let _slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
         let generations = GENERATIONS_WITH_DATA.with(|g| g.borrow().clone());
-        let io = NodeIo {
-            attempt: chat_delegate::current_load_attempt(),
-        };
+        let io = NodeIo { attempt };
         let report = run_pass(&io, &generations).await;
         info!(
             "legacy cleanup: compacted {} legacy room copies in {} generation(s) ({} failed, ~{} bytes freed)",
@@ -445,10 +455,12 @@ async fn cleanup_task() {
         report
     };
     if report.compacted == 0 {
+        migration_journal::poke_walk_if_interrupted();
         return;
     }
-    // Space was freed: commit the rooms the sweep merged (a save refused for
-    // quota earlier left them unrecorded, so it writes them now), then let the
+    // Space was freed: commit the rooms merged so far (a save refused for
+    // quota earlier left them unrecorded, so it writes them now; merges still
+    // queued behind the journal save themselves as they land), then let the
     // walk import what the sweep could not and resolve the journal.
     match chat_delegate::save_rooms_to_delegate().await {
         Ok(()) => info!("legacy cleanup: rooms saved to the current delegate"),
