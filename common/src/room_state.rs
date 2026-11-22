@@ -9,6 +9,7 @@ pub mod member;
 pub mod member_info;
 pub mod message;
 pub mod privacy;
+pub mod provisional;
 pub mod secret;
 pub mod upgrade;
 pub mod version;
@@ -217,6 +218,7 @@ use crate::room_state::direct_messages::DirectMessagesV1;
 use crate::room_state::member::{AuthorizedMember, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::message::MessagesV1;
+use crate::room_state::provisional::ProvisionalV1;
 use crate::room_state::secret::RoomSecretsV1;
 use crate::room_state::upgrade::OptionalUpgradeV1;
 use crate::room_state::version::StateVersion;
@@ -288,6 +290,18 @@ pub struct ChatRoomStateV1 {
     /// with itself does not rewrite it (merge-law `state_idempotence`).
     #[serde(default, skip_serializing_if = "BanEvidenceV1::is_empty")]
     pub ban_evidence: BanEvidenceV1,
+
+    /// Provisional members and provisional bans of a public room with an
+    /// open-admission policy (freenet/river#974). NOT membership: nothing that
+    /// reads `members` sees these. Must come after `ban_evidence` (its apply
+    /// reads the post-apply `members` and `ban_evidence`) and before
+    /// `member_info` and `recent_messages`, which read it to resolve a
+    /// provisional author's key. Pinned by
+    /// `provisional_field_sits_between_ban_evidence_and_member_info`. Skipped
+    /// when empty, so a room that never used open admission keeps its exact
+    /// bytes (`validate_whole_state` compares bytes).
+    #[serde(default, skip_serializing_if = "ProvisionalV1::is_empty")]
+    pub provisional: ProvisionalV1,
 
     /// Metadata about members like their nickname, can be updated by members themselves.
     pub member_info: MemberInfoV1,
@@ -866,6 +880,12 @@ impl ChatRoomStateV1 {
             .members
             .retain(|m| !enforced_banned_ids.contains(&m.member.id()));
 
+        // P0-P5 and C3 (freenet/river#974): which provisional entries and
+        // provisional bans stand, decided from the same records ban
+        // enforcement just used. P6 is the member loop's window scan below
+        // and P7 follows it.
+        let plan = self.provisional_step(parameters, owner_id, &enforced_banned_ids, &stable_known);
+
         // 1-3. Inactivity prune and the `max_members` cap, repeated until the
         //      cap removes no one (`prune_and_cap_members`). Each pass starts
         //      from every member left after step 0 except those an earlier
@@ -881,13 +901,20 @@ impl ChatRoomStateV1 {
         let members_after_ban_enforcement: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
         #[cfg(test)]
-        let required_ids = if member_loop_reference::in_use() {
-            self.member_loop_reference(parameters, owner_id, &enforced_banned_ids)
+        let (required_ids, pool) = if member_loop_reference::in_use() {
+            self.member_loop_reference(parameters, owner_id, &enforced_banned_ids, &plan)
         } else {
-            self.member_loop(parameters, owner_id, &enforced_banned_ids)
+            self.member_loop(parameters, owner_id, &enforced_banned_ids, &plan)
         };
         #[cfg(not(test))]
-        let required_ids = self.member_loop(parameters, owner_id, &enforced_banned_ids);
+        let (required_ids, pool) =
+            self.member_loop(parameters, owner_id, &enforced_banned_ids, &plan);
+
+        // P7: an entry stays only while one of its author's messages is in the
+        // window (the author is in the pool).
+        self.provisional
+            .entries
+            .retain(|e| pool.contains(&e.member_id()));
 
         // 4. Sweep any ban whose issuer is unknown or whose signature does
         //    not match the issuer's key (#411 round 3 item A.3, round 4 item
@@ -991,7 +1018,10 @@ impl ChatRoomStateV1 {
             .collect();
         self.member_info.member_info.retain(|info| {
             let id = info.member_info.member_id;
-            id == owner_id || required_ids.contains(&id) || evidence_ids.contains(&id)
+            id == owner_id
+                || required_ids.contains(&id)
+                || evidence_ids.contains(&id)
+                || pool.contains(&id)
         });
 
         // 5a. Collapse duplicate member_info records to the single canonical
@@ -1020,17 +1050,56 @@ impl ChatRoomStateV1 {
         let current_member_ids: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
         self.recent_messages.messages.retain(|m| {
-            m.message.author == owner_id || current_member_ids.contains(&m.message.author)
+            m.message.author == owner_id
+                || current_member_ids.contains(&m.message.author)
+                || pool.contains(&m.message.author)
         });
         // Then the `max_recent_messages` cap over what is left, newest by
         // `(time, id)` kept: the cap step 1 counted, so every author it
-        // counted keeps a message.
+        // counted keeps a message. A provisional author's message is taken
+        // only inside the provisional quota and the pool cap, the rule the
+        // member loop's window scan applied (P6), so the messages kept are
+        // exactly those the scan took.
         {
             let cap = self.configuration.configuration.max_recent_messages;
             let messages = &mut self.recent_messages.messages;
             messages.sort_by_key(|m| m.order_key());
-            if messages.len() > cap {
-                messages.drain(0..messages.len() - cap);
+            if pool.is_empty() {
+                if messages.len() > cap {
+                    messages.drain(0..messages.len() - cap);
+                }
+            } else {
+                let mut taken = 0;
+                let mut provisional_taken = 0;
+                let mut scan_pool: HashSet<MemberId> = HashSet::new();
+                let mut keep = vec![false; messages.len()];
+                for (i, m) in messages.iter().enumerate().rev() {
+                    if taken >= cap {
+                        break;
+                    }
+                    let author = m.message.author;
+                    if pool.contains(&author) && !current_member_ids.contains(&author) {
+                        if provisional_taken < plan.quota
+                            && (scan_pool.contains(&author) || scan_pool.len() < plan.pool_cap)
+                        {
+                            scan_pool.insert(author);
+                            provisional_taken += 1;
+                        } else {
+                            continue;
+                        }
+                    }
+                    keep[i] = true;
+                    taken += 1;
+                }
+                let mut i = 0;
+                messages.retain(|_| {
+                    i += 1;
+                    keep[i - 1]
+                });
+                debug_assert!(
+                    scan_pool == pool,
+                    "step 5b took a different provisional pool than the member loop (P6)"
+                );
             }
         }
 
@@ -1136,7 +1205,8 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         owner_id: MemberId,
         enforced_banned_ids: &HashSet<MemberId>,
-    ) -> HashSet<MemberId> {
+        plan: &crate::room_state::provisional::ProvisionalPlan,
+    ) -> (HashSet<MemberId>, HashSet<MemberId>) {
         let candidates = self.members.members.clone();
         let mut lp = MemberLoop::new(
             &candidates,
@@ -1147,7 +1217,7 @@ impl ChatRoomStateV1 {
         let mut required_ids = HashSet::new();
         for _ in 0..=candidates.len() {
             let required =
-                self.prune_and_cap_pass(&mut lp, parameters, owner_id, enforced_banned_ids);
+                self.prune_and_cap_pass(&mut lp, parameters, owner_id, enforced_banned_ids, plan);
             let kept: HashSet<MemberId> =
                 self.members.members.iter().map(|m| m.member.id()).collect();
             // Only an id this pass held can be capped out: the prune also
@@ -1170,7 +1240,7 @@ impl ChatRoomStateV1 {
             }
             lp.remove(newly_capped, owner_id);
         }
-        required_ids
+        (required_ids, std::mem::take(&mut lp.pool))
     }
 
     /// One pass of [`Self::member_loop`] over `lp.held`: what
@@ -1183,6 +1253,7 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         owner_id: MemberId,
         enforced_banned_ids: &HashSet<MemberId>,
+        plan: &crate::room_state::provisional::ProvisionalPlan,
     ) -> HashSet<MemberId> {
         let held = &lp.held;
         let live = |author: &MemberId| {
@@ -1191,22 +1262,44 @@ impl ChatRoomStateV1 {
         // The newest `max_recent_messages` live messages. Liveness only goes
         // (the held set only shrinks), so a message found not live is dropped
         // from the order for good.
+        //
+        // A provisional author's message (P6) is taken only while fewer than
+        // `plan.quota` provisional messages are taken and, if its author is
+        // not yet in the pool, the pool is under `plan.pool_cap`; an author
+        // joins the pool when one of its messages is taken; a message not
+        // taken is neither kept nor counted against the window. Which
+        // provisional messages are taken does not depend on the members (it
+        // reads only the provisional messages, newest first), so one that is
+        // not taken stays so in every later pass and is dropped from the
+        // order for good, like a message that is not live.
         let window = self.configuration.configuration.max_recent_messages;
         let mut message_authors: HashSet<MemberId> = HashSet::new();
+        let mut pool: HashSet<MemberId> = HashSet::new();
+        let mut provisional_taken = 0;
         let mut taken = 0;
         let mut scanned = 0;
+        let mut order = Vec::with_capacity(lp.newest_first.len());
         while taken < window && scanned < lp.newest_first.len() {
-            if live(&lp.newest_first[scanned]) {
-                message_authors.insert(lp.newest_first[scanned]);
+            let author = lp.newest_first[scanned];
+            if live(&author) {
+                message_authors.insert(author);
                 taken += 1;
+                order.push(author);
+            } else if plan.ids.contains(&author)
+                && provisional_taken < plan.quota
+                && (pool.contains(&author) || pool.len() < plan.pool_cap)
+            {
+                pool.insert(author);
+                provisional_taken += 1;
+                taken += 1;
+                order.push(author);
             }
             scanned += 1;
         }
-        let mut order = std::mem::take(&mut lp.newest_first);
-        let rest = order.split_off(scanned);
-        order.retain(|a| live(a));
+        let rest = lp.newest_first.split_off(scanned);
         order.extend(rest);
         lp.newest_first = order;
+        lp.pool = pool;
 
         let held = &lp.held;
         let dm_participants = lp.dms.participants(
@@ -1253,6 +1346,14 @@ impl ChatRoomStateV1 {
                 required_ids.insert(banner);
             }
         }
+        // The issuers of the kept provisional bans are needed like the issuers
+        // of valid `UserBan`s, so a deputy is not pruned for inactivity out
+        // from under their provisional bans.
+        for issuer in &plan.ban_issuers {
+            if held.contains(issuer) {
+                required_ids.insert(*issuer);
+            }
+        }
         // Walk invite chains upward, adding all ancestors (stop at owner).
         let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
         while let Some(member_id) = to_process.pop() {
@@ -1288,10 +1389,12 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         owner_id: MemberId,
         enforced_banned_ids: &HashSet<MemberId>,
-    ) -> HashSet<MemberId> {
+        plan: &crate::room_state::provisional::ProvisionalPlan,
+    ) -> (HashSet<MemberId>, HashSet<MemberId>) {
         let candidates = self.members.members.clone();
         let mut capped_out: HashSet<MemberId> = HashSet::new();
         let mut required_ids = HashSet::new();
+        let mut pool = HashSet::new();
         for _ in 0..=candidates.len() {
             let mut held: HashSet<MemberId> = candidates
                 .iter()
@@ -1318,7 +1421,9 @@ impl ChatRoomStateV1 {
                 .cloned()
                 .collect();
             cleanup_counters::count_member_records(self.members.members.len());
-            let required = self.prune_and_cap_members(parameters, owner_id, enforced_banned_ids);
+            let (required, pass_pool) =
+                self.prune_and_cap_members(parameters, owner_id, enforced_banned_ids, plan);
+            pool = pass_pool;
             let kept: HashSet<MemberId> =
                 self.members.members.iter().map(|m| m.member.id()).collect();
             let newly_capped: Vec<MemberId> = required
@@ -1335,7 +1440,7 @@ impl ChatRoomStateV1 {
             }
             capped_out.extend(newly_capped);
         }
-        required_ids
+        (required_ids, pool)
     }
 
     /// One pass of `post_apply_cleanup` steps 1-3: keep the members something
@@ -1363,23 +1468,39 @@ impl ChatRoomStateV1 {
         parameters: &ChatRoomParametersV1,
         owner_id: MemberId,
         enforced_banned_ids: &HashSet<MemberId>,
-    ) -> HashSet<MemberId> {
+        plan: &crate::room_state::provisional::ProvisionalPlan,
+    ) -> (HashSet<MemberId>, HashSet<MemberId>) {
         let members_now: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
+        let mut pool: HashSet<MemberId> = HashSet::new();
         let message_authors: HashSet<MemberId> = {
-            let mut live: Vec<&crate::room_state::message::AuthorizedMessageV1> = self
-                .recent_messages
-                .messages
-                .iter()
-                .filter(|m| {
-                    m.message.author == owner_id
-                        || (members_now.contains(&m.message.author)
-                            && !enforced_banned_ids.contains(&m.message.author))
-                })
-                .collect();
-            live.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
-            live.truncate(self.configuration.configuration.max_recent_messages);
-            live.into_iter().map(|m| m.message.author).collect()
+            let mut ordered: Vec<&crate::room_state::message::AuthorizedMessageV1> =
+                self.recent_messages.messages.iter().collect();
+            ordered.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
+            let window = self.configuration.configuration.max_recent_messages;
+            let mut authors = HashSet::new();
+            let mut taken = 0;
+            let mut provisional_taken = 0;
+            for m in ordered {
+                if taken >= window {
+                    break;
+                }
+                let author = m.message.author;
+                if author == owner_id
+                    || (members_now.contains(&author) && !enforced_banned_ids.contains(&author))
+                {
+                    authors.insert(author);
+                    taken += 1;
+                } else if plan.ids.contains(&author)
+                    && provisional_taken < plan.quota
+                    && (pool.contains(&author) || pool.len() < plan.pool_cap)
+                {
+                    pool.insert(author);
+                    provisional_taken += 1;
+                    taken += 1;
+                }
+            }
+            authors
         };
         let dm_participants: HashSet<MemberId> = {
             let mut dms = self.direct_messages.clone();
@@ -1421,6 +1542,11 @@ impl ChatRoomStateV1 {
                 required_ids.insert(banner);
             }
         }
+        for issuer in &plan.ban_issuers {
+            if members_by_id.contains_key(issuer) {
+                required_ids.insert(*issuer);
+            }
+        }
         // Walk invite chains upward, adding all ancestors (stop at owner).
         let mut to_process: Vec<MemberId> = required_ids.iter().cloned().collect();
         while let Some(member_id) = to_process.pop() {
@@ -1437,7 +1563,7 @@ impl ChatRoomStateV1 {
             .retain(|m| required_ids.contains(&m.member.id()));
         let max_members = self.configuration.configuration.max_members;
         self.members.remove_excess_members(parameters, max_members);
-        required_ids
+        (required_ids, pool)
     }
 }
 
@@ -1459,6 +1585,9 @@ struct MemberLoop<'c> {
     newest_first: Vec<MemberId>,
     /// The stored DMs, for the participants of those a pass keeps.
     dms: crate::room_state::direct_messages::DmParticipantIndex,
+    /// The provisional authors the last pass's window scan took messages of
+    /// (the pool, P6).
+    pool: HashSet<MemberId>,
 }
 
 impl<'c> MemberLoop<'c> {
@@ -1493,6 +1622,7 @@ impl<'c> MemberLoop<'c> {
             held: HashSet::new(),
             newest_first: order.into_iter().map(|(_, a)| a).collect(),
             dms: crate::room_state::direct_messages::DmParticipantIndex::new(direct_messages),
+            pool: HashSet::new(),
         };
         // The first pass holds every candidate id with a record whose
         // inviter is the owner or held: drop ids until none is left without
@@ -1617,8 +1747,23 @@ fn refuse_beyond_own_bounds(
     use crate::room_state::ban::MIN_BANS_DELTA_BOUND;
     use crate::room_state::ban_evidence::{evidence_bound, evidence_depth_cap};
     use crate::room_state::member::members_work_bound;
-    let over = |max_user_bans: usize, max_members: usize, evidence: usize| {
-        if state.bans.0.len() > max_user_bans {
+    use crate::room_state::provisional::{bans_cap, entries_cap, PROVISIONAL_DELTA_FLOOR};
+    let over = |max_user_bans: usize,
+                max_members: usize,
+                evidence: usize,
+                prov_entries: usize,
+                prov_bans: usize| {
+        if state.provisional.entries.len() > prov_entries {
+            Some(format!(
+                "{} provisional entries, more than {prov_entries}",
+                state.provisional.entries.len()
+            ))
+        } else if state.provisional.bans.len() > prov_bans {
+            Some(format!(
+                "{} provisional bans, more than {prov_bans}",
+                state.provisional.bans.len()
+            ))
+        } else if state.bans.0.len() > max_user_bans {
             Some(format!(
                 "{} bans, more than {max_user_bans}",
                 state.bans.0.len()
@@ -1642,6 +1787,8 @@ fn refuse_beyond_own_bounds(
         config.max_user_bans,
         config.max_members,
         evidence_bound(config.max_user_bans, evidence_depth_cap(config.max_members)),
+        entries_cap(config),
+        bans_cap(config),
     ) {
         return Err(format!(
             "Refusing a state that holds {why} (its own configuration's limit)"
@@ -1651,6 +1798,8 @@ fn refuse_beyond_own_bounds(
         MIN_BANS_DELTA_BOUND,
         members_work_bound(1),
         evidence_bound(MIN_BANS_DELTA_BOUND, evidence_depth_cap(1)),
+        PROVISIONAL_DELTA_FLOOR,
+        PROVISIONAL_DELTA_FLOOR,
     );
     if let Some(why) = floors {
         if state
@@ -1691,7 +1840,19 @@ fn refuse_beyond_receiver_bounds(
     let bans = c.max_user_bans.max(MIN_BANS_DELTA_BOUND);
     let members = members_work_bound(c.max_members);
     let evidence = evidence_bound(bans, evidence_depth_cap(c.max_members));
-    let why = if state.bans.0.len() > bans {
+    let prov_entries = crate::room_state::provisional::entries_work_bound(c);
+    let prov_bans = crate::room_state::provisional::bans_work_bound(c);
+    let why = if state.provisional.entries.len() > prov_entries {
+        format!(
+            "{} provisional entries, more than {prov_entries}",
+            state.provisional.entries.len()
+        )
+    } else if state.provisional.bans.len() > prov_bans {
+        format!(
+            "{} provisional bans, more than {prov_bans}",
+            state.provisional.bans.len()
+        )
+    } else if state.bans.0.len() > bans {
         format!("{} bans, more than {bans}", state.bans.0.len())
     } else if state.members.members.len() > members {
         format!(
@@ -1920,16 +2081,84 @@ fn trim_to_work_bounds(
         }
     }
 
+    // Provisional entries and bans (freenet/river#974): trimmed to the
+    // receiver's bounds, owner-issued bans first, then by digest.
+    if let Some(prov) = delta.provisional.as_mut() {
+        use crate::room_state::provisional::{bans_work_bound, entries_work_bound, entry_digest};
+        let entries_bound = entries_work_bound(config);
+        if prov.entries.len() > entries_bound {
+            prov.entries
+                .sort_by_cached_key(|e| (e.member_id(), entry_digest(e)));
+            prov.entries.truncate(entries_bound);
+        }
+        let prov_bans_bound = bans_work_bound(config);
+        if prov.bans.len() > prov_bans_bound {
+            prov.bans.sort_by_cached_key(|b| {
+                (
+                    b.ban.banned_by != owner_id,
+                    crate::room_state::provisional::ban_digest(b),
+                )
+            });
+            prov.bans.truncate(prov_bans_bound);
+        }
+    }
+
     if let Some(msgs) = delta.recent_messages.as_mut() {
         let carried: HashSet<MemberId> = delta
             .members
             .as_ref()
             .map(|m| m.added().iter().map(|a| a.member.id()).collect())
             .unwrap_or_default();
+        // A provisional author's message is kept when the receiver's
+        // provisional summary holds an entry for the author or the trimmed
+        // delta carries one; a message whose author's entry was trimmed goes
+        // with it, as for an author whose invite chain did not fit.
+        let carried_entries: HashSet<MemberId> = delta
+            .provisional
+            .as_ref()
+            .map(|p| p.entries.iter().map(|e| e.member_id()).collect())
+            .unwrap_or_default();
+        let held_entries: HashSet<MemberId> = summary
+            .provisional
+            .entries
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
         msgs.retain(|m| {
             let author = m.message.author;
-            author == owner_id || summary.members.contains(&author) || carried.contains(&author)
+            author == owner_id
+                || summary.members.contains(&author)
+                || carried.contains(&author)
+                || held_entries.contains(&author)
+                || carried_entries.contains(&author)
         });
+    }
+
+    // An entry is offered only alongside a message by its author that the
+    // delta carries, or when the receiver already holds such a message, so an
+    // entry is never sent alone to be dropped (it has no message in the
+    // window) and re-sent every round.
+    if let Some(prov) = delta.provisional.as_mut() {
+        let carried_authors: HashSet<MemberId> = delta
+            .recent_messages
+            .iter()
+            .flatten()
+            .map(|m| m.message.author)
+            .collect();
+        let receiver_has_message_by: HashSet<MemberId> = sender
+            .recent_messages
+            .messages
+            .iter()
+            .filter(|m| summary.recent_messages.message_ids.contains(&m.id()))
+            .map(|m| m.message.author)
+            .collect();
+        prov.entries.retain(|e| {
+            let id = e.member_id();
+            carried_authors.contains(&id) || receiver_has_message_by.contains(&id)
+        });
+        if prov.entries.is_empty() && prov.bans.is_empty() {
+            delta.provisional = None;
+        }
     }
 }
 
@@ -1982,6 +2211,7 @@ impl ChatRoomStateV1Summary {
             bans,
             members,
             ban_evidence,
+            provisional,
             member_info,
             secrets,
             recent_messages,
@@ -2004,6 +2234,7 @@ impl ChatRoomStateV1Summary {
             bans,
             members,
             ban_evidence,
+            provisional,
             member_info,
             secrets,
             recent_messages: MessagesSummary {
@@ -3777,6 +4008,82 @@ mod tests {
                  MessagesV1::apply_delta reads it through enforced_ban_set_of"
             );
         }
+    }
+
+    /// freenet/river#974. The `#[composable]` macro applies fields in
+    /// declaration order. `provisional` reads the post-apply `members` and
+    /// `ban_evidence` (arrival checks a provisional ban's issuer against
+    /// them), so it must come after both; `member_info` and `recent_messages`
+    /// read the entries it holds (a provisional member's first message and
+    /// nickname arrive in one delta with the entry), so it must come before
+    /// both. Also: an empty `provisional` is not serialized, so a room that
+    /// never used open admission keeps the exact bytes it had before the
+    /// field existed.
+    #[test]
+    fn provisional_field_sits_between_ban_evidence_and_member_info() {
+        use crate::room_state::provisional::{
+            AdmissionEvidence, AuthorizedProvisionalMember, ProvisionalMember,
+        };
+        let owner_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let member_sk = SigningKey::from_bytes(&[2u8; 32]);
+        let owner_id = MemberId::from(&owner_sk.verifying_key());
+        let mut state = ChatRoomStateV1::default();
+        // Empty `ban_evidence` and `provisional` are not serialized: give
+        // each one record.
+        state.ban_evidence.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: member_sk.verifying_key(),
+            },
+            &owner_sk,
+        ));
+        state
+            .provisional
+            .entries
+            .push(AuthorizedProvisionalMember::new(
+                &owner_sk.verifying_key(),
+                ProvisionalMember {
+                    member_vk: member_sk.verifying_key(),
+                    evidence: AdmissionEvidence::Pow { nonce: 1 },
+                },
+                &member_sk,
+            ));
+        let encode = |s: &ChatRoomStateV1| {
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(s, &mut bytes).expect("state serializes");
+            let value: ciborium::value::Value =
+                ciborium::de::from_reader(&bytes[..]).expect("round-trips as a CBOR value");
+            value
+                .into_map()
+                .expect("ChatRoomStateV1 serializes as a CBOR map")
+                .into_iter()
+                .filter_map(|(k, _)| k.into_text().ok())
+                .collect::<Vec<_>>()
+        };
+        let names = encode(&state);
+        let index_of = |name: &str| {
+            names
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("field `{name}` missing from the serialized state"))
+        };
+        assert!(index_of("members") < index_of("provisional"));
+        assert!(
+            index_of("ban_evidence") < index_of("provisional"),
+            "`provisional` must be declared AFTER `ban_evidence`"
+        );
+        assert!(
+            index_of("provisional") < index_of("member_info"),
+            "`provisional` must be declared BEFORE `member_info`"
+        );
+        assert!(
+            index_of("provisional") < index_of("recent_messages"),
+            "`provisional` must be declared BEFORE `recent_messages`"
+        );
+        // Empty: absent from the encoding.
+        state.provisional = ProvisionalV1::default();
+        assert!(!encode(&state).contains(&"provisional".to_string()));
     }
 
     #[test]

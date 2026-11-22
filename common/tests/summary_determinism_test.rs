@@ -347,6 +347,7 @@ fn top_level_summary_serialization_is_order_independent() {
             bans,
             members,
             ban_evidence,
+            provisional: Default::default(),
             member_info,
             secrets,
             recent_messages,

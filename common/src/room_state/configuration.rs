@@ -1,6 +1,7 @@
 use crate::room_state::member::MemberId;
 use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::privacy::{PrivacyMode, RoomDisplayMetadata};
+use crate::room_state::provisional::PublicRoomPolicy;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::truncated_base64;
 use crate::ChatRoomStateV1;
@@ -209,6 +210,7 @@ impl Default for Configuration {
             // gives new rooms the same bound while keeping the serialized
             // default configuration byte-identical to pre-#519 bytes.
             max_direct_messages: None,
+            public_admission: None,
         }
     }
 }
@@ -276,6 +278,17 @@ pub struct Configuration {
     /// never sees state carrying this field. Do not weaken that coupling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_direct_messages: Option<usize>,
+
+    /// Open admission for `PrivacyMode::Public` rooms (freenet/river#974).
+    /// `None` = invite-only, and a configuration without a policy serializes
+    /// to exactly the bytes it had before this field existed (the same
+    /// `Option` + `skip_serializing_if`, appended last pattern as
+    /// `max_direct_messages`), so every existing configuration and owner
+    /// signature stays valid. Pinned by
+    /// `legacy_configuration_bytes_serialize_identically_without_a_policy`.
+    /// A policy on a `Private` configuration is valid and inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_admission: Option<PublicRoomPolicy>,
 }
 
 /// Global cap applied to `direct_messages.messages` when a room's
@@ -437,6 +450,9 @@ impl Configuration {
         }
         if c.privacy_mode == PrivacyMode::Private && c.display.name.is_public() {
             return Err("Private room must have encrypted display metadata".to_string());
+        }
+        if let Some(policy) = &c.public_admission {
+            policy.check_values()?;
         }
         Ok(())
     }
@@ -991,5 +1007,134 @@ mod tests {
         assert!(held
             .apply_delta(&ChatRoomStateV1::default(), &parameters, &Some(forged))
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod public_admission_config_tests {
+    use super::*;
+    use crate::room_state::provisional::{PowPolicy, PublicRoomPolicy};
+
+    fn cbor_of(c: &Configuration) -> Vec<u8> {
+        let mut v = Vec::new();
+        ciborium::ser::into_writer(c, &mut v).unwrap();
+        v
+    }
+
+    fn some_policy() -> PublicRoomPolicy {
+        PublicRoomPolicy {
+            listed: true,
+            max_provisional: 10,
+            max_provisional_messages: 50,
+            max_provisional_bans: 5,
+            pow: Some(PowPolicy {
+                difficulty_bits: 16,
+                epoch: 42,
+            }),
+        }
+    }
+
+    /// freenet/river#974: `public_admission: None` serializes as the
+    /// configuration did before the field existed (the key is absent), so
+    /// every existing owner signature still verifies. The expected bytes are
+    /// the captured legacy encoding of `Configuration::default()` (the same
+    /// fixture `legacy_configuration_bytes_still_verify_after_adding_the_field`
+    /// uses), not a re-derivation from the current struct.
+    #[test]
+    fn legacy_configuration_bytes_serialize_identically_without_a_policy() {
+        const LEGACY: &str = "ab6f6f776e65725f6d656d6265725f69640075636f6e6669677572\
+6174696f6e5f76657273696f6e016c707269766163795f6d6f6465665075626c696367646973706c6179a2646e616d65a166\
+5075626c6963a16576616c75659118441865186618611875186c187418201852186f186f186d1820184e1861186d18656b64\
+6573637269707469\
+6f6ef6736d61785f726563656e745f6d6573736167657318646d6d61785f757365725f62616e730a706d61785f6d65737361\
+67655f73697a651903e8716d61785f6e69636b6e616d655f73697a6518326b6d61785f6d656d6265727318c86d6d61785f72\
+6f6f6d5f6e616d651864746d61785f726f6f6d5f6465736372697074696f6e1901f4";
+        let legacy: Vec<u8> = (0..LEGACY.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&LEGACY[i..i + 2], 16).unwrap())
+            .collect();
+        let decoded: Configuration = ciborium::de::from_reader(&legacy[..]).unwrap();
+        assert_eq!(decoded.public_admission, None);
+        assert_eq!(
+            cbor_of(&decoded),
+            legacy,
+            "legacy bytes must re-encode identically"
+        );
+        assert_eq!(cbor_of(&Configuration::default()), legacy);
+        // A legacy configuration that also carries `max_direct_messages`
+        // keeps its bytes too.
+        let with_dm = Configuration {
+            max_direct_messages: Some(7),
+            ..Configuration::default()
+        };
+        let bytes = cbor_of(&with_dm);
+        let back: Configuration = ciborium::de::from_reader(&bytes[..]).unwrap();
+        assert_eq!(cbor_of(&back), bytes);
+        assert_eq!(back.public_admission, None);
+    }
+
+    /// With a policy the field is appended LAST, after `max_direct_messages`,
+    /// and the configuration round-trips and verifies.
+    #[test]
+    fn a_policy_is_appended_last_and_round_trips() {
+        let sk = SigningKey::from_bytes(&[9; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: sk.verifying_key(),
+        };
+        let c = Configuration {
+            owner_member_id: params.owner_id(),
+            max_direct_messages: Some(11),
+            public_admission: Some(some_policy()),
+            ..Configuration::default()
+        };
+        let bytes = cbor_of(&c);
+        let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+        let keys: Vec<String> = value
+            .into_map()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k.into_text().unwrap())
+            .collect();
+        assert_eq!(keys.last().map(String::as_str), Some("public_admission"));
+        assert_eq!(
+            keys[keys.len() - 2],
+            "max_direct_messages",
+            "the new field comes after every earlier field"
+        );
+        let back: Configuration = ciborium::de::from_reader(&bytes[..]).unwrap();
+        assert_eq!(back, c);
+        let signed = AuthorizedConfigurationV1::new(c, &sk);
+        assert!(signed.verify_signature(&sk.verifying_key()).is_ok());
+        assert!(signed.check_values(&params).is_ok());
+    }
+
+    /// A policy out of range fails the value checks (so the configuration
+    /// ranks below every valid one), against absolute ranges only.
+    #[test]
+    fn an_out_of_range_policy_fails_the_value_checks() {
+        let sk = SigningKey::from_bytes(&[9; 32]);
+        let params = ChatRoomParametersV1 {
+            owner: sk.verifying_key(),
+        };
+        let mut c = Configuration {
+            owner_member_id: params.owner_id(),
+            public_admission: Some(some_policy()),
+            ..Configuration::default()
+        };
+        assert!(c.check_values(&params).is_ok());
+        c.public_admission.as_mut().unwrap().max_provisional = 0;
+        assert!(c.check_values(&params).is_err());
+        assert!(c.signing_refusal(&params).is_some());
+        // A policy on a private configuration is valid and inert.
+        c.public_admission = Some(some_policy());
+        c.privacy_mode = PrivacyMode::Private;
+        c.display.name = crate::room_state::privacy::SealedBytes::Private {
+            ciphertext: vec![1; 16],
+            nonce: [0; 12],
+            secret_version: 0,
+            declared_len_bytes: 4,
+        };
+        c.display.description = None;
+        assert!(c.check_values(&params).is_ok());
     }
 }

@@ -365,6 +365,10 @@ impl ComposableState for MemberInfoV1 {
             .ban_evidence
             .lookup(&parent_state.members, parameters.owner_id());
         let owner_id = parameters.owner_id();
+        // A provisional member's record (freenet/river#974) is signed by the
+        // key its held entries share, for an id no `members` or evidence
+        // record holds.
+        let provisional_keys = parent_state.provisional.key_map();
 
         // NOTE (#411 round 7 / Codex P1 #3): `verify` deliberately does NOT reject
         // a state that carries more than one `member_info` record for the same
@@ -397,12 +401,19 @@ impl ComposableState for MemberInfoV1 {
                 member_info.verify_signature(parameters)?;
             } else {
                 // For non-owner members, verify they exist in members list
-                let member = members_by_id.get(&member_id).ok_or_else(|| {
-                    format!("MemberInfo exists for non-existent member: {:?}", member_id)
-                })?;
+                let key = match members_by_id.get(&member_id) {
+                    Some(member) => member.member.member_vk,
+                    None => provisional_keys
+                        .get(&member_id)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| {
+                            format!("MemberInfo exists for non-existent member: {:?}", member_id)
+                        })?,
+                };
 
                 // Verify the signature with member's key
-                member_info.verify_signature_with_key(&member.member.member_vk)?;
+                member_info.verify_signature_with_key(&key)?;
             }
         }
         Ok(())
@@ -497,10 +508,14 @@ impl ComposableState for MemberInfoV1 {
         self.member_info.retain(within_nickname_ceiling);
 
         if let Some(delta) = delta {
-            // Members plus ban evidence, built once for the whole delta.
+            // Members plus ban evidence, built once for the whole delta, and
+            // the provisional entries held at this point of the apply, so a
+            // provisional member's first record is accepted with its entry
+            // (freenet/river#974).
             let known = parent_state
                 .ban_evidence
                 .lookup(&parent_state.members, parameters.owner_id());
+            let provisional_keys = parent_state.provisional.key_map();
             for member_info in delta {
                 let member_id = &member_info.member_info.member_id;
 
@@ -537,11 +552,22 @@ impl ComposableState for MemberInfoV1 {
                     // member held in ban evidence counts (freenet/river#702): its
                     // record keeps merging by rank like any other. Freezing it
                     // at removal cannot converge, see `BanEvidenceV1`.
-                    let member = match known.get(member_id) {
-                        Some(m) => m,
-                        None => continue,
+                    let key = match known.get(member_id) {
+                        Some(m) => m.member.member_vk,
+                        None => match provisional_keys.get(member_id).copied().flatten() {
+                            Some(key) => key,
+                            None => continue,
+                        },
                     };
-                    member_info.verify_signature_with_key(&member.member.member_vk)?;
+                    // A record that does not verify under the key its author
+                    // id resolves to is skipped, never an error: the id may be
+                    // shared by another key on this peer (a collision costs
+                    // nothing to make, `MemberId` is not a hash of the key's
+                    // strength), and an error would fail every merge with a
+                    // peer holding the other record (freenet/river#974, C3).
+                    if member_info.verify_signature_with_key(&key).is_err() {
+                        continue;
+                    }
                 }
 
                 // Update or add the member info. Conflict resolution uses the
@@ -576,9 +602,13 @@ impl ComposableState for MemberInfoV1 {
         let member_map = parent_state
             .ban_evidence
             .lookup(&parent_state.members, parameters.owner_id());
+        let provisional_keys = parent_state.provisional.key_map();
         self.member_info.retain(|info| {
             parameters.owner_id() == info.member_info.member_id
                 || member_map.contains_key(&info.member_info.member_id)
+                || provisional_keys
+                    .get(&info.member_info.member_id)
+                    .is_some_and(|k| k.is_some())
         });
 
         // Write-side dedup (#411 round 8 Task 2 / item A): the update path above

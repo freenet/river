@@ -420,9 +420,22 @@ fn an_unsigned_member_info_riding_a_re_add_is_rejected() {
     };
     let mut after = a.clone();
     let result = after.apply_delta(&a, &room.params, &Some(delta));
+    // A record that does not verify under the key its author id resolves to
+    // is SKIPPED, not an error (freenet/river#974, C3): a `MemberId` collision
+    // costs nothing to make, so a failing signature is not proof of a forgery,
+    // and an `Err` would fail every merge with a peer holding the other
+    // record. It is still never installed (checked below).
     assert!(
-        result.is_err(),
-        "the forged record must be rejected, not installed"
+        result.is_ok(),
+        "the forged record must be skipped, not fail the delta: {result:?}"
+    );
+    assert!(
+        !after
+            .member_info
+            .member_info
+            .iter()
+            .any(|i| i.member_info.member_id == victim.id && i.member_info.version == u32::MAX),
+        "the forged record must not be installed"
     );
     assert!(
         after.member_info.deputies_of(victim.id).is_empty(),
