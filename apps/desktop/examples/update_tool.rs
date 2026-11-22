@@ -3,8 +3,7 @@
 //! ```text
 //! update_tool keygen <private-key-file>
 //!     Make a new signing key. Writes the private key (hex, mode 0600) to the file and prints
-//!     the public key, whose 64 hex digits go in the build as RIVER_UPDATE_PUBKEY_HEX (or in
-//!     PLACEHOLDER_PUBKEY in src/update/mod.rs). Refuses to overwrite a file.
+//!     the public key. Refuses to overwrite a file.
 //!
 //! update_tool sign --key <private-key-file> --version 0.2.0 --out <dir> \
 //!       --artifact linux-x86_64=https://host/River-0.2.0-linux-x86_64.tar.gz=./River-0.2.0-linux-x86_64.tar.gz \
@@ -16,6 +15,17 @@
 //! update_tool verify --pubkey <hex> --manifest <file> --sig <file>
 //!     Check a manifest the way the app does.
 //! ```
+//!
+//! # Where the key lives, and rotating it
+//!
+//! The public half is committed in `apps/desktop/update-pubkey.hex` (64 lowercase hex digits and
+//! a newline). The release workflow reads it into `RIVER_UPDATE_PUBKEY_HEX` for the build and
+//! checks the built binary against it. The repository variable of that name is no longer used.
+//! The private half stays in `~/.freenet-signing/` and 1Password, never in the repository.
+//!
+//! A new key is a new release, because the key is compiled into each build: run
+//! `update_tool keygen <file>`, commit the printed public key to `update-pubkey.hex` in a
+//! reviewed PR, then cut a release. Installed versions keep trusting the old key.
 //!
 //! # Publishing a release
 //!
