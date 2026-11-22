@@ -423,8 +423,11 @@ async fn cleanup_task() {
         // Lock order: journal, then the slot fan-out. The sweep's per-room
         // migration takes only the slot lock and releases it before its
         // journal gate, and the walk takes only the journal lock, so no cycle
-        // exists. Both locks also keep the pass's legacy reads from sharing a
-        // correlation key with the sweep's or the walk's.
+        // exists. The locks keep the pass's legacy reads off the walk's and
+        // the per-room migration's waiters. The sweep's fire-and-forget
+        // `ListRequest` and `rooms_data` GET take neither lock, so a late reply
+        // to one can complete the pass's waiter instead: the pass then reads
+        // that reply, and the sweep loses that generation for this load only.
         let _ops = migration_journal::lock_journal_ops().await;
         let _slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
         let generations = GENERATIONS_WITH_DATA.with(|g| g.borrow().clone());
