@@ -98,7 +98,13 @@ fn call(
                         if let Value::Map(fields) = body {
                             for (fk, fv) in fields {
                                 if fk == Value::Text("value".into()) {
-                                    got = Some(if fv == Value::Null { None } else { as_bytes(&fv) });
+                                    got = Some(if fv == Value::Null {
+                                        None
+                                    } else {
+                                        Some(as_bytes(&fv).ok_or_else(|| {
+                                            format!("reply: `value` is neither null nor bytes: {fv:?}")
+                                        })?)
+                                    });
                                 }
                             }
                         }
@@ -122,7 +128,14 @@ async fn open_runtime(dir: &std::path::Path) -> Result<Runtime, String> {
 
 /// Run the full tier 1-3 exercise on one WASM. Ok(()) means every step passed.
 async fn exercise(bytes: &[u8], enc: Enc) -> Result<(), String> {
+    exercise_with(bytes, enc, false).await
+}
+
+/// `fresh_reopen` is a negative control: tier 3 reopens an EMPTY data dir instead of
+/// the one written in tier 2, so the persistence check must go red.
+async fn exercise_with(bytes: &[u8], enc: Enc, fresh_reopen: bool) -> Result<(), String> {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fresh = tempfile::tempdir().expect("tempdir");
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
         &bytes.to_vec().into(),
         &vec![].into(),
@@ -158,7 +171,8 @@ async fn exercise(bytes: &[u8], enc: Enc) -> Result<(), String> {
     }
     // Tier 3: drop everything, reopen the same data dir, read again.
     {
-        let mut rt = open_runtime(temp.path()).await?;
+        let dir = if fresh_reopen { fresh.path() } else { temp.path() };
+        let mut rt = open_runtime(dir).await?;
         rt.delegate_store
             .store_delegate(delegate.clone())
             .map_err(|e| format!("store_delegate (reopen): {e}"))?;
@@ -203,6 +217,14 @@ fn manifest() -> Vec<Entry> {
         .collect()
 }
 
+fn verify_hash(bytes: &[u8], expected: &str) -> Result<(), String> {
+    let actual = blake3::hash(bytes).to_hex().to_string();
+    if actual != expected {
+        return Err(format!("HASH MISMATCH: file hashes to {actual}, registry says {expected}"));
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_chat_delegate_gate() {
     let corpus = env("LEGACY_GATE_CORPUS");
@@ -220,9 +242,8 @@ async fn legacy_chat_delegate_gate() {
                 continue;
             }
         };
-        let actual = blake3::hash(&bytes).to_hex().to_string();
-        if actual != e.hash {
-            failures.push(format!("{}: HASH MISMATCH: file hashes to {actual}, registry says {}", e.version, e.hash));
+        if let Err(m) = verify_hash(&bytes, &e.hash) {
+            failures.push(format!("{}: {m}", e.version));
             continue;
         }
         let res = exercise(&bytes, e.enc).await;
@@ -230,7 +251,14 @@ async fn legacy_chat_delegate_gate() {
         match (e.works, res) {
             (true, Ok(())) => working_ran += 1,
             (true, Err(m)) => failures.push(format!("{}: expected to work, FAILED: {m}", e.version)),
-            (false, Err(_)) => dead_ran += 1,
+            // A dead delegate must fail while RUNNING (instantiate/call). A failure in
+            // our own setup (storage, runtime build, delegate store) says nothing
+            // about the delegate and must not be counted as "dead as expected".
+            (false, Err(m)) if m.starts_with("host error:") => dead_ran += 1,
+            (false, Err(m)) => failures.push(format!(
+                "{}: listed dead, but failed outside the delegate (harness/setup problem?): {m}",
+                e.version
+            )),
             (false, Ok(())) => failures.push(format!(
                 "{}: listed as dead in manifest.txt but now WORKS; update the manifest (stale allowlist)",
                 e.version
@@ -264,6 +292,12 @@ async fn legacy_gate_goes_red_on_mangled_wasm() {
     }
     assert!(exercise(&smeared, e.enc).await.is_err(), "mangled WASM passed");
 
-    // The hash guard is the manifest loop's job: assert it directly.
-    assert_ne!(blake3::hash(&truncated).to_hex().to_string(), e.hash);
+    // The gate's real hash guard goes red on bytes that disagree with the registry.
+    assert!(verify_hash(&truncated, &e.hash).is_err(), "hash guard accepted wrong bytes");
+    assert!(verify_hash(&good, &e.hash).is_ok(), "hash guard rejected the right bytes");
+
+    // Persistence control: reopening an empty data dir must NOT return the stored
+    // secret, so tier 3 genuinely reads what tier 2 wrote to disk.
+    let err = exercise_with(&good, e.enc, true).await.expect_err("fresh reopen passed");
+    assert!(err.starts_with("after reopen"), "fresh reopen failed in the wrong place: {err}");
 }

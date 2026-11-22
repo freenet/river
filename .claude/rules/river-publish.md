@@ -96,6 +96,16 @@ cargo make compress-webapp
 cargo make publish-river  # bumps published-contract/contract-version.txt
 ```
 
+`publish-river` (and `publish-river-debug`, and so `publish-all`) first runs
+`cargo make legacy-delegate-gate` (river#630): every old chat-delegate WASM still
+in git history must run on the freenet-core runtime of the locally installed
+`freenet` (or `LEGACY_GATE_CORE_REV=<tag|sha>`). It needs `b3sum`, full git history
+and GitHub access. A cold run compiles freenet (20-45 min); keep the cache
+(`CARGO_TARGET_DIR`, default `~/code/scratch/legacy-delegate-gate/target`, swept
+after 7 idle days). Exit 1 means a delegate broke: stop. Exit 2 means the harness
+does not build against that core or a guard tripped: fix
+`scripts/legacy-delegate-gate/` against that core and re-run. There is no skip.
+
 `sign-webapp` (run by `publish-river`) first checks that the built UI carries
 River's pointer author key (`scripts/check-webapp-pointer-author.sh`), before
 the counter moves. If it refuses, the UI was built with `RIVER_POINTER_RECORDS`

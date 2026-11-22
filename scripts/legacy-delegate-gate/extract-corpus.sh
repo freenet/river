@@ -18,11 +18,14 @@ ver=""
 while IFS= read -r line; do
   case "$line" in
     version*) ver=$(sed 's/.*"\(.*\)".*/\1/' <<<"$line");;
-    code_hash*) want[$(sed 's/.*"\(.*\)".*/\1/' <<<"$line")]=$ver;;
+    code_hash*)
+      hh=$(sed 's/.*"\(.*\)".*/\1/' <<<"$line")
+      [ -z "${want[$hh]:-}" ] || { echo "ERROR: code_hash $hh listed for both ${want[$hh]} and $ver" >&2; exit 2; }
+      want[$hh]=$ver;;
   esac
 done < legacy_delegates.toml
 declare -A seen
-for c in $(git log --format=%H -- "$WASM_PATH"); do
+for c in $(git log --full-history --format=%H -- "$WASM_PATH"); do
   blob=$(git rev-parse "$c:$WASM_PATH" 2>/dev/null) || continue
   [ -n "${seen[$blob]:-}" ] && continue
   seen[$blob]=1
@@ -32,7 +35,8 @@ for c in $(git log --format=%H -- "$WASM_PATH"); do
     echo "$h ${want[$h]}" >> "$OUT/index.txt"
   fi
 done
-git cat-file blob "HEAD:$WASM_PATH" > "$OUT/current.wasm.tmp"
+# CURRENT is the file a publish would ship (working tree), not merely HEAD.
+cp "$WASM_PATH" "$OUT/current.wasm.tmp"
 h=$(b3sum "$OUT/current.wasm.tmp" | cut -d' ' -f1)
 mv "$OUT/current.wasm.tmp" "$OUT/$h.wasm"; echo "$h CURRENT" >> "$OUT/index.txt"
 sort -u -o "$OUT/index.txt" "$OUT/index.txt"

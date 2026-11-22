@@ -30,9 +30,12 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$CORE_REV$CORE_PATH" ] || die "give --core-rev or --core-path"
 [ -z "$CORE_REV" ] || [ -z "$CORE_PATH" ] || die "give only one of --core-rev / --core-path"
-case "$WORK" in "$HOME/code/"*) ;; *) die "GATE_WORK must be under ~/code (build hook)";; esac
+case "$WORK" in ""|/|"$HOME"|"$HOME/code") die "refusing GATE_WORK=$WORK (the script deletes \$WORK/corpus and \$WORK/core)";; esac
 
 mkdir -p "$WORK"
+# One run at a time per work dir: concurrent runs would delete each other's core copy.
+exec 9>"$WORK/.lock"
+flock -w 3600 9 || die "could not take $WORK/.lock within an hour (another gate run is using it)"
 CORPUS="$WORK/corpus"; CORE="$WORK/core"
 rm -rf "$CORPUS" "$CORE"
 "$GATE/extract-corpus.sh" "$CORPUS" || die "corpus extraction failed"
@@ -47,7 +50,19 @@ while read -r ver expect enc rest; do
   echo "$h $ver $expect $enc" >> "$RESOLVED"
   [ "$expect" = works ] && min=$((min+1))
 done < "$GATE/manifest.txt"
-echo "corpus: $(wc -l < "$RESOLVED") entries ($min expected working)"
+# Fail-open guards. The floor is hard-coded here, NOT derived from the manifest, so
+# emptying the manifest cannot lower it.
+MIN_WORKING_FLOOR=10
+[ "$min" -ge "$MIN_WORKING_FLOOR" ] || die "manifest expects only $min working generations; floor is $MIN_WORKING_FLOOR"
+grep -q ' CURRENT works ' "$RESOLVED" || die "manifest must list CURRENT as works"
+# Coverage: every registry generation whose WASM exists in git history must be in the
+# manifest, so a newly retired generation cannot be silently left untested.
+# (Registry versions with no matching blob in history cannot be run; they are reported.)
+untested=$(awk '{print $2}' "$CORPUS/index.txt" | while read -r v; do
+  awk -v v="$v" '!/^#/ && $1==v{f=1} END{exit !f}' "$GATE/manifest.txt" || echo "$v"; done)
+[ -z "$untested" ] || die "WASM in git history for registry generation(s) not in manifest.txt: $(echo $untested). Add each as works or dead."
+nreg=$(grep -c '^version' "$RIVER/legacy_delegates.toml" || true)
+echo "corpus: $(wc -l < "$RESOLVED") entries ($min expected working); $((nreg - $(wc -l < "$CORPUS/index.txt") + 1)) registry generations have no WASM in git history and cannot be run"
 
 # Fetch the core version under test.
 if [ -n "$CORE_PATH" ]; then
@@ -76,7 +91,9 @@ rc=$?
 set -e
 grep -E 'LEGACY-GATE|test result|legacy delegate gate failed|^  V|^  CURRENT|panicked' "$LOG" || true
 if [ $rc -ne 0 ]; then
-  if grep -q 'LEGACY-GATE summary' "$LOG" || grep -q 'panicked' "$LOG"; then
+  # Exit 1 only when the gate tests actually ran and reported (the summary line or a
+  # FAILED gate test). Anything else (compile error, setup panic) is exit 2.
+  if grep -q 'LEGACY-GATE summary' "$LOG" || grep -qE 'legacy_gate::.* \.\.\. FAILED' "$LOG"; then
     echo "GATE FAILED (log: $LOG)"; exit 1
   fi
   echo "SETUP ERROR: harness did not compile/run against this core (log: $LOG)" >&2; tail -30 "$LOG" >&2; exit 2

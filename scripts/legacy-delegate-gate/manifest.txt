@@ -26,3 +26,15 @@ V3      dead  array  class A: stdlib <=0.2.x ApplicationMessage layout, "Invalid
 V9      dead  array  class C: committed bytes corrupt (UTF-8 replacement char in type section)
 V14     dead  array  class B: unresolvable __wbindgen_placeholder__ imports
 V16     dead  array  class B: unresolvable __wbindgen_placeholder__ imports
+V11 works array  stdlib-era generation found via --full-history
+V18 works array  stdlib-era generation found via --full-history
+V19 works array  stdlib-era generation found via --full-history
+V20 works array  stdlib-era generation found via --full-history
+V21 works array  stdlib-era generation found via --full-history
+V23 works array  stdlib-era generation found via --full-history
+V25 works array  stdlib-era generation found via --full-history
+V27 works array  stdlib-era generation found via --full-history
+V28 works array  stdlib-era generation found via --full-history
+V29 works array  stdlib-era generation found via --full-history
+V31 works array  stdlib-era generation found via --full-history
+V32 works array  stdlib-era generation found via --full-history
