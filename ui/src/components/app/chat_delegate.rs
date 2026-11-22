@@ -12041,6 +12041,12 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     true
 }
 
+/// Whether a legacy sweep is still sending its waves (the legacy-copy
+/// cleanup starts once it is not).
+pub(crate) fn legacy_sweep_pacing() -> bool {
+    SWEEP_RUNNING_FOR.load(Ordering::Relaxed) != 0
+}
+
 /// Bumped by every sweep that starts; a pacing sweep whose epoch is no longer
 /// the latest stops at its next wave (freenet/river#809).
 static SWEEP_EPOCH: AtomicU64 = AtomicU64::new(0);

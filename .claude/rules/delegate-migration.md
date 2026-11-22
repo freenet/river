@@ -267,8 +267,11 @@ them:
   The decision reads nothing from the current delegate, so it works when every
   write there is refused.
 
-The pass holds the journal lock and then the legacy slot-fetch lock, in that
-order, and visits only generations that answered with room data on that load.
+The pass starts as soon as the legacy sweep stops sending waves, not when the
+whole load settles: with the quota full that takes about two minutes, and users
+close the tab first. It holds the legacy slot-fetch lock, which the sweep's
+per-room fan-out and the walk (inside the journal lock, in that order) also
+take, and visits only generations that answered with room data on that load.
 
 ## Technical Details
 
