@@ -360,7 +360,9 @@ impl ResponseHandler {
                                                         if is_legacy_delegate {
                                                             info!("Successfully loaded rooms from LEGACY delegate - migrating to new delegate");
                                                             if !loaded_rooms.map.is_empty() {
-                                                                super::legacy_cleanup::note_legacy_data_seen();
+                                                                super::legacy_cleanup::note_legacy_data_seen(
+                                                                    responding_delegate.bytes(),
+                                                                );
                                                             }
                                                             // Journal-gated, so it runs in its own task:
                                                             // `note_app_import_started` is a round trip
@@ -1611,7 +1613,7 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
     }
     // This generation still holds rooms: shrink the superseded copies once the
     // load is quiet (`legacy_cleanup`).
-    super::legacy_cleanup::note_legacy_data_seen();
+    super::legacy_cleanup::note_legacy_data_seen(legacy_key.bytes());
 
     // Flag the import in the migration journal BEFORE the merge, with the count
     // read above (freenet/river#763). A refusal skips this delegate on this load;

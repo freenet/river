@@ -246,6 +246,28 @@ the identity-import gate. It has no fixed probe and did not raise
 `.claude/rules/river-publish.md` for why. It is stored by the UI in the
 existing KV store, so it needs no delegate change and no migration entry.
 
+## Legacy generations are compacted, never shrunk in keys
+
+Every legacy generation keeps its copy of every room after migration. On a
+hosted node those duplicates share one per-user secret quota and can fill it,
+after which no write to the current delegate succeeds. The UI's
+`freenet_api/legacy_cleanup.rs` therefore rewrites a legacy room copy without
+its `room_state` once a newer full copy of that room is kept (the current
+delegate's, or a newer generation's). Every unrecoverable field stays.
+
+Two rules hold, and any new code that writes to a legacy generation must keep
+them:
+
+- **Never delete a legacy key.** freenet-migrate does not believe a
+  predecessor that exports fewer items than an import already counted (#44),
+  so a missing key keeps that generation pending, and the full sweep running,
+  on every load. Rewriting a value in place keeps every count.
+- **Never compact the newest full copy of a room.** It may be the only
+  snapshot of a room whose contract the network cannot serve.
+
+The pass holds the journal lock and then the legacy slot-fetch lock, in that
+order, and visits only generations that answered with room data on that load.
+
 ## Technical Details
 
 - **Delegate key formula**: `BLAKE3(BLAKE3(wasm) || params)` — both steps use BLAKE3
