@@ -1713,3 +1713,189 @@ fn a_record_for_another_key_and_a_removed_policy_in_one_merge_leave_a_valid_stat
         .iter()
         .any(|m| m.message.author == id_of(&v)));
 }
+
+// ---------------------------------------------------------------------------
+// D2(a) and the P2 restriction: a ban reaches an entry only where no record
+// holds the id, so the result does not depend on whether the record was
+// present before or after ban enforcement
+// ---------------------------------------------------------------------------
+
+/// Owner-invited member I with a member V invited by I, both with messages.
+fn room_with_inviter_and_invitee() -> (Room, SigningKey, SigningKey) {
+    let mut room = Room::new(40, 20, Some(policy(1, 7)));
+    let (i, v) = (sk(2), sk(3));
+    let rec_v = AuthorizedMember::new(
+        Member {
+            owner_member_id: room.owner_id(),
+            invited_by: id_of(&i),
+            member_vk: v.verifying_key(),
+        },
+        &i,
+    );
+    room.apply(ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![
+            room.invite(None, &i.verifying_key()),
+            rec_v,
+        ])),
+        recent_messages: Some(vec![room.msg(&i, 1, "i"), room.msg(&v, 2, "v")]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(room.is_member(&i) && room.is_member(&v));
+    (room, i, v)
+}
+
+#[test]
+fn a_member_removed_with_their_inviter_may_come_back_as_provisional_in_either_order() {
+    let (base, i, v) = room_with_inviter_and_invitee();
+    // The owner bans the inviter: V goes with the subtree. V's own entry (the
+    // same key as the record that just left) rides in the same delta.
+    let ban_i = base.user_ban(None, id_of(&i), 10);
+    let mut together = base.join_delta(&v, 11, "back as provisional");
+    together.bans = Some(vec![ban_i.clone()]);
+    let ban_then_entry = [
+        user_ban_delta(ban_i),
+        base.join_delta(&v, 11, "back as provisional"),
+    ];
+    let one = replay(&base, &[&together]);
+    let two = replay(&base, &[&ban_then_entry[0], &ban_then_entry[1]]);
+    for s in [&one, &two] {
+        assert!(
+            s.provisional
+                .entries
+                .iter()
+                .any(|e| e.provisional.member_vk == v.verifying_key()),
+            "V is provisional again (D2(a))"
+        );
+        assert!(!s.members.members.iter().any(|m| m.member.id() == id_of(&v)));
+    }
+    // The same provisional set and members either way (V's older message
+    // survives only when the entry is held while the ban applies: both peers
+    // hold it after one merge).
+    let field = |s: &ChatRoomStateV1| {
+        let mut b = Vec::new();
+        ciborium::ser::into_writer(&(&s.provisional, &s.members), &mut b).unwrap();
+        b
+    };
+    assert!(
+        field(&one) == field(&two),
+        "one delta and two give the same provisional set (the P2 restriction)"
+    );
+    let (x, y) = merge2(&one, &two, &base.params);
+    assert!(ser(&x) == ser(&y));
+    // Banned directly, V stays out in both orders.
+    let ban_v = base.user_ban(None, id_of(&v), 10);
+    let mut together = base.join_delta(&v, 11, "no");
+    together.bans = Some(vec![ban_v.clone()]);
+    let one = replay(&base, &[&together]);
+    let two = replay(
+        &base,
+        &[&user_ban_delta(ban_v), &base.join_delta(&v, 11, "no")],
+    );
+    assert!(one.provisional.entries.is_empty() && two.provisional.entries.is_empty());
+    assert!(field(&one) == field(&two));
+}
+
+#[test]
+fn a_member_the_cap_removes_does_not_come_back_through_their_own_entry() {
+    // P5: an entry whose key has a `members` record at the start of the pass is
+    // dropped, even when the member cap then removes that record, so the
+    // member does not slip back in as provisional in the same apply.
+    let mut room = Room::new(40, 1, Some(policy(1, 7)));
+    let (a, b) = (sk(2), sk(3));
+    let mut d = room.members_delta(vec![
+        room.invite(None, &a.verifying_key()),
+        room.invite(None, &b.verifying_key()),
+    ]);
+    d.recent_messages = Some(vec![room.msg(&a, 1, "a"), room.msg(&b, 2, "b")]);
+    d.provisional = Some(ProvisionalDelta {
+        entries: vec![room.entry(&a), room.entry(&b)],
+        bans: vec![],
+    });
+    room.apply(d).unwrap();
+    assert_eq!(room.state.members.members.len(), 1, "the cap keeps one");
+    assert!(
+        room.state.provisional.entries.is_empty(),
+        "neither key comes back as provisional in the same apply"
+    );
+}
+
+#[test]
+fn two_entries_with_one_id_never_leave_either_key_resolving_the_id_whichever_digest_is_smaller() {
+    // C2 in several digest orders: the victim's entry and a second entry under
+    // another key for the same id (injected, as only a full-state PUT could
+    // hold it) are both dropped, and the victim's messages go with them.
+    let owner_room = Room::new(30, 10, Some(policy(1, 7)));
+    let owner = owner_room.params.owner;
+    for round in 0..8u8 {
+        let mut room = Room::new(30, 10, Some(policy(1, 7)));
+        let v = sk(10 + round);
+        // A different nonce each round changes the digest order.
+        let nonce = (u64::from(round)..)
+            .find(|n| leading_zero_bits(&pow_hash(&owner, &v.verifying_key(), 7, *n)) >= 1)
+            .unwrap();
+        let victim_entry = entry_with(&owner, &v, 7, nonce);
+        let d = ChatRoomStateV1Delta {
+            provisional: Some(ProvisionalDelta {
+                entries: vec![victim_entry],
+                bans: vec![],
+            }),
+            member_info: Some(vec![AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(id_of(&v), 1, "v".into()),
+                &v,
+            )]),
+            recent_messages: Some(vec![room.msg(&v, 5, "victim")]),
+            ..Default::default()
+        };
+        room.apply(d).unwrap();
+        let forged = forged_vk_with_id_of(&v.verifying_key());
+        let mut s = room.state.clone();
+        s.provisional.entries.push(unsigned_entry(&room, &forged));
+        s.post_apply_cleanup(&room.params).unwrap();
+        assert!(s.provisional.entries.is_empty(), "round {round}: C2");
+        assert!(
+            !s.recent_messages
+                .messages
+                .iter()
+                .any(|m| m.message.author == id_of(&v)),
+            "round {round}: the victim's messages go"
+        );
+        assert!(validate(&s, &room.params).is_ok(), "round {round}");
+    }
+}
+
+#[test]
+fn a_deputy_with_a_provisional_ban_is_not_pruned_for_inactivity() {
+    // The issuers of kept provisional bans are required ids in the member loop,
+    // as the issuers of valid UserBans are, so a deputy whose only message has
+    // left the window keeps their record and their bans.
+    let mut room = Room::new(6, 20, Some(policy(1, 7)));
+    let d = sk(3);
+    let mut info = MemberInfo::new_public(room.owner_id(), 2, "owner".into());
+    info.deputies = vec![id_of(&d)];
+    room.apply(ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![
+            room.invite(None, &d.verifying_key())
+        ])),
+        member_info: Some(vec![AuthorizedMemberInfo::new(info, &room.owner)]),
+        recent_messages: Some(vec![room.msg(&d, 1, "d")]),
+        ..Default::default()
+    })
+    .unwrap();
+    let target = id_of(&sk(40));
+    room.apply(prov_ban_delta(room.prov_ban(Some(&d), target, 5)))
+        .unwrap();
+    assert_eq!(room.state.provisional.bans.len(), 1);
+    // Owner messages push the deputy's only message out of the window.
+    let owner = sk(200);
+    for t in 10..20u64 {
+        room.apply(room.msg_delta(vec![room.msg(&owner, t, "owner")]))
+            .unwrap();
+    }
+    assert!(
+        !room.has_msg_by(&d),
+        "premise: the deputy's message left the window"
+    );
+    assert!(room.is_member(&d), "the issuer of a kept ban is not pruned");
+    assert_eq!(room.state.provisional.bans.len(), 1, "and the ban stays");
+}
