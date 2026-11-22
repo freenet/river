@@ -1417,10 +1417,10 @@ fn a_delta_past_the_entry_work_bound_is_refused_and_one_at_it_applies() {
         }
     };
     assert!(
-        room.apply(make(101, &room)).is_err(),
-        "101 new entries exceed the bound"
+        room.apply(make(17, &room)).is_err(),
+        "17 new entries exceed the bound"
     );
-    room.apply(make(100, &room)).expect("100 is at the bound");
+    room.apply(make(16, &room)).expect("16 is at the bound");
     assert_eq!(
         room.state.provisional.entries.len(),
         5,

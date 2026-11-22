@@ -411,9 +411,9 @@ impl PolicyEdit {
             }
             config.public_admission = Some(PublicRoomPolicy {
                 listed: false,
-                max_provisional: 20,
+                max_provisional: 10,
                 max_provisional_messages: 20,
-                max_provisional_bans: 20,
+                max_provisional_bans: 10,
                 pow: Some(PowPolicy {
                     difficulty_bits: 20,
                     epoch: 1,

@@ -36,17 +36,28 @@ pub const BAN_SIGNING_TAG: &[u8] = b"river-provisional-ban/v1";
 /// Domain tag of the proof-of-work hash (27 bytes).
 pub const POW_DOMAIN_TAG: &[u8; 27] = b"river-room-admission-pow/v1";
 
-/// Largest `max_provisional` a policy may set.
-pub const MAX_PROVISIONAL_CEILING: u32 = 100;
+/// Largest `max_provisional` a policy may set. Set by the cost gate, not by
+/// taste: the host re-verifies every held entry's signature, its `member_info`
+/// and its message, and every provisional ban, in `validate_state` after every
+/// chat message, plus every ban again in `update_state`'s cleanup. Measured
+/// under wasmtime (about 0.4 ms a signature) that is about 2.5 ms per entry and
+/// ban pair: 100 and 100 added over 300 ms to a pair that must stay under
+/// 100 ms (design section 5: "if the pair exceeds 100 ms, lower the ceilings"),
+/// and 20 and 20 still measured 100.3 ms on a default-sized room (window 100,
+/// 26 members). Raising it needs a measurement, not an opinion: the benchmark
+/// is `common/benches/provisional_pair.rs` (native) and the same fixtures run
+/// under wasmtime in the PR.
+pub const MAX_PROVISIONAL_CEILING: u32 = 16;
 /// Largest `max_provisional_messages` a policy may set.
 pub const MAX_PROVISIONAL_MESSAGES_CEILING: u32 = 500;
-/// Largest `max_provisional_bans` a policy may set.
-pub const MAX_PROVISIONAL_BANS_CEILING: u32 = 100;
+/// Largest `max_provisional_bans` a policy may set (see
+/// [`MAX_PROVISIONAL_CEILING`] for why it is this low).
+pub const MAX_PROVISIONAL_BANS_CEILING: u32 = 16;
 /// Largest `difficulty_bits` a policy may set.
 pub const MAX_DIFFICULTY_BITS: u8 = 32;
 /// The least number of entries or provisional bans one delta may carry: a work
-/// bound, never below the caps (ceilings are 100).
-pub const PROVISIONAL_DELTA_FLOOR: usize = 100;
+/// bound, never below the caps (the ceilings are 16).
+pub const PROVISIONAL_DELTA_FLOOR: usize = 16;
 
 // --- policy (owner-signed, inside `Configuration`) ---------------------------
 
@@ -56,12 +67,12 @@ pub const PROVISIONAL_DELTA_FLOOR: usize = 100;
 pub struct PublicRoomPolicy {
     /// Atlas discovery opt-in; no effect on admission.
     pub listed: bool,
-    /// Provisional authors held at once, `1..=100`.
+    /// Provisional authors held at once, `1..=16` ([`MAX_PROVISIONAL_CEILING`]).
     pub max_provisional: u32,
     /// Window slots for provisional messages, `1..=500`. The effective quota is
     /// `min(this, max_recent_messages / 2)` ([`Self::quota`]).
     pub max_provisional_messages: u32,
-    /// Provisional ban list size, `0..=100`.
+    /// Provisional ban list size, `0..=16` ([`MAX_PROVISIONAL_BANS_CEILING`]).
     pub max_provisional_bans: u32,
     /// `None` admits nobody (a listed, invite-only room).
     pub pow: Option<PowPolicy>,
@@ -109,7 +120,22 @@ impl PublicRoomPolicy {
     /// Window slots provisional messages may fill, clamped at use:
     /// `min(max_provisional_messages, max_recent_messages / 2)`.
     pub fn quota(&self, max_recent_messages: usize) -> usize {
-        (self.max_provisional_messages as usize).min(max_recent_messages / 2)
+        (self
+            .max_provisional_messages
+            .min(MAX_PROVISIONAL_MESSAGES_CEILING) as usize)
+            .min(max_recent_messages / 2)
+    }
+
+    /// Provisional authors the room holds at once, clamped to the ceiling at
+    /// use: a configuration that fails the value checks can be the held one,
+    /// and no bound may follow a value that large.
+    pub fn pool_cap(&self) -> usize {
+        self.max_provisional.min(MAX_PROVISIONAL_CEILING) as usize
+    }
+
+    /// Provisional bans the room holds, clamped to the ceiling at use.
+    pub fn ban_cap(&self) -> usize {
+        self.max_provisional_bans.min(MAX_PROVISIONAL_BANS_CEILING) as usize
     }
 }
 
@@ -125,30 +151,30 @@ pub fn active_policy(config: &Configuration) -> Option<&PublicRoomPolicy> {
 /// Most provisional entries a state may hold under `config` (zero with no
 /// policy or a private room).
 pub fn entries_cap(config: &Configuration) -> usize {
-    active_policy(config).map_or(0, |p| p.max_provisional as usize)
+    active_policy(config).map_or(0, PublicRoomPolicy::pool_cap)
 }
 
 /// Most provisional bans a state may hold under `config`.
 pub fn bans_cap(config: &Configuration) -> usize {
-    active_policy(config).map_or(0, |p| p.max_provisional_bans as usize)
+    active_policy(config).map_or(0, PublicRoomPolicy::ban_cap)
 }
 
 /// Most NEW entries one delta may carry in a room with `config`:
-/// `max(max_provisional, 100)`.
+/// `max(max_provisional, 16)`.
 pub fn entries_work_bound(config: &Configuration) -> usize {
     config
         .public_admission
         .as_ref()
-        .map_or(0, |p| p.max_provisional as usize)
+        .map_or(0, PublicRoomPolicy::pool_cap)
         .max(PROVISIONAL_DELTA_FLOOR)
 }
 
-/// Most NEW provisional bans one delta may carry: `max(max_provisional_bans, 100)`.
+/// Most NEW provisional bans one delta may carry: `max(max_provisional_bans, 16)`.
 pub fn bans_work_bound(config: &Configuration) -> usize {
     config
         .public_admission
         .as_ref()
-        .map_or(0, |p| p.max_provisional_bans as usize)
+        .map_or(0, PublicRoomPolicy::ban_cap)
         .max(PROVISIONAL_DELTA_FLOOR)
 }
 
@@ -855,7 +881,7 @@ impl ChatRoomStateV1 {
                 })
                 .collect();
             ranked.sort_by_key(|(non_owner, rank, digest, _)| (*non_owner, *rank, *digest));
-            ranked.truncate(policy.max_provisional_bans as usize);
+            ranked.truncate(policy.ban_cap());
             let mut kept: Vec<AuthorizedProvisionalBan> =
                 ranked.into_iter().map(|(_, _, _, b)| b.clone()).collect();
             kept.sort_by_cached_key(ban_digest);
@@ -935,7 +961,7 @@ impl ChatRoomStateV1 {
         ProvisionalPlan {
             ids,
             quota,
-            pool_cap: policy.max_provisional as usize,
+            pool_cap: policy.pool_cap(),
             ban_issuers,
         }
     }
@@ -1182,9 +1208,9 @@ mod tests {
     fn policy_values_are_absolute_ranges() {
         let ok = PublicRoomPolicy {
             listed: false,
-            max_provisional: 100,
+            max_provisional: 16,
             max_provisional_messages: 500,
-            max_provisional_bans: 100,
+            max_provisional_bans: 16,
             pow: Some(PowPolicy {
                 difficulty_bits: 32,
                 epoch: 0,
@@ -1194,7 +1220,7 @@ mod tests {
         let mut p = ok.clone();
         p.max_provisional = 0;
         assert!(p.check_values().is_err());
-        p.max_provisional = 101;
+        p.max_provisional = 17;
         assert!(p.check_values().is_err());
         let mut p = ok.clone();
         p.max_provisional_messages = 0;
@@ -1202,7 +1228,7 @@ mod tests {
         p.max_provisional_messages = 501;
         assert!(p.check_values().is_err());
         let mut p = ok.clone();
-        p.max_provisional_bans = 101;
+        p.max_provisional_bans = 17;
         assert!(p.check_values().is_err());
         p.max_provisional_bans = 0;
         assert!(p.check_values().is_ok());

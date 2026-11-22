@@ -1,7 +1,7 @@
 //! Cost of the pair the host pays after every chat message on a room at the
 //! provisional ceilings (freenet/river#974, design section 5): `update_state`
 //! with a one-message delta, then `validate_state` of its output. The room
-//! holds 100 provisional entries, 100 provisional bans and a full message
+//! holds the ceilings of provisional entries and bans (16 each) and a full message
 //! window; the baseline is the same room (same members, same messages) with no
 //! provisional data.
 //!
@@ -30,9 +30,13 @@ use river_core::room_state::provisional::{
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::time::{Duration, Instant, SystemTime};
 
-const WINDOW: usize = 300;
-const MEMBERS: u8 = 60;
-const PROVISIONAL: usize = 100;
+const WINDOW: usize = 100;
+const MEMBERS: u8 = 26;
+/// The ceilings: `MAX_PROVISIONAL_CEILING` entries and as many bans.
+const PROVISIONAL: usize = 16;
+/// What fills the window beside the members' three messages each and the
+/// provisional authors' one each.
+const OWNER_FILL: usize = WINDOW - MEMBERS as usize * 3 - PROVISIONAL;
 
 fn sk(n: u32) -> SigningKey {
     let mut b = [0u8; 32];
@@ -68,9 +72,9 @@ fn build(
     let owner_id = params.owner_id();
     let policy = with_provisional.then_some(PublicRoomPolicy {
         listed: false,
-        max_provisional: 100,
+        max_provisional: PROVISIONAL as u32,
         max_provisional_messages: 500,
-        max_provisional_bans: 100,
+        max_provisional_bans: PROVISIONAL as u32,
         pow: Some(PowPolicy {
             difficulty_bits: 0,
             epoch: 1,
@@ -105,7 +109,7 @@ fn build(
             msgs.push(msg(owner_id, k, t));
         }
     }
-    for _ in 0..20 {
+    for _ in 0..OWNER_FILL {
         t += 1;
         msgs.push(msg(owner_id, &owner, t));
     }
@@ -149,7 +153,7 @@ fn build(
                 )
             })
             .collect();
-        let bans: Vec<AuthorizedProvisionalBan> = (0..100u32)
+        let bans: Vec<AuthorizedProvisionalBan> = (0..PROVISIONAL as u32)
             .map(|i| {
                 AuthorizedProvisionalBan::new(
                     &params.owner,
@@ -179,13 +183,21 @@ fn build(
         assert_eq!(
             state.provisional.entries.len(),
             PROVISIONAL,
-            "fixture holds 100 entries"
+            "fixture holds the ceiling of entries"
         );
-        assert_eq!(state.provisional.bans.len(), 100, "fixture holds 100 bans");
+        assert_eq!(
+            state.provisional.bans.len(),
+            PROVISIONAL,
+            "fixture holds the ceiling of bans"
+        );
     }
     assert_eq!(
         state.recent_messages.messages.len(),
-        if with_provisional { WINDOW } else { 200 }
+        if with_provisional {
+            WINDOW
+        } else {
+            WINDOW - PROVISIONAL
+        }
     );
     (state, params, members[0].clone(), owner)
 }
@@ -226,7 +238,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(15);
-    println!("room at the ceilings: {PROVISIONAL} entries, 100 provisional bans, window {WINDOW}");
+    println!(
+        "room at the ceilings: {PROVISIONAL} entries, {PROVISIONAL} provisional bans, window {WINDOW}"
+    );
     let mut medians = Vec::new();
     for with in [false, true] {
         let (state, params, member, _owner) = build(with);
