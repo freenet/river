@@ -1850,7 +1850,15 @@ fn two_entries_with_one_id_never_leave_either_key_resolving_the_id_whichever_dig
         room.apply(d).unwrap();
         let forged = forged_vk_with_id_of(&v.verifying_key());
         let mut s = room.state.clone();
-        s.provisional.entries.push(unsigned_entry(&room, &forged));
+        // The injected entry goes first in some rounds and last in others, so
+        // the id resolves to either key if C2 does not drop both.
+        if round % 2 == 0 {
+            s.provisional.entries.push(unsigned_entry(&room, &forged));
+        } else {
+            s.provisional
+                .entries
+                .insert(0, unsigned_entry(&room, &forged));
+        }
         s.post_apply_cleanup(&room.params).unwrap();
         assert!(s.provisional.entries.is_empty(), "round {round}: C2");
         assert!(
