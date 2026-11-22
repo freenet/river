@@ -1529,10 +1529,24 @@ mod tests {
     }
 
     impl Waiter for Inject {
-        fn wait(&mut self, _tcp: &TcpStream, _left: Duration) -> Waited {
+        fn wait(&mut self, tcp: &TcpStream, _left: Duration) -> Waited {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.go.send(()).unwrap();
                 self.done.recv().unwrap();
+                // The node's `send` returning does not mean the bytes are readable here yet
+                // (macOS loopback delivers them a little later). Report the timeout only once
+                // they are, so the race is the one meant: data waiting, wait timed out.
+                let until = Instant::now() + Duration::from_secs(10);
+                let mut probe = [0u8; 1];
+                loop {
+                    match tcp.peek(&mut probe) {
+                        Ok(n) if n > 0 => break,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        other => panic!("peek on the node socket: {other:?}"),
+                    }
+                    assert!(Instant::now() < until, "the node's frame never arrived");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
             Waited::TimedOut
         }

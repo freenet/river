@@ -4804,32 +4804,24 @@ fn a_store_refused_at_first_is_set_up_later_by_itself_on_a_backoff() {
     session.wait_rooms("the store is said to be missing", |r, issues, _| {
         r.is_empty() && issues.store_missing
     });
-    // The node keeps refusing: the app's own retries follow the backoff schedule. The test
-    // compares the gaps between the registrations the node saw with the schedule, not read
-    // counts: reads and registrations run on different clocks, which scale differently on a
-    // loaded machine. First retry after at least `register_retry_first` (150 ms), then the
-    // wait doubles up to `register_retry_max` (600 ms).
+    // The node keeps refusing: the app's own retries follow the backoff schedule. The stamp
+    // is when the node RECEIVED each registration, which is the app's decision to retry plus
+    // the setup of the new connection before the registration goes out. That setup varies
+    // with load (hundreds of ms on a busy macOS runner), and the first registration is on
+    // the first connection while each later one follows a reconnect, so individual gaps do
+    // not follow the schedule. Their sum does: the decisions are at least 150 + 300 + 600 ms
+    // apart, and each stamp only comes later than its decision. A wait that did not grow
+    // (150 ms each time) gives about 450 ms here. The schedule itself is pinned exactly by
+    // `the_store_retry_waits_double_from_the_first_wait_up_to_the_max`.
     session.wait_until("four registrations", || {
         node.with(|w| w.register_times.len() >= 4)
     });
-    // The stamp is when the node RECEIVED the registration, which comes after the app's
-    // reconnect, so each gap is the scheduled wait plus the difference between two reconnect
-    // delays: allow 25% under the schedule, and require the growth itself (the third wait
-    // is at least 200 ms longer than the first), which is what the backoff is for.
     node.with(|w| {
         let times = &w.register_times;
-        let gaps: Vec<Duration> = (0..3)
-            .map(|i| times[i + 1].duration_since(times[i]))
-            .collect();
-        for (gap, scheduled) in gaps.iter().zip([150u64, 300, 600]) {
-            assert!(
-                *gap >= Duration::from_millis(scheduled * 3 / 4),
-                "registration gaps {gaps:?} against the schedule 150/300/600 ms"
-            );
-        }
+        let span = times[3].duration_since(times[0]);
         assert!(
-            gaps[2] >= gaps[0] + Duration::from_millis(200),
-            "the backoff did not grow: {gaps:?}"
+            span >= Duration::from_millis(150 + 300 + 600),
+            "registrations 1 to 4 took {span:?}, under the backoff schedule 150/300/600 ms"
         );
     });
     // The node is healthy now: the next retry sets the store up, with no command sent.
@@ -8811,4 +8803,32 @@ mod deleting_their_messages {
             }
         }
     }
+}
+
+/// The app's own retry of a store that could not be set up: the first re-read arms the first
+/// wait and does not retry; nothing is due before the wait is over; each retry taken doubles
+/// the next wait, up to the max. Exact instants, no clock.
+#[test]
+fn the_store_retry_waits_double_from_the_first_wait_up_to_the_max() {
+    let pace = Pace {
+        register_retry_first: Duration::from_millis(150),
+        register_retry_max: Duration::from_millis(600),
+        ..quick()
+    };
+    let mut rooms = Rooms::default();
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    assert!(
+        !rooms.register_retry_due(t0, &pace),
+        "the first re-read only arms the wait"
+    );
+    assert!(!rooms.register_retry_due(ms(149), &pace));
+    assert!(rooms.register_retry_due(ms(150), &pace));
+    assert!(!rooms.register_retry_due(ms(150 + 299), &pace));
+    assert!(rooms.register_retry_due(ms(150 + 300), &pace));
+    assert!(!rooms.register_retry_due(ms(450 + 599), &pace));
+    assert!(rooms.register_retry_due(ms(450 + 600), &pace));
+    // Capped: the next wait is 600 ms again, not 1200.
+    assert!(!rooms.register_retry_due(ms(1050 + 599), &pace));
+    assert!(rooms.register_retry_due(ms(1050 + 600), &pace));
 }
