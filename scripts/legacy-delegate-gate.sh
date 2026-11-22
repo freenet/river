@@ -49,6 +49,7 @@ while read -r ver expect enc rest; do
   case "$ver" in ''|'#'*) continue;; esac
   h=$(awk -v v="$ver" '$2==v{print $1}' "$CORPUS/index.txt")
   errtok=""; case "$rest" in err=*) errtok="${rest%% *}";; esac
+  if [ "$expect" = dead ] && [ -z "${errtok#err=}" ]; then die "dead entry $ver needs an err=<token> failure class in manifest.txt"; fi
   [ -n "$h" ] || die "manifest names $ver but no WASM with a registry hash was found in git history"
   echo "$h $ver $expect $enc $errtok" >> "$RESOLVED"
   if [ "$expect" = works ]; then min=$((min+1)); fi
@@ -76,14 +77,22 @@ if [ -n "$CORE_PATH" ]; then
   CORE="$WORK/core-$sha"
   if [ ! -d "$CORE" ]; then
     # Committed HEAD only (git archive): excludes target dirs and nested worktrees.
-    mkdir -p "$CORE.tmp" && git -C "$CORE_PATH" archive HEAD | tar -C "$CORE.tmp" -xf - && mv "$CORE.tmp" "$CORE"
+    rm -rf "$CORE.tmp"; mkdir -p "$CORE.tmp" || die "cannot create $CORE.tmp"
+    git -C "$CORE_PATH" archive HEAD | tar -C "$CORE.tmp" -xf - || die "cannot export $CORE_PATH"
+    mv "$CORE.tmp" "$CORE" || die "cannot move $CORE.tmp"
   fi
 else
   CORE="$WORK/core-$(printf %s "$CORE_REV" | tr -c 'A-Za-z0-9._-' _)"
   [ -d "$CORE/.git" ] || { rm -rf "$CORE"; git init -q "$CORE"; }
   git -C "$CORE" fetch -q --depth 1 "$CORE_UPSTREAM" "$CORE_REV" || die "cannot fetch freenet-core $CORE_REV"
-  # Check out only when the commit changed (a forced checkout would also revert the harness).
-  [ "$(git -C "$CORE" rev-parse HEAD 2>/dev/null)" = "$(git -C "$CORE" rev-parse FETCH_HEAD^{commit})" ] || git -C "$CORE" checkout -q -f FETCH_HEAD
+  # Check out only when the commit changed or the tree was altered beyond the harness
+  # injection (a forced checkout also reverts the harness, so it is avoided when clean).
+  want=$(git -C "$CORE" rev-parse 'FETCH_HEAD^{commit}') || die "cannot resolve $CORE_REV"
+  dirty=$(git -C "$CORE" status --porcelain --untracked-files=no | grep -v 'wasm_runtime/delegate/test.rs$' || true)
+  if [ "$(git -C "$CORE" rev-parse HEAD 2>/dev/null)" != "$want" ] || [ -n "$dirty" ]; then
+    rm -f "$CORE/.git/index.lock"
+    git -C "$CORE" checkout -q -f "$want" || die "cannot check out $CORE_REV"
+  fi
 fi
 echo "core: $(grep -m1 '^version' "$CORE/crates/core/Cargo.toml") ${CORE_REV:-$CORE_PATH}"
 
