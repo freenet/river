@@ -7,8 +7,9 @@
 //! Sections so far: **Updates** (River's own updates, [`super::update_view::updates_section`]),
 //! **Notifications** (do not disturb and message previews, [`notifications_section`]),
 //! **Background and startup** (the tray and login item, only where the shell offers them,
-//! [`super::background::background_section`]) and **Connection** (the Freenet node,
-//! [`connection_section`]). A section exists only when it has content ([`Section::shown`]). A new
+//! [`super::background::background_section`]), **Connection** (the Freenet node,
+//! [`connection_section`]), **Identity** (import and export, [`identity_section`]) and
+//! **Appearance** (size and the shortcuts page, [`appearance_section`]). A section exists only when it has content ([`Section::shown`]). A new
 //! section is an entry in [`Section::ALL`] and an arm in [`section_content`]; the rest (list,
 //! keys, narrow screens, arrow keys) follows from those.
 //! Which section was last shown is not remembered: the dialog opens on the first section, and
@@ -17,9 +18,9 @@
 //! Esc closes the whole dialog on every screen, including a section screen of a narrow window;
 //! Back is the way to the list. Opening from the keyboard hands the keyboard back to the
 //! composer on close when the composer had it ([`SettingsUi::restore_composer`]; the shortcuts
-//! page does not do this). Not in Settings yet: Export and Import ID, zoom and the shortcuts
-//! page, which are still the room list's footer button and their own dialogs. The room list keeps
-//! one quiet Do not disturb row that flips the switch ([`super::dnd::Chat::quick_dnd`]).
+//! page does not do this). Identity and Appearance open the existing import, export and
+//! shortcuts dialogs, closing Settings first. The room list keeps one quiet Do not disturb row
+//! that flips the switch ([`super::dnd::Chat::quick_dnd`]).
 //!
 //! The dialog has no Save or Close button: every control in it acts at once, and the X closes
 //! it. Keys are stable (`settings-section-{id}`, `settings-back`, and the keys of the controls
@@ -43,6 +44,8 @@ pub enum Section {
     Notifications,
     Background,
     Connection,
+    Identity,
+    Appearance,
 }
 
 impl Section {
@@ -52,6 +55,8 @@ impl Section {
         Section::Notifications,
         Section::Background,
         Section::Connection,
+        Section::Identity,
+        Section::Appearance,
     ];
 
     /// The sections the list shows: all of them, but Background and startup only where the
@@ -71,6 +76,8 @@ impl Section {
             Section::Notifications => "Notifications",
             Section::Background => "Background and startup",
             Section::Connection => "Connection",
+            Section::Identity => "Identity",
+            Section::Appearance => "Appearance",
         }
     }
 
@@ -81,6 +88,8 @@ impl Section {
             Section::Notifications => "notifications",
             Section::Background => "background",
             Section::Connection => "connection",
+            Section::Identity => "identity",
+            Section::Appearance => "appearance",
         }
     }
 
@@ -354,7 +363,174 @@ fn section_content(section: Section, chat: &super::Chat, p: &Palette, k: &Kit) -
         Section::Notifications => notifications_section(chat, p, k),
         Section::Background => super::background::background_section(chat, p, k),
         Section::Connection => connection_section(chat, p, k),
+        Section::Identity => identity_section(chat, p, k),
+        Section::Appearance => appearance_section(chat, p, k),
     }
+}
+
+/// The Identity section: move your identity to another device. Import opens the existing
+/// "Import identity" dialog; Export lists the rooms, because an export belongs to one room, and
+/// a room's button opens the existing "Export identity" dialog for it. Both dialogs and the
+/// identity code behind them are unchanged: this is only where they are reached from.
+fn identity_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
+    let can = chat.can_change_rooms();
+    let import = setting_row(
+        "settings-import-row",
+        label("Import identity", st::BODY, p.text),
+        Some(
+            label(
+                "Use an identity exported from another device or from the River web app.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-import-note"),
+        ),
+        Button::new("Import identity\u{2026}")
+            .variant(ButtonVariant::Outline)
+            .disabled(!can)
+            .on_press(|s: &mut RiverApp| {
+                s.chat.close_settings();
+                s.chat.open_import();
+            })
+            .build(k)
+            .key("settings-import-id"),
+        p,
+    );
+    let mut export = col()
+        .key("settings-export-group")
+        .w_full()
+        .gap(12.0)
+        .child(label("Export identity", st::ROOM_STRONG, p.text))
+        .child(
+            label(
+                "An identity belongs to one room. Choose the room whose identity to export; \
+                 the token holds your private key, so treat it like a password.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-export-note"),
+        );
+    if chat.rooms().is_empty() {
+        export = export.child(
+            label("You are not in any room yet.", st::SMALL, p.text_secondary)
+                .wrap()
+                .w_full()
+                .key("settings-export-none"),
+        );
+    } else {
+        let rows = chat
+            .rooms()
+            .iter()
+            .map(|room| {
+                let key = room.key.clone();
+                setting_row(
+                    &format!("settings-export-row-{}", room.key),
+                    label(room.name.clone(), st::BODY, p.text).wrap().w_full(),
+                    None,
+                    Button::new("Export")
+                        .variant(ButtonVariant::Outline)
+                        .disabled(!can)
+                        .on_press(move |s: &mut RiverApp| {
+                            s.chat.close_settings();
+                            s.chat.open_export_for(&key);
+                        })
+                        .build(k)
+                        .key(format!("settings-export-{}", room.key)),
+                    p,
+                )
+            })
+            .collect();
+        export = export.child(section_rows("settings-export-rows", rows, p));
+    }
+    col()
+        .key("settings-identity")
+        .w_full()
+        .gap(14.0)
+        .child(import)
+        .child(export)
+}
+
+/// The Appearance section: the size of everything (the zoom steps Ctrl+= and Ctrl+- walk, set
+/// by a press and saved the same way) and the keyboard shortcuts page.
+fn appearance_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
+    let now = chat.zoom.percent();
+    let mut sizes = row().key("settings-size-options").gap(6.0).flex_wrap();
+    for pct in super::zoom::STEPS {
+        sizes = sizes.child(
+            Button::new(format!("{pct}%"))
+                .variant(if pct == now {
+                    ButtonVariant::Contrast
+                } else {
+                    ButtonVariant::Outline
+                })
+                .on_press_tx(move |s: &mut RiverApp, tx: &mut rune::Tx| {
+                    tx.instant();
+                    s.chat.zoom.set(pct);
+                })
+                .build(k)
+                .key(format!("settings-size-{pct}")),
+        );
+    }
+    let mac = cfg!(target_os = "macos");
+    let size = col()
+        .key("settings-size-group")
+        .w_full()
+        .gap(8.0)
+        .child(label("Size", st::BODY, p.text))
+        .child(
+            label(
+                format!(
+                    "Makes everything in River bigger or smaller. {} and {} do the same, and {} \
+                     puts it back. Saved on this device.",
+                    super::shortcuts::shown("Mod+=", mac),
+                    super::shortcuts::shown("Mod+-", mac),
+                    super::shortcuts::shown("Mod+0", mac),
+                ),
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-size-note"),
+        )
+        .child(sizes);
+    let shortcuts = setting_row(
+        "settings-shortcuts-row",
+        label("Keyboard shortcuts", st::BODY, p.text),
+        Some(
+            label(
+                format!(
+                    "Every key River understands. {} opens the list from anywhere.",
+                    super::shortcuts::shown("Mod+/", mac)
+                ),
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-shortcuts-note"),
+        ),
+        Button::new("Show shortcuts")
+            .variant(ButtonVariant::Outline)
+            .on_press(|s: &mut RiverApp| {
+                s.chat.close_settings();
+                s.chat.open_shortcuts();
+            })
+            .build(k)
+            .key("settings-shortcuts"),
+        p,
+    );
+    col()
+        .key("settings-appearance")
+        .w_full()
+        .gap(14.0)
+        .child(size)
+        .child(rule(p))
+        .child(shortcuts)
 }
 
 /// The Notifications section: do not disturb, whether notifications show who wrote and what,

@@ -128,6 +128,15 @@ impl Zoom {
         std::mem::take(&mut self.dirty).then_some(self.percent)
     }
 
+    /// Set the level to `percent` (snapped to a step), saved like a key press.
+    pub fn set(&mut self, percent: u16) {
+        let next = snap(i64::from(percent));
+        if next != self.percent {
+            self.percent = next;
+            self.dirty = true;
+        }
+    }
+
     pub fn apply(&mut self, step: Step) {
         let next = stepped(self.percent, step);
         if next != self.percent {

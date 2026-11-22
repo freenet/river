@@ -221,17 +221,22 @@ fn the_arrow_keys_choose_sections_and_move_the_keyboard_with_them() {
     key(&mut rt, Key::Down);
     assert_eq!(rt.state.chat.settings.section, Section::Connection);
     assert!(rt.find("settings-node-change").is_some());
+    key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.settings.section, Section::Identity);
     // The list stops at its end.
     key(&mut rt, Key::Down);
-    assert_eq!(rt.state.chat.settings.section, Section::Connection);
-    key(&mut rt, Key::Up);
-    key(&mut rt, Key::Up);
+    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
+    key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
+    for _ in 0..4 {
+        key(&mut rt, Key::Up);
+    }
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     assert_eq!(focused(&rt).as_deref(), Some("settings-section-updates"));
     key(&mut rt, Key::Up);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     key(&mut rt, Key::End);
-    assert_eq!(rt.state.chat.settings.section, Section::Connection);
+    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
     key(&mut rt, Key::Home);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     assert!(is_open(&rt), "arrows never close it");
@@ -411,8 +416,12 @@ fn the_old_entry_points_are_still_in_the_source() {
         assert!(src.contains(key), "{key} left {file}");
     }
     // The footer buttons that are still the only way to their dialogs.
-    for footer in ["dnd_entry", "\"Enter invite code\"", "\"Import ID\""] {
+    for footer in ["dnd_entry", "\"Enter invite code\""] {
         assert!(view.contains(footer), "{footer} left the room list");
+    }
+    // Moved into Settings > Identity and Appearance.
+    for gone in ["\"Import ID\"", "\"Export ID\"", "shortcuts::entry("] {
+        assert!(!view.contains(gone), "{gone} is back in view.rs");
     }
 }
 
@@ -976,6 +985,10 @@ fn every_scene_of_these_sections_exists() {
         "chat-settings-background-narrow",
         "chat-settings-background-no-tray",
         "chat-settings-background-no-tray-narrow",
+        "chat-settings-identity",
+        "chat-settings-identity-narrow",
+        "chat-settings-appearance",
+        "chat-settings-appearance-narrow",
         "chat-dnd-on",
     ] {
         assert!(names.contains(&want), "{want}");
@@ -1125,4 +1138,28 @@ fn the_notifications_pane_has_a_scroll_bar_and_is_taller_in_a_tall_window() {
         src.matches(".scroll_bar(k)").count() >= 2,
         "wide and narrow"
     );
+}
+
+#[test]
+fn identity_actions_are_unavailable_for_the_example_rooms() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    press(&mut rt, "settings-import-id");
+    assert!(is_open(&rt), "a disabled button does nothing");
+    assert!(rt.state.chat.form.open.is_none());
+}
+
+#[test]
+fn the_new_sections_are_listed_and_reachable_in_a_narrow_window() {
+    let mut rt = render(connected(), NARROW_SCENE_SIZE);
+    press(&mut rt, "settings");
+    for id in ["identity", "appearance"] {
+        assert!(rt.find(&format!("settings-section-{id}")).is_some(), "{id}");
+    }
+    press(&mut rt, "settings-section-appearance");
+    assert!(rt.find("settings-size-100").is_some());
+    press(&mut rt, "settings-back");
+    press(&mut rt, "settings-section-identity");
+    assert!(rt.find("settings-import-id").is_some());
 }

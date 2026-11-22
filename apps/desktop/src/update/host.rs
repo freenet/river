@@ -17,8 +17,10 @@ use crate::release::{Version, parse_version};
 
 /// Overrides [`super::MANIFEST_URL`] (tests, staging). The signature is still checked against
 /// the compiled-in key, so this cannot point River at a build its key did not sign.
+#[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub const MANIFEST_URL_ENV: &str = "RIVER_UPDATE_MANIFEST_URL";
 /// The same override as a flag: `--update-manifest-url=URL`.
+#[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub const MANIFEST_URL_FLAG: &str = "--update-manifest-url=";
 
 pub struct DesktopUpdate {
