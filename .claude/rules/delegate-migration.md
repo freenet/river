@@ -154,6 +154,7 @@ rest of this file is about.
 | `common/src/migration.rs` | Re-derives legacy room-contract keys for backward recovery (#292) |
 | `ui/src/components/app/chat_delegate.rs` | Uses generated `LEGACY_DELEGATES` for runtime migration |
 | `scripts/check-migration.sh` / `scripts/add-migration.sh` | Delegate migration validation / entry |
+| `scripts/legacy-delegate-gate/manifest.txt` | Release gate corpus: add each retired generation as `works` or `dead` when `add-migration` adds it (the gate fails if its WASM is in git history and it is not listed) |
 | `scripts/check-room-contract-migration.sh` / `scripts/add-room-contract-migration.sh` | Room-contract registry validation / entry |
 | `pointer-records.toml` | Signed pointer records — stable identity (addressing only) for third parties, and the re-key signal open UI tabs watch (#580) |
 | `scripts/check-pointer-freshness.sh` / `scripts/sign-pointer-records.sh` / `scripts/publish-pointer-records.sh` | Pointer gate / re-sign / network publish |
