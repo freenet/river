@@ -49,7 +49,12 @@ pub(crate) mod node_ui;
 mod notify_dialog;
 pub mod overview;
 mod quick_reply;
+#[cfg(test)]
+mod reply_jump_tests;
 pub mod search;
+pub mod settings;
+#[cfg(test)]
+mod settings_tests;
 /// The web UI's share-link validator, compiled here unchanged so the two cannot disagree on
 /// what a share link is (its tests, and the shared vector file, run here too).
 #[path = "../../../../ui/src/util/share_link.rs"]
@@ -68,6 +73,9 @@ pub mod zoom;
 
 pub use background::{BackgroundHost, BackgroundUi};
 pub use dm_model::DmArrival;
+/// The preference key of [`Chat::private_previews`], unchanged from before it had a switch.
+pub const PREVIEWS_PREF: &str = "notification_previews";
+
 pub use dnd::{DndUi, Schedule as DndSchedule, Settings as DndSettings};
 pub use quick_reply::{MAX_REPLY_CHARS, ReplyRefusal};
 use std::collections::{HashMap, HashSet};
@@ -358,6 +366,11 @@ pub struct Chat {
     pub status: node_status::NodeStatusUi,
     /// Do not disturb: this device's switch and schedule ([`dnd`]).
     pub dnd: dnd::DndUi,
+    /// Whether a private room's and a direct message's notification may show the sender and
+    /// text: the `notification_previews` preference, off unless set in Settings > Notifications.
+    pub private_previews: bool,
+    /// Set when [`Chat::private_previews`] changed and has not been saved.
+    previews_dirty: bool,
     /// Whether the last status was not live, so the next live update is catch-up rather than
     /// news (see [`Chat::show_node_rooms`]).
     catching_up: bool,
@@ -374,6 +387,8 @@ pub struct Chat {
     notify_dialog: Option<String>,
     /// River's own updates and the settings dialog.
     pub update: crate::update::UpdateUi,
+    /// The settings dialog: whether it is open and which section it shows.
+    pub settings: settings::SettingsUi,
     /// The quick switcher (Ctrl+K), when open ([`switcher`]).
     pub switcher: Option<switcher::Switcher>,
     /// The message search panel (Ctrl+F), when open ([`search`]).
@@ -385,6 +400,8 @@ pub struct Chat {
     pub(crate) narrow: bool,
     /// A message marked for a moment after a jump from the search panel.
     flash: Option<search::Flash>,
+    /// A drag that began on a reply's strip travelled past a click.
+    reply_dragged: bool,
     /// Whether the unread and mentions overview is open ([`overview`]).
     pub overview: bool,
     /// A message to scroll to once the room it is in is on screen.
@@ -512,6 +529,8 @@ impl Chat {
             background: None,
             status: Default::default(),
             dnd: Default::default(),
+            private_previews: false,
+            previews_dirty: false,
             shortcode: Default::default(),
             zoom: Default::default(),
             shortcuts_open: false,
@@ -526,12 +545,14 @@ impl Chat {
             member_search: Default::default(),
             narrow: false,
             flash: None,
+            reply_dragged: false,
             overview: false,
             reveal: None,
             reply_notices: Default::default(),
             chord_at: None,
             node: Default::default(),
             update: Default::default(),
+            settings: Default::default(),
         };
         chat.set_rooms(rooms);
         chat
@@ -1106,9 +1127,8 @@ impl Chat {
             || self.details.is_some()
             || self.notify_dialog.is_some()
             || self.switcher.is_some()
-            || self.background.as_ref().is_some_and(|b| b.open)
             || self.status.open
-            || self.dnd.open
+            || self.settings.open
             || self.overview
             || self.shortcuts_open
             || self.link_menu.is_some()

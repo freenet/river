@@ -4,7 +4,9 @@ use crate::components::app::{
     CURRENT_ROOM, LAST_CONNECTION_ERROR, MEMBER_INFO_MODAL, ROOMS, SYNC_STATUS,
 };
 use crate::components::back_to_chat::BackToChatButton;
+use crate::components::connection_activity::use_background_reason;
 use crate::components::icons::*;
+use crate::components::loading_dots::SmallDots;
 use crate::components::tooltip::WithTooltip;
 use crate::util::confusable::{
     ConfusableTier, ImpersonationChecker, ImpersonationWarning, ProtectedName, ProtectedRole,
@@ -55,12 +57,12 @@ use self::invite_member_modal::InviteMemberModal;
 /// when no room is selected, leaving brand-new users with no signal
 /// that their node WebSocket was broken.
 ///
-/// Short labels only: Connected, Connecting..., Disconnected, or an error
-/// report's label ("Invalid operation", "Refreshing..."). When there is an
+/// Short labels only: Connected, Connecting, Disconnected, or an error
+/// report's label ("Invalid operation", "Refreshing"). When there is an
 /// error report, the current one or the last one kept through a reconnect
 /// (`LAST_CONNECTION_ERROR`, cleared on Connected), hovering or focusing the
 /// pill explains it and clicking copies its diagnostics. Its accessible name
-/// carries the label shown ("WebSocket connection status: Connecting..."),
+/// carries the label shown ("WebSocket connection status: Connecting"),
 /// even while the report it explains and copies is an earlier one.
 ///
 /// Signal safety: both signals are read with `try_read()`. A contended read
@@ -93,9 +95,10 @@ pub fn ConnectionStatusIndicator() -> Element {
     };
     *snapshot.borrow_mut() = (status.clone(), last_error.clone());
 
+    let reason = use_background_reason(&status);
     let (pill_classes, dot_classes, label) = match &status {
         SynchronizerStatus::Connected => ("text-text-muted", "bg-success", "Connected"),
-        SynchronizerStatus::Connecting => ("text-text-muted", "bg-warning", "Connecting..."),
+        SynchronizerStatus::Connecting => ("text-text-muted", "bg-warning", "Connecting"),
         SynchronizerStatus::Disconnected => ("text-danger", "bg-error", "Disconnected"),
         SynchronizerStatus::Error(report) if report.is_progress() => {
             ("text-text-muted", "bg-warning", report.label)
@@ -110,32 +113,44 @@ pub fn ConnectionStatusIndicator() -> Element {
         SynchronizerStatus::Connected => None,
         SynchronizerStatus::Connecting | SynchronizerStatus::Disconnected => last_error,
     };
-    let host_classes = format!("flex items-center gap-2 text-[12.5px] font-medium {pill_classes}");
-    let content = rsx! {
-        span {
-            "data-testid": "connection-status-dot",
-            class: "block w-[7px] h-[7px] rounded-full flex-shrink-0 {dot_classes}",
-        }
-        span { "data-testid": "connection-status-label", "{label}" }
-    };
+    let name = format!("WebSocket connection status: {label}");
+    let tip = report
+        .as_ref()
+        .map(|r| r.summary.clone())
+        .or_else(|| reason.map(|r| r.text().1.to_owned()));
+    let copy = report.as_ref().map(ErrorReport::diagnostics);
 
     rsx! {
         div { class: "tooltip-frame px-4 flex-shrink-0",
-            if let Some(report) = report {
-                WithTooltip {
-                    tip: report.summary.clone(),
-                    copy: report.diagnostics(),
-                    class: "{host_classes} tooltip-host--framed text-left",
-                    test_id: "connection-status-indicator",
-                    "aria-label": "WebSocket connection status: {label}",
-                    {content}
+            div {
+                class: "connection-pill {pill_classes}",
+                role: "group",
+                "aria-label": "{name}",
+                "aria-busy": if reason.is_some() { "true" } else { "false" },
+                "data-busy-reason": reason.map(|r| r.text().0),
+                "data-testid": "connection-status-indicator",
+                // The visual stays mounted while the control above it changes
+                // between an explanation, a copy button and an idle status.
+                span { class: "connection-pill-face", "aria-hidden": "true",
+                    span {
+                        class: "block w-[7px] h-[7px] rounded-full flex-shrink-0 {dot_classes}",
+                        "data-testid": "connection-status-dot",
+                    }
+                    span { class: "connection-activity", "data-testid": "connection-activity-dots",
+                        span { class: "connection-activity-clip", SmallDots {} }
+                    }
+                    span { class: "ml-2", "data-testid": "connection-status-label", "{label}" }
                 }
-            } else {
-                div {
-                    "aria-label": "WebSocket connection status: {label}",
-                    "data-testid": "connection-status-indicator",
-                    class: "{host_classes}",
-                    {content}
+                if let Some(tip) = tip {
+                    WithTooltip {
+                        tip,
+                        copy,
+                        class: "connection-pill-details tooltip-host--framed text-left",
+                        test_id: "connection-status-details",
+                        "aria-label": "{name}",
+                        role: if report.is_none() { Some("group") } else { None },
+                        tabindex: "0",
+                    }
                 }
             }
         }
@@ -3009,7 +3024,7 @@ pub fn ImportIdentityModal(is_active: Signal<bool>) -> Element {
                             div {
                                 "data-testid": "import-identity-loading-rooms",
                                 class: "mt-3 text-[13px] text-text-muted",
-                                "Loading your rooms\u{2026} the import will be available in a moment."
+                                "Loading your rooms. The import will be available in a moment."
                             }
                         }
                     }

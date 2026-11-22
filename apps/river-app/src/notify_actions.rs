@@ -44,7 +44,7 @@ impl RiverApp {
         if let Some((r, p)) = parse_dm_target(room) {
             // The notification offered no reply when it hid its sender (previews off): a reply
             // that arrives anyway is not sent, and nothing is kept (no name to say whose).
-            if !self.private_previews {
+            if !self.chat.private_previews {
                 return Err(ReplyRefusal::Blocked);
             }
             let result = self

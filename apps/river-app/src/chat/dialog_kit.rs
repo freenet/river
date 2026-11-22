@@ -261,6 +261,34 @@ pub fn danger_outline_button(
         })
 }
 
+/// [`danger_outline_button`] for an action that needs the runtime's [`rune::Tx`], such as
+/// quitting the app.
+pub fn danger_outline_button_tx(
+    k: &Kit,
+    text: impl Into<String>,
+    key: &'static str,
+    on_press: fn(&mut RiverApp, &mut rune::Tx),
+) -> El {
+    let p = st::palette();
+    let text = text.into();
+    let shown = text.clone();
+    let ink = p.danger;
+    Button::new(text)
+        .variant(ButtonVariant::Outline)
+        .label_with(move |font, _| rune::text(shown).font(font).color(ink))
+        .on_press_tx(on_press)
+        .build(k)
+        .key(key)
+        .border(1.0, p.danger)
+        .on_key(move |s: &mut RiverApp, ev, tx| {
+            let enter = ev.key == rune::Key::Enter;
+            if enter {
+                on_press(s, tx);
+            }
+            enter
+        })
+}
+
 /// What a [`notice`] means. Each has its own colour and icon, so "for your information" and
 /// "stop" do not look alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -23,6 +23,8 @@
 //!   into a real room, or contract-invalid state where they do not verify.
 
 use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+use crate::components::app::freenet_api::error_report::ErrorReport;
+use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, ROOMS};
 use crate::room_data::{CurrentRoom, RoomData};
 use dioxus::prelude::*;
@@ -601,6 +603,49 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Start a load attempt whose current-delegate listing is outstanding,
+    // then have the delegate refuse it: the real refusal path, which a hook
+    // that writes LoadFailed directly would skip.
+    set_hook(
+        "beginListedLoad",
+        Closure::<dyn FnMut()>::new(crate::components::app::chat_delegate::test_begin_listed_load)
+            .into_js_value(),
+    );
+    // The outstanding listing is answered with only the stored `rooms_data`
+    // blob, whose read then fails (no node in this build).
+    set_hook(
+        "deliverStoredRoomsBlobListing",
+        Closure::<dyn FnMut()>::new(
+            crate::components::app::freenet_api::response_handler::test_deliver_stored_rooms_blob_listing,
+        )
+        .into_js_value(),
+    );
+    set_hook(
+        "refuseOutstandingList",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::components::app::chat_delegate::on_current_list_refused(
+                river_core::chat_delegate::LIST_REFUSED_MARKER,
+            );
+        })
+        .into_js_value(),
+    );
+
+    // Production room setup. `false` lists first; `true` is Retry, which
+    // registers first. This build has no node, so the outgoing send fails.
+    set_hook(
+        "reloadRooms",
+        Closure::<dyn FnMut(bool)>::new(move |register_first: bool| {
+            if register_first {
+                crate::components::app::chat_delegate::retry_rooms_load();
+            } else {
+                crate::util::safe_spawn_local(async {
+                    let _ = crate::components::app::chat_delegate::set_up_chat_delegate().await;
+                });
+            }
+        })
+        .into_js_value(),
+    );
+
     // Switch rooms the way a notification click does: CURRENT_ROOM changes
     // while whatever modal is open stays open. The room list is behind the
     // modal's backdrop, so the UI itself cannot do this from a test.
@@ -801,13 +846,20 @@ pub fn install_test_hooks() {
         "setSyncErrorReport",
         Closure::<dyn FnMut(String, String, String)>::new(
             move |label: String, summary: String, detail: String| {
-                use crate::components::app::freenet_api::error_report::ErrorReport;
                 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
                 use crate::components::app::{set_sync_status, StatusOrigin};
                 let report = ErrorReport::new(report_label(&label), summary, detail);
                 set_sync_status(SynchronizerStatus::Error(report), StatusOrigin::Test);
             },
         )
+        .into_js_value(),
+    );
+
+    set_hook(
+        "showRoomInitialSync",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::util::defer(|| set_initial_sync_status(RoomSyncStatus::Subscribing));
+        })
         .into_js_value(),
     );
 
@@ -827,7 +879,8 @@ pub fn install_test_hooks() {
                     if fail_banner_read {
                         FAIL_NEXT_BANNER_READ.with(|f| f.set(true));
                     }
-                    show_room_sync_error(label, summary, detail);
+                    let report = ErrorReport::new(label, summary, detail);
+                    set_initial_sync_status(RoomSyncStatus::Error(report));
                 });
             },
         )
@@ -858,23 +911,20 @@ pub fn install_test_hooks() {
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
 }
 
-/// The current room becomes a placeholder awaiting its initial sync (its
-/// configuration no longer verifies) whose sync ended in this error. Call
-/// inside `defer`.
-fn show_room_sync_error(label: &'static str, summary: String, detail: String) {
-    use crate::components::app::freenet_api::error_report::ErrorReport;
-    use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
-    let report = ErrorReport::new(label, summary, detail);
-    with_current_room_mut(|room, room_key| {
-        let signature = room.room_state.configuration.signature.to_bytes();
-        let mut forged = signature;
-        forged[0] ^= 1;
-        room.room_state.configuration.signature = ed25519_dalek::Signature::from_bytes(&forged);
-        let key = *room_key;
-        SYNC_INFO.with_mut(|sync_info| {
-            sync_info.register_new_room(key);
-            sync_info.update_sync_status(&key, RoomSyncStatus::Error(report));
-        });
+/// Model an imported placeholder until it receives a valid signed configuration.
+/// Caller runs inside `defer`; release ROOMS before notifying SYNC_INFO readers.
+fn set_initial_sync_status(status: RoomSyncStatus) {
+    let mut found = None;
+    with_current_room_mut(|room, key| {
+        room.room_state.configuration.signature = ed25519_dalek::Signature::from_bytes(&[0; 64]);
+        found = Some(*key);
+    });
+    let Some(key) = found else {
+        return;
+    };
+    SYNC_INFO.with_mut(|sync_info| {
+        sync_info.register_new_room(key);
+        sync_info.update_sync_status(&key, status);
     });
 }
 

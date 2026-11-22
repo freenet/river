@@ -1012,7 +1012,6 @@ mod runtime {
     use super::super::freenet_synchronizer::SynchronizerMessage;
     use super::*;
     use crate::components::app::{NEEDS_SYNC, PENDING_INVITES, WEB_API};
-    use crate::invites::PendingRoomStatus;
     use dioxus::prelude::*;
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1150,14 +1149,7 @@ mod runtime {
         // treat as busy, it only delays.
         PENDING_INVITES
             .try_read()
-            .map(|p| {
-                p.map.values().any(|join| {
-                    matches!(
-                        join.status,
-                        PendingRoomStatus::PendingSubscription | PendingRoomStatus::Subscribing
-                    )
-                })
-            })
+            .map(|p| p.any_in_progress())
             .unwrap_or(true)
     }
 

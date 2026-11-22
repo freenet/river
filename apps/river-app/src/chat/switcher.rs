@@ -238,10 +238,8 @@ impl Chat {
             || self.dm.purge.confirming()
             || self.export.is_some()
             || self.node.form.is_some()
-            || self.update.settings_open
+            || self.settings.open
             || self.status.open
-            || self.background.as_ref().is_some_and(|b| b.open)
-            || self.dnd.open
             || self.overview
             || self.shortcuts_open
     }

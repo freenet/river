@@ -359,6 +359,11 @@ impl ResponseHandler {
                                                         // (every delegate-WASM bump needs it — freenet/river#345).
                                                         if is_legacy_delegate {
                                                             info!("Successfully loaded rooms from LEGACY delegate - migrating to new delegate");
+                                                            if !loaded_rooms.map.is_empty() {
+                                                                super::legacy_cleanup::note_legacy_data_seen(
+                                                                    responding_delegate.bytes(),
+                                                                );
+                                                            }
                                                             // Journal-gated, so it runs in its own task:
                                                             // `note_app_import_started` is a round trip
                                                             // and must answer before the merge
@@ -814,7 +819,7 @@ impl ResponseHandler {
 const ROOM_LOAD_CONCURRENCY: usize = 16;
 
 /// One legacy generation's per-room slot fan-out at a time (freenet/river#809).
-static LEGACY_SLOT_FETCH: std::sync::LazyLock<futures::lock::Mutex<()>> =
+pub(crate) static LEGACY_SLOT_FETCH: std::sync::LazyLock<futures::lock::Mutex<()>> =
     std::sync::LazyLock::new(|| futures::lock::Mutex::new(()));
 
 // What one client can have in the node's shared delegate admission queue
@@ -830,6 +835,21 @@ const _: () = assert!(
 );
 // `slice::chunks(0)` panics; pin the wave size as a valid chunk at compile time.
 const _: () = assert!(ROOM_LOAD_CONCURRENCY > 0);
+
+/// Test hook (example-data + no-sync builds only): the current delegate
+/// answers the outstanding listing (`beginListedLoad`) with only the
+/// `rooms_data` blob, and the room load runs as it would for that answer.
+/// Without a node the versioned blob read then fails: the read-error path of
+/// [`migrate_current_blob_to_per_room`]. Writes no load state of its own.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn test_deliver_stored_rooms_blob_listing() {
+    note_current_list_response();
+    if claim_list_load() {
+        crate::util::safe_spawn_local(load_rooms_per_room(vec![ChatDelegateKey::new(
+            ROOMS_STORAGE_KEY.to_vec(),
+        )]));
+    }
+}
 
 /// Per-room room load (freenet/river#345 / #65). Reconstructs the in-memory
 /// `Rooms` from the current delegate's `room:<vk>` slot keys (+ `rooms_meta`)
@@ -1401,11 +1421,16 @@ async fn migrate_current_blob_to_per_room(recovery: bool) {
             // `LoadPlan::MigrateCurrentBlob`, i.e. the current delegate's index
             // LISTED a `rooms_data` key, so the blob exists — a SEND failure
             // reading it is known-stored-data that failed to load. Mark the failure
-            // (attempt-scoped, review 7) so the worker's settlement resolves to
-            // LoadFailed rather than a silent Empty. (Display is masked by `List`
-            // if rooms are concurrently present.)
+            // (attempt-scoped, review 7).
+            //
+            // The initial load settles here even with cached rooms showing
+            // (see `on_current_list_refused`). The recovery re-run starts after
+            // a per-room load has settled and stays background-only.
             warn!("Failed to read current-delegate rooms blob: {}", e);
             worker.mark_fetch_failure();
+            if !recovery {
+                worker.set_load_state(RoomsLoadState::LoadFailed);
+            }
         }
     }
 }
@@ -1442,6 +1467,10 @@ async fn migrate_legacy_per_room(legacy_key: DelegateKey, keys: Vec<ChatDelegate
         // EMPTY legacy index must not show Migrating).
         LoadPlan::MigrateCurrentBlob | LoadPlan::ProbeLegacy => return,
     };
+    // This generation holds per-room copies: note it for the legacy-copy
+    // cleanup now, before waiting for the slot fan-out, so the cleanup (which
+    // starts once the sweep stops pacing) includes it (`legacy_cleanup`).
+    super::legacy_cleanup::note_legacy_data_seen(legacy_key.bytes());
 
     // freenet/river#397 Codex review 2/4 (P1): the legacy index is NON-EMPTY, so
     // rooms provably exist under the old delegate key. Announce `Migrating`
@@ -3369,7 +3398,7 @@ mod tests {
     /// Regression guard for freenet/river#287.
     ///
     /// A user restoring old room identities from exported backups hit a
-    /// never-ending "Syncing room state from the network..." spinner.
+    /// never-ending "Syncing room state from the network" spinner.
     /// Root cause: the rooms-loaded-from-delegate path issued a bare
     /// `Subscribe` request for every room. The node REJECTS a Subscribe
     /// when the contract's WASM/parameters are not cached locally

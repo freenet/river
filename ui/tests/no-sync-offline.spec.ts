@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { waitForApp } from "./example-room";
+import { visibleConnectionPill, waitForApp } from "./example-room";
 
 // Only the node API socket. CI serves the static release build, which opens no
 // sockets; a local `dx serve` still adds its own hot-reload socket.
@@ -15,5 +15,7 @@ test("a no-sync build opens no node socket and starts Disconnected", { tag: "@ch
   await page.waitForTimeout(1_500);
 
   expect(sockets, "no-sync build opened a node WebSocket").toEqual([]);
-  await expect(page.locator('[data-testid="connection-status-indicator"]:visible')).toContainText("Disconnected");
+  const pill = visibleConnectionPill(page);
+  await expect(pill).toContainText("Disconnected");
+  await expect(pill).toHaveAttribute("aria-busy", "false");
 });

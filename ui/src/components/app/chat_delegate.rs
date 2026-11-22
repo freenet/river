@@ -284,7 +284,7 @@ pub(crate) fn pending_load_workers() -> u32 {
 /// Bumped when a load worker starts and when the last one of the current
 /// attempt settles, so a render that reads [`pending_load_workers`] (a plain
 /// atomic) re-renders when it changes between zero and non-zero. The rail's
-/// "Restoring more rooms…" note shows `Migrating` only while a worker is
+/// "Restoring more rooms" note shows `Migrating` only while a worker is
 /// still running (freenet/river#802): with rooms present, a worker settling
 /// leaves `Migrating` as it is (`settle_terminal`, since the list renders
 /// anyway) until the hard-max backstop turns it into `LoadFailed`, so a stale
@@ -867,15 +867,32 @@ async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> 
         }
         Err(e) => {
             disarm_register_ack(register_ack.generation);
-            // freenet/river#397 Codex review 8/11: RegisterDelegate failed — a
-            // definitive setup failure, and this Err path returns before any load
-            // worker runs. Resolve directly to `LoadFailed` (if still current +
-            // empty) so the user gets Retry immediately rather than waiting for the
-            // hard-max.
-            resolve_load_failed_if_empty(attempt);
+            // The send failed before a load worker could start. Settle this
+            // attempt even with cached rooms showing, or the pill stays on
+            // "Loading your rooms" until the hard-max.
+            settle_register_send_failure(attempt, reload);
             Err(format!("Failed to register chat delegate: {}", e))
         }
     }
+}
+
+/// A `RegisterDelegate` send failed before any load worker started.
+///
+/// Settle `LoadFailed` even when cached rooms are showing. [`Reload::Unanswered`]
+/// does not own the load once a list response has claimed this attempt; that
+/// is the same question as [`should_relist`], read inside the deferred write
+/// so a listing that lands first is not overwritten. A superseded attempt
+/// writes nothing.
+fn settle_register_send_failure(attempt: u32, reload: Reload) {
+    crate::util::defer(move || {
+        if !load_attempt_is_current(attempt)
+            || !should_relist(reload, list_answered_this_attempt(attempt))
+        {
+            return;
+        }
+        mark_fetch_failure_if_current(attempt);
+        write_load_state_now(RoomsLoadState::LoadFailed);
+    });
 }
 
 /// How long the room load waits for the node's reply to `RegisterDelegate`
@@ -1140,7 +1157,10 @@ pub(crate) fn on_current_delegate_missing() {
         }
         MissingAction::FailLoad => {
             mark_fetch_failure_if_current(attempt);
-            resolve_load_failed_if_empty(attempt);
+            // A reconnect keeps cached rooms. LoadFailed either way, or the
+            // attempt stays Loading and the pill says "Loading your rooms"
+            // until the hard-max (see on_current_list_refused).
+            set_load_state_if_current(attempt, RoomsLoadState::LoadFailed);
         }
         MissingAction::Ignore => {}
     }
@@ -1163,18 +1183,31 @@ pub(crate) fn is_current_list_refusal(err_text: &str, list_outstanding: bool) ->
 
 /// The current delegate refused this attempt's room listing (an index it
 /// cannot read). No `ListResponse` will start the load, so fail the attempt
-/// now and show Retry rather than wait out the backstop and show "no rooms".
-/// Returns whether the error was such a refusal.
-pub(crate) fn on_current_list_refused(err_text: &str) -> bool {
+/// now rather than wait out the 60 s backstop.
+///
+/// `LoadFailed` is written even with rooms showing: a reconnect keeps cached
+/// rooms, and leaving the attempt in `Loading` holds the pill on "Loading your
+/// rooms" until the backstop. The rail keeps its list.
+pub(crate) fn on_current_list_refused(err_text: &str) {
     if !is_current_list_refusal(err_text, list_outstanding_this_attempt()) {
-        return false;
+        return;
     }
     let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
     let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
-    warn!("The chat delegate refused the room listing; showing Retry (freenet/river#592)");
+    warn!("The chat delegate refused the room listing; failing the load (freenet/river#592)");
     mark_fetch_failure_if_current(attempt);
-    resolve_load_failed_if_empty(attempt);
-    true
+    set_load_state_if_current(attempt, RoomsLoadState::LoadFailed);
+}
+
+/// Test hook (example-data + no-sync builds only): start a load attempt with
+/// its current-delegate room listing outstanding, the state
+/// `fire_list_rooms_request` leaves a real load in. `begin_load_attempt`
+/// defers its own signal write.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub(crate) fn test_begin_listed_load() {
+    begin_load_attempt();
+    let attempt = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    LIST_OUTSTANDING.store(attempt.wrapping_add(1), Ordering::Relaxed);
 }
 
 /// What a current-delegate "missing" answer does to load attempt `attempt`.
@@ -1320,6 +1353,22 @@ mod tests {
             "error while executing operation in the network: execution error: runtime: trap",
             true
         ));
+    }
+
+    /// See `on_current_list_refused` for why cached rooms must not hold `Loading`.
+    #[test]
+    fn missing_delegate_after_registration_settles_even_with_cached_rooms() {
+        let production = chat_delegate_production();
+        let missing = fn_body(&production, "pub(crate) fn on_current_delegate_missing(");
+        let fail_at = missing
+            .find("MissingAction::FailLoad => {")
+            .expect("FailLoad arm");
+        let ignore_at = missing[fail_at..]
+            .find("MissingAction::Ignore")
+            .expect("Ignore arm");
+        let fail_arm = &missing[fail_at..fail_at + ignore_at];
+        assert!(fail_arm.contains("set_load_state_if_current(attempt, RoomsLoadState::LoadFailed)"));
+        assert!(!fail_arm.contains("resolve_load_failed_if_empty"));
     }
     use ed25519_dalek::SigningKey;
 
@@ -1630,6 +1679,60 @@ mod tests {
         assert!(should_relist(Reload::All, true));
         assert!(should_relist(Reload::Unanswered, false));
         assert!(!should_relist(Reload::Unanswered, true));
+    }
+
+    /// A failed register send uses that same answer. `Reload::All` always
+    /// settles. `Reload::Unanswered` does not once the list was claimed, and
+    /// that read sits inside the deferred write with the generation check, so
+    /// a listing that lands first is not overwritten.
+    #[test]
+    fn failed_register_send_settles_unless_the_list_was_answered() {
+        let production = chat_delegate_production();
+        let settle = fn_body(&production, "fn settle_register_send_failure(");
+        let current = settle
+            .find("load_attempt_is_current(attempt)")
+            .expect("the deferred write must re-check the attempt");
+        let answered = settle
+            .find("should_relist(reload, list_answered_this_attempt(attempt))")
+            .expect("an answered list must keep a late register error from settling");
+        let mark = settle
+            .find("mark_fetch_failure_if_current(attempt)")
+            .expect("a settling register error must record the fetch failure");
+        let write = settle
+            .find("write_load_state_now(RoomsLoadState::LoadFailed)")
+            .expect("a settling register error must write LoadFailed");
+        let early_return = settle.find("return;").expect("the guard must return");
+        assert!(
+            settle.find("crate::util::defer(").unwrap() < current
+                && current < answered
+                && answered < early_return
+                && early_return < mark
+                && mark < write,
+            "check the attempt and the answered list before marking or writing"
+        );
+
+        let register = fn_body(&production, "async fn register_then_load(");
+        assert_eq!(
+            register.matches("settle_register_send_failure(").count(),
+            1,
+            "only the send-error arm settles"
+        );
+        for arm in [
+            "RegisterAckWait::Failed => {",
+            "RegisterAckWait::TimedOut => {",
+        ] {
+            let at = register
+                .find(arm)
+                .unwrap_or_else(|| panic!("`{arm}` must be handled"));
+            let next = register[at + arm.len()..]
+                .find("RegisterAckWait::")
+                .unwrap_or_else(|| panic!("`{arm}` must be followed by another wait arm"));
+            let body = &register[at..at + arm.len() + next];
+            assert!(
+                !body.contains("settle_register_send_failure") && !body.contains("LoadFailed"),
+                "`{arm}` must still load rooms, not fail the attempt"
+            );
+        }
     }
 
     /// freenet/river#757 wiring for the list-first load's edges: a stale
@@ -4433,25 +4536,11 @@ mod tests {
 
     /// freenet/river#397 Codex review 8: `set_up_chat_delegate` (initial +
     /// reconnect/wake) begins a fresh load attempt BEFORE `RegisterDelegate`, and
-    /// its `RegisterDelegate` `Err` path resolves the load (LoadFailed if empty)
+    /// its `RegisterDelegate` `Err` path settles the load even with cached rooms,
     /// so a registration failure doesn't leave the rail stuck `Loading`. The
     /// response handler must NOT arm the backstop.
     #[test]
     fn set_up_chat_delegate_begins_load_attempt_before_register() {
-        let self_src = include_str!("chat_delegate.rs");
-        let self_production = self_src
-            .split("mod tests {")
-            .next()
-            .expect("production code before `mod tests`");
-        let setup_idx = self_production
-            .find("pub async fn set_up_chat_delegate()")
-            .expect("set_up_chat_delegate must exist");
-        let setup_end = self_production[setup_idx..]
-            .find("Per-session dedup map for")
-            .map(|i| setup_idx + i)
-            .unwrap_or(self_production.len());
-        let setup_body = &self_production[setup_idx..setup_end];
-
         // freenet/river#757: the begin must precede BOTH ways a setup pass
         // first talks to the delegate, the list-first send and the
         // register-first path, so either failing has an armed hard-max.
@@ -4475,14 +4564,18 @@ mod tests {
              so even a registration or list failure has an armed hard-max"
         );
 
-        // The RegisterDelegate Err path resolves the load (P2#1).
-        let err_arm = setup_body
-            .find("Failed to register chat delegate")
+        // The RegisterDelegate Err path settles the load, cached rooms included.
+        let production = chat_delegate_production();
+        let register = fn_body(&production, "async fn register_then_load(");
+        let err_at = register
+            .find("Err(e) => {")
             .expect("the RegisterDelegate error arm must exist");
-        let err_ctx = &setup_body[err_arm.saturating_sub(200)..err_arm];
+        let err_arm = &register[err_at..];
         assert!(
-            err_ctx.contains("resolve_load_failed_if_empty(attempt)"),
-            "the RegisterDelegate error path must resolve LoadFailed (attempt-gated, review 11)"
+            err_arm.contains("disarm_register_ack(register_ack.generation);")
+                && err_arm.contains("settle_register_send_failure(attempt, reload);")
+                && err_arm.contains("Err(format!(\"Failed to register chat delegate: {}\", e))"),
+            "a failed register send must disarm its waiter, settle the attempt, and return the error"
         );
 
         // And the response handler must NOT arm the backstop.
@@ -4604,10 +4697,10 @@ mod tests {
     }
 
     /// freenet/river#397 review 5/7/11: `fire_list_rooms_request` runs OUTSIDE any
-    /// load worker, ACROSS an awaited send. It captures the attempt and routes its
-    /// serialize/send-error writes through the ATTEMPT-GATED helpers
-    /// (`mark_fetch_failure_if_current` + `resolve_load_failed_if_empty(attempt)`),
-    /// so a reconnect mid-send isn't polluted.
+    /// load worker, ACROSS an awaited send. It captures the attempt and routes
+    /// both serialize/send-error exits through the attempt-gated helpers,
+    /// settling `LoadFailed` even when cached rooms are showing, so a reconnect
+    /// mid-send isn't polluted and the pill does not wait out the hard-max.
     #[test]
     fn list_request_send_failure_marks_fetch_failure() {
         // `fire_list_rooms_request` is defined AFTER this mid-file test module;
@@ -4634,15 +4727,15 @@ mod tests {
             "both the serialize-error and send-error arms must mark_fetch_failure_if_current(attempt)"
         );
         assert_eq!(
-            body.matches("resolve_load_failed_if_empty(attempt)").count(),
+            body.matches("set_load_state_if_current(attempt, RoomsLoadState::LoadFailed)")
+                .count(),
             2,
-            "both error arms must resolve LoadFailed via the attempt-gated helper (P2#2 + review 11)"
+            "both error arms must settle LoadFailed for this attempt, cached rooms included"
         );
-        // No bare (ungated) forms survive.
         assert!(
             !body.contains("mark_fetch_failure();")
-                && !body.contains("resolve_load_failed_if_empty();"),
-            "no ungated bare marks/resolves may survive in fire_list_rooms_request"
+                && !body.contains("resolve_load_failed_if_empty"),
+            "no ungated bare marks, and no empty-map resolve, in fire_list_rooms_request"
         );
     }
 
@@ -4665,7 +4758,6 @@ mod tests {
         for def in [
             "pub(crate) fn set_load_state_if_current(attempt: u32, state: RoomsLoadState) {",
             "pub(crate) fn mark_fetch_failure_if_current(attempt: u32) {",
-            "pub(crate) fn resolve_load_failed_if_empty(attempt: u32) {",
         ] {
             // At least the definition (last occurrence) — and `set_load_state_if_current`
             // routes through `write_load_state_now` inside the gated closure.
@@ -4677,6 +4769,10 @@ mod tests {
                 "must be a production def"
             );
         }
+        assert!(
+            !chat_delegate_production().contains("resolve_load_failed_if_empty"),
+            "a failed list or register send settles with cached rooms; the empty-map resolve is gone"
+        );
         // set_load_state_if_current checks the attempt inside the deferred write.
         let helper = src
             .rfind("pub(crate) fn set_load_state_if_current(attempt: u32, state: RoomsLoadState) {")
@@ -7970,12 +8066,11 @@ async fn fire_list_rooms_request() {
     let mut payload = Vec::new();
     if let Err(e) = ciborium::ser::into_writer(&request, &mut payload) {
         error!("Failed to serialize list-rooms request: {}", e);
-        // freenet/river#397 Codex review 5/7/11: the initial list request
-        // definitively failed, so the load can never resolve on its own (no
-        // ListResponse → no worker). Record the failure AND resolve LoadFailed now
-        // (if still current + empty) rather than wait for the hard-max / show Empty.
+        // The list never leaves, so no ListResponse starts a worker. Record
+        // the failure and settle LoadFailed now, cached rooms included:
+        // leaving `Loading` holds the pill until the hard-max.
         mark_fetch_failure_if_current(attempt);
-        resolve_load_failed_if_empty(attempt);
+        set_load_state_if_current(attempt, RoomsLoadState::LoadFailed);
         return;
     }
 
@@ -8008,12 +8103,10 @@ async fn fire_list_rooms_request() {
     if let Err(e) = api_result {
         let _ = claim_outstanding_list(&LIST_OUTSTANDING, attempt);
         error!("Failed to send list-rooms request: {}", e);
-        // freenet/river#397 Codex review 5/7/11: the SEND itself failed (no
-        // response will ever come, no worker), so mark the attempt failed AND
-        // resolve LoadFailed now (if still current + empty) instead of a silent
-        // Empty / hard-max wait.
+        // The send itself failed, so no response will start a worker. Record
+        // the failure and settle LoadFailed now, cached rooms included.
         mark_fetch_failure_if_current(attempt);
-        resolve_load_failed_if_empty(attempt);
+        set_load_state_if_current(attempt, RoomsLoadState::LoadFailed);
     } else {
         info!("List-rooms request sent, response will be handled by message loop");
     }
@@ -8152,7 +8245,7 @@ fn should_defer_cache_only_save(elapsed_ms: f64) -> bool {
 /// inheriting the 5-minute debounce. Getting that backwards could delay
 /// persisting key material, and `self_sk` cannot be re-derived from the network
 /// — losing it loses the user's identity in that room.
-fn critical_hash(room_data: &RoomData) -> Option<u64> {
+pub(crate) fn critical_hash(room_data: &RoomData) -> Option<u64> {
     let mut probe = room_data.clone();
     probe.room_state = Default::default();
     probe.last_read_message_id = None;
@@ -11349,11 +11442,12 @@ fn write_load_state_now(state: RoomsLoadState) {
 
 /// UNIFORM attempt-gated load-state write (freenet/river#397 Codex review 11).
 /// EVERY write to `ROOMS_LOAD_STATE` that runs in or after an `.await` MUST route
-/// through this (or the `LoadWorkerGuard` helpers, which delegate to it) with the
-/// attempt captured at its async context's START. Deferred, and the attempt is
-/// re-checked INSIDE the defer (at the write moment), so a superseded attempt's
-/// late write is a no-op — closing the "stale async write lands on the new
-/// attempt" class by construction.
+/// through this (or the `LoadWorkerGuard` helpers, which delegate to it, or
+/// `settle_register_send_failure`, which also re-checks whether the list was
+/// already answered) with the attempt captured at its async context's START.
+/// Deferred, and the attempt is re-checked INSIDE the defer (at the write
+/// moment), so a superseded attempt's late write is a no-op — closing the
+/// "stale async write lands on the new attempt" class by construction.
 pub(crate) fn set_load_state_if_current(attempt: u32, state: RoomsLoadState) {
     crate::util::defer(move || {
         if load_attempt_is_current(attempt) {
@@ -11371,22 +11465,6 @@ pub(crate) fn mark_fetch_failure_if_current(attempt: u32) {
     if load_attempt_is_current(attempt) {
         mark_fetch_failure();
     }
-}
-
-/// Resolve to `LoadFailed` IF the rooms map is currently empty AND `attempt` is
-/// still current — for a DEFINITIVE stored-data failure discovered OUTSIDE any
-/// live load worker (so no worker settlement resolves it) that may run AFTER the
-/// state already reached a terminal `Loaded`(Empty) (freenet/river#397 review
-/// 7/11). Deferred; both the attempt and emptiness are checked inside the defer
-/// (at the write moment). A non-empty map is left as `List`. Used by
-/// `fire_list_rooms_request`'s send/serialize errors and `set_up_chat_delegate`'s
-/// RegisterDelegate failure.
-pub(crate) fn resolve_load_failed_if_empty(attempt: u32) {
-    crate::util::defer(move || {
-        if load_attempt_is_current(attempt) && rooms_map_is_empty() {
-            write_load_state_now(RoomsLoadState::LoadFailed);
-        }
-    });
 }
 
 /// Called when a load worker drops (and by the fire-and-forget legacy-probe path
@@ -11961,6 +12039,12 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // (freenet/river#763). Every merge this sweep's responses make is gated by
     // the journal (`migration_journal::gate_sweep_import`).
     true
+}
+
+/// Whether a legacy sweep is still sending its waves (the legacy-copy
+/// cleanup starts once it is not).
+pub(crate) fn legacy_sweep_pacing() -> bool {
+    SWEEP_RUNNING_FOR.load(Ordering::Relaxed) != 0
 }
 
 /// Bumped by every sweep that starts; a pacing sweep whose epoch is no longer

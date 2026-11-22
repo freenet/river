@@ -562,7 +562,11 @@ impl LiveRoom {
         let mut messages = Vec::with_capacity(shown.len());
         for (i, m) in shown.iter().enumerate() {
             let id = i as model::MessageId + 1;
-            let reply_to = self.reply_target(&m.message.content).and_then(|target| {
+            // A reply names its target by id. One whose target is not shown (pruned, deleted,
+            // moderated, or not arrived yet) keeps no quote, as the web UI shows none: it is
+            // drawn as unavailable until the target appears.
+            let target = self.reply_target(&m.message.content);
+            let reply_to = target.clone().and_then(|target| {
                 let target_id = *message_ids.get(&target)?;
                 let t = shown[target_id as usize - 1];
                 Some(ReplyTo {
@@ -571,6 +575,7 @@ impl LiveRoom {
                     preview: model::preview(&texts[target_id as usize - 1], REPLY_PREVIEW_CHARS),
                 })
             });
+            let reply_gone = target.is_some() && reply_to.is_none();
             let mut reactions: Vec<Reaction> = state
                 .recent_messages
                 .reactions(&m.id())
@@ -596,6 +601,7 @@ impl LiveRoom {
                     .map(|w| self.render_md(w))
                     .unwrap_or_default(),
                 reply_to,
+                reply_gone,
                 reactions,
                 edited: state.recent_messages.is_edited(&m.id()),
                 pending: None,

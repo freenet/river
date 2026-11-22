@@ -656,3 +656,125 @@ fn a_secret_blob_that_does_not_decrypt_is_skipped() {
     let room = LiveRoom::new(stored).view(&minutes);
     assert_eq!(room.name, "Secret garden");
 }
+
+// A reply whose target is not in the room, built through the real conversion.
+
+/// The reply from `private_state` alone: its target ("Hello ...") is not shown.
+fn state_with_only_the_reply(mut state: ChatRoomStateV1) -> ChatRoomStateV1 {
+    state.recent_messages.messages = state
+        .recent_messages
+        .messages
+        .iter()
+        .filter(|m| m.message.time == SystemTime::UNIX_EPOCH + Duration::from_secs(120))
+        .cloned()
+        .collect();
+    assert_eq!(state.recent_messages.messages.len(), 1);
+    state
+}
+
+fn strip_of(rt: &rune::Runtime<crate::RiverApp>, message_key: &str) -> rune::ElementInfo {
+    rt.elements()
+        .into_iter()
+        .find(|e| e.path.ends_with(&format!("msg-{message_key}/reply")))
+        .unwrap_or_else(|| panic!("no strip on {message_key}"))
+}
+
+fn render(room: crate::chat::Room) -> rune::Runtime<crate::RiverApp> {
+    let mut s = crate::RiverApp::detached();
+    s.setup = crate::Setup::Connected {
+        version: "0.2.155".into(),
+    };
+    s.chat = crate::chat::Chat::new(
+        crate::chat::Source::Node(crate::chat::LinkStatus::Live),
+        Vec::new(),
+        0,
+        0,
+        0,
+    );
+    s.chat
+        .show_node_rooms(vec![room], None, crate::chat::LinkStatus::Live, 29_000_000);
+    let mut rt = rune::Runtime::new(
+        s,
+        crate::view,
+        crate::WINDOW_SIZE,
+        rune::Env {
+            system_dark: true,
+            scale: 1.0,
+        },
+    );
+    rt.frame(0.0);
+    for i in 1..=30 {
+        rt.frame(f64::from(i) * 0.05);
+    }
+    rt
+}
+
+#[test]
+fn a_reply_to_a_message_the_room_does_not_show_is_kept_as_unavailable() {
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(state_with_only_the_reply(f.private_state()))).view(&minutes);
+    assert_eq!(room.messages.len(), 1);
+    let reply = &room.messages[0];
+    assert!(reply.reply_to.is_none(), "there is no target to quote");
+    assert!(reply.reply_gone, "but it is a reply");
+    // A plain message is not a reply.
+    let plain = f.private_state();
+    let room = LiveRoom::new(f.stored(plain)).view(&minutes);
+    assert!(!room.messages[0].reply_gone);
+    assert!(!room.messages[1].reply_gone);
+}
+
+#[test]
+fn the_unavailable_strip_is_drawn_for_it_and_cannot_be_pressed() {
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(state_with_only_the_reply(f.private_state()))).view(&minutes);
+    let key = room.messages[0].key.clone();
+    let mut rt = render(room);
+    let strip = strip_of(&rt, &key);
+    assert_ne!(strip.role, "button");
+    assert!(
+        rt.elements()
+            .into_iter()
+            .any(|e| e.text.as_deref() == Some("Original message unavailable"))
+    );
+    // Pressing it does nothing.
+    let (x, y) = rt.find(&strip.path).expect("drawn");
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(1.0);
+    assert!(rt.state.chat.pending_reveal().is_none());
+    assert_eq!(rt.state.chat.flashing(), None);
+}
+
+#[test]
+fn a_reply_that_arrives_before_its_target_becomes_a_jump_when_the_target_does() {
+    let f = Fixture::new();
+    let full = f.private_state();
+    let target = full
+        .recent_messages
+        .messages
+        .iter()
+        .find(|m| m.message.time == SystemTime::UNIX_EPOCH + Duration::from_secs(60))
+        .cloned()
+        .expect("the target");
+    let mut live = LiveRoom::new(f.stored(state_with_only_the_reply(full.clone())));
+    assert!(live.view(&minutes).messages[0].reply_gone);
+    live.apply_delta(river_core::room_state::ChatRoomStateV1Delta {
+        recent_messages: Some(vec![target]),
+        ..Default::default()
+    })
+    .expect("the target arrives");
+    let room = live.view(&minutes);
+    let reply = room
+        .messages
+        .iter()
+        .find(|m| m.text == "Hi Olive")
+        .expect("the reply");
+    assert!(!reply.reply_gone);
+    let quoted = reply.reply_to.as_ref().expect("now it quotes");
+    assert!(room.messages.iter().any(|m| m.id == quoted.message));
+    let key = reply.key.clone();
+    let rt = render(room);
+    let strip = strip_of(&rt, &key);
+    assert_eq!(strip.role, "button");
+}

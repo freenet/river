@@ -91,20 +91,26 @@ fn the_connection_dot_follows_the_link_status() {
     use super::view::connection_pill;
     use super::{LinkStatus::*, Source};
     let p = super::style::palette();
-    let words = |s| connection_pill(s, None, &p).text;
+    let words = |s| connection_pill(s, false, &p).text;
     assert_eq!(words(Source::Node(Live)), "Connected");
     assert_eq!(words(Source::Node(Loading)), "Connecting...");
     assert_eq!(words(Source::Node(Reconnecting)), "Disconnected");
-    assert_eq!(connection_pill(Source::Node(Live), None, &p).dot, p.success);
     assert_eq!(
-        connection_pill(Source::Node(Loading), None, &p).dot,
+        connection_pill(Source::Node(Live), false, &p).dot,
+        p.success
+    );
+    assert_eq!(
+        connection_pill(Source::Node(Loading), false, &p).dot,
         p.warning
     );
     assert_eq!(
-        connection_pill(Source::Node(Reconnecting), None, &p).dot,
+        connection_pill(Source::Node(Reconnecting), false, &p).dot,
         p.error
     );
-    assert_eq!(connection_pill(Source::Example, None, &p).dot, p.text_muted);
+    assert_eq!(
+        connection_pill(Source::Example, false, &p).dot,
+        p.text_muted
+    );
     // Each state is on screen, with its dot and a tooltip.
     for (status, text) in [
         (Live, "Connected"),
@@ -924,6 +930,7 @@ fn a_room_read_here_counts_unread_from_where_it_was_read() {
             source: "new".into(),
             md: String::new(),
             reply_to: None,
+            reply_gone: false,
             reactions: vec![],
             edited: false,
             pending: None,
@@ -939,6 +946,7 @@ fn a_room_read_here_counts_unread_from_where_it_was_read() {
         source: "mine".into(),
         md: String::new(),
         reply_to: None,
+        reply_gone: false,
         reactions: vec![],
         edited: false,
         pending: None,
@@ -2434,9 +2442,9 @@ fn a_link_in_the_header_description_opens_the_page_not_the_dialog() {
 #[test]
 fn the_room_name_opens_the_details_from_the_keyboard() {
     let mut rt = render(connected(), WINDOW_SIZE);
-    // Tab reaches the name (after the connection dot in the room list); Space presses it, as
-    // it does any button.
-    for _ in 0..3 {
+    // Tab reaches the name (after the Do not disturb row and the connection dot in the room
+    // list); Space presses it, as it does any button.
+    for _ in 0..4 {
         key(&mut rt, Key::Tab);
         if rt
             .elements()
@@ -3645,6 +3653,7 @@ fn chat_with_chip(chip: impl Fn(&str) -> String) -> (Runtime<RiverApp>, String) 
             source: String::new(),
             md,
             reply_to: None,
+            reply_gone: false,
             reactions: Vec::new(),
             edited: false,
             pending: None,
@@ -5742,8 +5751,6 @@ const KIT_DIALOGS: &[(&str, &str, &str, Option<&str>)] = &[
         "node-back",
         Some("node-confirm"),
     ),
-    ("chat-dnd", "dnd", "dnd-close", None),
-    ("chat-background", "background", "background-close", None),
     ("chat-shortcuts", "shortcuts", "shortcuts-close", None),
     (
         "chat-dm-purge-confirm",
@@ -5853,14 +5860,15 @@ fn every_scaffold_dialog_puts_dismiss_left_of_the_primary_button() {
     }
 }
 
+/// Quit River is in Settings now, below the switches and drawn as a danger button; it is not a
+/// footer button of a dialog of its own any more.
 #[test]
-fn quit_river_is_apart_at_the_left_and_close_is_rightmost() {
-    let rt = scene_runtime("chat-background");
-    let (qx, _) = rt.find("background-quit").expect("Quit River");
-    let (cx, _) = rt.find("background-close").expect("Close");
-    let (bx, _) = rt.find("background-body").expect("the body");
-    assert!(qx < cx, "Quit River is left of Close");
-    assert!(qx < bx + 120.0, "Quit River sits at the left edge");
+fn quit_river_is_apart_below_the_background_switches() {
+    let rt = scene_runtime("chat-settings-background");
+    let y = |k: &str| rt.find(k).unwrap_or_else(|| panic!("no {k}")).1;
+    assert!(y("background-quit") > y("background-start-at-login"));
+    assert!(y("background-quit") > y("background-close-to-tray"));
+    assert!(rt.find("background-dialog").is_none());
 }
 
 /// The dismiss button of every dialog is reachable with Tab, and pressing it closes the dialog.
@@ -6452,7 +6460,8 @@ mod rune_bump {
     /// keyboard, the thread's box takes it and Escape gives it back to the composer; Rune's
     /// focus agrees at each step. Opened by a click on its row the composer has already lost
     /// the keyboard to the click, so nothing is handed back and Rune puts the keyboard on the
-    /// first control it can (the connection pill), which River's flag also reports as not the
+    /// control it can (see the assertion: the "Change node" link when the connection is not
+    /// live, the connection pill when it is), which River's flag also reports as not the
     /// composer.
     #[test]
     fn a_dm_thread_takes_the_keyboard_and_gives_it_back_as_documented() {
@@ -6489,7 +6498,19 @@ mod rune_bump {
         settle_frames(&mut rt);
         assert!(rt.find("dm-thread").is_none());
         assert!(!rt.state.chat.composer.focused);
-        assert_eq!(rune_focus(&mut rt).as_deref(), Some("connection-pill"));
+        // Rune puts the keyboard on a control of the footer's connection row, and which one
+        // follows from the source: the quiet "Change node" link exists in every state but a
+        // live connection, and then the pill is the row's only control.
+        let expected = match rt.state.chat.source {
+            crate::chat::Source::Node(crate::chat::LinkStatus::Live) => "connection-pill",
+            _ => "node-change",
+        };
+        assert_eq!(
+            rune_focus(&mut rt).as_deref(),
+            Some(expected),
+            "source {:?}",
+            rt.state.chat.source
+        );
         assert_composer_focus_agrees(&mut rt, "after a click-opened thread closes");
     }
 

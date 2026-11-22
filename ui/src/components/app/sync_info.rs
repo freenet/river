@@ -365,6 +365,20 @@ impl SyncInfo {
         self.map.get(owner_key).map(|info| &info.sync_status)
     }
 
+    /// Connection-pill activity only counts registered, live rooms. A room
+    /// with previously synced state keeps retrying after the initial-sync
+    /// bound, but its activity indicator can still settle.
+    pub(crate) fn has_syncing_rooms(&self, live_keys: &[VerifyingKey]) -> bool {
+        live_keys.iter().any(|k| {
+            self.map.get(k).is_some_and(|info| {
+                matches!(
+                    info.sync_status,
+                    RoomSyncStatus::Disconnected | RoomSyncStatus::Subscribing
+                ) && info.failed_sync_attempts < MAX_SYNC_ATTEMPTS_BEFORE_ERROR
+            })
+        })
+    }
+
     pub fn get_owner_vk_for_instance_id(
         &self,
         instance_id: &ContractInstanceId,
@@ -587,6 +601,45 @@ pub enum RoomSyncStatus {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn pill_sync_activity_ignores_stale_unregistered_and_settled_rooms() {
+        let mut info = SyncInfo::new();
+        let live = test_owner(1);
+        let stale = test_owner(2);
+        info.register_new_room(stale);
+        assert!(!info.has_syncing_rooms(&[live]));
+        info.register_new_room(live);
+        for (status, expected) in [
+            (RoomSyncStatus::Disconnected, true),
+            (RoomSyncStatus::Subscribing, true),
+            (RoomSyncStatus::Subscribed, false),
+            (
+                RoomSyncStatus::Error(ErrorReport::new(LABEL_ROOM_NOT_FOUND, "gone", "gone")),
+                false,
+            ),
+        ] {
+            info.update_sync_status(&live, status);
+            assert_eq!(info.has_syncing_rooms(&[live]), expected);
+        }
+    }
+
+    #[test]
+    fn pill_sync_activity_stops_at_the_bound_even_if_the_room_retries() {
+        let mut info = SyncInfo::new();
+        let live = test_owner(3);
+        info.register_new_room(live);
+        for _ in 1..MAX_SYNC_ATTEMPTS_BEFORE_ERROR {
+            assert!(info.record_failed_sync_attempt(&live, false));
+        }
+        assert!(info.has_syncing_rooms(&[live]));
+        assert!(info.record_failed_sync_attempt(&live, false));
+        assert_eq!(
+            info.get_sync_status(&live),
+            Some(&RoomSyncStatus::Disconnected)
+        );
+        assert!(!info.has_syncing_rooms(&[live]));
+    }
 
     fn test_owner(seed: u8) -> VerifyingKey {
         SigningKey::from_bytes(&[seed; 32]).verifying_key()

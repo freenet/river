@@ -229,6 +229,9 @@ pub struct Message {
     /// message, whose `text` is then shown as plain text.
     pub md: String,
     pub reply_to: Option<ReplyTo>,
+    /// A reply whose target is not in the room (pruned, deleted, moderated): drawn as "Original
+    /// message unavailable", as the web UI does. `reply_to` is then `None`.
+    pub reply_gone: bool,
     pub reactions: Vec<Reaction>,
     pub edited: bool,
     /// `Some` for a message of yours still on its way, or one that failed.
@@ -419,6 +422,7 @@ impl Room {
             source: text.to_owned(),
             md: text.to_owned(),
             reply_to: None,
+            reply_gone: false,
             reactions: Vec::new(),
             edited: false,
             pending: None,
@@ -736,6 +740,7 @@ mod tests {
             source: String::new(),
             md: String::new(),
             reply_to: None,
+            reply_gone: false,
             reactions: vec![],
             edited: false,
             pending: None,

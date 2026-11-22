@@ -18,6 +18,7 @@ use crate::components::back_to_chat::BackToChatButton;
 use crate::components::icons::{
     line_icon, IMPORT_ICON_PATH, JOIN_ICON_PATH, LOCK_ICON_PATH, PLUS_ICON_PATH, REORDER_ICON_PATH,
 };
+use crate::components::loading_dots::{SmallDots, WaveDots};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
 use crate::components::room_list::dm_rail_section::DmRailSection;
 use crate::components::room_list::join_with_code_modal::JoinWithCodeModal;
@@ -43,7 +44,7 @@ const TAIL_DROP_ZONE_KEY: &str = "room-reorder-tail-drop-zone";
 // the element across transitions.
 const ROOM_LIST_STATE_KEY: &str = "room-list-state";
 
-// Stable Dioxus key for the "Restoring more rooms…" note (freenet/river#802).
+// Stable Dioxus key for the "Restoring more rooms" note (freenet/river#802).
 const RESTORING_MORE_KEY: &str = "room-list-restoring-more";
 
 /// What the rooms rail shows in place of the room list (freenet/river#397).
@@ -53,9 +54,9 @@ const RESTORING_MORE_KEY: &str = "room-list-restoring-more";
 /// non-empty list always wins.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RoomListDisplay {
-    /// Initial load hasn't resolved yet — subtle spinner + "Loading your rooms…".
+    /// Initial load hasn't resolved yet — wave dots + "Loading your rooms".
     Loading,
-    /// A delegate/room migration is recovering rooms — spinner + "Migrating…".
+    /// A delegate/room migration is recovering rooms — wave dots + "Migrating…".
     Migrating,
     /// Load resolved and the user genuinely has no rooms — calm empty state.
     Empty,
@@ -71,7 +72,7 @@ pub(crate) enum RoomListDisplay {
 ///
 /// A non-empty room list ALWAYS renders the list — once there's something to
 /// show, load/migration bookkeeping is irrelevant. Only when `room_count == 0`
-/// do we disambiguate the non-room states: `Loading`/`Migrating` spinners, the
+/// do we disambiguate the non-room states: `Loading`/`Migrating` indicators, the
 /// `LoadFailed` error+retry block, and the calm `Empty`. `Empty` is reached ONLY
 /// from `Loaded`, so an unresolved / migrating / failed load never shows "no
 /// rooms yet".
@@ -91,7 +92,7 @@ pub(crate) fn room_list_display_state(
     }
 }
 
-/// Whether the rail shows a "Restoring more rooms…" note under a list that is
+/// Whether the rail shows a "Restoring more rooms" note under a list that is
 /// already showing (freenet/river#802). Once one room has loaded the rail
 /// shows the list, so without it a partly restored list looked final while a
 /// migration was still bringing rooms back. `walk_restoring` is the journaled
@@ -294,9 +295,8 @@ pub fn RoomList() -> Element {
                 // A room is "awaiting sync" only while it has placeholder state
                 // AND has not been given up on. Once a placeholder room reaches
                 // a terminal Error (the bounded contract-absent case,
-                // freenet/river#290, or a failed GET/PUT send) the spinner must
-                // stop, so we surface an error marker (tooltip = the stored
-                // error message) instead of a perpetual spinner.
+                // freenet/river#290, or a failed GET/PUT send), show an error
+                // marker with the stored error message in its tooltip.
                 //
                 // Scoped to placeholder-state rooms: a fully-synced room that
                 // later hits some other transient `Error` should not show the
@@ -304,7 +304,7 @@ pub fn RoomList() -> Element {
                 let sync_error: Option<ErrorReport> = if room_data.is_awaiting_initial_sync() {
                     // Second fallible read in this memo, so it nudges too: a
                     // contended pass drops the SYNC_INFO subscription and the
-                    // room's error marker silently reads as a spinner until an
+                    // room's error marker silently shows loading dots until an
                     // unrelated signal moves (freenet/river#555).
                     let status = match SYNC_INFO.try_read() {
                         Ok(si) => si.get_sync_status(&room_key).cloned(),
@@ -388,8 +388,8 @@ pub fn RoomList() -> Element {
     // room there is nothing to reorder.
     let room_count: usize = room_items.read().len();
 
-    // Rail display state (freenet/river#397): the list, a loading spinner, a
-    // migrating spinner, the failed block, or the calm empty state.
+    // Rail display state (freenet/river#397): the list, loading or migration
+    // progress, the failed block, or the calm empty state.
     //
     // Through the SHARED reader, which the conversation panel's no-room screen
     // also calls (freenet/river#509). Deriving it separately here is what let
@@ -493,7 +493,7 @@ pub fn RoomList() -> Element {
                 }
             }
 
-            // Announces the "Restoring more rooms…" note to screen readers.
+            // Announces the "Restoring more rooms" note to screen readers.
             // Always mounted, with only its text toggled: a live region
             // inserted together with its content is not reliably announced.
             div {
@@ -501,7 +501,7 @@ pub fn RoomList() -> Element {
                 role: "status",
                 "aria-live": "polite",
                 "data-testid": "room-list-restoring-status",
-                if restoring_more { "Restoring more rooms…" }
+                if restoring_more { "Restoring more rooms" }
             }
 
             // Room list
@@ -511,17 +511,16 @@ pub fn RoomList() -> Element {
 
                 // Non-room states (freenet/river#397). Shown only when there are
                 // no rooms to render — the room-item map and tail drop zone below
-                // produce nothing while empty, so this is purely additive. A
-                // subtle, near-monochrome block: spinner (loading/migrating) or a
-                // calm empty-state hint, vertically centred in the rail.
+                // produce nothing while empty. Center the progress, failure or
+                // empty-state hint in the rail.
                 match display {
                     RoomListDisplay::Loading => rsx! {
                         li {
                             key: "{ROOM_LIST_STATE_KEY}",
                             "data-testid": "room-list-loading",
                             class: "flex flex-col items-center justify-center gap-2 py-10 px-4 text-center",
-                            div { class: "animate-spin w-4 h-4 border-2 border-text-muted border-t-transparent rounded-full" }
-                            span { class: "text-sm text-text-muted", "Loading your rooms…" }
+                            WaveDots { test_id: "room-list-loading-dots" }
+                            span { class: "text-sm text-text-muted", "Loading your rooms" }
                         }
                     },
                     RoomListDisplay::Migrating => rsx! {
@@ -529,8 +528,8 @@ pub fn RoomList() -> Element {
                             key: "{ROOM_LIST_STATE_KEY}",
                             "data-testid": "room-list-migrating",
                             class: "flex flex-col items-center justify-center gap-2 py-10 px-4 text-center",
-                            div { class: "animate-spin w-4 h-4 border-2 border-text-muted border-t-transparent rounded-full" }
-                            span { class: "text-sm text-text-muted", "Migrating your rooms…" }
+                            WaveDots { test_id: "room-list-migrating-dots" }
+                            span { class: "text-sm text-text-muted", "Migrating your rooms" }
                             span { class: "text-xs text-text-muted opacity-70", "(one-time step after an update)" }
                         }
                     },
@@ -728,12 +727,12 @@ pub fn RoomList() -> Element {
                                         }
                                     }
                                     if awaiting_sync {
-                                        div { class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0" }
+                                        SmallDots { test_id: "room-sync-dots" }
                                     } else if let Some(report) = sync_error {
                                         // Terminal sync failure for a placeholder room: the
                                         // bounded contract-absent case (freenet/river#290) or a
                                         // failed GET/PUT send. A warning marker instead of a
-                                        // perpetual spinner; its tooltip explains, and it does
+                                        // perpetual loading indicator; its tooltip explains, and it does
                                         // not copy (it sits inside the row's button, which
                                         // still opens the room, whose banner copies).
                                         WithTooltip {
@@ -827,11 +826,8 @@ pub fn RoomList() -> Element {
                         key: "{RESTORING_MORE_KEY}",
                         "data-testid": "room-list-restoring-more",
                         class: "flex items-center gap-2 px-3 py-2 text-xs text-text-muted",
-                        div {
-                            class: "animate-spin w-3 h-3 border-2 border-text-muted border-t-transparent rounded-full flex-shrink-0",
-                            "aria-hidden": "true",
-                        }
-                        span { "Restoring more rooms…" }
+                        SmallDots { test_id: "room-list-restoring-dots" }
+                        span { "Restoring more rooms" }
                     }
                 }
 
@@ -957,7 +953,7 @@ mod tests {
     }
 
     /// freenet/river#397: the initial load hasn't resolved and there are no
-    /// rooms yet → show the loading spinner, NOT a blank list or a premature
+    /// rooms yet → show the loading indicator, NOT a blank list or a premature
     /// "no rooms yet".
     #[test]
     fn loading_with_no_rooms_shows_loading() {
@@ -1023,7 +1019,7 @@ mod tests {
     }
 
     /// freenet/river#802: a list that is showing while a migration still
-    /// restores rooms carries a "Restoring more rooms…" note; a settled list,
+    /// restores rooms carries a "Restoring more rooms" note; a settled list,
     /// or an empty one (which shows the full Migrating state), does not.
     #[test]
     fn restoring_more_rooms_only_under_a_list_while_restoring() {
@@ -1073,7 +1069,7 @@ mod tests {
 
     /// freenet/river#397 (#1 safety invariant): a genuinely-new user, once the
     /// load resolves (`Loaded`) with zero rooms, lands on the calm empty state —
-    /// never a perpetual spinner. (The resolution itself — Loading→Loaded via the
+    /// never perpetual loading dots. (The resolution itself — Loading→Loaded via the
     /// completion signal / backstop — is pinned by the chat_delegate tests.)
     #[test]
     fn new_user_resolves_to_empty_not_stuck_loading() {

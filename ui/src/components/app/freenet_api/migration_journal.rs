@@ -200,7 +200,7 @@ pub(crate) fn a_pending_predecessor_may_hold_data(status: &JournalStatus) -> boo
 /// Whether a journaled walk running now may still bring rooms back: it is
 /// requested or running, and the journal says a pending predecessor may hold
 /// data (it has not been found "not installed") or an import was interrupted.
-/// Drives the rail's "Restoring more rooms…" note while a partly restored list
+/// Drives the rail's "Restoring more rooms" note while a partly restored list
 /// is already showing (freenet/river#802). A walk whose pending predecessors
 /// were all found "not installed" (the usual case once a migration is done)
 /// shows nothing. A predecessor not yet walked, or one that stays silent (it
@@ -780,6 +780,20 @@ pub(crate) fn poke_walk() {
     poke_driver();
 }
 
+/// Ask for a walk if the last status says an import was interrupted. The
+/// legacy-copy cleanup calls it after its pass: a walk this load wanted may
+/// have been gated off while the pass held the slot lock (sweep fan-outs
+/// queued behind it keep the load busy past the walk's quiescence wait).
+pub(crate) fn poke_walk_if_interrupted() {
+    let interrupted = session()
+        .status
+        .as_ref()
+        .is_some_and(|s| s.interrupted_import());
+    if interrupted {
+        poke_walk();
+    }
+}
+
 /// Ask for the post-resolve top-up alone (no walk, so the import gate is not
 /// held Pending for it).
 pub(crate) fn poke_topup() {
@@ -977,6 +991,11 @@ pub(crate) async fn run_work_with<C: RiverDelegateChannel, S: RiverImportSeam>(
     carry: impl FnOnce(crate::avatar_salt::AvatarSeedRecord),
 ) {
     let ops = JOURNAL_OPS.lock().await;
+    // The top-up and the walk read predecessors' keys; the legacy-copy cleanup
+    // (`legacy_cleanup`) rewrites some of them and reads them under the same
+    // delegate-scoped correlation keys. One at a time. Lock order: journal,
+    // then slot fetch; nothing takes them the other way round.
+    let slots = super::response_handler::LEGACY_SLOT_FETCH.lock().await;
     if work.topup {
         if let Some(newest) = lineage.iter().max_by_key(|e| e.generation) {
             match top_up_in_window_with(channel, &mut seam(), &successor, newest, now_ms()).await {
@@ -999,6 +1018,7 @@ pub(crate) async fn run_work_with<C: RiverDelegateChannel, S: RiverImportSeam>(
         let _ = store_walk_cadence(channel, &successor, 0).await;
     }
     let (report, _seam, found_seed) = walk_with(channel, seam(), successor, lineage).await;
+    drop(slots);
     log_migration_report(&report);
     let status = report.status.clone();
     update_session(move |s| s.on_walk_done(status));
@@ -1046,7 +1066,7 @@ mod tests {
         }
     }
 
-    /// freenet/river#802: the rail's "Restoring more rooms…" note follows a
+    /// freenet/river#802: the rail's "Restoring more rooms" note follows a
     /// walk that may still bring rooms, and nothing else.
     #[test]
     fn walk_may_restore_rooms_only_while_a_walk_may_bring_data() {
@@ -2174,6 +2194,62 @@ mod tests {
         );
         // Dropping the import releases the seed lock it holds.
         drop(started);
+    }
+
+    /// The walk reads predecessors under the same correlation keys as the
+    /// legacy-copy cleanup, which holds the slot-fetch lock for its pass: a
+    /// walk must not run until the pass releases it.
+    #[test]
+    fn the_walk_waits_for_the_legacy_cleanup_pass() {
+        use super::super::delegate_migration::tests_support::{
+            successor_key, DelegateSim, MockChannel,
+        };
+        use super::super::delegate_migration::NoImports;
+        let _g = fresh_load();
+        let lineage = river_delegate_lineage(&[([10u8; 32], [110u8; 32])]);
+        let mock = MockChannel::default().with_delegate(&successor_key(), DelegateSim::default());
+        let pass =
+            futures::executor::block_on(super::super::response_handler::LEGACY_SLOT_FETCH.lock());
+        let mut walk: std::pin::Pin<Box<dyn Future<Output = ()> + '_>> = Box::pin(run_work_with(
+            &mock,
+            || NoImports,
+            successor_key(),
+            &lineage,
+            DriverWork {
+                walk: true,
+                topup: false,
+            },
+            |_| {},
+        ));
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let asked_predecessor = || {
+            mock.log
+                .borrow()
+                .iter()
+                .any(|(target, _)| target.as_slice() == [10u8; 32])
+        };
+        for _ in 0..100 {
+            assert!(
+                walk.as_mut().poll(&mut cx).is_pending(),
+                "blocked by the pass"
+            );
+        }
+        assert!(
+            !asked_predecessor(),
+            "no predecessor read while the pass runs"
+        );
+        assert_eq!(session().status, None, "no walk status while the pass runs");
+        drop(pass);
+        futures::executor::block_on(walk);
+        assert!(
+            asked_predecessor(),
+            "the walk read the predecessor after the pass"
+        );
+        assert!(
+            session().status.is_some(),
+            "the walk ran once the pass was done"
+        );
     }
 
     fn poke_and_drive_env(env: &impl WalkEnv) {

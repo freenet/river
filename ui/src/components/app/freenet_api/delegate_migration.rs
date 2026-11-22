@@ -997,6 +997,14 @@ impl<C: RiverDelegateChannel> PredecessorSecretsIo for RiverPredecessorIo<'_, C>
                 }
             }
         }
+        if pairs
+            .iter()
+            .any(|(k, _)| k.as_slice() == ROOMS_STORAGE_KEY || parse_room_storage_key(k).is_some())
+        {
+            // This generation still holds room copies: let the legacy-copy
+            // cleanup shrink them (it starts once the sweep stops pacing).
+            super::legacy_cleanup::note_legacy_data_seen(predecessor.bytes());
+        }
         if let Ok(key) = <[u8; 32]>::try_from(predecessor.bytes()) {
             self.walk_answers
                 .borrow_mut()

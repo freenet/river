@@ -68,6 +68,7 @@ impl Builder {
             source: text.into(),
             md: text.into(),
             reply_to: None,
+            reply_gone: false,
             reactions: Vec::new(),
             edited: false,
             pending: None,

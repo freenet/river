@@ -215,6 +215,9 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         .pt(16.0)
         .pb(26.0)
         .gap(14.0);
+    // The ids a reply's strip can jump to, built once for the whole history.
+    let present: std::collections::HashSet<model::MessageId> =
+        room.messages.iter().map(|m| m.id).collect();
     let mut day = None;
     for group in model::groups(&room.messages) {
         let d = group.messages[0].time / MINUTES_PER_DAY;
@@ -226,7 +229,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
             );
             items = items.child(day_divider(d, label, p));
         }
-        items = items.child(group_el(chat, room, &group, p, k));
+        items = items.child(group_el(chat, room, &group, &present, p, k));
     }
     // Keyed by room, so each room's viewport is its own: a room opens at its newest message
     // instead of at the offset the previous room was scrolled to.
@@ -333,7 +336,14 @@ fn deputy_tag(tooltip: String, p: &Palette) -> El {
 /// One author's run of messages. Each message is its own row, as in the web UI: the first
 /// carries the avatar and the name line, and the others show their time in the gutter while
 /// the pointer is over them.
-fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El {
+fn group_el(
+    chat: &Chat,
+    room: &Room,
+    group: &Group,
+    present: &std::collections::HashSet<model::MessageId>,
+    p: &Palette,
+    k: &Kit,
+) -> El {
     let first = &group.messages[0];
     let author = room.member(group.author);
     let mine = group.author == room.me;
@@ -404,7 +414,7 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
                     .min_w(0.0)
                     .gap(4.0)
                     .child(name_row.take().unwrap_or_else(row))
-                    .child(message_el(room, m, p, k)),
+                    .child(message_el(room, m, present, p, k)),
             )
         } else {
             (
@@ -414,7 +424,10 @@ fn group_el(chat: &Chat, room: &Room, group: &Group, p: &Palette, k: &Kit) -> El
                         .help(model::full_time(chat.day_zero, m.time))
                         .group_opacity(0.0, 1.0),
                 ),
-                col().grow(1.0).min_w(0.0).child(message_el(room, m, p, k)),
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(message_el(room, m, present, p, k)),
             )
         };
         let flashing = chat.flashing() == Some(m.key.as_str());
@@ -649,11 +662,22 @@ pub(super) fn text_button(
         .child(label(name, st::SMALL_STRONG, color))
 }
 
-fn message_el(room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
+fn message_el(
+    room: &Room,
+    m: &Message,
+    present: &std::collections::HashSet<model::MessageId>,
+    p: &Palette,
+    k: &Kit,
+) -> El {
     let mut c = col().key(format!("msg-{}", m.key)).w_full().gap(5.0);
-    if let Some(reply) = &m.reply_to {
-        let author = room.nickname(reply.author).to_owned();
-        let line = format!("{author}  {}", reply.preview);
+    // As the web UI: a quote of a message that is in the room jumps to it; a reply whose
+    // target is not (pruned, deleted, moderated) says so and is not pressable. The web UI
+    // shows no author or preview then either.
+    if m.reply_gone
+        || m.reply_to
+            .as_ref()
+            .is_some_and(|r| !present.contains(&r.message))
+    {
         c = c.child(
             row()
                 .key("reply")
@@ -663,20 +687,67 @@ fn message_el(room: &Room, m: &Message, p: &Palette, k: &Kit) -> El {
                 .min_w(0.0)
                 .child(icon(&icons::REPLY, 13.0).color(p.text_muted))
                 .child(
-                    rune::rich(
-                        line,
-                        vec![
-                            rune::Span::new(0, author.len())
-                                .bold()
-                                .color(p.text_secondary),
-                        ],
-                    )
-                    .font(st::QUOTE)
-                    .color(p.quote)
-                    .truncate()
-                    .shrink(),
+                    label("Original message unavailable", st::QUOTE, p.quote)
+                        .truncate()
+                        .shrink(),
                 ),
         );
+    } else if let Some(reply) = &m.reply_to {
+        let author = room.nickname(reply.author).to_owned();
+        let target = reply.message;
+        let line = format!("{author}  {}", reply.preview);
+        let text = rune::rich(
+            line,
+            vec![
+                rune::Span::new(0, author.len())
+                    .bold()
+                    .color(p.text_secondary),
+            ],
+        )
+        .font(st::QUOTE)
+        .color(p.quote)
+        .truncate()
+        .shrink();
+        let strip = row()
+            .key("reply")
+            .max_w(BODY_MAX_W)
+            .gap(6.0)
+            .center_y()
+            .min_w(0.0)
+            .child(icon(&icons::REPLY, 13.0).color(p.text_muted))
+            .child(text)
+            .role("button")
+            .label(format!("Jump to the message from {author}"))
+            .focusable(true)
+            .help("Jump to the original message")
+            .radius(4.0)
+            // Padding with a matching negative margin keeps the text where the body's is while
+            // the hover fill extends past it.
+            .px(4.0)
+            .ml(-4.0)
+            .py(1.0)
+            .hover(p.surface_hover)
+            .cursor(rune::Cursor::Pointer)
+            // A drag that began here (to select the quote) must not jump when it ends over
+            // the strip: Rune runs a press after a drag, so the drag marks itself.
+            .on_drag(|s: &mut RiverApp, d: &mut rune::Drag, _| {
+                s.chat.reply_press_drag(d);
+            })
+            .on_press(move |s: &mut RiverApp| {
+                if !s.chat.reply_press_was_drag() {
+                    s.chat.reply_jump(target, std::time::Instant::now());
+                }
+            })
+            // Space presses a focused control; Return is the app's to take (as the archive
+            // button does), and an HTML button takes it too.
+            .on_key(move |s: &mut RiverApp, ev, _| {
+                let enter = ev.key == rune::Key::Enter && ev.mods == rune::Mods::default();
+                if enter {
+                    s.chat.reply_jump(target, std::time::Instant::now());
+                }
+                enter
+            });
+        c = c.child(strip);
     }
     c = c.child(message_body(m, p, k));
     if let Some(pending) = &m.pending {

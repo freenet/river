@@ -21,6 +21,9 @@ impl PendingInvites {
             map: HashMap::new(),
         }
     }
+    pub(crate) fn any_in_progress(&self) -> bool {
+        self.map.values().any(|join| join.status.is_in_progress())
+    }
     /*
         /// Adds a new pending room join request
         pub fn add(&mut self, owner_key: VerifyingKey, join_info: PendingRoomJoin) {
@@ -91,4 +94,13 @@ pub enum PendingRoomStatus {
     Subscribed,
     /// Error occurred during subscription or retrieval
     Error(String),
+}
+
+impl PendingRoomStatus {
+    fn is_in_progress(&self) -> bool {
+        match self {
+            Self::PendingSubscription | Self::Subscribing => true,
+            Self::Subscribed | Self::Error(_) => false,
+        }
+    }
 }

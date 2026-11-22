@@ -751,7 +751,7 @@ fn render_pending_subscription_state() -> Element {
     rsx! {
         div {
             class: "text-center py-4",
-            p { class: "mb-4 text-text", "Preparing to subscribe to room..." }
+            p { class: "mb-4 text-text", "Preparing to subscribe to room" }
             div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
                 div { class: "h-full bg-[var(--color-link)] animate-pulse w-1/2" }
             }
@@ -764,7 +764,7 @@ fn render_subscribing_state() -> Element {
     rsx! {
         div {
             class: "text-center py-4",
-            p { class: "mb-4 text-text", "Subscribing to room..." }
+            p { class: "mb-4 text-text", "Subscribing to room" }
             div { class: "w-full h-2 bg-surface rounded-full overflow-hidden",
                 div { class: "h-full bg-[var(--color-link)] animate-pulse w-2/3" }
             }
