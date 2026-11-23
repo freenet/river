@@ -448,8 +448,7 @@ fn evidence_under_another_key_never_replaces_held_evidence() {
         let lower = others
             .iter()
             .find(|o| digest(o) < digest(&held))
-            .or(others.first())
-            .unwrap()
+            .expect("an evidence record under the other key with a lower digest than v's")
             .clone();
         let parent = x.clone();
         let mut s = x.clone();
@@ -465,5 +464,91 @@ fn evidence_under_another_key_never_replaces_held_evidence() {
         r.valid(&s, "evidence under another key");
         assert!(s.ban_evidence.members.contains(&held));
         assert!(!s.ban_evidence.members.contains(&lower));
+    }
+}
+
+/// A purge record for the owner's id that the owner's key does not verify is
+/// still an error: the owner's key is the only key for the owner's id, so it
+/// is a forgery, unlike a member's record signed by another key for the
+/// member's id, which is skipped.
+#[test]
+fn a_forged_owner_purge_record_is_still_an_error() {
+    let r = Room::with_order(true);
+    let s = r.with_v();
+    let genuine = r.purge(&r.owner);
+    let other = r.purge(&r.a);
+    let forged = AuthorizedRecipientPurges {
+        recipient_signature: other.recipient_signature,
+        ..genuine
+    };
+    let mut out = s.clone();
+    let result = out.apply_delta(
+        &s,
+        &r.params,
+        &Some(ChatRoomStateV1Delta {
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: vec![],
+                advanced_purges: vec![forged],
+            }),
+            ..Default::default()
+        }),
+    );
+    assert!(
+        result.is_err(),
+        "a forged owner purge record fails the delta"
+    );
+}
+
+/// One evidence delta naming two keys for one id, with a child record signed
+/// by one of them, never leaves a state that fails `verify`: the apply takes
+/// one key per id from the delta and checks the child against that key.
+#[test]
+fn an_evidence_delta_naming_two_keys_for_one_id_leaves_a_state_that_verifies() {
+    for r in Room::both_orders() {
+        let c = sk("c");
+        let digest = river_core::room_state::ban_evidence::evidence_digest;
+        // Records for y's id under two keys, invited by members, and `c`
+        // invited by y's id and signed by y. The fixture is picked so that
+        // the other key's record has the lower digest: the case where taking
+        // the first record for the id and the lowest-digest one disagree.
+        let after = r.f.as_bytes() > r.v.verifying_key().as_bytes();
+        let (y, y_rec, other_rec) = (0..64)
+            .find_map(|n| {
+                let y = sk(&format!("y{n}"));
+                let other = other_key_with_id_of(&y.verifying_key(), after)?;
+                let y_rec = r.record(y.verifying_key(), &r.a);
+                let other_rec = [&r.owner, &r.a, &r.b]
+                    .map(|i| r.record(other, i))
+                    .into_iter()
+                    .find(|o| digest(o) < digest(&y_rec))?;
+                Some((y, y_rec, other_rec))
+            })
+            .expect("a fixture where the other key's record has the lower digest");
+        let c_rec = r.record(c.verifying_key(), &y);
+        let mut base = r.empty();
+        // `a`'s ban on c makes c and its ancestors referenced as evidence.
+        r.apply(
+            &mut base,
+            ChatRoomStateV1Delta {
+                bans: Some(vec![r.ban(&r.a, r.id(&c), 9)]),
+                ..Default::default()
+            },
+        );
+        for order in [
+            vec![y_rec.clone(), other_rec.clone(), c_rec.clone()],
+            vec![other_rec.clone(), y_rec.clone(), c_rec.clone()],
+        ] {
+            let mut s = base.clone();
+            s.apply_delta(
+                &base,
+                &r.params,
+                &Some(ChatRoomStateV1Delta {
+                    ban_evidence: Some(order),
+                    ..Default::default()
+                }),
+            )
+            .expect("applies");
+            r.valid(&s, "evidence delta naming two keys");
+        }
     }
 }

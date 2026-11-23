@@ -458,9 +458,56 @@ impl ComposableState for BanEvidenceV1 {
             let depth_cap =
                 evidence_depth_cap(parent_state.configuration.configuration.max_members);
             let added = {
+                // One key per id among the delta's records: a `MemberId` is a
+                // non-cryptographic hash, so a delta can name two keys for one
+                // id. The key of the lowest-digest record is the one `best`
+                // below can store, so records under any other key for that id
+                // are left out before anything reads them: otherwise a child
+                // was checked against one key's record while the other was
+                // stored, and the apply returned a state that failed `verify`.
+                // An id this peer already holds as evidence keeps its held
+                // key instead: a record under another key never replaces a
+                // held one, since the held member's `member_info` and bans
+                // were checked against the held key. The id stays with the
+                // record this peer took first, as for a member record
+                // (`MembersV1::resolve_records`). A held record about to be
+                // dropped (its chain no longer within the cap) still blocks
+                // another key for this apply: `member_info` is kept by id, so
+                // replacing it here would recreate the mismatch; the other
+                // key's record is taken on a later round.
+                let held_evidence_keys: HashMap<MemberId, VerifyingKey> = self
+                    .members
+                    .iter()
+                    .map(|m| (m.member.id(), m.member.member_vk))
+                    .collect();
+                let mut delta_key: HashMap<MemberId, (EvidenceDigest, VerifyingKey)> =
+                    HashMap::new();
+                for m in delta
+                    .iter()
+                    .filter(|m| !held_evidence_keys.contains_key(&m.member.id()))
+                {
+                    let d = evidence_digest(m);
+                    delta_key
+                        .entry(m.member.id())
+                        .and_modify(|best| {
+                            if d < best.0 {
+                                *best = (d, m.member.member_vk);
+                            }
+                        })
+                        .or_insert((d, m.member.member_vk));
+                }
+                let delta: Vec<&AuthorizedMember> = delta
+                    .iter()
+                    .filter(|m| {
+                        let key = held_evidence_keys
+                            .get(&m.member.id())
+                            .or(delta_key.get(&m.member.id()).map(|(_, vk)| vk));
+                        key.is_some_and(|vk| *vk == m.member.member_vk)
+                    })
+                    .collect();
                 let mut combined = self.lookup(&parent_state.members, owner_id);
-                for m in delta {
-                    combined.entry(m.member.id()).or_insert(m);
+                for m in &delta {
+                    combined.entry(m.member.id()).or_insert(*m);
                 }
                 // A held record competes only while its own chain still
                 // reaches the owner within the cap through the records known
@@ -482,28 +529,13 @@ impl ComposableState for BanEvidenceV1 {
                 // considered, and only if it would replace what is held, so an
                 // id costs at most one chain check. If it fails, a peer holding
                 // a valid record offers it on the next sync.
-                //
-                // A record under another key than a held record for its id
-                // never replaces it: a `MemberId` is a non-cryptographic hash,
-                // so two keys can share one, and the held member's
-                // `member_info` and bans were checked against the held key.
-                // The id stays with the record this peer took first, as for a
-                // member record (`MembersV1::resolve_records`).
-                let held_keys: HashMap<MemberId, VerifyingKey> = self
-                    .members
-                    .iter()
-                    .map(|m| (m.member.id(), m.member.member_vk))
-                    .collect();
                 let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> =
                     BTreeMap::new();
-                for m in delta {
+                for m in delta.iter().copied() {
                     let id = m.member.id();
                     if id == owner_id
                         || !referenced.contains(&id)
                         || present.contains_key(&id)
-                        || held_keys
-                            .get(&id)
-                            .is_some_and(|vk| *vk != m.member.member_vk)
                         || !within_depth(m, &combined, owner_id, depth_cap)
                     {
                         continue;

@@ -1864,6 +1864,135 @@ fn hold_different_records_for_one_member(a: &ChatRoomStateV1, b: &ChatRoomStateV
             .any(|(id, vk)| ka.get(id).is_some_and(|other| other != vk))
 }
 
+/// The ids two states hold different records for (different keys, or a
+/// different member record under one key), with every id invited under them
+/// in either state.
+fn contested_ids(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> std::collections::HashSet<MemberId> {
+    let records = |s: &ChatRoomStateV1| -> Vec<AuthorizedMember> {
+        s.members
+            .members
+            .iter()
+            .chain(&s.ban_evidence.members)
+            .cloned()
+            .collect()
+    };
+    let (ra, rb) = (records(a), records(b));
+    let mut by_id: std::collections::HashMap<MemberId, Vec<&AuthorizedMember>> =
+        std::collections::HashMap::new();
+    for m in ra.iter().chain(&rb) {
+        by_id.entry(m.member.id()).or_default().push(m);
+    }
+    let mut out: std::collections::HashSet<MemberId> = by_id
+        .iter()
+        .filter(|(_, rs)| {
+            rs.iter()
+                .any(|r| r.member.member_vk != rs[0].member.member_vk)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let in_members = |s: &ChatRoomStateV1, m: &AuthorizedMember| s.members.members.contains(m);
+    for m in &rb {
+        if a.members
+            .members
+            .iter()
+            .any(|h| h.member.id() == m.member.id() && h != m)
+            && in_members(b, m)
+        {
+            out.insert(m.member.id());
+        }
+    }
+    loop {
+        let before = out.len();
+        for m in ra.iter().chain(&rb) {
+            if out.contains(&m.member.invited_by) {
+                out.insert(m.member.id());
+            }
+        }
+        if out.len() == before {
+            break;
+        }
+    }
+    out
+}
+
+/// `s` without what is tied to the ids in `contested`: their member and
+/// evidence records, `member_info`, messages, DMs and purge records they
+/// sent or received, bans they issued or that name them, provisional entries
+/// and bans for them, and secret blobs for them.
+fn without_contested(
+    s: &ChatRoomStateV1,
+    contested: &std::collections::HashSet<MemberId>,
+) -> ChatRoomStateV1 {
+    let mut s = s.clone();
+    let c = |id: &MemberId| contested.contains(id);
+    s.members.members.retain(|m| !c(&m.member.id()));
+    s.ban_evidence.members.retain(|m| !c(&m.member.id()));
+    s.member_info
+        .member_info
+        .retain(|i| !c(&i.member_info.member_id));
+    s.recent_messages.messages.retain(|m| !c(&m.message.author));
+    s.direct_messages
+        .messages
+        .retain(|m| !c(&m.message.sender) && !c(&m.message.recipient));
+    s.direct_messages.purges.retain(|p| !c(&p.recipient_id));
+    s.bans
+        .0
+        .retain(|b| !c(&b.banned_by) && !c(&b.ban.banned_user));
+    s.provisional.entries.retain(|e| !c(&e.member_id()));
+    s.provisional
+        .bans
+        .retain(|b| !c(&b.ban.banned_by) && !c(&b.ban.target));
+    s.secrets
+        .encrypted_secrets
+        .retain(|e| !c(&e.secret.member_id));
+    s
+}
+
+/// A pair holding different records for some ids (see
+/// `hold_different_records_for_one_member`): such a pair does not converge
+/// on those ids, and the difference is not confined to them. The side that
+/// holds the other key lacks the contested member's messages, so its message
+/// window reaches further back and keeps members the other side prunes; bans
+/// the contested member issued take effect on one side only. What must hold
+/// is that the pair settles: after gossip, one more exchange in both
+/// directions leaves both states unchanged, with no merge refused. The
+/// fields that still differ outside the contested ids are reported under
+/// `FORK_CONTESTED_REPORT` (freenet/river#991 tracks closing the split).
+fn contested_converges(w: &World, a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> Result<(), String> {
+    let (mut x, mut y) = (a.clone(), b.clone());
+    for _ in 0..6 {
+        let (nx, ny) = match (merge(&x, &y, &w.params), merge(&y, &x, &w.params)) {
+            (Ok(nx), Ok(ny)) => (nx, ny),
+            _ => return Err("a merge was refused".to_string()),
+        };
+        x = nx;
+        y = ny;
+    }
+    let (nx, ny) = match (merge(&x, &y, &w.params), merge(&y, &x, &w.params)) {
+        (Ok(nx), Ok(ny)) => (nx, ny),
+        _ => return Err("a merge was refused after gossip".to_string()),
+    };
+    if std::env::var("FORK_CONTESTED_REPORT").is_ok() {
+        let contested = contested_ids(a, b);
+        let outside = differing_fields(
+            &without_contested(&x, &contested),
+            &without_contested(&y, &contested),
+        );
+        println!("contested pair: outside the contested ids differs in {outside:?}");
+    }
+    if ser(&nx) != ser(&x) || ser(&ny) != ser(&y) {
+        return Err(format!(
+            "a pair holding different records for an id does not settle: another exchange changes {}",
+            differing_fields(&nx, &x)
+                .into_iter()
+                .chain(differing_fields(&ny, &y))
+                .collect::<Vec<_>>()
+                .join("+")
+        ));
+    }
+    Ok(())
+}
+
 fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
     reset_fixpoint_counters();
     let mut out = Failures::default();
@@ -1926,13 +2055,17 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
         }
         // Such a pair keeps its own member record on each side (see
         // `hold_different_records_for_one_member`). It must still never be
-        // refused or leave cleanup unsettled; it is not required to converge.
+        // refused or leave cleanup unsettled, and everything not tied to the
+        // contested ids must still converge, with a commutative first
+        // exchange (`contested_converges`).
         if own_records {
             if let Ending::Rejecting(e) = end {
                 out.rejecting.push(format!(
                     "seed {seed} shape {shape}: {}",
                     &e[..e.len().min(200)]
                 ));
+            } else if let Err(e) = contested_converges(&w, &a, &b) {
+                out.silent.push(format!("seed {seed} shape {shape}: {e}"));
             }
             continue;
         }

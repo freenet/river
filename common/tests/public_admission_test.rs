@@ -2493,3 +2493,88 @@ fn a_ban_by_an_issuer_the_owner_removed_does_not_block_an_entry() {
     }
     assert!(ser(&one) == ser(&two));
 }
+
+/// A key other than `victim` with `victim`'s `MemberId`, ordering after
+/// `victim`'s bytes when `after` is set and before them otherwise. It has no
+/// secret key.
+fn forged_vk_in_order(victim: &VerifyingKey, after: bool) -> VerifyingKey {
+    let target: MemberId = victim.into();
+    let base = victim.to_bytes();
+    for i in 0..31 {
+        let mut bytes = base;
+        if after {
+            if bytes[i] == 255 || bytes[i + 1] < 31 {
+                continue;
+            }
+            bytes[i] += 1;
+            bytes[i + 1] -= 31;
+        } else {
+            if bytes[i] == 0 || bytes[i + 1] > 255 - 31 {
+                continue;
+            }
+            bytes[i] -= 1;
+            bytes[i + 1] += 31;
+        }
+        if let Ok(vk) = VerifyingKey::from_bytes(&bytes) {
+            if MemberId::from(&vk) == target && vk != *victim {
+                return vk;
+            }
+        }
+    }
+    panic!("no forged key found");
+}
+
+/// A provisional member sponsored into `members` on one peer, and a record
+/// under another key for their id (invited by a member and kept by a DM)
+/// taken first on another: both merge directions apply, and every result
+/// verifies and is canonical, for both byte orders of the two keys. The same
+/// holds once the sponsored member is held as ban evidence instead (their
+/// inviter bans them), with their `member_info` kept for the ban.
+#[test]
+fn a_sponsored_member_and_another_key_for_their_id_merge_and_verify() {
+    for after in [true, false] {
+        let (base, m, _d) = room_with_member_and_deputy();
+        let v = sk(10);
+        let forged = forged_vk_in_order(&v.verifying_key(), after);
+        let fork = |room: &Room| Room {
+            owner: room.owner.clone(),
+            params: room.params.clone(),
+            state: room.state.clone(),
+            version: room.version,
+        };
+        let mut victim = fork(&base);
+        victim.apply(victim.join_delta(&v, 5, "victim")).unwrap();
+        let mut sponsor = victim.members_delta(vec![victim.invite(Some(&m), &v.verifying_key())]);
+        sponsor.recent_messages = Some(vec![victim.msg(&v, 6, "sponsored")]);
+        victim.apply(sponsor).unwrap();
+        assert!(victim.is_member(&v));
+
+        let mut attacker = fork(&base);
+        let mut shadow = attacker.members_delta(vec![attacker.invite(Some(&m), &forged)]);
+        shadow.direct_messages = dm_delta(vec![dm(&attacker, &m, id_of(&v), 50)]).direct_messages;
+        attacker.apply(shadow).unwrap();
+
+        let (x, y) = merge2(&victim.state, &attacker.state, &base.params);
+        assert!(x
+            .members
+            .members
+            .iter()
+            .any(|r| r.member.member_vk == v.verifying_key()));
+        assert!(y
+            .members
+            .members
+            .iter()
+            .any(|r| r.member.member_vk == forged));
+
+        victim
+            .apply(user_ban_delta(victim.user_ban(Some(&m), id_of(&v), 60)))
+            .unwrap();
+        assert!(victim
+            .state
+            .ban_evidence
+            .members
+            .iter()
+            .any(|r| r.member.member_vk == v.verifying_key()));
+        merge2(&victim.state, &attacker.state, &base.params);
+    }
+}

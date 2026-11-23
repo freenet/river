@@ -159,7 +159,10 @@ impl ComposableState for MembersV1 {
             // one, and taking a member record under another key would leave
             // what the evidenced member signed (its `member_info`, its bans)
             // checked against a key that never signed it. The same key may
-            // come back as a member; its evidence record then leaves.
+            // come back as a member; its evidence record then leaves. This
+            // reads the evidence held before this apply, so an evidence record
+            // that this apply's cleanup drops still blocks another key for
+            // one round, deliberately (`member_info` is kept by id).
             let evidence_keys: HashMap<MemberId, VerifyingKey> = parent_state
                 .ban_evidence
                 .members
