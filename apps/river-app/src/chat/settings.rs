@@ -398,6 +398,16 @@ fn identity_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
             .key("settings-import-id"),
         p,
     );
+    let reason = (!can).then(|| {
+        label(
+            "Not available while the app shows example rooms.",
+            st::SMALL,
+            p.text_secondary,
+        )
+        .wrap()
+        .w_full()
+        .key("settings-identity-unavailable")
+    });
     let mut export = col()
         .key("settings-export-group")
         .w_full()
@@ -429,7 +439,13 @@ fn identity_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
                 let key = room.key.clone();
                 setting_row(
                     &format!("settings-export-row-{}", room.key),
-                    label(room.name.clone(), st::BODY, p.text).wrap().w_full(),
+                    label(
+                        super::identity::room_label(chat.rooms(), &room.key),
+                        st::BODY,
+                        p.text,
+                    )
+                    .wrap()
+                    .w_full(),
                     None,
                     Button::new("Export")
                         .variant(ButtonVariant::Outline)
@@ -450,6 +466,7 @@ fn identity_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
         .key("settings-identity")
         .w_full()
         .gap(14.0)
+        .children(reason)
         .child(import)
         .child(export)
 }

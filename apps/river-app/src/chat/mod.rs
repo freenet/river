@@ -642,6 +642,13 @@ impl Chat {
     /// bytes, and losing typed text costs the user.
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
+        // An export dialog is about one room: when that room leaves the list, the dialog and its
+        // token go with it.
+        if let Some(d) = &self.export
+            && !self.rooms.iter().any(|r| r.key == d.room)
+        {
+            self.close_export();
+        }
         // A join dialog open over a code already decoded follows the list: a room that arrived,
         // or went, changes what the invitation is.
         if self.form.open == Some(DialogKind::Join)

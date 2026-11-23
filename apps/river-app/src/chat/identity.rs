@@ -86,6 +86,36 @@ pub const REPLACE_WARNING: &str = "This room already has an identity. Importing 
 /// The web UI's second replace warning.
 pub const REPLACE_SESSIONS_WARNING: &str = "Close any other tabs or devices open to this room first. A session still using the old identity can write it back and undo the switch.";
 
+/// How a room is named where several rooms are listed side by side and one is picked (the
+/// Export rows in Settings and the Export dialog's heading). An empty name reads "Unnamed
+/// room"; a name that another room shares (after trimming) gets the last characters of the
+/// room's key, so two rows are never alike.
+pub fn room_label(rooms: &[super::Room], key: &str) -> String {
+    let Some(room) = rooms.iter().find(|r| r.key == key) else {
+        return String::new();
+    };
+    let clean = |n: &str| super::dm_view::clean_name(n);
+    let name = clean(&room.name);
+    let shared = rooms
+        .iter()
+        .filter(|r| r.key != key)
+        .any(|r| clean(&r.name) == name);
+    let shown = if name.is_empty() {
+        "Unnamed room".to_owned()
+    } else {
+        name
+    };
+    if shared || clean(&room.name).is_empty() && rooms.len() > 1 {
+        let tail: String = {
+            let n = room.key.chars().count();
+            room.key.chars().skip(n.saturating_sub(6)).collect()
+        };
+        format!("{shown} (\u{2026}{tail})")
+    } else {
+        shown
+    }
+}
+
 impl Chat {
     /// Open "Export identity" for the open room, and ask for its token.
     pub fn open_export(&mut self) {
@@ -217,6 +247,16 @@ pub(super) fn export_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     })
     .body_key("export-body")
     .width(520.0)
+    .child(
+        label(
+            format!("Room: {}", room_label(chat.rooms(), &dialog.room)),
+            st::ROOM_STRONG,
+            p.text,
+        )
+        .wrap()
+        .w_full()
+        .key("export-room"),
+    )
     .child(
         label(EXPORT_INTRO, st::BODY, p.text_secondary)
             .wrap()

@@ -2505,6 +2505,7 @@ pub const SCENES: &[Scene] = &[
     }),
     ("chat-settings-appearance-narrow", |s| {
         identity_scene(s, |c| {
+            c.zoom.load(125);
             c.settings.open_at(chat::settings::Section::Appearance)
         })
     }),
@@ -5248,12 +5249,43 @@ mod tests {
         press(&mut rt, "settings-size-100");
         assert_eq!(rt.state.chat.zoom.percent(), 100);
         assert_eq!(rt.state.chat.zoom.take_dirty(), Some(100));
-        // The same level the key walk reaches.
-        let mut by_keys = chat::zoom::Zoom::default();
+        // The same level the key walk reaches: three steps in from 100 is the 150 preset.
+        press(&mut rt, "settings-size-100");
+        let mut walked = rt.state.chat.zoom.clone();
         for _ in 0..3 {
-            by_keys.apply(chat::zoom::Step::In);
+            walked.apply(chat::zoom::Step::In);
         }
-        assert_eq!(by_keys.percent(), 150);
+        assert_eq!(walked.percent(), 150);
+        press(&mut rt, "settings-size-150");
+        assert_eq!(rt.state.chat.zoom.percent(), walked.percent());
+    }
+
+    /// The preset buttons that are drawn as the active one (the Contrast variant).
+    fn active_sizes(rt: &Runtime<RiverApp>) -> Vec<u16> {
+        chat::zoom::STEPS
+            .into_iter()
+            .filter(|pct| {
+                rt.elements().into_iter().any(|e| {
+                    e.key.as_deref() == Some(&format!("settings-size-{pct}")) && e.selected
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_size_picker_marks_the_active_preset_and_presses_from_a_stored_odd_value() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| s.chat.zoom.load(125));
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-appearance");
+        assert_eq!(active_sizes(&rt), vec![125]);
+        let before = rt.state.chat.zoom.percent();
+        press(&mut rt, "settings-size-100");
+        assert_ne!(before, 100);
+        assert_eq!(rt.state.chat.zoom.percent(), 100);
+        assert_eq!(rt.state.chat.zoom.take_dirty(), Some(100));
+        assert_eq!(active_sizes(&rt), vec![100], "the mark follows the press");
     }
 
     #[test]
