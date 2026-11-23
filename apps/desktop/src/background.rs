@@ -360,7 +360,10 @@ mod tests {
         save(dir.path(), false, true).unwrap();
         save(dir.path(), true, true).unwrap();
         let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
-        assert_eq!(text.matches(KEY).count(), 2, "one line per key: {text}");
+        for key in ["close-to-tray=", "close-to-tray-told="] {
+            let n = text.lines().filter(|l| l.starts_with(key)).count();
+            assert_eq!(n, 1, "one {key} line: {text}");
+        }
         assert!(text.contains("future=1\n"));
     }
 
