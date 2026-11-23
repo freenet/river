@@ -420,3 +420,50 @@ fn one_delta_naming_both_keys_applies_and_verifies() {
         }
     }
 }
+
+/// A peer holding `v` as ban evidence, with its member_info, receives an
+/// evidence record under the other key for `v`'s id, even one with a lower
+/// record digest. It keeps `v`'s record: replacing it would leave `v`'s
+/// member_info checked against a key that never signed it.
+#[test]
+fn evidence_under_another_key_never_replaces_held_evidence() {
+    for r in Room::both_orders() {
+        let mut x = r.with_v();
+        r.apply(
+            &mut x,
+            ChatRoomStateV1Delta {
+                bans: Some(vec![r.ban(&r.a, r.id(&r.v), 9)]),
+                ..Default::default()
+            },
+        );
+        let held = x
+            .ban_evidence
+            .members
+            .iter()
+            .find(|m| m.member.id() == r.id(&r.v))
+            .expect("v held as evidence")
+            .clone();
+        let digest = river_core::room_state::ban_evidence::evidence_digest;
+        let others = [&r.owner, &r.a, &r.b].map(|i| r.record(r.f, i));
+        let lower = others
+            .iter()
+            .find(|o| digest(o) < digest(&held))
+            .or(others.first())
+            .unwrap()
+            .clone();
+        let parent = x.clone();
+        let mut s = x.clone();
+        s.apply_delta(
+            &parent,
+            &r.params,
+            &Some(ChatRoomStateV1Delta {
+                ban_evidence: Some(vec![lower.clone()]),
+                ..Default::default()
+            }),
+        )
+        .expect("applies");
+        r.valid(&s, "evidence under another key");
+        assert!(s.ban_evidence.members.contains(&held));
+        assert!(!s.ban_evidence.members.contains(&lower));
+    }
+}

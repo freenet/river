@@ -31,6 +31,17 @@ the cap counts, so they cannot evict a stored ban). An `Err` for such a
 record fails every merge with a peer holding it, in one direction only, and
 nothing but its author can repair it.
 
+A `MemberId` is a non-cryptographic hash, so two keys can share one. A peer
+keeps the record for an id that it took first, as a member or as ban
+evidence: a member or evidence record under another key for a held id is
+skipped. Everything the id signed (`member_info`, messages, DMs, purge
+records, bans, the records of members it invited) is checked against the held
+record's key and skipped when it does not verify; only an owner-signed record
+that fails is an error. So the key a peer holds for an id never changes while
+content checked against it is held, and no merge leaves content that fails
+`verify`. Two peers that took different keys for one id keep their own (the
+fork fuzz counts such pairs apart from convergence failures).
+
 A configuration that fails the value checks is the one record that is never
 dropped: an owner-signed one ranks below every valid configuration, so a
 held one is replaced by any valid configuration, or by an invalid one of
