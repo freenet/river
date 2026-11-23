@@ -22,6 +22,15 @@ type RiverTestHooks = {
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
+  // Self, owning the current room, becomes a plain member of it under a new
+  // identity the owner invited; the owner's key is kept for setSelfStanding.
+  makeSelfPlainMember(): void;
+  // Self's standing in that room: an owner-signed ban, or removed with no
+  // stored invitation, or a member again.
+  setSelfStanding(standing: "member" | "banned" | "not-member"): void;
+  // The current room's identity (private and verifying key) taken off this
+  // device, or given back.
+  setRoomIdentityAvailable(available: boolean): void;
   // The current room under a new contract key, as a room-contract re-key leaves it.
   rekeyCurrentRoom(): void;
   // Show one mobile panel, as its buttons do, whatever covers them.

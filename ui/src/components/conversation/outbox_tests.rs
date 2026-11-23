@@ -262,6 +262,142 @@ fn discard_removes_the_entry() {
     assert!(outbox.discard(&room(), a).is_none());
 }
 
+/// Discard from a room's notice drops only what it showed: `author`'s failed
+/// send `id`. A second click, a stale id, another identity, a send still being
+/// signed and an action are all left as they are.
+#[test]
+fn a_notice_discards_only_the_authors_failed_send_it_showed() {
+    let me = author().verifying_key();
+    let other = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+    let mut outbox = Outbox::default();
+    let (failed, _) = send(&mut outbox, "failed", 1);
+    outbox.record_failure(&room(), failed, "x".to_string());
+    let (signing, _) = send(&mut outbox, "signing", 2);
+    let (action, _) = outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "edit",
+            effects: vec![],
+        },
+        me,
+        vec![message("edit", 3)],
+    );
+    let (failed_action, _) = outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "delete",
+            effects: vec![],
+        },
+        me,
+        vec![message("delete", 4)],
+    );
+    outbox.record_failure(&room(), failed_action, "x".to_string());
+
+    assert!(
+        !outbox.discard_failed_send(&room(), &other, failed),
+        "another identity"
+    );
+    assert!(
+        !outbox.discard_failed_send(&room(), &me, signing),
+        "a send still being signed"
+    );
+    assert!(
+        !outbox.discard_failed_send(&room(), &me, action),
+        "an action"
+    );
+    assert!(
+        !outbox.discard_failed_send(&room(), &me, failed_action),
+        "a failed action is reported and dropped elsewhere"
+    );
+    assert!(
+        !outbox.discard_failed_send(&room(), &me, 999),
+        "an id never made"
+    );
+    let other_room = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+    assert!(
+        !outbox.discard_failed_send(&other_room, &me, failed),
+        "another room"
+    );
+    for id in [failed, signing, action, failed_action] {
+        assert!(outbox.entry(&room(), id).is_some(), "entry {id} untouched");
+    }
+
+    assert!(outbox.is_failed_send(&room(), &me, failed));
+    assert!(outbox.discard_failed_send(&room(), &me, failed));
+    assert!(outbox.entry(&room(), failed).is_none());
+    assert!(
+        !outbox.discard_failed_send(&room(), &me, failed),
+        "a second click does nothing"
+    );
+    for id in [signing, action, failed_action] {
+        assert!(outbox.entry(&room(), id).is_some(), "entry {id} kept");
+    }
+}
+
+/// A click that lands after the composer took the send back finds nothing:
+/// the take-back's discard removed it.
+#[test]
+fn a_notice_discard_after_the_composer_took_the_send_back_does_nothing() {
+    let me = author().verifying_key();
+    let mut outbox = Outbox::default();
+    let (failed, _) = send(&mut outbox, "failed", 1);
+    outbox.record_failure(&room(), failed, "x".to_string());
+    let (later, _) = send(&mut outbox, "sent again", 2);
+    assert!(outbox.discard(&room(), failed).is_some(), "taken back");
+    assert!(!outbox.discard_failed_send(&room(), &me, failed));
+    assert!(outbox.entry(&room(), later).is_some());
+}
+
+/// Only that a failed send waits, by any identity, for a notice that cannot
+/// tell who self is: never a send being signed, an action, or another room's.
+#[test]
+fn presence_of_a_failed_send_is_by_room_not_by_identity() {
+    let me = author().verifying_key();
+    let other = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+    let mut outbox = Outbox::default();
+    assert!(!outbox.has_failed_send(&room()));
+    let (signing, _) = send(&mut outbox, "signing", 1);
+    let (action, _) = outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "edit",
+            effects: vec![],
+        },
+        me,
+        vec![message("edit", 2)],
+    );
+    outbox.record_failure(&room(), action, "x".to_string());
+    assert!(
+        !outbox.has_failed_send(&room()),
+        "a send being signed and a failed action are not failed sends"
+    );
+    outbox.record_failure(&room(), signing, "x".to_string());
+    assert!(outbox.has_failed_send(&room()));
+    let other_room = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+    assert!(!outbox.has_failed_send(&other_room));
+    assert!(
+        outbox.composer_send(&room(), &other).is_none(),
+        "the text is still only its author's to see"
+    );
+    assert!(outbox
+        .composer_send(&room(), &me)
+        .is_some_and(|row| row.failed.is_some()));
+}
+
+/// Discarding a failed send keeps the room's sealed mark: a send made after
+/// it is still never sealed under an older secret.
+#[test]
+fn a_notice_discard_keeps_the_sealed_mark() {
+    let me = author().verifying_key();
+    let mut outbox = Outbox::default();
+    let (id, _) = sealed_entry(&mut outbox, "sealed at five", 1, 5);
+    outbox.record_failure(&room(), id, "x".to_string());
+    assert!(outbox.discard_failed_send(&room(), &me, id));
+    assert!(!outbox.has_room(&room()), "nothing else waited");
+    assert!(!outbox.may_seal_at(&room(), 4), "the mark is kept");
+    assert!(outbox.may_seal_at(&room(), 5));
+}
+
 #[test]
 fn rooms_are_independent() {
     let mut outbox = Outbox::default();

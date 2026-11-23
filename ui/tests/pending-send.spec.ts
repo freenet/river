@@ -284,6 +284,205 @@ test("a draft outlives a room that shows a notice instead of the composer", { ta
   await expect(input(page), "the draft is still there").toHaveValue("typed in team chat");
 });
 
+// A send that fails while the room shows a notice instead of the composer
+// (its key missing, self banned or removed, the identity gone, a sync) has no
+// composer to come back to. The notice shows it until the user discards it or
+// the composer returns and takes it back.
+
+const failedNotice = (page: Page) => page.getByTestId("failed-send-notice");
+
+/// Holds signing, sends `text` from the composer and waits until the composer
+/// shows it locked: the send is in the outbox, being signed.
+async function sendHeld(page: Page, text: string) {
+  await callRiverTest(page, "holdMessageSigning");
+  await submitMessage(page, text);
+  await expectLocked(page, text);
+}
+
+/// Fails the held signing request and waits for its result to land.
+async function failHeldSend(page: Page) {
+  const before = await callRiverTest(page, "messageSignsRecorded");
+  await callRiverTest(page, "failNextMessageSign");
+  await callRiverTest(page, "releaseMessageSigning");
+  await expect.poll(() => callRiverTest(page, "messageSignsRecorded"), { message: "the signing result landed" }).toBeGreaterThan(before);
+}
+
+/// The notice area shows the failed send: its text, its reply target, why it
+/// was not sent, and Discard.
+async function expectFailedNotice(page: Page, text: string, reply: string | null) {
+  const notice = failedNotice(page);
+  await expect(notice, "the failed send is shown beside the notice").toBeVisible();
+  await expect(notice.getByTestId("failed-send-text")).toHaveText(text);
+  if (reply === null) {
+    await expect(notice.getByTestId("failed-send-reply")).toHaveCount(0);
+  } else {
+    await expect(notice.getByTestId("failed-send-reply")).toContainText(reply);
+  }
+  await expect(notice.getByTestId("failed-send-reason")).toContainText("signing failed");
+  await expect(notice.getByTestId("failed-send-discard-button")).toBeEnabled();
+}
+
+test("a send failing behind the missing-key notice is shown there, and Discard lets a reload go", { tag: "@chromium-only" }, async ({ page }) => {
+  const target = await openRoomWithTarget(page);
+  await clickFooter(page, target, "message-reply-button");
+  await expect(replyPreview(page)).toContainText("react target");
+  await sendHeld(page, "fails behind the notice");
+  await callRiverTest(page, "makeRoomPrivateWithoutSecret");
+  await expect(page.getByTestId("missing-room-secret-notice")).toBeVisible();
+  await expect(page.getByTestId("message-composer"), "premise: no composer").toHaveCount(0);
+
+  await failHeldSend(page);
+  await expect(page.getByTestId("missing-room-secret-notice"), "it failed while the notice showed").toBeVisible();
+  await expectFailedNotice(page, "fails behind the notice", "react target");
+  expect(await callRiverTest(page, "userIsBusy"), "the failed send holds a reload").toBe(true);
+
+  await failedNotice(page).getByTestId("failed-send-discard-button").click();
+  await expect(failedNotice(page)).toHaveCount(0);
+  await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "discarded, nothing holds a reload" }).toBe(false);
+  await expect(page.getByRole("heading", { name: "Your Private Room" }), "in the same room").toBeVisible();
+  await expect(page.getByTestId("missing-room-secret-notice")).toBeVisible();
+
+  // Another room's draft still holds one.
+  await selectListedRoom(page, "Team Chat Room");
+  await input(page).fill("a real draft");
+  await selectListedRoom(page, "Your Private Room");
+  expect(await callRiverTest(page, "userIsBusy"), "another room's draft holds a reload").toBe(true);
+});
+
+test("a send failing behind the missing-key notice comes back as one draft with its reply when the key arrives, and sends once", { tag: "@chromium-only" }, async ({ page }) => {
+  const target = await openRoomWithTarget(page);
+  await clickFooter(page, target, "message-reply-button");
+  await expect(replyPreview(page)).toContainText("react target");
+  await sendHeld(page, "returns with the key");
+  await callRiverTest(page, "makeRoomPrivateWithoutSecret");
+  await expect(page.getByTestId("missing-room-secret-notice")).toBeVisible();
+  await failHeldSend(page);
+  await expectFailedNotice(page, "returns with the key", "react target");
+
+  await callRiverTest(page, "makeRoomPrivate", 1);
+  await expect(page.getByTestId("message-composer")).toBeVisible();
+  await expect(failedNotice(page)).toHaveCount(0);
+  await expect(input(page), "one draft, the failed text once").toHaveValue("returns with the key");
+  await expect(input(page)).not.toHaveAttribute("readonly", /.*/);
+  await expect(replyPreview(page), "with its reply").toContainText("react target");
+  await expect(sendError(page)).toContainText("signing failed");
+
+  await sendButton(page).click();
+  const row = committedRow(page, "returns with the key");
+  await expect(row).toHaveCount(1);
+  // Committed as a reply. The quoted message is public, which the room, now
+  // private, does not show, so the strip cannot resolve it.
+  await expect(row.locator('[data-testid="reply-strip"], [data-testid="reply-strip-unavailable"]')).toHaveCount(1);
+  await expect(input(page)).toHaveValue("");
+  await settle(page);
+  await expect(row, "sent once").toHaveCount(1);
+});
+
+test("a send failing after a ban shows in the banned notice, and the composer takes it back when the ban is lifted", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "makeSelfPlainMember");
+  await settle(page);
+  await expect(page.getByTestId("message-composer"), "premise: a plain member has a composer").toBeVisible();
+  await sendHeld(page, "sent before the ban");
+  await callRiverTest(page, "setSelfStanding", "banned");
+  await expect(page.getByTestId("banned-notice")).toBeVisible();
+
+  await failHeldSend(page);
+  await expect(page.getByTestId("banned-notice")).toBeVisible();
+  await expectFailedNotice(page, "sent before the ban", null);
+
+  await callRiverTest(page, "setSelfStanding", "member");
+  await expect(input(page)).toHaveValue("sent before the ban");
+  await expect(sendError(page)).toContainText("signing failed");
+  await expect(failedNotice(page)).toHaveCount(0);
+  await sendButton(page).click();
+  await expect(committedRow(page, "sent before the ban")).toHaveCount(1);
+  await expect(input(page)).toHaveValue("");
+});
+
+test("a send failing after self is removed shows in the not-a-member notice, and Discard drops it for good", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "makeSelfPlainMember");
+  await settle(page);
+  await sendHeld(page, "sent before removal");
+  await callRiverTest(page, "setSelfStanding", "not-member");
+  await expect(page.getByTestId("not-member-notice")).toBeVisible();
+
+  await failHeldSend(page);
+  await expect(page.getByTestId("not-member-notice")).toBeVisible();
+  await expectFailedNotice(page, "sent before removal", null);
+  expect(await callRiverTest(page, "userIsBusy"), "the failed send holds a reload").toBe(true);
+  await failedNotice(page).getByTestId("failed-send-discard-button").click();
+  await expect(failedNotice(page)).toHaveCount(0);
+  await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "discarded, nothing holds a reload" }).toBe(false);
+
+  await callRiverTest(page, "setSelfStanding", "member");
+  await expect(page.getByTestId("message-composer")).toBeVisible();
+  await settle(page);
+  await expect(input(page), "nothing comes back").toHaveValue("");
+  await expect(sendError(page)).toHaveCount(0);
+});
+
+test("a send failing while this device lacks the room's identity says how to recover it, shows none of it, and holds no reload", { tag: "@chromium-only" }, async ({ page }) => {
+  const target = await openRoomWithTarget(page);
+  await clickFooter(page, target, "message-reply-button");
+  await expect(replyPreview(page)).toContainText("react target");
+  await sendHeld(page, "written before the key left");
+  await callRiverTest(page, "setRoomIdentityAvailable", false);
+  await expect(page.getByTestId("identity-unavailable-notice")).toBeVisible();
+
+  await failHeldSend(page);
+  await expect(page.getByTestId("identity-unavailable-notice")).toBeVisible();
+  const notice = failedNotice(page);
+  await expect(notice, "the notice says a send is waiting").toBeVisible();
+  await expect(notice).toContainText("original identity");
+  await expect(notice.getByTestId("failed-send-text")).toHaveCount(0);
+  await expect(notice.getByTestId("failed-send-reply")).toHaveCount(0);
+  await expect(notice.getByTestId("failed-send-discard-button")).toHaveCount(0);
+  await expect(notice).not.toContainText("react target");
+  await expect(page.getByText("written before the key left"), "its text is shown nowhere").toHaveCount(0);
+  await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "a row nobody can see holds no reload" }).toBe(false);
+
+  await callRiverTest(page, "setRoomIdentityAvailable", true);
+  await expect(page.getByTestId("message-composer")).toBeVisible();
+  await expect(failedNotice(page)).toHaveCount(0);
+  await expect(input(page), "restoring the identity gives it back").toHaveValue("written before the key left");
+  await expect(replyPreview(page)).toContainText("react target");
+  await expect(sendError(page)).toContainText("signing failed");
+  await sendButton(page).click();
+  const row = committedRow(page, "written before the key left");
+  await expect(row).toHaveCount(1);
+  await expect(row.getByTestId("reply-strip")).toContainText("react target");
+});
+
+test("a failed send from a replaced identity shows in no notice, and the toast names none of it", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await sendHeld(page, "failed as the old identity");
+  await callRiverTest(page, "replaceRoomIdentity");
+  // The new identity is not a member of this room.
+  await expect(page.getByTestId("not-member-notice")).toBeVisible();
+  await failHeldSend(page);
+  await expect(page.getByTestId("toast-message")).toContainText("previous identity");
+  await expect(page.getByTestId("toast-message")).not.toContainText("failed as the old identity");
+  await expect(failedNotice(page)).toHaveCount(0);
+  await expect(page.getByText("failed as the old identity")).toHaveCount(0);
+  await expect.poll(() => callRiverTest(page, "userIsBusy")).toBe(false);
+});
+
+test("a send failing while the room syncs is shown beside the sync notice", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await sendHeld(page, "sent before the resync");
+  await callRiverTest(page, "showRoomInitialSync");
+  await expect(page.getByTestId("room-sync-banner-dots")).toBeVisible();
+  await expect(page.getByTestId("message-composer")).toHaveCount(0);
+
+  await failHeldSend(page);
+  await expectFailedNotice(page, "sent before the resync", null);
+  await failedNotice(page).getByTestId("failed-send-discard-button").click();
+  await expect(failedNotice(page)).toHaveCount(0);
+  await expect.poll(() => callRiverTest(page, "userIsBusy")).toBe(false);
+});
+
 test("a send after a failure waits for the key it was first sealed under", { tag: "@chromium-only" }, async ({ page }) => {
   const keyNotHere = "does not have the room's newest key yet";
   await openRoomWithComposer(page);

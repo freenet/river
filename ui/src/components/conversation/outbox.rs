@@ -17,8 +17,11 @@
 //! not hold back the ones after it: it stays, marked failed, until the
 //! composer takes a failed send back as its draft (sending it again is a new
 //! entry) or an action is reported (a retried entry is restamped, and commits
-//! after them). Leaving the room drops what is waiting in it
-//! (`outbox_commit::clear_room_now`).
+//! after them). While the room shows a notice instead of the composer (its key
+//! not here, self banned, a sync), the notice shows a failed send, and the
+//! user can discard it there (`failed_send_notice.rs`); otherwise the
+//! composer takes it back once it returns. Leaving the room drops what is
+//! waiting in it (`outbox_commit::clear_room_now`).
 //!
 //! A private room's secret rotates (on a ban, a join or a prune). A message
 //! sealed under the previous secret whose signature arrives after a rotation
@@ -620,6 +623,43 @@ impl Outbox {
             self.rooms.remove(room);
         }
         Some(entry)
+    }
+
+    /// Whether entry `id` in `room` is `author`'s composer send, and failed.
+    pub fn is_failed_send(&self, room: &VerifyingKey, author: &VerifyingKey, id: u64) -> bool {
+        self.entry(room, id).is_some_and(|e| {
+            e.author_vk == *author
+                && matches!(e.kind, PendingKind::Send { .. })
+                && matches!(e.state, PendingState::Failed(_))
+        })
+    }
+
+    /// Drop entry `id` if it is still `author`'s failed composer send in
+    /// `room` (the user discarded it from the notice a room shows instead of
+    /// the composer), and say whether it was. Anything else is left as it is:
+    /// a send still being signed, an action, another identity's entry, an id
+    /// already gone (a second click, or the composer took the send back).
+    /// Like `discard`, it keeps the room's sealed mark (`may_seal_at`).
+    pub fn discard_failed_send(
+        &mut self,
+        room: &VerifyingKey,
+        author: &VerifyingKey,
+        id: u64,
+    ) -> bool {
+        self.is_failed_send(room, author, id) && self.discard(room, id).is_some()
+    }
+
+    /// Whether a failed composer send waits in `room`, written as any
+    /// identity. Only that: for the notice a room shows while this device
+    /// does not know who self is there, which must not show the text or the
+    /// quote of a send it cannot attribute.
+    pub fn has_failed_send(&self, room: &VerifyingKey) -> bool {
+        self.rooms.get(room).is_some_and(|queue| {
+            queue.iter().any(|e| {
+                matches!(e.kind, PendingKind::Send { .. })
+                    && matches!(e.state, PendingState::Failed(_))
+            })
+        })
     }
 
     /// Remove and return the failed actions (edit, delete, reaction) in

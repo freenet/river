@@ -3,7 +3,7 @@
 //! Every signal write here runs in a clean execution context (inside
 //! `crate::util::defer`), per `.claude/rules/dioxus-signal-safety.md`. The
 //! `*_now` functions write directly and must be called from a deferred
-//! closure; `discard` defers itself.
+//! closure; `discard` and `discard_failed_send` defer themselves.
 
 use super::outbox::{NewMessage, PendingEntry, PendingKind, SigningWork, OUTBOX};
 use crate::components::app::ROOMS;
@@ -79,6 +79,19 @@ pub(crate) fn clear_room_now(room: VerifyingKey) {
 pub(crate) fn discard(room: VerifyingKey, id: u64) {
     crate::util::defer(move || {
         OUTBOX.with_mut(|o| o.discard(&room, id));
+    });
+}
+
+/// Drop `author`'s failed send `id` in `room`: the user discarded it from the
+/// notice the room shows instead of the composer (`failed_send_notice.rs`).
+/// Deferred, and checked again when it runs, so a second click, an id that is
+/// gone, or a send the composer has taken back since does nothing (and writes
+/// no signal).
+pub(crate) fn discard_failed_send(room: VerifyingKey, author: VerifyingKey, id: u64) {
+    crate::util::defer(move || {
+        if OUTBOX.peek().is_failed_send(&room, &author, id) {
+            OUTBOX.with_mut(|o| o.discard_failed_send(&room, &author, id));
+        }
     });
 }
 

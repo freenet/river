@@ -677,6 +677,56 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Self, the owner of the current room, becomes a plain member of it under
+    // a new identity the owner invited, so the banned and not-a-member notices
+    // can be reached (`setSelfStanding`). Every example room self does not
+    // own has an owner whose key this page never held.
+    set_hook(
+        "makeSelfPlainMember",
+        Closure::<dyn FnMut()>::new(move || {
+            crate::util::defer(|| with_current_room_mut(make_self_plain_member));
+        })
+        .into_js_value(),
+    );
+
+    // Self's standing in the room `makeSelfPlainMember` set up: "member",
+    // "banned" (an owner-signed ban of self) or "not-member" (removed, with no
+    // stored invitation to rejoin with).
+    set_hook(
+        "setSelfStanding",
+        Closure::<dyn FnMut(String)>::new(move |standing: String| {
+            if !matches!(standing.as_str(), "member" | "banned" | "not-member") {
+                wasm_bindgen::throw_str(&format!("unknown standing {standing:?}"));
+            }
+            crate::util::defer(move || {
+                with_current_room_mut(|room, room_key| set_self_standing(room, room_key, &standing))
+            });
+        })
+        .into_js_value(),
+    );
+
+    // This device stops holding the current room's identity (no private key
+    // and no verifying key: who self is here is unknown), or holds it again.
+    set_hook(
+        "setRoomIdentityAvailable",
+        Closure::<dyn FnMut(bool)>::new(move |available: bool| {
+            crate::util::defer(move || {
+                with_current_room_mut(|room, _| {
+                    if available {
+                        if let Some((sk, vk)) = HIDDEN_IDENTITY.with(|h| h.borrow_mut().take()) {
+                            room.self_sk = sk;
+                            room.self_vk = vk;
+                        }
+                    } else if room.self_sk.is_some() || room.self_vk.is_some() {
+                        let hidden = (room.self_sk.take(), room.self_vk.take());
+                        HIDDEN_IDENTITY.with(|h| *h.borrow_mut() = Some(hidden));
+                    }
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
     // Corrupt the signature of the next own message the composer sends, so
     // the room does not admit it and the send fails AFTER the composer has
     // handed it off: the failed-send case of the A06 specs.
@@ -1075,6 +1125,100 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
     let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__riverTest"), &hooks);
+}
+
+thread_local! {
+    /// The owner's key and self's membership in the room `makeSelfPlainMember`
+    /// set up, for `setSelfStanding`.
+    static PLAIN_MEMBER: std::cell::RefCell<Option<(SigningKey, AuthorizedMember)>> =
+        const { std::cell::RefCell::new(None) };
+    /// The identity `setRoomIdentityAvailable(false)` took away.
+    static HIDDEN_IDENTITY: std::cell::RefCell<Option<(Option<SigningKey>, Option<VerifyingKey>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `makeSelfPlainMember`: self (the owner) invites a new identity, which
+/// becomes self in `room`. Call it only from inside a `defer` closure.
+fn make_self_plain_member(room: &mut RoomData, room_key: &VerifyingKey) {
+    let Some(owner_sk) = room
+        .signing_key()
+        .filter(|sk| sk.verifying_key() == *room_key)
+        .cloned()
+    else {
+        web_sys::console::error_1(
+            &"__riverTest.makeSelfPlainMember: self must own the room".into(),
+        );
+        return;
+    };
+    let member_sk = SigningKey::from_bytes(&[0x7d; 32]);
+    let member_vk = member_sk.verifying_key();
+    let owner_id = MemberId::from(room_key);
+    let member = AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: owner_id,
+            member_vk,
+        },
+        &owner_sk,
+    );
+    let info = AuthorizedMemberInfo::new_with_member_key(
+        MemberInfo {
+            member_id: MemberId::from(&member_vk),
+            version: 0,
+            preferred_nickname: SealedBytes::public(b"Plain Member".to_vec()),
+            deputies: Vec::new(),
+        },
+        &member_sk,
+    );
+    room.room_state.members.members.push(member.clone());
+    room.room_state.member_info.member_info.push(info.clone());
+    room.self_sk = Some(member_sk);
+    room.self_vk = Some(member_vk);
+    room.self_authorized_member = Some(member.clone());
+    room.invite_chain = Vec::new();
+    room.self_member_info = Some(info);
+    PLAIN_MEMBER.with(|p| *p.borrow_mut() = Some((owner_sk, member)));
+}
+
+/// `setSelfStanding`. Call it only from inside a `defer` closure.
+fn set_self_standing(room: &mut RoomData, room_key: &VerifyingKey, standing: &str) {
+    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    let Some((owner_sk, member)) = PLAIN_MEMBER.with(|p| p.borrow().clone()) else {
+        web_sys::console::error_1(
+            &"__riverTest.setSelfStanding: call makeSelfPlainMember first".into(),
+        );
+        return;
+    };
+    let owner_id = MemberId::from(room_key);
+    let self_id = member.member.id();
+    let members = &mut room.room_state.members.members;
+    match standing {
+        "member" => {
+            room.room_state
+                .bans
+                .0
+                .retain(|b| b.ban.banned_user != self_id);
+            if !members.iter().any(|m| m.member.id() == self_id) {
+                members.push(member.clone());
+            }
+            room.self_authorized_member = Some(member);
+        }
+        "banned" => {
+            room.room_state.bans.0.push(AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: owner_id,
+                    banned_at: crate::util::get_current_system_time(),
+                    banned_user: self_id,
+                },
+                owner_id,
+                &owner_sk,
+            ));
+        }
+        _ => {
+            members.retain(|m| m.member.id() != self_id);
+            room.self_authorized_member = None;
+        }
+    }
 }
 
 /// Model an imported placeholder until it receives a valid signed configuration.

@@ -33,6 +33,7 @@ use crate::util::{
 };
 pub(crate) mod avatar;
 mod emoji_picker;
+mod failed_send_notice;
 mod history_scroll;
 mod history_window;
 mod markdown;
@@ -63,6 +64,7 @@ mod reply_highlight;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::reaction_picker::is_open as reaction_picker_is_open;
 mod seal;
+use self::failed_send_notice::FailedSendNotice;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
     complete_scroll_request, correct_view_after_patch, follow_arrival_at_end,
@@ -3352,10 +3354,17 @@ pub fn Conversation() -> Element {
                         }
                     });
 
+                // A failed send has no composer to come back to while a
+                // notice replaces it: it shows beside the notice instead
+                // (`failed_send_notice.rs`).
+                let failed_send = |room_data: &crate::room_data::RoomData| rsx! {
+                    FailedSendNotice { room: room_data.owner_vk, author: room_data.self_verifying_key() }
+                };
                 match current_room_data.as_ref() {
-                    Some(_) if initial_sync_error.is_some() => {
+                    Some(room_data) if initial_sync_error.is_some() => {
                         let report = initial_sync_error.unwrap();
                         rsx! {
+                            {failed_send(room_data)}
                             div { class: "px-4 mb-4",
                                 WithTooltip {
                                     tip: report.summary.clone(),
@@ -3370,6 +3379,7 @@ pub fn Conversation() -> Element {
                     },
                     Some(room_data) if room_data.is_awaiting_initial_sync() => {
                         rsx! {
+                            {failed_send(room_data)}
                             div { class: "px-4 py-3 mx-4 mb-4 bg-surface rounded-lg text-sm text-text-muted flex items-center gap-3",
                                 SmallDots { test_id: "room-sync-banner-dots" }
                                 span { "Syncing room state from the network. You'll be able to send messages once sync completes." }
@@ -3382,6 +3392,7 @@ pub fn Conversation() -> Element {
                             // messages are encrypted with its secret, and a
                             // message sent without it would not be admitted.
                             Ok(()) if room_data.missing_room_secret() => rsx! {
+                                {failed_send(room_data)}
                                 div {
                                     "data-testid": "missing-room-secret-notice",
                                     class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
@@ -3443,6 +3454,7 @@ pub fn Conversation() -> Element {
                                 // instead of panicking the whole conversation.
                                 match room_data.self_verifying_key() {
                                     Some(user_vk) => rsx! {
+                                        {failed_send(room_data)}
                                         NotMemberNotification {
                                             user_verifying_key: user_vk
                                         }
@@ -3451,7 +3463,10 @@ pub fn Conversation() -> Element {
                                 }
                             },
                             Err(SendMessageError::UserBanned) => rsx! {
-                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
+                                {failed_send(room_data)}
+                                div {
+                                    "data-testid": "banned-notice",
+                                    class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "You have been banned from sending messages in this room."
                                 }
                             },
@@ -3460,7 +3475,10 @@ pub fn Conversation() -> Element {
                             // `NotMemberNotification` cannot be used here — it
                             // needs the verifying key, which is what is missing.
                             Err(SendMessageError::IdentityUnavailable) => rsx! {
-                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
+                                {failed_send(room_data)}
+                                div {
+                                    "data-testid": "identity-unavailable-notice",
+                                    class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "This device doesn't hold your key for this room, so you can't send messages here."
                                 }
                             },
