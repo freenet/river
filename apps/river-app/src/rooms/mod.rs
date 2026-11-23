@@ -72,6 +72,7 @@ pub mod leave;
 mod link_tests;
 pub mod modes;
 pub mod outbox;
+mod resync;
 pub mod room;
 #[cfg(test)]
 mod room_tests;
@@ -128,6 +129,9 @@ struct Inner {
     /// [`Link::with_watch`].
     watch: Mutex<Arc<generation::Watch>>,
     replace_watch: Mutex<bool>,
+    /// The room the window shows, as last told by [`Link::viewing`]: told again to each new
+    /// session, which reads it again when it has heard nothing about it for a while.
+    viewing: Mutex<Option<String>>,
 }
 
 impl Link {
@@ -210,6 +214,7 @@ impl Link {
                 outbox: Mutex::new(outbox::Outbox::default()),
                 watch: Mutex::new(Arc::new(watch)),
                 replace_watch: Mutex::new(false),
+                viewing: Mutex::new(None),
             }),
         }
     }
@@ -245,6 +250,11 @@ impl Link {
                 Arc::new(generation::Watch::shipped(inner.config_dir.as_deref()));
         }
         inner.drop_pending.store(true, Ordering::Release);
+        // The room shown was the previous node's; the new chat tells it again when one opens.
+        *inner
+            .viewing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         inner.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -254,6 +264,41 @@ impl Link {
             // The receiver lives as long as the link, so this cannot fail.
             let _ = tx.send(command);
         }
+    }
+
+    /// The window now shows the room keyed `room` (`Room::key`). The background work reads
+    /// the room shown again from the node when it has heard nothing about it for a while
+    /// (freenet/river#971), as the web UI's watchdog does.
+    pub fn viewing(&self, room: &str) {
+        *self
+            .inner
+            .viewing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(room.to_owned());
+        self.send(Command {
+            room: room.to_owned(),
+            action: Action::Viewing,
+        });
+    }
+
+    /// What was handed to the background work and not yet taken (tests).
+    #[cfg(test)]
+    pub(crate) fn take_sent(&self) -> Vec<Command> {
+        self.inner
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_iter()
+            .collect()
+    }
+
+    /// The window came to the front: read again every room the node has said nothing about
+    /// lately, as the web UI does when its page becomes visible.
+    pub fn resync(&self) {
+        self.send(Command {
+            room: String::new(),
+            action: Action::Resync,
+        });
     }
 
     /// Start reading the rooms, unless that is already under way. The work stops by itself
@@ -302,6 +347,18 @@ impl Link {
                 if inner.drop_pending.swap(false, Ordering::AcqRel) {
                     *outbox = outbox::Outbox::default();
                     while inbox.try_recv().is_ok() {}
+                }
+                // Each session starts knowing nothing of the window: tell it the room shown.
+                let viewing = inner
+                    .viewing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(room) = viewing {
+                    me.send(Command {
+                        room,
+                        action: Action::Viewing,
+                    });
                 }
                 let authority = inner
                     .authority

@@ -348,8 +348,16 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// How often, and how far apart, a test takes a lock that was just let go of. Other tests in
+    /// this binary start processes, and a child holds a copy of every open descriptor, the
+    /// lock's included, from fork until its exec closes it (`O_CLOEXEC`), so a lock let go of
+    /// here can stay taken for that moment. A real launch tries `TRIES` times `TRY_WAIT` apart
+    /// for the same reason; a test that tries once is flaky.
+    const TAKE_TRIES: u32 = 200;
+    const TAKE_WAIT: Duration = Duration::from_millis(5);
+
     fn first_in(dir: &Path) -> Guard {
-        match acquire_with(dir, None, 1, Duration::ZERO).unwrap() {
+        match acquire_with(dir, None, TAKE_TRIES, TAKE_WAIT).unwrap() {
             Start::First(g) => g,
             Start::Running { .. } => panic!("expected to be first"),
         }
@@ -405,6 +413,39 @@ mod tests {
         next(&shown);
     }
 
+    /// While this process starts other processes (as the update host and other tests in this
+    /// binary do), a child holds a copy of the lock's descriptor from fork until its exec closes
+    /// it, and so holds the lock that long after the guard drops. A launch that tries once can
+    /// find it taken; one that tries a few times, as a real launch does, is first.
+    #[test]
+    #[cfg(unix)]
+    fn the_next_launch_is_first_while_this_process_starts_others() {
+        /// Stops the spawning thread however the test ends, a panic included.
+        struct Stop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = Stop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let spawner = {
+            let stop = stop.0.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("sh")
+                        .args(["-c", "true"])
+                        .status();
+                }
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..300 {
+            drop(first_in(dir.path()));
+        }
+        drop(stop);
+        spawner.join().unwrap();
+    }
+
     #[test]
     fn dropping_the_guard_lets_the_next_launch_be_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -437,7 +478,7 @@ mod tests {
             "failed-child",
         )
         .unwrap();
-        assert!(guard.reacquire().unwrap());
+        assert!(guard.reacquire_within(TAKE_TRIES, TAKE_WAIT).unwrap());
         // A launch after the failure finds the lock taken and reaches the original instance.
         assert!(second(dir.path(), Some("again")));
         assert_eq!(next(&shown), Some("again".to_owned()));
@@ -452,11 +493,17 @@ mod tests {
         guard.release();
         // Something else (a process the replacement left behind) holds the lock.
         let holder = open_lock(dir.path()).unwrap();
-        holder.try_lock().unwrap();
+        let taken = (0..TAKE_TRIES).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(TAKE_WAIT);
+            }
+            holder.try_lock().is_ok()
+        });
+        assert!(taken);
         assert!(!guard.reacquire_within(3, Duration::ZERO).unwrap());
-        // It lets go; the next attempt takes the lock back.
+        // It lets go; trying again takes the lock back.
         drop(holder);
-        assert!(guard.reacquire_within(3, Duration::ZERO).unwrap());
+        assert!(guard.reacquire_within(TAKE_TRIES, TAKE_WAIT).unwrap());
     }
 
     #[test]
@@ -524,7 +571,7 @@ mod tests {
         let guard = first_in(dir.path());
         // No server answers; the holder drops its lock before the next try.
         guard.release();
-        match acquire_with(dir.path(), None, 3, Duration::ZERO).unwrap() {
+        match acquire_with(dir.path(), None, TAKE_TRIES, TAKE_WAIT).unwrap() {
             Start::First(_) => {}
             Start::Running { .. } => panic!("the lock was free"),
         }

@@ -255,6 +255,9 @@ impl RiverApp {
         // What the user does in a room goes to the background work, which sends it.
         let sink = link.clone();
         chat.set_sink(Box::new(move |command| sink.send(command)));
+        // So does which room is open: that room is read again when the node goes quiet on it.
+        let shown = link.clone();
+        chat.set_view_hook(Box::new(move |room| shown.viewing(room)));
         let link_generation = link.generation();
         RiverApp {
             setup: if waiting {
@@ -388,6 +391,14 @@ impl RiverApp {
 
     /// The window gained or lost focus.
     pub fn focus_changed(&mut self, focused: bool) {
+        // Back in front from away: read again the rooms the node has said nothing about lately
+        // (freenet/river#971), as the web UI does when its page becomes visible.
+        if focused
+            && !self.focused
+            && let Some(link) = &self.link
+        {
+            link.resync();
+        }
         self.focused = focused;
         self.focus_known = true;
         if focused {
@@ -952,6 +963,8 @@ impl RiverApp {
         if let Some(link) = &self.link {
             let sink = link.clone();
             chat.set_sink(Box::new(move |command| sink.send(command)));
+            let shown = link.clone();
+            chat.set_view_hook(Box::new(move |room| shown.viewing(room)));
         }
         self.chat = chat;
         self.access = Access::Connecting;
@@ -3477,6 +3490,30 @@ mod tests {
         );
         rt.frame(0.0);
         rt
+    }
+
+    /// Coming back to the front asks the background work to read quiet rooms again
+    /// (freenet/river#971), once per return: a focus event while already in front asks nothing.
+    #[test]
+    fn coming_to_the_front_asks_for_a_read_once_per_return() {
+        let mut state = RiverApp::detached();
+        let link = rooms::Link::new(None, |_| {});
+        state.link = Some(link.clone());
+        let resyncs = |link: &rooms::Link| {
+            link.take_sent()
+                .iter()
+                .filter(|c| matches!(c.action, rooms::outbox::Action::Resync))
+                .count()
+        };
+        state.focus_changed(false);
+        assert_eq!(resyncs(&link), 0);
+        state.focus_changed(true);
+        assert_eq!(resyncs(&link), 1);
+        state.focus_changed(true);
+        assert_eq!(resyncs(&link), 0, "already in front");
+        state.focus_changed(false);
+        state.focus_changed(true);
+        assert_eq!(resyncs(&link), 1);
     }
 
     #[test]

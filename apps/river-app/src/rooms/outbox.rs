@@ -271,6 +271,13 @@ pub enum Action {
     UnarchiveDm {
         peer: MemberId,
     },
+    /// The window now shows the command's room. Not something the user sends: the background
+    /// work reads that room again from the node when it has heard nothing about it for a while
+    /// ([`super::resync`]). Never kept in the outbox.
+    Viewing,
+    /// The window came to the front: read again from the node every room not heard about
+    /// lately ([`super::resync`]). `room` is empty. Never kept in the outbox.
+    Resync,
 }
 
 impl std::fmt::Debug for Action {
@@ -329,6 +336,8 @@ impl std::fmt::Debug for Action {
                 .field("mode", mode)
                 .finish(),
             Action::LeaveRoom => f.write_str("LeaveRoom"),
+            Action::Viewing => f.write_str("Viewing"),
+            Action::Resync => f.write_str("Resync"),
             Action::ExportId => f.write_str("ExportId"),
             Action::ImportId { replace, .. } => f
                 .debug_struct("ImportId")
@@ -2868,7 +2877,9 @@ impl Outbox {
             | Action::SendInviteDm { .. }
             | Action::AcceptInviteDm { .. }
             | Action::ArchiveDm { .. }
-            | Action::UnarchiveDm { .. } => Err(("Your message", "Nothing to do.".to_owned())),
+            | Action::UnarchiveDm { .. }
+            | Action::Viewing
+            | Action::Resync => Err(("Your message", "Nothing to do.".to_owned())),
         }
     }
 

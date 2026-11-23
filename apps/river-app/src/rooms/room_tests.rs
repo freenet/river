@@ -642,6 +642,150 @@ fn a_rejected_merge_changes_nothing() {
     assert_eq!(live.stored.room_state, before);
 }
 
+/// An upgrade pointer signed by someone other than the owner: every merge refuses it, and the
+/// upgrade is the room's last step but two, after the messages.
+fn forged_upgrade(f: &Fixture) -> river_core::room_state::upgrade::OptionalUpgradeV1 {
+    river_core::room_state::upgrade::OptionalUpgradeV1(Some(
+        river_core::room_state::upgrade::AuthorizedUpgradeV1::new(
+            river_core::room_state::upgrade::UpgradeV1 {
+                owner_member_id: f.owner_id(),
+                version: 1,
+                new_chatroom_address: blake3::Hash::from([0; 32]),
+            },
+            &SigningKey::from_bytes(&[99; 32]),
+        ),
+    ))
+}
+
+/// What the network sends is merged as the web UI merges it (`room_synchronizer.rs`), in place:
+/// the steps before the one that fails stay. Rolling it all back would keep a message out for
+/// good, since every later notification and every read again carries the same failing step
+/// (freenet/river#971). The merge still says it failed, so the room is named as not updated.
+#[test]
+fn a_network_state_that_fails_partway_keeps_the_steps_before_the_failure() {
+    let f = Fixture::new();
+    let state = f.private_state();
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let mut incoming = state;
+    incoming
+        .recent_messages
+        .messages
+        .push(text_at(&f, 700, 0, &SECRET, "lands anyway"));
+    incoming.upgrade = forged_upgrade(&f);
+    assert!(live.merge_network_state(&incoming).is_err());
+    let room = live.view(&minutes);
+    assert_eq!(
+        room.messages.last().map(|m| m.text.as_str()),
+        Some("lands anyway"),
+        "the messages step came before the failing one and stays, decrypted"
+    );
+    assert!(
+        live.stored.room_state.upgrade.0.is_none(),
+        "the forged pointer is not kept"
+    );
+}
+
+/// The same for a delta from a notification.
+#[test]
+fn a_network_delta_that_fails_partway_keeps_the_steps_before_the_failure() {
+    let f = Fixture::new();
+    let mut live = LiveRoom::new(f.stored(f.private_state()));
+    let delta = river_core::room_state::ChatRoomStateV1Delta {
+        recent_messages: Some(vec![text_at(&f, 700, 0, &SECRET, "lands anyway")]),
+        upgrade: forged_upgrade(&f).0,
+        ..Default::default()
+    };
+    assert!(live.apply_network_delta(delta).is_err());
+    let room = live.view(&minutes);
+    assert_eq!(
+        room.messages.last().map(|m| m.text.as_str()),
+        Some("lands anyway")
+    );
+    assert!(live.stored.room_state.upgrade.0.is_none());
+}
+
+/// The private room with its message cap set to the messages it holds, so any new message is
+/// one too many until cleanup drops the oldest.
+fn full_room(f: &Fixture) -> ChatRoomStateV1 {
+    let mut state = f.private_state();
+    let mut config = state.configuration.configuration.clone();
+    config.max_recent_messages = state.recent_messages.messages.len();
+    state.configuration = AuthorizedConfigurationV1::new(config, &f.owner);
+    state
+}
+
+/// What a partial merge keeps is cleaned up as a whole merge would be: the room's caps hold
+/// (here the message cap), so a room that fails partway again and again cannot grow past them.
+#[test]
+fn a_network_state_that_fails_partway_keeps_only_what_cleanup_allows() {
+    let f = Fixture::new();
+    let state = full_room(&f);
+    let cap = state.configuration.configuration.max_recent_messages;
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let mut incoming = state;
+    for (i, text) in ["newer", "newest"].iter().enumerate() {
+        incoming
+            .recent_messages
+            .messages
+            .push(text_at(&f, 700 + i as u64, 0, &SECRET, text));
+    }
+    incoming.upgrade = forged_upgrade(&f);
+    assert!(live.merge_network_state(&incoming).is_err());
+    let kept = &live.stored.room_state;
+    assert_eq!(kept.recent_messages.messages.len(), cap, "the cap holds");
+    assert_eq!(
+        kept.normalized(&live.params()).unwrap(),
+        *kept,
+        "cleaned up"
+    );
+    let room = live.view(&minutes);
+    assert_eq!(
+        room.messages.last().map(|m| m.text.as_str()),
+        Some("newest")
+    );
+}
+
+/// The same for a delta from a notification.
+#[test]
+fn a_network_delta_that_fails_partway_keeps_only_what_cleanup_allows() {
+    let f = Fixture::new();
+    let state = full_room(&f);
+    let cap = state.configuration.configuration.max_recent_messages;
+    let mut live = LiveRoom::new(f.stored(state));
+    let delta = river_core::room_state::ChatRoomStateV1Delta {
+        recent_messages: Some(vec![
+            text_at(&f, 700, 0, &SECRET, "newer"),
+            text_at(&f, 701, 0, &SECRET, "newest"),
+        ]),
+        upgrade: forged_upgrade(&f).0,
+        ..Default::default()
+    };
+    assert!(live.apply_network_delta(delta).is_err());
+    let kept = &live.stored.room_state;
+    assert_eq!(kept.recent_messages.messages.len(), cap);
+    assert_eq!(kept.normalized(&live.params()).unwrap(), *kept);
+}
+
+/// If the cleanup of what a failed merge kept itself fails, nothing is kept: the copy is
+/// exactly what it was, and nothing is reported as changed.
+#[test]
+fn a_failed_merge_whose_cleanup_fails_keeps_nothing() {
+    let f = Fixture::new();
+    let state = full_room(&f);
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let before = live.stored.room_state.clone();
+    let mut incoming = state;
+    incoming
+        .recent_messages
+        .messages
+        .push(text_at(&f, 700, 0, &SECRET, "not kept"));
+    incoming.upgrade = forged_upgrade(&f);
+    let merged = live.merge_network_state_failing_cleanup(&incoming);
+    assert!(merged.is_err(), "{merged:?}");
+    assert!(!merged.changed);
+    assert_eq!(live.stored.room_state, before);
+}
+
 /// A secret blob addressed to this member that does not decrypt is skipped, not fatal: the
 /// room still opens, with the invitation's copy of that version's secret.
 #[test]

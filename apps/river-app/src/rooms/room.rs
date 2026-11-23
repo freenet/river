@@ -50,6 +50,20 @@ pub struct LiveRoom {
     secrets: HashMap<u32, [u8; 32]>,
 }
 
+/// What a merge of what the network sent did to a room's copy.
+#[derive(Debug)]
+pub struct NetworkMerge {
+    /// The copy changed: what shows may have, even when the merge failed partway.
+    pub changed: bool,
+    pub result: Result<(), String>,
+}
+
+impl NetworkMerge {
+    pub fn is_err(&self) -> bool {
+        self.result.is_err()
+    }
+}
+
 impl LiveRoom {
     pub fn new(stored: StoredRoom) -> Self {
         let mut room = LiveRoom {
@@ -321,6 +335,99 @@ impl LiveRoom {
         self.stored.room_state = next;
         self.refresh();
         Ok(())
+    }
+
+    /// Merge a whole room state from the network (a notification, or the answer to a subscribe
+    /// or a read). Unlike [`merge_state`](Self::merge_state) this is NOT all or nothing: as in
+    /// the web UI (`room_synchronizer.rs`, which merges into its copy in place), the steps that
+    /// succeeded before the failing one stay, and the error is still returned so the room is
+    /// named as not updated and read again (freenet/river#971).
+    ///
+    /// Why not roll back: the node sends the whole state with every notification, and a read
+    /// again returns the same whole state, so a step that fails against this copy fails on
+    /// every later delivery too. Rolled back, everything after the first step that failed
+    /// would stay missing for good, a message included, however often the room is read. Kept,
+    /// only the failing step and the ones after it wait.
+    ///
+    /// What is kept is cleaned up as a whole merge is (`post_apply_cleanup`: the room's caps,
+    /// the bans checked against their issuers, the members and messages they remove), which a
+    /// failed composed merge skips; the web UI skips it too and normalizes only what it sends.
+    /// Cleaned up, the copy is a state the room contract accepts. If cleanup itself fails,
+    /// nothing is kept: the copy stays as it was.
+    ///
+    /// A failed merge cannot leave a private room with a secret version it holds no secret
+    /// for: the current version is part of the secrets step, so it moves only when that step,
+    /// with the secret addressed to this member, is applied.
+    ///
+    /// What River composes and checks itself (the outbox, direct messages) uses the
+    /// all-or-nothing [`apply_delta`](Self::apply_delta): there, a change that fails partway
+    /// must not be shown at all.
+    pub fn merge_network_state(&mut self, incoming: &ChatRoomStateV1) -> NetworkMerge {
+        self.merge_from_network(|state, params| {
+            state.merge_through_summary(params, incoming).map(|_| ())
+        })
+    }
+
+    /// Apply a delta from an update notification, keeping the steps before a failing one, as
+    /// [`merge_network_state`](Self::merge_network_state) does and for the same reasons.
+    pub fn apply_network_delta(&mut self, delta: ChatRoomStateV1Delta) -> NetworkMerge {
+        // The composed `apply_delta` ignores its parent-state argument (see
+        // [`apply_delta`](Self::apply_delta)), so a default stands in for it.
+        self.merge_from_network(|state, params| {
+            state.apply_delta(&ChatRoomStateV1::default(), params, &Some(delta))
+        })
+    }
+
+    fn merge_from_network(
+        &mut self,
+        merge: impl FnOnce(&mut ChatRoomStateV1, &ChatRoomParametersV1) -> Result<(), String>,
+    ) -> NetworkMerge {
+        self.merge_from_network_with(merge, |state, params| state.post_apply_cleanup(params))
+    }
+
+    /// [`merge_from_network`](Self::merge_from_network) with the cleanup of a failed merge's
+    /// result given (tests make it fail). On success the copy counts as changed without
+    /// comparing: the caller reports a success regardless. The copy's derived views
+    /// (`refresh`) are rebuilt only when it changed; nothing else they read changes here.
+    fn merge_from_network_with(
+        &mut self,
+        merge: impl FnOnce(&mut ChatRoomStateV1, &ChatRoomParametersV1) -> Result<(), String>,
+        cleanup: impl FnOnce(&mut ChatRoomStateV1, &ChatRoomParametersV1) -> Result<(), String>,
+    ) -> NetworkMerge {
+        let params = self.params();
+        let before = self.stored.room_state.clone();
+        let mut result = merge(&mut self.stored.room_state, &params);
+        let changed = match &result {
+            Ok(()) => true,
+            Err(merge_error) => {
+                if let Err(cleanup_error) = cleanup(&mut self.stored.room_state, &params) {
+                    result = Err(format!(
+                        "{merge_error}; what it kept could not be cleaned up \
+                         ({cleanup_error}), so nothing was kept"
+                    ));
+                    self.stored.room_state = before;
+                    false
+                } else {
+                    self.stored.room_state != before
+                }
+            }
+        };
+        if changed {
+            self.refresh();
+        }
+        NetworkMerge { changed, result }
+    }
+
+    /// [`merge_network_state`](Self::merge_network_state) with a cleanup that fails (tests).
+    #[cfg(test)]
+    pub(super) fn merge_network_state_failing_cleanup(
+        &mut self,
+        incoming: &ChatRoomStateV1,
+    ) -> NetworkMerge {
+        self.merge_from_network_with(
+            |state, params| state.merge_through_summary(params, incoming).map(|_| ()),
+            |_, _| Err("cleanup refused".into()),
+        )
     }
 
     /// Rebuild what the stored copy does not persist: the secrets, then the edits, deletions
