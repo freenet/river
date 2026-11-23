@@ -22,7 +22,7 @@ forks rooms between peers. These rules hold the room contract to them.
 key it could be checked against verifies) or a work bound exceeded. A record
 that is validly signed but that the room does not admit (over a cap, at an
 unknown secret version, a public message in a private room, a second record
-for a member id this peer already holds) is SKIPPED on arrival and dropped
+for a member id this peer already holds under the same key) is SKIPPED on arrival and dropped
 where held, by the same rule in both places. So is a ban whose known
 issuer's key does not verify it: another peer may not know that issuer. A
 ban whose issuer is known nowhere is kept on arrival and swept by the same
@@ -30,6 +30,23 @@ cleanup; neither kind counts toward `max_user_bans` (they are dropped before
 the cap counts, so they cannot evict a stored ban). An `Err` for such a
 record fails every merge with a peer holding it, in one direction only, and
 nothing but its author can repair it.
+
+A `MemberId` is a non-cryptographic hash, so two keys can share one. Every
+field apply keeps one record per (id, key), never per id, and accepts what an
+id signed (`member_info`, messages, DMs, purges, provisional bans) under ANY
+key a held member or evidence record names for it; a member-invited record
+whose signature fails under every key held for its inviter's id is skipped,
+not an error (an owner-invited one is still an error: the owner's key is the
+only key for the owner's id). A member's ban is kept on arrival whatever key
+is held for its issuer, because bans apply before members and the issuer's
+record may arrive in the same delta under another key; step 0-sig drops it if
+no key verifies it. Cleanup's first step (`resolve_shared_ids`) then keeps
+one key per id from the whole state: the key that has signed something the
+room holds, then least invite depth, then lower record digest. Anything that
+reads ONE record per id during a field apply (`members_by_member_id`,
+`BanEvidenceV1::lookup`) to accept or drop a record makes the first exchange
+depend on which record the lookup returned; read every key instead
+(`member::keys_by_member_id`).
 
 A configuration that fails the value checks is the one record that is never
 dropped: an owner-signed one ranks below every valid configuration, so a

@@ -130,6 +130,15 @@ survives review while being wrong (see the encoding trap in History below). See
   summary need not tell two records for one id apart (an interim
   `(id, digest)` shape measured 26.01 B/entry against 9.01 and was dropped).
   The same value-side rules apply to each; collections stayed `BTree*`.
+- **freenet/river#974 follow-up** (2026-11): `MembersV1::Summary` became
+  `BTreeSet<(MemberId, u64)>`, the id with `key_tag` (the first 8 bytes,
+  little-endian, of BLAKE3 over the key; golden vector
+  `key_tag_golden_vector`). Two keys can share a `MemberId`, and the id-only
+  summary never offered a peer holding one key the record naming the other,
+  so the split was permanent. 64 bits is enough here: the other side of the
+  comparison is a key the victim chose, so a match needs a targeted second
+  preimage, not a birthday search. Measured 19.01 B/entry against 9.01 for
+  ids only (`members_summary_bytes_per_entry`).
 - **freenet/river#571** (2026-07): the same summary's VALUE then shrank,
   `(u32, Signature)` → `(u32, SigDigest)`, where `SigDigest` is a 128-bit BLAKE3
   digest of the signature serialized as a CBOR byte string. Measured 134.08 →

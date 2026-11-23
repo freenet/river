@@ -118,7 +118,11 @@ impl ChatRoomStateV1 {
         // The records naming another key go, and the members a dropped key
         // invited: a record naming a decided id as its inviter whose
         // signature fails under the kept key. Their own invitees follow by
-        // id, through ids left with no record.
+        // id, through ids left with no record. A dropped key has invitees,
+        // and below content, only if it signed something, so this and the
+        // content check below act only when two keys for the id have each
+        // signed something (a second keypair with the same id). No test
+        // reaches them; they keep such a state valid.
         let keep = |m: &AuthorizedMember| {
             let loses = kept
                 .get(&m.member.id())

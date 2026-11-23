@@ -1412,27 +1412,18 @@ impl fmt::Debug for Member {
 
 /*
 `MemberId` is a 64-bit *non-cryptographic* `FastHash` (a Java-style `h*31 + byte`
-polynomial hash) of the member's `VerifyingKey`, NOT a cryptographic digest. The
-8-char base32 `Display` label is lossier still — only 40 of those 64 bits.
+polynomial hash) of the member's `VerifyingKey`, NOT a cryptographic digest, so
+two keys can share one. The 8-char base32 `Display` label is lossier still (40 of
+the 64 bits) and is UI/mention-token only; see `mention.rs`.
 
-Collision cost is therefore modest, not astronomical (an earlier version of this
-comment claimed ~3 * 10^59 years, which was wrong):
-  - 40-bit `Display` label, targeted second-preimage: ~2^40 keypair generations
-    (hours on a GPU / small cluster). Any-collision (birthday): ~2^20, seconds.
-  - Full 64-bit id, targeted: ~2^64 (large but finite brute force over keypairs,
-    not 10^59 years). Any-collision (birthday): ~2^32, ~hours single-core.
-The one thing that keeps this from being trivial is that a usable member needs a
-real keypair (to sign), so the weak hash can't be inverted algebraically — an
-attacker must brute-force by generating ed25519 keypairs and hashing the pubkey.
-
-Why a collision is not a full compromise: authorization is anchored on the full
-ed25519 keys and signatures. `member_vk` carries the full key, and the invite
-chain verifies signatures against the looked-up member's real `member_vk`; a
-member colliding with the owner's id (or full key) is rejected in `verify`. A
-`MemberId` collision buys identity confusion / member-map shadowing (bans,
-invite refs and the member map are keyed by the 64-bit id), NOT signature
-forgery. The cheap 40-bit label is UI/mention-token only and never keys these
-maps. See `mention.rs` for the label's lossy round-trip handling.
+Authorization never rests on an id alone. Every signature is checked against a
+full key, a member colliding with the owner's id (or key) is rejected in
+`verify`, and wherever two records name one id under different keys the full
+keys are compared: field applies keep one record per (id, key) and accept what
+an id signed under any key held for it, the members summary carries a key tag
+(`key_tag`), and cleanup decides one key per id from the whole state
+(`ChatRoomStateV1::resolve_shared_ids`), preferring the key that has signed
+something the room holds.
 */
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);
