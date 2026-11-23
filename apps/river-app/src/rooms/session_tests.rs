@@ -2481,8 +2481,9 @@ fn a_merge_that_always_fails_the_same_way_is_read_again_a_few_times_then_left() 
             &SigningKey::from_bytes(&[99; 32]),
         ),
     ));
-    // The first wait is 0.8-1.2 s and the second 1.6-2.4 s, so the second is longer unless the
-    // machine stalls for 0.4 s at just the wrong moment.
+    // The first heal wait is 0.8-1.2 s and the second, doubled, 1.6-2.4 s. A delay can only
+    // lengthen a gap, so the second gap is at least 1.6 s; without the doubling it would be at
+    // most 1.2 s plus any delay.
     let first = Duration::from_secs(1);
     let pace = Pace {
         resubscribe_first: first,
@@ -2513,8 +2514,8 @@ fn a_merge_that_always_fails_the_same_way_is_read_again_a_few_times_then_left() 
         panic!("{times:?}")
     };
     assert!(
-        two - one > one - noted,
-        "the wait grows: {:?} then {:?}",
+        two - one >= first.mul_f64(1.5),
+        "the wait doubles: {:?} then {:?}",
         one - noted,
         two - one
     );
