@@ -41,8 +41,10 @@ only key for the owner's id). A member's ban is kept on arrival whatever key
 is held for its issuer, because bans apply before members and the issuer's
 record may arrive in the same delta under another key; step 0-sig drops it if
 no key verifies it. Cleanup's first step (`resolve_shared_ids`) then keeps
-one key per id from the whole state: the key that has signed something the
-room holds, then least invite depth, then lower record digest. Anything that
+one key per id from the whole state: the key that has signed a record the
+room holds that no retention horizon withholds (`member_info`, a ban, a DM
+purge record, an invitee's record; never a message or DM, since a merge or
+delta may withhold those), then least invite depth, then lower record digest. Anything that
 reads ONE record per id during a field apply (`members_by_member_id`,
 `BanEvidenceV1::lookup`) to accept or drop a record makes the first exchange
 depend on which record the lookup returned; read every key instead

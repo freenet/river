@@ -22,8 +22,9 @@ impl ChatRoomStateV1 {
     /// whichever order the records arrived in, and in this order:
     ///
     /// 1. A key that has signed something the state holds for the id (its
-    ///    `member_info`, a message, a direct message, a ban it issued, or the
-    ///    record of a member it invited) beats a key that has not. A key with
+    ///    `member_info`, a ban it issued, a DM purge record, or the record of
+    ///    a member it invited; see `has_signed` for why messages do not
+    ///    count) beats a key that has not. A key with
     ///    no known secret can never sign anything, so a record naming another
     ///    key for a member who has used the room never displaces them, on any
     ///    peer, whichever record arrived first.
@@ -189,17 +190,18 @@ impl ChatRoomStateV1 {
             })
     }
 
-    /// Whether `vk` has signed anything this state holds for `id`.
+    /// Whether `vk` has signed a record this state holds for `id` that no
+    /// retention horizon withholds: its `member_info`, a ban it issued, a
+    /// purge record, or the record of a member it invited. Messages and
+    /// direct messages do not count: a merge or delta withholds those older
+    /// than the receiver's horizon, so counting them made the key kept
+    /// depend on how much history the exchange carried (the horizon-limited
+    /// merge and the open one disagreed).
     fn has_signed(&self, id: MemberId, vk: &VerifyingKey, owner_vk: &VerifyingKey) -> bool {
         self.member_info
             .member_info
             .iter()
             .any(|i| i.member_info.member_id == id && i.verify_signature_with_key(vk).is_ok())
-            || self
-                .recent_messages
-                .messages
-                .iter()
-                .any(|m| m.message.author == id && m.validate(vk).is_ok())
             || self
                 .members
                 .members
@@ -211,11 +213,6 @@ impl ChatRoomStateV1 {
                 .0
                 .iter()
                 .any(|b| b.banned_by == id && b.verify_signature(vk).is_ok())
-            || self
-                .direct_messages
-                .messages
-                .iter()
-                .any(|m| m.message.sender == id && m.verify_signature(vk, owner_vk).is_ok())
             || self
                 .direct_messages
                 .purges

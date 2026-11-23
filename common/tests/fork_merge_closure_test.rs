@@ -2220,6 +2220,11 @@ fn stale_summary_deltas_apply() {
                                     not_commutative.unwrap_or_default()
                                 ))
                                 .or_default() += 1;
+                            if examples.len() < 20 {
+                                examples.push(format!(
+                                    "{mode:?} seed {seed} shape {shape} {dir}: no clean convergence"
+                                ));
+                            }
                         }
                     }
                     Err(e) => {
@@ -2238,6 +2243,12 @@ fn stale_summary_deltas_apply() {
                 *rejected
                     .entry("cleanup not idempotent after a stale apply".to_string())
                     .or_default() += 1;
+                if examples.len() < 20 {
+                    examples.push(format!(
+                        "{mode:?} seed {seed} shape {shape}: cleanup not idempotent after {}",
+                        broken[0]
+                    ));
+                }
             }
         }
     }
