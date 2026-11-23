@@ -200,6 +200,8 @@ fn main() {
     #[cfg(any(windows, target_os = "macos"))]
     tray::stop();
     drop(instance);
+    #[cfg(windows)]
+    console::finished();
 }
 
 /// `--node-check`: say which node the arguments and environment name, and exit without opening a

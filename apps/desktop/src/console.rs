@@ -7,7 +7,8 @@
 //! console is already ours, the handler quits through the same path as the tray's Quit instead
 //! of the default exit.
 
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use river_app::RiverApp;
 use rune::AppHandle;
@@ -16,28 +17,76 @@ use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, GetConsoleProcessList, SetConsoleCtrlHandler,
 };
 
+/// The running app, for the handler. Cleared by [`finished`], so a late Ctrl+C reaches the
+/// default handler instead of being swallowed.
 static APP: Mutex<Option<AppHandle<RiverApp>>> = Mutex::new(None);
+static EXIT: Exit = Exit::new();
+
+/// How long a console-close handler waits for River to finish. Windows ends the process
+/// once the handler returns, and after about 5 seconds whatever it does.
+const CLOSE_WAIT: Duration = Duration::from_millis(3500);
+
+/// Set when `main` has finished its exit work, so the close handler knows it may return.
+struct Exit {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Exit {
+    const fn new() -> Self {
+        Exit {
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn set(&self) {
+        *self.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cv.notify_all();
+    }
+
+    /// Wait up to `limit` for [`Exit::set`]; whether it happened.
+    fn wait(&self, limit: Duration) -> bool {
+        let guard = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .cv
+            .wait_timeout_while(guard, limit, |done| !*done)
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+}
 
 /// Whether a console event should quit River. Logoff and shutdown are left to the system.
 fn quits(event: u32) -> bool {
     matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT)
 }
 
-/// Runs on a thread Windows makes for it: only signals the app, no UI work.
+/// Runs on a thread Windows makes for it: only signals the app, no UI work. `quit` queues a
+/// request for the event loop and returns at once (a quit before the loop starts is still
+/// honoured when it does), so closing the console, which ends the process when this returns,
+/// waits here for `main` to finish.
 unsafe extern "system" fn on_event(event: u32) -> i32 {
     if !quits(event) {
         return FALSE;
     }
-    match APP.lock() {
-        Ok(app) => match app.as_ref() {
-            Some(handle) => {
-                handle.quit();
-                TRUE
-            }
-            None => FALSE,
-        },
-        Err(_) => FALSE,
+    // The guard is dropped before quitting.
+    let handle = APP.lock().ok().and_then(|app| app.clone());
+    let Some(handle) = handle else {
+        return FALSE;
+    };
+    handle.quit();
+    if event == CTRL_CLOSE_EVENT {
+        EXIT.wait(CLOSE_WAIT);
     }
+    TRUE
+}
+
+/// `main` is done: the loop has returned and cleanup has run.
+pub fn finished() {
+    if let Ok(mut app) = APP.lock() {
+        *app = None;
+    }
+    EXIT.set();
 }
 
 /// Whether this process already has a console (it never attaches to one).
@@ -65,6 +114,20 @@ pub fn quit_on_console_signals(handle: AppHandle<RiverApp>) {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Console::{CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+
+    #[test]
+    fn the_close_wait_ends_when_main_finishes_and_times_out_when_it_does_not() {
+        let exit = Exit::new();
+        assert!(
+            !exit.wait(Duration::from_millis(10)),
+            "not finished: times out"
+        );
+        exit.set();
+        assert!(
+            exit.wait(Duration::from_secs(5)),
+            "finished: returns at once"
+        );
+    }
 
     #[test]
     fn ctrl_c_break_and_closing_the_console_quit_but_logoff_does_not() {

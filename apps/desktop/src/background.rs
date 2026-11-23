@@ -92,17 +92,37 @@ pub fn on_close(s: &mut RiverApp, tx: &mut Tx) {
     }
 }
 
-/// Show the notice the first time closing hides the window. The flag is set only when the
-/// notification was queued, so a River with no way to show one tries again next time. Failing
-/// to keep the flag is not an error: the person may see the notice once more.
+/// Show the notice the first time closing hides the window. The flag is set when the notifier
+/// accepted the notice for showing, which is not proof it was shown (macOS may be refusing
+/// permission; the update notice has the same limit). A notifier that could not even queue it
+/// leaves the flag unset, so the next hide tries again. Failing to keep the flag is not an
+/// error: the person may see the notice once more.
+///
+/// Runs on the UI thread, as does `set_close_to_tray` (the settings switch), so reading the
+/// choice here cannot race a change of it.
 fn tell_once(s: &mut RiverApp) {
-    if !should_tell(Close::Hide, TOLD.load(Ordering::Acquire)) {
+    tell_with(
+        |title, body| s.send_notice(title, body),
+        &TOLD,
+        CONFIG_DIR.get().map(PathBuf::as_path),
+        CLOSE_TO_TRAY.load(Ordering::Acquire),
+    );
+}
+
+fn tell_with(
+    send: impl FnOnce(String, String) -> bool,
+    told: &AtomicBool,
+    dir: Option<&Path>,
+    close_to_tray: bool,
+) {
+    if !should_tell(Close::Hide, told.load(Ordering::Acquire)) {
         return;
     }
-    if s.send_notice("River is still running".into(), notice_body()) {
-        TOLD.store(true, Ordering::Release);
-        if let Some(dir) = CONFIG_DIR.get()
-            && let Err(e) = save(dir, load(dir), true)
+    if send("River is still running".into(), notice_body()) {
+        told.store(true, Ordering::Release);
+        // The choice as it is now, so an earlier failed save is not reverted by this one.
+        if let Some(dir) = dir
+            && let Err(e) = save(dir, close_to_tray, true)
         {
             eprintln!("river: couldn't remember that the close notice was shown: {e}");
         }
@@ -138,7 +158,16 @@ fn save(dir: &Path, on: bool, told: bool) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
     let path = dir.join(FILE);
     let tmp = dir.join(format!(".{FILE}.{}.tmp", std::process::id()));
-    let mut text = format!("{KEY}={}\n", if on { "on" } else { "off" });
+    // Lines this version does not know are kept as they were.
+    let mut text: String = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(
+            |l| !matches!(l.split_once('='), Some((k, _)) if matches!(k.trim(), KEY | TOLD_KEY)),
+        )
+        .map(|l| format!("{l}\n"))
+        .collect();
+    text.push_str(&format!("{KEY}={}\n", if on { "on" } else { "off" }));
     if told {
         text.push_str(&format!("{TOLD_KEY}=on\n"));
     }
@@ -295,13 +324,44 @@ mod tests {
     }
 
     #[test]
-    fn hiding_marks_told_only_after_the_notice_was_queued() {
-        let src = include_str!("background.rs").replace("\r\n", "\n");
-        let body = &src[src.find("fn tell_once").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
-        let send = body.find("s.send_notice(").unwrap();
-        let mark = body.find("TOLD.store(true").unwrap();
-        assert!(send < mark, "the flag follows a notice that was queued");
+    fn a_notice_that_could_not_be_queued_leaves_told_unset_and_a_queued_one_sets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let told = AtomicBool::new(false);
+        tell_with(|_, _| false, &told, Some(dir.path()), true);
+        assert!(!told.load(Ordering::Acquire));
+        assert!(!load_told(dir.path()), "nothing kept");
+
+        let mut sent = 0;
+        tell_with(
+            |_, _| {
+                sent += 1;
+                true
+            },
+            &told,
+            Some(dir.path()),
+            false,
+        );
+        assert_eq!(sent, 1);
+        assert!(told.load(Ordering::Acquire));
+        assert!(load_told(dir.path()));
+        assert!(!load(dir.path()), "the choice in effect is what was saved");
+
+        tell_with(|_, _| panic!("said twice"), &told, Some(dir.path()), false);
+    }
+
+    #[test]
+    fn saving_keeps_lines_it_does_not_know() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), "future=1\nclose-to-tray=on\n").unwrap();
+        save_choice(dir.path(), false).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains("future=1\n"), "{text}");
+        assert!(!load(dir.path()));
+        save(dir.path(), false, true).unwrap();
+        save(dir.path(), true, true).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert_eq!(text.matches(KEY).count(), 2, "one line per key: {text}");
+        assert!(text.contains("future=1\n"));
     }
 
     #[test]
