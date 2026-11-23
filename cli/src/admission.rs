@@ -266,7 +266,8 @@ pub fn build_join(
             ..
         } => bail!(
             "the room's open-member slots are held by newer messages; solving again will \
-             not help, try again later"
+             not help. Send a message later (a newer message takes a slot from the author \
+             with the oldest one), or ask a member for an invitation (`riverctl invite accept`)"
         ),
         _ => {}
     }
@@ -400,7 +401,9 @@ fn attachment_for_status(
                  --pow` again to solve it"
             )),
             (NeedsAdmissionReason::RoomFull, Some(_)) => Err(anyhow!(
-                "The room's open-member slots are held by newer messages; try again later"
+                "The room's open-member slots are held by newer messages; send again later \
+                 (a newer message takes a slot from the author with the oldest one), or ask \
+                 a member for an invitation (`riverctl invite accept`)"
             )),
             (NeedsAdmissionReason::Shadowed, _) => Err(anyhow!(
                 "Another key holds this key's member id in the room; use a new key"

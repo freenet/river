@@ -498,6 +498,53 @@ fn the_provisional_pool_and_quota_bound_the_window() {
     );
 }
 
+/// A full pool at the ceiling (16 entries): a new admission is not refused for
+/// being the 17th. The pool is the authors of the newest provisional messages
+/// in the window (ties broken by message id), so the author whose newest
+/// message is oldest is the one that falls out, with its entry and messages. A
+/// newcomer whose message is older than all 16 is the one dropped instead. The
+/// dropped author keeps its stored entry and gets back in by sending a newer
+/// message (the client attaches the entry again).
+#[test]
+fn a_full_pool_ages_out_the_author_with_the_oldest_newest_message() {
+    let mut p = policy(0, 1);
+    p.max_provisional = 16;
+    p.max_provisional_messages = 20;
+    let mut room = Room::new(60, 10, Some(p));
+    let keys: Vec<SigningKey> = (1..=16u8).map(sk).collect();
+    for (i, k) in keys.iter().enumerate() {
+        room.apply(room.join_delta(k, 100 + i as u64, "hi"))
+            .unwrap();
+    }
+    assert_eq!(room.state.provisional.entries.len(), 16);
+
+    // A 17th newcomer with the newest message gets in; the oldest author goes.
+    let newcomer = sk(50);
+    room.apply(room.join_delta(&newcomer, 200, "me")).unwrap();
+    assert_eq!(room.state.provisional.entries.len(), 16);
+    assert!(room.has_entry(&newcomer) && room.has_msg_by(&newcomer));
+    assert!(
+        !room.has_entry(&keys[0]) && !room.has_msg_by(&keys[0]),
+        "the author whose newest message is oldest ages out, entry and messages"
+    );
+    for k in &keys[1..] {
+        assert!(room.has_entry(k), "every other author stays");
+    }
+
+    // The author that aged out comes back with a newer message (its entry
+    // attached again) and the next oldest author falls out.
+    room.apply(room.join_delta(&keys[0], 300, "back")).unwrap();
+    assert!(room.has_entry(&keys[0]) && room.has_msg_by(&keys[0]));
+    assert!(!room.has_entry(&keys[1]));
+    assert_eq!(room.state.provisional.entries.len(), 16);
+
+    // A newcomer whose message is older than all 16 is the one refused.
+    let stale = sk(51);
+    room.apply(room.join_delta(&stale, 50, "late")).unwrap();
+    assert!(!room.has_entry(&stale) && !room.has_msg_by(&stale));
+    assert_eq!(room.state.provisional.entries.len(), 16);
+}
+
 #[test]
 fn provisional_messages_fill_at_most_the_quota_and_members_keep_the_rest() {
     // window 6 => quota min(500, 3) = 3 (max_provisional_messages 500).

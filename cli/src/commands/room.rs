@@ -419,7 +419,19 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 &Some(delta.clone()),
             )
             .map_err(|e| anyhow::anyhow!("The room would refuse this join: {e}"))?;
-            crate::api::refuse_if_dropped(&check, &outcome.message_id)?;
+            if !check
+                .recent_messages
+                .messages
+                .iter()
+                .any(|m| m.id() == outcome.message_id)
+            {
+                anyhow::bail!(
+                    "The room's open-member slots are held by newer messages, so this join \
+                     would be dropped and was not sent (nothing was stored). Try again \
+                     later: a newer message takes a slot from the author with the oldest \
+                     one. Or ask a member for an invitation (`riverctl invite accept`)."
+                );
+            }
             api.storage()
                 .put_provisional_entry(&owner_key, &sk.verifying_key(), &outcome.entry)?;
             api.send_state_delta(&owner_key, &delta).await?;

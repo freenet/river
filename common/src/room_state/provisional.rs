@@ -72,6 +72,13 @@ pub struct PublicRoomPolicy {
     /// Atlas discovery opt-in; no effect on admission.
     pub listed: bool,
     /// Provisional authors held at once, `1..=16` ([`MAX_PROVISIONAL_CEILING`]).
+    ///
+    /// When the pool is full a new author is not refused for being one too
+    /// many: the pool is the authors of the newest provisional messages in the
+    /// window (ties broken by message id), so the author whose newest message
+    /// is oldest falls out, with its entry and messages, and may come back by
+    /// sending a newer message. A newcomer whose message is older than every
+    /// pooled author's is the one dropped (`RoomFull`).
     pub max_provisional: u32,
     /// Window slots for provisional messages, `1..=500`. The effective quota is
     /// `min(this, max_recent_messages / 2)` ([`Self::quota`]).

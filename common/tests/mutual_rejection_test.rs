@@ -38,11 +38,16 @@ struct Person {
 
 impl Room {
     fn new() -> Self {
+        Self::with_privacy(river_core::room_state::privacy::PrivacyMode::Public)
+    }
+
+    fn with_privacy(privacy_mode: river_core::room_state::privacy::PrivacyMode) -> Self {
         let owner_sk = SigningKey::generate(&mut OsRng);
         let owner_id: MemberId = owner_sk.verifying_key().into();
         let config = AuthorizedConfigurationV1::new(
             Configuration {
                 owner_member_id: owner_id,
+                privacy_mode,
                 max_members: 20,
                 max_user_bans: 10,
                 max_recent_messages: 50,
@@ -3339,4 +3344,77 @@ fn a_record_copying_a_bans_signature_is_not_live_on_an_unknown_target() {
     let forged = copy_signature(&g1, a.id, t3.id, 99, room.owner_id);
     let got = cap_both_orders(&room, &s, vec![g1.clone(), g2.clone(), forged], 2);
     assert_eq!(got, vec![ban_record(&g1), ban_record(&g2)]);
+}
+
+/// Two peers that receive the same invalid `member_info` (a record for a
+/// member that does not verify under the member's key) end in the same state
+/// whichever order the records arrive in, in a Public and in a Private room.
+/// The invalid record is skipped on every peer, so it can never make one peer's
+/// state differ from another's (freenet/river#974, design X1).
+#[test]
+fn an_invalid_member_info_is_skipped_the_same_way_in_either_order_in_public_and_private_rooms() {
+    use river_core::room_state::privacy::PrivacyMode;
+    for mode in [PrivacyMode::Public, PrivacyMode::Private] {
+        let room = Room::with_privacy(mode.clone());
+        let (t, v, attacker) = (room.person(), room.person(), room.person());
+        let base = room.state(&[&t], vec![], vec![room.msg(&t, 1)]);
+
+        // Invalid: a record for V that V did not sign, and one with no signature.
+        let mut forged = MemberInfo::new_public(v.id, 9, "forged".into());
+        forged.deputies = vec![attacker.id];
+        let bad_by_other_key =
+            AuthorizedMemberInfo::new_with_member_key(forged.clone(), &attacker.sk);
+        let bad_unsigned =
+            AuthorizedMemberInfo::with_signature(forged, Signature::from_bytes(&[0u8; 64]));
+        let good = AuthorizedMemberInfo::new_with_member_key(
+            MemberInfo::new_public(v.id, 1, "v".into()),
+            &v.sk,
+        );
+        let add_v = ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![v.auth.clone()])),
+            member_info: Some(vec![good.clone()]),
+            recent_messages: Some(vec![room.msg(&v, 2)]),
+            ..Default::default()
+        };
+        for bad in [bad_by_other_key, bad_unsigned] {
+            let bad_delta = ChatRoomStateV1Delta {
+                member_info: Some(vec![bad.clone()]),
+                ..Default::default()
+            };
+            let apply = |first: &ChatRoomStateV1Delta, second: &ChatRoomStateV1Delta| {
+                let mut s = base.clone();
+                for d in [first, second] {
+                    let parent = s.clone();
+                    s.apply_delta(&parent, &room.params, &Some(d.clone()))
+                        .unwrap_or_else(|e| panic!("{mode:?}: the delta must apply: {e}"));
+                }
+                s
+            };
+            let one = apply(&bad_delta, &add_v);
+            let two = apply(&add_v, &bad_delta);
+            assert!(
+                ser(&one) == ser(&two),
+                "{mode:?}: the two orders end in the same state"
+            );
+            // The invalid record is in neither; the valid one is in both.
+            for s in [&one, &two] {
+                let infos: Vec<_> = s
+                    .member_info
+                    .member_info
+                    .iter()
+                    .filter(|i| i.member_info.member_id == v.id)
+                    .collect();
+                assert!(infos.iter().all(|i| i.member_info.version == 1), "{mode:?}");
+                assert!(s.member_info.deputies_of(v.id).is_empty(), "{mode:?}");
+            }
+            // The same through whole-state merges: a peer holding the valid
+            // state and one that was handed the invalid record agree.
+            let mut x = one.clone();
+            let mut y = two.clone();
+            let (xp, yp) = (x.clone(), y.clone());
+            x.merge(&xp, &room.params, &yp).unwrap();
+            y.merge(&yp, &room.params, &xp).unwrap();
+            assert!(ser(&x) == ser(&y), "{mode:?}: merges agree");
+        }
+    }
 }
