@@ -16,6 +16,8 @@
 
 mod autostart;
 mod background;
+#[cfg(windows)]
+mod console;
 mod host;
 mod install;
 mod notify;
@@ -171,6 +173,10 @@ fn main() {
     if let Some(u) = &updater {
         u.on_start();
     }
+    // Only where this process already owns a console (debug or console builds; a release GUI
+    // build never attaches to its parent's): Ctrl+C there quits River cleanly.
+    #[cfg(windows)]
+    console::quit_on_console_signals(handle.clone());
     let on_exit = updater.clone();
     let started = std::time::Instant::now();
     settings.refresh_login();
@@ -194,6 +200,8 @@ fn main() {
     #[cfg(any(windows, target_os = "macos"))]
     tray::stop();
     drop(instance);
+    #[cfg(windows)]
+    console::finished();
 }
 
 /// `--node-check`: say which node the arguments and environment name, and exit without opening a

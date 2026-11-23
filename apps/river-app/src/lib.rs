@@ -437,8 +437,18 @@ impl RiverApp {
 
     /// Not a room's notification: nothing to open when it is clicked.
     fn send_update_notice(&mut self, title: String, body: String) {
+        self.send_notice_keyed("river-update", title, body);
+    }
+
+    /// A notice from the shell, not about a room and not held back by do not disturb: it says
+    /// River is still running. False when the notifier could not queue it.
+    pub fn send_notice(&mut self, title: String, body: String) -> bool {
+        self.send_notice_keyed("river-notice", title, body)
+    }
+
+    fn send_notice_keyed(&mut self, key: &str, title: String, body: String) -> bool {
         self.notifier.notify(notify::Notification {
-            room_key: "river-update".into(),
+            room_key: key.into(),
             room_name: "River".into(),
             title,
             body,
@@ -447,7 +457,7 @@ impl RiverApp {
             message_key: String::new(),
             actions: false,
             reply: false,
-        });
+        })
     }
 
     /// Show the update notice do not disturb held back, once, when it allows. A window in

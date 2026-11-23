@@ -104,7 +104,11 @@ When the system has a tray, closing the window hides it and River keeps running,
 keep arriving. This is on by default and can be turned off in **Settings > Background and startup**,
 where you can also have River start when you log in (it then starts hidden). To quit for real, use
 **Quit River** in that section, **Quit** in the tray menu, or Ctrl+Q. Without a tray, closing the
-window quits.
+window quits. The first time closing hides River, it shows a notification saying so and how to
+quit; it is not shown again.
+
+On Windows the tray icon may be in the hidden icons area (the `^` by the clock), where new icons
+start.
 
 Only one River runs per user. Starting it a second time shows the window of the first one.
 
