@@ -382,23 +382,52 @@ impl LiveRoom {
         &mut self,
         merge: impl FnOnce(&mut ChatRoomStateV1, &ChatRoomParametersV1) -> Result<(), String>,
     ) -> NetworkMerge {
+        self.merge_from_network_with(merge, |state, params| state.post_apply_cleanup(params))
+    }
+
+    /// [`merge_from_network`](Self::merge_from_network) with the cleanup of a failed merge's
+    /// result given (tests make it fail). On success the copy counts as changed without
+    /// comparing: the caller reports a success regardless. The copy's derived views
+    /// (`refresh`) are rebuilt only when it changed; nothing else they read changes here.
+    fn merge_from_network_with(
+        &mut self,
+        merge: impl FnOnce(&mut ChatRoomStateV1, &ChatRoomParametersV1) -> Result<(), String>,
+        cleanup: impl FnOnce(&mut ChatRoomStateV1, &ChatRoomParametersV1) -> Result<(), String>,
+    ) -> NetworkMerge {
         let params = self.params();
         let before = self.stored.room_state.clone();
         let mut result = merge(&mut self.stored.room_state, &params);
-        if let Err(merge_error) = &result
-            && let Err(cleanup_error) = self.stored.room_state.post_apply_cleanup(&params)
-        {
-            result = Err(format!(
-                "{merge_error}; what it kept could not be cleaned up ({cleanup_error}), so \
-                 nothing was kept"
-            ));
-            self.stored.room_state = before.clone();
-        }
-        let changed = self.stored.room_state != before;
+        let changed = match &result {
+            Ok(()) => true,
+            Err(merge_error) => {
+                if let Err(cleanup_error) = cleanup(&mut self.stored.room_state, &params) {
+                    result = Err(format!(
+                        "{merge_error}; what it kept could not be cleaned up \
+                         ({cleanup_error}), so nothing was kept"
+                    ));
+                    self.stored.room_state = before;
+                    false
+                } else {
+                    self.stored.room_state != before
+                }
+            }
+        };
         if changed {
             self.refresh();
         }
         NetworkMerge { changed, result }
+    }
+
+    /// [`merge_network_state`](Self::merge_network_state) with a cleanup that fails (tests).
+    #[cfg(test)]
+    pub(super) fn merge_network_state_failing_cleanup(
+        &mut self,
+        incoming: &ChatRoomStateV1,
+    ) -> NetworkMerge {
+        self.merge_from_network_with(
+            |state, params| state.merge_through_summary(params, incoming).map(|_| ()),
+            |_, _| Err("cleanup refused".into()),
+        )
     }
 
     /// Rebuild what the stored copy does not persist: the secrets, then the edits, deletions

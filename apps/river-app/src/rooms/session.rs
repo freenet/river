@@ -148,8 +148,12 @@ pub(super) struct Pace {
     /// Coming to the front spreads its reads over up to this long, at random
     /// ([`super::resync`]).
     pub resync_spread: Duration,
-    /// How long such a read may go unanswered before River stops waiting for it. It only frees
-    /// the room for the next read: it never reconnects ([`super::resync`]).
+    /// How long such a read may go unanswered before River stops waiting for it. It frees the
+    /// room for the next read, a whole `resync_idle` later, and never reconnects. It must be
+    /// well past the node's own limit on an operation (freenet-core `OPERATION_TTL`, 60 s),
+    /// after which the node reports a failed GET with an error that names nothing: until then
+    /// the read counts as out, so that error is not taken for another request's
+    /// ([`super::resync`]).
     pub resync_wait: Duration,
     /// How long the node may take to answer an update before the message counts as not sent.
     pub update_wait: Duration,
@@ -216,7 +220,7 @@ impl Default for Pace {
             resync_idle: Duration::from_secs(60),
             resync_focus: Duration::from_secs(60),
             resync_spread: Duration::from_secs(10),
-            resync_wait: Duration::from_secs(45),
+            resync_wait: Duration::from_secs(120),
             update_wait: Duration::from_secs(60),
             owed_limit: Duration::from_secs(180),
             delegate_deadline: Duration::from_secs(20),
@@ -1246,21 +1250,9 @@ fn follow_on(
                 {
                     // Not a reload failure either, so the reload goes on.
                     changed |= rooms.update_answered(&id, Err(cause));
-                } else if let Some(id) = resyncs.lone()
-                    && names_nothing(&e)
-                    && subs.pending.is_empty()
-                    && reload.is_none()
-                    && !rooms.keys.busy()
-                    && !rooms.outbox.work.has_out()
-                    && !rooms.outbox.has_stale()
-                    && !rooms
-                        .list
-                        .iter()
-                        .any(|r| rooms.outbox.owes(&r.stored.owner_vk))
+                } else if let Some(id) = rooms.nameless_read(&e, &subs, &resyncs, reload.is_some())
                 {
-                    // An error naming nothing, with one room read out and nothing else that
-                    // could fail this way: the read's. It frees the room for the next read
-                    // now, instead of after `resync_wait`.
+                    // It frees the room for the next read now, instead of after `resync_wait`.
                     eprintln!("River: reading a room again failed: {e}");
                     resyncs.failed(&id);
                 } else if let Some(id) = failed_contract(&e)
@@ -3107,6 +3099,31 @@ impl Rooms {
         let changed = self.outbox.answered(room, result);
         // Taking them may have settled others the room now holds.
         self.outbox.reconcile(room) | changed
+    }
+
+    /// The room read an error that names nothing belongs to: the one read out, when exactly one
+    /// is and nothing else that could fail that way is out (no subscribe waiting, no read of
+    /// the stored rooms, no signing key request, no create's or join's request, no answer owed
+    /// by any room, left or listed). Otherwise it could be either's, and is no one's.
+    fn nameless_read(
+        &self,
+        e: &ClientError,
+        subs: &Subscriptions,
+        resyncs: &Resyncs,
+        reloading: bool,
+    ) -> Option<ContractInstanceId> {
+        let id = resyncs.lone()?;
+        let alone = names_nothing(e)
+            && subs.pending.is_empty()
+            && !reloading
+            && !self.keys.busy()
+            && !self.outbox.work.has_out()
+            && !self.outbox.has_stale()
+            && !self
+                .list
+                .iter()
+                .any(|r| self.outbox.owes(&r.stored.owner_vk));
+        alone.then_some(id)
     }
 
     /// The contract of the room the window shows, if it is listed.

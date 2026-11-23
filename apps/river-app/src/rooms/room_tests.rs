@@ -766,6 +766,26 @@ fn a_network_delta_that_fails_partway_keeps_only_what_cleanup_allows() {
     assert_eq!(kept.normalized(&live.params()).unwrap(), *kept);
 }
 
+/// If the cleanup of what a failed merge kept itself fails, nothing is kept: the copy is
+/// exactly what it was, and nothing is reported as changed.
+#[test]
+fn a_failed_merge_whose_cleanup_fails_keeps_nothing() {
+    let f = Fixture::new();
+    let state = full_room(&f);
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let before = live.stored.room_state.clone();
+    let mut incoming = state;
+    incoming
+        .recent_messages
+        .messages
+        .push(text_at(&f, 700, 0, &SECRET, "not kept"));
+    incoming.upgrade = forged_upgrade(&f);
+    let merged = live.merge_network_state_failing_cleanup(&incoming);
+    assert!(merged.is_err(), "{merged:?}");
+    assert!(!merged.changed);
+    assert_eq!(live.stored.room_state, before);
+}
+
 /// A secret blob addressed to this member that does not decrypt is skipped, not fatal: the
 /// room still opens, with the invitation's copy of that version's secret.
 #[test]

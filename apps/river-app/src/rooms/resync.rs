@@ -37,20 +37,30 @@
 //! has one out, and none of those starts while a read is out. Such an error with one read out
 //! and nothing else that could have failed is the read's, and frees its room at once. One
 //! exception, chosen so a message is never held back for a read: an UPDATE goes out for a room
-//! whose read is out. Its answers and errors name the UPDATE, except `MissingContract`, which
-//! names only the room; while the room's read is out, that is taken for the read's, so a read
-//! never fails a message. A real UPDATE failure of that kind then shows when its answer is
-//! given up on (`update_wait`).
+//! whose read is out. Its answer and its contract error name the UPDATE. Two of its errors do
+//! not: `MissingContract`, which names only the room, and the errors naming nothing that the
+//! node sends for an UPDATE that failed to start (`OperationError`, `EmptyRing`...). While the
+//! room's read is out, a `MissingContract` for it is taken for the read's, and an error naming
+//! nothing is taken by neither, so a read's error never fails a message. The cost, accepted: an
+//! UPDATE that fails in one of those two ways while its room's read is out shows as failed only
+//! when its answer is given up on (`update_wait`), not at once, and the read waits out
+//! `resync_wait`. It needs the node to fail both at once (one degraded node), and a message
+//! never shows as failed when it may have been sent.
 //!
-//! A read the node does not answer is given up after [`Pace::resync_wait`], which only frees the
-//! room for the next read. It NEVER reconnects, and it is not an answer owed in the sense of
+//! A read the node does not answer is given up after [`Pace::resync_wait`], which frees the room
+//! for the next read a whole [`Pace::resync_idle`] later. `resync_wait` is twice the node's own
+//! limit on an operation (freenet-core `OPERATION_TTL`, 60 s), after which the node reports a
+//! failed GET with an error that names nothing: the read still counts as out when that comes,
+//! so it is never taken for a request that started after the read was given up on. (A GET
+//! whose answer is still streaming in can outlast 60 s; a room state streams in far less than
+//! the minute of margin.) A read NEVER reconnects, and it is not an answer owed in the sense of
 //! [`super::outbox`]'s reconnect rule (`wants_reconnect`, `owed_limit`): that rule exists because
 //! an UPDATE's answer names only the room, so a room that owes one cannot send another on the
 //! same connection. A read's answer names its room and merges idempotently, so a late one is
 //! harmless. Whether the node is there at all is the ping's job ([`Pace::idle_check`],
 //! [`Pace::pong_wait`]), and a node that answers pings but not reads would not answer them any
-//! better on a new connection. So an unanswered read costs one read per room per
-//! `max(resync_idle, resync_wait)`, and reconnects nobody.
+//! better on a new connection. So an unanswered read costs one read of the open room per
+//! `resync_wait + resync_idle` (three minutes), and reconnects nobody.
 //!
 //! The reads go out as GETs that do not subscribe. The node's answer to one looks exactly like
 //! its answer to a subscribe (a `GetResponse`), so the two are never out at once for one room:
@@ -209,10 +219,20 @@ impl Resyncs {
         }
     }
 
-    /// Give up reads out for `wait` or longer.
+    /// Give up reads out for `wait` or longer. Each one's room is quiet from now, so its next
+    /// read waits a whole idle time: on a node that answers no read, the requests a read keeps
+    /// out (a read of the stored rooms, a signing key request, a create or join) get a turn.
     pub fn expire(&mut self, wait: Duration, now: Instant) {
-        self.out
-            .retain(|_, asked| now.saturating_duration_since(*asked) < wait);
+        let given_up: Vec<ContractInstanceId> = self
+            .out
+            .iter()
+            .filter(|(_, asked)| now.saturating_duration_since(**asked) >= wait)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in given_up {
+            self.out.remove(&id);
+            self.heard.insert(id, now);
+        }
     }
 
     /// Forget rooms no longer shown.
@@ -330,10 +350,25 @@ mod tests {
             r.due(Some(id(1)), &rooms, FREE, t1 + p.idle * 3, &p)
                 .is_empty()
         );
-        // Given up: the quiet clock restarted when it was asked.
-        r.expire(Duration::from_secs(45), t1 + Duration::from_secs(45));
+        // Given up: the quiet clock restarts then, so the next waits a whole idle time.
+        let gave_up = t1 + Duration::from_secs(45);
+        r.expire(Duration::from_secs(45), gave_up);
         assert!(!r.is_out(&id(1)));
-        assert_eq!(r.due(Some(id(1)), &rooms, FREE, t1 + p.idle, &p), [id(1)]);
+        assert!(
+            r.due(
+                Some(id(1)),
+                &rooms,
+                FREE,
+                gave_up + p.idle - Duration::from_millis(1),
+                &p
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            r.due(Some(id(1)), &rooms, FREE, gave_up + p.idle, &p),
+            [id(1)]
+        );
+        let t1 = gave_up + p.idle;
         // Answered: the next one waits a whole idle from the answer.
         let t2 = t1 + p.idle + Duration::from_secs(1);
         assert!(r.answered(&id(1), t2));
@@ -469,8 +504,19 @@ mod tests {
         r.focus(&rooms, t1, &p);
         let at_once = r.due(None, &rooms, FREE, t1, &p).len();
         assert!(at_once < 20, "all {at_once} at once");
+        // Each room has its own moment: about half have come by the middle of the spread. All
+        // or none of 20 by then has a chance of about one in half a million.
+        let by_middle = r.due(None, &rooms, FREE, t1 + p.spread / 2, &p).len();
+        assert!(
+            at_once + by_middle > 0 && at_once + by_middle < 20,
+            "{at_once} at once, {by_middle} by the middle"
+        );
         let by_end = r.due(None, &rooms, FREE, t1 + p.spread, &p).len();
-        assert_eq!(at_once + by_end, 20, "each read once, within the spread");
+        assert_eq!(
+            at_once + by_middle + by_end,
+            20,
+            "each read once, within the spread"
+        );
     }
 
     #[test]
