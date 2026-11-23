@@ -1005,13 +1005,10 @@ fn follow_on(
         // being read, a signing key request or a room read is out: their answers and its are
         // told apart by kind, but an error names neither.
         if writes
-            && let Some(mut request) = rooms
-                .outbox
-                .work
-                .next_request(
-                    reload.is_some() || rooms.keys.busy() || resyncs.any_out(),
-                    Instant::now(),
-                )
+            && let Some(mut request) = rooms.outbox.work.next_request(
+                reload.is_some() || rooms.keys.busy() || resyncs.any_out(),
+                Instant::now(),
+            )
         {
             let sent = socket.send(&request);
             // A store of the sent-message key holds what the user wrote: not kept after it is out.
@@ -3043,10 +3040,10 @@ impl Rooms {
             }
             _ if names_nothing(e)
                 && owing.len() == 1
-                    && !self.outbox.has_stale()
-                    && subs.pending.is_empty()
-                    && !other_out
-                    && !self.outbox.work.has_out() =>
+                && !self.outbox.has_stale()
+                && subs.pending.is_empty()
+                && !other_out
+                && !self.outbox.work.has_out() =>
             {
                 Some((owing[0], e.kind().to_string()))
             }

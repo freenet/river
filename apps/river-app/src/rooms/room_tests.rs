@@ -733,7 +733,11 @@ fn a_network_state_that_fails_partway_keeps_only_what_cleanup_allows() {
     assert!(live.merge_network_state(&incoming).is_err());
     let kept = &live.stored.room_state;
     assert_eq!(kept.recent_messages.messages.len(), cap, "the cap holds");
-    assert_eq!(kept.normalized(&live.params()).unwrap(), *kept, "cleaned up");
+    assert_eq!(
+        kept.normalized(&live.params()).unwrap(),
+        *kept,
+        "cleaned up"
+    );
     let room = live.view(&minutes);
     assert_eq!(
         room.messages.last().map(|m| m.text.as_str()),

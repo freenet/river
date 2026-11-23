@@ -203,9 +203,9 @@ impl Resyncs {
     /// then.
     pub fn focus(&mut self, rooms: &[ContractInstanceId], now: Instant, pace: &ResyncPace) {
         for id in rooms {
-            self.wanted
-                .entry(*id)
-                .or_insert_with(|| now + pace.spread.mul_f64(rand::thread_rng().gen_range(0.0..=1.0)));
+            self.wanted.entry(*id).or_insert_with(|| {
+                now + pace.spread.mul_f64(rand::thread_rng().gen_range(0.0..=1.0))
+            });
         }
     }
 
@@ -491,7 +491,11 @@ mod tests {
             reads += 1;
             r.answered(&id(1), t);
         }
-        assert_eq!(reads, HEAL_GIVE_UP - 1, "read after each of the failures but the last");
+        assert_eq!(
+            reads,
+            HEAL_GIVE_UP - 1,
+            "read after each of the failures but the last"
+        );
         // A different failure starts over; so does a merge that works.
         r.merged(id(1), &Err("another".into()), t, &p);
         assert_eq!(r.due(None, &rooms, FREE, t + p.heal_max * 2, &p), [id(1)]);
@@ -514,4 +518,3 @@ mod tests {
         assert_eq!(r.heal[&id(1)].asked, 0);
     }
 }
-

@@ -1299,7 +1299,12 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                 }
             }
             let asked_key = w.contracts.get(&id).map(|(k, _)| *k);
-            match w.contracts.get(&from).cloned().map(|(k, c)| (asked_key.unwrap_or(k), c)) {
+            match w
+                .contracts
+                .get(&from)
+                .cloned()
+                .map(|(k, c)| (asked_key.unwrap_or(k), c))
+            {
                 Some((key, Contract::State(state))) => out.push(encode(Ok(
                     HostResponse::ContractResponse(ContractResponse::GetResponse {
                         key,
@@ -2227,9 +2232,11 @@ fn reads_the_node_never_answers_go_one_at_a_time_and_never_reconnect() {
     node.with(|w| w.read_play = ReadPlay::Silence);
     let start = Instant::now();
     session.act(&a, Action::Viewing);
-    session.wait_on_one_connection(&node, "an unanswered read is given up and asked again", || {
-        node.with(|w| w.reads_of(a.id()) >= 3)
-    });
+    session.wait_on_one_connection(
+        &node,
+        "an unanswered read is given up and asked again",
+        || node.with(|w| w.reads_of(a.id()) >= 3),
+    );
     let elapsed = start.elapsed();
     let (reads, connections) = node.with(|w| (w.reads_of(a.id()), w.connections.len()));
     let most = (elapsed.as_millis() / wait.as_millis()) as usize + 1;
@@ -2352,9 +2359,7 @@ fn a_whole_state_notification_shows_what_it_carries_in_its_room_only() {
     let b = TestRoom::new(2, "B", 1, &["b1"]);
     let (session, _dir) = following(&node, &[&a, &b], "resync-full-note", quick());
     node.with(|w| w.notify_full(&a, "for A"));
-    session.wait_on_one_connection(&node, "it shows in A", || {
-        shows_in(&session, &a, "for A")
-    });
+    session.wait_on_one_connection(&node, "it shows in A", || shows_in(&session, &a, "for A"));
     assert!(!shows_in(&session, &b, "for A"));
     assert!(session.last_rooms().unwrap().1.not_updated.is_empty());
 }
@@ -2416,8 +2421,12 @@ fn a_read_that_fails_changes_nothing_and_the_next_comes_at_the_usual_pace() {
         session.wait_on_one_connection(&node, &format!("{name}: three reads"), || {
             node.with(|w| w.reads_of(a.id()) >= 3)
         });
-        let (subscribes, connections) =
-            node.with(|w| (w.subscribes_to(a.id()) - w.reads_of(a.id()), w.connections.len()));
+        let (subscribes, connections) = node.with(|w| {
+            (
+                w.subscribes_to(a.id()) - w.reads_of(a.id()),
+                w.connections.len(),
+            )
+        });
         assert_eq!(subscribes, 1, "{name}: subscribed again");
         assert_eq!(connections, 1, "{name}");
         let (_, issues, status) = session.last_rooms().unwrap();
@@ -2517,7 +2526,11 @@ fn the_stored_rooms_are_not_read_again_while_a_room_read_is_out() {
     wait_for_a_read(&session, &node, &a);
     let lists = node.with(|w| w.lists);
     std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(node.with(|w| w.lists), lists, "a stored-rooms read went out beside it");
+    assert_eq!(
+        node.with(|w| w.lists),
+        lists,
+        "a stored-rooms read went out beside it"
+    );
 }
 
 /// The signing key sweep sends nothing while a room read is out, for the same reason.
@@ -2600,9 +2613,9 @@ fn a_missing_contract_while_a_read_is_out_does_not_fail_a_message() {
     });
     std::thread::sleep(Duration::from_millis(500));
     let failed = session.last_rooms().is_some_and(|(r, _, _)| {
-        r.iter()
-            .flat_map(|r| r.messages.iter())
-            .any(|m| m.text == "still sending" && m.pending.as_ref().is_some_and(|p| p.failed.is_some()))
+        r.iter().flat_map(|r| r.messages.iter()).any(|m| {
+            m.text == "still sending" && m.pending.as_ref().is_some_and(|p| p.failed.is_some())
+        })
     });
     assert!(!failed, "the read's error was taken for the update's");
 }
@@ -2622,7 +2635,9 @@ fn the_open_room_is_still_read_again_after_a_reconnect() {
     session.act(&a, Action::Viewing);
     wait_for_a_read(&session, &node, &a);
     node.with(|w| w.drop_live = true);
-    session.wait_until("a new connection", || node.with(|w| w.connections.len() == 2));
+    session.wait_until("a new connection", || {
+        node.with(|w| w.connections.len() == 2)
+    });
     let since = Instant::now();
     session.wait_until("a read on the new connection", || {
         node.with(|w| w.reads.iter().any(|(id, at)| *id == a.id() && *at > since))
