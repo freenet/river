@@ -465,6 +465,12 @@ async function expectOwnerAgain(page: Page, why: string) {
   await expectAtMostOnePainter(page);
 }
 
+/// The rooms rail's dialogs: what, the rail button, the backdrop.
+const RAIL_DIALOGS = [
+  ["Enter invite code", "join-with-code-button", "join-with-code-backdrop"],
+  ["Import ID", "import-id-button", "import-identity-backdrop"],
+] as const;
+
 test.describe("Ownership", () => {
   test("the delete confirmation hides the room's dots at once", async ({ page }) => {
     await connectedRoom(page);
@@ -542,7 +548,59 @@ test.describe("Ownership", () => {
     await callRiverTest(page, "setMobileView", "chat");
     await expectOwnerAgain(page, "back to the chat");
   });
+
+  // The rooms rail's two dialogs: their open state is `RoomList`'s, and their
+  // full-screen backdrop covers the room and the Welcome screen alike. At a
+  // desktop width, so the rail sits beside the chat and only the dialog can
+  // cover it.
+  for (const [what, open, backdrop] of RAIL_DIALOGS) {
+    test(`the ${what} dialog hides the room's dots at once`, async ({ page }) => {
+      await page.setViewportSize({ width: 1280, height: 800 });
+      await connectedRoom(page);
+      expect(await narrowLayout(page), "premise: the rail sits beside the chat").toBe(false);
+      await editAndMark(page);
+      await expectPainted(page);
+      await expectSuppressedAtOnce(page, `the ${what} dialog covers the room`, async () => {
+        await page.getByTestId(open).click();
+        await expect(page.getByTestId(backdrop)).toBeVisible();
+      });
+
+      await closeRailDialog(page, backdrop);
+      expect(await marks(page), "premise: the edit is still on its way").toBe(1);
+      await expectOwnerAgain(page, "closing it gives the dots back");
+    });
+  }
+
+  test("the Enter invite code dialog hides the Welcome screen's join dots while it is open", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+    await waitForApp(page);
+    await expect(page.getByRole("heading", { name: "Welcome to River" })).toBeVisible({ timeout: 10_000 });
+    expect(await narrowLayout(page), "premise: the rail sits beside the Welcome screen").toBe(false);
+    await connect(page);
+    await callRiverTest(page, "setPendingJoin", true);
+    await expectShowing(welcomeDots(page), "premise: the join shows on the Welcome screen");
+
+    await page.getByTestId("join-with-code-button").click();
+    await expect(page.getByTestId("join-with-code-backdrop")).toBeVisible();
+    await expect(welcomeDots(page), "the dialog covers the Welcome screen").toHaveAttribute("data-owner", "false");
+    await expect(welcomeDots(page), "the join goes on").toHaveAttribute("data-active", "true");
+    await expect(welcomeDots(page)).toHaveAttribute("data-reason", "joining-room");
+    await expect(welcomeDots(page), "nothing paints under the backdrop").toHaveCSS("opacity", "0");
+    await expectAtMostOnePainter(page);
+
+    await closeRailDialog(page, "join-with-code-backdrop");
+    await expectShowing(welcomeDots(page), "closing it gives the dots back");
+    await expectAtMostOnePainter(page);
+    await callRiverTest(page, "setPendingJoin", false);
+  });
 });
+
+/// Close a rail dialog through its own Cancel button.
+async function closeRailDialog(page: Page, backdrop: string) {
+  await page.getByTestId(backdrop).getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.getByTestId(backdrop)).toHaveCount(0);
+}
 
 /// The newest row in the history and the dots, in viewport px.
 function endGeometry(page: Page) {

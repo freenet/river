@@ -236,8 +236,11 @@ fn format_build_time_local() -> String {
 
 #[component]
 pub fn RoomList() -> Element {
-    let mut import_modal_active = use_signal(|| false);
-    let mut join_code_modal_active = use_signal(|| false);
+    // Provided by `App`, so the user wait dots can tell these dialogs cover
+    // the conversation and the Welcome screen (`user_wait_dots::LocalModals`).
+    let local_modals = use_context::<crate::components::user_wait_dots::LocalModals>();
+    let mut import_modal_active = local_modals.import_identity;
+    let mut join_code_modal_active = local_modals.join_with_code;
 
     // Drag-and-drop reorder state (a local view preference). `dragged_room`
     // is the row currently being dragged; `drag_over_room` is the row the
@@ -894,14 +897,15 @@ pub fn RoomList() -> Element {
                 button {
                     "data-testid": "join-with-code-button",
                     class: "{RAIL_ACTION_CLASS}",
-                    onclick: move |_| join_code_modal_active.set(true),
+                    // Deferred: the wait-dot hosts read this handle too.
+                    onclick: move |_| crate::util::defer(move || join_code_modal_active.set(true)),
                     {line_icon(JOIN_ICON_PATH, 15)}
                     span { "Enter invite code" }
                 }
                 button {
                     "data-testid": "import-id-button",
                     class: "{RAIL_ACTION_CLASS}",
-                    onclick: move |_| import_modal_active.set(true),
+                    onclick: move |_| crate::util::defer(move || import_modal_active.set(true)),
                     {line_icon(IMPORT_ICON_PATH, 15)}
                     span { "Import ID" }
                 }

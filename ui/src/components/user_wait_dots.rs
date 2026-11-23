@@ -18,7 +18,8 @@
 //! # One visible host
 //!
 //! The reason is shared; a mounted host paints it only while nothing covers
-//! it (`covered`): an app modal, the room's delete confirmation, the DM
+//! it (`covered`): an app modal (the rooms rail's Enter invite code and
+//! Import ID dialogs among them), the room's delete confirmation, the DM
 //! thread, the mobile message sheet, or, below 48rem, the Rooms or Members
 //! panel that replaces the chat. At 48rem and wider the Members panel sits
 //! beside the chat and covers nothing. This plan mounts the room dock and the
@@ -91,6 +92,10 @@ pub(crate) struct LocalModals {
     pub receive_invitation: Signal<Option<Invitation>>,
     pub invite_member: Signal<bool>,
     pub export_identity: Signal<bool>,
+    /// The rooms rail's Enter invite code dialog (`RoomList`).
+    pub join_with_code: Signal<bool>,
+    /// The rooms rail's Import ID dialog (`RoomList`).
+    pub import_identity: Signal<bool>,
 }
 
 /// Whether anything covers the conversation, and so the mounted host: an app
@@ -104,6 +109,8 @@ fn covering_now(delete_confirmation: bool, mobile_sheet: bool) -> Option<bool> {
             m.receive_invitation.try_read().ok()?.is_some()
                 || *m.invite_member.try_read().ok()?
                 || *m.export_identity.try_read().ok()?
+                || *m.join_with_code.try_read().ok()?
+                || *m.import_identity.try_read().ok()?
         }
         None => false,
     };

@@ -263,6 +263,8 @@ pub fn App() -> Element {
         receive_invitation,
         invite_member: Signal::new(false),
         export_identity: Signal::new(false),
+        join_with_code: Signal::new(false),
+        import_identity: Signal::new(false),
     });
 
     // One-shot guard for the localStorage auto-resume path (#218). The
