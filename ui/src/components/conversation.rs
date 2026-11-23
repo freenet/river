@@ -1393,7 +1393,8 @@ fn banner_sync_read_fails() -> bool {
     false
 }
 
-/// Sends `message_text` in `room`, the composer's room, as a reply to
+/// Sends `message_text`, which the composer has checked is not empty and
+/// within the room's limit, in `room`, the composer's room, as a reply to
 /// `reply_ctx` if there is one. `Ok` means the message is queued: it enters
 /// the outbox in the `defer` below, before anything the composer defers after
 /// this returns, and the composer shows it from there until the room admits
@@ -1404,9 +1405,6 @@ fn queue_message(
     message_text: String,
     reply_ctx: Option<ReplyContext>,
 ) -> Result<(), String> {
-    if message_text.is_empty() {
-        return Err("the message is empty".to_string());
-    }
     let open_room = { CURRENT_ROOM.read().owner_key };
     let Some(current_room) = open_room else {
         error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
