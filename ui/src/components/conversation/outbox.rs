@@ -31,9 +31,11 @@
 //!
 //! Sealing only ever moves forward. The outbox keeps, per room, the highest
 //! secret version it has sealed an entry under (`may_seal_at`), past the
-//! entries themselves: a send is refused while this device's current secret
-//! is older than that, as a failed send taken back and sent again would
-//! otherwise be sealed under a key a newer rotation excluded someone from.
+//! entries themselves: a send, an edit, a delete and a reaction are all
+//! refused while this device's current secret is older than that
+//! (`conversation.rs`, `sealing_secret`). A failed send taken back and sent
+//! again, or an edit's new text, would otherwise be sealed under a key a
+//! newer rotation excluded someone from.
 //!
 //! The outbox is memory only: a reload while a message is still being signed
 //! loses it.
@@ -347,8 +349,10 @@ impl Outbox {
         }
     }
 
-    /// Whether a new message in `room` may be sealed under secret `version`:
-    /// not if this device has already sealed one there under a newer version.
+    /// Whether a new message in `room` (a send, or an edit, a delete or a
+    /// reaction, which are messages too) may be sealed under secret
+    /// `version`: not if this device has already sealed one there under a
+    /// newer version.
     /// The room's secret pointer can move back (`RoomData`'s alignment with
     /// the contract's current version), and a member the newer rotation
     /// excluded can read a message sealed under the older key.

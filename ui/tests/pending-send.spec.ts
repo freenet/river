@@ -1,5 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
-import { clickFooter, committedRow, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, openRoomWithTarget, press, reactionChoices, reactTo, selectListedRoom, sendCommitted, settle, submitMessage } from "./example-room";
+import { test, expect, Locator, Page } from "@playwright/test";
+import { chips, clickFooter, committedRow, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, openRoomWithTarget, press, reactionChoices, reactTo, selectListedRoom, sendCommitted, settle, submitMessage } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // An own message is signed by the chat delegate, which can take seconds. The
@@ -374,3 +374,140 @@ test("a second click on a reaction still being signed undoes it", { tag: "@chrom
   await settle(page);
   await expect(row.getByTestId("reaction-chip"), "and stays undone once both are signed").toHaveCount(0);
 });
+
+// A private room's key pointer can move back below a version this device has
+// already sealed under there. A composer send is refused then (above); so is
+// an edit, a delete and a reaction, each of which is sealed too, and an edit
+// carries new private text. Nothing is signed, shown or marked until the key
+// is back.
+const KEY_NOT_HERE = "does not have the room's newest key yet";
+const signsRecorded = (page: Page) => callRiverTest(page, "messageSignsRecorded");
+
+/// An own message committed at key version 3 in a fresh private room, with an
+/// own reaction on it when `seeded`, and the room's key pointer then moved
+/// back to 2. Returns the row and the signatures recorded so far.
+async function openRoomBelowItsFloor(page: Page, seeded: boolean): Promise<{ row: Locator; signed: number }> {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "makeRoomPrivate", 3);
+  const before = await signsRecorded(page);
+  const row = await sendCommitted(page, "floor target");
+  if (seeded) await reactTo(page, row);
+  const signed = before + (seeded ? 2 : 1);
+  await expect.poll(() => signsRecorded(page), { message: "premise: the setup is signed at version 3" }).toBe(signed);
+  await settle(page);
+  expect(await callRiverTest(page, "userWaitRooms"), "premise: no wait mark").toBe(0);
+  await callRiverTest(page, "setSecretVersion", 2);
+  await settle(page);
+  return { row, signed };
+}
+
+/// A refused action signed nothing and marked nothing.
+async function expectNothingSigned(page: Page, signed: number, why: string) {
+  await settle(page);
+  expect(await signsRecorded(page), `${why}: nothing new is signed`).toBe(signed);
+  expect(await callRiverTest(page, "userWaitRooms"), `${why}: no wait mark`).toBe(0);
+}
+
+async function expectRefusalToast(page: Page) {
+  await expect(page.getByTestId("toast-message"), "the reason is shown").toContainText(KEY_NOT_HERE);
+}
+
+async function confirmDelete(page: Page, row: Locator) {
+  await clickFooter(page, row, "message-delete-button");
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Delete Message?" })).toHaveCount(0);
+}
+
+/// Pick the `index`-th emoji of `row`'s reaction choices.
+async function pickReaction(page: Page, row: Locator, index: number): Promise<string> {
+  await openInlinePicker(page, row);
+  const choice = (await reactionChoices(page)).nth(index);
+  const emoji = (await choice.textContent())!.trim();
+  await press(choice);
+  return emoji;
+}
+
+test("an edit below the room's sealed key version is refused and kept, then saved once the key is back", { tag: "@chromium-only" }, async ({ page }) => {
+  const { row, signed } = await openRoomBelowItsFloor(page, false);
+  const edited = committedRow(page, "floor target, edited");
+  const editError = page.getByTestId("edit-save-error");
+
+  // Enter, then Save: both keep the form and what was typed.
+  const editArea = await openOwnMessageEdit(page, row);
+  await editArea.fill("floor target, edited");
+  await editArea.press("Enter");
+  await expectNothingSigned(page, signed, "an edit by Enter at version 2");
+  await expect(editError).toContainText(KEY_NOT_HERE);
+  await expect(editArea, "the proposed text is kept for another try").toHaveValue("floor target, edited");
+  await page.getByTestId("edit-save-button").click();
+  await expectNothingSigned(page, signed, "an edit by Save at version 2");
+  await expect(editError).toContainText(KEY_NOT_HERE);
+  await expect(editArea).toHaveValue("floor target, edited");
+  await expect(edited, "the message is not edited").toHaveCount(0);
+
+  // The key is back: the same Save goes, once.
+  await callRiverTest(page, "setSecretVersion", 3);
+  await settle(page);
+  await page.getByTestId("edit-save-button").click();
+  await expect(edited).toHaveCount(1);
+  await expect(page.locator('textarea[id^="edit-msg-"]'), "an accepted edit closes the form").toHaveCount(0);
+  await expect.poll(() => signsRecorded(page), { message: "one signature for the edit" }).toBe(signed + 1);
+  await settle(page);
+  expect(await signsRecorded(page), "and no more").toBe(signed + 1);
+});
+
+test("a confirmed delete below the room's sealed key version is refused, then goes once the key is back", { tag: "@chromium-only" }, async ({ page }) => {
+  const { row, signed } = await openRoomBelowItsFloor(page, false);
+
+  await confirmDelete(page, row);
+  await expectNothingSigned(page, signed, "a delete at version 2");
+  await expect(row, "the message is still there").toHaveCount(1);
+  await expect(row).toContainText("floor target");
+  await expectRefusalToast(page);
+
+  await callRiverTest(page, "setSecretVersion", 3);
+  await settle(page);
+  await confirmDelete(page, row);
+  await expect(row).toHaveCount(0);
+  await expect.poll(() => signsRecorded(page), { message: "one signature for the delete" }).toBe(signed + 1);
+  await settle(page);
+  expect(await signsRecorded(page), "and no more").toBe(signed + 1);
+});
+
+for (const kind of ["add", "remove", "swap"] as const) {
+  test(`a reaction ${kind} below the room's sealed key version is refused, then goes once the key is back`, { tag: "@chromium-only" }, async ({ page }) => {
+    const seeded = kind !== "add";
+    const { row, signed } = await openRoomBelowItsFloor(page, seeded);
+    const chip = chips(row);
+    const original = seeded ? (await chip.textContent())!.trim() : "";
+    // The reaction the accepted action leaves, and the signatures it takes
+    // (a swap removes the old one and adds the new one).
+    const act = async (): Promise<string | null> => {
+      if (kind === "add") return pickReaction(page, row, 0);
+      if (kind === "swap") return pickReaction(page, row, 1);
+      await chip.click();
+      return null;
+    };
+    const signs = kind === "swap" ? 2 : 1;
+
+    await act();
+    await expectNothingSigned(page, signed, `a reaction ${kind} at version 2`);
+    await expect(chip, "the chips are as they were").toHaveCount(seeded ? 1 : 0);
+    if (seeded) await expect(chip, "the own reaction survives").toHaveText(original);
+    await expectRefusalToast(page);
+
+    await callRiverTest(page, "setSecretVersion", 3);
+    await settle(page);
+    const emoji = await act();
+    if (emoji === null) {
+      await expect(chip).toHaveCount(0);
+    } else {
+      await expect(chip).toHaveCount(1);
+      await expect(chip).toContainText(emoji);
+      if (kind === "swap") expect(original, "premise: another emoji").not.toContain(emoji);
+    }
+    await expect.poll(() => signsRecorded(page), { message: `${signs} signature(s) for the ${kind}` }).toBe(signed + signs);
+    await settle(page);
+    expect(await signsRecorded(page), "and no more").toBe(signed + signs);
+  });
+}
