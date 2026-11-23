@@ -25,9 +25,9 @@
 //!   can return `Some(...)`. The probe is gated on `target_family = "wasm"`
 //!   so the permissive behaviour observed by
 //!   `subscribes_to_room_on_ensure_request` is correct under non-WASM. The
-//!   comparison the probe makes, `is_room_owner_signing_key`, is a plain
-//!   function and is tested directly below; the wiring into the handler is
-//!   not reached by these tests.
+//!   decision the handler makes from the stored key, and the writes it then
+//!   makes, are `ensure_subscription_writes`, tested directly below with a
+//!   stored key; only the secret-store read itself is WASM-only.
 //!
 //! - **Cache-not-updated-when-signing-key-missing** (Fix 3): exercising
 //!   the cache-discipline rule needs `set_secret` to actually persist the
@@ -935,4 +935,111 @@ fn only_the_room_owners_signing_key_may_set_the_subscription_record() {
         &room
     ));
     assert!(!is_room_owner_signing_key(Some(&[0u8; 33]), &room));
+}
+
+/// `EnsureRoomSubscription` decides before writing anything: a caller
+/// holding no key for the room, or a key that is not the owner's, gets an
+/// error and no write; the owner's key gives exactly the subscription record
+/// and the reverse index, the latter keyed by the contract id and the
+/// owner's member id.
+#[test]
+fn ensure_checks_the_owner_key_before_any_write() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let member = SigningKey::generate(&mut OsRng);
+    let room = owner.verifying_key().to_bytes();
+    let cid = [7u8; 32];
+    for refused in [None, Some(member.to_bytes().to_vec()), Some(vec![1u8; 31])] {
+        assert!(
+            ensure_subscription_writes("origin", room, cid, KeyCheck::Stored(refused)).is_err()
+        );
+    }
+    let writes = ensure_subscription_writes(
+        "origin",
+        room,
+        cid,
+        KeyCheck::Stored(Some(owner.to_bytes().to_vec())),
+    )
+    .expect("the owner's key is accepted");
+    let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            secret_keys::sub_index(&room_owner_b58(&room)),
+            contract_id_index_key(&cid, MemberId::from(&owner.verifying_key())),
+        ]
+    );
+}
+
+/// The writes of every `EnsureRoomSubscription` in `calls`, applied in order
+/// to one store, as the delegate applies them.
+fn store_after(
+    calls: &[(&str, &SigningKey, [u8; 32])],
+) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+    let mut store = std::collections::HashMap::new();
+    for (origin, sk, cid) in calls {
+        let room = sk.verifying_key().to_bytes();
+        for (k, v) in ensure_subscription_writes(
+            origin,
+            room,
+            *cid,
+            KeyCheck::Stored(Some(sk.to_bytes().to_vec())),
+        )
+        .unwrap()
+        {
+            store.insert(k, v);
+        }
+    }
+    store
+}
+
+/// A subscription another caller makes for its own room, naming the
+/// contract id of someone else's room, never decides where that room's
+/// notifications go: they resolve through the owner the notified state names,
+/// in either order of the two subscriptions.
+#[test]
+fn another_callers_subscription_never_captures_a_rooms_notifications() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let cid = [9u8; 32];
+    let state = private_room_state(&owner, &[]);
+    for calls in [
+        vec![("owner-origin", &owner, cid), ("other-origin", &other, cid)],
+        vec![("other-origin", &other, cid), ("owner-origin", &owner, cid)],
+    ] {
+        let store = store_after(&calls);
+        assert_eq!(
+            resolve_notified_room(&cid, &state, |k| store.get(k).cloned()),
+            Some(owner.verifying_key().to_bytes()),
+            "the owner's room, whichever subscription was written last"
+        );
+    }
+    // With only the other caller's subscription on file, the owner's
+    // notifications resolve to no room at all.
+    let store = store_after(&[("other-origin", &other, cid)]);
+    assert_eq!(
+        resolve_notified_room(&cid, &state, |k| store.get(k).cloned()),
+        None
+    );
+}
+
+/// A notified state whose configuration names an owner but is not signed by
+/// that owner's key resolves to no room.
+#[test]
+fn a_notification_whose_configuration_the_owner_did_not_sign_resolves_to_no_room() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let cid = [3u8; 32];
+    let store = store_after(&[("owner-origin", &owner, cid)]);
+    let mut state = private_room_state(&owner, &[]);
+    state.configuration =
+        AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &other);
+    assert_eq!(
+        resolve_notified_room(&cid, &state, |k| store.get(k).cloned()),
+        None
+    );
+    let good = private_room_state(&owner, &[]);
+    assert_eq!(
+        resolve_notified_room(&cid, &good, |k| store.get(k).cloned()),
+        Some(owner.verifying_key().to_bytes())
+    );
 }
