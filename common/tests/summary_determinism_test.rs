@@ -347,6 +347,7 @@ fn top_level_summary_serialization_is_order_independent() {
             bans,
             members,
             ban_evidence,
+            provisional: Default::default(),
             member_info,
             secrets,
             recent_messages,
@@ -682,4 +683,61 @@ fn bans_summary_bytes_per_entry() {
         (17.0..18.0).contains(&per_entry),
         "each entry must be one 17-byte digest (got {per_entry:.2} B/entry)"
     );
+}
+
+/// The provisional field's summary (freenet/river#974): entries as
+/// `(MemberId, EntryDigest)` pairs and provisional bans as `BanDigest`s,
+/// inserted in two orders, give the same bytes. Built through the field's
+/// own `summarize`, over states holding the same records in two orders.
+#[test]
+fn provisional_summary_serialization_is_order_independent() {
+    use river_core::room_state::provisional::{
+        AdmissionEvidence, AuthorizedProvisionalBan, AuthorizedProvisionalMember, ProvisionalBan,
+        ProvisionalMember, ProvisionalV1,
+    };
+    type ProvisionalSummary = <ProvisionalV1 as ComposableState>::Summary;
+    let owner = SigningKey::from_bytes(&[1u8; 32]);
+    let entries: Vec<AuthorizedProvisionalMember> = (2u8..8)
+        .map(|i| {
+            let k = SigningKey::from_bytes(&[i; 32]);
+            AuthorizedProvisionalMember::new(
+                &owner.verifying_key(),
+                ProvisionalMember {
+                    member_vk: k.verifying_key(),
+                    evidence: AdmissionEvidence::Pow { nonce: i as u64 },
+                },
+                &k,
+            )
+        })
+        .collect();
+    let bans: Vec<AuthorizedProvisionalBan> = (2i64..8)
+        .map(|i| {
+            AuthorizedProvisionalBan::new(
+                &owner.verifying_key(),
+                ProvisionalBan {
+                    banned_by: MemberId::from(&owner.verifying_key()),
+                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64),
+                    target: member_id(i),
+                },
+                &owner,
+            )
+        })
+        .collect();
+    let params = ChatRoomParametersV1 {
+        owner: owner.verifying_key(),
+    };
+    let parent = ChatRoomStateV1::default();
+    let forward = ProvisionalV1 {
+        entries: entries.clone(),
+        bans: bans.clone(),
+    };
+    let backward = ProvisionalV1 {
+        entries: entries.into_iter().rev().collect(),
+        bans: bans.into_iter().rev().collect(),
+    };
+    let a: ProvisionalSummary = forward.summarize(&parent, &params);
+    let b: ProvisionalSummary = backward.summarize(&parent, &params);
+    assert_eq!(a.entries.len(), 6);
+    assert_eq!(a.bans.len(), 6);
+    assert_eq!(cbor(&a), cbor(&b));
 }

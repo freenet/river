@@ -720,9 +720,13 @@ mod tests {
         use river_core::room_state::configuration::Configuration;
         use river_core::room_state::privacy::RoomDisplayMetadata;
 
-        let mut config = Configuration::default();
-        config.display =
-            RoomDisplayMetadata::public("My Room".to_string(), Some("Hello **world**".to_string()));
+        let config = Configuration {
+            display: RoomDisplayMetadata::public(
+                "My Room".to_string(),
+                Some("Hello **world**".to_string()),
+            ),
+            ..Configuration::default()
+        };
 
         let rc = RoomConfig::from_configuration(&config);
         assert_eq!(rc.room_name, "My Room");

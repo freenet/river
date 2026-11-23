@@ -142,6 +142,9 @@ struct Stats {
     /// pairs each side of which keeps its own record, counted apart
     /// (freenet/river#703).
     runs_with_two_records_for_one_member: usize,
+    /// Runs whose forks end holding provisional entries, and provisional bans.
+    runs_with_entries: usize,
+    runs_with_provisional_bans: usize,
 }
 
 thread_local! {
@@ -163,6 +166,9 @@ fn shape_of(d: &ChatRoomStateV1Delta) -> String {
     }
     if d.members.is_some() {
         parts.push("members".to_string());
+    }
+    if d.provisional.is_some() {
+        parts.push("prov".to_string());
     }
     if d.member_info.is_some() {
         parts.push("info".to_string());
@@ -205,6 +211,12 @@ struct World {
     params: ChatRoomParametersV1,
     pool: Vec<PoolMember>,
     base_time: SystemTime,
+    /// `Mode::Provisional`: keys that are never in the pool, their ids, and
+    /// for each a forged key with the same `MemberId`. Fixed bytes, not drawn
+    /// from the generator, so the other modes' random streams are unchanged.
+    prov: Vec<SigningKey>,
+    prov_ids: Vec<MemberId>,
+    forged: Vec<ed25519_dalek::VerifyingKey>,
 }
 
 fn key(rng: &mut StdRng) -> SigningKey {
@@ -246,16 +258,47 @@ impl World {
                 auth,
             });
         }
+        let (mut prov, mut prov_ids, mut forged) = (Vec::new(), Vec::new(), Vec::new());
+        let mut b = 1u8;
+        while prov.len() < 6 {
+            let k = SigningKey::from_bytes(&[b; 32]);
+            b += 1;
+            if let Some(f) = forged_vk_with_id_of(&k.verifying_key()) {
+                prov_ids.push(k.verifying_key().into());
+                forged.push(f);
+                prov.push(k);
+            }
+        }
         World {
             owner_sk,
             owner_id,
             params,
             pool,
             base_time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            prov,
+            prov_ids,
+            forged,
         }
     }
 
-    fn initial_state(&self, max_recent_messages: usize, max_user_bans: usize) -> ChatRoomStateV1 {
+    fn initial_state(
+        &self,
+        max_recent_messages: usize,
+        max_user_bans: usize,
+        mode: Mode,
+    ) -> ChatRoomStateV1 {
+        let public_admission = (mode == Mode::Provisional).then_some({
+            river_core::room_state::provisional::PublicRoomPolicy {
+                listed: false,
+                max_provisional: 3,
+                max_provisional_messages: 4,
+                max_provisional_bans: 3,
+                pow: Some(river_core::room_state::provisional::PowPolicy {
+                    difficulty_bits: 2,
+                    epoch: 1,
+                }),
+            }
+        });
         ChatRoomStateV1 {
             configuration: AuthorizedConfigurationV1::new(
                 Configuration {
@@ -264,6 +307,7 @@ impl World {
                     max_user_bans,
                     max_recent_messages,
                     max_message_size: 1000,
+                    public_admission,
                     ..Default::default()
                 },
                 &self.owner_sk,
@@ -722,6 +766,8 @@ fn op_for(
         random_op_ext(w, rng, state, clock, t)
     } else if mode == Mode::Rich && rng.gen_bool(0.5) {
         random_op_rich(w, rng, state, clock, t)
+    } else if mode == Mode::Provisional && rng.gen_bool(0.65) {
+        random_op_prov(w, rng, state, clock, t)
     } else {
         random_op(w, rng, state, clock, t, mode)
     }
@@ -944,6 +990,474 @@ fn random_op_ext(
     }
 }
 
+/// `Mode::Provisional` (freenet/river#974): open admission. The operations
+/// are what an honest client or owner device sends, plus what a member can
+/// produce at will: policy changes (difficulty up and down, a new epoch,
+/// caps, removing the policy, Private and back), entries with their first
+/// message in one delta, later messages (some future-dated), sponsorship,
+/// provisional bans and `UserBan`s by the owner, a deputy and a non-deputy,
+/// deputy grants, and forged `MemberId` collisions (an invited member's
+/// record for a forged key with a provisional member's id, kept by a DM, with
+/// and without a ban on the id).
+fn random_op_prov(
+    w: &World,
+    rng: &mut StdRng,
+    state: &ChatRoomStateV1,
+    clock: &mut ForkClock,
+    t: u64,
+) -> ChatRoomStateV1Delta {
+    use river_core::room_state::direct_messages::{sign_direct_message, DirectMessagesDelta};
+    use river_core::room_state::privacy::{PrivacyMode, RoomDisplayMetadata, SealedBytes};
+    use river_core::room_state::provisional::{
+        AdmissionEvidence, AuthorizedProvisionalBan, AuthorizedProvisionalMember, PowPolicy,
+        ProvisionalBan, ProvisionalDelta, ProvisionalMember,
+    };
+    let n = w.pool.len();
+    let np = w.prov.len();
+    let present: Vec<usize> = (0..n)
+        .filter(|&i| {
+            state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.id() == w.pool[i].id)
+        })
+        .collect();
+    let pick = |rng: &mut StdRng, from: &[usize]| -> Option<usize> {
+        if from.is_empty() {
+            None
+        } else {
+            Some(from[rng.gen_range(0..from.len())])
+        }
+    };
+    let cfg = &state.configuration.configuration;
+    let prov_msg = |j: usize, at: u64, text: &str| {
+        AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: w.owner_id,
+                author: w.prov_ids[j],
+                time: w.base_time + Duration::from_secs(at),
+                content: RoomMessageBody::public(text.to_string()),
+            },
+            &w.prov[j],
+        )
+    };
+    let bump = if clock.config_offset > 0 {
+        clock.config_offset
+    } else {
+        1
+    };
+    match rng.gen_range(0..21) {
+        // An entry with its member_info and first message, solved against the
+        // policy this fork holds.
+        0..=4 => {
+            let Some(pow) = cfg.public_admission.as_ref().and_then(|p| p.pow.clone()) else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let j = rng.gen_range(0..np);
+            let nonce = (0u64..)
+                .find(|nn| {
+                    river_core::room_state::provisional::leading_zero_bits(
+                        &river_core::room_state::provisional::pow_hash(
+                            &w.params.owner,
+                            &w.prov[j].verifying_key(),
+                            pow.epoch,
+                            *nn,
+                        ),
+                    ) >= pow.difficulty_bits as u32
+                })
+                .unwrap();
+            let entry = AuthorizedProvisionalMember::new(
+                &w.params.owner,
+                ProvisionalMember {
+                    member_vk: w.prov[j].verifying_key(),
+                    evidence: AdmissionEvidence::Pow { nonce },
+                },
+                &w.prov[j],
+            );
+            let v = clock.info_version.entry(n + j).or_insert(0);
+            *v += 1;
+            let info = MemberInfo::new_public(w.prov_ids[j], *v, format!("p{j}v{v}"));
+            ChatRoomStateV1Delta {
+                provisional: Some(ProvisionalDelta {
+                    entries: vec![entry],
+                    bans: vec![],
+                }),
+                member_info: Some(vec![AuthorizedMemberInfo::new_with_member_key(
+                    info, &w.prov[j],
+                )]),
+                recent_messages: Some(vec![prov_msg(j, t, &format!("prov {j}@{t}"))]),
+                ..Default::default()
+            }
+        }
+        // A later message by a provisional author, sometimes future-dated.
+        5..=7 => {
+            let j = rng.gen_range(0..np);
+            let at = if rng.gen_bool(0.25) { t + 1_000_000 } else { t };
+            ChatRoomStateV1Delta {
+                recent_messages: Some(vec![prov_msg(j, at, &format!("again {j}@{at}"))]),
+                ..Default::default()
+            }
+        }
+        // The owner changes the policy (or the room's mode and caps).
+        8..=9 => {
+            let mut c = cfg.clone();
+            c.configuration_version += bump;
+            match rng.gen_range(0..9) {
+                0 | 1 => {
+                    // Difficulty up or down, same epoch.
+                    let mut p = c.public_admission.clone().unwrap_or({
+                        river_core::room_state::provisional::PublicRoomPolicy {
+                            listed: false,
+                            max_provisional: 3,
+                            max_provisional_messages: 4,
+                            max_provisional_bans: 3,
+                            pow: Some(PowPolicy {
+                                difficulty_bits: 2,
+                                epoch: 1,
+                            }),
+                        }
+                    });
+                    let bits = rng.gen_range(0..=6u8);
+                    let epoch = p.pow.as_ref().map_or(1, |x| x.epoch);
+                    p.pow = Some(PowPolicy {
+                        difficulty_bits: bits,
+                        epoch,
+                    });
+                    c.public_admission = Some(p);
+                }
+                2 => {
+                    // A new random epoch.
+                    if let Some(p) = c.public_admission.as_mut() {
+                        let bits = p.pow.as_ref().map_or(2, |x| x.difficulty_bits);
+                        p.pow = Some(PowPolicy {
+                            difficulty_bits: bits,
+                            epoch: rng.gen(),
+                        });
+                    }
+                }
+                3 => {
+                    // Caps.
+                    if let Some(p) = c.public_admission.as_mut() {
+                        p.max_provisional = rng.gen_range(1..=4);
+                        p.max_provisional_messages = rng.gen_range(1..=6);
+                        p.max_provisional_bans = rng.gen_range(0..=4);
+                    }
+                }
+                4 => c.public_admission = None,
+                5 => {
+                    // No proof of work admits nobody.
+                    if let Some(p) = c.public_admission.as_mut() {
+                        p.pow = None;
+                    }
+                }
+                6 => {
+                    // Private and back.
+                    if c.privacy_mode == PrivacyMode::Private {
+                        c.privacy_mode = PrivacyMode::Public;
+                        c.display = RoomDisplayMetadata {
+                            name: SealedBytes::public(b"Room".to_vec()),
+                            description: None,
+                        };
+                    } else {
+                        c.privacy_mode = PrivacyMode::Private;
+                        c.display = RoomDisplayMetadata {
+                            name: SealedBytes::private(vec![7; 8], [0; 12], 1, 8),
+                            description: None,
+                        };
+                    }
+                }
+                7 => {
+                    c.max_recent_messages = rng.gen_range(1..8);
+                    c.max_members = rng.gen_range(2..8);
+                }
+                _ => {
+                    // Back to a sane open policy.
+                    c.privacy_mode = PrivacyMode::Public;
+                    c.display = RoomDisplayMetadata {
+                        name: SealedBytes::public(b"Room".to_vec()),
+                        description: None,
+                    };
+                    c.public_admission =
+                        Some(river_core::room_state::provisional::PublicRoomPolicy {
+                            listed: false,
+                            max_provisional: rng.gen_range(1..=4),
+                            max_provisional_messages: rng.gen_range(1..=6),
+                            max_provisional_bans: rng.gen_range(0..=4),
+                            pow: Some(PowPolicy {
+                                difficulty_bits: rng.gen_range(0..=5),
+                                epoch: rng.gen_range(0..3),
+                            }),
+                        });
+                }
+            }
+            ChatRoomStateV1Delta {
+                configuration: Some(AuthorizedConfigurationV1::new(c, &w.owner_sk)),
+                ..Default::default()
+            }
+        }
+        // Sponsorship: the owner or a present member invites a provisional
+        // key (with the inviter's chain), with a message by the new member.
+        10..=11 => {
+            // Only keys 0..3 are ever sponsored, and only keys 3..6 are ever
+            // shadowed by a forged record (op 15): a record that collides with
+            // another RECORD (a sponsored key, later evidence, against a forged
+            // record for its id) is the older member-member collision, which
+            // no provisional rule decides (see the PR).
+            let j = rng.gen_range(0..np / 2);
+            let inviter = pick(rng, &present);
+            let (inviter_id, inviter_sk, mut members) = match inviter {
+                None => (w.owner_id, &w.owner_sk, Vec::new()),
+                Some(i) => (
+                    w.pool[i].id,
+                    &w.pool[i].sk,
+                    w.chain(i).iter().map(|&c| w.pool[c].auth.clone()).collect(),
+                ),
+            };
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: w.owner_id,
+                    invited_by: inviter_id,
+                    member_vk: w.prov[j].verifying_key(),
+                },
+                inviter_sk,
+            ));
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(members)),
+                recent_messages: Some(vec![prov_msg(j, t, &format!("sponsored {j}@{t}"))]),
+                ..Default::default()
+            }
+        }
+        // A provisional ban by the owner, a deputy or anyone, on a
+        // provisional id (or, now and then, a pool member's).
+        12..=13 => {
+            let target = if rng.gen_bool(0.85) {
+                w.prov_ids[rng.gen_range(0..np)]
+            } else {
+                w.pool[rng.gen_range(0..n)].id
+            };
+            let (by_id, by_sk) = if rng.gen_bool(0.4) {
+                (w.owner_id, &w.owner_sk)
+            } else {
+                let b = rng.gen_range(0..n);
+                (w.pool[b].id, &w.pool[b].sk)
+            };
+            let ban = AuthorizedProvisionalBan::new(
+                &w.params.owner,
+                ProvisionalBan {
+                    banned_by: by_id,
+                    banned_at: w.base_time + Duration::from_secs(t),
+                    target,
+                },
+                by_sk,
+            );
+            ChatRoomStateV1Delta {
+                provisional: Some(ProvisionalDelta {
+                    entries: vec![],
+                    bans: vec![ban],
+                }),
+                ..Default::default()
+            }
+        }
+        // A `UserBan` on a provisional id by the owner or a pool member.
+        14 => {
+            let target = w.prov_ids[rng.gen_range(0..np)];
+            let (by_id, by_sk) = if rng.gen_bool(0.5) {
+                (w.owner_id, &w.owner_sk)
+            } else {
+                let b = rng.gen_range(0..n);
+                (w.pool[b].id, &w.pool[b].sk)
+            };
+            let ban = UserBan {
+                owner_member_id: w.owner_id,
+                banned_at: w.base_time + Duration::from_secs(t),
+                banned_user: target,
+            };
+            ChatRoomStateV1Delta {
+                bans: Some(vec![AuthorizedUserBan::new(ban, by_id, by_sk)]),
+                ..Default::default()
+            }
+        }
+        // A forged collision: a present member invites a forged key with a
+        // provisional member's id, keeps it with a DM, and sometimes bans the id.
+        15..=16 => {
+            let Some(p) = pick(rng, &present) else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let j = np / 2 + rng.gen_range(0..np - np / 2);
+            let mut members: Vec<AuthorizedMember> =
+                w.chain(p).iter().map(|&c| w.pool[c].auth.clone()).collect();
+            members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: w.owner_id,
+                    invited_by: w.pool[p].id,
+                    member_vk: w.forged[j],
+                },
+                &w.pool[p].sk,
+            ));
+            let dm = sign_direct_message(
+                &w.pool[p].sk,
+                w.pool[p].id,
+                w.prov_ids[j],
+                &w.params.owner,
+                t,
+                b"x".to_vec(),
+            )
+            .unwrap();
+            let bans = rng.gen_bool(0.4).then(|| {
+                vec![AuthorizedUserBan::new(
+                    UserBan {
+                        owner_member_id: w.owner_id,
+                        banned_at: w.base_time + Duration::from_secs(t),
+                        banned_user: w.prov_ids[j],
+                    },
+                    w.pool[p].id,
+                    &w.pool[p].sk,
+                )]
+            });
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(members)),
+                direct_messages: Some(DirectMessagesDelta {
+                    new_messages: vec![dm],
+                    advanced_purges: vec![],
+                }),
+                bans,
+                ..Default::default()
+            }
+        }
+        // The owner lists deputies (a pool member, sometimes a provisional id).
+        17 => {
+            let v = clock.info_version.entry(n + np).or_insert(0);
+            *v += 1;
+            let mut info = MemberInfo::new_public(w.owner_id, *v + 100, "owner".to_string());
+            let d = if rng.gen_bool(0.2) {
+                w.prov_ids[rng.gen_range(0..np)]
+            } else {
+                w.pool[rng.gen_range(0..n)].id
+            };
+            info.deputies = vec![d];
+            ChatRoomStateV1Delta {
+                member_info: Some(vec![AuthorizedMemberInfo::new(info, &w.owner_sk)]),
+                ..Default::default()
+            }
+        }
+        // The owner bans a pool member (their subtree, DMs and bans go).
+        18 => ChatRoomStateV1Delta {
+            bans: Some(vec![sign_ban(w, None, rng.gen_range(0..n), t)]),
+            ..Default::default()
+        },
+        // A sponsored provisional key banned directly by its inviter or by
+        // an owner deputy (a `UserBan` that moves its record to ban evidence
+        // under its own key), sometimes with the key's entry, `member_info`
+        // and a message in the same delta. Only an owner or deputy ban keeps
+        // the key out; the inviter's ban does not (Ian, 2026-11-22). The
+        // merge laws are what is checked here, whichever way P2 decides.
+        20 => {
+            let j = rng.gen_range(0..np / 2);
+            let Some(record) = state
+                .members
+                .members
+                .iter()
+                .find(|m| m.member.id() == w.prov_ids[j])
+            else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let inviter = record.member.invited_by;
+            let deputies = state.member_info.deputies_of(w.owner_id);
+            let issuer = if inviter != w.owner_id && rng.gen_bool(0.6) {
+                w.pool.iter().position(|p| p.id == inviter)
+            } else {
+                (0..n).find(|&i| deputies.contains(&w.pool[i].id))
+            };
+            let Some(b) = issuer else {
+                return ChatRoomStateV1Delta::default();
+            };
+            let ban = AuthorizedUserBan::new(
+                UserBan {
+                    owner_member_id: w.owner_id,
+                    banned_at: w.base_time + Duration::from_secs(t),
+                    banned_user: w.prov_ids[j],
+                },
+                w.pool[b].id,
+                &w.pool[b].sk,
+            );
+            let mut d = ChatRoomStateV1Delta {
+                bans: Some(vec![ban]),
+                ..Default::default()
+            };
+            if let Some(pow) = cfg.public_admission.as_ref().and_then(|p| p.pow.clone()) {
+                if rng.gen_bool(0.5) {
+                    let nonce = (0u64..)
+                        .find(|nn| {
+                            river_core::room_state::provisional::leading_zero_bits(
+                                &river_core::room_state::provisional::pow_hash(
+                                    &w.params.owner,
+                                    &w.prov[j].verifying_key(),
+                                    pow.epoch,
+                                    *nn,
+                                ),
+                            ) >= pow.difficulty_bits as u32
+                        })
+                        .unwrap();
+                    d.provisional = Some(ProvisionalDelta {
+                        entries: vec![AuthorizedProvisionalMember::new(
+                            &w.params.owner,
+                            ProvisionalMember {
+                                member_vk: w.prov[j].verifying_key(),
+                                evidence: AdmissionEvidence::Pow { nonce },
+                            },
+                            &w.prov[j],
+                        )],
+                        bans: vec![],
+                    });
+                    d.recent_messages = Some(vec![prov_msg(j, t, &format!("back {j}@{t}"))]);
+                }
+            }
+            d
+        }
+        // A pool member (re)joins with a message, so members and provisional
+        // authors compete for the window.
+        _ => {
+            let i = rng.gen_range(0..n);
+            let chain = w.chain(i);
+            let members: Vec<AuthorizedMember> =
+                chain.iter().map(|&c| w.pool[c].auth.clone()).collect();
+            let msgs = chain
+                .iter()
+                .map(|&c| w.msg(Some(c), t, &format!("pj {c}@{t}")))
+                .collect();
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(members)),
+                recent_messages: Some(msgs),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// A key whose `MemberId` equals `victim`'s and whose bytes differ (see the
+/// `MemberId` docs), or `None` if none is found. It has no secret key.
+fn forged_vk_with_id_of(
+    victim: &ed25519_dalek::VerifyingKey,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    let target: MemberId = victim.into();
+    let base = victim.to_bytes();
+    for i in 0..31 {
+        let mut bytes = base;
+        if bytes[i] == 255 || bytes[i + 1] < 31 {
+            continue;
+        }
+        bytes[i] += 1;
+        bytes[i + 1] -= 31;
+        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&bytes) {
+            if MemberId::from(&vk) == target && vk != *victim {
+                return Some(vk);
+            }
+        }
+    }
+    None
+}
+
 fn apply(
     state: &mut ChatRoomStateV1,
     params: &ChatRoomParametersV1,
@@ -1025,6 +1539,10 @@ enum Mode {
     /// `max_members` together with a ban, and a removed member replaying their
     /// own record with a counter-ban. See `random_op_ext`.
     Extended,
+    /// Public-room open admission (freenet/river#974): entries, policy
+    /// changes, sponsorship, provisional bans, forged `MemberId` collisions.
+    /// See `random_op_prov`.
+    Provisional,
     /// Honest operations, but fork B's owner device bumps the configuration
     /// version from the same base as fork A's, so the two forks can hold
     /// different owner-signed configurations at an EQUAL version
@@ -1070,7 +1588,7 @@ fn fork_pair_with_base(
     let (pool, prefix, fork_ops, cap, bans) = shape;
     let mut rng = StdRng::seed_from_u64(seed);
     let w = World::new(&mut rng, pool);
-    let mut base = w.initial_state(cap, bans);
+    let mut base = w.initial_state(cap, bans, mode);
     let mut clock = ForkClock::default();
     let mut t = 0u64;
     for _ in 0..prefix {
@@ -1118,11 +1636,12 @@ fn differing_fields(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> Vec<&'static st
         v
     }
     let mut out = Vec::new();
-    let checks: [(&str, bool); 10] = [
+    let checks: [(&str, bool); 11] = [
         ("configuration", f(&a.configuration) != f(&b.configuration)),
         ("bans", f(&a.bans) != f(&b.bans)),
         ("members", f(&a.members) != f(&b.members)),
         ("ban_evidence", f(&a.ban_evidence) != f(&b.ban_evidence)),
+        ("provisional", f(&a.provisional) != f(&b.provisional)),
         ("member_info", f(&a.member_info) != f(&b.member_info)),
         ("secrets", f(&a.secrets) != f(&b.secrets)),
         (
@@ -1225,8 +1744,14 @@ fn seeds_from_env(default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// `FORK_SEEDS=N` seeds starting at `FORK_SEED_BASE` (default 0), so a run
+/// can cover a range no earlier run did (`FORK_SEED_BASE=100000`).
 fn default_seeds(n: u64) -> Vec<(u64, usize)> {
-    (0..n)
+    let base: u64 = std::env::var("FORK_SEED_BASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (base..base + n)
         .flat_map(|s| (0..SHAPES.len()).map(move |sh| (s, sh)))
         .collect()
 }
@@ -1303,6 +1828,12 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
             }
             if !a.ban_evidence.is_empty() || !b.ban_evidence.is_empty() {
                 s.runs_with_evidence += 1;
+            }
+            if !a.provisional.entries.is_empty() || !b.provisional.entries.is_empty() {
+                s.runs_with_entries += 1;
+            }
+            if !a.provisional.bans.is_empty() || !b.provisional.bans.is_empty() {
+                s.runs_with_provisional_bans += 1;
             }
             let mut union: Vec<_> = a.bans.0.clone();
             union.extend(b.bans.0.iter().filter(|x| !a.bans.0.contains(x)).cloned());
@@ -1607,6 +2138,7 @@ fn stale_summary_deltas_apply() {
         Mode::Collide,
         Mode::Extended,
         Mode::Rich,
+        Mode::Provisional,
     ] {
         for &(seed, shape) in &seeds {
             drain_not_idempotent();
@@ -1703,7 +2235,7 @@ fn split_delivery_converges() {
             let (pool, prefix, _, cap, max_bans) = *shape;
             let mut rng = StdRng::seed_from_u64(seed ^ 0x5eed);
             let w = World::new(&mut rng, pool);
-            let mut base = w.initial_state(cap, max_bans);
+            let mut base = w.initial_state(cap, max_bans, Mode::Extended);
             let mut clock = ForkClock::default();
             let mut t = 0;
             for _ in 0..prefix {
@@ -1769,4 +2301,46 @@ fn split_delivery_converges() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `Mode::Provisional` (freenet/river#974): open admission. Every pair must
+/// converge with the first exchange commutative, no merge refused, and cleanup
+/// a fixpoint of itself and of `merge(S, S)` after every apply and merge
+/// (`check_idempotent`, which also counts what `validate_state` would refuse
+/// and, under `--cfg river_cleanup_counters`, that no cleanup reaches
+/// `MAX_CLEANUP_PASSES` unconfirmed). `FORK_SEEDS=1000` before merging.
+///
+/// The default (3 seeds) is a smoke test only: the mutation check found that
+/// deleting C2, P2 or the deputy-authority half of P1 is not caught at that
+/// count (the deterministic tests in `public_admission_test.rs` catch each).
+/// Use `FORK_SEED_BASE` to cover seed ranges earlier runs did not: review
+/// finding 2 on #979 was found only at `FORK_SEED_BASE=100000`.
+#[test]
+fn provisional_forks_converge() {
+    let seeds = default_seeds(seeds_from_env(3));
+    let failures = endings(Mode::Provisional, &seeds);
+    let stats = take_stats();
+    assert_floors(
+        Mode::Provisional,
+        &stats,
+        &["prov+info+msgs", "config", "bans1", "members+msgs", "prov"],
+        false,
+    );
+    assert!(
+        stats.runs_with_entries > 0,
+        "no run ended holding a provisional entry: {stats:?}"
+    );
+    assert!(
+        stats.runs_with_provisional_bans > 0,
+        "no run ended holding a provisional ban: {stats:?}"
+    );
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures.report("provisional", seeds.len())
+    );
+    assert_eq!(
+        stats.merge_rejections, 0,
+        "a provisional-mode merge was rejected: {stats:?}"
+    );
 }

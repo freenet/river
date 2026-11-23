@@ -2337,6 +2337,23 @@ mod tests {
             "the owner-only OLD-contract upgrade delta must still publish the pointer \
              (the one legitimate publish — #427 P2-2)"
         );
+        // freenet/river#974 design section 7: never write policy-bearing state
+        // to an old key. An old WASM drops `public_admission` on decode, so a
+        // configuration carrying one would fail its owner signature there. The
+        // write to the old contract must carry the upgrade pointer and nothing
+        // else.
+        // The needle is assembled from two pieces so this test's own text
+        // does not contain it (a plain literal here would match itself).
+        let squashed: String = src.split_whitespace().collect();
+        let needle = [
+            "ChatRoomStateV1Delta{",
+            "upgrade:Some(authorized_upgrade),..Default::default()}",
+        ]
+        .concat();
+        assert!(
+            squashed.contains(&needle),
+            "the OLD-contract write must be a delta holding only the upgrade pointer"
+        );
     }
 
     // -----------------------------------------------------------------

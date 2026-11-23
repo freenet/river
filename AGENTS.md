@@ -59,9 +59,11 @@ Never `git add -A`, `.` or `-u`: it picks up rebuilt, non-reproducible WASM. Add
 
 | Record | Must have |
 |---|---|
-| Message | A valid signature from a verified member at the time it is added |
+| Message | A valid signature from a verified member, or from the key of a provisional entry that passes the room's current policy, at the time it is added |
 | Member | A valid invitation chain back to the room owner |
 | Ban | Authorization from the room owner's tree |
+| Provisional member | The member's self-signature over proof of work that passes the room's current owner-signed policy, in a Public room; never shadowing a member record |
+| Provisional ban | A signature by the owner or a current owner deputy |
 
 Verify at insertion time, never "when the data arrives later". If a delta would add data that cannot be verified (a message whose author is not in the member list), include the authorization data in the delta (the member entry beside the message); do not relax verification.
 

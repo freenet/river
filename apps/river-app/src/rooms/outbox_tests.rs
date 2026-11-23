@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ed25519_dalek::SigningKey;
+use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::ecies::decrypt_with_symmetric_key;
 use river_core::room_state::ChatRoomStateV1;
@@ -1769,7 +1770,9 @@ fn only_a_member_can_set_a_nickname_and_is_told_why_if_not() {
         assert_eq!(view.notices.len(), 1);
     }
 
-    // The room itself refuses a record from a key that is no member's, whoever sends it.
+    // The room itself never installs a record from a key that is no member's, whoever sends
+    // it: the record is skipped (not an error, freenet/river#974 X1: another key may hold the
+    // same id on another peer), the rest of the delta applies, and the state still verifies.
     let outsider = SigningKey::from_bytes(&[9; 32]);
     let forged = AuthorizedMemberInfo::new_with_member_key(
         MemberInfo {
@@ -1781,13 +1784,19 @@ fn only_a_member_can_set_a_nickname_and_is_told_why_if_not() {
         &outsider,
     );
     let mut room = public_room(&f);
-    assert!(
-        room.apply_delta(ChatRoomStateV1Delta {
-            member_info: Some(vec![forged]),
-            ..Default::default()
-        })
-        .is_err()
+    let before = room.stored.room_state.member_info.clone();
+    room.apply_delta(ChatRoomStateV1Delta {
+        member_info: Some(vec![forged.clone()]),
+        ..Default::default()
+    })
+    .expect("a record no key verifies is skipped, not an error");
+    let after = &room.stored.room_state;
+    assert!(!after.member_info.member_info.contains(&forged));
+    assert_eq!(
+        after.member_info, before,
+        "nothing about member_info changed"
     );
+    assert!(after.verify(after, &room.params()).is_ok());
 }
 
 #[test]
