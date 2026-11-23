@@ -22,7 +22,7 @@ use crate::room_state::member::{AuthorizedMember, MemberId};
 use crate::room_state::privacy::PrivacyMode;
 use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1135,6 +1135,7 @@ impl ChatRoomStateV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Verifier;
     use freenet_scaffold::util::FastHash;
 
     fn owner() -> SigningKey {
