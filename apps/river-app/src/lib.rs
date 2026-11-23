@@ -448,8 +448,18 @@ impl RiverApp {
 
     /// Not a room's notification: nothing to open when it is clicked.
     fn send_update_notice(&mut self, title: String, body: String) {
+        self.send_notice_keyed("river-update", title, body);
+    }
+
+    /// A notice from the shell, not about a room and not held back by do not disturb: it says
+    /// River is still running. False when the notifier could not queue it.
+    pub fn send_notice(&mut self, title: String, body: String) -> bool {
+        self.send_notice_keyed("river-notice", title, body)
+    }
+
+    fn send_notice_keyed(&mut self, key: &str, title: String, body: String) -> bool {
         self.notifier.notify(notify::Notification {
-            room_key: "river-update".into(),
+            room_key: key.into(),
             room_name: "River".into(),
             title,
             body,
@@ -458,7 +468,7 @@ impl RiverApp {
             message_key: String::new(),
             actions: false,
             reply: false,
-        });
+        })
     }
 
     /// Show the update notice do not disturb held back, once, when it allows. A window in
@@ -2503,6 +2513,24 @@ pub const SCENES: &[Scene] = &[
         s.chat.dnd.sync_inputs();
         s.chat.close_settings();
         s.chat.open_dnd();
+    }),
+    ("chat-settings-identity", |s| {
+        identity_scene(s, |c| c.settings.open_at(chat::settings::Section::Identity))
+    }),
+    ("chat-settings-identity-narrow", |s| {
+        identity_scene(s, |c| c.settings.open_at(chat::settings::Section::Identity))
+    }),
+    ("chat-settings-appearance", |s| {
+        identity_scene(s, |c| {
+            c.zoom.load(125);
+            c.settings.open_at(chat::settings::Section::Appearance)
+        })
+    }),
+    ("chat-settings-appearance-narrow", |s| {
+        identity_scene(s, |c| {
+            c.zoom.load(125);
+            c.settings.open_at(chat::settings::Section::Appearance)
+        })
     }),
     ("chat-settings-background", |s| background_scene(s, true)),
     ("chat-settings-background-narrow", |s| {
@@ -5152,12 +5180,194 @@ mod tests {
         assert_eq!(at, chat::node_status::Connection::WaitingForApproval);
     }
 
+    /// Settings > Identity > Export, for the open room.
+    fn export_from_settings(rt: &mut Runtime<RiverApp>) {
+        let open = rt.state.chat.room().unwrap().key.clone();
+        press(rt, "settings");
+        press(rt, "settings-section-identity");
+        press(rt, &format!("settings-export-{open}"));
+    }
+
+    /// Settings > Identity > Import.
+    fn import_from_settings(rt: &mut Runtime<RiverApp>) {
+        press(rt, "settings");
+        press(rt, "settings-section-identity");
+        press(rt, "settings-import-id");
+    }
+
+    #[test]
+    fn the_old_identity_and_shortcut_buttons_are_gone_from_the_room_list_and_members() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        for gone in ["import-id", "export-id", "shortcuts-entry"] {
+            assert!(rt.find(gone).is_none(), "{gone} is in Settings now");
+        }
+        assert!(rt.find("enter-invite").is_some());
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-identity");
+        assert!(rt.find("settings-import-id").is_some());
+    }
+
+    #[test]
+    fn settings_import_opens_the_import_dialog_and_closes_settings() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        import_from_settings(&mut rt);
+        assert!(rt.find("import-identity-dialog").is_some());
+        assert!(rt.find("settings-dialog").is_none());
+        assert_eq!(rt.state.chat.form.open, Some(chat::DialogKind::Import));
+    }
+
+    #[test]
+    fn the_join_dialog_offers_import() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "enter-invite");
+        assert!(rt.find("join-room-dialog").is_some());
+        press(&mut rt, "join-import-id");
+        assert!(rt.find("import-identity-dialog").is_some());
+        assert!(rt.find("join-room-dialog").is_none());
+    }
+
+    #[test]
+    fn export_lists_every_room_and_exports_the_one_chosen() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        let keys: Vec<String> = rt
+            .state
+            .chat
+            .rooms()
+            .iter()
+            .map(|r| r.key.clone())
+            .collect();
+        assert!(keys.len() > 1);
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-identity");
+        for k in &keys {
+            assert!(rt.find(&format!("settings-export-{k}")).is_some(), "{k}");
+        }
+        // A room that is not the open one.
+        let other = keys
+            .iter()
+            .find(|k| Some(k.as_str()) != rt.state.chat.room().map(|r| r.key.as_str()))
+            .unwrap()
+            .clone();
+        press(&mut rt, &format!("settings-export-{other}"));
+        assert!(rt.find("export-identity-dialog").is_some());
+        assert!(rt.find("settings-dialog").is_none());
+        assert_eq!(
+            rt.state.chat.outgoing,
+            [rooms::Command {
+                room: other.clone(),
+                action: rooms::Action::ExportId,
+            }]
+        );
+        assert_eq!(rt.state.chat.export.as_ref().unwrap().room, other);
+    }
+
+    #[test]
+    fn export_of_an_unknown_room_does_nothing() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| s.chat.open_export_for("not-a-room"));
+        assert!(rt.state.chat.export.is_none());
+        assert!(rt.state.chat.outgoing.is_empty());
+    }
+
+    #[test]
+    fn the_size_picker_sets_and_saves_the_zoom_as_the_keys_do() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-appearance");
+        for pct in chat::zoom::STEPS {
+            assert!(rt.find(&format!("settings-size-{pct}")).is_some(), "{pct}");
+        }
+        press(&mut rt, "settings-size-150");
+        assert_eq!(rt.state.chat.zoom.percent(), 150);
+        assert_eq!(
+            rt.state.chat.zoom.take_dirty(),
+            Some(150),
+            "saved like Ctrl+="
+        );
+        // Choosing the level already in force saves nothing.
+        press(&mut rt, "settings-size-150");
+        assert_eq!(rt.state.chat.zoom.take_dirty(), None);
+        press(&mut rt, "settings-size-100");
+        assert_eq!(rt.state.chat.zoom.percent(), 100);
+        assert_eq!(rt.state.chat.zoom.take_dirty(), Some(100));
+        // The same level the key walk reaches: three steps in from 100 is the 150 preset.
+        press(&mut rt, "settings-size-100");
+        let mut walked = rt.state.chat.zoom.clone();
+        for _ in 0..3 {
+            walked.apply(chat::zoom::Step::In);
+        }
+        assert_eq!(walked.percent(), 150);
+        press(&mut rt, "settings-size-150");
+        assert_eq!(rt.state.chat.zoom.percent(), walked.percent());
+    }
+
+    /// The preset buttons drawn as the active one: the Contrast variant has a different fill from
+    /// the Outline buttons beside it.
+    fn active_sizes(rt: &Runtime<RiverApp>) -> Vec<u16> {
+        let fills: Vec<(u16, String)> = chat::zoom::STEPS
+            .into_iter()
+            .map(|pct| {
+                let key = format!("settings-size-{pct}");
+                let e = rt
+                    .elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some(key.as_str()))
+                    .unwrap_or_else(|| panic!("{key} is drawn"));
+                (pct, format!("{:?}", e.fill))
+            })
+            .collect();
+        let common = fills
+            .iter()
+            .map(|(_, f)| f)
+            .max_by_key(|f| fills.iter().filter(|(_, g)| g == *f).count())
+            .cloned()
+            .unwrap();
+        fills
+            .into_iter()
+            .filter(|(_, f)| *f != common)
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    #[test]
+    fn the_size_picker_marks_the_active_preset_and_presses_from_a_stored_odd_value() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        rt.update(|s, _| s.chat.zoom.load(125));
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-appearance");
+        assert_eq!(active_sizes(&rt), vec![125]);
+        let before = rt.state.chat.zoom.percent();
+        press(&mut rt, "settings-size-100");
+        assert_ne!(before, 100);
+        assert_eq!(rt.state.chat.zoom.percent(), 100);
+        assert_eq!(rt.state.chat.zoom.take_dirty(), Some(100));
+        assert_eq!(active_sizes(&rt), vec![100], "the mark follows the press");
+    }
+
+    #[test]
+    fn the_shortcuts_button_opens_the_list_and_closes_settings() {
+        let board = rune::clipboard::memory();
+        let mut rt = node_rooms(&board);
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-appearance");
+        press(&mut rt, "settings-shortcuts");
+        assert!(rt.find("shortcuts-dialog").is_some());
+        assert!(rt.find("settings-dialog").is_none());
+    }
+
     #[test]
     fn export_id_shows_the_warning_and_copies_only_when_asked() {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
         let open = rt.state.chat.room().unwrap().key.clone();
-        press(&mut rt, "export-id");
+        export_from_settings(&mut rt);
         assert!(rt.find("export-identity-dialog").is_some());
         assert_eq!(
             rt.state.chat.outgoing,
@@ -5211,7 +5421,7 @@ mod tests {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
         let open = rt.state.chat.room().unwrap().key.clone();
-        press(&mut rt, "export-id");
+        export_from_settings(&mut rt);
         press(&mut rt, "export-close");
         let (token, _) = identity_token(3, 70);
         rt.update(move |s, tx| {
@@ -5232,7 +5442,7 @@ mod tests {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
         let open = rt.state.chat.room().unwrap().key.clone();
-        press(&mut rt, "export-id");
+        export_from_settings(&mut rt);
         rt.update(move |s, tx| {
             s.apply_rooms(
                 RoomsUpdate::Export {
@@ -5255,7 +5465,7 @@ mod tests {
     fn import_id_checks_the_token_and_sends_it_for_a_room_not_in_the_list() {
         let board = rune::clipboard::memory();
         let mut rt = node_rooms(&board);
-        press(&mut rt, "import-id");
+        import_from_settings(&mut rt);
         assert!(rt.find("import-identity-dialog").is_some());
         press(&mut rt, "form-submit");
         assert!(rt.find("form-error").is_some(), "an empty box is said");
@@ -5308,7 +5518,7 @@ mod tests {
             room.key = bs58::encode(owner_a.to_bytes()).into_string();
             s.chat.set_rooms(vec![room]);
         });
-        press(&mut rt, "import-id");
+        import_from_settings(&mut rt);
         let a = token_a.clone();
         rt.update(move |s, _| s.chat.form.token.replace_text(&a));
         press(&mut rt, "form-submit");
@@ -5343,7 +5553,7 @@ mod tests {
         );
         assert!(rt.find("import-identity-dialog").is_none());
         // Editing the box drops the warning.
-        press(&mut rt, "import-id");
+        import_from_settings(&mut rt);
         let a = token_a.clone();
         rt.update(move |s, _| s.chat.form.token.replace_text(&a));
         press(&mut rt, "form-submit");
@@ -5370,7 +5580,7 @@ mod tests {
             room.key = bs58::encode(owner_a.to_bytes()).into_string();
             s.chat.set_rooms(vec![room]);
         });
-        press(&mut rt, "import-id");
+        import_from_settings(&mut rt);
         let a = token_a.clone();
         rt.update(move |s, _| s.chat.form.token.replace_text(&a));
         press(&mut rt, "form-submit");
@@ -5409,7 +5619,7 @@ mod tests {
             room.name = "Stored name".into();
             s.chat.set_rooms(vec![room]);
         });
-        press(&mut rt, "import-id");
+        import_from_settings(&mut rt);
         rt.update(move |s, _| s.chat.form.token.replace_text(&token));
         press(&mut rt, "form-submit");
         let confirm = rt.state.chat.form.replace.as_ref().expect("asked");

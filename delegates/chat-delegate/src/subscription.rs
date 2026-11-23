@@ -475,6 +475,7 @@ pub(crate) fn handle_contract_notification(
         bans: None,
         members: None,
         ban_evidence: None,
+        provisional: None,
         member_info: None,
         secrets: Some(SecretsDelta {
             current_version: Some(new_version),

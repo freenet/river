@@ -316,9 +316,11 @@ fn the_chord_opens_the_page_even_from_the_composer_and_escape_closes_it() {
 }
 
 #[test]
-fn the_footer_entry_opens_it_and_close_closes_it() {
+fn the_appearance_section_opens_it_and_close_closes_it() {
     let mut rt = app();
-    press(&mut rt, "shortcuts-entry");
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-appearance");
+    press(&mut rt, "settings-shortcuts");
     assert!(rt.state.chat.shortcuts_open);
     press(&mut rt, "shortcuts-close");
     assert!(!rt.state.chat.shortcuts_open);

@@ -86,8 +86,8 @@ a VPN, and point River at the local end of the tunnel.
    button in the app. It opens a page in your browser on your node's own address, not on River.
    Choose Allow there. Your node must be Freenet 0.2.156 or newer.
 3. **Identity and rooms.** River keeps your rooms and identity in your Freenet node. To bring an
-   identity over from the web UI, use **Export ID** there, then **Import ID** in the footer of the
-   room list in the app, and paste the token.
+   identity over from the web UI, use **Export ID** there, then **Settings > Identity > Import identity** in the
+   app (or **Import it** in the Join dialog), and paste the token.
 4. **Join a room.** Choose **Enter invite code**, paste an invite code or link, and press Join room.
    You can also create a room with the plus button.
 
@@ -104,7 +104,11 @@ When the system has a tray, closing the window hides it and River keeps running,
 keep arriving. This is on by default and can be turned off in **Settings > Background and startup**,
 where you can also have River start when you log in (it then starts hidden). To quit for real, use
 **Quit River** in that section, **Quit** in the tray menu, or Ctrl+Q. Without a tray, closing the
-window quits.
+window quits. The first time closing hides River, it shows a notification saying so and how to
+quit; it is not shown again.
+
+On Windows the tray icon may be in the hidden icons area (the `^` by the clock), where new icons
+start.
 
 Only one River runs per user. Starting it a second time shows the window of the first one.
 

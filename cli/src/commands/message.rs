@@ -679,17 +679,17 @@ mod tests {
         );
     }
 
-    /// `message reply --format json` must return the new message's ID, and in
-    /// the SAME form `message list` prints and `message delete` accepts.
-    ///
-    /// Without it a caller cannot act on a reply it just sent: the response was
-    /// `{"status":"success","action":"reply"}` and nothing else, so identifying
-    /// your own reply meant scanning the room and guessing. Automated moderation
-    /// needs to delete a reply it posted, which is what motivated this.
-    ///
-    /// Source-scrape rather than a live round trip, because sending a reply
-    /// requires a node and a room. Whitespace is squashed so rustfmt cannot
-    /// silently disarm the pin.
+    // `message reply --format json` must return the new message's ID, and in
+    // the SAME form `message list` prints and `message delete` accepts.
+    //
+    // Without it a caller cannot act on a reply it just sent: the response was
+    // `{"status":"success","action":"reply"}` and nothing else, so identifying
+    // your own reply meant scanning the room and guessing. Automated moderation
+    // needs to delete a reply it posted, which is what motivated this.
+    //
+    // Source-scrape rather than a live round trip, because sending a reply
+    // requires a node and a room. Whitespace is squashed so rustfmt cannot
+    // silently disarm the pin.
 
     /// Reactions must be attributable. Room state has always held
     /// `HashMap<String, Vec<MemberId>>`, but both JSON boundaries collapsed it

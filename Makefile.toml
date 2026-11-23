@@ -399,6 +399,25 @@ echo "Published contract updated with ID: $contract_id"
 echo "Please commit the changes to git"
 '''
 
+[tasks.legacy-delegate-gate]
+description = "Release gate (river#630): old River chat-delegate WASMs must still run on the freenet-core being released/deployed"
+# Core version under test: LEGACY_GATE_CORE_REV (tag/sha/branch) if set, else the
+# tag of the locally installed `freenet` (the node River is about to be published
+# to). Exit 1 = a delegate broke: STOP. Exit 2 = the harness does not build against
+# this core: fix scripts/legacy-delegate-gate/ and re-run; never skip the gate.
+# First run on a core compiles freenet (tens of minutes); later runs reuse the cache.
+script = '''
+set -e
+rev="${LEGACY_GATE_CORE_REV:-}"
+if [ -z "$rev" ]; then
+    ver=$(freenet --version 2>/dev/null | awk '/version:/{print $3}')
+    [ -n "$ver" ] || { echo "cannot determine core version; set LEGACY_GATE_CORE_REV"; exit 2; }
+    rev="v$ver"
+fi
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/code/scratch/legacy-delegate-gate/target}"
+scripts/legacy-delegate-gate.sh --core-rev "$rev"
+'''
+
 [tasks.publish-river]
 # GUARDRAIL: any republish that regenerates the room-contract / chat-delegate
 # WASM MUST go through a PR that COMMITS the regenerated WASM (run `cargo make
@@ -418,7 +437,7 @@ echo "Please commit the changes to git"
 # Migration entries carry our users' DATA forward; the pointer carries their
 # open tabs and everyone else. Skipped, open tabs stay on the old keys.
 description = "Publish River to Freenet using the committed contract version"
-dependencies = ["sign-webapp"]
+dependencies = ["legacy-delegate-gate", "sign-webapp"]
 script = '''
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
@@ -471,7 +490,7 @@ fi
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
 env = { BUILD_PROFILE = "dev" }
-dependencies = ["sign-webapp"]
+dependencies = ["legacy-delegate-gate", "sign-webapp"]
 script = '''
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"

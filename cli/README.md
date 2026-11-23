@@ -281,6 +281,37 @@ Caveats:
   standard path, which may PUT migrated state or publish a `member_info` heal
   for your own identity. They never write deputy state.
 
+## Open admission to public rooms
+
+A public room can let newcomers in by proof of work instead of an invitation.
+
+- `riverctl room admission <room>` shows what the room asks of a newcomer
+  (an invitation, or proof of work with its difficulty), and with
+  `--signing-key` where that key stands in the room.
+- `riverctl room join <room> --pow` solves the proof of work and joins as an
+  open member, posting a nickname and a first message
+  (`--nickname`, `--message`). It makes a new signing key unless you pass
+  `--signing-key`; save the key it prints, since nothing else stores it.
+  `--extra-bits` (at most 8) solves extra bits beyond the requirement so a
+  small rise in difficulty does not invalidate the proof, and `--threads`
+  (at most 256) sets the solver threads. Later messages use
+  `riverctl message send <room> "text" --signing-key <key>`.
+- A room holds at most `--max-provisional` open members (16 at most). When it
+  is full a new member is not turned away for being one too many: the open
+  members are the authors of the newest open-member messages, so the member
+  whose newest message is oldest drops out (entry and messages) and can come
+  back by sending a newer message. If a join's own message is older than all
+  of theirs, `join` refuses with "the room's open-member slots are held by
+  newer messages" and stores nothing; try again later, or ask a member for an
+  invitation (`riverctl invite accept`).
+- The room owner turns it on with
+  `riverctl room config <room> --public-admission true`, and tunes it with
+  `--admission-difficulty` (0 to 32 bits), `--admission-new-epoch`
+  (invalidates every proof solved so far), `--max-provisional` (1 to 16),
+  `--max-provisional-messages`, `--max-provisional-bans` and
+  `--admission-listed`. `--public-admission false` turns it off and clears
+  the room's open members and bans.
+
 ## Command reference
 
 | Group      | Commands                                                                |

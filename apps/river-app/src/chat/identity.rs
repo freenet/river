@@ -1,13 +1,13 @@
 //! Export ID and Import ID, as the web UI has them (`ExportIdentityModal` and
 //! `ImportIdentityModal` in `ui/src/components/members.rs`).
 //!
-//! **Export ID** is a quiet button at the foot of the members panel. It opens "Export identity"
-//! over the open room: the token in a box, the web UI's warning that it holds your private key,
+//! **Export** is in Settings > Identity, one button per room (an export belongs to one room). It
+//! opens "Export identity" for that room: the token in a box, the web UI's warning that it holds your private key,
 //! Close and "Copy to clipboard" (which reads "Copied!" after). Nothing is copied until the
 //! user presses it. The token is made by the background work ([`crate::rooms::identity`]) and
 //! lives only in the open dialog: closing it drops it.
 //!
-//! **Import ID** is a quiet button in the room list's footer. It opens "Import identity": a
+//! **Import** is in Settings > Identity, and also a link in the Join dialog. It opens "Import identity": a
 //! box to paste into, the web UI's error ("Invalid token: ...") for a token that does not
 //! check, and, when the room is already in the list, the web UI's two warnings (importing
 //! REPLACES the identity you have in it; close other sessions first) with "Replace identity".
@@ -86,15 +86,52 @@ pub const REPLACE_WARNING: &str = "This room already has an identity. Importing 
 /// The web UI's second replace warning.
 pub const REPLACE_SESSIONS_WARNING: &str = "Close any other tabs or devices open to this room first. A session still using the old identity can write it back and undo the switch.";
 
+/// How a room is named where several rooms are listed side by side and one is picked (the
+/// Export rows in Settings and the Export dialog's heading). An empty name reads "Unnamed
+/// room"; a name that another room shares (after trimming) gets the last characters of the
+/// room's key, so two rows are never alike.
+pub fn room_label(rooms: &[super::Room], key: &str) -> String {
+    let Some(room) = rooms.iter().find(|r| r.key == key) else {
+        return String::new();
+    };
+    let clean = |n: &str| super::dm_view::clean_name(n);
+    let name = clean(&room.name);
+    let shared = rooms
+        .iter()
+        .filter(|r| r.key != key)
+        .any(|r| clean(&r.name) == name);
+    let shown = if name.is_empty() {
+        "Unnamed room".to_owned()
+    } else {
+        name
+    };
+    if shared || clean(&room.name).is_empty() && rooms.len() > 1 {
+        let tail: String = {
+            let n = room.key.chars().count();
+            room.key.chars().skip(n.saturating_sub(6)).collect()
+        };
+        format!("{shown} (\u{2026}{tail})")
+    } else {
+        shown
+    }
+}
+
 impl Chat {
     /// Open "Export identity" for the open room, and ask for its token.
     pub fn open_export(&mut self) {
-        if !self.can_change_rooms() {
-            return;
-        }
         let Some(key) = self.room().map(|r| r.key.clone()) else {
             return;
         };
+        self.open_export_for(&key);
+    }
+
+    /// Open "Export identity" for the room keyed `key` (Settings > Identity lists the rooms),
+    /// and ask for its token.
+    pub fn open_export_for(&mut self, key: &str) {
+        if !self.can_change_rooms() || !self.rooms.iter().any(|r| r.key == key) {
+            return;
+        }
+        let key = key.to_owned();
         self.export = Some(ExportDialog {
             room: key.clone(),
             state: ExportState::Making,
@@ -210,6 +247,16 @@ pub(super) fn export_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     })
     .body_key("export-body")
     .width(520.0)
+    .child(
+        label(
+            format!("Room: {}", room_label(chat.rooms(), &dialog.room)),
+            st::ROOM_STRONG,
+            p.text,
+        )
+        .wrap()
+        .w_full()
+        .key("export-room"),
+    )
     .child(
         label(EXPORT_INTRO, st::BODY, p.text_secondary)
             .wrap()

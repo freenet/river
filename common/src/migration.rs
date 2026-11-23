@@ -139,8 +139,12 @@ mod tests {
         //
         // V38 registers the last generation built against freenet-stdlib
         // 0.8.5, before the stdlib 0.12.1 / river-core 0.4.0 upgrade.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 38);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "9b465cc984d24f2e");
+        //
+        // V39 registers the last generation before open admission to public
+        // rooms (freenet/river#974): no `provisional` state field and no
+        // `public_admission` policy.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 39);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "a5ef3e6a049d27e8");
     }
 
     #[test]

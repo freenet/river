@@ -246,7 +246,7 @@ mod tests {
         // reconstructing the decision (start_check itself does cache I/O).
         let newer = highest_non_yanked(r#"{"vers":"0.1.73","yanked":false}"#).unwrap();
         assert!(parse_semver(&newer).unwrap() > parse_semver("0.1.72").unwrap());
-        assert!(!(parse_semver(&newer).unwrap() > parse_semver("0.1.73").unwrap()));
-        assert!(!(parse_semver(&newer).unwrap() > parse_semver("0.2.0").unwrap()));
+        assert!(parse_semver(&newer).unwrap() <= parse_semver("0.1.73").unwrap());
+        assert!(parse_semver(&newer).unwrap() <= parse_semver("0.2.0").unwrap());
     }
 }

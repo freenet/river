@@ -898,9 +898,14 @@ pub(crate) mod signature_memo {
     use std::time::SystemTime;
 
     type Key = ([u8; 64], [u8; 32], MemberId, SystemTime, MemberId);
+    /// A provisional record check: (digest of the whole record, owner key,
+    /// key it was checked against, kind), the whole input of the check.
+    pub(crate) type ProvisionalKey = ([u8; 32], [u8; 32], [u8; 32], u8);
 
     thread_local! {
         static MEMO: RefCell<Option<HashMap<Key, bool>>> = const { RefCell::new(None) };
+        static PROVISIONAL_MEMO: RefCell<Option<HashMap<ProvisionalKey, bool>>> =
+            const { RefCell::new(None) };
         static LAST_CAP: RefCell<Option<([u8; 32], Vec<super::AuthorizedUserBan>)>> =
             const { RefCell::new(None) };
     }
@@ -956,15 +961,29 @@ pub(crate) mod signature_memo {
         });
     }
 
+    pub(crate) fn lookup_provisional(key: &ProvisionalKey) -> Option<bool> {
+        PROVISIONAL_MEMO.with(|m| m.borrow().as_ref().and_then(|m| m.get(key).copied()))
+    }
+
+    pub(crate) fn record_provisional(key: ProvisionalKey, verified: bool) {
+        PROVISIONAL_MEMO.with(|m| {
+            if let Some(m) = m.borrow_mut().as_mut() {
+                m.insert(key, verified);
+            }
+        });
+    }
+
     /// Run `f` with the memo set aside (neither read nor written), restoring
     /// it afterwards: for the debug-build cross-check in cleanup, so debug
     /// builds verify the same signatures release builds do.
     #[cfg(debug_assertions)]
     pub(crate) fn set_aside<R>(f: impl FnOnce() -> R) -> R {
         let held = MEMO.with(|m| m.borrow_mut().take());
+        let held_provisional = PROVISIONAL_MEMO.with(|m| m.borrow_mut().take());
         let held_cap = LAST_CAP.with(|c| c.borrow_mut().take());
         let r = f();
         MEMO.with(|m| *m.borrow_mut() = held);
+        PROVISIONAL_MEMO.with(|m| *m.borrow_mut() = held_provisional);
         LAST_CAP.with(|c| *c.borrow_mut() = held_cap);
         r
     }
@@ -978,12 +997,14 @@ pub(crate) mod signature_memo {
         impl Drop for Clear {
             fn drop(&mut self) {
                 MEMO.with(|m| *m.borrow_mut() = None);
+                PROVISIONAL_MEMO.with(|m| *m.borrow_mut() = None);
             }
         }
         let outermost = MEMO.with(|m| {
             let mut m = m.borrow_mut();
             if m.is_none() {
                 *m = Some(HashMap::new());
+                PROVISIONAL_MEMO.with(|p| *p.borrow_mut() = Some(HashMap::new()));
                 true
             } else {
                 false

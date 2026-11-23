@@ -265,3 +265,9 @@ version = "V38"
 description = "Before the freenet-stdlib 0.8.5 -> 0.12.1 upgrade: last room-contract generation built against stdlib 0.8.5"
 date = "2026-10-27"
 code_hash = "fa9e59e87532bc9681e8fef903f6d35a1207c25a0f0d8cca2c92e2f31761a4f9"
+
+[[entry]]
+version = "V39"
+description = "Last room-contract generation before open admission to public rooms (provisional members, freenet/river#974): no provisional field, no public_admission policy"
+date = "2026-11-22"
+code_hash = "bc9b4066fccc37435556295871c567e455b48832eb0a72623d399b354471aef5"

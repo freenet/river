@@ -1486,6 +1486,17 @@ pub(crate) fn authorize_send(
     if rejoin_members_delta.is_some() {
         return Ok(());
     }
+    // An open member of a public room (freenet/river#974): the room holds, or
+    // the send attaches, the sender's proof-of-work entry. Not a `members`
+    // record, and never read as one.
+    if room_state
+        .provisional
+        .entries
+        .iter()
+        .any(|e| e.provisional.member_vk == *sender_vk)
+    {
+        return Ok(());
+    }
     Err(anyhow!(
         "Signing key is not a current member of this room and no stored membership \
          credentials were found for automatic rejoin. If you were pruned for inactivity, \
@@ -4925,11 +4936,12 @@ impl ApiClient {
         .map_err(|e| anyhow!(e))?;
 
         // Create the message
+        let message_time = std::time::SystemTime::now();
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: sender_member_id,
             content,
-            time: std::time::SystemTime::now(),
+            time: message_time,
         };
 
         // Sign the message
@@ -4941,6 +4953,29 @@ impl ApiClient {
         // Check if we need to re-add ourselves (pruned for inactivity)
         let (members_delta, member_info_delta) =
             self.build_rejoin_delta(&room_state, room_owner_key, signing_key);
+
+        // An open member (freenet/river#974): the room holds their entry, or a
+        // stored entry is attached to this message because the room pruned it.
+        //
+        // Not when stored membership credentials re-add this key as a member:
+        // the member record supersedes any entry, and a stored entry that
+        // cannot be used must not fail a send the credentials already cover.
+        let provisional_delta = if members_delta.is_some() {
+            None
+        } else {
+            crate::admission::attachment_for_send(
+                &self.storage,
+                &room_state,
+                room_owner_key,
+                signing_key,
+                message_time,
+            )?
+        };
+        // The authorization below sees the entry as already attached, the
+        // view the contract has once it applies the delta.
+        if let Some(p) = &provisional_delta {
+            room_state.provisional.entries.extend(p.entries.clone());
+        }
 
         authorize_send(
             &room_state,
@@ -4954,6 +4989,7 @@ impl ApiClient {
             recent_messages: Some(vec![auth_message.clone()]),
             members: members_delta,
             member_info: member_info_delta,
+            provisional: provisional_delta,
             ..Default::default()
         };
 
@@ -8516,7 +8552,7 @@ mod migration_recovery_tests {
         let Step::Get(a) = driver.next_action() else {
             panic!()
         };
-        driver.on_timeout(a); // absent generation
+        driver.on_unknown(a); // absent generation
         let Step::Get(b) = driver.next_action() else {
             panic!()
         };
@@ -9128,7 +9164,7 @@ mod migration_recovery_tests {
             panic!("expected a GET")
         };
         assert_eq!(first, cli_id(9));
-        driver.on_timeout(first);
+        driver.on_unknown(first);
         // The re-listed stored key is retried (NOT an older generation) and hits.
         let Step::Get(retry) = driver.next_action() else {
             panic!("expected the retry GET")
@@ -9228,7 +9264,7 @@ mod migration_recovery_tests {
         let Step::Get(a) = driver.next_action() else {
             panic!()
         };
-        driver.on_timeout(a); // absent generation
+        driver.on_unknown(a); // absent generation
         let Step::Get(b) = driver.next_action() else {
             panic!()
         };
@@ -10531,11 +10567,9 @@ mod subscribe_handshake_tests {
     /// each notification only triggers a full-state re-fetch.
     #[test]
     fn the_handshake_queue_is_bounded() {
-        assert!(
-            MAX_PENDING_DURING_HANDSHAKE > 0 && MAX_PENDING_DURING_HANDSHAKE <= 64,
-            "handshake queue must be bounded and small; an unbounded queue fed \
-             by the node is a memory amplification vector"
-        );
+        // The queue must be bounded and small: an unbounded queue fed by the
+        // node is a memory amplification vector.
+        const { assert!(MAX_PENDING_DURING_HANDSHAKE > 0 && MAX_PENDING_DURING_HANDSHAKE <= 64) };
     }
 
     pub(super) fn other_key() -> ContractKey {
