@@ -2008,6 +2008,11 @@ fn a_sent_message_shows_at_once_and_is_marked_sent_when_the_node_takes_it() {
     session.wait_until("shown on its way", || {
         matches!(delivery_of(&session, "hello from the app"), Some(Some(p)) if p.failed.is_none())
     });
+    // The message shows as on its way before the update reaches the node, so
+    // wait for the node to have it too (this read raced under load).
+    session.wait_until("received by the node", || {
+        node.with(|w| !w.updates.is_empty())
+    });
     let (key, delta) = node.with(|w| w.updates[0].clone());
     // The room's contract, a delta carrying one message signed by the room's key.
     assert_eq!(key, a.key);
