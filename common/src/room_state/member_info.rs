@@ -92,6 +92,53 @@ impl MemberInfoV1 {
     /// kept like any other (it is just another `member_id`). Runs in
     /// `post_apply_cleanup`, NEVER in `verify`/`validate_state`, so the
     /// permissionless migration PUT (which only runs `verify`) is unaffected.
+    /// [`Self::dedup_to_canonical`], except that for an id in `shared` (held
+    /// under several keys until cleanup decides) records are ranked only
+    /// against records signed by the same key, so each key keeps its own.
+    pub(crate) fn dedup_to_canonical_per_key(
+        &mut self,
+        shared: &HashMap<MemberId, Vec<VerifyingKey>>,
+    ) {
+        if shared.is_empty() {
+            self.dedup_to_canonical();
+            return;
+        }
+        if self.member_info.len() < 2 {
+            return;
+        }
+        let key_index = |info: &AuthorizedMemberInfo| -> usize {
+            shared
+                .get(&info.member_info.member_id)
+                .and_then(|keys| {
+                    keys.iter()
+                        .position(|k| info.verify_signature_with_key(k).is_ok())
+                })
+                .map_or(0, |i| i + 1)
+        };
+        let mut best: HashMap<(MemberId, usize), ((u32, SigDigest), AuthorizedMemberInfo)> =
+            HashMap::new();
+        for info in self.member_info.drain(..) {
+            let slot = (info.member_info.member_id, key_index(&info));
+            let rank = member_info_rank(info.member_info.version, &info.signature);
+            match best.entry(slot) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if outranks(rank, e.get().0) {
+                        e.insert((rank, info));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((rank, info));
+                }
+            }
+        }
+        let mut out: Vec<((MemberId, usize), AuthorizedMemberInfo)> = best
+            .into_iter()
+            .map(|(slot, (_, info))| (slot, info))
+            .collect();
+        out.sort_by_key(|(slot, _)| *slot);
+        self.member_info = out.into_iter().map(|(_, info)| info).collect();
+    }
+
     pub fn dedup_to_canonical(&mut self) {
         if self.member_info.len() < 2 {
             return;
@@ -551,6 +598,12 @@ impl ComposableState for MemberInfoV1 {
                     continue;
                 }
 
+                // The key this record verified under, when the id is held
+                // under more than one: records rank only against records
+                // under the same key until cleanup decides the id's key
+                // (`resolve_shared_ids`), so another key's record never
+                // evicts this one before then.
+                let mut signed_under: Option<VerifyingKey> = None;
                 // Check if this is the room owner
                 if *member_id == parameters.owner_id() {
                     // If it's the owner, verify against the room owner's key
@@ -582,10 +635,16 @@ impl ComposableState for MemberInfoV1 {
                     if keys.peek().is_none() {
                         continue;
                     }
-                    if !keys.any(|key| member_info.verify_signature_with_key(key).is_ok()) {
-                        continue;
+                    match keys.find(|key| member_info.verify_signature_with_key(key).is_ok()) {
+                        Some(key) => signed_under = Some(*key),
+                        None => continue,
                     }
                 }
+                let shared = signed_under.filter(|_| {
+                    known.get(member_id).map_or(0, |k| k.len())
+                        + provisional_keys.get(member_id).map_or(0, |k| k.len())
+                        > 1
+                });
 
                 // Update or add the member info. Conflict resolution uses the
                 // total, deterministic `member_info_rank` order (higher version,
@@ -595,11 +654,10 @@ impl ComposableState for MemberInfoV1 {
                 // `version >` (as before) left equal-version conflicts
                 // order-dependent, so peers could permanently disagree on
                 // `deputies` (and therefore on ban authority).
-                if let Some(existing_info) = self
-                    .member_info
-                    .iter_mut()
-                    .find(|info| info.member_info.member_id == *member_id)
-                {
+                if let Some(existing_info) = self.member_info.iter_mut().find(|info| {
+                    info.member_info.member_id == *member_id
+                        && shared.is_none_or(|k| info.verify_signature_with_key(&k).is_ok())
+                }) {
                     if outranks(
                         member_info_rank(member_info.member_info.version, &member_info.signature),
                         member_info_rank(
@@ -639,8 +697,21 @@ impl ComposableState for MemberInfoV1 {
         // duplicate-free case. Readers still canonicalize and must not depend on
         // this having run (`MemberInfoV1::canonical`). `dedup_to_canonical` also
         // sorts for deterministic ordering (CRDT convergence requirement); the
-        // <2-record case it skips is trivially sorted already.
-        self.dedup_to_canonical();
+        // <2-record case it skips is trivially sorted already. An id held
+        // under two keys keeps one record per key until cleanup decides
+        // (`dedup_to_canonical_per_key`).
+        let shared_keys: HashMap<MemberId, Vec<VerifyingKey>> =
+            crate::room_state::member::keys_by_member_id(
+                parent_state
+                    .members
+                    .members
+                    .iter()
+                    .chain(&parent_state.ban_evidence.members),
+            )
+            .into_iter()
+            .filter(|(_, k)| k.len() > 1)
+            .collect();
+        self.dedup_to_canonical_per_key(&shared_keys);
 
         Ok(())
     }

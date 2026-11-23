@@ -134,12 +134,22 @@ pub(crate) fn within_depth(
     depth <= cap
 }
 
+/// Memoized results for [`chain_within_cap`]: each (record, inviter key)
+/// signature is checked once, and each (record, depth, check) walk is done
+/// once.
+#[derive(Default)]
+struct ChainMemo {
+    sigs: HashMap<(EvidenceDigest, [u8; 32]), bool>,
+    walks: HashMap<(EvidenceDigest, usize, bool), bool>,
+}
+
 /// Whether `record`'s invite chain reaches the owner within `cap` records
 /// (`record` at `depth`) through ANY of the records `by_id` holds for each
 /// inviter id, with every link's signature checked when `check` is set. A
 /// `MemberId` is a non-cryptographic hash, so an inviter's id can be held
-/// under several keys at once; every one is tried. Each (record, inviter key)
-/// signature is checked at most once per `sig_memo`. The cap bounds the walk.
+/// under two keys at once; both are tried. `by_id` holds at most
+/// `MAX_KEYS_PER_ID` records per id and `memo` keeps every result, so the work
+/// is linear in the records times the cap.
 fn chain_within_cap(
     record: &AuthorizedMember,
     by_id: &HashMap<MemberId, Vec<&AuthorizedMember>>,
@@ -147,36 +157,42 @@ fn chain_within_cap(
     cap: usize,
     depth: usize,
     check: bool,
-    sig_memo: &mut HashMap<(EvidenceDigest, [u8; 32]), bool>,
+    memo: &mut ChainMemo,
 ) -> bool {
     if depth > cap {
         return false;
     }
+    let digest = evidence_digest(record);
+    if let Some(known) = memo.walks.get(&(digest, depth, check)) {
+        return *known;
+    }
     let owner_id = parameters.owner_id();
-    let signed_by = |vk: &VerifyingKey, memo: &mut HashMap<(EvidenceDigest, [u8; 32]), bool>| {
+    let signed_by = |vk: &VerifyingKey, memo: &mut ChainMemo| {
         !check
-            || *memo
-                .entry((evidence_digest(record), vk.to_bytes()))
-                .or_insert_with(|| {
-                    #[cfg(test)]
-                    crate::room_state::member::tests::count_invite_signature_check();
-                    record.verify_signature(vk).is_ok()
-                })
+            || *memo.sigs.entry((digest, vk.to_bytes())).or_insert_with(|| {
+                #[cfg(test)]
+                crate::room_state::member::tests::count_invite_signature_check();
+                record.verify_signature(vk).is_ok()
+            })
     };
-    if record.member.invited_by == owner_id {
-        return signed_by(&parameters.owner, sig_memo);
-    }
-    if record.member.invited_by == record.member.id() {
-        return false;
-    }
-    by_id
-        .get(&record.member.invited_by)
-        .into_iter()
-        .flatten()
-        .any(|inviter| {
-            signed_by(&inviter.member.member_vk, sig_memo)
-                && chain_within_cap(inviter, by_id, parameters, cap, depth + 1, check, sig_memo)
-        })
+    let result = if record.member.invited_by == owner_id {
+        signed_by(&parameters.owner, memo)
+    } else if record.member.invited_by == record.member.id() {
+        false
+    } else {
+        let mut ok = false;
+        for inviter in by_id.get(&record.member.invited_by).into_iter().flatten() {
+            if signed_by(&inviter.member.member_vk, memo)
+                && chain_within_cap(inviter, by_id, parameters, cap, depth + 1, check, memo)
+            {
+                ok = true;
+                break;
+            }
+        }
+        ok
+    };
+    memo.walks.insert((digest, depth, check), result);
+    result
 }
 
 /// Every member id a stored non-owner ban references: its issuer and target,
@@ -510,20 +526,37 @@ impl ComposableState for BanEvidenceV1 {
             let depth_cap =
                 evidence_depth_cap(parent_state.configuration.configuration.max_members);
             let added = {
-                // Every record known here per id, under every key: a
+                // The delta records this apply may take: referenced, not the
+                // owner, not a present member's record, and under at most one
+                // key per id not already held (`admit_one_new_key_per_id`),
+                // chosen before any chain is walked or signature checked, so
+                // the work does not grow with the keys a delta names for an
+                // id.
+                let candidates: Vec<&AuthorizedMember> = delta
+                    .iter()
+                    .filter(|m| {
+                        let id = m.member.id();
+                        id != owner_id && referenced.contains(&id) && !present.contains(&slot(m))
+                    })
+                    .collect();
+                let candidates = crate::room_state::member::admit_one_new_key_per_id(
+                    candidates,
+                    parent_state.members.members.iter().chain(&self.members),
+                );
+                // Every record known here per id, under every key it may hold
+                // (at most `MAX_KEYS_PER_ID`): the record the lookup gives
+                // (members first, then evidence reached from them, then the
+                // delta candidates), plus one record for each other key a
+                // member, evidence or candidate record names for that id. A
                 // `MemberId` is a non-cryptographic hash, so an inviter's id
                 // can be held under two keys until cleanup decides which it
                 // keeps (`resolve_shared_ids`), and a chain counts when it
-                // holds through ANY of them. Reading one record per id here
-                // made whether a record was taken depend on which of the two
-                // the lookup happened to return.
-                // Per id: the record the lookup gives (members first, then
-                // evidence reached from them, then the delta), plus, for an
-                // id it gives, one record for each OTHER key some member,
-                // evidence or delta record names for that id.
+                // holds through either. Reading one record per id here made
+                // whether a record was taken depend on which of the two the
+                // lookup happened to return.
                 let mut combined = self.lookup(&parent_state.members, owner_id);
-                for m in delta {
-                    combined.entry(m.member.id()).or_insert(m);
+                for m in &candidates {
+                    combined.entry(m.member.id()).or_insert(*m);
                 }
                 let mut by_id: HashMap<MemberId, Vec<&AuthorizedMember>> =
                     combined.iter().map(|(id, m)| (*id, vec![*m])).collect();
@@ -532,7 +565,7 @@ impl ComposableState for BanEvidenceV1 {
                     .members
                     .iter()
                     .chain(&self.members)
-                    .chain(delta)
+                    .chain(candidates.iter().copied())
                 {
                     if let Some(records) = by_id.get_mut(&m.member.id()) {
                         if records
@@ -543,9 +576,9 @@ impl ComposableState for BanEvidenceV1 {
                         }
                     }
                 }
-                let mut sig_memo: HashMap<(EvidenceDigest, [u8; 32]), bool> = HashMap::new();
+                let mut memo = ChainMemo::default();
                 let mut reaches = |m: &AuthorizedMember, check: bool| {
-                    chain_within_cap(m, &by_id, parameters, depth_cap, 1, check, &mut sig_memo)
+                    chain_within_cap(m, &by_id, parameters, depth_cap, 1, check, &mut memo)
                 };
                 // A held record competes only while its own chain still
                 // reaches the owner within the cap through the records known
@@ -565,16 +598,11 @@ impl ComposableState for BanEvidenceV1 {
                 // chains resolve, the lower digest wins. Per (id, key) only
                 // the lowest-digest record that passes the cheap checks is
                 // considered, and only if it would replace what is held, so
-                // an (id, key) costs at most one chain check. If it fails, a peer holding
-                // a valid record offers it on the next sync.
+                // an (id, key) costs at most one chain check. If it fails, a
+                // peer holding a valid record offers it on the next sync.
                 let mut best: BTreeMap<Slot, (EvidenceDigest, &AuthorizedMember)> = BTreeMap::new();
-                for m in delta {
-                    let id = m.member.id();
-                    if id == owner_id
-                        || !referenced.contains(&id)
-                        || present.contains(&slot(m))
-                        || !reaches(m, false)
-                    {
+                for m in candidates.iter().copied() {
+                    if !reaches(m, false) {
                         continue;
                     }
                     let digest = evidence_digest(m);

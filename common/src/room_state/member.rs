@@ -48,6 +48,24 @@ impl ComposableState for MembersV1 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
+        // At most `MAX_KEYS_PER_ID` keys per id in members and evidence
+        // together, checked before any signature.
+        let mut keys_per_id: HashMap<MemberId, HashSet<[u8; 32]>> = HashMap::new();
+        for m in self
+            .members
+            .iter()
+            .chain(&parent_state.ban_evidence.members)
+        {
+            let keys = keys_per_id.entry(m.member.id()).or_default();
+            keys.insert(m.member.member_vk.to_bytes());
+            if keys.len() > MAX_KEYS_PER_ID {
+                return Err(format!(
+                    "Member id {:?} is held under more than {MAX_KEYS_PER_ID} keys",
+                    m.member.id()
+                ));
+            }
+        }
+
         if self.members.is_empty() {
             return Ok(());
         }
@@ -182,6 +200,12 @@ impl ComposableState for MembersV1 {
                     work_bound
                 ));
             }
+            let added = admit_one_new_key_per_id(
+                added,
+                self.members
+                    .iter()
+                    .chain(&parent_state.ban_evidence.members),
+            );
             if !added.is_empty() {
                 self.members = Self::resolve_records(&self.members, &added, parameters)?;
             }
@@ -205,6 +229,61 @@ impl ComposableState for MembersV1 {
 pub(crate) fn record_order(a: &AuthorizedMember, b: &AuthorizedMember) -> std::cmp::Ordering {
     (a.member.id(), a.member.member_vk.as_bytes())
         .cmp(&(b.member.id(), b.member.member_vk.as_bytes()))
+}
+
+/// The most keys one id may be held under at once (in `members` and ban
+/// evidence together). A cleaned state holds one; an apply adds at most one
+/// more (`admit_one_new_key_per_id`), and cleanup reduces the id to one again
+/// (`ChatRoomStateV1::resolve_shared_ids`). `verify` refuses a state over it,
+/// so no per-key loop anywhere costs more than twice its single-key work.
+pub const MAX_KEYS_PER_ID: usize = 2;
+
+/// Of `added` (records for (id, key) slots not already held), keep those an
+/// apply may admit: for each id, records under at most ONE key not already
+/// held for it, and none when the id is already held under
+/// [`MAX_KEYS_PER_ID`] keys. Of several new keys, the key of the record with
+/// the lowest record digest is taken, before any signature is checked, so
+/// the work a delta causes does not grow with the number of keys it names
+/// for an id. A whole state and an honest delta carry one key per id, so this
+/// only ever skips records from a crafted delta; a peer holding the real
+/// record offers it again in its own delta.
+pub(crate) fn admit_one_new_key_per_id<'a, 'b>(
+    added: Vec<&'a AuthorizedMember>,
+    held: impl IntoIterator<Item = &'b AuthorizedMember>,
+) -> Vec<&'a AuthorizedMember> {
+    let mut held_keys: HashMap<MemberId, HashSet<[u8; 32]>> = HashMap::new();
+    for m in held {
+        held_keys
+            .entry(m.member.id())
+            .or_default()
+            .insert(m.member.member_vk.to_bytes());
+    }
+    let mut pick: HashMap<MemberId, (EvidenceDigest, [u8; 32])> = HashMap::new();
+    for m in &added {
+        let id = m.member.id();
+        let key = m.member.member_vk.to_bytes();
+        let held_for_id = held_keys.get(&id);
+        if held_for_id.is_some_and(|k| k.contains(&key) || k.len() >= MAX_KEYS_PER_ID) {
+            continue;
+        }
+        let d = evidence_digest(m);
+        pick.entry(id)
+            .and_modify(|best| {
+                if d < best.0 {
+                    *best = (d, key);
+                }
+            })
+            .or_insert((d, key));
+    }
+    added
+        .into_iter()
+        .filter(|m| {
+            let id = m.member.id();
+            let key = m.member.member_vk.to_bytes();
+            held_keys.get(&id).is_some_and(|k| k.contains(&key))
+                || pick.get(&id).is_some_and(|(_, k)| *k == key)
+        })
+        .collect()
 }
 
 /// A 64-bit tag of a full member key: the first 8 bytes of its BLAKE3 hash.

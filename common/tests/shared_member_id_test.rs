@@ -48,6 +48,42 @@ fn other_key_with_id_of(victim: &VerifyingKey, after: bool) -> Option<VerifyingK
     })
 }
 
+/// Every key other than `victim` with `victim`'s `MemberId` found by the
+/// same search, in both byte orders.
+fn other_keys_with_id_of(victim: &VerifyingKey) -> Vec<VerifyingKey> {
+    let target: MemberId = victim.into();
+    let base = victim.to_bytes();
+    let mut out = Vec::new();
+    for i in 0..31 {
+        for after in [true, false] {
+            let mut bytes = base;
+            if after {
+                if bytes[i] == 255 || bytes[i + 1] < 31 {
+                    continue;
+                }
+                bytes[i] += 1;
+                bytes[i + 1] -= 31;
+            } else {
+                if bytes[i] == 0 || bytes[i + 1] > 255 - 31 {
+                    continue;
+                }
+                bytes[i] -= 1;
+                bytes[i + 1] += 31;
+            }
+            if let Ok(vk) = VerifyingKey::from_bytes(&bytes) {
+                if MemberId::from(&vk) == target && vk != *victim && !out.contains(&vk) {
+                    out.push(vk);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn digest(m: &AuthorizedMember) -> river_core::room_state::ban_evidence::EvidenceDigest {
+    river_core::room_state::ban_evidence::evidence_digest(m)
+}
+
 struct Room {
     owner: SigningKey,
     owner_id: MemberId,
@@ -336,15 +372,27 @@ fn shared_id_converges_to_the_signed_key(r: &Room) {
     assert!(!r.holds(&synced, &r.f));
 }
 
-/// Whether `v` has signed something decides before invite depth: the other
-/// key's record, invited by the owner, sits higher than `v` (invited by `a`)
-/// and still goes.
+/// A `member_info` decides before the record digest and invite depth: with
+/// the other key's record invited by the owner (shallower than `v`) and by
+/// each member, so its digest falls on both sides of `v`'s, `v` is kept.
 #[test]
 fn a_signed_key_wins_over_a_shallower_record() {
-    let r = Room::new();
-    let merged = r.converge(&r.with_v(), &r.with_f(&r.owner));
-    assert!(r.holds(&merged, &r.v.verifying_key()));
-    assert!(!r.holds(&merged, &r.f));
+    let mut digests_below = 0;
+    for r in Room::both_orders() {
+        let v_rec = r.record(r.v.verifying_key(), &r.a);
+        for inviter in [&r.owner, &r.a, &r.b] {
+            if digest(&r.record(r.f, inviter)) < digest(&v_rec) {
+                digests_below += 1;
+            }
+            let merged = r.converge(&r.with_v(), &r.with_f(inviter));
+            assert!(r.holds(&merged, &r.v.verifying_key()));
+            assert!(!r.holds(&merged, &r.f));
+        }
+    }
+    assert!(
+        digests_below > 0,
+        "some case has the other key's digest below v's"
+    );
 }
 
 /// `v`'s invitee, signed by `v`, arrives at a peer holding the other key's
@@ -455,36 +503,134 @@ fn evidence_with_a_signed_member_info_beats_a_member_record_under_another_key() 
     }
 }
 
-/// With nothing signed by either key, the record kept is decided by depth,
-/// then digest, the same way on both sides.
+/// `v` with a record, a message and a DM only (no `member_info`), against the
+/// other key's record. Neither has signed a `member_info`, so the lower
+/// record digest decides, whatever the invite depth. When the other key wins,
+/// `v`'s message and DM go with `v`'s record and the merged state verifies.
+/// The same key is kept in both merge directions, through a summary sync, and
+/// when the exchange withholds `v`'s message behind a retention horizon:
+/// messages and DMs are never part of the decision.
 #[test]
-fn two_unsigned_keys_resolve_the_same_way_in_both_directions() {
+fn without_member_info_the_lower_record_digest_decides_and_the_loser_s_content_goes() {
+    for r in Room::both_orders() {
+        let v_rec = r.record(r.v.verifying_key(), &r.a);
+        // An inviter for the other key whose record digest is lower than
+        // v's, so v loses and its content must go.
+        let inviter = [&r.owner, &r.a, &r.b]
+            .into_iter()
+            .find(|i| digest(&r.record(r.f, i)) < digest(&v_rec))
+            .expect("one of three inviters gives a lower digest");
+        let mut x = r.empty();
+        r.apply(
+            &mut x,
+            ChatRoomStateV1Delta {
+                members: Some(MembersDelta::new(vec![v_rec.clone()])),
+                recent_messages: Some(vec![r.msg(&r.v, 3)]),
+                direct_messages: Some(DirectMessagesDelta {
+                    new_messages: vec![r.dm_from_v()],
+                    advanced_purges: vec![],
+                }),
+                ..Default::default()
+            },
+        );
+        let y = r.with_f(inviter);
+        let check = |s: &ChatRoomStateV1, what: &str| {
+            assert!(r.holds(s, &r.f), "{what}: the lower digest is kept");
+            assert!(!r.holds(s, &r.v.verifying_key()), "{what}");
+            assert!(
+                !s.recent_messages
+                    .messages
+                    .iter()
+                    .any(|m| m.message.author == r.id(&r.v)),
+                "{what}: v's message goes"
+            );
+            assert!(!r.holds_dm_from_v(s), "{what}: v's DM goes");
+            s.verify(s, &r.params).expect(what);
+        };
+        check(&r.converge(&x, &y), "merge");
+        check(&r.sync(&y, &x), "sync into the other key's peer");
+        check(&r.sync(&x, &y), "sync into v's peer");
+        // The exchange withholds v's message (a horizon below it): the same
+        // key is kept.
+        let mut x_without_history = x.clone();
+        x_without_history.recent_messages.messages.clear();
+        check(
+            &r.converge(&x_without_history, &y),
+            "merge without v's message",
+        );
+    }
+}
+
+/// A crafted delta can carry `v`'s record together with another forged key
+/// for `v`'s id whose record digest is lower: an apply admits one new key per
+/// id, so `v` is skipped there. That only delays `v`: the next honest delta
+/// carries `v` alone, and `v`, who has a `member_info`, ends kept on every
+/// peer, whichever delta arrives first.
+#[test]
+fn a_crafted_delta_with_a_lower_digest_key_only_delays_the_signed_key() {
     let r = Room::new();
-    let mut x = r.empty();
-    r.apply(
-        &mut x,
-        ChatRoomStateV1Delta {
-            members: Some(MembersDelta::new(vec![r.record(r.v.verifying_key(), &r.a)])),
-            direct_messages: Some(DirectMessagesDelta {
-                new_messages: vec![sign_direct_message(
-                    &r.a,
-                    r.id(&r.a),
-                    r.id(&r.v),
-                    &r.params.owner,
-                    4,
-                    b"y".to_vec(),
-                )
-                .unwrap()],
-                advanced_purges: vec![],
-            }),
-            ..Default::default()
-        },
+    let v_rec = r.record(r.v.verifying_key(), &r.a);
+    let others = other_keys_with_id_of(&r.v.verifying_key());
+    // A second forged key and inviter whose record digest is below v's.
+    let f2_rec = others
+        .iter()
+        .filter(|k| **k != r.f)
+        .flat_map(|k| [&r.owner, &r.a, &r.b].map(|i| r.record(*k, i)))
+        .find(|rec| digest(rec) < digest(&v_rec))
+        .expect("a forged record with a lower digest");
+    let held = r.with_f(&r.b);
+    let crafted = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![v_rec.clone(), f2_rec.clone()])),
+        member_info: Some(vec![r.info(&r.v, "v")]),
+        ..Default::default()
+    };
+    let honest = ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![v_rec.clone()])),
+        member_info: Some(vec![r.info(&r.v, "v")]),
+        recent_messages: Some(vec![r.msg(&r.v, 3)]),
+        ..Default::default()
+    };
+    let apply = |s: &ChatRoomStateV1, d: &ChatRoomStateV1Delta| {
+        let mut out = s.clone();
+        out.apply_delta(s, &r.params, &Some(d.clone()))
+            .expect("never refused");
+        out.verify(&out, &r.params).expect("verifies");
+        out
+    };
+    let after_crafted = apply(&held, &crafted);
+    assert!(
+        !r.holds(&after_crafted, &r.v.verifying_key()),
+        "the crafted delta admits the lower-digest key, not v"
     );
-    let merged = r.converge(&x, &r.with_f(&r.owner));
-    // The other key's record is invited by the owner (depth 1), `v`'s by `a`
-    // (depth 2): with neither signed, depth decides.
-    assert!(r.holds(&merged, &r.f));
-    assert!(!r.holds(&merged, &r.v.verifying_key()));
+    for end in [
+        apply(&after_crafted, &honest),
+        apply(&apply(&held, &honest), &crafted),
+    ] {
+        assert!(r.holds(&end, &r.v.verifying_key()), "v is kept");
+        assert_eq!(
+            end.members
+                .members
+                .iter()
+                .filter(|m| m.member.id() == r.id(&r.v))
+                .count(),
+            1
+        );
+    }
+}
+
+/// A state naming three keys for one id is refused before any signature is
+/// checked.
+#[test]
+fn a_state_with_three_keys_for_one_id_is_refused() {
+    let r = Room::new();
+    let mut s = r.with_v();
+    let others = other_keys_with_id_of(&r.v.verifying_key());
+    assert!(others.len() >= 2, "two other keys for v's id");
+    for k in &others[..2] {
+        s.members.members.push(r.record(*k, &r.b));
+    }
+    let err = s.verify(&s, &r.params).unwrap_err();
+    assert!(err.contains("more than 2 keys"), "{err}");
 }
 
 /// One delta brings the other key's record, invited by `a`, and `a`'s ban on

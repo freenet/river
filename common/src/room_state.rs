@@ -799,6 +799,15 @@ impl ChatRoomStateV1 {
             }
             keys
         };
+        // One key per member id, before anything below reads a record by id
+        // (including the evidence depth prune, which reads one record per
+        // id): an id held under two keys keeps the key that has signed a
+        // `member_info` here, else the lower record digest, and what the other
+        // key brought goes (`resolve_shared_ids`). It runs after the keys
+        // above are read, so C3 still re-checks an entry whose id a dropped
+        // record held. A no-op when no id is held twice, so it adds no pass of
+        // its own: what it drops is gone before the next pass.
+        self.resolve_shared_ids(parameters);
         // A lowered `max_members` can leave held evidence deeper than the
         // cap. Drop it before anything reads it, so every step of this pass
         // (and `enforced_ban_set_of`, which drops it the same way) judges the
@@ -809,14 +818,6 @@ impl ChatRoomStateV1 {
         {
             self.ban_evidence = pruned;
         }
-        // One key per member id, before anything below reads a record by id:
-        // an id held under two keys (a `MemberId` is a non-cryptographic
-        // hash) keeps the key that has signed something here, and what the
-        // other keys brought goes (`resolve_shared_ids`). It runs after the
-        // keys above are read, so C3 still re-checks an entry whose id a
-        // dropped record held. A no-op when no id is held twice, so it adds
-        // no pass of its own: what it drops is gone before the next pass.
-        self.resolve_shared_ids(parameters);
         // Every record known at the start of this pass: members plus ban
         // evidence. Step 5 and the evidence recomputation read THIS, never the
         // pruned member set, so nothing this pass removes can change which

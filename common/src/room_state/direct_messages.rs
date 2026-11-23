@@ -889,20 +889,14 @@ fn enforced_ban_set_of_inner(
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {
     // With an id held under two keys, judge over the records cleanup will
-    // read: it decides one key per id (`resolve_shared_ids`, after dropping
-    // evidence deeper than the cap) before step 0. Without this the DM apply
-    // judged bans over whichever record a lookup returned for the shared id.
+    // read: it decides one key per id (`resolve_shared_ids`) before anything
+    // else, then drops evidence deeper than the cap (below, on the resolved
+    // state). Without this the DM apply judged bans over whichever record a
+    // lookup returned for the shared id. `member_info`, the only input to the
+    // decision besides the records, applies before this field, so the
+    // decision is the one cleanup makes.
     if parent_state.has_shared_id() {
         let mut resolved = parent_state.clone();
-        if let Some(pruned) = resolved.ban_evidence.without_too_deep(
-            &resolved.members,
-            parameters.owner_id(),
-            crate::room_state::ban_evidence::evidence_depth_cap(
-                resolved.configuration.configuration.max_members,
-            ),
-        ) {
-            resolved.ban_evidence = pruned;
-        }
         resolved.resolve_shared_ids(parameters);
         return enforced_ban_set_of_inner(&resolved, parameters);
     }
@@ -1268,10 +1262,11 @@ impl ComposableState for DirectMessagesV1 {
                 // once the member entry is present.
                 continue;
             }
-            if !recipient_keys
+            let signer = recipient_keys
                 .iter()
-                .any(|vk| advance.verify_signature(vk, &parameters.owner).is_ok())
-            {
+                .find(|vk| advance.verify_signature(vk, &parameters.owner).is_ok())
+                .copied();
+            let Some(signer) = signer else {
                 // The owner's key is the only key for the owner's id, so a
                 // bad owner envelope is a forgery. A member's may be signed
                 // by another key for the same id that this peer does not
@@ -1281,12 +1276,17 @@ impl ComposableState for DirectMessagesV1 {
                     advance.verify_signature(&parameters.owner, &parameters.owner)?;
                 }
                 continue;
-            }
+            };
 
-            let pos = self
-                .purges
-                .iter()
-                .position(|p| p.recipient_id == advance.recipient_id);
+            // With the recipient's id held under two keys, an envelope
+            // replaces only one signed by the same key, so another key's
+            // envelope never evicts it before cleanup decides the id's key
+            // (`resolve_shared_ids`).
+            let shared = recipient_keys.len() > 1;
+            let pos = self.purges.iter().position(|p| {
+                p.recipient_id == advance.recipient_id
+                    && (!shared || p.verify_signature(&signer, &parameters.owner).is_ok())
+            });
             match pos {
                 Some(idx) => {
                     if outranks(advance.rank(), self.purges[idx].rank()) {
@@ -1634,7 +1634,7 @@ fn sort_state(s: &mut DirectMessagesV1) {
                     .cmp(&b.sender_signature.to_bytes()),
             )
     });
-    s.purges.sort_by_key(|p| p.recipient_id);
+    s.purges.sort_by_key(|p| (p.recipient_id, p.rank()));
 }
 
 // ---------------------------------------------------------------------------
