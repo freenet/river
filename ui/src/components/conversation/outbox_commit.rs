@@ -64,12 +64,15 @@ pub(crate) fn has_signing() -> bool {
     OUTBOX.try_read().map_or(true, |o| o.has_unsent(|_| None))
 }
 
-/// Drop everything waiting in `room`: the user left it. From a deferred
-/// closure only.
+/// Drop everything the outbox keeps for `room`: the user left it. From a
+/// deferred closure only.
+///
+/// Unconditional: a drained queue can still hold the room's sealed mark
+/// (`Outbox::may_seal_at`), so "nothing waits" is no reason to skip it. A
+/// leave is a single user action that already writes `ROOMS`, so the one
+/// extra write costs nothing worth guarding against.
 pub(crate) fn clear_room_now(room: VerifyingKey) {
-    if OUTBOX.peek().has_room(&room) {
-        OUTBOX.with_mut(|o| o.clear_room(&room));
-    }
+    OUTBOX.with_mut(|o| o.clear_room(&room));
 }
 
 /// Drop a failed entry: the composer has taken the send back as its draft.

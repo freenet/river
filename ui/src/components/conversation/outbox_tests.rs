@@ -635,7 +635,8 @@ fn a_reseal_never_moves_to_an_older_secret() {
 }
 
 /// The highest version sealed under in a room is kept past the entries that
-/// set it, per room, until the room is left.
+/// set it (commit, failure, discard, a send again), per room, until the user
+/// leaves the room, which ends it even once the queue has drained.
 #[test]
 fn the_sealed_mark_follows_a_reseal_and_ends_with_the_room() {
     let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
@@ -658,11 +659,40 @@ fn the_sealed_mark_follows_a_reseal_and_ends_with_the_room() {
         "another room is not held to it"
     );
 
-    outbox.clear_room(&room());
-    assert!(
-        outbox.may_seal_at(&room(), 0),
-        "the mark goes with the room"
-    );
+    // The resealed entry commits: the queue drains, the mark stays.
+    let (id, _, work) = resign.into_iter().next().unwrap();
+    sign_all(&mut outbox, id, &work);
+    let (ready, resign) = outbox.take_committable(&room(), Some(([2u8; 32], 2)));
+    assert!(resign.is_empty());
+    assert_eq!(texts(&ready), ["sealed at v1"]);
+    assert!(!outbox.has_room(&room()), "the queue has drained");
+    assert!(!outbox.may_seal_at(&room(), 1), "kept past a commit");
+
+    // A send at v2 fails and the composer takes it back: still kept. Sent
+    // again, it is a new entry at v2, which commits and drains the queue.
+    let (b, _) = sealed_entry(&mut outbox, "sealed at v2", 3, 2);
+    outbox.record_failure(&room(), b, "timed out".to_string());
+    outbox.discard(&room(), b);
+    assert!(!outbox.has_room(&room()));
+    assert!(!outbox.may_seal_at(&room(), 1), "kept past a discard");
+    let (c, wc) = sealed_entry(&mut outbox, "sealed at v2", 4, 2);
+    sign_all(&mut outbox, c, &wc);
+    let (ready, _) = outbox.take_committable(&room(), Some(([2u8; 32], 2)));
+    assert_eq!(texts(&ready), ["sealed at v2"]);
+    assert!(!outbox.has_room(&room()), "the queue has drained again");
+    assert!(!outbox.may_seal_at(&room(), 1), "kept past a send again");
+
+    // The user leaves, through the leave path itself: nothing waits, and the
+    // mark still goes with the room.
+    let dom = VirtualDom::new(|| rsx! {});
+    dom.in_scope(ScopeId::ROOT, || {
+        *OUTBOX.write() = outbox;
+        super::super::outbox_commit::clear_room_now(room());
+        assert!(
+            OUTBOX.peek().may_seal_at(&room(), 0),
+            "the mark goes with the room"
+        );
+    });
 }
 
 /// The everyday path: public messages, and messages sealed under the current

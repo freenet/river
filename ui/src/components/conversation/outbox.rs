@@ -583,7 +583,8 @@ impl Outbox {
             .is_some_and(|q| q.iter().any(|e| e.author_vk != *author))
     }
 
-    /// Drop everything waiting in `room` (the user left it).
+    /// Drop everything waiting in `room`, and its sealed mark (the user left
+    /// it). Returns how many entries were waiting.
     pub fn clear_room(&mut self, room: &VerifyingKey) -> usize {
         self.sealed_high.remove(room);
         self.rooms.remove(room).map_or(0, |q| q.len())
