@@ -1194,6 +1194,9 @@ fn follow_on(
                 instance_id,
             }))) => {
                 subs.failed(instance_id, pace);
+                // After a room-contract re-key the current key may have no state yet: move the
+                // room there from its earlier key.
+                changed |= rooms.seed_if_rekeyed(&instance_id);
                 changed |= rooms.following(&instance_id, false);
             }
             // An earlier chat delegate's answer, for carrying rooms over: its own key names it.
@@ -1966,6 +1969,11 @@ struct Rooms {
     register_first: bool,
     /// Carrying rooms over from earlier chat delegates was started this run.
     carry_started: bool,
+    /// Rooms stored under an earlier room-contract key, followed under the current one: the
+    /// earlier key, by owner.
+    rekeyed: HashMap<VerifyingKey, freenet_stdlib::prelude::ContractKey>,
+    /// Rooms already being moved to their current contract key this run.
+    seeded: HashSet<VerifyingKey>,
     /// While the store could not be set up: when the app next registers it by itself, and
     /// the wait after that one. `None` while the store is there.
     register_retry: Option<(Instant, Duration)>,
@@ -2213,8 +2221,19 @@ impl Rooms {
             .collect();
         let mut new_ids = Vec::new();
         let mut by_key: HashMap<VerifyingKey, LiveRoom> = HashMap::new();
-        for slot in loaded.slots {
+        for mut slot in loaded.slots {
             let vk = slot.owner_vk;
+            // A room stored under one of its earlier contract keys is followed under the key
+            // this build's room contract gives it ([`super::rekey`]).
+            match super::rekey::current_key(&slot) {
+                (current, Some(earlier)) => {
+                    slot.contract_key = current;
+                    self.rekeyed.insert(vk, earlier);
+                }
+                (_, None) => {
+                    self.rekeyed.remove(&vk);
+                }
+            }
             // A room being left stays off the list (and unsubscribed) while its tombstone
             // is on its way: the read just made may have come first.
             if self.outbox.work.leaving(&vk) {
@@ -3232,7 +3251,25 @@ impl Rooms {
             return false;
         }
         subs.failed(id, pace);
+        self.seed_if_rekeyed(&id);
         self.following(&id, false)
+    }
+
+    /// The network has no state under `id`, a room's current contract key: when the room is
+    /// stored under an earlier key, move it ([`super::rekey`]), once a run. True when started.
+    fn seed_if_rekeyed(&mut self, id: &ContractInstanceId) -> bool {
+        let Some(room) = self.by_contract(id) else {
+            return false;
+        };
+        let owner = room.stored.owner_vk;
+        let (name, local) = (room.name(), room.stored.room_state.clone());
+        let Some(earlier) = self.rekeyed.get(&owner).copied() else {
+            return false;
+        };
+        if !self.seeded.insert(owner) {
+            return false;
+        }
+        self.outbox.work.seed(owner, name, earlier, local)
     }
 
     /// Record whether a room is subscribed; true when that changed what shows.

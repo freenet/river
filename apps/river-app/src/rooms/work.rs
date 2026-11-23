@@ -94,7 +94,7 @@ use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, DelegateError,
     ErrorKind, RequestError,
 };
-use freenet_stdlib::prelude::{ContractInstanceId, DelegateKey, StateDelta, UpdateData};
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, StateDelta, UpdateData};
 use river_core::chat_delegate::{CasStoreResult, ChatDelegateResponseMsg};
 use river_core::invitation::Invitation;
 use river_core::room_state::ChatRoomStateV1;
@@ -105,6 +105,7 @@ use river_core::stored_rooms::{
 };
 
 use super::carry::{self, Ask, Carry};
+use super::rekey::{self, Found, Probe};
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
 use super::dm_archive::ArchiveOp;
@@ -252,6 +253,16 @@ enum Kind {
     /// (`Walk`), then add each room or tombstone found to the store (`Slot`, once per room).
     /// Shown only while it has found rooms, or the list is empty, and when it fails.
     Carry(Box<Carry>),
+    /// Carry `room` (named `name`), stored under an earlier room-contract key, to the current
+    /// key, which has no state on the network ([`super::rekey`]): read the earlier keys
+    /// (`Probe`), then PUT the newest real state found, merged with `local` (`Forward`).
+    /// `candidates` are the earlier keys to read, newest first.
+    Seed {
+        room: VerifyingKey,
+        name: String,
+        candidates: Vec<ContractInstanceId>,
+        local: Box<ChatRoomStateV1>,
+    },
     /// Refused before it started; never works.
     Refused(String),
 }
@@ -262,6 +273,10 @@ enum Step {
     Walk,
     /// Read the room from the network (joining).
     Get,
+    /// Read the room's earlier contract keys, the current one having no state.
+    Probe,
+    /// PUT the state found under an earlier key to the current one.
+    Forward,
     /// Add the room to the store.
     Slot,
     /// Publish a new room.
@@ -359,6 +374,10 @@ struct Task {
     /// For a finished join: the room's name, kept for the line that says it is done after the
     /// plan (which holds the invitee's key and the room's secrets) has been wiped.
     done_name: Option<String>,
+    /// Reading the room's earlier contract keys (the `Probe` step).
+    probe: Option<Box<Probe>>,
+    /// The state found under an earlier key, to PUT under the current one (the `Forward` step).
+    carried: Option<Box<ChatRoomStateV1>>,
 }
 
 /// For tests: how many non-zero secrets of an invitation and of a join plan were wiped on this
@@ -449,6 +468,8 @@ impl Task {
             dm_archive_dropped: Vec::new(),
             dm_refusal: None,
             done_name: None,
+            probe: None,
+            carried: None,
         }
     }
 
@@ -458,6 +479,7 @@ impl Task {
             Kind::Join { invitation, .. } => Some(invitation.room),
             Kind::Leave { room, .. } => Some(*room),
             Kind::Import { export, .. } => Some(export.room_owner),
+            Kind::Seed { room, .. } => Some(*room),
             Kind::Mode { .. } | Kind::DmSave { .. } | Kind::Carry(_) | Kind::Refused(_) => None,
         }
     }
@@ -465,6 +487,11 @@ impl Task {
     /// Whether this carries rooms over from earlier chat delegates.
     fn is_carry(&self) -> bool {
         matches!(self.kind, Kind::Carry(_))
+    }
+
+    /// Whether this moves a stored room to its current contract key.
+    fn is_seed(&self) -> bool {
+        matches!(self.kind, Kind::Seed { .. })
     }
 
     /// Whether this only saves a notification mode.
@@ -491,6 +518,7 @@ impl Task {
             | Kind::Mode { .. }
             | Kind::DmSave { .. }
             | Kind::Carry(_)
+            | Kind::Seed { .. }
             | Kind::Refused(_) => None,
             Kind::Import { plan, .. } => plan.as_deref(),
         }
@@ -514,6 +542,9 @@ impl Task {
             Kind::DmSave { .. } => "Saving sent messages".to_owned(),
             Kind::Leave { name, .. } => format!("Leaving “{name}”"),
             Kind::Carry(c) => carry_line(c),
+            Kind::Seed { name, .. } => {
+                format!("Moving “{name}” to this version of River")
+            }
             Kind::Refused(what) => what.clone(),
         };
         let state = match (&self.failed, self.step, self.owner()) {
@@ -586,7 +617,9 @@ impl Task {
         self.step = match (&self.kind, self.step) {
             (Kind::Create(_), Step::Slot) => Step::Put,
             (Kind::Create(_), Step::Put) => Step::Meta,
-            (Kind::Join { .. } | Kind::Import { .. }, Step::Get) => Step::Slot,
+            (Kind::Join { .. } | Kind::Import { .. }, Step::Get | Step::Forward) => Step::Slot,
+            (Kind::Seed { .. }, Step::Probe) => Step::Forward,
+            (Kind::Seed { .. }, Step::Forward) => Step::Done,
             // Nothing to send: the room, read just before, already has the invitee as a member
             // (another tab that accepted the same invitation, or an invitation accepted twice).
             // That is decided from the room alone, as the web UI's `build_state_for_put` does,
@@ -790,6 +823,26 @@ impl Work {
             return;
         }
         self.push(Kind::Carry(Box::new(carry)), Step::Walk);
+    }
+
+    /// Move `room`, stored under the earlier contract key `stored`, to its current key, which
+    /// has no state on the network ([`super::rekey`]); `local` is the copy the user holds. Once
+    /// per room per run: false when it was asked already.
+    pub fn seed(&mut self, room: VerifyingKey, name: String, stored: ContractKey, local: ChatRoomStateV1) -> bool {
+        if self.tasks.iter().any(|t| t.is_seed() && t.owner() == Some(room)) {
+            return false;
+        }
+        let candidates = rekey::candidates_down_to(&room, Some(&stored));
+        self.push(
+            Kind::Seed {
+                room,
+                name,
+                candidates,
+                local: Box::new(local),
+            },
+            Step::Probe,
+        );
+        true
     }
 
     /// An answer from an earlier chat delegate (`from`). True when it was the working task's.
@@ -1174,6 +1227,13 @@ impl Work {
             c.restart();
             t.step = Step::Walk;
         }
+        // Moving a room reads its earlier keys again (a PUT that failed is built again from what
+        // they hold now).
+        t.probe = None;
+        t.carried = None;
+        if t.is_seed() {
+            t.step = Step::Probe;
+        }
         // A join reads the room again, so what it sends is built against the room as it is now,
         // with the time it is sent, when it failed before its UPDATE, or when the node refused
         // the UPDATE (the room may have filled up or banned the invitee since; whether to send
@@ -1326,6 +1386,77 @@ impl Work {
                     ),
                 }
             }
+            (Step::Probe, kind) => {
+                if t.probe.is_none()
+                    && let Kind::Seed {
+                        room,
+                        candidates,
+                        local,
+                        ..
+                    } = kind
+                {
+                    t.probe = Some(Box::new(Probe::new(
+                        *room,
+                        candidates.clone(),
+                        (**local).clone(),
+                    )));
+                }
+                let Some(p) = t.probe.as_mut() else {
+                    t.fail("Something unexpected went wrong.", true);
+                    return None;
+                };
+                match p.next() {
+                    Ok(id) => (
+                        Out::Contract(id),
+                        ClientRequest::ContractOp(ContractRequest::Get {
+                            key: id,
+                            return_contract_code: false,
+                            subscribe: false,
+                            blocking_subscribe: false,
+                        }),
+                    ),
+                    Err(Found::State(state)) => {
+                        t.probe = None;
+                        t.carried = Some(state);
+                        t.step = Step::Forward;
+                        return None;
+                    }
+                    Err(Found::Nothing) => {
+                        t.probe = None;
+                        if t.is_seed() {
+                            // Nothing to carry: the room shows the copy the user holds, as before.
+                            eprintln!(
+                                "River: no earlier key of a re-keyed room holds it; showing the stored copy"
+                            );
+                            t.step = Step::Done;
+                        } else {
+                            t.fail(NOT_FOUND, true);
+                        }
+                        return None;
+                    }
+                }
+            }
+            (Step::Forward, _) => {
+                let (Some(owner), Some(state)) = (owner, t.carried.as_deref()) else {
+                    t.fail("Something unexpected went wrong.", true);
+                    return None;
+                };
+                match rekey::put_forward(&owner, state) {
+                    Ok(put) => (
+                        Out::Contract(*create::contract_key(&owner).id()),
+                        ClientRequest::ContractOp(put),
+                    ),
+                    Err(e) => {
+                        t.fail(
+                            format!(
+                                "The room's copy from an earlier version of River can't be moved: {e}"
+                            ),
+                            false,
+                        );
+                        return None;
+                    }
+                }
+            }
             (Step::Get, _) => {
                 let id = *create::contract_key(&owner?).id();
                 (
@@ -1475,70 +1606,60 @@ impl Work {
         match (t.step, response) {
             (Step::Get, ContractResponse::GetResponse { key, state, .. }) if *key.id() == id => {
                 match ciborium::de::from_reader::<ChatRoomStateV1, _>(state.as_ref()) {
-                    Ok(state) => match &mut t.kind {
-                        Kind::Join {
-                            invitation,
-                            nickname,
-                            only_new,
-                            plan,
-                        } => {
-                            let key = create::contract_key(&invitation.room);
-                            // A nickname made for the user (a join from a message) is cut to
-                            // what this room allows; one the user typed is not changed.
-                            let nick = if *only_new {
-                                create::fit_nickname(nickname, &state.configuration.configuration)
-                            } else {
-                                Some(nickname.clone())
-                            };
-                            let Some(nick) = nick else {
-                                t.fail(
-                                    "This room's nickname limit is too small for a generated nickname, so the invitation is not used.",
-                                    false,
-                                );
-                                return true;
-                            };
-                            match create::join(invitation, &nick, &state, key, SystemTime::now()) {
-                                Ok(p) => {
-                                    // Kept in the task before it is judged, so a plan that is
-                                    // refused is wiped with the task's credential.
-                                    let rejected = *only_new && !p.adds_member();
-                                    *plan = Some(Box::new(p));
-                                    if rejected {
-                                        t.fail(
-                                            "This invitation is for someone who is a member of the room already, so it is not used.",
-                                            false,
-                                        );
-                                    } else {
-                                        t.advance();
-                                    }
-                                }
-                                Err(r) => t.fail(r.why, r.retry),
-                            }
+                    Ok(state) => {
+                        if !take_state(t, &state) {
+                            return false;
                         }
-                        Kind::Import { export, plan, .. } => {
-                            let key = create::contract_key(&export.room_owner);
-                            match identity::new_room(export, &state, key) {
-                                Ok(room) => {
-                                    *plan = Some(Box::new(room));
-                                    t.advance();
-                                }
-                                Err(r) => t.fail(r.why, r.retry),
-                            }
-                        }
-                        _ => return false,
-                    },
+                    }
                     Err(e) => t.fail(
                         format!("Freenet gave back a room this app can't read ({e})."),
                         true,
                     ),
                 }
             }
-            (Step::Get, ContractResponse::NotFound { instance_id }) if *instance_id == id => t
-                .fail(
-                    "Freenet couldn't find this room. It may be gone, or Freenet may not reach \
-                     it yet.",
-                    true,
-                ),
+            // The current key has no state: after a room-contract re-key the room may be under
+            // an earlier key only. Read those, newest first ([`super::rekey`]).
+            (Step::Get, ContractResponse::NotFound { instance_id })
+                if *instance_id == id && t.probe.is_none() =>
+            {
+                let Some(owner) = t.owner() else {
+                    return false;
+                };
+                let candidates = rekey::candidates_down_to(&owner, None);
+                t.probe = Some(Box::new(Probe::new(
+                    owner,
+                    candidates,
+                    ChatRoomStateV1::default(),
+                )));
+                t.out = None;
+                t.step = Step::Probe;
+            }
+            (Step::Get, ContractResponse::NotFound { instance_id }) if *instance_id == id => {
+                t.fail(NOT_FOUND, true)
+            }
+            (Step::Probe, ContractResponse::GetResponse { key, state, .. }) if *key.id() == id => {
+                if let Some(p) = t.probe.as_mut() {
+                    p.state(id, state.as_ref());
+                }
+                t.out = None;
+            }
+            (Step::Probe, ContractResponse::NotFound { instance_id }) if *instance_id == id => {
+                if let Some(p) = t.probe.as_mut() {
+                    p.absent(id);
+                }
+                t.out = None;
+            }
+            (Step::Forward, ContractResponse::PutResponse { key }) if *key.id() == id => {
+                match (&t.kind, t.carried.take()) {
+                    // A join or an import goes on as if the current key had answered with it.
+                    (Kind::Join { .. } | Kind::Import { .. }, Some(state)) => {
+                        if !take_state(t, &state) {
+                            return false;
+                        }
+                    }
+                    _ => t.advance(),
+                }
+            }
             (Step::Put, ContractResponse::PutResponse { key }) if *key.id() == id => t.advance(),
             (Step::Update, ContractResponse::UpdateResponse { key, .. }) if *key.id() == id => {
                 t.advance()
@@ -1609,9 +1730,46 @@ impl Work {
             self.note_done();
             return true;
         }
+        // Reading an earlier key: a failure of one read is not the task's; the next key is read.
+        if let (Out::Contract(id), Step::Probe) = (out, t.step) {
+            let id = *id;
+            let absent = match e.kind() {
+                ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
+                    key, ..
+                })) if *key.id() == id => false,
+                ErrorKind::RequestError(RequestError::ContractError(
+                    ContractError::MissingContract { key },
+                )) if *key == id => true,
+                ErrorKind::EmptyRing
+                | ErrorKind::PeerNotJoined
+                | ErrorKind::Shutdown
+                | ErrorKind::OperationError { .. }
+                | ErrorKind::FailedOperation
+                    if alone =>
+                {
+                    false
+                }
+                _ => return false,
+            };
+            if let Some(p) = t.probe.as_mut() {
+                if absent {
+                    p.absent(id);
+                } else {
+                    p.unknown(id);
+                }
+            }
+            t.out = None;
+            return true;
+        }
         let why = match (out, e.kind()) {
             (Out::Contract(id), ErrorKind::RequestError(RequestError::ContractError(c))) => match c
             {
+                ContractError::Put { key, cause } if key.id() == id && t.step == Step::Forward => {
+                    format!(
+                        "Freenet didn't take the room's copy from an earlier version of River: {}",
+                        short(cause)
+                    )
+                }
                 ContractError::Get { key, cause } if key.id() == id && t.step == Step::Get => {
                     format!("Couldn't read the room from Freenet: {}", short(cause))
                 }
@@ -1689,6 +1847,16 @@ impl Work {
         if now.saturating_duration_since(*at) < wait {
             return false;
         }
+        // An earlier key that does not answer is passed over in the same way.
+        if let (Out::Contract(id), Step::Probe) = (out, t.step) {
+            let id = *id;
+            t.out = None;
+            if let Some(p) = t.probe.as_mut() {
+                p.unknown(id);
+            }
+            self.expired_dm = false;
+            return true;
+        }
         // An earlier delegate that does not answer is passed over (the walk goes on with the next
         // one on the new connection); it does not count against the task, since each one is
         // asked at most once.
@@ -1725,7 +1893,7 @@ impl Work {
             // A leave that failed before the tombstone was stored: the room was taken off the
             // screen, so the stored rooms are read to show it again.
             let restored = t.is_leave() && t.failed.is_some() && t.step == Step::Slot;
-            if (t.step == Step::Done || restored) && !t.reload_asked {
+            if (t.step == Step::Done || restored) && !t.reload_asked && !t.is_seed() {
                 t.reload_asked = true;
                 self.reload = true;
             }
@@ -1762,6 +1930,7 @@ impl Work {
                     Some((_, retry)) => *retry,
                     None => t.step != Step::Done && (c.rooms_found() > 0 || c.list_was_empty),
                 },
+                Kind::Seed { .. } => t.step != Step::Done || t.failed.is_some(),
                 _ => true,
             })
             .map(Task::view)
@@ -1785,6 +1954,68 @@ impl Work {
                     || (!t.is_leave() && t.owner().is_some_and(|o| shown(&o)))))
         });
     }
+}
+
+/// What a join or import says when no key holds the room.
+const NOT_FOUND: &str = "Freenet couldn't find this room. It may be gone, or Freenet may not reach \
+     it yet.";
+
+/// A join or an import has read the room (`state`): build what it stores and sends, and go on.
+/// False when the task is neither.
+fn take_state(t: &mut Task, state: &ChatRoomStateV1) -> bool {
+    match &mut t.kind {
+        Kind::Join {
+            invitation,
+            nickname,
+            only_new,
+            plan,
+        } => {
+            let key = create::contract_key(&invitation.room);
+            // A nickname made for the user (a join from a message) is cut to what this room
+            // allows; one the user typed is not changed.
+            let nick = if *only_new {
+                create::fit_nickname(nickname, &state.configuration.configuration)
+            } else {
+                Some(nickname.clone())
+            };
+            let Some(nick) = nick else {
+                t.fail(
+                    "This room's nickname limit is too small for a generated nickname, so the invitation is not used.",
+                    false,
+                );
+                return true;
+            };
+            match create::join(invitation, &nick, state, key, SystemTime::now()) {
+                Ok(p) => {
+                    // Kept in the task before it is judged, so a plan that is refused is wiped
+                    // with the task's credential.
+                    let rejected = *only_new && !p.adds_member();
+                    *plan = Some(Box::new(p));
+                    if rejected {
+                        t.fail(
+                            "This invitation is for someone who is a member of the room already, so it is not used.",
+                            false,
+                        );
+                    } else {
+                        t.advance();
+                    }
+                }
+                Err(r) => t.fail(r.why, r.retry),
+            }
+        }
+        Kind::Import { export, plan, .. } => {
+            let key = create::contract_key(&export.room_owner);
+            match identity::new_room(export, state, key) {
+                Ok(room) => {
+                    *plan = Some(Box::new(room));
+                    t.advance();
+                }
+                Err(r) => t.fail(r.why, r.retry),
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// What the screen says while rooms are carried over.

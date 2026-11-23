@@ -75,7 +75,7 @@ use super::room::LiveRoom;
 pub(crate) const ROOM_CONTRACT_WASM: &[u8] =
     include_bytes!("../../../../ui/public/contracts/room_contract.wasm");
 
-fn params_bytes(owner: &VerifyingKey) -> Vec<u8> {
+pub(crate) fn params_bytes(owner: &VerifyingKey) -> Vec<u8> {
     let mut out = Vec::new();
     // CBOR of a struct of one 32-byte key into a Vec does not fail.
     let _ = ciborium::ser::into_writer(&ChatRoomParametersV1 { owner: *owner }, &mut out);

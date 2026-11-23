@@ -7,7 +7,7 @@ use crate::rooms::work::WorkState;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
-    ApplicationMessage, CodeHash, ContractCode, ContractKey, InboundDelegateMsg,
+    ApplicationMessage, CodeHash, ContractCode, ContractKey, DelegateKey, InboundDelegateMsg,
     OutboundDelegateMsg, Parameters, State, StateDelta, WrappedState,
 };
 use river_core::chat_delegate::{CasStoreResult, ChatDelegateKey, ChatDelegateRequestMsg};
@@ -640,6 +640,12 @@ struct World {
     reads_due: usize,
     /// Versioned reads and CAS stores that arrived while a reader was still reading.
     overlaps: usize,
+    /// Earlier chat delegates the node holds, with what each stores. Any other is `Missing`.
+    legacy: HashMap<DelegateKey, BTreeMap<Vec<u8>, Vec<u8>>>,
+    /// Every request to an earlier chat delegate: the connection and the delegate.
+    legacy_asks: Vec<(usize, DelegateKey)>,
+    /// Take requests to this earlier delegate but answer nothing.
+    silence_legacy: Option<DelegateKey>,
 }
 
 /// How the fake node answers signing key requests.
@@ -1055,10 +1061,51 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                 })));
             }
         }
-        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, .. })
+        // An earlier chat delegate (carrying rooms over): answered from `legacy` when the node
+        // holds it, `Missing` otherwise, as a node answers for a delegate never registered.
+        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, inbound, .. })
             if &key != delegate::chat_delegate_key() =>
         {
-            panic!("the app only asks River's own chat delegate, but asked {key}");
+            assert!(
+                super::super::carry::predecessors().iter().any(|p| p.key == key),
+                "the app asked a delegate that is neither River's nor an earlier River's: {key}"
+            );
+            w.legacy_asks.push((n, key.clone()));
+            if w.silence_legacy.as_ref() == Some(&key) {
+                return out;
+            }
+            for msg in inbound {
+                let InboundDelegateMsg::ApplicationMessage(m) = msg else {
+                    continue;
+                };
+                let read: ChatDelegateRequestMsg =
+                    ciborium::de::from_reader(m.payload.as_slice()).unwrap();
+                let Some(store) = w.legacy.get(&key) else {
+                    out.push(encode(Err(ErrorKind::RequestError(
+                        RequestError::DelegateError(DelegateError::Missing(key.clone())),
+                    )
+                    .into())));
+                    continue;
+                };
+                let reply = match read {
+                    ChatDelegateRequestMsg::ListRequest => ChatDelegateResponseMsg::ListResponse {
+                        keys: store.keys().cloned().map(ChatDelegateKey::new).collect(),
+                    },
+                    ChatDelegateRequestMsg::GetRequest { key: k } => {
+                        ChatDelegateResponseMsg::GetResponse {
+                            value: store.get(k.as_bytes()).cloned(),
+                            key: k,
+                        }
+                    }
+                    other => panic!("the app only reads an earlier delegate, but sent {other:?}"),
+                };
+                out.push(encode(Ok(HostResponse::DelegateResponse {
+                    key: key.clone(),
+                    values: vec![OutboundDelegateMsg::ApplicationMessage(
+                        ApplicationMessage::new(cbor(&reply)),
+                    )],
+                })));
+            }
         }
         ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) => {
             for msg in inbound {

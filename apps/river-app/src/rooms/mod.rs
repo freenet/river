@@ -73,6 +73,7 @@ pub mod leave;
 mod link_tests;
 pub mod modes;
 pub mod outbox;
+pub mod rekey;
 mod resync;
 pub mod room;
 #[cfg(test)]
