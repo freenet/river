@@ -1157,8 +1157,15 @@ fn node_state(edit: fn(&mut Vec<crate::chat::model::Room>)) -> RiverApp {
     let mut rooms = crate::chat::example::data().rooms;
     edit(&mut rooms);
     s.chat.source = crate::chat::Source::Node(crate::chat::LinkStatus::Live);
-    s.chat
-        .show_node_rooms(rooms, None, crate::chat::LinkStatus::Live, 29_000_000);
+    // The first live list is catch-up; the second is the whole list.
+    for _ in 0..2 {
+        s.chat.show_node_rooms(
+            rooms.clone(),
+            None,
+            crate::chat::LinkStatus::Live,
+            29_000_000,
+        );
+    }
     s
 }
 
@@ -1253,6 +1260,48 @@ fn the_export_dialog_closes_when_its_room_leaves_the_list() {
     settle(&mut rt);
     assert!(rt.state.chat.export.is_none(), "dialog and token dropped");
     assert!(rt.find("export-identity-dialog").is_none());
+}
+
+#[test]
+fn a_partial_list_while_reconnecting_keeps_the_export_dialog_and_a_full_one_closes_it() {
+    let mut rt = render(node_state(|_| {}), WINDOW_SIZE);
+    let key = rt.state.chat.rooms()[1].key.clone();
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    press(&mut rt, &format!("settings-export-{key}"));
+    assert!(rt.state.chat.export.is_some());
+    let rest: Vec<_> = rt
+        .state
+        .chat
+        .rooms()
+        .iter()
+        .filter(|r| r.key != key)
+        .cloned()
+        .collect();
+    // Reconnecting: the list lacks the room only because it is partial.
+    let partial = rest.clone();
+    rt.update(move |s, _| {
+        s.chat.show_node_rooms(
+            partial,
+            None,
+            crate::chat::LinkStatus::Reconnecting,
+            29_000_000,
+        );
+    });
+    assert!(rt.state.chat.export.is_some(), "a partial list keeps it");
+    // The first live list after that is still catch-up, not the whole list.
+    let catch_up = rest.clone();
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(catch_up, None, crate::chat::LinkStatus::Live, 29_000_000);
+    });
+    assert!(rt.state.chat.export.is_some(), "catch-up keeps it");
+    // A full live list without the room closes it.
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(rest, None, crate::chat::LinkStatus::Live, 29_000_000);
+    });
+    assert!(rt.state.chat.export.is_none(), "a full list closes it");
 }
 
 #[test]

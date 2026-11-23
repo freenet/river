@@ -643,8 +643,10 @@ impl Chat {
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
         // An export dialog is about one room: when that room leaves the list, the dialog and its
-        // token go with it.
-        if let Some(d) = &self.export
+        // token go with it. Only a FULL list says so: a partial one while reconnecting or
+        // catching up (see `show_node_rooms`) lacks rooms that are still there.
+        if self.full_list
+            && let Some(d) = &self.export
             && !self.rooms.iter().any(|r| r.key == d.room)
         {
             self.close_export();
