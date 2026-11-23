@@ -62,9 +62,7 @@ grep -q ' CURRENT works ' "$RESOLVED" || die "manifest must list CURRENT as work
 # Coverage: every registry generation whose WASM exists in git history must be in the
 # manifest, so a newly retired generation cannot be silently left untested.
 # (Registry versions with no matching blob in history cannot be run; they are reported.)
-untested=$(awk '{print $2}' "$CORPUS/index.txt" | while read -r v; do
-  awk -v v="$v" '!/^#/ && $1==v{f=1} END{exit !f}' "$GATE/manifest.txt" || echo "$v"; done)
-[ -z "$untested" ] || die "WASM in git history for registry generation(s) not in manifest.txt: $(echo $untested). Add each as works or dead."
+"$GATE/check-manifest-coverage.sh" "$CORPUS/index.txt" || die "manifest.txt does not cover every registry generation (see above)"
 nreg=$(grep -c '^version' "$RIVER/legacy_delegates.toml" || true)
 echo "corpus: $(wc -l < "$RESOLVED") entries ($min expected working); $((nreg - $(wc -l < "$CORPUS/index.txt") + 1)) registry generations have no WASM in git history and cannot be run"
 

@@ -36,3 +36,7 @@ jobs:
         ./scripts/check-migration.sh --ci \
           "${{ github.event.pull_request.base.sha }}" \
           "${{ github.event.pull_request.head.sha }}"
+
+    - name: Verify every retired delegate generation is in the legacy-delegate gate manifest
+      if: always()
+      run: ./scripts/legacy-delegate-gate/check-manifest-coverage.sh
