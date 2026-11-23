@@ -5260,15 +5260,31 @@ mod tests {
         assert_eq!(rt.state.chat.zoom.percent(), walked.percent());
     }
 
-    /// The preset buttons that are drawn as the active one (the Contrast variant).
+    /// The preset buttons drawn as the active one: the Contrast variant has a different fill from
+    /// the Outline buttons beside it.
     fn active_sizes(rt: &Runtime<RiverApp>) -> Vec<u16> {
-        chat::zoom::STEPS
+        let fills: Vec<(u16, String)> = chat::zoom::STEPS
             .into_iter()
-            .filter(|pct| {
-                rt.elements().into_iter().any(|e| {
-                    e.key.as_deref() == Some(&format!("settings-size-{pct}")) && e.selected
-                })
+            .map(|pct| {
+                let key = format!("settings-size-{pct}");
+                let e = rt
+                    .elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some(key.as_str()))
+                    .unwrap_or_else(|| panic!("{key} is drawn"));
+                (pct, format!("{:?}", e.fill))
             })
+            .collect();
+        let common = fills
+            .iter()
+            .map(|(_, f)| f)
+            .max_by_key(|f| fills.iter().filter(|(_, g)| g == *f).count())
+            .cloned()
+            .unwrap();
+        fills
+            .into_iter()
+            .filter(|(_, f)| *f != common)
+            .map(|(p, _)| p)
             .collect()
     }
 
