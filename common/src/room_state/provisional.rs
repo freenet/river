@@ -1448,4 +1448,29 @@ mod tests {
             "a record under another key held at the start of the pass conflicts the id"
         );
     }
+
+    /// A provisional ban signature is checked with `verify_strict`, like an
+    /// entry's: a small-order issuer key with the identity `R` and `S = 0`
+    /// passes the cofactored `verify` for any message, and must not pass here.
+    #[test]
+    fn a_provisional_ban_signature_under_a_small_order_key_is_refused() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).expect("the identity point decodes");
+        assert!(weak.is_weak(), "premise: the key is small order");
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[0] = 1; // R = identity, S = 0
+        let signature = Signature::from_bytes(&sig_bytes);
+        let mut b = fixture_ban();
+        b.signature = signature;
+        assert!(
+            weak.verify(
+                &provisional_ban_signing_bytes(&owner().verifying_key(), &b.ban),
+                &signature
+            )
+            .is_ok(),
+            "premise: the non-strict check accepts it"
+        );
+        assert!(b.verify_signature(&owner().verifying_key(), &weak).is_err());
+    }
 }
