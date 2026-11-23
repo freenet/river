@@ -184,7 +184,7 @@ fn header(chat: &Chat, room: &Room, narrow: bool, p: &Palette, k: &Kit) -> El {
 }
 
 fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
-    if room.messages.is_empty() {
+    if room.messages.is_empty() && room.joins.is_empty() {
         return col()
             .key("history-empty")
             .grow(1.0)
@@ -219,17 +219,26 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     let present: std::collections::HashSet<model::MessageId> =
         room.messages.iter().map(|m| m.id).collect();
     let mut day = None;
-    for group in model::groups(&room.messages) {
-        let d = group.messages[0].time / MINUTES_PER_DAY;
-        if day != Some(d) {
-            day = Some(d);
-            let label = model::day_label(
-                chat.day_zero + i64::from(d),
-                chat.day_zero + i64::from(chat.today),
-            );
-            items = items.child(day_divider(d, label, p));
+    // A join line is not part of a message group: it ends the group before it, so the same
+    // author's messages either side of it are two groups, as in the web UI.
+    let mut at = 0;
+    let mut joins = room.joins.iter().peekable();
+    loop {
+        while let Some(j) = joins.next_if(|j| j.before.min(room.messages.len()) <= at) {
+            items = day_break(items, &mut day, j.time, chat, p);
+            items = items.child(join_el(chat, j, p));
         }
-        items = items.child(group_el(chat, room, &group, &present, p, k));
+        let end = joins
+            .peek()
+            .map_or(room.messages.len(), |j| j.before.min(room.messages.len()));
+        if at >= room.messages.len() && joins.peek().is_none() {
+            break;
+        }
+        for group in model::groups(&room.messages[at..end]) {
+            items = day_break(items, &mut day, group.messages[0].time, chat, p);
+            items = items.child(group_el(chat, room, &group, &present, p, k));
+        }
+        at = end;
     }
     // Keyed by room, so each room's viewport is its own: a room opens at its newest message
     // instead of at the offset the previous room was scrolled to.
@@ -274,6 +283,63 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         );
     }
     frame
+}
+
+/// `items` with the divider for `time`'s day first, when that is not the day of the last item.
+fn day_break(items: El, day: &mut Option<u32>, time: u32, chat: &Chat, p: &Palette) -> El {
+    let d = time / MINUTES_PER_DAY;
+    if *day == Some(d) {
+        return items;
+    }
+    *day = Some(d);
+    let label = model::day_label(
+        chat.day_zero + i64::from(d),
+        chat.day_zero + i64::from(chat.today),
+    );
+    items.child(day_divider(d, label, p))
+}
+
+/// A join line, as the web UI's `msg-event`: the icon in the avatar column, then one quiet line
+/// with the names in bold and the time. It has no actions and nothing to press; three or more
+/// people are named in its tooltip.
+fn join_el(chat: &Chat, j: &model::Join, p: &Palette) -> El {
+    let (mut line, bold) = j.line();
+    line.push_str(" \u{b7} ");
+    line.push_str(&model::clock(j.time));
+    let spans = bold
+        .into_iter()
+        .map(|r| {
+            rune::Span::new(r.start, r.end)
+                .bold()
+                .color(p.text_secondary)
+        })
+        .collect();
+    let mut text = rune::rich(line, spans)
+        .font(st::JOIN)
+        .color(p.text_muted)
+        .shrink()
+        .selectable(true);
+    if j.names.len() > 2 {
+        text = text.help(j.names.join(", "));
+    }
+    row()
+        .key(format!("join-{}", j.key))
+        .label(format!(
+            "{} at {}",
+            j.line().0,
+            model::full_time(chat.day_zero, j.time)
+        ))
+        .w_full()
+        .pt(3.0)
+        .pb(3.0)
+        .pr(24.0)
+        .center_y()
+        .child(
+            el().w(GUTTER)
+                .center()
+                .child(icon(&icons::JOIN, 14.0).color(p.text_muted)),
+        )
+        .child(text)
 }
 
 pub(super) fn day_divider(day: u32, text: String, p: &Palette) -> El {

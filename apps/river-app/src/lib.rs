@@ -2392,6 +2392,11 @@ pub const SCENES: &[Scene] = &[
     }),
     // Message search (Ctrl+F): the messages of the open room that contain the query, the
     // matches drawn bold; a query nothing matches says so; a long list is cut and says so.
+    // Join events between messages: one person, two people and three, each its own quiet line.
+    ("chat-joins", |s| {
+        connect(s);
+        s.chat.edit_rooms(|r| chat::example::add_example_joins(r));
+    }),
     ("chat-search", |s| search_scene(s, "the", 0)),
     ("chat-search-empty", |s| search_scene(s, "zzzz", 0)),
     ("chat-search-many", |s| search_scene(s, "release", 130)),

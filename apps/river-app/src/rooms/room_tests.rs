@@ -922,3 +922,165 @@ fn a_reply_that_arrives_before_its_target_becomes_a_jump_when_the_target_does() 
     let strip = strip_of(&rt, &key);
     assert_eq!(strip.role, "button");
 }
+
+// Join events ----------------------------------------------------------------------------------
+
+/// The private state with join events by `who` at `secs` seconds spliced in, each after the
+/// message at index `after` of the original four (hello, reply, reaction, edit).
+fn with_joins(f: &Fixture, joins: &[(usize, &SigningKey, u64)]) -> ChatRoomStateV1 {
+    let mut state = f.private_state();
+    let original = state.recent_messages.messages.clone();
+    let mut out = Vec::new();
+    for (i, m) in original.into_iter().enumerate() {
+        out.push(m);
+        for (after, who, secs) in joins {
+            if *after == i {
+                out.push(f.message(who, *secs, RoomMessageBody::join_event()));
+            }
+        }
+    }
+    state.recent_messages.messages = out;
+    state
+}
+
+#[test]
+fn a_join_event_is_a_line_between_the_messages_not_a_message() {
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(with_joins(&f, &[(0, &f.me, 90)]))).view(&minutes);
+    // The same two messages as without it: the event is no message.
+    assert_eq!(room.messages.len(), 2);
+    assert_eq!(room.joins.len(), 1);
+    let join = &room.joins[0];
+    assert_eq!(join.names, ["Mia"]);
+    assert_eq!(join.before, 1, "after the first message, before the reply");
+    assert_eq!(join.line().0, "Mia joined");
+}
+
+#[test]
+fn joins_with_no_message_between_them_fold_within_an_hour() {
+    let f = Fixture::new();
+    // Two joins a minute apart, a third 61 minutes after the second.
+    let state = with_joins(
+        &f,
+        &[
+            (0, &f.me, 90),
+            (0, &f.owner, 150),
+            (0, &f.me, 150 + 61 * 60),
+        ],
+    );
+    let room = LiveRoom::new(f.stored(state)).view(&minutes);
+    assert_eq!(room.joins.len(), 2);
+    assert_eq!(room.joins[0].names, ["Mia", "Olive"]);
+    assert_eq!(room.joins[0].line().0, "Mia and Olive joined");
+    assert_eq!(room.joins[1].names, ["Mia"]);
+    assert_eq!(room.joins[0].before, room.joins[1].before);
+}
+
+#[test]
+fn a_message_between_two_joins_keeps_them_apart() {
+    let f = Fixture::new();
+    let state = with_joins(&f, &[(0, &f.me, 90), (1, &f.owner, 130)]);
+    let room = LiveRoom::new(f.stored(state)).view(&minutes);
+    assert_eq!(room.joins.len(), 2);
+    assert_eq!((room.joins[0].before, room.joins[1].before), (1, 2));
+}
+
+#[test]
+fn three_joins_are_counted_not_named_in_the_line() {
+    let join = |names: &[&str]| crate::chat::model::Join {
+        key: "k".into(),
+        names: names.iter().map(|n| n.to_string()).collect(),
+        time: 0,
+        before: 0,
+    };
+    let (line, bold) = join(&["Ann", "Bo", "Cy"]).line();
+    assert_eq!(line, "3 people joined");
+    assert!(bold.is_empty());
+    let (line, bold) = join(&["Ann", "Bo"]).line();
+    let named: Vec<&str> = bold.iter().map(|r| &line[r.clone()]).collect();
+    assert_eq!(named, ["Ann", "Bo"]);
+}
+
+#[test]
+fn a_join_event_is_never_unread() {
+    let f = Fixture::new();
+    // As Mia: the owner's text after the reply is the one unread message. Joins by the owner
+    // after the last read add nothing (a join by anyone else would be no different).
+    let mut state = with_joins(&f, &[(1, &f.owner, 130), (3, &f.owner, 300)]);
+    state.recent_messages.messages.push(f.message(
+        &f.owner,
+        400,
+        RoomMessageBody::public("later".into()),
+    ));
+    let mut stored = f.stored(state.clone());
+    stored.last_read_message_id = Some(state.recent_messages.messages[0].id());
+    let room = LiveRoom::new(stored).view(&minutes);
+    assert_eq!(room.messages.len(), 3);
+    assert_eq!(room.unread, 1);
+}
+
+#[test]
+fn the_join_line_is_drawn_between_the_messages_with_nothing_to_press() {
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(with_joins(&f, &[(0, &f.me, 90)]))).view(&minutes);
+    let key = format!("join-{}", room.joins[0].key);
+    let rt = render(room);
+    let all = rt.elements();
+    let line = all
+        .iter()
+        .find(|e| e.key.as_deref() == Some(key.as_str()))
+        .expect("the join line is drawn");
+    let inside: Vec<_> = all
+        .iter()
+        .filter(|e| e.path.starts_with(&format!("{}/", line.path)))
+        .collect();
+    assert!(
+        inside.iter().any(|e| e
+            .text
+            .as_deref()
+            .is_some_and(|t| t.starts_with("Mia joined"))),
+        "it says who joined: {:?}",
+        inside.iter().map(|e| &e.text).collect::<Vec<_>>()
+    );
+    assert!(
+        inside.iter().all(|e| e.role != "button" && !e.focusable),
+        "no reply, react, edit or delete on it"
+    );
+    // It sits after the first message's group and before the second's, with no avatar or name.
+    let at = |k: &str| all.iter().position(|e| e.key.as_deref() == Some(k));
+    let first = at(&format!("group-{}", "1")).or_else(|| {
+        all.iter()
+            .position(|e| e.key.as_deref().is_some_and(|k| k.starts_with("group-")))
+    });
+    let join_at = at(&key).unwrap();
+    assert!(first.unwrap() < join_at);
+    let groups: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.key.as_deref().is_some_and(|k| k.starts_with("group-")))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(groups.len(), 2, "the join splits nothing into three");
+    assert!(groups[0] < join_at && join_at < groups[1]);
+}
+
+#[test]
+fn a_join_splits_one_authors_messages_into_two_groups() {
+    let f = Fixture::new();
+    // Two messages by the owner a minute apart (one group alone), a join between them.
+    let mut state = f.private_state();
+    state.recent_messages.messages.clear();
+    let text = |secs, t: &str| f.message(&f.owner, secs, RoomMessageBody::public(t.into()));
+    let join = f.message(&f.me, 90, RoomMessageBody::join_event());
+    state.recent_messages.messages = vec![text(60, "one"), join, text(120, "two")];
+    let room = LiveRoom::new(f.stored(state)).view(&minutes);
+    assert_eq!(room.messages.len(), 2);
+    assert_eq!(crate::chat::model::groups(&room.messages).len(), 1);
+    let rt = render(room);
+    let groups = rt
+        .elements()
+        .iter()
+        .filter(|e| e.key.as_deref().is_some_and(|k| k.starts_with("group-")))
+        .count();
+    assert_eq!(groups, 2, "the join line ends the first group");
+}
