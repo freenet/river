@@ -286,3 +286,10 @@ description = "Last chat-delegate generation before open admission to public roo
 date = "2026-11-22"
 delegate_key = "01a4832147aa67ba10d24e769e67d79b5a25337baf64128d2d5cb65b3ecb026b"
 code_hash = "264a93013e97a464109a63ebfbe84a98e61e81f691f905b142eb1417e9da9329"
+
+[[entry]]
+version = "V40"
+description = "Chat delegate before the room subscription record required the room owner's signing key"
+date = "2026-11-23"
+delegate_key = "c6fa1ad833f3f8bc74b43390827a35f376ccf948c7416d2c390087777a5ca185"
+code_hash = "4fbc0f3a4940d1dace00415337d3cfae7ea3eceac03a8877a2b62fc9455bf4c4"

@@ -20,12 +20,14 @@
 //! exercised end-to-end here because they require state to round-trip
 //! through the secret store:
 //!
-//! - **EnsureRoomSubscription rejects when no signing key on file**
-//!   (Fix 5): the WASM-only probe runs only when `get_secret` can return
-//!   `Some(...)`. The probe is gated on `target_family = "wasm"` so the
-//!   permissive behaviour observed by `subscribes_to_room_on_ensure_request`
-//!   is correct under non-WASM. A future WASM integration test (e.g. via
-//!   `freenet local` end-to-end harness) would cover the rejection path.
+//! - **EnsureRoomSubscription rejects when the caller holds no key for the
+//!   room owner** (Fix 5): the WASM-only probe runs only when `get_secret`
+//!   can return `Some(...)`. The probe is gated on `target_family = "wasm"`
+//!   so the permissive behaviour observed by
+//!   `subscribes_to_room_on_ensure_request` is correct under non-WASM. The
+//!   comparison the probe makes, `is_room_owner_signing_key`, is a plain
+//!   function and is tested directly below; the wiring into the handler is
+//!   not reached by these tests.
 //!
 //! - **Cache-not-updated-when-signing-key-missing** (Fix 3): exercising
 //!   the cache-discipline rule needs `set_secret` to actually persist the
@@ -907,4 +909,30 @@ fn backfill_handles_sparse_high_version_state() {
         emitted, expected,
         "must emit only the versions we actually have secrets for"
     );
+}
+
+/// The subscription record is shared by every caller, so
+/// `EnsureRoomSubscription` accepts only a caller holding the room owner's
+/// signing key: the owner's key passes; another key (such as a member's,
+/// stored under the same room), a missing key and a key of the wrong length
+/// are refused.
+#[test]
+fn only_the_room_owners_signing_key_may_set_the_subscription_record() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let room = owner.verifying_key().to_bytes();
+    assert!(is_room_owner_signing_key(
+        Some(owner.to_bytes().as_slice()),
+        &room
+    ));
+    assert!(!is_room_owner_signing_key(
+        Some(other.to_bytes().as_slice()),
+        &room
+    ));
+    assert!(!is_room_owner_signing_key(None, &room));
+    assert!(!is_room_owner_signing_key(
+        Some(&owner.to_bytes()[..31]),
+        &room
+    ));
+    assert!(!is_room_owner_signing_key(Some(&[0u8; 33]), &room));
 }

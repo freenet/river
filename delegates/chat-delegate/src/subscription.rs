@@ -124,6 +124,20 @@ pub(crate) struct RoomSubscriptionContext {
     pub signing_key_origin_b58: String,
 }
 
+/// Whether `stored` is a signing-key seed whose verifying key is
+/// `room_owner_vk`: what `handle_ensure_room_subscription` requires of the
+/// key the caller holds for the room, and what rotation checks again before
+/// it signs. Called on WASM only (see the handler); host builds use it in
+/// tests.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub(crate) fn is_room_owner_signing_key(stored: Option<&[u8]>, room_owner_vk: &RoomKey) -> bool {
+    stored
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .is_some_and(|seed| {
+            SigningKey::from_bytes(&seed).verifying_key().to_bytes() == *room_owner_vk
+        })
+}
+
 /// Public entry point invoked from `handlers::handle_application_message`.
 ///
 /// `request_id` is echoed back in the response so the UI's pending-request
@@ -142,31 +156,28 @@ pub(crate) fn handle_ensure_room_subscription(
         bs58::encode(&contract_id).into_string()
     ));
 
-    // Probe for the signing key. The UI is required to send
-    // `StoreSigningKey` before `EnsureRoomSubscription` so the rotation
-    // pipeline has access to the owner's signing key when a notification
-    // arrives. If the key isn't on file we fail fast rather than silently
-    // setting up a sub-index that will never be able to rotate.
+    // The room's subscription record is one per room, shared by every
+    // caller, and rotation for the room signs with the key it names. So the
+    // caller must hold the room OWNER's signing key under its own origin:
+    // the UI sends `StoreSigningKey` before `EnsureRoomSubscription`, and a
+    // caller holding no key, or a key that is not the owner's, is refused
+    // here rather than replacing a working record with one that can never
+    // rotate.
     //
     // Note: `DelegateCtx::get_secret` returns `None` in non-WASM tests, so
-    // running this check there would always reject. We therefore only
-    // enforce it on WASM. The non-WASM test
-    // `subscribes_to_room_on_ensure_request` documents the legacy
-    // permissive behaviour; a WASM integration test would cover the
-    // rejection path. Filed as a known gap in the test harness — see
-    // module-level comment.
+    // running this check there would always reject. It is enforced on WASM
+    // only; the comparison itself is `is_room_owner_signing_key`, which the
+    // host tests cover directly.
     #[cfg(target_family = "wasm")]
     {
-        let signing_key_present = ctx
-            .get_secret(&signing_key_secret_key(origin_b58, &room_b58))
-            .map(|b| b.len() == 32)
-            .unwrap_or(false);
-        if !signing_key_present {
+        let stored = ctx.get_secret(&signing_key_secret_key(origin_b58, &room_b58));
+        if !is_room_owner_signing_key(stored.as_deref(), &room_owner_vk) {
             return ok_response(
                 room_owner_vk,
                 request_id,
                 Err(
-                    "no signing key on file for this room — call StoreSigningKey first".to_string(),
+                    "no signing key for the room owner on file for this room; call StoreSigningKey with the owner's key first"
+                        .to_string(),
                 ),
             );
         }
