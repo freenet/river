@@ -15,6 +15,21 @@ if [ -z "$INDEX" ]; then
   INDEX="$tmp/index.txt"
 fi
 [ -s "$INDEX" ] || { echo "ERROR: empty corpus index $INDEX" >&2; exit 2; }
+# extract-corpus.sh always appends CURRENT, so a registry that parses to nothing still
+# yields one line. Require at least one real generation, or the check passes vacuously.
+if ! awk '$2!="CURRENT"{f=1} END{exit !f}' "$INDEX"; then
+  echo "ERROR: corpus index holds no legacy generation (only CURRENT): legacy_delegates.toml did not parse, or no WASM matched." >&2
+  exit 1
+fi
+# Every non-CURRENT manifest line must resolve to a WASM in the index. Counting index
+# lines against registry entries would be wrong: some registry generations legitimately
+# have no WASM in git history and cannot be run.
+unresolved=$(awk '!/^#/ && NF && $1!="CURRENT"{print $1}' "$MANIFEST" | while read -r v; do
+  awk -v v="$v" '$2==v{f=1} END{exit !f}' "$INDEX" || echo "$v"; done)
+if [ -n "$unresolved" ]; then
+  echo "ERROR: manifest.txt names generation(s) with no matching WASM in git history: $(echo $unresolved). Registry hash wrong or entry removed?" >&2
+  exit 1
+fi
 untested=$(awk '{print $2}' "$INDEX" | while read -r v; do
   awk -v v="$v" '!/^#/ && $1==v{f=1} END{exit !f}' "$MANIFEST" || echo "$v"; done)
 if [ -n "$untested" ]; then
