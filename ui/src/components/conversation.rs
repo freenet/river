@@ -1545,7 +1545,10 @@ pub fn Conversation() -> Element {
         });
     }
 
-    let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
+    // The message being replied to, with the room it is in: only that
+    // room's composer shows it or sends with it.
+    let mut replying_to: Signal<Option<(ed25519_dalek::VerifyingKey, ReplyContext)>> =
+        use_signal(|| None);
 
     // State for delete confirmation modal
     let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
@@ -2219,7 +2222,12 @@ pub fn Conversation() -> Element {
     // it from there until the room admits it. `Err` is why it was not, for
     // the composer to show beside the draft it keeps.
     let handle_send_message = {
-        move |(message_text, reply_ctx): (String, Option<ReplyContext>)| -> Result<(), String> {
+        move |(composer_room, message_text, reply_ctx): (
+            ed25519_dalek::VerifyingKey,
+            String,
+            Option<ReplyContext>,
+        )|
+              -> Result<(), String> {
             if message_text.is_empty() {
                 warn!("Message is empty");
                 return Err("the message is empty".to_string());
@@ -2229,6 +2237,12 @@ pub fn Conversation() -> Element {
                 error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
                 return Err("no room is open".to_string());
             };
+            // The text and reply target were written in `composer_room`:
+            // they are never sent to another one.
+            if composer_room != current_room {
+                warn!("The open room changed under the composer; nothing sent");
+                return Err("the room changed, try again".to_string());
+            }
             // Read now from ROOMS, not from a render-time capture, so a room
             // or identity change since the last render is seen. Only what a
             // send needs, and the borrow ends here, before the message is
@@ -2366,7 +2380,10 @@ pub fn Conversation() -> Element {
         handle_edit_message(msg_id, new_text);
     });
     let on_group_reply = use_callback(move |ctx: ReplyContext| {
-        replying_to.set(Some(ctx));
+        let Some(room) = CURRENT_ROOM.peek().owner_key else {
+            return;
+        };
+        replying_to.set(Some((room, ctx)));
         if let Some(window) = web_sys::window() {
             if let Some(doc) = window.document() {
                 if let Some(el) = doc.get_element_by_id("message-input") {
@@ -3341,7 +3358,7 @@ pub fn Conversation() -> Element {
                                     MessageInput {
                                         room: composer_room,
                                         author: composer_author,
-                                        handle_send_message: move |msg: (String, Option<ReplyContext>)| {
+                                        handle_send_message: move |msg: (ed25519_dalek::VerifyingKey, String, Option<ReplyContext>)| {
                                             let handle = handle_send_message;
                                             handle(msg)
                                         },

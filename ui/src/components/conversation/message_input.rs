@@ -176,6 +176,17 @@ fn draft_with_failed(draft: &str, failed: &str) -> String {
     }
 }
 
+/// The reply target held for `room`: one started in another room is not this
+/// composer's to show or send.
+fn reply_for(
+    held: &Option<(VerifyingKey, ReplyContext)>,
+    room: &VerifyingKey,
+) -> Option<ReplyContext> {
+    held.as_ref()
+        .filter(|(reply_room, _)| reply_room == room)
+        .map(|(_, reply)| reply.clone())
+}
+
 /// Message input component that owns its own state.
 /// This isolates keystroke handling from the parent component,
 /// preventing expensive re-renders of the message list on each keystroke.
@@ -200,8 +211,15 @@ pub fn MessageInput(
     author: VerifyingKey,
     /// Queues the message (`Ok`) or says why it cannot (`Err`). Queued, it
     /// is in the outbox before anything this component defers afterwards.
-    handle_send_message: Callback<(String, Option<ReplyContext>), Result<(), String>>,
-    replying_to: Signal<Option<ReplyContext>>,
+    /// The first field is `room`: a send is refused if another room is open
+    /// by then.
+    handle_send_message: Callback<
+        (VerifyingKey, String, Option<ReplyContext>),
+        Result<(), String>,
+    >,
+    /// The reply target, with the room it was started in. Only `room`'s is
+    /// shown or sent here (`reply_for`).
+    replying_to: Signal<Option<(VerifyingKey, ReplyContext)>>,
     on_request_edit_last: EventHandler<()>,
     /// Maximum message content size in bytes (from room configuration).
     /// Bounds the ENCODED content (`RoomMessageBody::content_len`), which is
@@ -282,7 +300,7 @@ pub fn MessageInput(
         taken_back.set(Some(row.id));
         let draft = draft_with_failed(&message_text.peek(), &row.text);
         message_text.set(draft);
-        replying_to.set(row.reply.clone());
+        replying_to.set(row.reply.clone().map(|reply| (room, reply)));
         send_error.set(row.failed.clone().map(|reason| (room, reason)));
         outbox_commit::discard(room, row.id);
         crate::util::defer(auto_resize_message_input);
@@ -300,13 +318,12 @@ pub fn MessageInput(
             return;
         }
         let text = message_text.peek().to_string();
-        let within_limit =
-            measure_draft(&text, replying_to.peek().as_ref(), is_private) <= max_message_size;
+        let reply_ctx = reply_for(&replying_to.peek(), &room);
+        let within_limit = measure_draft(&text, reply_ctx.as_ref(), is_private) <= max_message_size;
         if text.is_empty() || !within_limit {
             return;
         }
-        let reply_ctx = replying_to.peek().clone();
-        match handle_send_message.call((text, reply_ctx)) {
+        match handle_send_message.call((room, text, reply_ctx)) {
             Ok(()) => {
                 queueing.set(true);
                 send_error.set(None);
@@ -316,7 +333,11 @@ pub fn MessageInput(
                 crate::util::defer(move || {
                     queueing.set(false);
                     message_text.set(String::new());
-                    replying_to.set(None);
+                    // Only the reply that was sent: one started in another
+                    // room since is that room's.
+                    if reply_for(&replying_to.peek(), &room).is_some() {
+                        replying_to.set(None);
+                    }
                 });
             }
             Err(reason) => send_error.set(Some((room, reason))),
@@ -336,7 +357,7 @@ pub fn MessageInput(
     };
     let shown_reply = match &sending {
         Some(row) => row.reply.clone(),
-        None => replying_to.read().clone(),
+        None => reply_for(&replying_to.read(), &room),
     };
     let shown_error = send_error
         .read()
@@ -599,6 +620,15 @@ mod tests {
     use super::*;
     use freenet_scaffold::util::FastHash;
     use river_core::room_state::message::MessageId;
+
+    #[test]
+    fn a_reply_is_held_for_the_room_it_was_started_in_only() {
+        let key = |b: u8| ed25519_dalek::SigningKey::from_bytes(&[b; 32]).verifying_key();
+        let held = Some((key(1), reply_ctx()));
+        assert_eq!(reply_for(&held, &key(1)), Some(reply_ctx()));
+        assert_eq!(reply_for(&held, &key(2)), None);
+        assert_eq!(reply_for(&None, &key(1)), None);
+    }
 
     #[test]
     fn a_failed_send_joins_the_draft_without_losing_either() {

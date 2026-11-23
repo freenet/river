@@ -204,7 +204,42 @@ test("a send failing while its room is not shown is given back when the room is"
   await expect(input(page)).toHaveValue("fails while away");
 });
 
-test("a send from a replaced identity is never committed", { tag: "@chromium-only" }, async ({ page }) => {
+test("a reply started in one room does not show in another", { tag: "@chromium-only" }, async ({ page }) => {
+  const target = await openRoomWithTarget(page);
+  await clickFooter(page, target, "message-reply-button");
+  await expect(replyPreview(page)).toContainText("react target");
+
+  await selectListedRoom(page, "Team Chat Room");
+  await expect(replyPreview(page), "another room has no reply target").toHaveCount(0);
+
+  await selectListedRoom(page, "Your Private Room");
+  await expect(replyPreview(page), "it is still held in its own room").toContainText("react target");
+});
+
+test("a failed reply is not carried into another room", { tag: "@chromium-only" }, async ({ page }) => {
+  const target = await openRoomWithTarget(page);
+  await clickFooter(page, target, "message-reply-button");
+  await expect(replyPreview(page)).toContainText("react target");
+  await callRiverTest(page, "failNextMessageSign");
+  await submitMessage(page, "private reply");
+  await expect(sendError(page)).toContainText("signing failed");
+  await expect(replyPreview(page)).toContainText("react target");
+
+  await selectListedRoom(page, "Team Chat Room");
+  await expect(replyPreview(page), "the failed reply's quote stays in its room").toHaveCount(0);
+  await input(page).fill("sent elsewhere");
+  await input(page).press("Enter");
+  const row = committedRow(page, "sent elsewhere");
+  await expect(row).toHaveCount(1);
+  await expect(row.getByTestId("reply-strip"), "and is not sent with this room's message").toHaveCount(0);
+  await expect(row, "nor is the failed text").not.toContainText("private reply");
+
+  await selectListedRoom(page, "Your Private Room");
+  await expect(replyPreview(page), "the reply is still with its draft").toContainText("react target");
+  await expect(input(page)).toHaveValue("private reply");
+});
+
+test("a send from a replaced identity is never committed",{ tag: "@chromium-only" }, async ({ page }) => {
   await openRoomWithComposer(page);
   await callRiverTest(page, "holdMessageSigning");
   await submitMessage(page, "from the old identity");
