@@ -45,7 +45,7 @@ pub const POW_DOMAIN_TAG: &[u8; 27] = b"river-room-admission-pow/v1";
 /// 100 ms (design section 5: "if the pair exceeds 100 ms, lower the ceilings"),
 /// and 20 and 20 still measured 100.3 ms on a default-sized room (window 100,
 /// 26 members). At 16 and 16 a one-message delta measured about 86 ms, and
-/// the worst-case delta (every entry and ban carried) about 128.6 ms, over the
+/// the worst-case delta (every entry and ban carried) about 130 ms, over the
 /// 100 ms gate, which is set for one-message deltas; the worst case needs a
 /// delta that fills the per-delta floor and is paid once per such delta.
 /// Raising it needs a measurement, not an opinion: the benchmark
