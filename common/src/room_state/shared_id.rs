@@ -400,13 +400,180 @@ mod tests {
             },
             &v,
         )];
-        let other = sk("other").verifying_key().to_bytes();
-        let chosen = BTreeMap::from([(v_id, Some(other))]);
+        // The kept key's record stays, so v's id is still held: w, signed by
+        // the dropped key, must go by its failed signature, not as an orphan.
+        let other = other_keys_with_id_of(&v.verifying_key())[0];
+        s.members.members.push(record(owner, other, &a));
+        let chosen = BTreeMap::from([(v_id, Some(other.to_bytes()))]);
         s.apply_shared_id_decision(&chosen, &p);
-        assert_eq!(s.members.members.len(), 1, "only a stays");
+        let held: Vec<VerifyingKey> = s
+            .members
+            .members
+            .iter()
+            .map(|m| m.member.member_vk)
+            .collect();
+        assert_eq!(held.len(), 2, "a and the kept key's record stay: {held:?}");
+        assert!(held.contains(&a.verifying_key()) && held.contains(&other));
         assert!(s.member_info.member_info.is_empty());
         assert!(s.recent_messages.messages.is_empty());
         s.verify(&s, &p).unwrap();
+    }
+
+    /// An id already held under two keys (a stored state can hold two) admits
+    /// no third key.
+    #[test]
+    fn an_id_held_under_two_keys_admits_no_third() {
+        let (o, v) = (sk("o"), sk("v"));
+        let owner = MemberId::from(&o.verifying_key());
+        let others = other_keys_with_id_of(&v.verifying_key());
+        let held = [
+            record(owner, v.verifying_key(), &o),
+            record(owner, others[0], &o),
+        ];
+        let third = record(owner, others[1], &o);
+        let admitted = crate::room_state::member::admit_one_new_key_per_id(vec![&third], &held);
+        assert!(admitted.is_empty());
+        let one_held =
+            crate::room_state::member::admit_one_new_key_per_id(vec![&third], &held[..1]);
+        assert_eq!(one_held.len(), 1, "with one key held, a second is admitted");
+    }
+
+    /// Two shared ids, one invited by the other. `x`'s member `v` has no
+    /// member_info and the other key `f` has the lower digest, so `f` is
+    /// kept; `v`'s invitee `w` (no member_info, lower digest than the other
+    /// key `w2` for its id) is then reachable only through the dropped key.
+    /// The decision is repeated over what the kept keys reach, so `w2` is
+    /// kept and `w` goes, instead of `w` winning on digest and then being
+    /// dropped by its failed signature, which would leave `w`'s id empty.
+    #[test]
+    fn a_shared_id_reachable_only_through_a_dropped_key_is_decided_again() {
+        let (o, a, b) = (sk("o"), sk("a"), sk("b"));
+        let (mut s, p) = room(&o);
+        let owner = p.owner_id();
+        let inviters = [&o, &a, &b];
+        let digest = |m: &AuthorizedMember| evidence_digest(m);
+        // Find keys v, w and forged f (v's id), w2 (w's id) with
+        // digest(f) < digest(v) and digest(w) < digest(w2).
+        let (v_rec, f_rec, w_rec, w2_rec) = (0..64)
+            .find_map(|n| {
+                let v = sk(&format!("v{n}"));
+                let w = sk(&format!("w{n}"));
+                let v_rec = record(owner, v.verifying_key(), &a);
+                let w_rec = record(owner, w.verifying_key(), &v);
+                let f_rec = other_keys_with_id_of(&v.verifying_key())
+                    .into_iter()
+                    .flat_map(|k| inviters.map(|i| record(owner, k, i)))
+                    .find(|r| digest(r) < digest(&v_rec))?;
+                let w2_rec = other_keys_with_id_of(&w.verifying_key())
+                    .into_iter()
+                    .flat_map(|k| inviters.map(|i| record(owner, k, i)))
+                    .find(|r| digest(r) > digest(&w_rec))?;
+                Some((v_rec, f_rec, w_rec, w2_rec))
+            })
+            .expect("a fixture with the needed digest orders");
+        s.members.members = vec![
+            record(owner, a.verifying_key(), &o),
+            record(owner, b.verifying_key(), &o),
+            v_rec.clone(),
+            f_rec.clone(),
+            w_rec.clone(),
+            w2_rec.clone(),
+        ];
+        s.resolve_shared_ids(&p);
+        let held = &s.members.members;
+        assert!(held.contains(&f_rec) && !held.contains(&v_rec));
+        assert!(held.contains(&w2_rec), "w's id keeps the key it can reach");
+        assert!(!held.contains(&w_rec));
+        s.verify(&s, &p).unwrap();
+    }
+
+    /// An evidence record deeper than the depth cap does not compete: the
+    /// member record under the other key is kept even though the deep record
+    /// has a member_info, since the depth prune would drop the deep record
+    /// right after and leave the id with nothing.
+    #[test]
+    fn an_evidence_record_past_the_depth_cap_does_not_compete() {
+        let o = sk("o");
+        let (mut s, p) = room(&o);
+        let owner = p.owner_id();
+        let chain: Vec<SigningKey> = (0..4).map(|i| sk(&format!("c{i}"))).collect();
+        let v = sk("v");
+        let mut evidence = vec![record(owner, chain[0].verifying_key(), &o)];
+        for i in 1..4 {
+            evidence.push(record(owner, chain[i].verifying_key(), &chain[i - 1]));
+        }
+        // v at depth 5, past the cap of 4.
+        evidence.push(record(owner, v.verifying_key(), &chain[3]));
+        s.ban_evidence.members = evidence;
+        let f = other_keys_with_id_of(&v.verifying_key())[0];
+        s.members.members = vec![record(owner, f, &o)];
+        let v_id = MemberId::from(&v.verifying_key());
+        s.member_info.member_info = vec![AuthorizedMemberInfo::new(
+            MemberInfo::new_public(v_id, 1, "v".into()),
+            &v,
+        )];
+        let kept = s.resolve_shared_ids(&p);
+        assert_eq!(kept.get(&v_id), Some(&f));
+        assert!(s.members.members.iter().any(|m| m.member.member_vk == f));
+    }
+
+    /// `dedup_to_canonical_per_key` keeps one record per key for an id held
+    /// under two keys, where the plain dedup keeps one per id.
+    #[test]
+    fn member_info_is_ranked_within_one_key_while_an_id_is_shared() {
+        let (k1, k2) = (sk("k1"), sk("k2"));
+        let id = MemberId::from(&sk("v").verifying_key());
+        let mut infos = crate::room_state::member_info::MemberInfoV1 {
+            member_info: vec![
+                AuthorizedMemberInfo::new(MemberInfo::new_public(id, 5, "one".into()), &k1),
+                AuthorizedMemberInfo::new(MemberInfo::new_public(id, 9, "two".into()), &k2),
+            ],
+        };
+        let shared = HashMap::from([(id, vec![k1.verifying_key(), k2.verifying_key()])]);
+        infos.dedup_to_canonical_per_key(&shared);
+        assert_eq!(infos.member_info.len(), 2, "each key keeps its record");
+    }
+
+    /// The evidence chain walk is memoized: many records invited by one
+    /// shared ancestor chain walk that chain once, not once per record.
+    #[test]
+    fn evidence_chains_sharing_ancestors_are_walked_once() {
+        let o = sk("o");
+        let (mut s, p) = room(&o);
+        let owner = p.owner_id();
+        let (c1, c2) = (sk("c1"), sk("c2"));
+        s.members.members = vec![record(owner, c1.verifying_key(), &o)];
+        let leaves: Vec<SigningKey> = (0..60).map(|i| sk(&format!("leaf{i}"))).collect();
+        // One unverified ban per leaf, by the leaf, makes it and its
+        // ancestors referenced.
+        s.bans = BansV1(
+            leaves
+                .iter()
+                .map(|l| {
+                    AuthorizedUserBan::new(
+                        UserBan {
+                            owner_member_id: owner,
+                            banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                            banned_user: MemberId::from(&sk("target").verifying_key()),
+                        },
+                        MemberId::from(&l.verifying_key()),
+                        l,
+                    )
+                })
+                .collect(),
+        );
+        let mut delta = vec![record(owner, c2.verifying_key(), &c1)];
+        delta.extend(leaves.iter().map(|l| record(owner, l.verifying_key(), &c2)));
+        let parent = s.clone();
+        let mut evidence = BanEvidenceV1::default();
+        let before = crate::room_state::ban_evidence::tests::chain_walks();
+        evidence.apply_delta(&parent, &p, &Some(delta)).unwrap();
+        let walks = crate::room_state::ban_evidence::tests::chain_walks() - before;
+        assert_eq!(evidence.members.len(), 61);
+        assert!(
+            walks <= 3 * 61,
+            "{walks} uncached chain walks for 61 records"
+        );
     }
 
     /// One delta naming many keys for one id, each signed into the room by a
