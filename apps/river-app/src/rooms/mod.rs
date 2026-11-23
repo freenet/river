@@ -281,6 +281,17 @@ impl Link {
         });
     }
 
+    /// What was handed to the background work and not yet taken (tests).
+    #[cfg(test)]
+    pub(crate) fn take_sent(&self) -> Vec<Command> {
+        self.inner
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_iter()
+            .collect()
+    }
+
     /// The window came to the front: read again every room the node has said nothing about
     /// lately, as the web UI does when its page becomes visible.
     pub fn resync(&self) {

@@ -3464,6 +3464,30 @@ mod tests {
         rt
     }
 
+    /// Coming back to the front asks the background work to read quiet rooms again
+    /// (freenet/river#971), once per return: a focus event while already in front asks nothing.
+    #[test]
+    fn coming_to_the_front_asks_for_a_read_once_per_return() {
+        let mut state = RiverApp::detached();
+        let link = rooms::Link::new(None, |_| {});
+        state.link = Some(link.clone());
+        let resyncs = |link: &rooms::Link| {
+            link.take_sent()
+                .iter()
+                .filter(|c| matches!(c.action, rooms::outbox::Action::Resync))
+                .count()
+        };
+        state.focus_changed(false);
+        assert_eq!(resyncs(&link), 0);
+        state.focus_changed(true);
+        assert_eq!(resyncs(&link), 1);
+        state.focus_changed(true);
+        assert_eq!(resyncs(&link), 0, "already in front");
+        state.focus_changed(false);
+        state.focus_changed(true);
+        assert_eq!(resyncs(&link), 1);
+    }
+
     #[test]
     fn each_stage_offers_the_right_actions() {
         let cases = [
