@@ -11,7 +11,7 @@ use super::mention::{
 };
 use super::outbox::{PendingRow, OUTBOX};
 use super::outbox_commit;
-use super::{last_good_for_room, queue_message, ReplyContext};
+use super::{queue_message, value_for_room, ReplyContext};
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::RoomMessageBody;
@@ -274,11 +274,10 @@ fn clear_error_of(mut send_error: Signal<Option<(VerifyingKey, String)>>, room: 
 ///
 /// # Sending
 ///
-/// Enter and Send go through one guard (`send_message`), then
-/// `queue_message`. An accepted send
-/// enters the outbox (`outbox.rs`), and while it is signed and admitted the
-/// composer shows its text and reply target from there, read-only, with Send
-/// disabled; further Enters and clicks do nothing. Admitted, it leaves the
+/// Enter and Send go through one guard (`send_message`), then `queue_message`.
+/// An accepted send enters the outbox (`outbox.rs`), and while it is signed
+/// and admitted the composer shows its text and reply target from there,
+/// read-only, with Send disabled; further Enters and clicks do nothing. Admitted, it leaves the
 /// outbox, the message shows once in the history, and the composer is empty
 /// and ready for the next. If it fails (signing, or the room refuses it), the
 /// composer takes the text and reply target back as its editable draft, with
@@ -286,7 +285,7 @@ fn clear_error_of(mut send_error: Signal<Option<(VerifyingKey, String)>>, room: 
 /// checks. A send belongs to the room and identity it was written in: another
 /// room's composer never shows it, and its outcome never clears another
 /// room's draft (`room`, `author`). So does a draft (`RoomDraft`) and a reply
-/// target (`last_good_for_room`): neither shows, or is sent, in another room.
+/// target (`value_for_room`): neither shows, or is sent, in another room.
 #[component]
 pub fn MessageInput(
     /// The open room and the identity it sends as.
@@ -339,7 +338,7 @@ pub fn MessageInput(
         }
         Err(_) => {
             crate::util::signal_guard::schedule_nudge();
-            last_good_for_room(&last_good.peek(), &(room, author)).flatten()
+            value_for_room(&last_good.peek(), &(room, author)).flatten()
         }
     };
     // Being signed or admitted: shown read-only until it settles.
@@ -396,7 +395,7 @@ pub fn MessageInput(
             return;
         }
         let text = draft.peek();
-        let reply_ctx = last_good_for_room(&replying_to.peek(), &room);
+        let reply_ctx = value_for_room(&replying_to.peek(), &room);
         let within_limit = measure_draft(&text, reply_ctx.as_ref(), is_private) <= max_message_size;
         if text.is_empty() || !within_limit {
             return;
@@ -413,7 +412,7 @@ pub fn MessageInput(
                     draft.set(String::new());
                     // Only the reply that was sent: one started in another
                     // room since is that room's.
-                    if last_good_for_room(&replying_to.peek(), &room).is_some() {
+                    if value_for_room(&replying_to.peek(), &room).is_some() {
                         replying_to.set(None);
                     }
                 });
@@ -435,7 +434,7 @@ pub fn MessageInput(
     };
     let shown_reply = match &sending {
         Some(row) => row.reply.clone(),
-        None => last_good_for_room(&replying_to.read(), &room),
+        None => value_for_room(&replying_to.read(), &room),
     };
     let shown_error = send_error
         .read()
@@ -701,9 +700,9 @@ mod tests {
     fn a_reply_is_held_for_the_room_it_was_started_in_only() {
         let key = |b: u8| ed25519_dalek::SigningKey::from_bytes(&[b; 32]).verifying_key();
         let held = Some((key(1), reply_ctx()));
-        assert_eq!(last_good_for_room(&held, &key(1)), Some(reply_ctx()));
-        assert_eq!(last_good_for_room(&held, &key(2)), None);
-        assert_eq!(last_good_for_room::<_, ReplyContext>(&None, &key(1)), None);
+        assert_eq!(value_for_room(&held, &key(1)), Some(reply_ctx()));
+        assert_eq!(value_for_room(&held, &key(2)), None);
+        assert_eq!(value_for_room::<_, ReplyContext>(&None, &key(1)), None);
     }
 
     #[test]

@@ -1126,9 +1126,9 @@ fn newest_key(items: &[DisplayItem]) -> Option<NewestKey> {
     items.last().and_then(display_item_newest)
 }
 
-/// The value a contended read stands in with: the last good one, but only if
-/// it was taken for `room`. Another room's rows never render in this one.
-fn last_good_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) -> Option<T> {
+/// The value `cache` holds, only if it was stored for `room`: what a
+/// contended read stands in with, or a reply target, is never another room's.
+fn value_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) -> Option<T> {
     cache
         .as_ref()
         .filter(|(cached, _)| cached == room)
@@ -1560,7 +1560,7 @@ pub fn Conversation() -> Element {
             // contended read renders the open room as last seen, never
             // nothing: with no rows the container collapses, `scrollTop`
             // drops to 0, and nothing puts the reader back when the rows
-            // return. Only ever the same room's data (`last_good_for_room`).
+            // return. Only ever the same room's data (`value_for_room`).
             match ROOMS.try_read() {
                 Ok(rooms) => {
                     let fresh = rooms.map.get(&key).cloned().map(Rc::new);
@@ -1572,7 +1572,7 @@ pub fn Conversation() -> Element {
                     // renders it again (freenet/river#555).
                     crate::util::signal_guard::anchor();
                     crate::util::signal_guard::schedule_nudge();
-                    last_good_for_room(&last_good_room.borrow(), &key)
+                    value_for_room(&last_good_room.borrow(), &key)
                 }
             }
         } else {
@@ -1930,7 +1930,7 @@ pub fn Conversation() -> Element {
         let Ok(rooms) = ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             // This room's groups as last computed: another room's never.
-            return last_good_for_room(&last_good_groups.borrow(), &key).flatten();
+            return value_for_room(&last_good_groups.borrow(), &key).flatten();
         };
         let groups = rooms.map.get(&key).and_then(|room_data| {
             let room_state = &room_data.room_state;
