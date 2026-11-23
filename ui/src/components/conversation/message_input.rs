@@ -11,7 +11,7 @@ use super::mention::{
 };
 use super::outbox::{PendingRow, OUTBOX};
 use super::outbox_commit;
-use super::ReplyContext;
+use super::{last_good_for_room, queue_message, ReplyContext};
 use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::RoomMessageBody;
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// Encoded `content_len()` the draft will have when sent — the measure the
 /// contract enforces (`max_message_size` bounds encoded bytes, not typed
-/// text). Mirrors `handle_send_message`'s body construction: replies embed
+/// text). Mirrors `queue_message`'s body construction: replies embed
 /// the quoted author + preview, private rooms add the AES-GCM tag. Gating on
 /// `text.len()` instead silently lost messages in the encoding-overhead gap
 /// (the contract prunes them after the draft is already cleared).
@@ -169,60 +169,74 @@ fn get_message_textarea() -> Option<web_sys::HtmlTextAreaElement> {
 /// A room and the identity it is written as: whose draft it is.
 type DraftKey = (VerifyingKey, VerifyingKey);
 
-/// The composer's drafts, one per room and identity, and which one is open.
-/// Text typed (or a failed send taken back) in a room stays in that room.
+/// The composer's drafts, one per room and identity. Held here rather than in
+/// `MessageInput`, which is unmounted while the open room shows a notice
+/// instead (syncing, or a private room's key not here yet): a draft typed in
+/// another room must outlive that, and still hold a reload
+/// (`has_unsent_draft`). Only the composer subscribes.
+static DRAFTS: GlobalSignal<HashMap<DraftKey, String>> = Signal::global(HashMap::new);
+
+/// The open room's draft. Text typed (or a failed send taken back) in a
+/// room stays in that room.
 #[derive(Clone, Copy, PartialEq)]
 struct RoomDraft {
-    drafts: Signal<HashMap<DraftKey, String>>,
     key: DraftKey,
 }
 
 impl RoomDraft {
     /// The open room's draft. Subscribes the caller.
     fn text(&self) -> String {
-        self.drafts
-            .read()
-            .get(&self.key)
-            .cloned()
-            .unwrap_or_default()
+        DRAFTS.read().get(&self.key).cloned().unwrap_or_default()
     }
 
     fn peek(&self) -> String {
-        self.drafts
-            .peek()
-            .get(&self.key)
-            .cloned()
-            .unwrap_or_default()
+        DRAFTS.peek().get(&self.key).cloned().unwrap_or_default()
     }
 
     /// An emptied draft leaves the map, so it holds only real drafts.
+    ///
+    /// Written synchronously, from `oninput` too: deferring would lag the
+    /// textarea and drop keystrokes (`dioxus-signal-safety.md`, "Bind
+    /// `oninput`"). Only the composer's render subscribes to `DRAFTS`.
     fn set(&mut self, text: String) {
         if text.is_empty() {
-            if self.drafts.peek().contains_key(&self.key) {
-                self.drafts.write().remove(&self.key);
+            if DRAFTS.peek().contains_key(&self.key) {
+                DRAFTS.write().remove(&self.key);
             }
         } else {
-            self.drafts.write().insert(self.key, text);
+            DRAFTS.write().insert(self.key, text);
         }
-    }
-
-    /// Whether a room other than the open one has a draft, among the rooms
-    /// `held` says are still there as the identity that wrote it. A draft
-    /// whose room is gone does not count, or it would hold a reload back for
-    /// the life of the page (`generation_watch.rs::user_is_busy`).
-    fn other_rooms_have_text(&self, held: impl Fn(&DraftKey) -> bool) -> bool {
-        other_drafts(&self.drafts.read(), &self.key, held)
     }
 }
 
-fn other_drafts(
-    drafts: &HashMap<DraftKey, String>,
-    open: &DraftKey,
-    held: impl Fn(&DraftKey) -> bool,
-) -> bool {
+/// Whether a draft waits that a reload would lose: one with text, in a room
+/// still held as the identity that wrote it. A draft whose room is gone does
+/// not count, or it would hold a reload back for the life of the page.
+/// Unreadable means "cannot tell": busy, as `user_is_busy` treats it.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn has_unsent_draft() -> bool {
+    let Ok(drafts) = DRAFTS.try_peek() else {
+        return true;
+    };
+    if drafts.is_empty() {
+        return false;
+    }
+    let Ok(rooms) = crate::components::app::ROOMS.try_peek() else {
+        return true;
+    };
+    any_held_draft(&drafts, |(room, author)| {
+        rooms
+            .map
+            .get(room)
+            .is_some_and(|r| r.self_verifying_key() == Some(*author))
+    })
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn any_held_draft(drafts: &HashMap<DraftKey, String>, held: impl Fn(&DraftKey) -> bool) -> bool {
     drafts
         .iter()
-        .any(|(key, text)| key != open && !text.trim().is_empty() && held(key))
+        .any(|(key, text)| !text.trim().is_empty() && held(key))
 }
 
 impl MentionText for RoomDraft {
@@ -246,17 +260,6 @@ fn draft_with_failed(draft: &str, failed: &str) -> String {
     }
 }
 
-/// The reply target held for `room`: one started in another room is not this
-/// composer's to show or send.
-fn reply_for(
-    held: &Option<(VerifyingKey, ReplyContext)>,
-    room: &VerifyingKey,
-) -> Option<ReplyContext> {
-    held.as_ref()
-        .filter(|(reply_room, _)| reply_room == room)
-        .map(|(_, reply)| reply.clone())
-}
-
 /// Clear the send error if it is `room`'s: typing or sending in another room
 /// leaves a failed send's reason beside its draft.
 fn clear_error_of(mut send_error: Signal<Option<(VerifyingKey, String)>>, room: &VerifyingKey) {
@@ -271,7 +274,8 @@ fn clear_error_of(mut send_error: Signal<Option<(VerifyingKey, String)>>, room: 
 ///
 /// # Sending
 ///
-/// Enter and Send go through one guard (`send_message`). An accepted send
+/// Enter and Send go through one guard (`send_message`), then
+/// `queue_message`. An accepted send
 /// enters the outbox (`outbox.rs`), and while it is signed and admitted the
 /// composer shows its text and reply target from there, read-only, with Send
 /// disabled; further Enters and clicks do nothing. Admitted, it leaves the
@@ -282,22 +286,14 @@ fn clear_error_of(mut send_error: Signal<Option<(VerifyingKey, String)>>, room: 
 /// checks. A send belongs to the room and identity it was written in: another
 /// room's composer never shows it, and its outcome never clears another
 /// room's draft (`room`, `author`). So does a draft (`RoomDraft`) and a reply
-/// target (`reply_for`): neither shows, or is sent, in another room.
+/// target (`last_good_for_room`): neither shows, or is sent, in another room.
 #[component]
 pub fn MessageInput(
     /// The open room and the identity it sends as.
     room: VerifyingKey,
     author: VerifyingKey,
-    /// Queues the message (`Ok`) or says why it cannot (`Err`). Queued, it
-    /// is in the outbox before anything this component defers afterwards.
-    /// The first field is `room`: a send is refused if another room is open
-    /// by then.
-    handle_send_message: Callback<
-        (VerifyingKey, String, Option<ReplyContext>),
-        Result<(), String>,
-    >,
     /// The reply target, with the room it was started in. Only `room`'s is
-    /// shown or sent here (`reply_for`).
+    /// shown or sent here.
     replying_to: Signal<Option<(VerifyingKey, ReplyContext)>>,
     on_request_edit_last: EventHandler<()>,
     /// Maximum message content size in bytes (from room configuration).
@@ -312,10 +308,8 @@ pub fn MessageInput(
     /// so it does not affect keystroke-level re-rendering.
     members: Vec<(MemberId, String)>,
 ) -> Element {
-    // Own the message state locally - keystrokes only re-render this component
-    let drafts = use_signal(HashMap::<DraftKey, String>::new);
+    // Keystrokes only re-render this component: only it reads `DRAFTS`.
     let mut draft = RoomDraft {
-        drafts,
         key: (room, author),
     };
     let mut show_emoji_picker = use_signal(|| false);
@@ -325,7 +319,7 @@ pub fn MessageInput(
     // in that room.
     let mut send_error = use_signal(|| None as Option<(VerifyingKey, String)>);
     // Set from an accepted send until the outbox holds it (the defer queued
-    // after `handle_send_message`'s): a second Enter or click before then,
+    // after `queue_message`'s): a second Enter or click before then,
     // even before the next render, does nothing.
     let mut queueing = use_hook(|| CopyValue::new(false));
     // The failed send last taken back, so a render before its discard lands
@@ -345,11 +339,7 @@ pub fn MessageInput(
         }
         Err(_) => {
             crate::util::signal_guard::schedule_nudge();
-            last_good
-                .peek()
-                .as_ref()
-                .filter(|(key, _)| *key == (room, author))
-                .and_then(|(_, row)| row.clone())
+            last_good_for_room(&last_good.peek(), &(room, author)).flatten()
         }
     };
     // Being signed or admitted: shown read-only until it settles.
@@ -385,7 +375,6 @@ pub fn MessageInput(
         // `draft` is rebuilt here: this closure is the first render's, and
         // the room is this run's.
         let mut draft = RoomDraft {
-            drafts,
             key: (room, author),
         };
         draft.set(draft_with_failed(&draft.peek(), &row.text));
@@ -407,12 +396,12 @@ pub fn MessageInput(
             return;
         }
         let text = draft.peek();
-        let reply_ctx = reply_for(&replying_to.peek(), &room);
+        let reply_ctx = last_good_for_room(&replying_to.peek(), &room);
         let within_limit = measure_draft(&text, reply_ctx.as_ref(), is_private) <= max_message_size;
         if text.is_empty() || !within_limit {
             return;
         }
-        match handle_send_message.call((room, text, reply_ctx)) {
+        match queue_message(room, text, reply_ctx) {
             Ok(()) => {
                 queueing.set(true);
                 clear_error_of(send_error, &room);
@@ -424,7 +413,7 @@ pub fn MessageInput(
                     draft.set(String::new());
                     // Only the reply that was sent: one started in another
                     // room since is that room's.
-                    if reply_for(&replying_to.peek(), &room).is_some() {
+                    if last_good_for_room(&replying_to.peek(), &room).is_some() {
                         replying_to.set(None);
                     }
                 });
@@ -446,25 +435,13 @@ pub fn MessageInput(
     };
     let shown_reply = match &sending {
         Some(row) => row.reply.clone(),
-        None => reply_for(&replying_to.read(), &room),
+        None => last_good_for_room(&replying_to.read(), &room),
     };
     let shown_error = send_error
         .read()
         .as_ref()
         .filter(|(r, _)| *r == room && sending.is_none())
         .map(|(_, reason)| reason.clone());
-
-    // Unreadable means "cannot tell": counted, as the reload check does.
-    let other_drafts_wait = draft.other_rooms_have_text(|(room, author)| {
-        crate::components::app::ROOMS
-            .try_peek()
-            .map_or(true, |rooms| {
-                rooms
-                    .map
-                    .get(room)
-                    .is_some_and(|r| r.self_verifying_key() == Some(*author))
-            })
-    });
 
     // Once per render, for the counter and Send; `send_message` re-measures on click.
     let encoded_bytes = measure_draft(&shown_text, shown_reply.as_ref(), is_private);
@@ -531,9 +508,6 @@ pub fn MessageInput(
                     "data-testid": "message-composer-box",
                     // A send being signed: the box shows it read-only.
                     "data-sending": if locked { "true" } else { "false" },
-                    // A draft waits in a room that is not shown: a reload
-                    // would lose it (`generation_watch.rs::user_is_busy`).
-                    "data-other-drafts": if other_drafts_wait { "true" } else { "false" },
                     class: "flex items-end gap-0.5 px-1.5 bg-surface border border-border rounded-xl focus-within:border-text-muted transition-colors",
                     onsubmit: move |evt| {
                         evt.prevent_default();
@@ -727,29 +701,24 @@ mod tests {
     fn a_reply_is_held_for_the_room_it_was_started_in_only() {
         let key = |b: u8| ed25519_dalek::SigningKey::from_bytes(&[b; 32]).verifying_key();
         let held = Some((key(1), reply_ctx()));
-        assert_eq!(reply_for(&held, &key(1)), Some(reply_ctx()));
-        assert_eq!(reply_for(&held, &key(2)), None);
-        assert_eq!(reply_for(&None, &key(1)), None);
+        assert_eq!(last_good_for_room(&held, &key(1)), Some(reply_ctx()));
+        assert_eq!(last_good_for_room(&held, &key(2)), None);
+        assert_eq!(last_good_for_room::<_, ReplyContext>(&None, &key(1)), None);
     }
 
     #[test]
-    fn only_another_held_rooms_real_draft_counts_as_waiting() {
+    fn only_a_held_rooms_real_draft_counts_as_waiting() {
         let key = |b: u8| ed25519_dalek::SigningKey::from_bytes(&[b; 32]).verifying_key();
-        let (open, other, gone) = ((key(1), key(9)), (key(2), key(9)), (key(3), key(9)));
+        let (room, gone) = ((key(1), key(9)), (key(3), key(9)));
         let held = |k: &DraftKey| *k != gone;
         let mut drafts = HashMap::new();
-        drafts.insert(open, "the open room's draft".to_string());
-        assert!(!other_drafts(&drafts, &open, held));
-        drafts.insert(other, "  \n".to_string());
-        assert!(!other_drafts(&drafts, &open, held), "blank is no draft");
+        assert!(!any_held_draft(&drafts, held));
+        drafts.insert(room, "  \n".to_string());
+        assert!(!any_held_draft(&drafts, held), "blank is no draft");
         drafts.insert(gone, "left behind".to_string());
-        assert!(!other_drafts(&drafts, &open, held), "its room is gone");
-        drafts.insert(other, "typed elsewhere".to_string());
-        assert!(other_drafts(&drafts, &open, held));
-        assert!(
-            other_drafts(&drafts, &other, held),
-            "seen from the other room"
-        );
+        assert!(!any_held_draft(&drafts, held), "its room is gone");
+        drafts.insert(room, "typed".to_string());
+        assert!(any_held_draft(&drafts, held));
     }
 
     #[test]

@@ -1104,11 +1104,9 @@ mod runtime {
             }
         }
         // A draft in a room that is not shown: the composer keeps one per
-        // room, and only the open room's is in the textarea.
-        if matches!(
-            document.query_selector("[data-other-drafts=\"true\"]"),
-            Ok(Some(_))
-        ) {
+        // room and identity, even while the open room shows a notice
+        // instead of the composer.
+        if crate::components::conversation::composer_has_unsent_draft() {
             return true;
         }
         if matches!(document.query_selector("[id^=\"edit-msg-\"]"), Ok(Some(_))) {
@@ -3038,6 +3036,10 @@ mod tests {
             busy.contains("mobile_surface_is_open()"),
             "an open mobile message sheet must hold it too"
         );
+        assert!(
+            busy.contains("composer_has_unsent_draft()"),
+            "a draft in a room that is not shown must hold it too"
+        );
         let flush_at = code.find("async fn reload_after_flush(").expect("flush");
         let flush = &code[flush_at..];
         let wait = flush
@@ -3058,12 +3060,8 @@ mod tests {
     #[test]
     fn busy_detection_selectors_still_exist() {
         let src = |s: &str| crate::util::strip_comments(s);
-        let composer = src(include_str!("../../conversation/message_input.rs"));
-        assert!(composer.contains("id: \"message-input\""));
-        assert!(composer.contains("\"data-other-drafts\": if other_drafts_wait"));
-        assert!(
-            src(include_str!("generation_watch.rs")).contains("[data-other-drafts=\\\"true\\\"]")
-        );
+        assert!(src(include_str!("../../conversation/message_input.rs"))
+            .contains("id: \"message-input\""));
         assert!(src(include_str!("../../conversation.rs")).contains("\"edit-msg-{"));
         for (file, body) in [
             (

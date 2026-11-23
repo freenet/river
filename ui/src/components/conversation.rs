@@ -51,6 +51,8 @@ mod mobile_message_sheet;
 mod mobile_sheet_drag;
 mod mobile_surface;
 #[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+pub(crate) use self::message_input::has_unsent_draft as composer_has_unsent_draft;
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 pub(crate) use self::mobile_surface::narrow_for_render as narrow_window_for_render;
 mod pending_effects;
@@ -1391,6 +1393,159 @@ fn banner_sync_read_fails() -> bool {
     false
 }
 
+/// Sends `message_text` in `room`, the composer's room, as a reply to
+/// `reply_ctx` if there is one. `Ok` means the message is queued: it enters
+/// the outbox in the `defer` below, before anything the composer defers after
+/// this returns, and the composer shows it from there until the room admits
+/// it. `Err` is why it was not, for the composer to show beside the draft it
+/// keeps.
+fn queue_message(
+    room: ed25519_dalek::VerifyingKey,
+    message_text: String,
+    reply_ctx: Option<ReplyContext>,
+) -> Result<(), String> {
+    if message_text.is_empty() {
+        return Err("the message is empty".to_string());
+    }
+    let open_room = { CURRENT_ROOM.read().owner_key };
+    let Some(current_room) = open_room else {
+        error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
+        return Err("no room is open".to_string());
+    };
+    // The text and reply target were written in `room`:
+    // they are never sent to another one.
+    if room != current_room {
+        return Err("the room changed, try again".to_string());
+    }
+    // Read now from ROOMS, not from a render-time capture, so a room
+    // or identity change since the last render is seen. Only what a
+    // send needs, and the borrow ends here, before the message is
+    // built or queued.
+    let (identity, secret, max_size) = {
+        let Ok(rooms) = ROOMS.try_read() else {
+            warn!("ROOMS signal busy while sending; the draft is kept");
+            return Err("the room is busy, try again".to_string());
+        };
+        let Some(room_data) = rooms.map.get(&current_room) else {
+            error!(
+                "Cannot send message: room data not loaded (ROOMS has no entry for current room)"
+            );
+            return Err("the room is not loaded yet".to_string());
+        };
+        let Some(identity) = ActionIdentity::of(room_data) else {
+            error!("Cannot send message: no identity for this room");
+            return Err("this device has no identity for this room".to_string());
+        };
+        (
+            identity,
+            action_secret(room_data),
+            room_data
+                .room_state
+                .configuration
+                .configuration
+                .max_message_size,
+        )
+    };
+
+    // Everything up to the outbox insert is synchronous: the message
+    // must show, pending, before anything is awaited
+    // (freenet/river#512). Signing happens after, through the chat
+    // delegate (`outbox_commit`).
+    //
+    // Build content based on whether this is a reply or regular
+    // message. A private body keeps what it was sealed from, so it
+    // can be sealed again if the room's secret rotates while it is
+    // being signed (`seal.rs`).
+    let reply = reply_ctx.clone();
+    let content = match (reply_ctx, secret) {
+        (Some(reply), None) => (
+            RoomMessageBody::reply(
+                message_text.clone(),
+                reply.message_id,
+                reply.author_name,
+                reply.content_preview,
+            ),
+            None,
+        ),
+        (None, None) => (RoomMessageBody::public(message_text.clone()), None),
+        (_, Some(None)) => {
+            // The composer is not offered without the secret (see
+            // `missing_room_secret`); this is the backstop. A public
+            // body in a private room is not admitted.
+            error!("Cannot send: this private room's secret is not on this device");
+            return Err("this private room's key is not on this device".to_string());
+        }
+        (reply, Some(Some((secret, version)))) => {
+            // Never below a version this device already sealed a
+            // message under here: a failed send sent again waits
+            // for that key, as the outbox's own reseal does.
+            let Ok(outbox) = OUTBOX.try_peek() else {
+                warn!("OUTBOX signal busy while sending; the draft is kept");
+                return Err("the room is busy, try again".to_string());
+            };
+            if !outbox.may_seal_at(&current_room, version) {
+                warn!("Send refused: this device's room key (v{version}) is older than one it already sealed under");
+                return Err(outbox::KEY_NOT_YET_HERE.to_string());
+            }
+            drop(outbox);
+            let seal = match reply {
+                Some(reply) => SealInput::Reply {
+                    text: message_text.clone(),
+                    message_id: reply.message_id,
+                    author_name: reply.author_name,
+                    content_preview: reply.content_preview,
+                },
+                None => SealInput::Text(message_text.clone()),
+            };
+            (seal.seal(&secret, version), Some(seal))
+        }
+    };
+
+    // Safety net: check encoded content size before signing. Should
+    // be unreachable: the input gate measures the same encoded size
+    // via RoomMessageBody::measure_* (pinned equal to content_len()
+    // by river-core tests). If this fires, the measure helpers have
+    // drifted from the body construction above. The send is refused
+    // and the composer keeps the draft. Fix the drift, don't relax
+    // this check.
+    let content_size = content.0.content_len();
+    if content_size > max_size {
+        error!(
+            "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; send refused, draft kept",
+            content_size, max_size
+        );
+        return Err(format!(
+            "the message is too long ({content_size} of {max_size} bytes)"
+        ));
+    }
+
+    let Some(message) = unsigned_message(current_room, &identity.author_vk, content) else {
+        return Err("the message could not be encoded".to_string());
+    };
+
+    crate::util::debug_log("[send] queued, signing via the delegate");
+    // Defer the signal writes to a clean execution context to
+    // prevent RefCell re-entrant borrow panics.
+    crate::util::defer(move || {
+        outbox_commit::submit_now(
+            current_room,
+            PendingKind::Send {
+                text: message_text,
+                reply,
+            },
+            identity.author_vk,
+            vec![message],
+            identity.fallback_key,
+        );
+        // The conversation goes to the end when the room admits
+        // the message (`outbox_commit::take_own_send_committed`),
+        // not now: nothing of it is in the history yet.
+        #[cfg(target_arch = "wasm32")]
+        request_permission_on_first_message();
+    });
+    Ok(())
+}
+
 #[component]
 pub fn Conversation() -> Element {
     // The open room as the last render whose `ROOMS` read succeeded saw it.
@@ -2213,161 +2368,6 @@ pub fn Conversation() -> Element {
                     );
                 });
             }
-        }
-    };
-
-    // Message sending handler, called by `MessageInput`. `Ok` means the
-    // message is queued: it enters the outbox in the `defer` below, before
-    // anything the composer defers after this returns, and the composer shows
-    // it from there until the room admits it. `Err` is why it was not, for
-    // the composer to show beside the draft it keeps.
-    let handle_send_message = {
-        move |(composer_room, message_text, reply_ctx): (
-            ed25519_dalek::VerifyingKey,
-            String,
-            Option<ReplyContext>,
-        )|
-              -> Result<(), String> {
-            if message_text.is_empty() {
-                warn!("Message is empty");
-                return Err("the message is empty".to_string());
-            }
-            let open_room = { CURRENT_ROOM.read().owner_key };
-            let Some(current_room) = open_room else {
-                error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
-                return Err("no room is open".to_string());
-            };
-            // The text and reply target were written in `composer_room`:
-            // they are never sent to another one.
-            if composer_room != current_room {
-                warn!("The open room changed under the composer; nothing sent");
-                return Err("the room changed, try again".to_string());
-            }
-            // Read now from ROOMS, not from a render-time capture, so a room
-            // or identity change since the last render is seen. Only what a
-            // send needs, and the borrow ends here, before the message is
-            // built or queued.
-            let (identity, secret, max_size) = {
-                let Ok(rooms) = ROOMS.try_read() else {
-                    warn!("ROOMS signal busy while sending; the draft is kept");
-                    return Err("the room is busy, try again".to_string());
-                };
-                let Some(room_data) = rooms.map.get(&current_room) else {
-                    error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
-                    return Err("the room is not loaded yet".to_string());
-                };
-                let Some(identity) = ActionIdentity::of(room_data) else {
-                    error!("Cannot send message: no identity for this room");
-                    return Err("this device has no identity for this room".to_string());
-                };
-                (
-                    identity,
-                    action_secret(room_data),
-                    room_data
-                        .room_state
-                        .configuration
-                        .configuration
-                        .max_message_size,
-                )
-            };
-
-            // Everything up to the outbox insert is synchronous: the message
-            // must show, pending, before anything is awaited
-            // (freenet/river#512). Signing happens after, through the chat
-            // delegate (`outbox_commit`).
-            //
-            // Build content based on whether this is a reply or regular
-            // message. A private body keeps what it was sealed from, so it
-            // can be sealed again if the room's secret rotates while it is
-            // being signed (`seal.rs`).
-            let reply = reply_ctx.clone();
-            let content = match (reply_ctx, secret) {
-                (Some(reply), None) => (
-                    RoomMessageBody::reply(
-                        message_text.clone(),
-                        reply.message_id,
-                        reply.author_name,
-                        reply.content_preview,
-                    ),
-                    None,
-                ),
-                (None, None) => (RoomMessageBody::public(message_text.clone()), None),
-                (_, Some(None)) => {
-                    // The composer is not offered without the secret (see
-                    // `missing_room_secret`); this is the backstop. A public
-                    // body in a private room is not admitted.
-                    error!("Cannot send: this private room's secret is not on this device");
-                    return Err("this private room's key is not on this device".to_string());
-                }
-                (reply, Some(Some((secret, version)))) => {
-                    // Never below a version this device already sealed a
-                    // message under here: a failed send sent again waits
-                    // for that key, as the outbox's own reseal does.
-                    let Ok(outbox) = OUTBOX.try_peek() else {
-                        warn!("OUTBOX signal busy while sending; the draft is kept");
-                        return Err("the room is busy, try again".to_string());
-                    };
-                    if !outbox.may_seal_at(&current_room, version) {
-                        warn!("Send refused: this device's room key (v{version}) is older than one it already sealed under");
-                        return Err(outbox::KEY_NOT_YET_HERE.to_string());
-                    }
-                    drop(outbox);
-                    let seal = match reply {
-                        Some(reply) => SealInput::Reply {
-                            text: message_text.clone(),
-                            message_id: reply.message_id,
-                            author_name: reply.author_name,
-                            content_preview: reply.content_preview,
-                        },
-                        None => SealInput::Text(message_text.clone()),
-                    };
-                    (seal.seal(&secret, version), Some(seal))
-                }
-            };
-
-            // Safety net: check encoded content size before signing. Should
-            // be unreachable: the input gate measures the same encoded size
-            // via RoomMessageBody::measure_* (pinned equal to content_len()
-            // by river-core tests). If this fires, the measure helpers have
-            // drifted from the body construction above. The send is refused
-            // and the composer keeps the draft. Fix the drift, don't relax
-            // this check.
-            let content_size = content.0.content_len();
-            if content_size > max_size {
-                error!(
-                    "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; send refused, draft kept",
-                    content_size, max_size
-                );
-                return Err(format!(
-                    "the message is too long ({content_size} of {max_size} bytes)"
-                ));
-            }
-
-            let Some(message) = unsigned_message(current_room, &identity.author_vk, content) else {
-                return Err("the message could not be encoded".to_string());
-            };
-
-            crate::util::debug_log("[send] queued, signing via the delegate");
-            // Defer the signal writes to a clean execution context to
-            // prevent RefCell re-entrant borrow panics.
-            crate::util::defer(move || {
-                outbox_commit::submit_now(
-                    current_room,
-                    PendingKind::Send {
-                        text: message_text,
-                        reply,
-                    },
-                    identity.author_vk,
-                    vec![message],
-                    identity.fallback_key,
-                );
-                // The conversation goes to the end when the room admits
-                // the message (`outbox_commit::take_own_send_committed`),
-                // not now: nothing of it is in the history yet.
-                #[cfg(target_arch = "wasm32")]
-                request_permission_on_first_message();
-            });
-            Ok(())
         }
     };
 
@@ -3370,10 +3370,6 @@ pub fn Conversation() -> Element {
                                     MessageInput {
                                         room: composer_room,
                                         author: composer_author,
-                                        handle_send_message: move |msg: (ed25519_dalek::VerifyingKey, String, Option<ReplyContext>)| {
-                                            let handle = handle_send_message;
-                                            handle(msg)
-                                        },
                                         replying_to: replying_to,
                                         on_request_edit_last: request_edit_last,
                                         max_message_size: max_msg_size,
@@ -5420,7 +5416,7 @@ mod tests {
         let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
         for handler in [
-            "lethandle_send_message={",
+            "fnqueue_message(",
             "lethandle_toggle_reaction={",
             "lethandle_delete_message={",
             "lethandle_edit_message={",
