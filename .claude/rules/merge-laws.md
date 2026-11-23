@@ -57,7 +57,9 @@ other skips, and the split is not confined to that id: the side missing the
 member's messages keeps an older message window (and the members it needs),
 and bans the member issued take effect on one side only. The fork fuzz
 requires such a pair to settle (one more exchange changes neither side) and
-reports what still differs under `FORK_CONTESTED_REPORT`.
+reports what still differs under `FORK_CONTESTED_REPORT`. Three-way merges
+(`(a+b)+c` against `(a+c)+b`) also differ on the first exchange in rooms with
+no shared id at all; that gap is freenet/river#985, not the member-id rule.
 
 A configuration that fails the value checks is the one record that is never
 dropped: an owner-signed one ranks below every valid configuration, so a
