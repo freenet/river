@@ -260,6 +260,38 @@ test("a failed send's text stays in its room, and a draft in a room not shown ho
   await expect(input(page), "and this room's draft is its own").toHaveValue("typed elsewhere");
 });
 
+test("a send after a failure waits for the key it was first sealed under", { tag: "@chromium-only" }, async ({ page }) => {
+  const keyNotHere = "does not have the room's newest key yet";
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "makeRoomPrivate", 3);
+  await callRiverTest(page, "holdMessageSigning");
+  await submitMessage(page, "sealed at three");
+  await expectLocked(page, "sealed at three");
+
+  // The room's secret pointer moves back while the message is being signed.
+  await callRiverTest(page, "setSecretVersion", 2);
+  await callRiverTest(page, "releaseMessageSigning");
+  await expect(sendError(page)).toContainText(keyNotHere);
+  await expect(input(page)).toHaveValue("sealed at three");
+  const signed = await callRiverTest(page, "messageSignsRecorded");
+
+  // Send again: not sealed under the older key, so nothing is signed or sent.
+  await sendButton(page).click();
+  await settle(page);
+  await expect(sendError(page)).toContainText(keyNotHere);
+  await expect(committedRow(page, "sealed at three")).toHaveCount(0);
+  await expect(input(page)).toHaveValue("sealed at three");
+  expect(await callRiverTest(page, "messageSignsRecorded"), "nothing was signed").toBe(signed);
+
+  // The key is back: the same Send goes.
+  await callRiverTest(page, "setSecretVersion", 3);
+  await settle(page);
+  await sendButton(page).click();
+  await expect(committedRow(page, "sealed at three")).toHaveCount(1);
+  await expect(sendError(page)).toHaveCount(0);
+  await expect(input(page)).toHaveValue("");
+});
+
 test("a send from a replaced identity is never committed",{ tag: "@chromium-only" }, async ({ page }) => {
   await openRoomWithComposer(page);
   await callRiverTest(page, "holdMessageSigning");

@@ -2300,6 +2300,18 @@ pub fn Conversation() -> Element {
                     return Err("this private room's key is not on this device".to_string());
                 }
                 (reply, Some(Some((secret, version)))) => {
+                    // Never below a version this device already sealed a
+                    // message under here: a failed send sent again waits
+                    // for that key, as the outbox's own reseal does.
+                    let Ok(outbox) = OUTBOX.try_peek() else {
+                        warn!("OUTBOX signal busy while sending; the draft is kept");
+                        return Err("the room is busy, try again".to_string());
+                    };
+                    if !outbox.may_seal_at(&current_room, version) {
+                        warn!("Send refused: this device's room key (v{version}) is older than one it already sealed under");
+                        return Err(outbox::KEY_NOT_YET_HERE.to_string());
+                    }
+                    drop(outbox);
                     let seal = match reply {
                         Some(reply) => SealInput::Reply {
                             text: message_text.clone(),

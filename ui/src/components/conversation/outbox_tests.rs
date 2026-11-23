@@ -624,6 +624,45 @@ fn a_reseal_never_moves_to_an_older_secret() {
     assert!(outbox.pending_rows(&room(), &author().verifying_key())[0]
         .failed
         .is_some());
+
+    // The composer takes the failed send back and drops the entry. Sending
+    // it again is a new message, and still not one sealed below v3.
+    outbox.discard(&room(), a);
+    assert!(!outbox.has_room(&room()));
+    assert!(!outbox.may_seal_at(&room(), 2));
+    assert!(outbox.may_seal_at(&room(), 3));
+    assert!(outbox.may_seal_at(&room(), 4));
+}
+
+/// The highest version sealed under in a room is kept past the entries that
+/// set it, per room, until the room is left.
+#[test]
+fn the_sealed_mark_follows_a_reseal_and_ends_with_the_room() {
+    let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+    let mut outbox = Outbox::default();
+    let (p, wp) = send(&mut outbox, "public", 1);
+    sign_all(&mut outbox, p, &wp);
+    assert!(outbox.may_seal_at(&room(), 0), "public entries set no mark");
+
+    let (a, wa) = sealed_entry(&mut outbox, "sealed at v1", 2, 1);
+    assert!(!outbox.may_seal_at(&room(), 0));
+    assert!(outbox.may_seal_at(&room(), 1));
+
+    sign_all(&mut outbox, a, &wa);
+    let (_, resign) = outbox.take_committable(&room(), Some(([2u8; 32], 2)));
+    assert_eq!(resign.len(), 1, "sealed again at v2");
+    assert!(!outbox.may_seal_at(&room(), 1));
+    assert!(outbox.may_seal_at(&room(), 2));
+    assert!(
+        outbox.may_seal_at(&other, 0),
+        "another room is not held to it"
+    );
+
+    outbox.clear_room(&room());
+    assert!(
+        outbox.may_seal_at(&room(), 0),
+        "the mark goes with the room"
+    );
 }
 
 /// The everyday path: public messages, and messages sealed under the current

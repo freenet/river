@@ -29,6 +29,12 @@
 //! `MAX_RESEALS` times; then it fails (a send goes back to the composer, and
 //! sending it again seals it under the room's secret at that time).
 //!
+//! Sealing only ever moves forward. The outbox keeps, per room, the highest
+//! secret version it has sealed an entry under (`may_seal_at`), past the
+//! entries themselves: a send is refused while this device's current secret
+//! is older than that, as a failed send taken back and sent again would
+//! otherwise be sealed under a key a newer rotation excluded someone from.
+//!
 //! The outbox is memory only: a reload while a message is still being signed
 //! loses it.
 //!
@@ -50,7 +56,7 @@ pub(crate) const MAX_RESEALS: u32 = 3;
 
 /// Why a sealed message waits: this device does not yet hold the room's
 /// current secret (or holds an older one than the message was sealed under).
-const KEY_NOT_YET_HERE: &str = "this device does not have the room's newest key yet";
+pub(crate) const KEY_NOT_YET_HERE: &str = "this device does not have the room's newest key yet";
 
 /// A message to enqueue: the message, its CBOR bytes, and for a sealed body
 /// what the user wrote (`SealInput`).
@@ -168,6 +174,14 @@ impl PendingEntry {
         })
     }
 
+    /// The highest secret version any of its bodies is sealed under.
+    fn highest_sealed(&self) -> Option<u32> {
+        self.messages
+            .iter()
+            .filter_map(|m| m.message.content.secret_version())
+            .max()
+    }
+
     /// This entry as the composer shows it, if it is a composer send.
     fn send_row(&self) -> Option<PendingRow> {
         match &self.kind {
@@ -252,6 +266,10 @@ pub(crate) type SigningWork = Vec<(usize, Vec<u8>)>;
 pub(crate) struct Outbox {
     rooms: HashMap<VerifyingKey, Vec<PendingEntry>>,
     next_id: u64,
+    /// Per room, the highest secret version an entry was sealed under
+    /// (`may_seal_at`). Kept when the entry commits, fails or is discarded;
+    /// dropped when the room is left.
+    sealed_high: HashMap<VerifyingKey, u32>,
 }
 
 impl Outbox {
@@ -284,7 +302,7 @@ impl Outbox {
             .enumerate()
             .map(|(i, (_, bytes, _))| (i, bytes.clone()))
             .collect();
-        self.rooms.entry(room).or_default().push(PendingEntry {
+        let entry = PendingEntry {
             id,
             kind,
             author_vk,
@@ -299,8 +317,28 @@ impl Outbox {
                 .collect(),
             state: PendingState::Signing,
             reseals: 0,
-        });
+        };
+        self.note_sealed(room, entry.highest_sealed());
+        self.rooms.entry(room).or_default().push(entry);
         (id, work)
+    }
+
+    fn note_sealed(&mut self, room: VerifyingKey, version: Option<u32>) {
+        if let Some(version) = version {
+            let high = self.sealed_high.entry(room).or_insert(version);
+            *high = (*high).max(version);
+        }
+    }
+
+    /// Whether a new message in `room` may be sealed under secret `version`:
+    /// not if this device has already sealed one there under a newer version.
+    /// The room's secret pointer can move back (`RoomData`'s alignment with
+    /// the contract's current version), and a member the newer rotation
+    /// excluded can read a message sealed under the older key.
+    pub fn may_seal_at(&self, room: &VerifyingKey, version: u32) -> bool {
+        self.sealed_high
+            .get(room)
+            .is_none_or(|high| version >= *high)
     }
 
     fn entry_mut(&mut self, room: &VerifyingKey, id: u64) -> Option<&mut PendingEntry> {
@@ -313,7 +351,7 @@ impl Outbox {
     /// attempt would land on the new one. A reseal starts a new attempt only
     /// for a fully signed entry, so nothing of the old one is outstanding,
     /// and a failed send is never signed again (the composer sends it as a
-    /// new entry). A stray late signature cannot publish old content anyway:
+    /// new entry, never sealed below the failed one's version: `may_seal_at`). A stray late signature cannot publish old content anyway:
     /// it does not verify over the new bytes, and the room skips the message.
     pub fn record_signature(&mut self, room: &VerifyingKey, id: u64, index: usize, sig: Signature) {
         if let Some(entry) = self.entry_mut(room, id) {
@@ -455,7 +493,9 @@ impl Outbox {
             return None;
         }
         entry.reseals += 1;
-        Some((entry.author_vk, entry.work()))
+        let resealed = (entry.author_vk, entry.work());
+        self.note_sealed(*room, Some(version));
+        Some(resealed)
     }
 
     /// One commit step for `room`, given the room's current secret: the
@@ -545,6 +585,7 @@ impl Outbox {
 
     /// Drop everything waiting in `room` (the user left it).
     pub fn clear_room(&mut self, room: &VerifyingKey) -> usize {
+        self.sealed_high.remove(room);
         self.rooms.remove(room).map_or(0, |q| q.len())
     }
 

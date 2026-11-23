@@ -552,6 +552,59 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Make the current room (owned by this identity) private, holding the
+    // secrets for versions 0 to `version`, `version` current.
+    set_hook(
+        "makeRoomPrivate",
+        Closure::<dyn FnMut(u32)>::new(move |version: u32| {
+            crate::util::defer(move || {
+                with_current_room_mut(|room, _| {
+                    use river_core::room_state::configuration::AuthorizedConfigurationV1;
+                    use river_core::room_state::privacy::{PrivacyMode, RoomCipherSpec};
+                    use river_core::room_state::secret::{
+                        AuthorizedSecretVersionRecord, SecretVersionRecordV1,
+                    };
+                    let Some(owner_sk) = room.self_sk.clone() else {
+                        return;
+                    };
+                    let mut config = room.room_state.configuration.configuration.clone();
+                    config.privacy_mode = PrivacyMode::Private;
+                    config.configuration_version += 1;
+                    room.room_state.configuration =
+                        AuthorizedConfigurationV1::new(config, &owner_sk);
+                    for v in 0..=version {
+                        let record = SecretVersionRecordV1 {
+                            version: v,
+                            cipher_spec: RoomCipherSpec::Aes256Gcm,
+                            created_at: crate::util::get_current_system_time(),
+                        };
+                        room.room_state
+                            .secrets
+                            .versions
+                            .push(AuthorizedSecretVersionRecord::new(record, &owner_sk));
+                        room.set_secret([0x5e; 32], v);
+                    }
+                    room.room_state.secrets.current_version = version;
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
+    // Point the current room at secret `version`, as a merge that leaves
+    // local state ahead of the contract's can (`RoomData`'s secret pointer).
+    set_hook(
+        "setSecretVersion",
+        Closure::<dyn FnMut(u32)>::new(move |version: u32| {
+            crate::util::defer(move || {
+                with_current_room_mut(|room, _| {
+                    room.current_secret_version = Some(version);
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
     // Give the current room a new contract key, as a room-contract re-key
     // does: the same room and messages under another generation. The mobile
     // message sheet closes on it, and work queued for it does nothing.
