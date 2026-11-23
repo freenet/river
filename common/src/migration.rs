@@ -143,8 +143,12 @@ mod tests {
         // V39 registers the last generation before open admission to public
         // rooms (freenet/river#974): no `provisional` state field and no
         // `public_admission` policy.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 39);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "a5ef3e6a049d27e8");
+        //
+        // V40 registers the open-admission generation before member ids were
+        // decided by full key (records kept per (id, key), one key per id
+        // chosen in cleanup).
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 40);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "f0d5f4684f243c51");
     }
 
     #[test]

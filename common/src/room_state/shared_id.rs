@@ -80,8 +80,8 @@ impl ChatRoomStateV1 {
             for inviter in &frontier {
                 for m in by_inviter.get(inviter).into_iter().flatten() {
                     let id = m.member.id();
-                    if !inviter_depth.contains_key(&id) {
-                        inviter_depth.insert(id, level);
+                    if let std::collections::hash_map::Entry::Vacant(e) = inviter_depth.entry(id) {
+                        e.insert(level);
                         next.push(id);
                     }
                 }
@@ -155,9 +155,8 @@ impl ChatRoomStateV1 {
         }
 
         // What a decided id signed under a key it no longer resolves to.
-        let verifies = |id: MemberId, ok: &dyn Fn(&VerifyingKey) -> bool| {
-            kept.get(&id).is_none_or(|vk| ok(vk))
-        };
+        let verifies =
+            |id: MemberId, ok: &dyn Fn(&VerifyingKey) -> bool| kept.get(&id).is_none_or(ok);
         self.member_info.member_info.retain(|info| {
             let id = info.member_info.member_id;
             id == owner_id || verifies(id, &|vk| info.verify_signature_with_key(vk).is_ok())
