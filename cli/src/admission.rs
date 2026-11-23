@@ -327,12 +327,15 @@ pub fn build_join(
         MemberInfo::new_public(id, next_info_version, options.nickname.to_string()),
         signing_key,
     );
+    // Taken after the proof solve, which can run for minutes: a message
+    // stamped before it would be older than the work that admits it.
+    let message_time = SystemTime::now();
     let message = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: MemberId::from(owner_key),
             author: id,
             content: RoomMessageBody::public(options.text.to_string()),
-            time: now,
+            time: message_time,
         },
         signing_key,
     );
@@ -861,6 +864,42 @@ mod tests {
         // A key the room has never seen does read the store, and reports it.
         let other = SigningKey::from_bytes(&[6; 32]);
         assert!(attachment_for_send(&storage, &state, &params.owner, &other, now).is_err());
+    }
+
+    /// The `AdmissionStatus::Member` early return in `attachment_for_send`: a
+    /// key the room holds as a member never reads provisional storage, even
+    /// when the stored entry is unreadable (so a member's send cannot fail on
+    /// a store it does not need). Without the early return the read errors.
+    #[test]
+    fn a_member_key_returns_before_reading_provisional_storage() {
+        use river_core::room_state::member::{AuthorizedMember, Member};
+        let (mut state, params, owner) = open_room(4);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(Some(dir.path().to_str().unwrap())).unwrap();
+        std::fs::write(dir.path().join("provisional.json"), b"{ not json").unwrap();
+        let k = SigningKey::from_bytes(&[7; 32]);
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: params.owner_id(),
+                invited_by: params.owner_id(),
+                member_vk: k.verifying_key(),
+            },
+            &owner,
+        ));
+        let now = SystemTime::now();
+        assert_eq!(
+            admission_status(&state, &params, &k.verifying_key(), None, now),
+            AdmissionStatus::Member,
+            "premise: the key is a member"
+        );
+        assert!(storage
+            .get_provisional_entry(&params.owner, &k.verifying_key())
+            .is_err());
+        assert!(
+            attachment_for_send(&storage, &state, &params.owner, &k, now)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

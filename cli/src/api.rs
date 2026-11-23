@@ -4956,13 +4956,21 @@ impl ApiClient {
 
         // An open member (freenet/river#974): the room holds their entry, or a
         // stored entry is attached to this message because the room pruned it.
-        let provisional_delta = crate::admission::attachment_for_send(
-            &self.storage,
-            &room_state,
-            room_owner_key,
-            signing_key,
-            message_time,
-        )?;
+        //
+        // Not when stored membership credentials re-add this key as a member:
+        // the member record supersedes any entry, and a stored entry that
+        // cannot be used must not fail a send the credentials already cover.
+        let provisional_delta = if members_delta.is_some() {
+            None
+        } else {
+            crate::admission::attachment_for_send(
+                &self.storage,
+                &room_state,
+                room_owner_key,
+                signing_key,
+                message_time,
+            )?
+        };
         // The authorization below sees the entry as already attached, the
         // view the contract has once it applies the delta.
         if let Some(p) = &provisional_delta {
