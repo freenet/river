@@ -13,20 +13,34 @@
 //!   busy room does not keep a stalled open room stale. The quiet clock restarts when River
 //!   asks, so the open room is read again at most once per `resync_idle`.
 //! - **Coming to the front** (the window gains focus) reads again every room the node has said
-//!   nothing about for [`Pace::resync_focus`], once each. A window that flips focus often reads
-//!   nothing more, since each room's quiet clock was just restarted. There is no wake-from-sleep
+//!   nothing about for [`Pace::resync_focus`], once each, spread at random over up to
+//!   [`Pace::resync_spread`] so they do not all go in one instant. A window that flips focus
+//!   often reads nothing more, since each room's quiet clock was just restarted. There is no
+//!   wake-from-sleep
 //!   signal in the app: after a sleep the ping either fails (a new connection subscribes, and so
 //!   reads, every room afresh) or the idle rule reads the open room.
 //! - **A merge that fails** (a notification, or the answer to a read or subscribe) is followed by
 //!   a read of that room, again after [`Pace::resubscribe_first`] doubling to
 //!   [`Pace::resubscribe_max`] with +-20% jitter while it keeps failing, and from the start once
-//!   one works.
+//!   one works. A failure that repeats [`HEAL_GIVE_UP`] times in a row with the same error is
+//!   one a read cannot heal (the node sends the same whole state each time): the room is not
+//!   read again for it on that connection.
 //!
 //! What bounds the load: at most one read out per room. A room is not read while its subscribe
 //! is out or waiting to be asked again (that ask reads it), while it owes the answer to an
-//! UPDATE or a create or join holds it (an error that names no room could then be either's;
-//! see [`super::session`]), and no read is sent while the stored rooms are being read, the
-//! signing key sweep has a request out, or a create or join has one out, for the same reason.
+//! UPDATE or a create or join holds it.
+//!
+//! **Keeping errors apart.** The node's errors that name nothing (`EmptyRing`, an operation
+//! error...) cannot be told from one request to another, so a read never shares the connection
+//! with another request that could fail that way, in either direction: no read is sent while
+//! the stored rooms are being read, the signing key sweep has a request out or a create or join
+//! has one out, and none of those starts while a read is out. Such an error with one read out
+//! and nothing else that could have failed is the read's, and frees its room at once. One
+//! exception, chosen so a message is never held back for a read: an UPDATE goes out for a room
+//! whose read is out. Its answers and errors name the UPDATE, except `MissingContract`, which
+//! names only the room; while the room's read is out, that is taken for the read's, so a read
+//! never fails a message. A real UPDATE failure of that kind then shows when its answer is
+//! given up on (`update_wait`).
 //!
 //! A read the node does not answer is given up after [`Pace::resync_wait`], which only frees the
 //! room for the next read. It NEVER reconnects, and it is not an answer owed in the sense of
@@ -40,7 +54,9 @@
 //!
 //! The reads go out as GETs that do not subscribe. The node's answer to one looks exactly like
 //! its answer to a subscribe (a `GetResponse`), so the two are never out at once for one room:
-//! no read while a subscribe is out or due, and no subscribe asked while a read is out. The one
+//! no read while a subscribe is out or due, and no subscribe asked while a read is out (a
+//! subscribe due waits; one asked for a room the stored rooms' read just added cannot meet a
+//! read, since neither runs beside the other). The one
 //! overlap left is a read given up after `resync_wait` whose answer comes later still, after a
 //! subscribe for the same room was asked; that answer is taken for the subscribe's. The room
 //! merges the state either way; if the subscribe in fact fails, its error names it on screen,
@@ -48,6 +64,7 @@
 //!
 //! [`Pace::resync_idle`]: super::session::Pace
 //! [`Pace::resync_focus`]: super::session::Pace
+//! [`Pace::resync_spread`]: super::session::Pace
 //! [`Pace::resync_wait`]: super::session::Pace
 //! [`Pace::resubscribe_first`]: super::session::Pace
 //! [`Pace::resubscribe_max`]: super::session::Pace

@@ -352,9 +352,8 @@ impl LiveRoom {
     /// What is kept is cleaned up as a whole merge is (`post_apply_cleanup`: the room's caps,
     /// the bans checked against their issuers, the members and messages they remove), which a
     /// failed composed merge skips; the web UI skips it too and normalizes only what it sends.
-    /// Cleaned up, the copy is a state the room contract accepts, and fields the failing step
-    /// never reached are checked against what came before them, as in any delta. If cleanup
-    /// itself fails, nothing is kept: the copy stays as it was.
+    /// Cleaned up, the copy is a state the room contract accepts. If cleanup itself fails,
+    /// nothing is kept: the copy stays as it was.
     ///
     /// A failed merge cannot leave a private room with a secret version it holds no secret
     /// for: the current version is part of the secrets step, so it moves only when that step,

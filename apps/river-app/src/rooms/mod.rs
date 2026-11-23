@@ -250,6 +250,11 @@ impl Link {
                 Arc::new(generation::Watch::shipped(inner.config_dir.as_deref()));
         }
         inner.drop_pending.store(true, Ordering::Release);
+        // The room shown was the previous node's; the new chat tells it again when one opens.
+        *inner
+            .viewing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         inner.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 

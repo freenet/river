@@ -248,3 +248,21 @@ fn a_session_that_waits_for_the_user_is_not_restarted_by_a_second_start() {
     assert_eq!(a.count.load(Ordering::SeqCst), 2);
     assert!(!link.inner.restart.load(Ordering::SeqCst));
 }
+
+/// The room shown belongs to the node it was shown on: pointing the link at another node
+/// forgets it, so the next session is not told a room of the old node's
+/// (freenet/river#971). The new node's chat tells it again when a room opens.
+#[test]
+fn pointing_at_another_node_forgets_the_room_shown() {
+    let (a, b) = (fake_node(), fake_node());
+    let (link, _rx) = link_to(&a.authority);
+    link.viewing("a room of the first node");
+    assert!(link.inner.viewing.lock().unwrap().is_some());
+    link.set_node(&b.authority, false);
+    assert_eq!(*link.inner.viewing.lock().unwrap(), None);
+    link.viewing("a room of the second node");
+    assert_eq!(
+        link.inner.viewing.lock().unwrap().as_deref(),
+        Some("a room of the second node")
+    );
+}
