@@ -77,7 +77,7 @@ pub(super) struct Resyncs {
     /// When the node last said anything about each room, or River last asked it to: the room's
     /// quiet clock. A room with none counts from when the connection was set up.
     heard: HashMap<ContractInstanceId, Instant>,
-    /// Rooms whose last merge failed: failures in a row, and when to read again.
+    /// Rooms whose last merge failed: reads asked since to heal it, and when to read again.
     heal: HashMap<ContractInstanceId, (u32, Instant)>,
     /// Rooms to read again because the window came to the front.
     wanted: HashSet<ContractInstanceId>,
@@ -122,19 +122,15 @@ impl Resyncs {
     }
 
     /// The outcome of merging what the node sent about the room. A failure schedules a read,
-    /// sooner the first time; a success forgets earlier failures.
+    /// after a wait that doubles with each read already asked to heal it; a success forgets
+    /// earlier failures.
     pub fn merged(&mut self, id: ContractInstanceId, ok: bool, now: Instant, pace: &ResyncPace) {
         if ok {
             self.heal.remove(&id);
             return;
         }
-        let failures = self.heal.get(&id).map_or(0, |(n, _)| *n);
-        let wait = pace
-            .heal_first
-            .saturating_mul(1 << failures.min(16))
-            .min(pace.heal_max);
-        self.heal
-            .insert(id, (failures.saturating_add(1), now + jittered(wait)));
+        let asked = self.heal.get(&id).map_or(0, |(n, _)| *n);
+        self.heal.insert(id, (asked, now + heal_wait(asked, pace)));
     }
 
     /// The window came to the front: every room in `rooms` is to be read again, if the node has
@@ -192,6 +188,12 @@ impl Resyncs {
             let wanted = self.wanted.contains(id);
             let idle = viewing.as_ref() == Some(id) && self.quiet(id, now) >= pace.idle;
             if heal || wanted || idle {
+                // The next heal is scheduled now, not when the answer merges: a read that fails
+                // or goes unanswered must not be asked again at once, on every tick.
+                if let Some((asked, at)) = self.heal.get_mut(id) {
+                    *asked = asked.saturating_add(1);
+                    *at = now + heal_wait(*asked, pace);
+                }
                 self.wanted.remove(id);
                 self.out.insert(*id, now);
                 self.heard.insert(*id, now);
@@ -200,6 +202,16 @@ impl Resyncs {
         }
         due
     }
+}
+
+/// How long after a failed merge the room is read again, `asked` reads in: `heal_first`
+/// doubling to `heal_max`, jittered.
+fn heal_wait(asked: u32, pace: &ResyncPace) -> Duration {
+    jittered(
+        pace.heal_first
+            .saturating_mul(1 << asked.min(16))
+            .min(pace.heal_max),
+    )
 }
 
 /// `wait` +-20%, so rooms that failed together are not read again together.
@@ -316,14 +328,29 @@ mod tests {
             r.due(None, &rooms, FREE, t1 + second.mul_f64(1.21), &p),
             [id(1)]
         );
-        // Capped.
-        for _ in 0..20 {
+        // Reads that fail with an error are not asked again at once, and the wait keeps
+        // growing, to the cap.
+        let mut t = t1 + second.mul_f64(1.21);
+        r.failed(&id(1));
+        assert!(r.due(None, &rooms, FREE, t, &p).is_empty(), "not at once");
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let next = (1..)
+                .map(|ms| t + Duration::from_millis(ms * 50))
+                .find(|at| !r.due(None, &rooms, FREE, *at, &p).is_empty())
+                .unwrap();
+            waits.push(next - t);
             r.failed(&id(1));
-            r.merged(id(1), false, t1, &p);
+            t = next;
         }
-        assert_eq!(
-            r.due(None, &rooms, FREE, t1 + p.heal_max.mul_f64(1.21), &p),
-            [id(1)]
+        assert!(waits[1] > waits[0].mul_f64(1.2), "{waits:?}");
+        assert!(
+            waits.iter().all(|w| *w <= p.heal_max.mul_f64(1.21)),
+            "{waits:?}"
+        );
+        assert!(
+            waits.last().unwrap() >= &p.heal_max.mul_f64(0.79),
+            "{waits:?}"
         );
         // A merge that works forgets it.
         r.answered(&id(1), t1);
