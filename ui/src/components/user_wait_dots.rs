@@ -9,10 +9,11 @@
 //!   `PENDING_INVITES`), anywhere. Its outcome is the join flow's; these dots
 //!   never decide it. The one screen-reader announcement is for this reason
 //!   ([`UserWaitStatus`]).
-//! - **A room change on its way** (an edit, a delete or a reaction, marked in
+//! - **A room change on its way** (an edit or a delete, marked in
 //!   `app/user_waits.rs`), in that room only. Best effort: see that module.
 //!   Sending a message or a reply lights nothing; the composer keeps its
-//!   draft instead (`conversation/message_input.rs`).
+//!   draft instead (`conversation/message_input.rs`). A reaction lights
+//!   nothing either.
 //!
 //! # One visible host
 //!
@@ -242,7 +243,7 @@ pub(crate) fn WelcomeWaitSlot() -> Element {
 }
 
 /// The one live region: announces a join, and stays quiet for room changes,
-/// which repeat with every edit or reaction.
+/// which repeat with every edit.
 #[component]
 pub(crate) fn UserWaitStatus() -> Element {
     let reason = use_user_wait_reason();

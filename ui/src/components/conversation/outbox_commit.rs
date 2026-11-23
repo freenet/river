@@ -211,16 +211,16 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
         return;
     };
     let mut any_applied = false;
-    let mut action_applied = false;
+    let mut lights_wait_dots = false;
     for (entry, outcome) in ready.into_iter().zip(outcomes) {
         match outcome {
             Ok(()) => {
                 any_applied = true;
-                match entry.kind {
-                    // The composer's send is done: it clears as the entry
-                    // leaves the outbox, and its conversation goes to the end.
-                    PendingKind::Send { .. } => note_own_send_committed(room),
-                    PendingKind::Action { .. } => action_applied = true,
+                lights_wait_dots |= entry.kind.lights_wait_dots();
+                // The composer's send is done: it clears as the entry leaves
+                // the outbox, and its conversation goes to the end.
+                if matches!(entry.kind, PendingKind::Send { .. }) {
+                    note_own_send_committed(room);
                 }
             }
             Err(reason) => {
@@ -241,9 +241,9 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
         // not delayed by a task hop.
         crate::components::app::mark_needs_sync(room);
     }
-    if action_applied {
-        // Only an edit, delete or reaction lights the room's wait dots, and
-        // restarts its cap; the feedback mark itself is deferred.
+    if lights_wait_dots {
+        // Only an edit or a delete lights the room's wait dots, and restarts
+        // its cap; the feedback mark itself is deferred.
         crate::components::app::user_waits::mark_user_change(room);
     }
 }

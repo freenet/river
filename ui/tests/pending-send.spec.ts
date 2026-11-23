@@ -17,7 +17,7 @@ const replyPreview = (page: Page) => page.getByTestId("composer-reply-preview");
 const sendError = (page: Page) => page.getByTestId("composer-send-error");
 
 /// A send marks no room wait and lights no wait dots (they are for edits,
-/// deletes, reactions and joins).
+/// deletes and joins).
 async function expectNoWait(page: Page, why: string) {
   expect(await callRiverTest(page, "userWaitRooms"), `${why}: no room wait`).toBe(0);
   await expect(page.locator('[data-testid="user-wait-dots"][data-active="true"]'), `${why}: no dots`).toHaveCount(0);

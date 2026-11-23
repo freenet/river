@@ -31,8 +31,9 @@ import {
 } from "./history-geometry";
 import { callRiverTest } from "./river-test";
 
-// The ten wave dots that say an edit, a delete, a reaction or a join is still
-// on its way (`user_wait_dots.rs`, `app/user_waits.rs`). One host paints at a
+// The ten wave dots that say an edit, a delete or a join is still on its way
+// (`user_wait_dots.rs`, `app/user_waits.rs`). A send and a reaction light
+// nothing. One host paints at a
 // time: the open room's dock above the composer, else the Welcome slot, and
 // nothing while something covers the room. Dots appear 300 ms after activity,
 // fade over 200 ms, and vanish at once when their host stops being the owner.
@@ -158,19 +159,44 @@ function expectDelayedAppearance(state: PaintState, why: string) {
   expect(Number(state.opacity), `${why}: not painted at full opacity first`).toBeLessThan(1);
 }
 
-/// A room with a received message at the end, connected, and no mark yet.
-async function connectedRoomWithTarget(page: Page): Promise<Locator> {
-  const row = await openRoomWithTarget(page);
+/// Connect the open room, with no mark yet.
+async function connectIdle(page: Page) {
   await connect(page);
   await expectIdle(page, "premise: nothing on its way yet");
   expect(await marks(page), "premise: no marks").toBe(0);
+}
+
+/// An open room, connected, and no mark yet.
+async function connectedRoom(page: Page) {
+  await openRoomWithComposer(page);
+  await connectIdle(page);
+}
+
+/// `connectedRoom` with a received message at the end. Returns its row.
+async function connectedRoomWithTarget(page: Page): Promise<Locator> {
+  const row = await openRoomWithTarget(page);
+  await connectIdle(page);
   return row;
 }
 
-/// React to `row` and wait for the room's mark.
-async function reactAndMark(page: Page, row: Locator) {
-  await reactTo(page, row);
-  await expectMarks(page, 1, "the reaction marks its room");
+/// Edit own `row` to `text` and wait for the room to admit it. Returns the
+/// edited row.
+async function saveEdit(page: Page, row: Locator, text: string): Promise<Locator> {
+  const editArea = await openOwnMessageEdit(page, row);
+  await editArea.fill(text);
+  await page.getByTestId("edit-save-button").click();
+  const edited = committedRow(page, text);
+  await expect(edited).toHaveCount(1);
+  return edited;
+}
+
+/// Send a message and edit it, and wait for the room's mark (`marked` rooms
+/// in all). Returns its row, the newest in the history.
+async function editAndMark(page: Page, text = "edit target", marked = 1): Promise<Locator> {
+  const row = await sendCommitted(page, text);
+  const edited = await saveEdit(page, row, `${text}, edited`);
+  await expectMarks(page, marked, "the edit marks its room");
+  return edited;
 }
 
 /// Delete `row` through its footer Delete and the confirmation's Delete.
@@ -198,10 +224,7 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     await connect(page);
     const row = await sendCommitted(page, "edit me");
     expect(await marks(page), "premise: the send marked nothing").toBe(0);
-    const editArea = await openOwnMessageEdit(page, row);
-    await editArea.fill("edited once");
-    await page.getByTestId("edit-save-button").click();
-    await expect(committedRow(page, "edited once")).toHaveCount(1);
+    await saveEdit(page, row, "edited once");
     await expectMarks(page, 1, "the edit marks its room");
     await expectShowing(roomDots(page), "an edit shows the dots");
     await callRiverTest(page, "deliverUpdateError", "keyed");
@@ -223,10 +246,28 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     await expect(roomDots(page)).toHaveAttribute("data-reason", "");
   });
 
+  test("a reaction, and taking it back, marks nothing and shows no dots", async ({ page }) => {
+    const row = await connectedRoomWithTarget(page);
+    const signs = () => callRiverTest(page, "messageSignsRecorded");
+    const signed = await signs();
+    const chip = await reactTo(page, row);
+    await expect.poll(signs, { message: "the room admits the reaction" }).toBe(signed + 1);
+    await settle(page);
+    expect(await marks(page), "a reaction marks nothing").toBe(0);
+    await expectIdle(page, "and shows no dots");
+
+    await chip.click();
+    await expect(chip).toHaveCount(0);
+    await expect.poll(signs, { message: "the room admits its removal" }).toBe(signed + 2);
+    await settle(page);
+    expect(await marks(page), "taking it back marks nothing").toBe(0);
+    await expectIdle(page, "and shows no dots");
+  });
+
   test("while disconnected the mark is kept but nothing shows; reconnecting shows it again", async ({ page }) => {
-    const row = await openRoomWithTarget(page);
+    await openRoomWithComposer(page);
     // The no-sync build starts Disconnected.
-    await reactAndMark(page, row);
+    await editAndMark(page);
     await settle(page);
     await expectIdle(page, "nothing shows while disconnected");
 
@@ -244,20 +285,18 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
   });
 
   test("an unkeyed UPDATE failure ends every room's mark", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
-    await reactAndMark(page, row);
+    await connectedRoom(page);
+    await editAndMark(page);
     await selectRoom(page, "Team Chat Room");
-    const team = await sendCommitted(page, "team target");
-    await reactTo(page, team);
-    await expectMarks(page, 2, "premise: two rooms marked");
+    await editAndMark(page, "team target", 2);
     await callRiverTest(page, "deliverUpdateError", "unkeyed");
     await expectMarks(page, 0, "an unkeyed failure names no room, so it ends them all");
     await expectIdle(page, "and the open room's dots");
   });
 
   test("a room's mark shows only in that room, and another room's reply leaves it", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
-    await reactAndMark(page, row);
+    await connectedRoom(page);
+    await editAndMark(page);
     await expectShowing(roomDots(page), "premise: showing in its room");
 
     await callRiverTest(page, "switchRoom", "Team Chat Room");
@@ -301,8 +340,8 @@ test.describe("Joining a room", () => {
   });
 
   test("a join outranks the room's own change", { tag: "@chromium-only" }, async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
-    await reactAndMark(page, row);
+    await connectedRoom(page);
+    await editAndMark(page);
     await callRiverTest(page, "setPendingJoin", true);
     await expect(roomDots(page)).toHaveAttribute("data-reason", "joining-room");
     await expect(status(page)).toHaveText("Joining room");
@@ -348,12 +387,18 @@ test.describe("Joining a room", () => {
 
 test.describe("Paint timing", () => {
   test("dots fade in after the delay, fade out when done, and a new change during the fade does not jump", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
+    await connectedRoom(page);
     await recordPaintAt(page, "room", "shown");
-    await reactAndMark(page, row);
-    expectDelayedAppearance(await takeRecordedPaint(page), "a reaction");
+    const row = await editAndMark(page, "paint target");
+    expectDelayedAppearance(await takeRecordedPaint(page), "an edit");
     await expect(roomDots(page), "shown once the delay and fade-in end").toHaveCSS("opacity", "1");
     await expect(spacer(page)).toHaveCSS("height", `${SPACER_OPEN_PX}px`);
+
+    // A second edit, typed and one click from saved. Below 48rem its way in
+    // is the message sheet, which covers the room and then gives it back.
+    const editArea = await openOwnMessageEdit(page, row);
+    await editArea.fill("paint target, edited twice");
+    await expectPainted(page);
 
     // The reply: a 200 ms fade, no delay. Held half way.
     await callRiverTest(page, "deliverUpdateResponse");
@@ -372,10 +417,10 @@ test.describe("Paint timing", () => {
     expect(fading!.opacity, "premise: half way through the fade").toBeGreaterThan(0.05);
     expect(fading!.opacity).toBeLessThan(0.95);
 
-    // Busy again mid-fade (the chip's own click takes the reaction back,
-    // another eligible change): no jump back to full opacity.
+    // Busy again mid-fade (the second edit is saved): no jump back to full
+    // opacity.
     await recordPaintAt(page, "room", "shown");
-    await row.getByTestId("reaction-chip").first().click();
+    await page.getByTestId("edit-save-button").click();
     const again = await takeRecordedPaint(page);
     expect(Number(again.opacity), "busy again does not jump to full opacity").toBeLessThan(0.95);
     const t = opacityTransition(again.transitions);
@@ -422,11 +467,9 @@ async function expectOwnerAgain(page: Page, why: string) {
 
 test.describe("Ownership", () => {
   test("the delete confirmation hides the room's dots at once", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
-    await reactAndMark(page, row);
+    await connectedRoom(page);
+    const own = await editAndMark(page);
     await expectPainted(page);
-    const own = page.locator('[id^="msg-"][data-message-self="true"]').last();
-    await own.scrollIntoViewIfNeeded();
     await expectSuppressedAtOnce(page, "the delete confirmation covers the room", async () => {
       await clickFooter(page, own, "message-delete-button");
       await expect(deleteDialog(page)).toBeVisible();
@@ -438,9 +481,9 @@ test.describe("Ownership", () => {
   });
 
   test("the member info modal hides the room's dots at once", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
+    await connectedRoom(page);
     test.skip(await narrowLayout(page), "below 48rem the member list replaces the chat (the panel test covers it)");
-    await reactAndMark(page, row);
+    await editAndMark(page);
     await expectPainted(page);
     await expectSuppressedAtOnce(page, "the member info modal covers the room", async () => {
       await memberRows(page).first().click();
@@ -457,8 +500,7 @@ test.describe("Ownership", () => {
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
     await connect(page);
-    const row = await sendCommitted(page, "dm cover target");
-    await reactAndMark(page, row);
+    await editAndMark(page, "dm cover target");
     await expectPainted(page);
 
     const other = memberRows(page).filter({ hasNot: page.getByTestId("member-list-self") }).first();
@@ -482,9 +524,9 @@ test.describe("Ownership", () => {
 
   test("below 48rem the message sheet and the members panel hide the room's dots at once", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
-    const row = await connectedRoomWithTarget(page);
+    await connectedRoom(page);
     expect(await narrowLayout(page), "premise: below 48rem").toBe(true);
-    await reactAndMark(page, row);
+    const row = await editAndMark(page);
     await expect(sheet(page)).toBeHidden();
     await expectPainted(page);
 
@@ -522,10 +564,20 @@ function endGeometry(page: Page) {
 
 test.describe("History", () => {
   test("held at the end, the newest message stays in view above the dots", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
+    await connectedRoom(page);
+    // A delete above the newest message: the newest stays, so the end hold
+    // does, and the history only gets shorter.
+    const older = await sendCommitted(page, "delete target");
+    await sendCommitted(page, "end target");
     await expectSettledAtBottom(page, "premise: at the end");
-    await reactAndMark(page, row);
+    await confirmDelete(page, older);
+    await expectMarks(page, 1, "the delete marks its room");
     await expectShowing(roomDots(page), "premise: showing");
+    // The removed row's clamp has its own scroll event, a frame later. The
+    // dots' delay keeps the spacer shut until long after it; finishing the
+    // transitions before it would open the spacer under that event, which
+    // the hold reads as the reader scrolling up.
+    await settle(page);
     await finishTransitions(page);
     await expect(spacer(page)).toHaveCSS("height", `${SPACER_OPEN_PX}px`);
     await settle(page);
@@ -548,7 +600,7 @@ test.describe("History", () => {
   });
 
   test("the spacer follows the sentinel, keyless, and never moves a parked reader", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
+    await connectedRoom(page);
     const order = await page.evaluate(() => {
       const s = document.getElementById("bottom-sentinel")!;
       const next = s.nextElementSibling;
@@ -564,7 +616,7 @@ test.describe("History", () => {
       keys: [null, null],
     });
 
-    await reactAndMark(page, row);
+    await editAndMark(page);
     // Disconnected, the mark stays and the spacer closes: the reader parks
     // with it closed, then it opens and closes under them.
     await callRiverTest(page, "setSyncStatus", "disconnected");
@@ -600,7 +652,7 @@ test.describe("History", () => {
 test.describe("Hits", () => {
   test("the dots take no clicks", async ({ page }) => {
     const row = await connectedRoomWithTarget(page);
-    await reactAndMark(page, row);
+    await editAndMark(page);
     await expectPainted(page);
 
     const hit = await roomDots(page).evaluate((el) => {

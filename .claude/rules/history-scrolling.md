@@ -229,7 +229,7 @@ Known limitations:
   history, and a quoted message that is not rendered is left alone (no
   paging). The highlight is a two-second Web Animations API animation on the
   whole row; it changes no height.
-- While an edit, delete or reaction's wait dots show over the history's
+- While an edit or delete's wait dots show over the history's
   bottom edge, a decorative spacer after `bottom-sentinel`
   (`user_wait_dots.rs`) adds a dot row and a gap below the newest message,
   snapping open after the dots' delay and shut once they have faded. It is

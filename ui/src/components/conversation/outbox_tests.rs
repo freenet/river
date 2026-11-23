@@ -769,3 +769,48 @@ fn every_message_of_an_entry_is_sealed_again() {
         ));
     }
 }
+
+/// What `commit_ready_now` marks the room for: an edit or a delete. A send
+/// keeps the composer's draft instead, and a reaction (added, taken back or
+/// swapped) shows no loading at all.
+#[test]
+fn only_an_edit_or_a_delete_lights_the_wait_dots() {
+    let target = || river_core::room_state::message::MessageId(freenet_scaffold::util::FastHash(1));
+    let react = || PendingEffect::React {
+        target: target(),
+        emoji: "👍".to_string(),
+    };
+    let unreact = || PendingEffect::Unreact {
+        target: target(),
+        emoji: "🎉".to_string(),
+    };
+    let action = |label, effects| PendingKind::Action { label, effects };
+    for (kind, lights) in [
+        (
+            PendingKind::Send {
+                text: "a send".to_string(),
+                reply: None,
+            },
+            false,
+        ),
+        (action("reaction", vec![react()]), false),
+        (action("reaction", vec![unreact()]), false),
+        (action("reaction", vec![unreact(), react()]), false),
+        (
+            action(
+                "edit",
+                vec![PendingEffect::Edit {
+                    target: target(),
+                    text: "changed".to_string(),
+                }],
+            ),
+            true,
+        ),
+        (
+            action("delete", vec![PendingEffect::Delete { target: target() }]),
+            true,
+        ),
+    ] {
+        assert_eq!(kind.lights_wait_dots(), lights, "{kind:?}");
+    }
+}

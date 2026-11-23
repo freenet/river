@@ -82,6 +82,23 @@ pub(crate) enum PendingKind {
     },
 }
 
+impl PendingKind {
+    /// Whether the room's wait dots light once the room admits this
+    /// (`app/user_waits.rs`): an edit or a delete only. A send keeps the
+    /// composer's draft instead, and a reaction lights nothing.
+    pub fn lights_wait_dots(&self) -> bool {
+        match self {
+            Self::Send { .. } => false,
+            Self::Action { effects, .. } => effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    PendingEffect::Edit { .. } | PendingEffect::Delete { .. }
+                )
+            }),
+        }
+    }
+}
+
 /// What a pending action does to the conversation, in plaintext: the
 /// messages themselves may be sealed under the room secret.
 #[derive(Clone, PartialEq, Debug)]

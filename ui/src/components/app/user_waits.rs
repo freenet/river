@@ -1,12 +1,13 @@
 //! Best-effort feedback that a room change the user made is on its way to
 //! the network: the room's wait dots (`components/user_wait_dots.rs`).
 //!
-//! An edit, a delete or a reaction that the local room has admitted
+//! An edit or a delete that the local room has admitted
 //! (`outbox_commit::commit_ready_now`) marks its room here. The mark ends at
 //! the room contract's next UPDATE reply or keyed UPDATE error, or after
 //! [`FEEDBACK_CAP_MS`], whichever comes first. A message or reply from the
 //! composer marks nothing: the composer keeps its draft until the room admits
-//! it, and its sync goes on in the background.
+//! it, and its sync goes on in the background. A reaction marks nothing
+//! either: its sync stays out of sight.
 //!
 //! **This is not an acknowledgment of the action.** An UPDATE reply names a
 //! contract, not a request, so any reply for the room ends the mark: an
@@ -128,8 +129,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// An edit, a delete or a reaction has been applied to `room` locally: show
-/// its room's wait dots. Its sync is the caller's to queue, synchronously
+/// An edit or a delete has been applied to `room` locally: show its room's
+/// wait dots. Its sync is the caller's to queue, synchronously
 /// (`outbox_commit::commit_ready_now`); only this feedback is deferred.
 pub(crate) fn mark_user_change(room: VerifyingKey) {
     let now = now_ms();
