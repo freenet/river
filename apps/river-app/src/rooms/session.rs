@@ -1141,7 +1141,11 @@ fn follow_on(
                 state,
                 ..
             }))) => {
-                // A read's answer says nothing about the subscription.
+                // A read's answer says nothing about the subscription. One for a late read,
+                // with no subscribe or other read out for its room, ends that read.
+                if !subs.pending.contains_key(key.id()) && !resyncs.is_out(key.id()) {
+                    resyncs.late_done(key.id());
+                }
                 if !resyncs.answered(key.id(), Instant::now()) {
                     subs.answered(key.id());
                     changed |= rooms.following(key.id(), true);
@@ -1162,9 +1166,16 @@ fn follow_on(
             // a room it has just created, so it keeps showing the stored copy and asks again.
             Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
                 instance_id,
-            }))) if resyncs.is_out(&instance_id) && !subs.pending.contains_key(&instance_id) => {
-                // A read found nothing: the subscription is not in question, and the next read
-                // comes by the usual rules.
+            }))) if (resyncs.is_out(&instance_id) || resyncs.is_late(&instance_id))
+                && !subs.pending.contains_key(&instance_id) =>
+            {
+                // A read found nothing (the node also says so for a GET whose attempts ran out,
+                // so this is how a read given up on usually ends): the subscription is not in
+                // question, and the next read comes by the usual rules.
+                // With a read out too, it is either's: the late one stays late.
+                if !resyncs.is_out(&instance_id) {
+                    resyncs.late_done(&instance_id);
+                }
                 resyncs.failed(&instance_id);
             }
             Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
@@ -1243,6 +1254,10 @@ fn follow_on(
                     });
                 if late_reads {
                     eprintln!("River: an error that may be a read given up on, taken by none: {e}");
+                    // One that names the late read's room is that read's: it is over.
+                    if let Some(id) = failed_contract(&e) {
+                        resyncs.late_done(&id);
+                    }
                 } else if rooms.outbox.work.on_error(&e, alone, &|id| {
                     subs.pending.contains_key(id) || resyncs.is_out(id)
                 }) {
@@ -3202,7 +3217,6 @@ impl Rooms {
         }
     }
 
-    /// Record whether a room took the network's latest; true when that changed what shows.
     /// Record how a merge of what the network sent went. True when what shows changed: always
     /// on success, and on a failure when the room is newly named as not updated or the merge
     /// kept something (`kept`) before the step that failed.

@@ -57,12 +57,16 @@
 //! frees the room for the next read a whole [`Pace::resync_idle`] later and frees the requests
 //! above. The node gives up on one attempt of a GET after a minute (freenet-core
 //! `OPERATION_TTL`, a per-attempt timeout) and makes up to four attempts (`MAX_RETRIES`), then
-//! reports the failure with an error naming nothing: up to about four minutes after the read.
+//! reports the failure, usually as `NotFound` (attempts that ran out) and otherwise with an
+//! error naming nothing: up to about four minutes after the read.
 //! So a read given up on is kept as late until [`Pace::resync_late`] (five minutes) after it
 //! was asked. A late read holds nothing back, but while any read is late an error naming
 //! nothing, or naming a late read's room with nothing else out for that room, is claimed by
 //! nobody: it is never taken for a request that started after the read was given up on, and
-//! that request, if it was the one that failed, runs to its own deadline instead. A read NEVER
+//! that request, if it was the one that failed, runs to its own deadline instead. A `NotFound`
+//! or an answer for a late read's room, with no subscribe out for it, is that read's and
+//! leaves the subscription alone. Once a late read's answer, `NotFound` or named error has
+//! come, it is no longer late. A read NEVER
 //! reconnects, and it is not an answer owed in the sense of
 //! [`super::outbox`]'s reconnect rule (`wants_reconnect`, `owed_limit`): that rule exists because
 //! an UPDATE's answer names only the room, so a room that owes one cannot send another on the
@@ -185,6 +189,11 @@ impl Resyncs {
 
     pub fn is_late(&self, id: &ContractInstanceId) -> bool {
         self.late.contains_key(id)
+    }
+
+    /// A late read of the room has had its answer or error: nothing more can come from it.
+    pub fn late_done(&mut self, id: &ContractInstanceId) {
+        self.late.remove(id);
     }
 
     /// The one read out, when exactly one is.

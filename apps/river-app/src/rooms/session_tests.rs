@@ -2839,6 +2839,41 @@ fn a_late_read_error_is_not_blamed_on_what_came_after_the_read() {
     assert!(!failed, "the read's error was taken for the message's");
 }
 
+/// A GET the node gave up on after its retries comes back as `NotFound`, not as an error. One
+/// for a read already given up on is that read's: the subscription is not in question, so the
+/// room is not shown as not following.
+#[test]
+fn a_late_reads_not_found_leaves_the_subscription_alone() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_focus: Duration::from_millis(50),
+        resync_wait: Duration::from_millis(200),
+        resync_late: Duration::from_secs(60),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-late-not-found", pace);
+    node.with(|w| w.read_play = ReadPlay::Silence);
+    // One read, from coming to the front; no room is open, so no other read follows.
+    std::thread::sleep(Duration::from_millis(200));
+    session.focus();
+    wait_for_a_read(&session, &node, &a);
+    // Well past `resync_wait`: the read has been given up on and is late.
+    std::thread::sleep(Duration::from_secs(1));
+    node.with(|w| {
+        let answer: Result<HostResponse, ClientError> =
+            Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                instance_id: a.id(),
+            }));
+        w.push
+            .push(Message::Binary(bincode::serialize(&answer).unwrap().into()));
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let (_, issues, _) = session.last_rooms().unwrap();
+    assert!(issues.not_following.is_empty(), "{issues:?}");
+    assert_eq!(node.with(|w| w.connections.len()), 1);
+}
+
 /// No read starts while a read of the stored rooms is out.
 #[test]
 fn no_room_read_starts_beside_a_read_of_the_stored_rooms() {
