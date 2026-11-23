@@ -507,6 +507,19 @@ fn every_kind_of_update_reaches_the_room_and_a_rejected_delta_keeps_what_came_be
     assert_eq!(rooms.issues().not_updated, ["A"]);
     assert_eq!(last_text(&rooms).as_deref(), Some("half applied"));
     assert!(shown(&rooms, &a).stored.room_state.upgrade.0.is_none());
+    // Failing again while already named, with a new message before the failing step: the
+    // message is kept and must show, though the room's name on the issues list does not change.
+    let again = ChatRoomStateV1Delta {
+        recent_messages: Some(vec![message(&a.owner, SystemTime::now(), "kept again")]),
+        ..bad.clone()
+    };
+    assert!(
+        rooms.apply_update(&a.id(), &UpdateData::Delta(cbor(&again).into())),
+        "what the failed merge kept is reported"
+    );
+    assert_eq!(last_text(&rooms).as_deref(), Some("kept again"));
+    // The same failure with nothing new changes nothing.
+    assert!(!rooms.apply_update(&a.id(), &UpdateData::Delta(cbor(&again).into())));
 }
 
 // Against a fake node -------------------------------------------------------------------------
@@ -570,8 +583,10 @@ struct World {
     subscribes: Vec<ContractInstanceId>,
     /// Every GET that does not subscribe (a read again of a room), with when it arrived.
     reads: Vec<(ContractInstanceId, Instant)>,
-    /// Answer no GET that does not subscribe.
-    silence_reads: bool,
+    /// How GETs that do not subscribe are answered.
+    read_play: ReadPlay,
+    /// Answer no subscribing GET for these rooms.
+    ignore_subscribes: HashSet<ContractInstanceId>,
     /// Sent on the newest connection as soon as it is served.
     push: Vec<Message>,
     /// Drop the newest connection.
@@ -663,6 +678,25 @@ impl KeyPlay {
     }
 }
 
+/// How the fake node answers a GET that does not subscribe (a read again of a room).
+#[derive(Clone, Debug, Default)]
+enum ReadPlay {
+    /// With the network's copy, as for a subscribe.
+    #[default]
+    Answer,
+    /// No answer at all.
+    Silence,
+    /// `NotFound`.
+    NotFound,
+    /// The node's GET error, naming the contract.
+    ErrNamed,
+    /// An error that names nothing (`OperationError`), as the node reports a request that
+    /// failed to start.
+    ErrNameless,
+    /// With this other contract's state, under the asked contract's key (a bad node).
+    Swap(ContractInstanceId),
+}
+
 /// How the fake node answers an UPDATE.
 #[derive(Clone, Debug, Default)]
 enum UpdatePlay {
@@ -688,6 +722,42 @@ impl World {
 
     fn reads_of(&self, id: ContractInstanceId) -> usize {
         self.reads.iter().filter(|(r, _)| *r == id).count()
+    }
+
+    /// The network's copy of `room`, as it holds it now.
+    fn network_state(&self, room: &TestRoom) -> ChatRoomStateV1 {
+        match &self.contracts[&room.id()].1 {
+            Contract::State(bytes) => ciborium::de::from_reader(bytes.as_slice()).unwrap(),
+            Contract::NotFound => panic!("the network has no copy"),
+        }
+    }
+
+    /// Another message from `room`'s owner reaches the network's copy, and the node notifies
+    /// the newest connection as the real node does: with the whole new state.
+    fn notify_full(&mut self, room: &TestRoom, text: &str) {
+        let mut state = self.network_state(room);
+        state
+            .recent_messages
+            .messages
+            .push(message(&room.owner, SystemTime::now(), text));
+        let bytes = cbor(&state);
+        self.contracts
+            .insert(room.id(), (room.key, Contract::State(bytes.clone())));
+        let note: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(
+            ContractResponse::UpdateNotification {
+                key: room.key,
+                update: UpdateData::State(bytes.into()),
+            },
+        ));
+        self.push
+            .push(Message::Binary(bincode::serialize(&note).unwrap().into()));
+    }
+
+    /// Push `error` to the newest connection, as if answering a request still out.
+    fn push_error(&mut self, error: ClientError) {
+        let e: Result<HostResponse, ClientError> = Err(error);
+        self.push
+            .push(Message::Binary(bincode::serialize(&e).unwrap().into()));
     }
 
     /// The network's copy of `room` now also holds `text` from its owner, which no
@@ -1192,13 +1262,44 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
             key: id, subscribe, ..
         }) => {
             w.subscribes.push(id);
+            if subscribe && w.ignore_subscribes.contains(&id) {
+                return out;
+            }
+            let mut from = id;
             if !subscribe {
                 w.reads.push((id, Instant::now()));
-                if w.silence_reads {
-                    return out;
+                let named = |id| -> ClientError {
+                    ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
+                        key: w.contracts[&id].0,
+                        cause: "no route".into(),
+                    }))
+                    .into()
+                };
+                match w.read_play.clone() {
+                    ReadPlay::Answer => {}
+                    ReadPlay::Silence => return out,
+                    ReadPlay::NotFound => {
+                        out.push(encode(Ok(HostResponse::ContractResponse(
+                            ContractResponse::NotFound { instance_id: id },
+                        ))));
+                        return out;
+                    }
+                    ReadPlay::ErrNamed => {
+                        out.push(encode(Err(named(id))));
+                        return out;
+                    }
+                    ReadPlay::ErrNameless => {
+                        out.push(encode(Err(ErrorKind::OperationError {
+                            cause: "the request could not start".into(),
+                        }
+                        .into())));
+                        return out;
+                    }
+                    ReadPlay::Swap(other) => from = other,
                 }
             }
-            match w.contracts.get(&id).cloned() {
+            let asked_key = w.contracts.get(&id).map(|(k, _)| *k);
+            match w.contracts.get(&from).cloned().map(|(k, c)| (asked_key.unwrap_or(k), c)) {
                 Some((key, Contract::State(state))) => out.push(encode(Ok(
                     HostResponse::ContractResponse(ContractResponse::GetResponse {
                         key,
@@ -1269,6 +1370,7 @@ fn quick() -> Pace {
         refresh: Duration::from_secs(3600),
         resync_idle: Duration::from_secs(3600),
         resync_focus: Duration::from_secs(3600),
+        resync_spread: Duration::ZERO,
         resync_wait: Duration::from_secs(3600),
         update_wait: Duration::from_secs(60),
         owed_limit: Duration::from_secs(180),
@@ -2091,12 +2193,13 @@ fn a_quiet_node_is_read_again_at_the_idle_pace_only_for_the_open_room_and_kept()
     let (session, _dir) = following(&node, &[&a, &b], "resync-pace", pace);
     let start = Instant::now();
     session.act(&a, Action::Viewing);
-    std::thread::sleep(Duration::from_secs(2));
+    session.wait_on_one_connection(&node, "the open room is read again, three times", || {
+        node.with(|w| w.reads_of(a.id()) >= 3)
+    });
     let elapsed = start.elapsed();
     let (reads_a, reads_b, connections) =
         node.with(|w| (w.reads_of(a.id()), w.reads_of(b.id()), w.connections.len()));
     let most = (elapsed.as_millis() / idle.as_millis()) as usize + 1;
-    assert!(reads_a >= 2, "the open room is read again: {reads_a}");
     assert!(
         reads_a <= most,
         "{reads_a} reads in {elapsed:?}, at most {most}"
@@ -2121,28 +2224,20 @@ fn reads_the_node_never_answers_go_one_at_a_time_and_never_reconnect() {
         ..quick()
     };
     let (session, _dir) = following(&node, &[&a], "resync-silent", pace);
-    node.with(|w| w.silence_reads = true);
+    node.with(|w| w.read_play = ReadPlay::Silence);
     let start = Instant::now();
     session.act(&a, Action::Viewing);
-    std::thread::sleep(Duration::from_secs(2));
+    session.wait_on_one_connection(&node, "an unanswered read is given up and asked again", || {
+        node.with(|w| w.reads_of(a.id()) >= 3)
+    });
     let elapsed = start.elapsed();
     let (reads, connections) = node.with(|w| (w.reads_of(a.id()), w.connections.len()));
     let most = (elapsed.as_millis() / wait.as_millis()) as usize + 1;
-    assert!(
-        reads >= 2,
-        "an unanswered read is given up and asked again: {reads}"
-    );
     assert!(
         reads <= most,
         "{reads} reads in {elapsed:?}, at most {most}"
     );
     assert_eq!(connections, 1);
-    assert!(
-        !session
-            .updates()
-            .iter()
-            .any(|u| matches!(u, RoomsUpdate::Status(LinkStatus::Reconnecting)))
-    );
 }
 
 /// A room that owes the answer to an update is not read again: an error naming nothing could
@@ -2176,7 +2271,7 @@ fn coming_to_the_front_reads_again_each_room_not_heard_about_lately_once() {
     let a = TestRoom::new(1, "A", 1, &["a1"]);
     let b = TestRoom::new(2, "B", 1, &["b1"]);
     let pace = Pace {
-        resync_focus: Duration::from_millis(600),
+        resync_focus: Duration::from_millis(300),
         resync_wait: Duration::from_secs(5),
         ..quick()
     };
@@ -2185,7 +2280,8 @@ fn coming_to_the_front_reads_again_each_room_not_heard_about_lately_once() {
         w.network_says(&a, "news in A");
         w.network_says(&b, "news in B");
     });
-    std::thread::sleep(Duration::from_millis(700));
+    // Well past `resync_focus`, so both rooms are quiet enough however slow the machine.
+    std::thread::sleep(Duration::from_secs(1));
     session.focus();
     session.wait_on_one_connection(&node, "both rooms are read again and show it", || {
         shows(&session, "news in A") && shows(&session, "news in B")
@@ -2195,12 +2291,342 @@ fn coming_to_the_front_reads_again_each_room_not_heard_about_lately_once() {
         (1, 1)
     );
     session.focus();
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(600));
     assert_eq!(
         node.with(|w| (w.reads_of(a.id()), w.reads_of(b.id()))),
         (1, 1),
         "rooms just heard from are not read again"
     );
+}
+
+/// Whether the room `room` (that room, not any) shows `text`.
+fn shows_in(session: &Running, room: &TestRoom, text: &str) -> bool {
+    let key = bs58::encode(room.vk().to_bytes()).into_string();
+    session.last_rooms().is_some_and(|(r, _, _)| {
+        r.iter()
+            .any(|shown| shown.key == key && texts(shown).iter().any(|t| t == text))
+    })
+}
+
+/// Wait until a read of `room` has reached the node.
+fn wait_for_a_read(session: &Running, node: &FakeNode, room: &TestRoom) {
+    session.wait_on_one_connection(node, "a read is out", || {
+        node.with(|w| w.reads_of(room.id()) >= 1)
+    });
+}
+
+/// Notifications for the open room keep it from being read again: the node is plainly telling
+/// River about it. The notifications carry the whole state, as the real node's do.
+#[test]
+fn notifications_for_the_open_room_keep_it_from_being_read_again() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(400),
+        resync_wait: Duration::from_secs(5),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-notified", pace);
+    session.act(&a, Action::Viewing);
+    let start = Instant::now();
+    let mut n = 0;
+    // A notification every 100 ms, well inside the 400 ms idle time, for two seconds.
+    while start.elapsed() < Duration::from_secs(2) {
+        n += 1;
+        let text = format!("note {n}");
+        node.with(|w| w.notify_full(&a, &text));
+        session.wait_on_one_connection(&node, "the notification shows", || {
+            shows_in(&session, &a, &text)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(node.with(|w| w.reads_of(a.id())), 0);
+}
+
+/// A message the node took arrives in a whole-state notification, as the real node sends it,
+/// and shows in that room only.
+#[test]
+fn a_whole_state_notification_shows_what_it_carries_in_its_room_only() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let (session, _dir) = following(&node, &[&a, &b], "resync-full-note", quick());
+    node.with(|w| w.notify_full(&a, "for A"));
+    session.wait_on_one_connection(&node, "it shows in A", || {
+        shows_in(&session, &a, "for A")
+    });
+    assert!(!shows_in(&session, &b, "for A"));
+    assert!(session.last_rooms().unwrap().1.not_updated.is_empty());
+}
+
+/// A room whose subscribe the node has not answered is not read again: the read's answer could
+/// not be told from the subscribe's.
+#[test]
+fn a_room_whose_subscribe_is_unanswered_is_not_read_again() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    node.with(|w| {
+        w.ignore_subscribes.insert(a.id());
+    });
+    let pace = Pace {
+        resync_idle: Duration::from_millis(50),
+        resync_wait: Duration::from_secs(5),
+        // Asked once and left waiting for the whole test.
+        catch_up: Duration::from_secs(30),
+        ..quick()
+    };
+    node.with(|w| {
+        w.add_room(&a);
+        w.add_room(&b);
+    });
+    let dir = temp_dir("resync-sub-pending");
+    save_token(&dir, "kept-token");
+    let session = Running::start(&node, &dir, pace);
+    session.wait_rooms("both rooms show", |r, _, _| r.len() == 2);
+    session.act(&a, Action::Viewing);
+    // B, with its subscribe answered, is read once it is open: the rule is live.
+    std::thread::sleep(Duration::from_millis(500));
+    session.act(&b, Action::Viewing);
+    wait_for_a_read(&session, &node, &b);
+    assert_eq!(node.with(|w| w.reads_of(a.id())), 0);
+}
+
+/// A read that fails in any way the node fails one (nothing found, its GET error, an error
+/// naming nothing) changes nothing on screen, does not touch the subscription, never
+/// reconnects, and the next read comes by the usual rule, not after `resync_wait`.
+#[test]
+fn a_read_that_fails_changes_nothing_and_the_next_comes_at_the_usual_pace() {
+    for (play, name) in [
+        (ReadPlay::NotFound, "not-found"),
+        (ReadPlay::ErrNamed, "named"),
+        (ReadPlay::ErrNameless, "nameless"),
+    ] {
+        let node = fake_node(vec![]);
+        let a = TestRoom::new(1, "A", 1, &["a1"]);
+        let pace = Pace {
+            resync_idle: Duration::from_millis(100),
+            // Far longer than the test: a read is freed by its failure, not by giving up.
+            resync_wait: Duration::from_secs(3600),
+            ..quick()
+        };
+        let (session, _dir) = following(&node, &[&a], &format!("resync-fail-{name}"), pace);
+        node.with(|w| w.read_play = play.clone());
+        session.act(&a, Action::Viewing);
+        session.wait_on_one_connection(&node, &format!("{name}: three reads"), || {
+            node.with(|w| w.reads_of(a.id()) >= 3)
+        });
+        let (subscribes, connections) =
+            node.with(|w| (w.subscribes_to(a.id()) - w.reads_of(a.id()), w.connections.len()));
+        assert_eq!(subscribes, 1, "{name}: subscribed again");
+        assert_eq!(connections, 1, "{name}");
+        let (_, issues, status) = session.last_rooms().unwrap();
+        assert!(issues.not_updated.is_empty(), "{name}: {issues:?}");
+        assert_eq!(status, LinkStatus::Live, "{name}");
+    }
+}
+
+/// A bad node answers a read of B with A's state: neither room takes the other's messages.
+#[test]
+fn an_answer_with_another_rooms_state_leaks_into_neither() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(50),
+        resync_wait: Duration::from_secs(5),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a, &b], "resync-swap", pace);
+    node.with(|w| {
+        w.network_says(&a, "only A");
+        w.read_play = ReadPlay::Swap(a.id());
+    });
+    session.act(&b, Action::Viewing);
+    session.wait_on_one_connection(&node, "B is read twice", || {
+        node.with(|w| w.reads_of(b.id()) >= 2)
+    });
+    assert!(!shows_in(&session, &b, "only A"));
+    assert!(!shows_in(&session, &a, "only A"), "A was not read");
+    assert!(shows_in(&session, &b, "b1") && shows_in(&session, &a, "a1"));
+}
+
+/// A merge that fails the same way every time (the network's copy holds an upgrade pointer
+/// signed by someone else, which every merge refuses) is read again with a growing wait, and
+/// then no more on this connection: reading it again cannot help.
+#[test]
+fn a_merge_that_always_fails_the_same_way_is_read_again_a_few_times_then_left() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let mut bad = a.state.clone();
+    bad.upgrade = river_core::room_state::upgrade::OptionalUpgradeV1(Some(
+        river_core::room_state::upgrade::AuthorizedUpgradeV1::new(
+            river_core::room_state::upgrade::UpgradeV1 {
+                owner_member_id: MemberId::from(&a.vk()),
+                version: 1,
+                new_chatroom_address: blake3::Hash::from([0; 32]),
+            },
+            &SigningKey::from_bytes(&[99; 32]),
+        ),
+    ));
+    let pace = Pace {
+        resubscribe_first: Duration::from_millis(100),
+        resubscribe_max: Duration::from_millis(400),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-hopeless", pace);
+    node.with(|w| {
+        w.contracts
+            .insert(a.id(), (a.key, Contract::State(cbor(&bad))));
+        w.notify_full(&a, "kept though the merge fails");
+    });
+    session.wait_on_one_connection(&node, "a read follows the failed merge", || {
+        node.with(|w| w.reads_of(a.id()) >= 1)
+    });
+    // With the waits capped at 400 ms, an unbounded heal would read about 7 more times in
+    // three seconds.
+    std::thread::sleep(Duration::from_secs(3));
+    let reads = node.with(|w| w.reads_of(a.id()));
+    assert!(reads <= 3, "{reads} reads of a room that can never merge");
+    let gaps: Vec<Duration> = node.with(|w| {
+        let times: Vec<Instant> = w.reads.iter().map(|(_, t)| *t).collect();
+        times.windows(2).map(|p| p[1] - p[0]).collect()
+    });
+    if let [first, second, ..] = gaps[..] {
+        assert!(second > first, "the wait grows: {gaps:?}");
+    }
+    assert_eq!(node.with(|w| w.connections.len()), 1);
+    assert_eq!(session.last_rooms().unwrap().1.not_updated, ["A"]);
+}
+
+/// The stored rooms are not read again while a room read is out: an error naming nothing could
+/// then be either's, and taken for the stored rooms' it aborts their read.
+#[test]
+fn the_stored_rooms_are_not_read_again_while_a_room_read_is_out() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(50),
+        resync_wait: Duration::from_secs(3600),
+        refresh: Duration::from_millis(300),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-vs-reload", pace);
+    node.with(|w| w.read_play = ReadPlay::Silence);
+    session.act(&a, Action::Viewing);
+    wait_for_a_read(&session, &node, &a);
+    let lists = node.with(|w| w.lists);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(node.with(|w| w.lists), lists, "a stored-rooms read went out beside it");
+}
+
+/// The signing key sweep sends nothing while a room read is out, for the same reason.
+#[test]
+fn the_signing_key_sweep_waits_while_a_room_read_is_out() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(50),
+        resync_wait: Duration::from_secs(3600),
+        key_delay: Duration::from_millis(1000),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-vs-sweep", pace);
+    node.with(|w| w.read_play = ReadPlay::Silence);
+    session.act(&a, Action::Viewing);
+    wait_for_a_read(&session, &node, &a);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(node.with(|w| w.key_reads.is_empty() && w.key_stores.is_empty()));
+}
+
+/// A create sends nothing while a room read is out, for the same reason.
+#[test]
+fn a_create_waits_while_a_room_read_is_out() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(50),
+        resync_wait: Duration::from_secs(3600),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-vs-create", pace);
+    node.with(|w| w.read_play = ReadPlay::Silence);
+    session.act(&a, Action::Viewing);
+    wait_for_a_read(&session, &node, &a);
+    let before = node.with(|w| w.sent.len());
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let after: Vec<&'static str> =
+        node.with(|w| w.sent[before..].iter().map(|(_, k)| *k).collect());
+    assert!(
+        after.iter().all(|k| *k == "contract") && node.with(|w| w.puts.is_empty()),
+        "the create sent {after:?} beside the read"
+    );
+}
+
+/// A room read whose node answers `MissingContract` while the room also owes an update's
+/// answer: the error may be the read's, so the message is not marked as failed for it.
+#[test]
+fn a_missing_contract_while_a_read_is_out_does_not_fail_a_message() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(50),
+        resync_wait: Duration::from_secs(3600),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-vs-update", pace);
+    node.with(|w| {
+        w.read_play = ReadPlay::Silence;
+        w.update_play = UpdatePlay::Ignore;
+    });
+    session.act(&a, Action::Viewing);
+    wait_for_a_read(&session, &node, &a);
+    session.act(&a, say("still sending"));
+    session.wait_until("the update reached the node", || {
+        node.with(|w| !w.updates.is_empty())
+    });
+    node.with(|w| {
+        w.push_error(
+            ErrorKind::RequestError(RequestError::ContractError(
+                ContractError::MissingContract { key: a.id() },
+            ))
+            .into(),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let failed = session.last_rooms().is_some_and(|(r, _, _)| {
+        r.iter()
+            .flat_map(|r| r.messages.iter())
+            .any(|m| m.text == "still sending" && m.pending.as_ref().is_some_and(|p| p.failed.is_some()))
+    });
+    assert!(!failed, "the read's error was taken for the update's");
+}
+
+/// The open room is still read again after a reconnect: the new connection is told which room
+/// the window shows.
+#[test]
+fn the_open_room_is_still_read_again_after_a_reconnect() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(200),
+        resync_wait: Duration::from_secs(5),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-reconnect", pace);
+    session.act(&a, Action::Viewing);
+    wait_for_a_read(&session, &node, &a);
+    node.with(|w| w.drop_live = true);
+    session.wait_until("a new connection", || node.with(|w| w.connections.len() == 2));
+    let since = Instant::now();
+    session.wait_until("a read on the new connection", || {
+        node.with(|w| w.reads.iter().any(|(id, at)| *id == a.id() && *at > since))
+    });
 }
 
 // Sending ---------------------------------------------------------------------------------------

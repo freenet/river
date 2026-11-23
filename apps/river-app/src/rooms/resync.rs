@@ -54,19 +54,40 @@
 //! [`Pace::idle_check`]: super::session::Pace
 //! [`Pace::pong_wait`]: super::session::Pace
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use freenet_stdlib::prelude::ContractInstanceId;
 use rand::Rng;
+
+/// How many merges in a row may fail with the same error before the room is no longer read
+/// again for it on this connection: the node sends the same whole state each time, so a
+/// failure that repeats is one a read cannot heal. The room stays named as not updated; a
+/// notification still merges, a different failure or a merge that works starts over, and a new
+/// connection reads every room afresh.
+pub(super) const HEAL_GIVE_UP: u32 = 3;
 
 /// The pacing [`Resyncs`] needs, taken from the session's `Pace`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ResyncPace {
     pub idle: Duration,
     pub focus: Duration,
+    /// Coming to the front spreads its reads over up to this long, at random, so a window that
+    /// comes to the front does not send one read per room in the same instant.
+    pub spread: Duration,
     pub heal_first: Duration,
     pub heal_max: Duration,
+}
+
+/// A room whose last merge failed.
+struct Heal {
+    /// Reads asked to heal it so far.
+    asked: u32,
+    /// When to read it again; `None` once given up ([`HEAL_GIVE_UP`]).
+    at: Option<Instant>,
+    /// The last merge's error, and how many merges in a row failed with it.
+    error: String,
+    same: u32,
 }
 
 /// The rooms read again on one connection. A new connection subscribes to, and so reads, every
@@ -77,10 +98,9 @@ pub(super) struct Resyncs {
     /// When the node last said anything about each room, or River last asked it to: the room's
     /// quiet clock. A room with none counts from when the connection was set up.
     heard: HashMap<ContractInstanceId, Instant>,
-    /// Rooms whose last merge failed: reads asked since to heal it, and when to read again.
-    heal: HashMap<ContractInstanceId, (u32, Instant)>,
-    /// Rooms to read again because the window came to the front.
-    wanted: HashSet<ContractInstanceId>,
+    heal: HashMap<ContractInstanceId, Heal>,
+    /// Rooms to read again because the window came to the front, each with when its read may go.
+    wanted: HashMap<ContractInstanceId, Instant>,
     started: Instant,
 }
 
@@ -90,7 +110,7 @@ impl Resyncs {
             out: HashMap::new(),
             heard: HashMap::new(),
             heal: HashMap::new(),
-            wanted: HashSet::new(),
+            wanted: HashMap::new(),
             started: now,
         }
     }
@@ -115,6 +135,14 @@ impl Resyncs {
         !self.out.is_empty()
     }
 
+    /// The one read out, when exactly one is.
+    pub fn lone(&self) -> Option<ContractInstanceId> {
+        match self.out.keys().collect::<Vec<_>>()[..] {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
     /// A read failed (the node's error, or nothing found). The room is free for the next read,
     /// by the usual rules.
     pub fn failed(&mut self, id: &ContractInstanceId) {
@@ -122,21 +150,46 @@ impl Resyncs {
     }
 
     /// The outcome of merging what the node sent about the room. A failure schedules a read,
-    /// after a wait that doubles with each read already asked to heal it; a success forgets
-    /// earlier failures.
-    pub fn merged(&mut self, id: ContractInstanceId, ok: bool, now: Instant, pace: &ResyncPace) {
-        if ok {
-            self.heal.remove(&id);
-            return;
+    /// after a wait that doubles with each read already asked to heal it, unless it is the
+    /// [`HEAL_GIVE_UP`]th in a row with the same error; a success forgets earlier failures.
+    pub fn merged(
+        &mut self,
+        id: ContractInstanceId,
+        result: &Result<(), String>,
+        now: Instant,
+        pace: &ResyncPace,
+    ) {
+        let error = match result {
+            Ok(()) => {
+                self.heal.remove(&id);
+                return;
+            }
+            Err(e) => e,
+        };
+        let heal = self.heal.entry(id).or_insert_with(|| Heal {
+            asked: 0,
+            at: None,
+            error: String::new(),
+            same: 0,
+        });
+        if heal.error == *error {
+            heal.same = heal.same.saturating_add(1);
+        } else {
+            heal.error = error.clone();
+            heal.same = 1;
         }
-        let asked = self.heal.get(&id).map_or(0, |(n, _)| *n);
-        self.heal.insert(id, (asked, now + heal_wait(asked, pace)));
+        heal.at = (heal.same < HEAL_GIVE_UP).then(|| now + heal_wait(heal.asked, pace));
     }
 
-    /// The window came to the front: every room in `rooms` is to be read again, if the node has
-    /// said nothing about it for `pace.focus` by the time it can go.
-    pub fn focus(&mut self, rooms: &[ContractInstanceId]) {
-        self.wanted.extend(rooms.iter().copied());
+    /// The window came to the front: every room in `rooms` is to be read again, each at a random
+    /// moment within `pace.spread`, if the node has said nothing about it for `pace.focus` by
+    /// then.
+    pub fn focus(&mut self, rooms: &[ContractInstanceId], now: Instant, pace: &ResyncPace) {
+        for id in rooms {
+            self.wanted
+                .entry(*id)
+                .or_insert_with(|| now + pace.spread.mul_f64(rand::thread_rng().gen_range(0.0..=1.0)));
+        }
     }
 
     /// Give up reads out for `wait` or longer.
@@ -150,7 +203,7 @@ impl Resyncs {
         self.out.retain(|id, _| shown.contains(id));
         self.heard.retain(|id, _| shown.contains(id));
         self.heal.retain(|id, _| shown.contains(id));
-        self.wanted.retain(|id| shown.contains(id));
+        self.wanted.retain(|id, _| shown.contains(id));
     }
 
     fn quiet(&self, id: &ContractInstanceId, now: Instant) -> Duration {
@@ -158,9 +211,9 @@ impl Resyncs {
     }
 
     /// The rooms of `rooms` to read now, each marked out and its quiet clock restarted: those
-    /// whose failed merge is due for a read, those wanted by coming to the front and still quiet
-    /// for `pace.focus`, and the open room `viewing` when quiet for `pace.idle`. Never a room
-    /// with a read out, nor one `blocked` says may not be read now.
+    /// whose failed merge is due for a read, those wanted by coming to the front whose moment
+    /// has come and still quiet for `pace.focus`, and the open room `viewing` when quiet for
+    /// `pace.idle`. Never a room with a read out, nor one `blocked` says may not be read now.
     pub fn due(
         &mut self,
         viewing: Option<ContractInstanceId>,
@@ -169,12 +222,12 @@ impl Resyncs {
         now: Instant,
         pace: &ResyncPace,
     ) -> Vec<ContractInstanceId> {
-        // A room wanted by coming to the front but heard from since is not read again.
+        // A room wanted by coming to the front but heard from by its moment is not read again.
         let fresh: Vec<ContractInstanceId> = self
             .wanted
             .iter()
-            .filter(|id| self.quiet(id, now) < pace.focus)
-            .copied()
+            .filter(|(id, at)| **at <= now && self.quiet(id, now) < pace.focus)
+            .map(|(id, _)| *id)
             .collect();
         for id in fresh {
             self.wanted.remove(&id);
@@ -184,21 +237,28 @@ impl Resyncs {
             if self.out.contains_key(id) || blocked(id) {
                 continue;
             }
-            let heal = self.heal.get(id).is_some_and(|(_, at)| *at <= now);
-            let wanted = self.wanted.contains(id);
+            let heal = self
+                .heal
+                .get(id)
+                .is_some_and(|h| h.at.is_some_and(|at| at <= now));
+            let wanted = self.wanted.get(id).is_some_and(|at| *at <= now);
             let idle = viewing.as_ref() == Some(id) && self.quiet(id, now) >= pace.idle;
-            if heal || wanted || idle {
-                // The next heal is scheduled now, not when the answer merges: a read that fails
-                // or goes unanswered must not be asked again at once, on every tick.
-                if let Some((asked, at)) = self.heal.get_mut(id) {
-                    *asked = asked.saturating_add(1);
-                    *at = now + heal_wait(*asked, pace);
-                }
-                self.wanted.remove(id);
-                self.out.insert(*id, now);
-                self.heard.insert(*id, now);
-                due.push(*id);
+            if !(heal || wanted || idle) {
+                continue;
             }
+            // A heal read schedules the next one now, not when its answer merges: one that fails
+            // or goes unanswered must not be asked again at once, on every tick. A read for
+            // another reason leaves the heal's schedule as it is.
+            if heal && let Some(h) = self.heal.get_mut(id) {
+                h.asked = h.asked.saturating_add(1);
+                h.at = Some(now + heal_wait(h.asked, pace));
+            }
+            if wanted {
+                self.wanted.remove(id);
+            }
+            self.out.insert(*id, now);
+            self.heard.insert(*id, now);
+            due.push(*id);
         }
         due
     }
@@ -231,6 +291,7 @@ mod tests {
         ResyncPace {
             idle: Duration::from_secs(60),
             focus: Duration::from_secs(30),
+            spread: Duration::ZERO,
             heal_first: Duration::from_secs(5),
             heal_max: Duration::from_secs(300),
         }
@@ -292,12 +353,12 @@ mod tests {
         let rooms = [id(1), id(2)];
         let t1 = t0 + p.focus;
         r.heard(&id(2), t1 - Duration::from_secs(1));
-        r.focus(&rooms);
+        r.focus(&rooms, t1, &p);
         assert_eq!(r.due(None, &rooms, FREE, t1, &p), [id(1)]);
         r.answered(&id(1), t1);
         // Room 2 was heard from lately and is dropped, not kept for later.
         assert!(r.due(None, &rooms, FREE, t1 + p.focus * 2, &p).is_empty());
-        r.focus(&rooms);
+        r.focus(&rooms, t1, &p);
         assert!(r.due(None, &rooms, FREE, t1, &p).is_empty(), "just heard");
     }
 
@@ -307,7 +368,7 @@ mod tests {
         let mut r = Resyncs::new(t0);
         let p = pace();
         let rooms = [id(1)];
-        r.merged(id(1), false, t0, &p);
+        r.merged(id(1), &Err("bad".into()), t0, &p);
         assert!(
             r.due(None, &rooms, FREE, t0 + p.heal_first.mul_f64(0.79), &p)
                 .is_empty()
@@ -318,7 +379,7 @@ mod tests {
         );
         let t1 = t0 + p.heal_first * 2;
         r.answered(&id(1), t1);
-        r.merged(id(1), false, t1, &p);
+        r.merged(id(1), &Err("bad".into()), t1, &p);
         let second = p.heal_first * 2;
         assert!(
             r.due(None, &rooms, FREE, t1 + second.mul_f64(0.79), &p)
@@ -354,7 +415,7 @@ mod tests {
         );
         // A merge that works forgets it.
         r.answered(&id(1), t1);
-        r.merged(id(1), true, t1, &p);
+        r.merged(id(1), &Ok(()), t1, &p);
         assert!(
             r.due(None, &rooms, FREE, t1 + p.heal_max * 10, &p)
                 .is_empty()
@@ -366,12 +427,74 @@ mod tests {
         let t0 = Instant::now();
         let mut r = Resyncs::new(t0);
         let p = pace();
-        r.merged(id(1), false, t0, &p);
-        r.focus(&[id(1)]);
+        r.merged(id(1), &Err("bad".into()), t0, &p);
+        r.focus(&[id(1)], t0, &p);
+        r.due(None, &[id(1)], FREE, t0, &p);
+        r.heard(&id(1), t0);
         r.keep_only(&[id(2)]);
+        assert!(!r.is_out(&id(1)) && !r.heard.contains_key(&id(1)));
         assert!(
             r.due(None, &[id(1)], FREE, t0 + p.heal_max * 2, &p)
                 .is_empty()
         );
     }
+
+    #[test]
+    fn coming_to_the_front_spreads_its_reads() {
+        let t0 = Instant::now();
+        let mut r = Resyncs::new(t0);
+        let p = ResyncPace {
+            spread: Duration::from_secs(10),
+            ..pace()
+        };
+        let rooms: Vec<ContractInstanceId> = (1..=20).map(id).collect();
+        let t1 = t0 + p.focus;
+        r.focus(&rooms, t1, &p);
+        let at_once = r.due(None, &rooms, FREE, t1, &p).len();
+        assert!(at_once < 20, "all {at_once} at once");
+        let by_end = r.due(None, &rooms, FREE, t1 + p.spread, &p).len();
+        assert_eq!(at_once + by_end, 20, "each read once, within the spread");
+    }
+
+    #[test]
+    fn a_failure_that_repeats_is_read_again_a_few_times_then_left() {
+        let t0 = Instant::now();
+        let mut r = Resyncs::new(t0);
+        let p = pace();
+        let rooms = [id(1)];
+        let same: Result<(), String> = Err("refused".into());
+        let mut t = t0;
+        let mut reads = 0;
+        for _ in 0..10 {
+            r.merged(id(1), &same, t, &p);
+            t += p.heal_max * 2;
+            if r.due(None, &rooms, FREE, t, &p).is_empty() {
+                break;
+            }
+            reads += 1;
+            r.answered(&id(1), t);
+        }
+        assert_eq!(reads, HEAL_GIVE_UP - 1, "read after each of the failures but the last");
+        // A different failure starts over; so does a merge that works.
+        r.merged(id(1), &Err("another".into()), t, &p);
+        assert_eq!(r.due(None, &rooms, FREE, t + p.heal_max * 2, &p), [id(1)]);
+        r.answered(&id(1), t);
+        r.merged(id(1), &Ok(()), t, &p);
+        assert!(r.heal.is_empty());
+    }
+
+    #[test]
+    fn an_idle_or_focus_read_leaves_the_heal_schedule_alone() {
+        let t0 = Instant::now();
+        let mut r = Resyncs::new(t0);
+        let p = pace();
+        let rooms = [id(1)];
+        r.merged(id(1), &Err("bad".into()), t0, &p);
+        // The open room falls quiet before its heal is due: that read is not a heal.
+        let quiet = t0 + p.idle;
+        r.heal.get_mut(&id(1)).unwrap().at = Some(quiet + p.heal_first);
+        assert_eq!(r.due(Some(id(1)), &rooms, FREE, quiet, &p), [id(1)]);
+        assert_eq!(r.heal[&id(1)].asked, 0);
+    }
 }
+

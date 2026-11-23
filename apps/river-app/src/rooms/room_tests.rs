@@ -704,6 +704,64 @@ fn a_network_delta_that_fails_partway_keeps_the_steps_before_the_failure() {
     assert!(live.stored.room_state.upgrade.0.is_none());
 }
 
+/// The private room with its message cap set to the messages it holds, so any new message is
+/// one too many until cleanup drops the oldest.
+fn full_room(f: &Fixture) -> ChatRoomStateV1 {
+    let mut state = f.private_state();
+    let mut config = state.configuration.configuration.clone();
+    config.max_recent_messages = state.recent_messages.messages.len();
+    state.configuration = AuthorizedConfigurationV1::new(config, &f.owner);
+    state
+}
+
+/// What a partial merge keeps is cleaned up as a whole merge would be: the room's caps hold
+/// (here the message cap), so a room that fails partway again and again cannot grow past them.
+#[test]
+fn a_network_state_that_fails_partway_keeps_only_what_cleanup_allows() {
+    let f = Fixture::new();
+    let state = full_room(&f);
+    let cap = state.configuration.configuration.max_recent_messages;
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let mut incoming = state;
+    for (i, text) in ["newer", "newest"].iter().enumerate() {
+        incoming
+            .recent_messages
+            .messages
+            .push(text_at(&f, 700 + i as u64, 0, &SECRET, text));
+    }
+    incoming.upgrade = forged_upgrade(&f);
+    assert!(live.merge_network_state(&incoming).is_err());
+    let kept = &live.stored.room_state;
+    assert_eq!(kept.recent_messages.messages.len(), cap, "the cap holds");
+    assert_eq!(kept.normalized(&live.params()).unwrap(), *kept, "cleaned up");
+    let room = live.view(&minutes);
+    assert_eq!(
+        room.messages.last().map(|m| m.text.as_str()),
+        Some("newest")
+    );
+}
+
+/// The same for a delta from a notification.
+#[test]
+fn a_network_delta_that_fails_partway_keeps_only_what_cleanup_allows() {
+    let f = Fixture::new();
+    let state = full_room(&f);
+    let cap = state.configuration.configuration.max_recent_messages;
+    let mut live = LiveRoom::new(f.stored(state));
+    let delta = river_core::room_state::ChatRoomStateV1Delta {
+        recent_messages: Some(vec![
+            text_at(&f, 700, 0, &SECRET, "newer"),
+            text_at(&f, 701, 0, &SECRET, "newest"),
+        ]),
+        upgrade: forged_upgrade(&f).0,
+        ..Default::default()
+    };
+    assert!(live.apply_network_delta(delta).is_err());
+    let kept = &live.stored.room_state;
+    assert_eq!(kept.recent_messages.messages.len(), cap);
+    assert_eq!(kept.normalized(&live.params()).unwrap(), *kept);
+}
+
 /// A secret blob addressed to this member that does not decrypt is skipped, not fatal: the
 /// room still opens, with the invitation's copy of that version's secret.
 #[test]
