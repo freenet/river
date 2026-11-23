@@ -1501,8 +1501,9 @@ full key, a member colliding with the owner's id (or key) is rejected in
 keys are compared: field applies keep one record per (id, key) and accept what
 an id signed under any key held for it, the members summary carries a key tag
 (`key_tag`), and cleanup decides one key per id from the whole state
-(`ChatRoomStateV1::resolve_shared_ids`), preferring the key that has signed
-something the room holds.
+(`ChatRoomStateV1::resolve_shared_ids`), preferring a key that has signed a
+`member_info`. An apply admits at most one new key per id, so at most two are
+ever held (`MAX_KEYS_PER_ID`).
 */
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);

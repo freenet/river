@@ -162,6 +162,8 @@ fn chain_within_cap(
     if depth > cap {
         return false;
     }
+    #[cfg(test)]
+    tests::CHAIN_WALKS.with(|c| c.set(c.get() + 1));
     let digest = evidence_digest(record);
     if let Some(known) = memo.walks.get(&(digest, depth, check)) {
         return *known;
@@ -641,6 +643,12 @@ pub(crate) mod tests {
         /// Calls to `BanEvidenceV1::lookup`, and evidence records it examined.
         pub(crate) static LOOKUP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(crate) static LOOKUP_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Calls into `chain_within_cap`, memo hits included.
+        pub(crate) static CHAIN_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn chain_walks() -> usize {
+        CHAIN_WALKS.with(|c| c.get())
     }
     use crate::room_state::ban::{AuthorizedUserBan, UserBan};
     use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};

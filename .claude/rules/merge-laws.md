@@ -22,8 +22,8 @@ forks rooms between peers. These rules hold the room contract to them.
 key it could be checked against verifies) or a work bound exceeded. A record
 that is validly signed but that the room does not admit (over a cap, at an
 unknown secret version, a public message in a private room, a second record
-for a member id this peer already holds under the same key) is SKIPPED on arrival and dropped
-where held, by the same rule in both places. So is a ban whose known
+for a member id this peer already holds under the same key) is SKIPPED on
+arrival and dropped where held, by the same rule in both places. So is a ban whose known
 issuer's key does not verify it: another peer may not know that issuer. A
 ban whose issuer is known nowhere is kept on arrival and swept by the same
 cleanup; neither kind counts toward `max_user_bans` (they are dropped before
@@ -31,24 +31,30 @@ the cap counts, so they cannot evict a stored ban). An `Err` for such a
 record fails every merge with a peer holding it, in one direction only, and
 nothing but its author can repair it.
 
-A `MemberId` is a non-cryptographic hash, so two keys can share one. Every
-field apply keeps one record per (id, key), never per id, and accepts what an
-id signed (`member_info`, messages, DMs, purges, provisional bans) under ANY
-key a held member or evidence record names for it; a member-invited record
-whose signature fails under every key held for its inviter's id is skipped,
-not an error (an owner-invited one is still an error: the owner's key is the
-only key for the owner's id). A member's ban is kept on arrival whatever key
-is held for its issuer, because bans apply before members and the issuer's
-record may arrive in the same delta under another key; step 0-sig drops it if
-no key verifies it. Cleanup's first step (`resolve_shared_ids`) then keeps
-one key per id from the whole state: the key that has signed a record the
-room holds that no retention horizon withholds (`member_info`, a ban, a DM
-purge record, an invitee's record; never a message or DM, since a merge or
-delta may withhold those), then least invite depth, then lower record digest. Anything that
-reads ONE record per id during a field apply (`members_by_member_id`,
+A `MemberId` is a non-cryptographic hash, so two keys can share one. Field
+applies keep one record per (id, key), never per id, and admit at most ONE
+new key per id per apply (the lowest record digest, chosen before any
+signature check; `member::admit_one_new_key_per_id`), so an id is held under
+at most two keys at once and `verify` refuses a state naming more. That bound
+is what keeps every per-key loop at most twice its single-key work; do not
+add a path that holds more. Arrivals accept what an id signed (`member_info`,
+messages, DMs, purges, provisional bans) under ANY key a held member or
+evidence record names for it, and `member_info` and purges rank only within
+one key until the id is decided. A member-invited record whose signature
+fails under every key held for its inviter's id is skipped, not an error (an
+owner-invited one is still an error). A member's ban is kept on arrival
+whatever key is held for its issuer (bans apply before members); step 0-sig
+drops it if no key verifies it. Cleanup's first step (`resolve_shared_ids`,
+before the evidence depth prune) keeps one key per id among the keys whose
+record is reachable through verified links: a key with a `member_info` first
+(the only proof that no later cleanup removes while the member stays), then
+the lower record digest, which the other key's author can steer. Anything
+that reads ONE record per id during a field apply (`members_by_member_id`,
 `BanEvidenceV1::lookup`) to accept or drop a record makes the first exchange
 depend on which record the lookup returned; read every key instead
-(`member::keys_by_member_id`).
+(`member::keys_by_member_id`). Known limit: a three-way merge can differ when
+the kept key's member is removed in the same merge; the results converge
+after one more exchange (`three_way_merges_converge_after_one_more_exchange`).
 
 A configuration that fails the value checks is the one record that is never
 dropped: an owner-signed one ranks below every valid configuration, so a

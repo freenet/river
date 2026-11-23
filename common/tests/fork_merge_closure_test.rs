@@ -270,7 +270,7 @@ impl World {
         while prov.len() < 6 {
             let k = SigningKey::from_bytes(&[b; 32]);
             b += 1;
-            if let Some(f) = forged_vk_with_id_of(&k.verifying_key()) {
+            if let Some(f) = forged_vk_with_id_of(&k.verifying_key(), b.is_multiple_of(2)) {
                 prov_ids.push(k.verifying_key().into());
                 forged.push(f);
                 prov.push(k);
@@ -278,7 +278,8 @@ impl World {
         }
         let pool_forged = pool
             .iter()
-            .map(|m| forged_vk_with_id_of(&m.sk.verifying_key()))
+            .enumerate()
+            .map(|(i, m)| forged_vk_with_id_of(&m.sk.verifying_key(), i.is_multiple_of(2)))
             .collect();
         World {
             owner_sk,
@@ -1459,19 +1460,31 @@ fn random_op_prov(
 }
 
 /// A key whose `MemberId` equals `victim`'s and whose bytes differ (see the
-/// `MemberId` docs), or `None` if none is found. It has no secret key.
+/// `MemberId` docs), ordering after `victim`'s bytes when `after` is set and
+/// before them otherwise, or `None` if none is found. It has no secret key.
+/// Both orders are generated: a read of the first or the last record stored
+/// for an id is caught only by the order that puts the wrong one there.
 fn forged_vk_with_id_of(
     victim: &ed25519_dalek::VerifyingKey,
+    after: bool,
 ) -> Option<ed25519_dalek::VerifyingKey> {
     let target: MemberId = victim.into();
     let base = victim.to_bytes();
     for i in 0..31 {
         let mut bytes = base;
-        if bytes[i] == 255 || bytes[i + 1] < 31 {
-            continue;
+        if after {
+            if bytes[i] == 255 || bytes[i + 1] < 31 {
+                continue;
+            }
+            bytes[i] += 1;
+            bytes[i + 1] -= 31;
+        } else {
+            if bytes[i] == 0 || bytes[i + 1] > 255 - 31 {
+                continue;
+            }
+            bytes[i] -= 1;
+            bytes[i + 1] += 31;
         }
-        bytes[i] += 1;
-        bytes[i + 1] -= 31;
         if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&bytes) {
             if MemberId::from(&vk) == target && vk != *victim {
                 return Some(vk);
@@ -1864,6 +1877,9 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
             }
             if keys.values().any(|k| k.len() > 1) {
                 s.runs_with_shared_id += 1;
+                if std::env::var("FORK_PRINT_SHARED").is_ok() {
+                    println!("shared id: seed {seed} shape {shape}");
+                }
             }
             if !a.ban_evidence.is_empty() || !b.ban_evidence.is_empty() {
                 s.runs_with_evidence += 1;
@@ -2367,7 +2383,13 @@ fn split_delivery_converges() {
 /// finding 2 on #979 was found only at `FORK_SEED_BASE=100000`.
 #[test]
 fn provisional_forks_converge() {
-    let seeds = default_seeds(seeds_from_env(3));
+    let mut seeds = default_seeds(seeds_from_env(3));
+    // Two fork pairs known to hold two keys for one member id (seed 0
+    // shape 2 is in the default set), so the default run exercises
+    // `resolve_shared_ids` whatever the seed count. Only meaningful while
+    // `random_op_prov` draws as it does today: the floor below fails if it
+    // stops.
+    seeds.push((9, 0));
     let failures = endings(Mode::Provisional, &seeds);
     let stats = take_stats();
     println!("provisional stats: {stats:?}");
@@ -2386,8 +2408,8 @@ fn provisional_forks_converge() {
         "no run ended holding a provisional ban: {stats:?}"
     );
     assert!(
-        stats.runs_with_shared_id > 0,
-        "no fork pair held two keys for one member id: {stats:?}"
+        stats.runs_with_shared_id >= 2,
+        "fewer than two fork pairs held two keys for one member id: {stats:?}"
     );
     assert!(
         failures.is_empty(),
@@ -2398,4 +2420,108 @@ fn provisional_forks_converge() {
         stats.merge_rejections, 0,
         "a provisional-mode merge was rejected: {stats:?}"
     );
+}
+
+/// Three forks of a provisional-mode room (which forges records for shared
+/// ids) merged in two orders, `(a+b)+c` and `(a+c)+b`. The results may differ
+/// in one known way: a shared id is decided when a merge runs, so when the
+/// kept key's member is removed later in the same merge (pruned, banned), the
+/// other key's record has already gone in one order and not the other (the
+/// `resolve_shared_ids` docs; the same class as freenet/river#985). They
+/// must converge after one further mutual exchange, and no merge may be
+/// refused.
+#[test]
+fn three_way_merges_converge_after_one_more_exchange() {
+    let seeds = default_seeds(seeds_from_env(3));
+    let (mut runs, mut differed, mut differed_shared) = (0usize, 0usize, 0usize);
+    let mut failures = Vec::new();
+    for &(seed, shape) in &seeds {
+        let (pool, prefix, fork_ops, cap, bans) = SHAPES[shape];
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x3a3a_3a3a);
+        let w = World::new(&mut rng, pool);
+        let mut base = w.initial_state(cap, bans, Mode::Provisional);
+        let mut clock = ForkClock::default();
+        let mut t = 0u64;
+        for _ in 0..prefix {
+            t += 1;
+            let d = op_for(&w, &mut rng, &base, &mut clock, t, Mode::Provisional);
+            apply(&mut base, &w.params, d);
+        }
+        let mut forks = [base.clone(), base.clone(), base.clone()];
+        let mut clocks = [clock.clone(), clock.clone(), clock];
+        for (i, c) in clocks.iter_mut().enumerate() {
+            for v in c.info_version.values_mut() {
+                *v += 1000 * i as u32;
+            }
+            c.config_offset = 1000 * i as u32;
+        }
+        for _ in 0..fork_ops {
+            for i in 0..3 {
+                t += 1;
+                let d = op_for(
+                    &w,
+                    &mut rng,
+                    &forks[i],
+                    &mut clocks[i],
+                    t,
+                    Mode::Provisional,
+                );
+                apply(&mut forks[i], &w.params, d);
+            }
+        }
+        let [a, b, c] = &forks;
+        let p = &w.params;
+        let x = merge(a, b, p).and_then(|ab| merge(&ab, c, p));
+        let y = merge(a, c, p).and_then(|ac| merge(&ac, b, p));
+        let (x, y) = match (x, y) {
+            (Ok(x), Ok(y)) => (x, y),
+            (x, y) => {
+                failures.push(format!(
+                    "seed {seed} shape {shape}: merge refused ({:?} / {:?})",
+                    x.err(),
+                    y.err()
+                ));
+                continue;
+            }
+        };
+        runs += 1;
+        if ser(&x) == ser(&y) {
+            continue;
+        }
+        differed += 1;
+        let mut keys: HashMap<MemberId, std::collections::HashSet<[u8; 32]>> = HashMap::new();
+        for m in forks
+            .iter()
+            .flat_map(|g| g.members.members.iter().chain(&g.ban_evidence.members))
+        {
+            keys.entry(m.member.id())
+                .or_default()
+                .insert(m.member.member_vk.to_bytes());
+        }
+        let shared = keys.values().any(|k| k.len() > 1);
+        if shared {
+            differed_shared += 1;
+        }
+        match (merge(&x, &y, p), merge(&y, &x, p)) {
+            (Ok(xy), Ok(yx)) if ser(&xy) == ser(&yx) => {}
+            (Ok(xy), Ok(yx)) if !hold_different_records_for_one_member(&xy, &yx) => {
+                failures.push(format!(
+                "seed {seed} shape {shape}: (a+b)+c and (a+c)+b still differ after one exchange in {} (shared id: {shared})",
+                differing_fields(&xy, &yx).join("+")
+            ))
+            }
+            // Two records for one member under the SAME key (different
+            // inviters) are kept per peer and need not converge (see
+            // `hold_different_records_for_one_member`).
+            (Ok(_), Ok(_)) => {}
+            _ => failures.push(format!("seed {seed} shape {shape}: extra exchange refused")),
+        }
+    }
+    let _ = take_stats();
+    println!(
+        "three-way: {runs} runs, {differed} differed before the extra exchange \
+         ({differed_shared} with a shared id among the forks)"
+    );
+    assert!(runs > 0);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

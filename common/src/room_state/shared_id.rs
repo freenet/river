@@ -83,8 +83,6 @@ impl ChatRoomStateV1 {
         if keys.is_empty() {
             return HashMap::new();
         }
-        let owner_id = parameters.owner_id();
-        let owner_vk = parameters.owner;
         let depth_cap = evidence_depth_cap(self.configuration.configuration.max_members);
 
         // Decide, then decide again over what is reachable through the keys
@@ -113,6 +111,21 @@ impl ChatRoomStateV1 {
             chosen = next;
         }
 
+        self.apply_shared_id_decision(&chosen, parameters)
+    }
+
+    /// Drop what `chosen` rules out: for each decided id, the records under
+    /// another key (all of them for `None`), the records of members a
+    /// dropped key invited and their subtrees, and the id's `member_info`,
+    /// messages, DMs and purge records that do not verify under the kept
+    /// key. Split from the decision so a test can force one.
+    pub(crate) fn apply_shared_id_decision(
+        &mut self,
+        chosen: &BTreeMap<MemberId, Option<KeyBytes>>,
+        parameters: &ChatRoomParametersV1,
+    ) -> HashMap<MemberId, VerifyingKey> {
+        let owner_id = parameters.owner_id();
+        let owner_vk = parameters.owner;
         let kept: HashMap<MemberId, VerifyingKey> = chosen
             .iter()
             .filter_map(|(id, k)| {
@@ -274,5 +287,213 @@ impl ChatRoomStateV1 {
             .member_info
             .iter()
             .any(|i| i.member_info.member_id == id && i.verify_signature_with_key(vk).is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
+    use crate::room_state::ban_evidence::BanEvidenceV1;
+    use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use crate::room_state::member::tests::invite_signature_checks;
+    use crate::room_state::member::{Member, MembersDelta};
+    use crate::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    use ed25519_dalek::SigningKey;
+    use freenet_scaffold::ComposableState;
+    use std::time::{Duration, SystemTime};
+
+    fn sk(label: &str) -> SigningKey {
+        SigningKey::from_bytes(blake3::hash(label.as_bytes()).as_bytes())
+    }
+
+    /// Keys other than `victim` with its `MemberId` (no secret keys).
+    fn other_keys_with_id_of(victim: &VerifyingKey) -> Vec<VerifyingKey> {
+        let target = MemberId::from(victim);
+        let base = victim.to_bytes();
+        let mut out = Vec::new();
+        for i in 0..31 {
+            for after in [true, false] {
+                let mut b = base;
+                if after {
+                    if b[i] == 255 || b[i + 1] < 31 {
+                        continue;
+                    }
+                    b[i] += 1;
+                    b[i + 1] -= 31;
+                } else {
+                    if b[i] == 0 || b[i + 1] > 255 - 31 {
+                        continue;
+                    }
+                    b[i] -= 1;
+                    b[i + 1] += 31;
+                }
+                if let Ok(vk) = VerifyingKey::from_bytes(&b) {
+                    if MemberId::from(&vk) == target && vk != *victim && !out.contains(&vk) {
+                        out.push(vk);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn record(owner: MemberId, vk: VerifyingKey, inviter: &SigningKey) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: owner,
+                invited_by: inviter.verifying_key().into(),
+                member_vk: vk,
+            },
+            inviter,
+        )
+    }
+
+    fn room(owner: &SigningKey) -> (ChatRoomStateV1, ChatRoomParametersV1) {
+        let owner_id = MemberId::from(&owner.verifying_key());
+        let state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: owner_id,
+                    max_members: 1000,
+                    ..Default::default()
+                },
+                owner,
+            ),
+            ..Default::default()
+        };
+        (
+            state,
+            ChatRoomParametersV1 {
+                owner: owner.verifying_key(),
+            },
+        )
+    }
+
+    /// A decision that rules out a key which has signed things (reachable
+    /// only with a second keypair for the id) drops that key's record, the
+    /// members it invited and their subtree, and its member_info and
+    /// messages, leaving a state that verifies.
+    #[test]
+    fn a_dropped_key_takes_its_invitees_and_content_with_it() {
+        let (o, a, v, w, x) = (sk("o"), sk("a"), sk("v"), sk("w"), sk("x"));
+        let (mut s, p) = room(&o);
+        let owner = p.owner_id();
+        s.members.members = vec![
+            record(owner, a.verifying_key(), &o),
+            record(owner, v.verifying_key(), &a),
+            record(owner, w.verifying_key(), &v),
+            record(owner, x.verifying_key(), &w),
+        ];
+        let v_id = MemberId::from(&v.verifying_key());
+        s.member_info.member_info = vec![AuthorizedMemberInfo::new(
+            MemberInfo::new_public(v_id, 1, "v".into()),
+            &v,
+        )];
+        s.recent_messages.messages = vec![AuthorizedMessageV1::new(
+            MessageV1 {
+                room_owner: owner,
+                author: v_id,
+                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                content: RoomMessageBody::public("hi".into()),
+            },
+            &v,
+        )];
+        let other = sk("other").verifying_key().to_bytes();
+        let chosen = BTreeMap::from([(v_id, Some(other))]);
+        s.apply_shared_id_decision(&chosen, &p);
+        assert_eq!(s.members.members.len(), 1, "only a stays");
+        assert!(s.member_info.member_info.is_empty());
+        assert!(s.recent_messages.messages.is_empty());
+        s.verify(&s, &p).unwrap();
+    }
+
+    /// One delta naming many keys for one id, each signed into the room by a
+    /// member, plus many records naming that id as inviter with junk
+    /// signatures: the apply admits one new key for the id, so it checks
+    /// about one signature per record, not keys times records.
+    #[test]
+    fn many_keys_for_one_id_cost_one_signature_per_record() {
+        let (o, a, v) = (sk("o"), sk("a"), sk("v"));
+        let (mut s, p) = room(&o);
+        let owner = p.owner_id();
+        s.members.members = vec![record(owner, a.verifying_key(), &o)];
+        let v_id = MemberId::from(&v.verifying_key());
+        let forged = other_keys_with_id_of(&v.verifying_key());
+        assert!(forged.len() >= 20, "{} forged keys", forged.len());
+        let mut added: Vec<AuthorizedMember> =
+            forged.iter().map(|k| record(owner, *k, &a)).collect();
+        let junk_signature = added[0].signature;
+        let m = 200;
+        for i in 0..m {
+            added.push(AuthorizedMember {
+                member: Member {
+                    owner_member_id: owner,
+                    invited_by: v_id,
+                    member_vk: sk(&format!("junk{i}")).verifying_key(),
+                },
+                signature: junk_signature,
+            });
+        }
+        let parent = s.clone();
+        let before = invite_signature_checks();
+        s.members
+            .apply_delta(&parent, &p, &Some(MembersDelta::new(added)))
+            .unwrap();
+        let checks = invite_signature_checks() - before;
+        assert!(
+            checks <= m + 2,
+            "{checks} signature checks for {m} invitees of one id named under {} keys",
+            forged.len()
+        );
+        let keys_for_v = s
+            .members
+            .members
+            .iter()
+            .filter(|r| r.member.id() == v_id)
+            .count();
+        assert_eq!(keys_for_v, 1, "one new key admitted");
+    }
+
+    /// Evidence records for two ids under many keys each, invited by each
+    /// other (a cycle that never reaches the owner), named by a ban: the
+    /// apply admits one new key per id and walks each chain once.
+    #[test]
+    fn many_keys_in_an_evidence_cycle_are_walked_once() {
+        let (o, xk, yk) = (sk("o"), sk("x"), sk("y"));
+        let (mut s, p) = room(&o);
+        let owner = p.owner_id();
+        let (x_id, y_id) = (
+            MemberId::from(&xk.verifying_key()),
+            MemberId::from(&yk.verifying_key()),
+        );
+        // An unverified ban by y on x makes both ids referenced.
+        s.bans = BansV1(vec![AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner,
+                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                banned_user: x_id,
+            },
+            y_id,
+            &yk,
+        )]);
+        let mut delta = Vec::new();
+        for k in other_keys_with_id_of(&xk.verifying_key()) {
+            delta.push(record(owner, k, &yk));
+        }
+        for k in other_keys_with_id_of(&yk.verifying_key()) {
+            delta.push(record(owner, k, &xk));
+        }
+        assert!(delta.len() >= 40);
+        let parent = s.clone();
+        let mut evidence = BanEvidenceV1::default();
+        let before = crate::room_state::ban_evidence::tests::chain_walks();
+        evidence
+            .apply_delta(&parent, &p, &Some(delta))
+            .expect("never refused");
+        let walks = crate::room_state::ban_evidence::tests::chain_walks() - before;
+        assert!(evidence.members.is_empty(), "nothing reaches the owner");
+        assert!(walks <= 40, "{walks} chain walks");
     }
 }

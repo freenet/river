@@ -128,7 +128,8 @@ survives review while being wrong (see the encoding trap in History below). See
   signature are told apart (17.02 B/entry against 9.02). `MembersV1::Summary`
   stayed `BTreeSet<MemberId>`: a peer keeps the member record it holds, so the
   summary need not tell two records for one id apart (an interim
-  `(id, digest)` shape measured 26.01 B/entry against 9.01 and was dropped).
+  `(id, digest)` shape measured 26.01 B/entry against 9.01 and was dropped;
+  superseded by the #974 follow-up below).
   The same value-side rules apply to each; collections stayed `BTree*`.
 - **freenet/river#974 follow-up** (2026-11): `MembersV1::Summary` became
   `BTreeSet<(MemberId, u64)>`, the id with `key_tag` (the first 8 bytes,

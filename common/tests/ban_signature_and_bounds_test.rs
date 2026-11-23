@@ -105,6 +105,9 @@ fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
             !room.bans.0.contains(&as_member) && !room.bans.0.contains(&as_owner),
             "cleanup drops a ban its issuer's key does not verify"
         );
+        if delta.contains(&genuine) {
+            assert!(room.bans.0.contains(&genuine), "the genuine ban is kept");
+        }
     }
 }
 
@@ -157,6 +160,7 @@ fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
     room.bans = bans;
     room.post_apply_cleanup(&params).unwrap();
     assert!(!room.bans.0.contains(&unverified));
+    assert!(room.bans.0.contains(&genuine), "the genuine ban is kept");
 }
 
 fn room_config(
