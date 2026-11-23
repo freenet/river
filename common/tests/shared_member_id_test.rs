@@ -21,18 +21,27 @@ fn sk(label: &str) -> SigningKey {
     SigningKey::from_bytes(blake3::hash(label.as_bytes()).as_bytes())
 }
 
-/// A key other than `victim` with `victim`'s `MemberId`, or `None`. It has
-/// no secret key.
-fn other_key_with_id_of(victim: &VerifyingKey) -> Option<VerifyingKey> {
+/// A key other than `victim` with `victim`'s `MemberId`, ordering after
+/// `victim`'s bytes when `after` is set and before them otherwise, or `None`.
+/// It has no secret key.
+fn other_key_with_id_of(victim: &VerifyingKey, after: bool) -> Option<VerifyingKey> {
     let target: MemberId = victim.into();
     let base = victim.to_bytes();
     (0..31).find_map(|i| {
         let mut bytes = base;
-        if bytes[i] == 255 || bytes[i + 1] < 31 {
-            return None;
+        if after {
+            if bytes[i] == 255 || bytes[i + 1] < 31 {
+                return None;
+            }
+            bytes[i] += 1;
+            bytes[i + 1] -= 31;
+        } else {
+            if bytes[i] == 0 || bytes[i + 1] > 255 - 31 {
+                return None;
+            }
+            bytes[i] -= 1;
+            bytes[i + 1] += 31;
         }
-        bytes[i] += 1;
-        bytes[i + 1] -= 31;
         VerifyingKey::from_bytes(&bytes)
             .ok()
             .filter(|vk| MemberId::from(vk) == target && vk != victim)
@@ -54,15 +63,28 @@ struct Room {
 }
 
 impl Room {
+    /// The other key orders after `v`'s, so a read of the LAST record per
+    /// id returns it.
     fn new() -> Self {
+        Self::with_order(true)
+    }
+
+    /// Both orders of the two keys' bytes, so a read of either the first or
+    /// the last record for the id is caught.
+    fn both_orders() -> [Self; 2] {
+        [Self::with_order(true), Self::with_order(false)]
+    }
+
+    fn with_order(f_after: bool) -> Self {
         let owner = sk("owner");
         let owner_id = MemberId::from(&owner.verifying_key());
         let (v, f) = (0..)
             .find_map(|i| {
                 let v = sk(&format!("v{i}"));
-                other_key_with_id_of(&v.verifying_key()).map(|f| (v, f))
+                other_key_with_id_of(&v.verifying_key(), f_after).map(|f| (v, f))
             })
             .unwrap();
+        assert_eq!(f.as_bytes() > v.verifying_key().as_bytes(), f_after);
         Room {
             params: ChatRoomParametersV1 {
                 owner: owner.verifying_key(),
@@ -169,10 +191,31 @@ impl Room {
                 ])),
                 member_info: Some(vec![self.info(&self.v, "v")]),
                 recent_messages: Some(vec![self.msg(&self.v, 3)]),
+                direct_messages: Some(DirectMessagesDelta {
+                    new_messages: vec![self.dm_from_v()],
+                    advanced_purges: vec![],
+                }),
                 ..Default::default()
             },
         );
         s
+    }
+
+    /// A DM from `v` to `a`.
+    fn dm_from_v(&self) -> river_core::room_state::direct_messages::AuthorizedDirectMessage {
+        sign_direct_message(
+            &self.v,
+            self.id(&self.v),
+            self.id(&self.a),
+            &self.params.owner,
+            3,
+            b"from v".to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn holds_dm_from_v(&self, s: &ChatRoomStateV1) -> bool {
+        s.direct_messages.messages.contains(&self.dm_from_v())
     }
 
     /// The other key for `v`'s id, invited by `inviter` and kept by a DM
@@ -253,7 +296,12 @@ fn cbor(s: &ChatRoomStateV1) -> Vec<u8> {
 /// member_info failed the whole update there.
 #[test]
 fn a_record_under_another_key_never_displaces_a_member_who_has_signed_something() {
-    let r = Room::new();
+    for r in Room::both_orders() {
+        shared_id_converges_to_the_signed_key(&r);
+    }
+}
+
+fn shared_id_converges_to_the_signed_key(r: &Room) {
     let x = r.with_v();
     let y = r.with_f(&r.b);
     let merged = r.converge(&x, &y);
@@ -269,6 +317,10 @@ fn a_record_under_another_key_never_displaces_a_member_who_has_signed_something(
         .member_info
         .iter()
         .any(|i| i.member_info.member_id == r.id(&r.v)));
+    assert!(
+        r.holds_dm_from_v(&merged),
+        "v's DM survives both directions"
+    );
 
     let synced = r.sync(&y, &x);
     assert!(
@@ -276,6 +328,7 @@ fn a_record_under_another_key_never_displaces_a_member_who_has_signed_something(
         "the sync delivers v"
     );
     assert!(!r.holds(&synced, &r.f), "and the other record goes");
+    assert!(r.holds_dm_from_v(&synced), "with v's DM");
     synced.verify(&synced, &r.params).unwrap();
     // The peer that held `v` does not take the other record either.
     let synced = r.sync(&x, &y);
@@ -432,4 +485,47 @@ fn two_unsigned_keys_resolve_the_same_way_in_both_directions() {
     // (depth 2): with neither signed, depth decides.
     assert!(r.holds(&merged, &r.f));
     assert!(!r.holds(&merged, &r.v.verifying_key()));
+}
+
+/// One delta brings the other key's record, invited by `a`, and `a`'s ban on
+/// the shared id to a peer holding `v` (invited by `b`, with a DM). Over the
+/// other record the ban would be by the target's inviter and take effect;
+/// over `v`'s it does not. The DM apply judges bans over the records cleanup
+/// keeps, so `v` and `v`'s DM both stay.
+#[test]
+fn the_dm_apply_judges_bans_over_the_key_cleanup_keeps() {
+    let r = Room::new();
+    let mut x = r.empty();
+    r.apply(
+        &mut x,
+        ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![r.record(r.v.verifying_key(), &r.b)])),
+            member_info: Some(vec![r.info(&r.v, "v")]),
+            recent_messages: Some(vec![r.msg(&r.v, 3)]),
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: vec![r.dm_from_v()],
+                advanced_purges: vec![],
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(r.holds_dm_from_v(&x));
+    let parent = x.clone();
+    x.apply_delta(
+        &parent,
+        &r.params,
+        &Some(ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![r.record(r.f, &r.a)])),
+            bans: Some(vec![r.ban(&r.a, r.id(&r.v), 9)]),
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    x.verify(&x, &r.params).unwrap();
+    assert!(r.holds(&x, &r.v.verifying_key()));
+    assert!(!r.holds(&x, &r.f));
+    assert!(
+        r.holds_dm_from_v(&x),
+        "v's DM is not swept by a ban that does not apply to v"
+    );
 }
