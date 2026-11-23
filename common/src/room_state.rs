@@ -885,20 +885,22 @@ impl ChatRoomStateV1 {
             parameters,
         );
         let enforced_banned_ids = resolution.removed.clone();
-        // The targets of the bans that take effect: an id a ban names
-        // directly, by any authority River accepts (the owner, a deputy, the
-        // target's inviter or another ancestor), as opposed to one removed
-        // only because a ban removed its inviter. A provisional entry for a
-        // directly banned id is dropped (P2) even when the id's record is
-        // ban evidence under the entry's own key.
+        // The targets of the bans that take effect and that the owner or an
+        // owner deputy issued. Only these block a provisional entry for the
+        // banned id (P2): a ban by the member's inviter (or another ancestor)
+        // removes the membership but does not stop the key from re-entering
+        // provisionally, so a plain member cannot keep a newcomer out by
+        // inviting its key and banning it (design D2, decision of 2026-11-22).
         let direct_ban_targets: HashSet<MemberId> = if self.provisional.entries.is_empty() {
             HashSet::new()
         } else {
+            let deputies = self.member_info.deputies_of(owner_id);
             self.bans
                 .0
                 .iter()
                 .filter(|b| {
                     resolution.tier(&b.id()) != crate::room_state::member::BanResolution::INERT
+                        && (b.banned_by == owner_id || deputies.contains(&b.banned_by))
                 })
                 .map(|b| b.ban.banned_user)
                 .collect()

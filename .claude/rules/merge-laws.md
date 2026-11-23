@@ -96,6 +96,14 @@ unsigned as a whole; each record carries its own signature.
   any key that a held record, or a held entry that passes the room's current
   policy, carries. Cleanup (C1, C2, C3) then decides which survive, so
   "skipped on arrival" never reads a record that cleanup drops.
+- P2 (banned ids): only a ban by the owner or an owner deputy blocks a
+  provisional entry for the banned id, whatever record holds it. A ban by the
+  member's inviter (or another ancestor) removes the membership but does not
+  block the entry, so a plain member cannot keep a newcomer out by inviting its
+  key and banning it. An id removed only because its inviter was banned is
+  blocked only where no record holds it. The deciding set is computed from the
+  ban resolution and the deputies in `post_apply_cleanup`, never from one
+  peer's arrival order.
 
 ## Caps are decided in cleanup, after removals
 

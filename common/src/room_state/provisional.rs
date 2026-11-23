@@ -44,7 +44,11 @@ pub const POW_DOMAIN_TAG: &[u8; 27] = b"river-room-admission-pow/v1";
 /// ban pair: 100 and 100 added over 300 ms to a pair that must stay under
 /// 100 ms (design section 5: "if the pair exceeds 100 ms, lower the ceilings"),
 /// and 20 and 20 still measured 100.3 ms on a default-sized room (window 100,
-/// 26 members). Raising it needs a measurement, not an opinion: the benchmark
+/// 26 members). At 16 and 16 a one-message delta measured about 86 ms, and
+/// the worst-case delta (every entry and ban carried) about 128.6 ms, over the
+/// 100 ms gate, which is set for one-message deltas; the worst case needs a
+/// delta that fills the per-delta floor and is paid once per such delta.
+/// Raising it needs a measurement, not an opinion: the benchmark
 /// is `common/benches/provisional_pair.rs` (native) and the same fixtures run
 /// under wasmtime in the PR.
 pub const MAX_PROVISIONAL_CEILING: u32 = 16;
@@ -420,8 +424,10 @@ impl AuthorizedProvisionalBan {
         if let Some(ok) = crate::room_state::ban::signature_memo::lookup_provisional(&key) {
             return ok_or_invalid(ok, "provisional ban");
         }
+        // `verify_strict`, as for entry signatures: also refuses a small-order
+        // key or `R`.
         let ok = issuer_vk
-            .verify(
+            .verify_strict(
                 &provisional_ban_signing_bytes(owner_vk, &self.ban),
                 &self.signature,
             )
@@ -842,8 +848,9 @@ pub(crate) struct ProvisionalPlan {
 pub(crate) struct BanInputs<'a> {
     /// `resolution.removed`: every id a ban the pass enforces removes.
     pub removed: &'a HashSet<MemberId>,
-    /// The targets of the bans that take effect (any authority River
-    /// accepts), as opposed to ids removed only with a banned inviter.
+    /// The targets of the bans that take effect and were issued by the owner
+    /// or an owner deputy. Bans by anyone else (the member's inviter, another
+    /// ancestor) and ids removed only with a banned inviter are not here.
     pub direct_targets: &'a HashSet<MemberId>,
     /// The records the pass reads for ban judgement (`BansV1::stable_known`).
     pub stable_known: &'a HashMap<MemberId, &'a AuthorizedMember>,
@@ -989,19 +996,19 @@ impl ChatRoomStateV1 {
             .filter(|id| *id != owner_id)
             .collect();
 
-        // P2: banned ids. An id a ban the pass enforces names directly, by
-        // any authority River accepts (owner, deputy, an ancestor in the
-        // invite tree), is banned whatever record holds it: a member a deputy
-        // or their inviter banned does not come back by doing the work, even
-        // though their record is ban evidence under the entry's own key. An
-        // id removed only because a ban removed its inviter (`reach_in`) is
-        // banned only where no record holds it; where a record holds it under
-        // the entry's key, the entry may stay (design D2, consequence (a)),
-        // and under another key C1 drops it. A ban on an id no record holds
-        // takes effect only from the owner or an owner deputy
-        // (`is_ban_authorized` gives such a target the strict ancestors
-        // `{owner}`), so a non-deputy's ban reaches an entry only through a
-        // record it can be attributed to.
+        // P2: banned ids. An id the owner or an owner deputy bans directly is
+        // banned whatever record holds it: a member they banned does not come
+        // back by doing the work, even though their record is ban evidence
+        // under the entry's own key. A ban by the member's inviter (or another
+        // ancestor) removes the membership but does not block a provisional
+        // entry, so a plain member cannot keep a newcomer out by inviting its
+        // key and banning it (Ian's decision, 2026-11-22). An id removed only
+        // because a ban removed its inviter (`reach_in`) is banned only where
+        // no record holds it; where a record holds it under the entry's key,
+        // the entry may stay (design D2, consequence (a)), and under another
+        // key C1 drops it. A ban on an id no record holds takes effect only
+        // from the owner or an owner deputy (`is_ban_authorized` gives such a
+        // target the strict ancestors `{owner}`).
         let banned: HashSet<MemberId> = removed
             .iter()
             .filter(|id| !record_keys.contains_key(id) || direct_targets.contains(id))
@@ -1352,5 +1359,93 @@ mod tests {
         assert_eq!(ok.quota(10), 5);
         assert_eq!(ok.quota(1), 0, "with max_recent_messages < 2 nobody posts");
         assert_eq!(ok.quota(10_000), 500);
+    }
+
+    /// C3's start-of-pass rule, through `provisional_step` with a hand-built
+    /// `held_record_keys`: an id with no record under another key is not
+    /// conflicted, but an id that held a record under ANOTHER key at the start
+    /// of the pass (the record the merge then dropped as too deep) is, and the
+    /// content it authored under that other key goes. The message below
+    /// verifies under Y's key, not under the entry's key, so only the
+    /// conflict makes it go.
+    #[test]
+    fn c3_reads_the_records_held_at_the_start_of_the_pass() {
+        use crate::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        use crate::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+
+        let owner_sk = owner();
+        let params = ChatRoomParametersV1 {
+            owner: owner_sk.verifying_key(),
+        };
+        let owner_id = params.owner_id();
+        let entry = fixture_entry();
+        let x_id = entry.member_id();
+        let y = SigningKey::from_bytes(&[9u8; 32]);
+        let config = Configuration {
+            owner_member_id: owner_id,
+            public_admission: Some(PublicRoomPolicy {
+                listed: false,
+                max_provisional: 3,
+                max_provisional_messages: 5,
+                max_provisional_bans: 3,
+                pow: Some(PowPolicy {
+                    difficulty_bits: 0,
+                    epoch: 0,
+                }),
+            }),
+            ..Configuration::default()
+        };
+        let build = || {
+            let mut state = ChatRoomStateV1 {
+                configuration: AuthorizedConfigurationV1::new(config.clone(), &owner_sk),
+                ..Default::default()
+            };
+            state.provisional.entries.push(entry.clone());
+            // Authored under Y's key with X's id: not valid under the entry.
+            state
+                .recent_messages
+                .messages
+                .push(AuthorizedMessageV1::new(
+                    MessageV1 {
+                        room_owner: owner_id,
+                        author: x_id,
+                        time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5),
+                        content: RoomMessageBody::public("under another key".to_string()),
+                    },
+                    &y,
+                ));
+            state
+        };
+        let run = |held: HashMap<MemberId, Vec<VerifyingKey>>| {
+            let mut state = build();
+            let removed = HashSet::new();
+            let direct = HashSet::new();
+            let stable: HashMap<MemberId, &crate::room_state::member::AuthorizedMember> =
+                HashMap::new();
+            let plan = state.provisional_step(
+                &params,
+                owner_id,
+                &BanInputs {
+                    removed: &removed,
+                    direct_targets: &direct,
+                    stable_known: &stable,
+                    held_record_keys: &held,
+                },
+            );
+            assert!(plan.ids.contains(&x_id), "the entry stands either way");
+            state.recent_messages.messages.len()
+        };
+        assert_eq!(
+            run(HashMap::new()),
+            1,
+            "no record held another key: not conflicted, the content is left alone"
+        );
+        let mut held = HashMap::new();
+        held.insert(x_id, vec![y.verifying_key()]);
+        assert_eq!(
+            run(held),
+            0,
+            "a record under another key held at the start of the pass conflicts the id"
+        );
     }
 }

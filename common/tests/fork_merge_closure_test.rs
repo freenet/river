@@ -1349,8 +1349,9 @@ fn random_op_prov(
         // A sponsored provisional key banned directly by its inviter or by
         // an owner deputy (a `UserBan` that moves its record to ban evidence
         // under its own key), sometimes with the key's entry, `member_info`
-        // and a message in the same delta: a directly banned member must not
-        // come back as provisional (review finding 1).
+        // and a message in the same delta. Only an owner or deputy ban keeps
+        // the key out; the inviter's ban does not (Ian, 2026-11-22). The
+        // merge laws are what is checked here, whichever way P2 decides.
         20 => {
             let j = rng.gen_range(0..np / 2);
             let Some(record) = state

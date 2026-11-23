@@ -1926,9 +1926,11 @@ fn a_deputy_with_a_provisional_ban_is_not_pruned_for_inactivity() {
     assert_eq!(room.state.provisional.bans.len(), 1, "and the ban stays");
 }
 
-/// A member that a ban names directly cannot come back as provisional with
-/// the same key by doing the work, whoever issued the ban: the owner, an owner
-/// deputy, or the member's own inviter. The banned member's record moves to
+/// A member that the owner or an owner deputy bans directly cannot come back
+/// as provisional with the same key by doing the work. (A ban by the member's
+/// own inviter does not block it: Ian's decision of 2026-11-22, see
+/// `a_member_their_inviter_banned_may_rejoin_as_provisional`.) The banned
+/// member's record moves to
 /// ban evidence under the entry's own key, so neither C1 (another key) nor P5
 /// (a `members` record) drops the entry; P2 must. Checked with the ban and the
 /// entry in one delta, in two deltas, and with each on a different peer,
@@ -2002,10 +2004,101 @@ fn a_member_a_deputy_banned_does_not_come_back_as_provisional() {
     a_directly_banned_member_stays_out(&base, Some(&d), &m);
 }
 
+/// Rejoin after a ban by a plain member (the target's inviter) succeeds: the
+/// ban removes the membership but does not block a provisional entry for the
+/// same key, in one delta, in two, and with the ban and the entry on
+/// different peers merged either way.
+fn a_member_banned_by_a_plain_member_may_rejoin(
+    base: &Room,
+    banner: &SigningKey,
+    target: &SigningKey,
+) {
+    let ban = base.user_ban(Some(banner), id_of(target), 10);
+    let mut together = base.join_delta(target, 11, "back");
+    together.bans = Some(vec![ban.clone()]);
+    let one = replay(base, &[&together]);
+    let two = replay(
+        base,
+        &[
+            &user_ban_delta(ban.clone()),
+            &base.join_delta(target, 11, "back"),
+        ],
+    );
+    let author = id_of(target);
+    for s in [&one, &two] {
+        assert!(
+            s.bans.0.iter().any(|b| b.ban.banned_user == author),
+            "the ban is held"
+        );
+        assert!(
+            !s.members.members.iter().any(|m| m.member.id() == author),
+            "the ban removed the membership"
+        );
+        assert!(
+            s.provisional
+                .entries
+                .iter()
+                .any(|e| e.provisional.member_vk == target.verifying_key()),
+            "a ban by the inviter does not block the provisional entry"
+        );
+        assert!(
+            s.recent_messages
+                .messages
+                .iter()
+                .any(|m| m.message.author == author),
+            "and its message stands"
+        );
+    }
+    // The two histories can differ (an old message of the member, purged by
+    // the ban before the entry existed, is kept where ban and entry arrive
+    // together, because it verifies under the entry's key), but they converge
+    // when merged, in either direction.
+    let (x, y) = merge2(&one, &two, &base.params);
+    assert!(ser(&x) == ser(&y), "one delta and two merge to one state");
+
+    let mut fresh = Room::new(40, 20, Some(policy(1, 7)));
+    fresh.apply(fresh.join_delta(target, 11, "back")).unwrap();
+    let banned = replay(base, &[&user_ban_delta(ban)]);
+    let (x, y) = merge2(&banned, &fresh.state, &base.params);
+    assert!(ser(&x) == ser(&y), "a commutative first exchange");
+    assert!(x
+        .provisional
+        .entries
+        .iter()
+        .any(|e| e.provisional.member_vk == target.verifying_key()));
+}
+
 #[test]
-fn a_member_their_inviter_banned_does_not_come_back_as_provisional() {
+fn a_member_their_inviter_banned_may_rejoin_as_provisional() {
     let (base, i, v) = room_with_inviter_and_invitee();
-    a_directly_banned_member_stays_out(&base, Some(&i), &v);
+    a_member_banned_by_a_plain_member_may_rejoin(&base, &i, &v);
+}
+
+/// The griefing case: a plain member invites a newcomer's key (the newcomer
+/// never joined through it) and bans it. The newcomer can still join
+/// provisionally.
+#[test]
+fn a_plain_member_cannot_keep_a_newcomer_out_by_inviting_and_banning_its_key() {
+    let mut base = Room::new(40, 20, Some(policy(1, 7)));
+    let (i, newcomer) = (sk(2), sk(3));
+    let rec = AuthorizedMember::new(
+        Member {
+            owner_member_id: base.owner_id(),
+            invited_by: id_of(&i),
+            member_vk: newcomer.verifying_key(),
+        },
+        &i,
+    );
+    base.apply(ChatRoomStateV1Delta {
+        members: Some(MembersDelta::new(vec![
+            base.invite(None, &i.verifying_key()),
+            rec,
+        ])),
+        recent_messages: Some(vec![base.msg(&i, 1, "i")]),
+        ..Default::default()
+    })
+    .unwrap();
+    a_member_banned_by_a_plain_member_may_rejoin(&base, &i, &newcomer);
 }
 
 /// Review finding 2 (seed 101055 shape 1 of the fork fuzz): an id with a
