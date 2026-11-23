@@ -1103,6 +1103,14 @@ mod runtime {
                 return true;
             }
         }
+        // A draft in a room that is not shown: the composer keeps one per
+        // room, and only the open room's is in the textarea.
+        if matches!(
+            document.query_selector("[data-other-drafts=\"true\"]"),
+            Ok(Some(_))
+        ) {
+            return true;
+        }
         if matches!(document.query_selector("[id^=\"edit-msg-\"]"), Ok(Some(_))) {
             return true;
         }
@@ -3050,8 +3058,12 @@ mod tests {
     #[test]
     fn busy_detection_selectors_still_exist() {
         let src = |s: &str| crate::util::strip_comments(s);
-        assert!(src(include_str!("../../conversation/message_input.rs"))
-            .contains("id: \"message-input\""));
+        let composer = src(include_str!("../../conversation/message_input.rs"));
+        assert!(composer.contains("id: \"message-input\""));
+        assert!(composer.contains("\"data-other-drafts\": if other_drafts_wait"));
+        assert!(
+            src(include_str!("generation_watch.rs")).contains("[data-other-drafts=\\\"true\\\"]")
+        );
         assert!(src(include_str!("../../conversation.rs")).contains("\"edit-msg-{"));
         for (file, body) in [
             (

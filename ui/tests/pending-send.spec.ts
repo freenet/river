@@ -239,6 +239,27 @@ test("a failed reply is not carried into another room", { tag: "@chromium-only" 
   await expect(input(page)).toHaveValue("private reply");
 });
 
+test("a failed send's text stays in its room, and a draft in a room not shown holds a reload", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "failNextMessageSign");
+  await submitMessage(page, "fails here");
+  await expect(sendError(page)).toContainText("signing failed");
+  await expect(input(page)).toHaveValue("fails here");
+
+  await selectListedRoom(page, "Team Chat Room");
+  await expect(input(page), "another room's composer is empty").toHaveValue("");
+  await expect(sendError(page)).toHaveCount(0);
+  expect(await callRiverTest(page, "userIsBusy"), "the draft left in the other room holds a reload").toBe(true);
+  await input(page).fill("typed elsewhere");
+
+  await selectListedRoom(page, "Your Private Room");
+  await expect(input(page), "the failed send is where it was written").toHaveValue("fails here");
+  await expect(sendError(page)).toContainText("signing failed");
+
+  await selectListedRoom(page, "Team Chat Room");
+  await expect(input(page), "and this room's draft is its own").toHaveValue("typed elsewhere");
+});
+
 test("a send from a replaced identity is never committed",{ tag: "@chromium-only" }, async ({ page }) => {
   await openRoomWithComposer(page);
   await callRiverTest(page, "holdMessageSigning");
