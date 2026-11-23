@@ -273,8 +273,48 @@ pub fn create_example_rooms() -> Rooms {
     }
 }
 
+/// Rooms a `?room=` link can open in the no-sync example build, which has no
+/// network to fetch from: one public, one private. They are NOT in `ROOMS`, so
+/// opening one exercises the visitor path. Built once per page load, so the
+/// keys the test hook hands out stay valid.
+pub fn viewable_fixtures() -> &'static [(&'static str, VerifyingKey, ChatRoomStateV1)] {
+    use std::sync::OnceLock;
+    static FIXTURES: OnceLock<Vec<(&'static str, VerifyingKey, ChatRoomStateV1)>> = OnceLock::new();
+    FIXTURES.get_or_init(|| {
+        let public = create_room(
+            &"Open Public Room".to_string(),
+            SelfIs::Observer,
+            Some("Anyone with the link can read this."),
+            HistoryDepth::Standard,
+        );
+        let private = create_room(
+            &"Secret Members Room".to_string(),
+            SelfIs::Observer,
+            None,
+            HistoryDepth::Standard,
+        );
+        let mut private_state = private.room_data.room_state.clone();
+        let mut config = private_state.configuration.configuration.clone();
+        config.privacy_mode = river_core::room_state::privacy::PrivacyMode::Private;
+        private_state.configuration = AuthorizedConfigurationV1::new(config, &private.owner_sk);
+        vec![
+            ("public", public.owner_vk, public.room_data.room_state),
+            ("private", private.owner_vk, private_state),
+        ]
+    })
+}
+
+/// The fixture room whose owner key is `owner_vk`.
+pub fn viewable_room_state(owner_vk: &VerifyingKey) -> Option<ChatRoomStateV1> {
+    viewable_fixtures()
+        .iter()
+        .find(|(_, vk, _)| vk == owner_vk)
+        .map(|(_, _, state)| state.clone())
+}
+
 struct CreatedRoom {
     owner_vk: VerifyingKey,
+    owner_sk: SigningKey,
     room_data: RoomData,
 }
 
@@ -532,6 +572,7 @@ fn create_room(
 
     CreatedRoom {
         owner_vk,
+        owner_sk: owner_sk.clone(),
         room_data: RoomData {
             owner_vk: owner_vk.clone(),
             room_state,

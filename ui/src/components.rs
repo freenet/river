@@ -13,6 +13,7 @@ pub mod room_list;
 pub mod scroll_to_latest;
 pub mod toast;
 pub mod tooltip;
+pub(crate) mod viewed_room;
 
 /// Tree-wide audit for freenet/river#564: every EDITABLE form control that
 /// binds `value:` must also handle `oninput`.

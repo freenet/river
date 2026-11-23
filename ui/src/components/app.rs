@@ -554,6 +554,32 @@ pub fn App() -> Element {
         }
     }
 
+    // `?room=<owner key>` (freenet/river#513): open a public room read-only,
+    // without membership. An invitation in the same URL wins. Once per page
+    // load: the sandboxed gateway iframe cannot drop the parameter, so this
+    // body would otherwise re-open the link on every render.
+    let room_link_read = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    if !found_invitation && !room_link_read.replace(true) {
+        if let Some(window) = window() {
+            if let Ok(search) = window.location().search() {
+                if let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) {
+                    if params.get("invitation").is_none() {
+                        if let Some(room) = params.get(crate::public_room::ROOM_PARAM) {
+                            crate::public_room::open_from_param(&room);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let viewing_room = match crate::public_room::VIEWED_ROOM.try_read() {
+        Ok(v) => v.is_some(),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    };
+
     // Seed DM_LAST_SEEN from the room state we just hydrated, so
     // previously-existing inbound DMs don't show up as unread on every
     // page load. We explicitly subscribe to ROOMS here so the effect
@@ -697,7 +723,11 @@ pub fn App() -> Element {
                     let is_chat = *MOBILE_VIEW.read() == MobileView::Chat;
                     if is_chat { "flex-1 flex min-w-0" } else { "hidden md:flex md:flex-1 md:min-w-0" }
                 },
-                Conversation {}
+                if viewing_room {
+                    crate::components::viewed_room::ViewedRoomPane {}
+                } else {
+                    Conversation {}
+                }
             }
             div {
                 // From 768px it follows `MEMBERS_PANEL_OPEN` (automatic: `lg:`
@@ -715,7 +745,9 @@ pub fn App() -> Element {
                         (false, Some(false)) => "hidden",
                     }
                 },
-                MemberList {}
+                if !viewing_room {
+                    MemberList {}
+                }
             }
         }
         EditRoomModal {}

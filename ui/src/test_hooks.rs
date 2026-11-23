@@ -160,6 +160,20 @@ pub fn install_test_hooks() {
         let _ = js_sys::Reflect::set(&hooks, &JsValue::from_str(name), &hook);
     };
 
+    // The base58 owner key of an example room a `?room=` link can open
+    // ("public" or "private"). These rooms are not in `ROOMS`.
+    set_hook(
+        "viewableRoomKey",
+        Closure::<dyn FnMut(String) -> String>::new(move |kind: String| {
+            crate::example_data::viewable_fixtures()
+                .iter()
+                .find(|(k, _, _)| *k == kind)
+                .map(|(_, vk, _)| crate::public_room::owner_key_b58(vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
     set_hook(
         "takeMessageGroupRenders",
         Closure::<dyn FnMut() -> u32>::new(move || MESSAGE_GROUP_RENDERS.with(|n| n.replace(0)))

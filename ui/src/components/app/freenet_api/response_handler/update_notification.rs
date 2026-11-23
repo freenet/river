@@ -231,6 +231,10 @@ pub fn handle_update_notification(
     if crate::components::app::freenet_api::generation_watch::deliver_update(key.id(), &update) {
         return Ok(());
     }
+    // A public room viewed read-only by `?room=` link (freenet/river#513).
+    if crate::public_room::deliver_update(key.id(), &update) {
+        return Ok(());
+    }
     // Get contract info, return early if not found
     let room_owner_vk = match SYNC_INFO.read().get_owner_vk_for_instance_id(key.id()) {
         Some(vk) => vk,
