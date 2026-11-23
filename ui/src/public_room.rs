@@ -101,17 +101,18 @@ pub fn owner_key_b58(owner_vk: &VerifyingKey) -> String {
         .into_string()
 }
 
-/// `<base>?room=<owner key>`. `base` is the River page URL without query or
-/// fragment, as `get_invitation_base_url` returns it for invitation links.
-pub fn public_room_link(base: &str, owner_vk: &VerifyingKey) -> String {
-    format!("{base}?{ROOM_PARAM}={}", owner_key_b58(owner_vk))
-}
+/// The River web container's contract id: the app a public link opens.
+const RIVER_WEB_APP: &str = include_str!("../../published-contract/contract-id.txt");
 
-/// The link for the page River is open on now.
-pub fn current_public_room_link(owner_vk: &VerifyingKey) -> String {
-    public_room_link(
-        &crate::components::members::invite_member_modal::get_invitation_base_url(),
-        owner_vk,
+/// `https://freenet.org/open#<River web container id>/?room=<owner key>`: the
+/// share-link form, which opens River on the reader's own node whatever host
+/// the sharer was on (so it also works from a hosted instance such as
+/// try.freenet.org). `ui/src/util/share_link.rs` accepts it as it is.
+pub fn public_room_link(owner_vk: &VerifyingKey) -> String {
+    format!(
+        "https://freenet.org/open#{}/?{ROOM_PARAM}={}",
+        RIVER_WEB_APP.trim(),
+        owner_key_b58(owner_vk)
     )
 }
 
@@ -137,7 +138,9 @@ pub struct ViewedRoom {
     pub status: ViewedRoomStatus,
 }
 
-pub static VIEWED_ROOM: GlobalSignal<Option<ViewedRoom>> = Global::new(|| None);
+/// Initialised from the page address, so a `?room=` link is the very first
+/// thing rendered: the conversation pane never mounts and unmounts under it.
+pub static VIEWED_ROOM: GlobalSignal<Option<ViewedRoom>> = Global::new(initial_viewed_room);
 
 /// The contract id of the room being viewed, mirrored out of the signal so the
 /// response handlers can test it without a signal read.
@@ -211,30 +214,45 @@ fn viewed_owner() -> Option<VerifyingKey> {
     VIEWED_ROOM.try_read().ok()?.as_ref()?.owner_vk
 }
 
-/// Start viewing the room named by a `?room=` value.
-pub fn open_from_param(raw: &str) {
-    let raw = raw.to_string();
-    crate::util::defer(move || match parse_room_param(&raw) {
+/// What a `?room=` value opens: the room (waiting for the network) or the
+/// reason it was refused. Records the contract id the response handlers match.
+fn viewed_from_param(raw: &str) -> ViewedRoom {
+    match parse_room_param(raw) {
         Ok(owner_vk) => {
             set_viewed_id(Some(*crate::util::owner_vk_to_contract_key(&owner_vk).id()));
-            *VIEWED_ROOM.write() = Some(ViewedRoom {
-                owner_vk: Some(owner_vk),
-                status: ViewedRoomStatus::Loading,
-            });
+            // The no-sync example build has no network: answer from fixtures.
             #[cfg(all(feature = "example-data", feature = "no-sync"))]
-            {
-                let state = crate::example_data::viewable_room_state(&owner_vk);
-                set_status(owner_vk, classify_state(state));
+            let status = classify_state(crate::example_data::viewable_room_state(&owner_vk));
+            #[cfg(not(all(feature = "example-data", feature = "no-sync")))]
+            let status = ViewedRoomStatus::Loading;
+            ViewedRoom {
+                owner_vk: Some(owner_vk),
+                status,
             }
         }
-        Err(e) => {
-            set_viewed_id(None);
-            *VIEWED_ROOM.write() = Some(ViewedRoom {
-                owner_vk: None,
-                status: ViewedRoomStatus::Invalid(e),
-            });
+        Err(e) => ViewedRoom {
+            owner_vk: None,
+            status: ViewedRoomStatus::Invalid(e),
+        },
+    }
+}
+
+/// The room named by the page's `?room=` parameter, if any. An invitation in
+/// the same URL wins: that flow is unchanged.
+fn initial_viewed_room() -> Option<ViewedRoom> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let search = web_sys::window()?.location().search().ok()?;
+        let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+        if params.get("invitation").is_some() {
+            return None;
         }
-    });
+        params.get(ROOM_PARAM).map(|raw| viewed_from_param(&raw))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
 }
 
 /// Stop viewing, and drop `?room=` from the address bar where the page may
@@ -421,12 +439,22 @@ mod tests {
     }
 
     #[test]
-    fn the_public_link_is_the_page_url_plus_the_owner_key() {
+    fn the_public_link_is_a_share_link_that_opens_river_with_the_room() {
+        use crate::util::share_link::parse_share_link;
         let vk = key();
-        let base = "https://node.example:7509/v1/contract/web/ABC/";
-        let link = public_room_link(base, &vk);
-        assert_eq!(link, format!("{base}?room={}", owner_key_b58(&vk)));
-        let key_part = link.split("?room=").nth(1).unwrap();
+        let link = public_room_link(&vk);
+        let id = RIVER_WEB_APP.trim();
+        assert_eq!(
+            link,
+            format!("https://freenet.org/open#{id}/?room={}", owner_key_b58(&vk))
+        );
+        let target = parse_share_link(&link).expect("a valid share link");
+        let path = target.local_path();
+        assert_eq!(
+            path,
+            format!("/v1/contract/web/{id}/?room={}", owner_key_b58(&vk))
+        );
+        let key_part = path.split("?room=").nth(1).unwrap();
         assert_eq!(parse_room_param(key_part), Ok(vk));
     }
 

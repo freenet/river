@@ -22,6 +22,8 @@ type RiverTestHooks = {
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
+  // Base58 owner key of an example room a ?room= link can open ("public" or "private"; "missing" is a valid key no room has). Not in the room list.
+  viewableRoomKey(kind: "public" | "private" | "missing"): string;
   // The current room under a new contract key, as a room-contract re-key leaves it.
   rekeyCurrentRoom(): void;
   // Show one mobile panel, as its buttons do, whatever covers them.

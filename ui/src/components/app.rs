@@ -554,24 +554,8 @@ pub fn App() -> Element {
         }
     }
 
-    // `?room=<owner key>` (freenet/river#513): open a public room read-only,
-    // without membership. An invitation in the same URL wins. Once per page
-    // load: the sandboxed gateway iframe cannot drop the parameter, so this
-    // body would otherwise re-open the link on every render.
-    let room_link_read = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
-    if !found_invitation && !room_link_read.replace(true) {
-        if let Some(window) = window() {
-            if let Ok(search) = window.location().search() {
-                if let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) {
-                    if params.get("invitation").is_none() {
-                        if let Some(room) = params.get(crate::public_room::ROOM_PARAM) {
-                            crate::public_room::open_from_param(&room);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // `?room=<owner key>` (freenet/river#513) opens a public room read-only,
+    // without membership; `VIEWED_ROOM` reads the address itself.
     let viewing_room = match crate::public_room::VIEWED_ROOM.try_read() {
         Ok(v) => v.is_some(),
         Err(_) => {

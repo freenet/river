@@ -5,7 +5,7 @@ use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatu
 use crate::components::app::{CURRENT_ROOM, ROOMS, SYNC_STATUS};
 use crate::components::room_list::edit_room_modal::CopyButton;
 use crate::public_room::{
-    close, composer_note, current_public_room_link, should_request, ViewedRoom, ViewedRoomStatus,
+    close, composer_note, public_room_link, should_request, ViewedRoom, ViewedRoomStatus,
     VIEWED_ROOM,
 };
 use crate::room_data::CurrentRoom;
@@ -223,7 +223,7 @@ fn PublicRoomView(
         .as_ref()
         .map(|d| d.to_string_lossy())
         .filter(|d| !d.is_empty());
-    let link = owner_vk.map(|vk| current_public_room_link(&vk));
+    let link = owner_vk.map(|vk| public_room_link(&vk));
     let note = composer_note(&state);
     let rows = lines(&state);
 

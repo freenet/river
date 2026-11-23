@@ -264,10 +264,10 @@ pub fn EditRoomModal() -> Element {
                                         span {
                                             "data-testid": "room-public-link-text",
                                             class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-xl text-text-muted text-[13px] font-mono break-all select-text",
-                                            "{crate::public_room::current_public_room_link(&room_data.owner_vk)}"
+                                            "{crate::public_room::public_room_link(&room_data.owner_vk)}"
                                         }
                                         CopyButton {
-                                            value: crate::public_room::current_public_room_link(&room_data.owner_vk),
+                                            value: crate::public_room::public_room_link(&room_data.owner_vk),
                                             testid: "room-public-link-copy-button",
                                             label: "Copy public link",
                                         }

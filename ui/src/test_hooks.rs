@@ -161,10 +161,16 @@ pub fn install_test_hooks() {
     };
 
     // The base58 owner key of an example room a `?room=` link can open
-    // ("public" or "private"). These rooms are not in `ROOMS`.
+    // ("public" or "private"; "missing" is well formed but held by no room).
+    // These rooms are not in `ROOMS`.
     set_hook(
         "viewableRoomKey",
         Closure::<dyn FnMut(String) -> String>::new(move |kind: String| {
+            // A well-formed key no fixture room has: the not-found case.
+            if kind == "missing" {
+                let vk = SigningKey::from_bytes(&[0x53; 32]).verifying_key();
+                return crate::public_room::owner_key_b58(&vk);
+            }
             crate::example_data::viewable_fixtures()
                 .iter()
                 .find(|(k, _, _)| *k == kind)
