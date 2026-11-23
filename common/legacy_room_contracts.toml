@@ -274,6 +274,6 @@ code_hash = "bc9b4066fccc37435556295871c567e455b48832eb0a72623d399b354471aef5"
 
 [[entry]]
 version = "V40"
-description = "Open-admission room contract (freenet/river#974) before member ids were decided by full key; never published if the full-key fix merges before the next release"
+description = "Open-admission room contract (freenet/river#974, merged as #979), the last generation before member ids were decided by full key"
 date = "2026-11-23"
 code_hash = "86c0fce06032efc32c024f3cb03b767f399592c5464272f677fa48567c1b10bf"

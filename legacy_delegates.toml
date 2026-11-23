@@ -289,7 +289,7 @@ code_hash = "264a93013e97a464109a63ebfbe84a98e61e81f691f905b142eb1417e9da9329"
 
 [[entry]]
 version = "V40"
-description = "Chat delegate built with the open-admission river-core (freenet/river#974), before member ids were decided by full key"
+description = "Chat delegate built with the open-admission river-core (freenet/river#974, merged as #979), the last generation before member ids were decided by full key"
 date = "2026-11-23"
 delegate_key = "c6fa1ad833f3f8bc74b43390827a35f376ccf948c7416d2c390087777a5ca185"
 code_hash = "4fbc0f3a4940d1dace00415337d3cfae7ea3eceac03a8877a2b62fc9455bf4c4"
