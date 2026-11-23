@@ -37,6 +37,7 @@ use crate::room_state::ban::BansV1;
 use crate::room_state::member::{AuthorizedMember, MemberId, MembersV1};
 use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
+use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -481,6 +482,18 @@ impl ComposableState for BanEvidenceV1 {
                 // considered, and only if it would replace what is held, so an
                 // id costs at most one chain check. If it fails, a peer holding
                 // a valid record offers it on the next sync.
+                //
+                // A record under another key than a held record for its id
+                // never replaces it: a `MemberId` is a non-cryptographic hash,
+                // so two keys can share one, and the held member's
+                // `member_info` and bans were checked against the held key.
+                // The id stays with the record this peer took first, as for a
+                // member record (`MembersV1::resolve_records`).
+                let held_keys: HashMap<MemberId, VerifyingKey> = self
+                    .members
+                    .iter()
+                    .map(|m| (m.member.id(), m.member.member_vk))
+                    .collect();
                 let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> =
                     BTreeMap::new();
                 for m in delta {
@@ -488,6 +501,9 @@ impl ComposableState for BanEvidenceV1 {
                     if id == owner_id
                         || !referenced.contains(&id)
                         || present.contains_key(&id)
+                        || held_keys
+                            .get(&id)
+                            .is_some_and(|vk| *vk != m.member.member_vk)
                         || !within_depth(m, &combined, owner_id, depth_cap)
                     {
                         continue;
