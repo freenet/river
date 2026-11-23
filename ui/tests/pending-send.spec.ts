@@ -252,6 +252,18 @@ test("a failed send's text stays in its room, and a draft in a room not shown ho
   await expect(input(page), "and this room's draft is its own").toHaveValue("typed elsewhere");
 });
 
+test("a draft in the open composer holds a reload with the box unfocused", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "premise: idle" }).toBe(false);
+  await input(page).fill("typed here");
+  await input(page).evaluate((el: HTMLElement) => el.blur());
+  await expect(input(page), "premise: not focused").not.toBeFocused();
+  expect(await callRiverTest(page, "userIsBusy"), "the open room's draft holds a reload").toBe(true);
+  await input(page).fill("");
+  await input(page).evaluate((el: HTMLElement) => el.blur());
+  await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "an emptied draft holds nothing" }).toBe(false);
+});
+
 test("a draft outlives a room that shows a notice instead of the composer", { tag: "@chromium-only" }, async ({ page }) => {
   // Self owns this room, which the hook needs. Without its key, the room
   // shows a notice and no composer.

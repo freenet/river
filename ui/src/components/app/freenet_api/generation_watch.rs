@@ -1084,7 +1084,7 @@ mod runtime {
     /// means a dialog, picker or menu is up (with whatever is typed in it).
     /// The reaction picker, a native popover with no overlay, and the mobile
     /// message sheet, a modal dialog, are checked on their own.
-    /// Beyond that: unsent text in the room composer, a message being edited,
+    /// Beyond that: a draft in the room composer, a message being edited,
     /// any focused text field with something in it, and an invitation being
     /// accepted.
     fn user_is_busy() -> bool {
@@ -1098,14 +1098,8 @@ mod runtime {
         };
         let has_text = |el: &web_sys::Element| value_of(el).is_some_and(|v| !v.trim().is_empty());
 
-        if let Ok(Some(el)) = document.query_selector("#message-input") {
-            if has_text(&el) {
-                return true;
-            }
-        }
-        // A draft in a room that is not shown: the composer keeps one per
-        // room and identity, even while the open room shows a notice
-        // instead of the composer.
+        // A draft in any room, the open one included: the composer keeps
+        // one per room and identity, even while it is not mounted.
         if crate::components::conversation::composer_has_unsent_draft() {
             return true;
         }
@@ -3055,13 +3049,12 @@ mod tests {
         );
     }
 
-    /// `user_is_busy` finds the composers by these hooks. Renaming one would
-    /// fail OPEN (reload over unsent text) without anything else noticing.
+    /// `user_is_busy` finds the edit box and the modals by these hooks.
+    /// Renaming one would fail OPEN (reload over unsent text) without anything
+    /// else noticing.
     #[test]
     fn busy_detection_selectors_still_exist() {
         let src = |s: &str| crate::util::strip_comments(s);
-        assert!(src(include_str!("../../conversation/message_input.rs"))
-            .contains("id: \"message-input\""));
         assert!(src(include_str!("../../conversation.rs")).contains("\"edit-msg-{"));
         for (file, body) in [
             (
