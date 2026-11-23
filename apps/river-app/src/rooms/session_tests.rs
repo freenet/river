@@ -343,6 +343,7 @@ fn the_loader_takes_answers_in_any_order_and_counts_what_it_cannot_read() {
 fn loaded(slots: Vec<StoredRoom>) -> Loaded {
     Loaded {
         listed: slots.len(),
+        listed_rooms: slots.iter().map(|s| s.owner_vk).collect(),
         slots,
         meta: StoredRoomsMeta::default(),
         modes: Default::default(),

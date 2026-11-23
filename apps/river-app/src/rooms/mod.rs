@@ -50,6 +50,7 @@
 //! a thread by editing `hidden_threads` of the same value, in the same write ([`dm_archive`]).
 
 pub mod bans;
+pub mod carry;
 pub mod create;
 pub mod delegate;
 pub mod deputies;

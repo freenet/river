@@ -898,6 +898,18 @@ fn follow_on(
         };
     }
     *unconfirmed = false;
+    // Once a run, with River's storage there: carry over the rooms earlier River releases stored
+    // in their own chat delegates (freenet/river#889). After the read, so it knows which rooms
+    // the store holds; it works as a task, so it waits for the write gate like any other.
+    if !loaded.store_missing && !std::mem::replace(&mut rooms.carry_started, true) {
+        let current = loaded.listed_rooms.iter().map(room_storage_key);
+        let empty = loaded.slots.is_empty();
+        rooms.outbox.work.carry(super::carry::Carry::new(
+            super::carry::predecessors().to_vec(),
+            current,
+            empty,
+        ));
+    }
     rooms.replace(loaded);
     rooms.update_required = watching.watch.is_stale();
     // Every room is subscribed afresh on every connection: subscriptions belong to it.
@@ -1184,6 +1196,18 @@ fn follow_on(
                 subs.failed(instance_id, pace);
                 changed |= rooms.following(&instance_id, false);
             }
+            // An earlier chat delegate's answer, for carrying rooms over: its own key names it.
+            Some(Ok(HostResponse::DelegateResponse { key, mut values }))
+                if &key != delegate::chat_delegate_key() =>
+            {
+                let mut response = HostResponse::DelegateResponse {
+                    key,
+                    values: std::mem::take(&mut values),
+                };
+                if let Some((from, answers)) = super::carry::answers_from(&mut response) {
+                    changed |= rooms.outbox.work.on_predecessor(&from, &answers);
+                }
+            }
             Some(Ok(mut other)) => {
                 let answers = delegate::answers(&other);
                 delegate::wipe_response(&mut other);
@@ -1464,6 +1488,8 @@ struct Loaded {
     store_missing: bool,
     /// How many `room:` keys the store listed (tombstones included).
     listed: usize,
+    /// Those keys' rooms, by owner (tombstones included).
+    listed_rooms: Vec<VerifyingKey>,
     /// Stored rooms that could not be decoded.
     unreadable: usize,
     /// What `outbound_dms` held (read here; written by [`super::dm_save`]).
@@ -1478,6 +1504,7 @@ impl Loaded {
             modes: HashMap::new(),
             store_missing: true,
             listed: 0,
+            listed_rooms: Vec::new(),
             unreadable: 0,
             dms: DmRead::NotListed,
         }
@@ -1604,6 +1631,7 @@ impl Loader {
             modes,
             store_missing: false,
             listed: self.rooms.len(),
+            listed_rooms: self.rooms.clone(),
             unreadable,
             dms,
         }
@@ -1936,6 +1964,8 @@ struct Rooms {
     exports: Vec<(String, Result<String, String>)>,
     /// The store went missing on the last connection: the next one registers it first.
     register_first: bool,
+    /// Carrying rooms over from earlier chat delegates was started this run.
+    carry_started: bool,
     /// While the store could not be set up: when the app next registers it by itself, and
     /// the wait after that one. `None` while the store is there.
     register_retry: Option<(Instant, Duration)>,

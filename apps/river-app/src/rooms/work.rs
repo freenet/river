@@ -94,7 +94,7 @@ use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, DelegateError,
     ErrorKind, RequestError,
 };
-use freenet_stdlib::prelude::{ContractInstanceId, StateDelta, UpdateData};
+use freenet_stdlib::prelude::{ContractInstanceId, DelegateKey, StateDelta, UpdateData};
 use river_core::chat_delegate::{CasStoreResult, ChatDelegateResponseMsg};
 use river_core::invitation::Invitation;
 use river_core::room_state::ChatRoomStateV1;
@@ -104,6 +104,7 @@ use river_core::stored_rooms::{
     encode_new_room, meta_with_current_room, reconcile_new_room, room_storage_key,
 };
 
+use super::carry::{self, Ask, Carry};
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
 use super::dm_archive::ArchiveOp;
@@ -247,12 +248,18 @@ enum Kind {
         ops: Vec<DmOp>,
         listed: bool,
     },
+    /// Carry the user's rooms over from earlier chat delegates ([`super::carry`]): read them
+    /// (`Walk`), then add each room or tombstone found to the store (`Slot`, once per room).
+    /// Shown only while it has found rooms, or the list is empty, and when it fails.
+    Carry(Box<Carry>),
     /// Refused before it started; never works.
     Refused(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
+    /// Read earlier chat delegates (carrying rooms over).
+    Walk,
     /// Read the room from the network (joining).
     Get,
     /// Add the room to the store.
@@ -298,6 +305,8 @@ enum Out {
     Store(Vec<u8>),
     /// A GET, PUT or UPDATE of this room contract.
     Contract(ContractInstanceId),
+    /// A read of an earlier chat delegate ([`super::carry`]).
+    Pred(Ask),
 }
 
 /// A wait before the next request, for a write that was beaten to the key.
@@ -449,8 +458,13 @@ impl Task {
             Kind::Join { invitation, .. } => Some(invitation.room),
             Kind::Leave { room, .. } => Some(*room),
             Kind::Import { export, .. } => Some(export.room_owner),
-            Kind::Mode { .. } | Kind::DmSave { .. } | Kind::Refused(_) => None,
+            Kind::Mode { .. } | Kind::DmSave { .. } | Kind::Carry(_) | Kind::Refused(_) => None,
         }
+    }
+
+    /// Whether this carries rooms over from earlier chat delegates.
+    fn is_carry(&self) -> bool {
+        matches!(self.kind, Kind::Carry(_))
     }
 
     /// Whether this only saves a notification mode.
@@ -473,7 +487,11 @@ impl Task {
         match &self.kind {
             Kind::Create(plan) => Some(&plan.room),
             Kind::Join { plan, .. } => plan.as_ref().map(|p| &p.room),
-            Kind::Leave { .. } | Kind::Mode { .. } | Kind::DmSave { .. } | Kind::Refused(_) => None,
+            Kind::Leave { .. }
+            | Kind::Mode { .. }
+            | Kind::DmSave { .. }
+            | Kind::Carry(_)
+            | Kind::Refused(_) => None,
             Kind::Import { plan, .. } => plan.as_deref(),
         }
     }
@@ -495,6 +513,7 @@ impl Task {
             Kind::Mode { .. } => "Saving the notification setting".to_owned(),
             Kind::DmSave { .. } => "Saving sent messages".to_owned(),
             Kind::Leave { name, .. } => format!("Leaving “{name}”"),
+            Kind::Carry(c) => carry_line(c),
             Kind::Refused(what) => what.clone(),
         };
         let state = match (&self.failed, self.step, self.owner()) {
@@ -551,6 +570,19 @@ impl Task {
         self.out = None;
         self.wipe();
         self.conflicts = 0;
+        if let Kind::Carry(c) = &self.kind {
+            // Walked, or a room written: the next room, or done.
+            if c.walked() && c.writes_left() {
+                self.step = Step::Slot;
+            } else if c.walked() {
+                self.step = Step::Done;
+                if !c.unread.is_empty() {
+                    let why = carry_failure(c);
+                    self.fail(why, true);
+                }
+            }
+            return;
+        }
         self.step = match (&self.kind, self.step) {
             (Kind::Create(_), Step::Slot) => Step::Put,
             (Kind::Create(_), Step::Put) => Step::Meta,
@@ -632,6 +664,12 @@ impl Task {
                     Err(refusal.to_string())
                 }
             };
+        }
+        if let Kind::Carry(c) = &mut self.kind {
+            let Some((_, bytes)) = c.write() else {
+                return Err(unexpected());
+            };
+            return Ok(carry::decide(value, &bytes));
         }
         if let Kind::Mode { room, mode } = &self.kind {
             return meta_with_mode(value, room, *mode).map_err(|e| {
@@ -746,6 +784,43 @@ impl Work {
 
     /// Join the room `pasted` invites to, as `nickname`. `shown` says whether a room is in the
     /// list already.
+    /// Carry rooms over from earlier chat delegates ([`super::carry`]), unless that is under way.
+    pub fn carry(&mut self, carry: Carry) {
+        if self.tasks.iter().any(|t| t.is_carry() && t.running()) {
+            return;
+        }
+        self.push(Kind::Carry(Box::new(carry)), Step::Walk);
+    }
+
+    /// An answer from an earlier chat delegate (`from`). True when it was the working task's.
+    pub fn on_predecessor(&mut self, from: &DelegateKey, answers: &[ChatDelegateResponseMsg]) -> bool {
+        let Some(t) = self.active() else {
+            return false;
+        };
+        let Some((Out::Pred(ask), _)) = t.out.clone() else {
+            return false;
+        };
+        let Kind::Carry(c) = &mut t.kind else {
+            return false;
+        };
+        let mut taken = false;
+        for answer in answers {
+            if c.on_answer(&ask, from, answer) {
+                taken = true;
+                break;
+            }
+        }
+        if !taken {
+            return false;
+        }
+        t.out = None;
+        if c.walked() {
+            t.advance();
+        }
+        self.note_done();
+        true
+    }
+
     pub fn join(&mut self, pasted: &str, nickname: &str, shown: &dyn Fn(&VerifyingKey) -> bool) {
         const WHAT: &str = "Joining a room";
         let invitation = match create::decode_invitation(pasted) {
@@ -1094,6 +1169,11 @@ impl Work {
         t.conflicts = 0;
         t.out = None;
         t.phase = Phase::Read;
+        // Carrying rooms over reads every earlier delegate again.
+        if let Kind::Carry(c) = &mut t.kind {
+            c.restart();
+            t.step = Step::Walk;
+        }
         // A join reads the room again, so what it sends is built against the room as it is now,
         // with the time it is sent, when it failed before its UPDATE, or when the node refused
         // the UPDATE (the room may have filled up or banned the invitee since; whether to send
@@ -1217,7 +1297,35 @@ impl Work {
             Cool::Until(_) => t.cool = Cool::No,
         }
         let owner = t.owner();
-        let (out, request) = match (t.step, &t.kind) {
+        let (out, request) = match (t.step, &mut t.kind) {
+            (Step::Walk, Kind::Carry(c)) => {
+                let Some(ask) = c.next_ask() else {
+                    t.advance();
+                    return None;
+                };
+                let request = ask.to_request();
+                (Out::Pred(ask), request)
+            }
+            (Step::Slot, Kind::Carry(c)) => {
+                let Some((key, _)) = c.write() else {
+                    t.advance();
+                    return None;
+                };
+                match &t.phase {
+                    Phase::Read => (
+                        Out::Read(key.clone()),
+                        delegate::versioned(&delegate::Versioned::Read(key)),
+                    ),
+                    Phase::Store { value, generation } => (
+                        Out::Store(key.clone()),
+                        delegate::versioned(&delegate::Versioned::Store {
+                            key,
+                            value: value.clone(),
+                            generation: *generation,
+                        }),
+                    ),
+                }
+            }
             (Step::Get, _) => {
                 let id = *create::contract_key(&owner?).id();
                 (
@@ -1310,14 +1418,24 @@ impl Work {
                     };
                 }
                 // Nothing to store: the room is already there, or the meta already opens it.
-                Ok(None) => t.advance(),
+                Ok(None) => {
+                    if let Kind::Carry(c) = &mut t.kind {
+                        c.written(false);
+                    }
+                    t.advance()
+                }
                 Err(why) => t.fail(why, false),
             },
             (Out::Store(key), ChatDelegateResponseMsg::CasStoreResponse { key: k, result })
                 if k.as_bytes() == key.as_slice() =>
             {
                 match result {
-                    CasStoreResult::Stored { .. } => t.advance(),
+                    CasStoreResult::Stored { .. } => {
+                        if let Kind::Carry(c) = &mut t.kind {
+                            c.written(true);
+                        }
+                        t.advance()
+                    }
                     // Another writer stored first: read what it stored and work from that.
                     CasStoreResult::Conflict { .. } => {
                         t.out = None;
@@ -1458,6 +1576,39 @@ impl Work {
                 ))
             )
         );
+        // A read of an earlier chat delegate: while a task works nothing else asks a delegate, so
+        // a delegate error is this read's. The node not holding it is the usual answer.
+        if let Out::Pred(ask) = out {
+            let ask = ask.clone();
+            let why = match e.kind() {
+                ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(k)))
+                    if k == ask.delegate() =>
+                {
+                    None
+                }
+                ErrorKind::RequestError(RequestError::DelegateError(d)) => Some(d.to_string()),
+                ErrorKind::Unhandled { cause } if alone => Some(short(cause)),
+                _ => return false,
+            };
+            let Kind::Carry(c) = &mut t.kind else {
+                return false;
+            };
+            t.out = None;
+            match why {
+                None => {
+                    c.not_installed(ask.delegate());
+                }
+                Some(why) => {
+                    eprintln!("River: an earlier River's storage could not be read: {why}");
+                    c.unreadable(why);
+                }
+            }
+            if c.walked() {
+                t.advance();
+            }
+            self.note_done();
+            return true;
+        }
         let why = match (out, e.kind()) {
             (Out::Contract(id), ErrorKind::RequestError(RequestError::ContractError(c))) => match c
             {
@@ -1532,11 +1683,26 @@ impl Work {
             return false;
         };
         let wait = match out {
-            Out::Read(_) | Out::Store(_) => delegate_wait,
+            Out::Read(_) | Out::Store(_) | Out::Pred(_) => delegate_wait,
             Out::Contract(_) => network_wait,
         };
         if now.saturating_duration_since(*at) < wait {
             return false;
+        }
+        // An earlier delegate that does not answer is passed over (the walk goes on with the next
+        // one on the new connection); it does not count against the task, since each one is
+        // asked at most once.
+        if matches!(out, Out::Pred(_)) {
+            t.out = None;
+            if let Kind::Carry(c) = &mut t.kind {
+                c.unreadable("it did not answer".to_owned());
+                if c.walked() {
+                    t.advance();
+                }
+            }
+            self.expired_dm = false;
+            self.note_done();
+            return true;
         }
         t.out = None;
         t.wipe();
@@ -1587,6 +1753,17 @@ impl Work {
             .iter()
             .filter(|t| !t.is_dm())
             .filter(|t| !((t.is_mode() || t.is_leave()) && t.step == Step::Done))
+            .filter(|t| match &t.kind {
+                // Carrying rooms over is shown while it has rooms to carry, or the list is empty
+                // (so an empty list says why), and when it failed with something to try again.
+                // Not once done (the rooms show), and not when River moved on (halted: the
+                // newer build carries them).
+                Kind::Carry(c) => match &t.failed {
+                    Some((_, retry)) => *retry,
+                    None => t.step != Step::Done && (c.rooms_found() > 0 || c.list_was_empty),
+                },
+                _ => true,
+            })
             .map(Task::view)
             .collect()
     }
@@ -1603,9 +1780,36 @@ impl Work {
         self.tasks.retain(|t| {
             !(t.step == Step::Done
                 && t.failed.is_none()
-                && (t.is_mode() || (!t.is_leave() && t.owner().is_some_and(|o| shown(&o)))))
+                && (t.is_mode()
+                    || t.is_carry()
+                    || (!t.is_leave() && t.owner().is_some_and(|o| shown(&o)))))
         });
     }
+}
+
+/// What the screen says while rooms are carried over.
+fn carry_line(c: &Carry) -> String {
+    match c.rooms_found() {
+        0 => "Looking for your rooms from an earlier version of River".to_owned(),
+        1 => "Carrying 1 room over from an earlier version of River".to_owned(),
+        n => format!("Carrying {n} rooms over from an earlier version of River"),
+    }
+}
+
+/// Why carrying rooms over failed: some earlier delegates could not be read.
+fn carry_failure(c: &Carry) -> String {
+    let versions: Vec<&str> = c.unread.iter().map(|(v, _)| v.as_str()).collect();
+    let (_, first) = &c.unread[0];
+    let carried = match c.carried {
+        0 => String::new(),
+        1 => "1 room was carried over. ".to_owned(),
+        n => format!("{n} rooms were carried over. "),
+    };
+    format!(
+        "{carried}River couldn't read its storage from an earlier version ({}: {first}), so rooms \
+         kept only there are not shown yet.",
+        versions.join(", ")
+    )
 }
 
 #[cfg(test)]
