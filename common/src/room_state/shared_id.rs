@@ -172,6 +172,19 @@ impl ChatRoomStateV1 {
         kept
     }
 
+    /// Whether some id is held under two or more keys in `members` and ban
+    /// evidence together: what `resolve_shared_ids` decides.
+    pub(crate) fn has_shared_id(&self) -> bool {
+        let mut seen: HashMap<MemberId, &VerifyingKey> = HashMap::new();
+        self.members
+            .members
+            .iter()
+            .chain(&self.ban_evidence.members)
+            .any(|m| {
+                *seen.entry(m.member.id()).or_insert(&m.member.member_vk) != &m.member.member_vk
+            })
+    }
+
     /// Whether `vk` has signed anything this state holds for `id`.
     fn has_signed(&self, id: MemberId, vk: &VerifyingKey, owner_vk: &VerifyingKey) -> bool {
         self.member_info

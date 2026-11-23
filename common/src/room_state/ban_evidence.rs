@@ -37,6 +37,7 @@ use crate::room_state::ban::BansV1;
 use crate::room_state::member::{AuthorizedMember, MemberId, MembersV1};
 use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
+use ed25519_dalek::VerifyingKey;
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -131,6 +132,51 @@ pub(crate) fn within_depth(
         depth += 1;
     }
     depth <= cap
+}
+
+/// Whether `record`'s invite chain reaches the owner within `cap` records
+/// (`record` at `depth`) through ANY of the records `by_id` holds for each
+/// inviter id, with every link's signature checked when `check` is set. A
+/// `MemberId` is a non-cryptographic hash, so an inviter's id can be held
+/// under several keys at once; every one is tried. Each (record, inviter key)
+/// signature is checked at most once per `sig_memo`. The cap bounds the walk.
+fn chain_within_cap(
+    record: &AuthorizedMember,
+    by_id: &HashMap<MemberId, Vec<&AuthorizedMember>>,
+    parameters: &ChatRoomParametersV1,
+    cap: usize,
+    depth: usize,
+    check: bool,
+    sig_memo: &mut HashMap<(EvidenceDigest, [u8; 32]), bool>,
+) -> bool {
+    if depth > cap {
+        return false;
+    }
+    let owner_id = parameters.owner_id();
+    let signed_by = |vk: &VerifyingKey, memo: &mut HashMap<(EvidenceDigest, [u8; 32]), bool>| {
+        !check
+            || *memo
+                .entry((evidence_digest(record), vk.to_bytes()))
+                .or_insert_with(|| {
+                    #[cfg(test)]
+                    crate::room_state::member::tests::count_invite_signature_check();
+                    record.verify_signature(vk).is_ok()
+                })
+    };
+    if record.member.invited_by == owner_id {
+        return signed_by(&parameters.owner, sig_memo);
+    }
+    if record.member.invited_by == record.member.id() {
+        return false;
+    }
+    by_id
+        .get(&record.member.invited_by)
+        .into_iter()
+        .flatten()
+        .any(|inviter| {
+            signed_by(&inviter.member.member_vk, sig_memo)
+                && chain_within_cap(inviter, by_id, parameters, cap, depth + 1, check, sig_memo)
+        })
 }
 
 /// Every member id a stored non-owner ban references: its issuer and target,
@@ -464,10 +510,43 @@ impl ComposableState for BanEvidenceV1 {
             let depth_cap =
                 evidence_depth_cap(parent_state.configuration.configuration.max_members);
             let added = {
+                // Every record known here per id, under every key: a
+                // `MemberId` is a non-cryptographic hash, so an inviter's id
+                // can be held under two keys until cleanup decides which it
+                // keeps (`resolve_shared_ids`), and a chain counts when it
+                // holds through ANY of them. Reading one record per id here
+                // made whether a record was taken depend on which of the two
+                // the lookup happened to return.
+                // Per id: the record the lookup gives (members first, then
+                // evidence reached from them, then the delta), plus, for an
+                // id it gives, one record for each OTHER key some member,
+                // evidence or delta record names for that id.
                 let mut combined = self.lookup(&parent_state.members, owner_id);
                 for m in delta {
                     combined.entry(m.member.id()).or_insert(m);
                 }
+                let mut by_id: HashMap<MemberId, Vec<&AuthorizedMember>> =
+                    combined.iter().map(|(id, m)| (*id, vec![*m])).collect();
+                for m in parent_state
+                    .members
+                    .members
+                    .iter()
+                    .chain(&self.members)
+                    .chain(delta)
+                {
+                    if let Some(records) = by_id.get_mut(&m.member.id()) {
+                        if records
+                            .iter()
+                            .all(|r| r.member.member_vk != m.member.member_vk)
+                        {
+                            records.push(m);
+                        }
+                    }
+                }
+                let mut sig_memo: HashMap<(EvidenceDigest, [u8; 32]), bool> = HashMap::new();
+                let mut reaches = |m: &AuthorizedMember, check: bool| {
+                    chain_within_cap(m, &by_id, parameters, depth_cap, 1, check, &mut sig_memo)
+                };
                 // A held record competes only while its own chain still
                 // reaches the owner within the cap through the records known
                 // here; one that no longer does (its inviter was removed by
@@ -478,7 +557,7 @@ impl ComposableState for BanEvidenceV1 {
                 let held: HashMap<Slot, EvidenceDigest> = self
                     .members
                     .iter()
-                    .filter(|m| within_depth(m, &combined, owner_id, depth_cap))
+                    .filter(|m| reaches(m, false))
                     .map(|m| (slot(m), evidence_digest(m)))
                     .collect();
                 // Two valid records for one (id, key) resolve the same way on
@@ -494,7 +573,7 @@ impl ComposableState for BanEvidenceV1 {
                     if id == owner_id
                         || !referenced.contains(&id)
                         || present.contains(&slot(m))
-                        || !within_depth(m, &combined, owner_id, depth_cap)
+                        || !reaches(m, false)
                     {
                         continue;
                     }
@@ -506,19 +585,9 @@ impl ComposableState for BanEvidenceV1 {
                         best.insert(slot(m), (digest, m));
                     }
                 }
-                let mut verified = HashSet::new();
-                let mut failed = HashSet::new();
                 let mut added = Vec::new();
                 for (_, (_, m)) in best {
-                    if MembersV1::verify_invite_chain_memo(
-                        m,
-                        parameters,
-                        &combined,
-                        &mut verified,
-                        Some(&mut failed),
-                    )
-                    .is_ok()
-                    {
+                    if reaches(m, true) {
                         added.push(m.clone());
                     }
                 }

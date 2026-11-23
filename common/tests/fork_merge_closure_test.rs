@@ -142,6 +142,10 @@ struct Stats {
     /// pairs each side of which keeps its own record, counted apart
     /// (freenet/river#703).
     runs_with_two_records_for_one_member: usize,
+    /// Fork pairs whose `members` and evidence records together name two
+    /// keys for one id: the member-member collision the merge must decide
+    /// (`resolve_shared_ids`).
+    runs_with_shared_id: usize,
     /// Runs whose forks end holding provisional entries, and provisional bans.
     runs_with_entries: usize,
     runs_with_provisional_bans: usize,
@@ -217,6 +221,9 @@ struct World {
     prov: Vec<SigningKey>,
     prov_ids: Vec<MemberId>,
     forged: Vec<ed25519_dalek::VerifyingKey>,
+    /// For each pool member, a forged key with the same `MemberId`, when
+    /// one is found: the member-member collision.
+    pool_forged: Vec<Option<ed25519_dalek::VerifyingKey>>,
 }
 
 fn key(rng: &mut StdRng) -> SigningKey {
@@ -269,10 +276,15 @@ impl World {
                 prov.push(k);
             }
         }
+        let pool_forged = pool
+            .iter()
+            .map(|m| forged_vk_with_id_of(&m.sk.verifying_key()))
+            .collect();
         World {
             owner_sk,
             owner_id,
             params,
+            pool_forged,
             pool,
             base_time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
             prov,
@@ -1199,11 +1211,10 @@ fn random_op_prov(
         // Sponsorship: the owner or a present member invites a provisional
         // key (with the inviter's chain), with a message by the new member.
         10..=11 => {
-            // Only keys 0..3 are ever sponsored, and only keys 3..6 are ever
-            // shadowed by a forged record (op 15): a record that collides with
-            // another RECORD (a sponsored key, later evidence, against a forged
-            // record for its id) is the older member-member collision, which
-            // no provisional rule decides (see the PR).
+            // Keys 0..3 are sponsored; op 15 shadows any key with a forged
+            // record, so a sponsored key (later evidence) meets a forged
+            // record for its id: the member-member collision, decided by
+            // `resolve_shared_ids`.
             let j = rng.gen_range(0..np / 2);
             let inviter = pick(rng, &present);
             let (inviter_id, inviter_sk, mut members) = match inviter {
@@ -1284,21 +1295,33 @@ fn random_op_prov(
             let Some(p) = pick(rng, &present) else {
                 return ChatRoomStateV1Delta::default();
             };
-            let j = np / 2 + rng.gen_range(0..np - np / 2);
+            // A provisional or sponsored key's id, or (now and then) a pool
+            // member's: the forged record then collides with a member who
+            // has a record, messages and member_info.
+            let pool_victim = (0..n)
+                .filter(|&v| v != p && w.pool_forged[v].is_some())
+                .collect::<Vec<_>>();
+            let (victim_id, forged) = match pick(rng, &pool_victim) {
+                Some(v) if rng.gen_bool(0.3) => (w.pool[v].id, w.pool_forged[v].unwrap()),
+                _ => {
+                    let j = rng.gen_range(0..np);
+                    (w.prov_ids[j], w.forged[j])
+                }
+            };
             let mut members: Vec<AuthorizedMember> =
                 w.chain(p).iter().map(|&c| w.pool[c].auth.clone()).collect();
             members.push(AuthorizedMember::new(
                 Member {
                     owner_member_id: w.owner_id,
                     invited_by: w.pool[p].id,
-                    member_vk: w.forged[j],
+                    member_vk: forged,
                 },
                 &w.pool[p].sk,
             ));
             let dm = sign_direct_message(
                 &w.pool[p].sk,
                 w.pool[p].id,
-                w.prov_ids[j],
+                victim_id,
                 &w.params.owner,
                 t,
                 b"x".to_vec(),
@@ -1309,7 +1332,7 @@ fn random_op_prov(
                     UserBan {
                         owner_member_id: w.owner_id,
                         banned_at: w.base_time + Duration::from_secs(t),
-                        banned_user: w.prov_ids[j],
+                        banned_user: victim_id,
                     },
                     w.pool[p].id,
                     &w.pool[p].sk,
@@ -1795,10 +1818,13 @@ impl Failures {
     }
 }
 
-/// Whether the two states hold DIFFERENT records for one member id: the
-/// Each peer keeps the record it holds (`MembersV1::resolve_records`), so
-/// such a pair does not converge on that member, and the tests count it
-/// apart instead of as a failure (freenet/river#703).
+/// Whether the two states hold DIFFERENT records for one member id under
+/// the SAME key. Each peer keeps the record it holds for a key
+/// (`MembersV1::resolve_records`), so such a pair does not converge on that
+/// member, and the tests count it apart instead of as a failure
+/// (freenet/river#703). Records for one id under different keys are not
+/// exempt: cleanup decides one key per id (`resolve_shared_ids`), and such a
+/// pair must converge.
 fn hold_different_records_for_one_member(a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> bool {
     let held: std::collections::HashMap<MemberId, &AuthorizedMember> = a
         .members
@@ -1806,10 +1832,10 @@ fn hold_different_records_for_one_member(a: &ChatRoomStateV1, b: &ChatRoomStateV
         .iter()
         .map(|m| (m.member.id(), m))
         .collect();
-    b.members
-        .members
-        .iter()
-        .any(|m| held.get(&m.member.id()).is_some_and(|h| *h != m))
+    b.members.members.iter().any(|m| {
+        held.get(&m.member.id())
+            .is_some_and(|h| *h != m && h.member.member_vk == m.member.member_vk)
+    })
 }
 
 fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
@@ -1825,6 +1851,19 @@ fn endings(mode: Mode, seeds: &[(u64, usize)]) -> Failures {
             s.runs += 1;
             if own_records {
                 s.runs_with_two_records_for_one_member += 1;
+            }
+            let mut keys: std::collections::HashMap<MemberId, std::collections::HashSet<[u8; 32]>> =
+                std::collections::HashMap::new();
+            for m in [&a, &b]
+                .iter()
+                .flat_map(|st| st.members.members.iter().chain(&st.ban_evidence.members))
+            {
+                keys.entry(m.member.id())
+                    .or_default()
+                    .insert(m.member.member_vk.to_bytes());
+            }
+            if keys.values().any(|k| k.len() > 1) {
+                s.runs_with_shared_id += 1;
             }
             if !a.ban_evidence.is_empty() || !b.ban_evidence.is_empty() {
                 s.runs_with_evidence += 1;
@@ -2320,6 +2359,7 @@ fn provisional_forks_converge() {
     let seeds = default_seeds(seeds_from_env(3));
     let failures = endings(Mode::Provisional, &seeds);
     let stats = take_stats();
+    println!("provisional stats: {stats:?}");
     assert_floors(
         Mode::Provisional,
         &stats,
@@ -2333,6 +2373,10 @@ fn provisional_forks_converge() {
     assert!(
         stats.runs_with_provisional_bans > 0,
         "no run ended holding a provisional ban: {stats:?}"
+    );
+    assert!(
+        stats.runs_with_shared_id > 0,
+        "no fork pair held two keys for one member id: {stats:?}"
     );
     assert!(
         failures.is_empty(),

@@ -888,6 +888,24 @@ fn enforced_ban_set_of_inner(
     parent_state: &ChatRoomStateV1,
     parameters: &ChatRoomParametersV1,
 ) -> HashSet<MemberId> {
+    // With an id held under two keys, judge over the records cleanup will
+    // read: it decides one key per id (`resolve_shared_ids`, after dropping
+    // evidence deeper than the cap) before step 0. Without this the DM apply
+    // judged bans over whichever record a lookup returned for the shared id.
+    if parent_state.has_shared_id() {
+        let mut resolved = parent_state.clone();
+        if let Some(pruned) = resolved.ban_evidence.without_too_deep(
+            &resolved.members,
+            parameters.owner_id(),
+            crate::room_state::ban_evidence::evidence_depth_cap(
+                resolved.configuration.configuration.max_members,
+            ),
+        ) {
+            resolved.ban_evidence = pruned;
+        }
+        resolved.resolve_shared_ids(parameters);
+        return enforced_ban_set_of_inner(&resolved, parameters);
+    }
     let max_bans = parent_state.configuration.configuration.max_user_bans;
     // The evidence `post_apply_cleanup` reads: without records deeper than
     // the cap, which it drops first.

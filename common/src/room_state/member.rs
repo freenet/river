@@ -1507,7 +1507,7 @@ pub(crate) mod tests {
         CHAIN_STEPS.with(|c| c.get())
     }
 
-    pub(super) fn count_invite_signature_check() {
+    pub(crate) fn count_invite_signature_check() {
         INVITE_SIGNATURE_CHECKS.with(|c| c.set(c.get() + 1));
     }
 
