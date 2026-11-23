@@ -1527,8 +1527,11 @@ fn badge_for_target(
 
 #[component]
 pub fn MemberList() -> Element {
-    let mut invite_modal_active = use_signal(|| false);
-    let mut export_modal_active = use_signal(|| false);
+    // Provided by `App`, so the user wait dots can tell these modals cover
+    // the conversation (`user_wait_dots::LocalModals`).
+    let local_modals = use_context::<crate::components::user_wait_dots::LocalModals>();
+    let mut invite_modal_active = local_modals.invite_member;
+    let mut export_modal_active = local_modals.export_identity;
     // Hidden until the Members heading is clicked, so a quiet room
     // does not spend a row on a box nobody is using (freenet/river#493).
     let mut member_search_open = use_signal(|| false);

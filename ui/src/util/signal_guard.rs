@@ -165,6 +165,10 @@ mod tests {
             "dm_thread_modal.rs view",
             include_str!("../components/direct_messages/dm_thread_modal.rs"),
         ),
+        (
+            "user_wait_dots.rs reason",
+            include_str!("../components/user_wait_dots.rs"),
+        ),
     ];
 
     /// Same requirement as [`GUARDED_MEMO_SITES`], for `use_effect(...)`
@@ -190,6 +194,10 @@ mod tests {
         (
             "toast.rs banner clearance",
             include_str!("../components/toast.rs"),
+        ),
+        (
+            "message_input.rs failed send taken back",
+            include_str!("../components/conversation/message_input.rs"),
         ),
     ];
 
@@ -314,18 +322,18 @@ mod tests {
 
     #[test]
     fn every_fallible_memo_anchors_before_its_first_try_read_and_nudges() {
-        // 13 across the 9 files; conversation.rs alone has 4, member_info_modal.rs 2.
-        assert_fallible_hooks_are_guarded(GUARDED_MEMO_SITES, "use_memo(", "freenet/river#555", 13);
+        // 14 across the 10 files; conversation.rs alone has 4, member_info_modal.rs 2.
+        assert_fallible_hooks_are_guarded(GUARDED_MEMO_SITES, "use_memo(", "freenet/river#555", 14);
     }
 
     #[test]
     fn every_fallible_effect_anchors_before_its_first_try_read_and_nudges() {
-        // 14 effects across five files; app.rs has 5, dm_thread_modal.rs 2 (the
-        // DM_DRAFT merge and the DM read rule), members.rs 1, conversation.rs 5
+        // 14 effects across six files; app.rs has 5, dm_thread_modal.rs 2 (the
+        // DM_DRAFT merge and the DM read rule), members.rs 1, conversation.rs 4
         // (the room read rule's foreground re-check, the two description
-        // overflow effects from freenet/river#718, the member-panel
-        // toggle's reading-row restore, and the post-render scroll effect's
-        // outbox subscription), toast.rs 1 (the banner-clearance effect).
+        // overflow effects from freenet/river#718, and the member-panel
+        // toggle's reading-row restore), toast.rs 1 (the banner-clearance
+        // effect), message_input.rs 1 (a failed send taken back as the draft).
         assert_fallible_hooks_are_guarded(
             GUARDED_EFFECT_SITES,
             "use_effect(",

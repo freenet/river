@@ -308,7 +308,7 @@ static NARROW: GlobalSignal<bool> = Global::new(narrow_now);
 /// [`NARROW`], read fallibly: a contended read answers from the media query
 /// itself, and this render, holding no subscription, is woken by the nudge
 /// (freenet/river#555).
-pub(super) fn narrow_for_render() -> bool {
+pub(crate) fn narrow_for_render() -> bool {
     match NARROW.try_read() {
         Ok(narrow) => *narrow,
         Err(_) => {

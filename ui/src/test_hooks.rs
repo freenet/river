@@ -439,6 +439,136 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The room wait feedback's inputs (`user_waits.rs`), at its adapters: an
+    // UPDATE reply for the current room's contract, an UPDATE error as the
+    // socket would report it (classified by the production classifier), and
+    // the 20 s cap reached. Real-node checks cover the call sites themselves.
+    set_hook(
+        "deliverUpdateResponse",
+        Closure::<dyn FnMut()>::new(move || {
+            let Some(room) = CURRENT_ROOM.peek().owner_key else {
+                wasm_bindgen::throw_str("deliverUpdateResponse: no room is open");
+            };
+            let Some(key) = ROOMS.peek().map.get(&room).map(|r| r.contract_key) else {
+                wasm_bindgen::throw_str("deliverUpdateResponse: the room is not loaded");
+            };
+            crate::components::app::user_waits::note_update_response(key);
+        })
+        .into_js_value(),
+    );
+    set_hook(
+        "deliverUpdateError",
+        Closure::<dyn FnMut(String)>::new(move |kind: String| {
+            use freenet_stdlib::client_api::{ClientError, ContractError, ErrorKind, RequestError};
+            let Some(key) = CURRENT_ROOM
+                .peek()
+                .owner_key
+                .and_then(|room| ROOMS.peek().map.get(&room).map(|r| r.contract_key))
+            else {
+                wasm_bindgen::throw_str("deliverUpdateError: no room is open");
+            };
+            let kind = match kind.as_str() {
+                "keyed" => {
+                    ErrorKind::RequestError(RequestError::ContractError(ContractError::Update {
+                        key,
+                        cause: "refused (test)".into(),
+                    }))
+                }
+                "unkeyed" => ErrorKind::OperationError {
+                    cause: "UPDATE failed: timed out (test)".into(),
+                },
+                "get" => ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
+                    key,
+                    cause: "update failed (test)".into(),
+                })),
+                other => wasm_bindgen::throw_str(&format!("unknown UPDATE error kind {other:?}")),
+            };
+            if let Some(failure) =
+                crate::components::app::user_waits::update_failure(&ClientError::from(kind))
+            {
+                crate::components::app::user_waits::note_update_failure(failure);
+            }
+        })
+        .into_js_value(),
+    );
+    set_hook(
+        "expireUserWaits",
+        Closure::<dyn FnMut()>::new(move || {
+            crate::util::defer(|| {
+                use crate::components::app::user_waits::{FEEDBACK_CAP_MS, USER_WAITS};
+                let now = crate::util::get_current_system_time()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                USER_WAITS.with_mut(|w| w.sweep(now + FEEDBACK_CAP_MS));
+            });
+        })
+        .into_js_value(),
+    );
+    set_hook(
+        "userWaitRooms",
+        Closure::<dyn FnMut() -> u32>::new(move || {
+            crate::components::app::user_waits::USER_WAITS
+                .peek()
+                .room_count() as u32
+        })
+        .into_js_value(),
+    );
+
+    // A join in progress (an accepted invitation subscribing), or none.
+    set_hook(
+        "setPendingJoin",
+        Closure::<dyn FnMut(bool)>::new(move |on: bool| {
+            crate::util::defer(move || {
+                use crate::components::app::PENDING_INVITES;
+                use crate::invites::{PendingRoomJoin, PendingRoomStatus};
+                let room_sk = SigningKey::from_bytes(&[0x5a; 32]);
+                let room = room_sk.verifying_key();
+                if !on {
+                    PENDING_INVITES.with_mut(|p| p.map.remove(&room));
+                    return;
+                }
+                let invitee = SigningKey::from_bytes(&[0x5b; 32]);
+                let member = AuthorizedMember::new(
+                    Member {
+                        owner_member_id: MemberId::from(&room),
+                        invited_by: MemberId::from(&room),
+                        member_vk: invitee.verifying_key(),
+                    },
+                    &room_sk,
+                );
+                PENDING_INVITES.with_mut(|p| {
+                    p.map.insert(
+                        room,
+                        PendingRoomJoin {
+                            authorized_member: member,
+                            invitee_signing_key: invitee,
+                            preferred_nickname: "Joiner".to_string(),
+                            status: PendingRoomStatus::Subscribing,
+                            subscribing_since: None,
+                            retry_count: 0,
+                            room_secrets: Vec::new(),
+                        },
+                    )
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
+    // The current room's identity replaced, as an identity import does.
+    set_hook(
+        "replaceRoomIdentity",
+        Closure::<dyn FnMut()>::new(move || {
+            crate::util::defer(|| {
+                with_current_room_mut(|room, _| {
+                    room.self_sk = Some(SigningKey::from_bytes(&[0x6c; 32]));
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
     // Give the current room a new contract key, as a room-contract re-key
     // does: the same room and messages under another generation. The mobile
     // message sheet closes on it, and work queued for it does nothing.

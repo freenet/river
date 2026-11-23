@@ -8,11 +8,6 @@ fn room() -> VerifyingKey {
     SigningKey::from_bytes(&[1u8; 32]).verifying_key()
 }
 
-/// When a retry happens in these tests.
-fn later() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(3600)
-}
-
 fn author() -> SigningKey {
     SigningKey::from_bytes(&[2u8; 32])
 }
@@ -35,7 +30,7 @@ fn send(outbox: &mut Outbox, text: &str, ms: u64) -> (u64, SigningWork) {
         room(),
         PendingKind::Send {
             text: text.to_string(),
-            author_name: "Me".to_string(),
+            reply: None,
         },
         author().verifying_key(),
         vec![message(text, ms)],
@@ -66,7 +61,7 @@ fn a_send_shows_as_pending_until_its_signature_arrives_then_commits_once() {
     let rows = outbox.pending_rows(&room(), &author().verifying_key());
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].text, "hello");
-    assert_eq!(rows[0].author_name, "Me");
+    assert_eq!(rows[0].reply, None);
     assert_eq!(rows[0].failed, None);
     assert_eq!(
         rows[0].time,
@@ -162,30 +157,6 @@ fn a_late_signature_for_a_failed_attempt_is_ignored() {
 }
 
 #[test]
-fn retry_signs_again_and_commits() {
-    let mut outbox = Outbox::default();
-    let (a, wa) = send(&mut outbox, "a", 1);
-    assert!(
-        outbox.retry(&room(), a, later(), None).is_none(),
-        "only a failed entry can be retried"
-    );
-    outbox.record_failure(&room(), a, "timed out".to_string());
-
-    let (vk, work) = outbox
-        .retry(&room(), a, later(), None)
-        .expect("a failed entry retries");
-    assert_eq!(vk, author().verifying_key());
-    assert_ne!(work, wa, "a retry is restamped, so it signs new bytes");
-    assert_eq!(
-        outbox.pending_rows(&room(), &author().verifying_key())[0].failed,
-        None,
-        "sending again"
-    );
-    sign_all(&mut outbox, a, &work);
-    assert_eq!(texts(&outbox.take_ready(&room())), ["a"]);
-}
-
-#[test]
 fn a_message_the_room_refused_goes_back_failed_in_its_place() {
     let mut outbox = Outbox::default();
     let (a, wa) = send(&mut outbox, "a", 1);
@@ -255,7 +226,7 @@ fn rooms_are_independent() {
         other,
         PendingKind::Send {
             text: "other room".to_string(),
-            author_name: "Me".to_string(),
+            reply: None,
         },
         author().verifying_key(),
         vec![message("other room", 2)],
@@ -352,53 +323,6 @@ fn pending_effects_are_those_of_actions_still_signing() {
     );
 }
 
-/// By design: a message that failed and is retried commits after the ones
-/// sent after it, and is restamped at the retry, so it shows after them too.
-#[test]
-fn a_retried_message_commits_after_the_ones_that_went_ahead() {
-    let mut outbox = Outbox::default();
-    let (a, _) = send(&mut outbox, "a", 1);
-    let (b, wb) = send(&mut outbox, "b", 2);
-    outbox.record_failure(&room(), a, "timed out".to_string());
-    sign_all(&mut outbox, b, &wb);
-    let (_, wa) = outbox.retry(&room(), a, later(), None).unwrap();
-    sign_all(&mut outbox, a, &wa);
-    let first = outbox.take_ready(&room());
-    assert_eq!(texts(&first), ["a", "b"], "both ready: committed in order");
-
-    let mut outbox = Outbox::default();
-    let (a, _) = send(&mut outbox, "a", 1);
-    let (b, wb) = send(&mut outbox, "b", 2);
-    outbox.record_failure(&room(), a, "timed out".to_string());
-    sign_all(&mut outbox, b, &wb);
-    assert_eq!(texts(&outbox.take_ready(&room())), ["b"]);
-    let (_, wa) = outbox.retry(&room(), a, later(), None).unwrap();
-    sign_all(&mut outbox, a, &wa);
-    assert_eq!(texts(&outbox.take_ready(&room())), ["a"]);
-}
-
-#[test]
-fn a_refused_message_can_be_retried() {
-    let mut outbox = Outbox::default();
-    let (a, wa) = send(&mut outbox, "a", 1);
-    sign_all(&mut outbox, a, &wa);
-    let entry = outbox.take_ready(&room()).pop().unwrap();
-    outbox.restore_failed(room(), entry, "not admitted".to_string());
-    let (_, work) = outbox
-        .retry(&room(), a, later(), None)
-        .expect("a refused message retries");
-    assert_ne!(work, wa, "a retry is restamped, so it signs new bytes");
-    assert_eq!(
-        outbox.pending_rows(&room(), &author().verifying_key())[0].time,
-        later(),
-        "the retried message carries the retry's time, so a room at its cap keeps it"
-    );
-    assert_eq!(
-        outbox.pending_rows(&room(), &author().verifying_key())[0].failed,
-        None
-    );
-}
-
 #[test]
 fn a_reaction_swap_with_one_half_failed_is_reported_whole() {
     let mut outbox = Outbox::default();
@@ -485,10 +409,11 @@ fn a_reload_would_lose_signing_messages_and_failed_rows_on_screen_only() {
         !outbox.has_unsent(shown),
         "a failed action has no row; it is reported and dropped"
     );
-    let (_, work) = outbox.retry(&room(), e, later(), None).unwrap();
+    let (s, work) = send(&mut outbox, "b", 3);
     assert!(outbox.has_unsent(|_| None));
-    sign_all(&mut outbox, e, &work);
+    sign_all(&mut outbox, s, &work);
     let _ = outbox.take_ready(&room());
+    let _ = outbox.take_failed_actions(&room());
     assert!(!outbox.has_unsent(shown));
 }
 
@@ -504,10 +429,34 @@ fn sealed_entry(outbox: &mut Outbox, text: &str, ms: u64, version: u32) -> (u64,
         room(),
         PendingKind::Send {
             text: text.to_string(),
-            author_name: "Me".to_string(),
+            reply: None,
         },
         author().verifying_key(),
         vec![(message, bytes, Some(seal))],
+    )
+}
+
+/// A message sealed under v1, nothing to seal it from (`enqueue` keeps no
+/// `SealInput`), so it cannot be sealed again.
+fn sealed_without_input(
+    outbox: &mut Outbox,
+    text: &str,
+    ms: u64,
+    version: u32,
+) -> (u64, SigningWork) {
+    use super::super::seal::SealInput;
+    let (mut message, _) = message(text, ms);
+    message.content = SealInput::Text(text.to_string()).seal(&[1u8; 32], version);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+    outbox.enqueue(
+        room(),
+        PendingKind::Send {
+            text: text.to_string(),
+            reply: None,
+        },
+        author().verifying_key(),
+        vec![(message, bytes)],
     )
 }
 
@@ -556,7 +505,7 @@ fn a_message_signed_across_a_rotation_is_sealed_again_and_committed_in_order() {
 }
 
 #[test]
-fn resealing_is_bounded_and_retry_seals_again() {
+fn resealing_is_bounded() {
     let mut outbox = Outbox::default();
     let (a, _) = sealed_entry(&mut outbox, "keeps rotating", 10, 1);
     for v in 2..2 + MAX_RESEALS {
@@ -567,42 +516,10 @@ fn resealing_is_bounded_and_retry_seals_again() {
         "bounded"
     );
     let rows = outbox.pending_rows(&room(), &author().verifying_key());
-    assert!(rows[0].failed.is_some(), "shown as failed, text kept");
-
-    let (_, work) = outbox
-        .retry(&room(), a, later(), Some(([4u8; 32], 7)))
-        .expect("Retry works on it");
-    sign_all(&mut outbox, a, &work);
-    let (ready, _) = outbox.take_ready_sealed_under(&room(), Some(Some(7)));
-    assert_eq!(
-        version_of(&ready[0]),
-        7,
-        "Retry sealed it under the current secret"
+    assert!(
+        rows[0].failed.is_some(),
+        "failed, text kept for the composer"
     );
-}
-
-/// A message sealed under v1, nothing to seal it from (`enqueue` keeps no
-/// `SealInput`), so it cannot be sealed again.
-fn sealed_without_input(
-    outbox: &mut Outbox,
-    text: &str,
-    ms: u64,
-    version: u32,
-) -> (u64, SigningWork) {
-    use super::super::seal::SealInput;
-    let (mut message, _) = message(text, ms);
-    message.content = SealInput::Text(text.to_string()).seal(&[1u8; 32], version);
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(&message, &mut bytes).unwrap();
-    outbox.enqueue(
-        room(),
-        PendingKind::Send {
-            text: text.to_string(),
-            author_name: "Me".to_string(),
-        },
-        author().verifying_key(),
-        vec![(message, bytes)],
-    )
 }
 
 /// A stale entry that cannot be sealed again fails, and the entries behind it
@@ -736,83 +653,5 @@ fn every_message_of_an_entry_is_sealed_again() {
                 ..
             }
         ));
-    }
-}
-
-/// Retry resets the reseal count, so a retried message gets the full bound.
-#[test]
-fn retry_resets_the_reseal_count() {
-    let mut outbox = Outbox::default();
-    let (a, _) = sealed_entry(&mut outbox, "retried", 1, 1);
-    for v in 0..MAX_RESEALS {
-        outbox.reseal(&room(), a, &[9u8; 32], 2 + v).unwrap();
-    }
-    assert!(outbox.reseal(&room(), a, &[9u8; 32], 9).is_none());
-    outbox
-        .retry(&room(), a, later(), Some(([9u8; 32], 9)))
-        .unwrap();
-    for v in 0..MAX_RESEALS {
-        assert!(outbox.reseal(&room(), a, &[9u8; 32], 10 + v).is_some());
-    }
-}
-
-/// Retry seals forward only: it never seals a message down to an older
-/// secret this device holds, and leaves one already sealed under the current
-/// secret as it is.
-#[test]
-fn retry_never_seals_down_and_leaves_a_current_seal_alone() {
-    let ciphertext_of =
-        |outbox: &Outbox, id: u64| match &outbox.entry(&room(), id).unwrap().messages[0]
-            .message
-            .content
-        {
-            RoomMessageBody::Private { ciphertext, .. } => ciphertext.clone(),
-            RoomMessageBody::Public { .. } => panic!("sealed"),
-        };
-    let mut outbox = Outbox::default();
-    let (newer, _) = sealed_entry(&mut outbox, "sealed at v3", 1, 3);
-    outbox.record_failure(&room(), newer, "x".to_string());
-    let before = ciphertext_of(&outbox, newer);
-    assert!(
-        outbox
-            .retry(&room(), newer, later(), Some(([2u8; 32], 2)))
-            .is_none(),
-        "no Retry down to v2"
-    );
-    assert_eq!(ciphertext_of(&outbox, newer), before);
-    assert!(outbox.pending_rows(&room(), &author().verifying_key())[0]
-        .failed
-        .is_some());
-
-    let (current, _) = sealed_entry(&mut outbox, "sealed at v2", 2, 2);
-    outbox.record_failure(&room(), current, "x".to_string());
-    let before = ciphertext_of(&outbox, current);
-    outbox
-        .retry(&room(), current, later(), Some(([2u8; 32], 2)))
-        .unwrap();
-    assert_eq!(ciphertext_of(&outbox, current), before, "not sealed again");
-
-    let (bare, _) = sealed_without_input(&mut outbox, "nothing to seal from", 3, 1);
-    outbox.record_failure(&room(), bare, "x".to_string());
-    assert!(
-        outbox
-            .retry(&room(), bare, later(), Some(([2u8; 32], 2)))
-            .is_none(),
-        "cannot be sealed again"
-    );
-
-    // With no current secret here, a sealed message's Retry waits for it
-    // rather than signing something that cannot commit.
-    let (waiting, _) = sealed_entry(&mut outbox, "no key here", 4, 1);
-    outbox.record_failure(&room(), waiting, "x".to_string());
-    assert!(outbox.retry(&room(), waiting, later(), None).is_none());
-    for row in outbox.pending_rows(&room(), &author().verifying_key()) {
-        if row.id != current {
-            assert!(
-                row.failed.is_some(),
-                "a row that cannot be retried stays failed"
-            );
-            assert_ne!(row.failed.as_deref(), Some("x"), "with its new reason");
-        }
     }
 }

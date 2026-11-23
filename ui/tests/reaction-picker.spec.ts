@@ -946,7 +946,7 @@ test.describe("While the reaction picker is open", () => {
     // is open, and closing the picker does not let it go.
     await callRiverTest(page, "holdMessageSigning");
     const held = await submitMessage(page, "held while picking");
-    await expect(page.getByTestId("pending-message").filter({ hasText: "held while picking" }), "premise: still being signed").toHaveCount(1);
+    await expect(page.getByTestId("message-composer-box"), "premise: still being signed").toHaveAttribute("data-sending", "true");
     await openFromKeyboard(page, row);
     await page.keyboard.press("Escape");
     await expectClosed(page);

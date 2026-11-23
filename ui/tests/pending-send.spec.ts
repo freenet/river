@@ -1,115 +1,213 @@
 import { test, expect, Page } from "@playwright/test";
-import { committedRow, FOOTER_CONTROLS, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, press, reactionChoices, reactTo, settle, submitMessage } from "./example-room";
+import { clickFooter, committedRow, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, openRoomWithTarget, press, reactionChoices, reactTo, selectListedRoom, settle, submitMessage } from "./example-room";
 import { callRiverTest } from "./river-test";
 
-// An own message is signed by the chat delegate, which can take seconds. It
-// shows at once as a pending row and turns into the committed message when
-// the signature arrives (freenet/river#512). With `no-sync` the delegate
-// fails instantly and the local key signs, so these tests hold signing open
-// through a test hook: without the hold they would only ever see the fast path.
+// An own message is signed by the chat delegate, which can take seconds. The
+// composer keeps the text and reply target, read-only, until the room admits
+// the signed message; then the message shows once in the history and the
+// draft clears. A failure gives the draft back with the reason. With
+// `no-sync` the delegate fails instantly and the local key signs, so these
+// tests hold signing open through a test hook: without the hold they would
+// only ever see the fast path.
 
-const pending = (page: Page) => page.getByTestId("pending-message");
+const input = (page: Page) => page.getByTestId("message-input");
+const composerBox = (page: Page) => page.getByTestId("message-composer-box");
+const sendButton = (page: Page) => page.getByTestId("send-message-button");
+const replyPreview = (page: Page) => page.getByTestId("composer-reply-preview");
+const sendError = (page: Page) => page.getByTestId("composer-send-error");
 
-/// Submit `text` and wait for the composer to clear, so the next send starts
+/// Submit `text` and wait for the room to admit it, so the next send starts
 /// from an empty draft.
 async function send(page: Page, text: string) {
   await submitMessage(page, text);
-  await expect(page.getByTestId("message-input"), "the draft is cleared on Enter").toHaveValue("");
+  await expect(committedRow(page, text)).toHaveCount(1);
+  await expect(input(page), "the draft clears once the room admits it").toHaveValue("");
 }
 
-// Footer actions (React, Reply, Edit, Delete) act on a signed message. A
-// row still being signed keeps "Sending", a failed one Retry and Discard,
-// and neither has a footer; once signed, the one message has its footer.
-const FOOTER = ['[data-testid="message-footer"]', ...FOOTER_CONTROLS.map((id) => `[data-testid="${id}"]`)].join(", ");
+/// Nothing of a send is in the history, and it lights no wait dots.
+async function expectNoInterimRowOrWait(page: Page, text: string) {
+  await expect(committedRow(page, text)).toHaveCount(0);
+  await expect(page.getByTestId("pending-message"), "no interim history row").toHaveCount(0);
+  expect(await callRiverTest(page, "userWaitRooms"), "a send marks no room wait").toBe(0);
+  await expect(page.locator('[data-testid="user-wait-dots"][data-active="true"]')).toHaveCount(0);
+  await expect(page.getByTestId("user-wait-spacer")).toHaveAttribute("data-active", "false");
+}
 
-test("a sent message shows at once, pending, and commits once when signed", async ({ page }) => {
-  await openRoomWithComposer(page);
-  await callRiverTest(page, "holdMessageSigning");
-  await send(page, "pending until signed");
+async function expectLocked(page: Page, text: string) {
+  await expect(input(page)).toHaveValue(text);
+  await expect(input(page)).toHaveAttribute("readonly", /.*/);
+  await expect(composerBox(page)).toHaveAttribute("data-sending", "true");
+  await expect(sendButton(page)).toBeDisabled();
+}
 
-  const row = pending(page).filter({ hasText: "pending until signed" });
-  await expect(row).toBeVisible();
-  await expect(row).toHaveAttribute("data-pending-state", "sending");
-  await expect(row.getByTestId("pending-message-status")).toHaveText("Sending");
-  await expect(row, "the pending row is in view").toBeInViewport();
-  await expect(row.locator(FOOTER), "no footer while unsigned").toHaveCount(0);
-
-  // Held: nothing reaches the room however long it takes.
-  await settle(page);
-  await expect(committedRow(page, "pending until signed")).toHaveCount(0);
-  await expect(row).toBeVisible();
-
-  await callRiverTest(page, "releaseMessageSigning");
-  await expect(committedRow(page, "pending until signed")).toHaveCount(1);
-  await expect(pending(page), "the pending row is replaced, not duplicated").toHaveCount(0);
-  const signed = committedRow(page, "pending until signed");
-  await expect(signed).toBeInViewport();
-  await expect(signed.getByTestId("message-footer"), "once signed, its own footer").toHaveCount(1);
-  for (const id of FOOTER_CONTROLS) await expect(signed.getByTestId(id), id).toHaveCount(1);
-});
-
-test("messages commit in the order they were sent, whatever order they are signed in", { tag: "@chromium-only" }, async ({
-  page,
-}) => {
-  await openRoomWithComposer(page);
-  await callRiverTest(page, "holdMessageSigning");
-  for (const text of ["order one", "order two", "order three"]) await send(page, text);
-  await expect(pending(page)).toHaveText([/order one/, /order two/, /order three/]);
-
-  // The second and third are signed first: they must wait for the first.
-  const recorded = await callRiverTest(page, "messageSignsRecorded");
-  await expect.poll(() => callRiverTest(page, "releaseMessageSign", 2)).toBe(3);
-  await callRiverTest(page, "releaseMessageSign", 1);
+/// The signing requests held so far: polls until one arrives, releasing it.
+async function releaseOnlyRequest(page: Page) {
   await expect
-    .poll(() => callRiverTest(page, "messageSignsRecorded"), {
-      message: "premise: the second and third signatures reach the outbox",
-    })
-    .toBe(recorded + 2);
-  await settle(page);
-  for (const text of ["order one", "order two", "order three"]) {
-    await expect(committedRow(page, text), `"${text}" committed before "order one" was signed`).toHaveCount(0);
-  }
-  await expect(pending(page)).toHaveCount(3);
+    .poll(() => callRiverTest(page, "releaseMessageSign", 0), { message: "exactly one signing request was made" })
+    .toBe(1);
+}
 
-  await callRiverTest(page, "releaseMessageSign", 0);
-  await expect(pending(page)).toHaveCount(0);
-  const rows = page.getByTestId("conversation-history").getByTestId("message-row");
-  const texts = (await rows.allInnerTexts()).filter((t) => t.includes("order "));
-  expect(texts.map((t) => t.match(/order (one|two|three)/)?.[0])).toEqual([
-    "order one",
-    "order two",
-    "order three",
-  ]);
+test("Enter keeps a held reply in the composer, read-only and sent once, then it commits once and clears", async ({ page }) => {
+  const target = await openRoomWithTarget(page);
+  await callRiverTest(page, "setSyncStatus", "connected");
+  await clickFooter(page, target, "message-reply-button");
+  await expect(replyPreview(page)).toContainText("react target");
+  await callRiverTest(page, "holdMessageSigning");
+  await input(page).fill("held reply");
+
+  // Three activations before the next render: one send.
+  await page.evaluate(() => {
+    const el = document.getElementById("message-input")!;
+    for (let i = 0; i < 3; i++) {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    }
+  });
+  await expectLocked(page, "held reply");
+  await expect(replyPreview(page), "the reply target stays with the send").toContainText("react target");
+  await expect(page.getByTestId("composer-reply-cancel"), "and cannot be dropped while it is sent").toHaveCount(0);
+  await input(page).press("Enter");
+  await settle(page);
+  await expectNoInterimRowOrWait(page, "held reply");
+
+  await releaseOnlyRequest(page);
+  const row = committedRow(page, "held reply");
+  await expect(row).toHaveCount(1);
+  await expect(row.getByTestId("reply-strip"), "committed as a reply").toContainText("react target");
+  await expect(row, "an own send goes to the end once admitted").toBeInViewport();
+  await expect(input(page)).toHaveValue("");
+  await expect(input(page)).not.toHaveAttribute("readonly", /.*/);
+  await expect(replyPreview(page)).toHaveCount(0);
+  await expect(composerBox(page)).toHaveAttribute("data-sending", "false");
+  expect(await callRiverTest(page, "userWaitRooms"), "admitted: still no wait").toBe(0);
+  await callRiverTest(page, "releaseMessageSigning");
+
+  // The next message goes at once, and lights nothing either.
+  await send(page, "right after");
+  await expect(committedRow(page, "held reply"), "no duplicate").toHaveCount(1);
+  expect(await callRiverTest(page, "userWaitRooms")).toBe(0);
+});
+
+test("the composer is one line again once a multi-line send is admitted", async ({ page }) => {
+  await openRoomWithComposer(page);
+  const height = () => input(page).evaluate((el) => el.getBoundingClientRect().height);
+  const empty = await height();
+  await callRiverTest(page, "holdMessageSigning");
+  await input(page).fill("line one\nline two\nline three");
+  await expect.poll(height, { message: "premise: the draft grows the box" }).toBeGreaterThan(empty + 20);
+  await input(page).press("Enter");
+  await expectLocked(page, "line one\nline two\nline three");
+  expect(await height(), "the send keeps its size while it is signed").toBeGreaterThan(empty + 20);
+  await callRiverTest(page, "releaseMessageSigning");
+  await expect(committedRow(page, "line three")).toHaveCount(1);
+  await expect.poll(height, { message: "back to one line" }).toBeLessThan(empty + 2);
+});
+
+test("rapid Send clicks send once", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "holdMessageSigning");
+  await input(page).fill("clicked thrice");
+  await page.evaluate(() => {
+    const button = document.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]')!;
+    for (let i = 0; i < 3; i++) button.click();
+  });
+  await expectLocked(page, "clicked thrice");
+  await expectNoInterimRowOrWait(page, "clicked thrice");
+  await releaseOnlyRequest(page);
+  await expect(committedRow(page, "clicked thrice")).toHaveCount(1);
+  await expect(input(page)).toHaveValue("");
   await callRiverTest(page, "releaseMessageSigning");
 });
 
-test("a message that cannot be signed stays, failed, with Retry and Discard and no footer, and Retry sends it", { tag: "@chromium-only" }, async ({ page }) => {
-  await openRoomWithComposer(page);
+test("a send that cannot be signed comes back as an editable draft with its reply, and sending it again commits once", { tag: "@chromium-only" }, async ({ page }) => {
+  const target = await openRoomWithTarget(page);
+  await clickFooter(page, target, "message-reply-button");
+  await expect(replyPreview(page)).toContainText("react target");
   await callRiverTest(page, "failNextMessageSign");
-  await send(page, "signing fails once");
+  await submitMessage(page, "signing fails once");
 
-  const row = pending(page).filter({ hasText: "signing fails once" });
-  await expect(row).toHaveAttribute("data-pending-state", "failed");
-  await expect(row.getByTestId("pending-message-status")).toHaveText("Not sent");
-  await expect(row.getByTestId("pending-message-retry")).toBeVisible();
-  await expect(row.getByTestId("pending-message-discard")).toBeVisible();
-  await expect(row.locator(FOOTER), "no footer while failed").toHaveCount(0);
+  await expect(sendError(page)).toContainText("signing failed");
+  await expect(input(page), "the draft is intact").toHaveValue("signing fails once");
+  await expect(input(page)).not.toHaveAttribute("readonly", /.*/);
+  await expect(replyPreview(page), "and its reply target").toContainText("react target");
+  await expect(page.getByTestId("composer-reply-cancel")).toHaveCount(1);
+  await expect(sendButton(page)).toBeEnabled();
   await expect(committedRow(page, "signing fails once")).toHaveCount(0);
+  await expect(page.getByTestId("pending-message"), "no retry control in the history").toHaveCount(0);
 
-  await row.getByTestId("pending-message-retry").click();
-  await expect(committedRow(page, "signing fails once")).toHaveCount(1);
-  await expect(pending(page)).toHaveCount(0);
+  // Edited, then sent again: one message, the edited one, still a reply.
+  await input(page).fill("signing fails once, edited");
+  await expect(sendError(page), "typing clears the reason").toHaveCount(0);
+  await sendButton(page).click();
+  const row = committedRow(page, "signing fails once, edited");
+  await expect(row).toHaveCount(1);
+  await expect(row.getByTestId("reply-strip")).toContainText("react target");
+  await expect(input(page)).toHaveValue("");
+  await expect(page.getByTestId("conversation-history").getByText("signing fails once", { exact: false })).toHaveCount(1);
 });
 
-test("a failed message can be discarded", { tag: "@chromium-only" }, async ({ page }) => {
+test("a send the room does not admit comes back with the reason, and sending it again commits once", { tag: "@chromium-only" }, async ({ page }) => {
   await openRoomWithComposer(page);
+  await callRiverTest(page, "forgeNextSendSignature");
+  await submitMessage(page, "refused once");
+  await expect(sendError(page)).toContainText("the room did not admit the message");
+  await expect(input(page)).toHaveValue("refused once");
+  await expect(committedRow(page, "refused once")).toHaveCount(0);
+
+  await input(page).press("Enter");
+  await expect(committedRow(page, "refused once")).toHaveCount(1);
+  await expect(sendError(page)).toHaveCount(0);
+  await expect(input(page)).toHaveValue("");
+});
+
+test("a send stays with its room: another room's composer is free, and a late commit clears nothing there", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "holdMessageSigning");
+  await submitMessage(page, "sent before switching");
+  await expectLocked(page, "sent before switching");
+  expect(await callRiverTest(page, "userIsBusy"), "a send being signed holds a reload").toBe(true);
+
+  await selectListedRoom(page, "Team Chat Room");
+  await expect(composerBox(page), "this room's composer is not locked").toHaveAttribute("data-sending", "false");
+  await expect(input(page)).not.toHaveValue("sent before switching");
+  await input(page).fill("draft in another room");
+  await callRiverTest(page, "releaseMessageSigning");
+  await expect.poll(() => callRiverTest(page, "messageSignsRecorded")).toBeGreaterThan(0);
+  await settle(page);
+  await expect(input(page), "the late commit did not clear this draft").toHaveValue("draft in another room");
+  await expect(committedRow(page, "sent before switching"), "nor land here").toHaveCount(0);
+
+  await selectListedRoom(page, "Your Private Room");
+  await expect(committedRow(page, "sent before switching")).toHaveCount(1);
+  await expect(composerBox(page)).toHaveAttribute("data-sending", "false");
+});
+
+test("a send failing while its room is not shown is given back when the room is", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "holdMessageSigning");
   await callRiverTest(page, "failNextMessageSign");
-  await send(page, "discard me");
-  const row = pending(page).filter({ hasText: "discard me" });
-  await expect(row).toHaveAttribute("data-pending-state", "failed");
-  await row.getByTestId("pending-message-discard").click();
-  await expect(pending(page)).toHaveCount(0);
-  await expect(committedRow(page, "discard me")).toHaveCount(0);
+  await submitMessage(page, "fails while away");
+  await selectListedRoom(page, "Team Chat Room");
+  await callRiverTest(page, "releaseMessageSigning");
+  await expect.poll(() => callRiverTest(page, "messageSignsRecorded")).toBeGreaterThan(0);
+  await expect(sendError(page), "another room shows no failure").toHaveCount(0);
+  expect(await callRiverTest(page, "userIsBusy"), "the failed send still holds a reload").toBe(true);
+
+  await selectListedRoom(page, "Your Private Room");
+  await expect(sendError(page)).toContainText("signing failed");
+  await expect(input(page)).toHaveValue("fails while away");
+});
+
+test("a send from a replaced identity is never committed", { tag: "@chromium-only" }, async ({ page }) => {
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "holdMessageSigning");
+  await submitMessage(page, "from the old identity");
+  await expectLocked(page, "from the old identity");
+  await callRiverTest(page, "replaceRoomIdentity");
+  await callRiverTest(page, "releaseMessageSigning");
+  await expect(page.getByTestId("toast-message")).toContainText("previous identity");
+  await expect(committedRow(page, "from the old identity")).toHaveCount(0);
+  await expect(page.getByTestId("conversation-history").getByText("from the old identity")).toHaveCount(0);
+  await expect(page.locator('[data-testid="message-composer-box"][data-sending="true"]'), "nothing is left locked").toHaveCount(0);
 });
 
 test("an own reaction, a switch to another emoji, and an edit show while their signatures are held", async ({ page }) => {

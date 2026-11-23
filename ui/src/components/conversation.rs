@@ -52,8 +52,8 @@ mod mobile_sheet_drag;
 mod mobile_surface;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
+pub(crate) use self::mobile_surface::narrow_for_render as narrow_window_for_render;
 mod pending_effects;
-mod pending_sends;
 mod reaction_focus;
 mod reaction_order;
 mod reaction_picker;
@@ -80,10 +80,10 @@ use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
-use self::pending_sends::PendingSends;
 use self::reaction_picker::{ReactionInvoker, ReactionPicker, ReactionSurfaces};
 use self::seal::SealInput;
 use crate::components::conversation::message_input::MessageInput;
+use crate::components::user_wait_dots::{RoomWaitDock, RoomWaitSpacer, WelcomeWaitSlot};
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
@@ -232,25 +232,9 @@ fn unsigned_message(
     Some((message, bytes, seal))
 }
 
-/// The sender's own nickname, as the room shows it, for a pending row.
-fn own_display_name(
-    room_data: &crate::room_data::RoomData,
-    author_vk: &ed25519_dalek::VerifyingKey,
-) -> String {
-    let self_id = MemberId::from(author_vk);
-    room_data
-        .room_state
-        .member_info
-        .member_info
-        .iter()
-        .find(|info| info.member_info.member_id == self_id)
-        .map(|info| display_nickname(&info.member_info.preferred_nickname, &room_data.secrets))
-        .unwrap_or_else(|| "You".to_string())
-}
-
 /// Context for a reply-in-progress (held in a signal)
 #[derive(Clone, PartialEq, Debug)]
-struct ReplyContext {
+pub(crate) struct ReplyContext {
     message_id: MessageId,
     author_name: String,
     content_preview: String,
@@ -1439,14 +1423,6 @@ pub fn Conversation() -> Element {
             None
         }
     };
-    // Render again when this room's pending sends change, not only the
-    // `PendingSends` child: an own send requests the end when its pending row
-    // is added, and this render is what takes the latest range for a reader
-    // in a held range before the scroll effect lands the request.
-    if OUTBOX.try_read().is_err() {
-        crate::util::signal_guard::anchor();
-        crate::util::signal_guard::schedule_nudge();
-    }
     // Drives the scroll-to-latest button: "is the newest message's bottom on
     // screen right now?".
     let mut newest_in_view = use_signal(|| true);
@@ -1965,12 +1941,6 @@ pub fn Conversation() -> Element {
             // and heads swap on content changes too.
             let _ = message_groups.read().is_some();
             let _ = window_items();
-            // And the outbox: an own send requests the end when its pending
-            // row is added, which changes neither of the above, so without
-            // this the request would wait for the commit (`pending_sends.rs`).
-            if OUTBOX.try_read().is_err() {
-                crate::util::signal_guard::schedule_nudge();
-            }
             note_patch_while_hidden(&reader_position);
             correct_view_after_patch(&reader_position);
             complete_scroll_request(&reader_position, opening_snap_done);
@@ -2236,13 +2206,16 @@ pub fn Conversation() -> Element {
         }
     };
 
-    // Message sending handler - receives message text from MessageInput component
+    // Message sending handler, called by `MessageInput`. `Ok` means the
+    // message is queued: it enters the outbox in the `defer` below, before
+    // anything the composer defers after this returns, and the composer shows
+    // it from there until the room admits it. `Err` is why it was not, for
+    // the composer to show beside the draft it keeps.
     let handle_send_message = {
-        let reader_position = reader_position.clone();
-        move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
+        move |(message_text, reply_ctx): (String, Option<ReplyContext>)| -> Result<(), String> {
             if message_text.is_empty() {
                 warn!("Message is empty");
-                return;
+                return Err("the message is empty".to_string());
             }
             crate::util::debug_log(&format!(
                 "[send] start: {}...",
@@ -2251,14 +2224,14 @@ pub fn Conversation() -> Element {
             let current_room_opt = CURRENT_ROOM.read().owner_key;
             if current_room_opt.is_none() {
                 error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
-                return;
+                return Err("no room is open".to_string());
             }
             // Re-read room data from ROOMS signal (don't rely on stale closure capture)
             let fresh_room_data =
                 current_room_opt.and_then(|key| ROOMS.try_read().ok()?.map.get(&key).cloned());
             if fresh_room_data.is_none() {
                 error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
-                return;
+                return Err("the room is not loaded yet".to_string());
             }
             if let (Some(current_room), Some(current_room_data)) =
                 (current_room_opt, fresh_room_data)
@@ -2269,11 +2242,10 @@ pub fn Conversation() -> Element {
                 // chat delegate (`outbox_commit`).
                 let Some(author_vk) = current_room_data.self_verifying_key() else {
                     error!("Cannot send message: no identity for this room");
-                    return;
+                    return Err("this device has no identity for this room".to_string());
                 };
                 // The local fallback while this build still holds the key.
                 let fallback_key = current_room_data.signing_key().cloned();
-                let author_name = own_display_name(&current_room_data, &author_vk);
                 let is_private = current_room_data.is_private();
                 // Copy the secret data (get_secret returns Option<(&[u8; 32], u32)>)
                 let secret_opt: Option<([u8; 32], u32)> = current_room_data
@@ -2290,6 +2262,7 @@ pub fn Conversation() -> Element {
                 // message. A private body keeps what it was sealed from, so
                 // it can be sealed again if the room's secret rotates while
                 // it is being signed (`seal.rs`).
+                let reply = reply_ctx.clone();
                 let (content, seal) = match (reply_ctx, is_private) {
                     (Some(reply), false) => (
                         RoomMessageBody::reply(
@@ -2308,7 +2281,7 @@ pub fn Conversation() -> Element {
                             // is the backstop. A public body in a private
                             // room is not admitted.
                             error!("Cannot send: this private room's secret is not on this device");
-                            return;
+                            return Err("this private room's key is not on this device".to_string());
                         };
                         let seal = match reply {
                             Some(reply) => SealInput::Reply {
@@ -2337,7 +2310,9 @@ pub fn Conversation() -> Element {
                         "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; message dropped",
                         content_size, max_size
                     );
-                    return;
+                    return Err(format!(
+                        "the message is too long ({content_size} of {max_size} bytes)"
+                    ));
                 }
 
                 // Stamped now, at Enter, and never restamped: several messages
@@ -2354,10 +2329,9 @@ pub fn Conversation() -> Element {
                 let mut message_bytes = Vec::new();
                 if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
                     error!("Failed to serialize message for signing: {:?}", e);
-                    return;
+                    return Err("the message could not be encoded".to_string());
                 }
 
-                let reader_position = reader_position.clone();
                 crate::util::debug_log("[send] queued, signing via the delegate");
                 // Defer the signal writes to a clean execution context to
                 // prevent RefCell re-entrant borrow panics.
@@ -2366,25 +2340,29 @@ pub fn Conversation() -> Element {
                         current_room,
                         PendingKind::Send {
                             text: message_text,
-                            author_name,
+                            reply,
                         },
                         author_vk,
                         vec![(message, message_bytes, seal)],
                         fallback_key,
                     );
-                    // An own send goes to the end, now, to show the pending
-                    // row; the committed message replaces it in place. Only
-                    // if the user is still in the room this send targeted
-                    // (#402): the defer is a task hop after the keypress.
-                    if CURRENT_ROOM.peek().owner_key == Some(current_room) {
-                        reader_position.request_end(Some(current_room));
-                    }
+                    // The conversation goes to the end when the room admits
+                    // the message (`outbox_commit::take_own_send_committed`),
+                    // not now: nothing of it is in the history yet.
                     #[cfg(target_arch = "wasm32")]
                     request_permission_on_first_message();
                 });
+                Ok(())
+            } else {
+                Err("the room is not loaded yet".to_string())
             }
         }
     };
+
+    // What covers the room for the wait dots (`user_wait_dots.rs`): its
+    // delete confirmation and the mobile message sheet.
+    let wait_covered_by_delete = pending_delete.read().is_some();
+    let wait_covered_by_sheet = reaction_surfaces.mobile_for_render().is_some();
 
     // The message groups' handlers, created once. An `EventHandler` compares
     // by pointer, so a closure written in the row loop is a new handler on
@@ -2841,6 +2819,13 @@ pub fn Conversation() -> Element {
                                     } else {
                                         subscribed_window
                                     };
+                                    // An own send the room just admitted goes
+                                    // to the end, like a followed arrival, in
+                                    // the render that shows it, and only in
+                                    // the room it was sent to.
+                                    if outbox_commit::take_own_send_committed(CURRENT_ROOM.peek().owner_key) {
+                                        reader_position.request_end(CURRENT_ROOM.peek().owner_key);
+                                    }
                                     // Before the range resolves, so a follow
                                     // selects the latest range in this render.
                                     #[cfg(target_arch = "wasm32")]
@@ -3155,18 +3140,6 @@ pub fn Conversation() -> Element {
                             None
                         }
                     }
-                    // The sender's own messages still being signed, or that
-                    // failed, below the newest message (`pending_sends.rs`).
-                    // Not under a held range: they belong after the latest
-                    // message, and an own send requests the latest range.
-                    if let Some((room, author)) = current_room_data
-                        .as_ref()
-                        .and_then(|r| Some((r.owner_vk, r.self_verifying_key()?)))
-                    {
-                        if !reader_position.has_newer.get() {
-                            PendingSends { room, author }
-                        }
-                    }
                     // Invisible sentinel right under the newest rendered row,
                     // after the history list and above `#chat-content`'s bottom
                     // padding, so its top edge is that row's bottom (the
@@ -3176,8 +3149,26 @@ pub fn Conversation() -> Element {
                         id: "bottom-sentinel",
                         class: "h-px pointer-events-none",
                     }
+                    // Room for the wait dots' dock below the newest message,
+                    // while they show (`user_wait_dots.rs`). After the
+                    // sentinel, so Latest and the read rule still measure the
+                    // message's edge.
+                    if current_room_data.is_some() {
+                        RoomWaitSpacer {
+                            delete_confirmation: wait_covered_by_delete,
+                            mobile_sheet: wait_covered_by_sheet,
+                        }
+                    }
                 }
             }
+                // The wait dots' dock, 12px above the composer. Before Latest,
+                // which paints over it.
+                if current_room_data.is_some() {
+                    RoomWaitDock {
+                        delete_confirmation: wait_covered_by_delete,
+                        mobile_sheet: wait_covered_by_sheet,
+                    }
+                }
                 // Latest (#402): shown while the newest message's bottom is off
                 // screen, or a held range withholds newer items.
                 if !newest_in_view() || reader_position.has_newer.get() {
@@ -3328,7 +3319,9 @@ pub fn Conversation() -> Element {
                                     "This private room's key hasn't reached this device yet, so you can't send messages here until it does."
                                 }
                             },
-                            Ok(()) => {
+                            Ok(()) if room_data.self_verifying_key().is_some() => {
+                                let composer_room = room_data.owner_vk;
+                                let composer_author = room_data.self_verifying_key().unwrap();
                                 let max_msg_size = room_data.room_state.configuration.configuration.max_message_size;
                                 let room_is_private = room_data.is_private();
                                 // Mentionable members for the @ autocomplete: every member
@@ -3360,8 +3353,10 @@ pub fn Conversation() -> Element {
                                     .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
                                 rsx! {
                                     MessageInput {
+                                        room: composer_room,
+                                        author: composer_author,
                                         handle_send_message: move |msg: (String, Option<ReplyContext>)| {
-                                            let handle = handle_send_message.clone();
+                                            let handle = handle_send_message;
                                             handle(msg)
                                         },
                                         replying_to: replying_to,
@@ -3372,6 +3367,9 @@ pub fn Conversation() -> Element {
                                     }
                                 }
                             },
+                            // `can_participate` is Ok only with a key (see
+                            // `IdentityUnavailable` below).
+                            Ok(()) => rsx! {},
                             Err(SendMessageError::UserNotMember) => {
                                 // `can_participate` reports IdentityUnavailable
                                 // (below), never UserNotMember, when the key is
@@ -3510,6 +3508,7 @@ pub fn Conversation() -> Element {
                                     p { class: "text-text-muted",
                                         "Create a new room, or get invited to an existing one."
                                     }
+                                    WelcomeWaitSlot {}
                                     NoRoomFooter {}
                                 }
                             },
@@ -5452,24 +5451,23 @@ mod tests {
                  runs on the event handler's stack"
             );
         }
-        // An own send requests the end when its pending row is added. That
-        // write changes neither `message_groups` nor `window_items`, so both
-        // the render (which takes the latest range for a held reader) and the
-        // post-render scroll effect (which lands the request) must subscribe
-        // to the outbox, or the view waits for the commit.
+        // An own send goes to the end when the room admits it, not on Enter:
+        // the render that shows it takes the note `commit_ready_now` leaves,
+        // before the range resolves, so a held reader gets the latest range.
         let body = &squashed[squashed.find("pubfnConversation()->Element{").unwrap()..];
-        let render = &body[..body.find("letmutnewest_in_view=").unwrap()];
+        let take = body
+            .find("outbox_commit::take_own_send_committed(")
+            .expect("the render takes the own-send note");
+        let resolve = body
+            .find("resolve_rendered_range(")
+            .expect("the render resolves its range");
         assert!(
-            render.contains("OUTBOX.try_read()"),
-            "the Conversation render must subscribe to OUTBOX"
+            take < resolve,
+            "the own send's request must come before the range resolves"
         );
-        let effect_end = body
-            .find("complete_scroll_request(&reader_position")
-            .unwrap();
-        let effect = &body[body[..effect_end].rfind("use_effect(").unwrap()..effect_end];
         assert!(
-            effect.contains("OUTBOX.try_read()"),
-            "the scroll effect must subscribe to OUTBOX"
+            body[take..resolve].contains("reader_position.request_end("),
+            "an admitted own send requests the end"
         );
         // Every path into the outbox is one of the four above.
         assert_eq!(

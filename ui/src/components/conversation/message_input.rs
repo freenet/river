@@ -9,7 +9,10 @@ use super::mention::{
     apply_mention_selection, handle_mention_keydown, update_mention_from_input,
     MentionAutocomplete, MentionDropdown,
 };
+use super::outbox::{PendingRow, OUTBOX};
+use super::outbox_commit;
 use super::ReplyContext;
+use ed25519_dalek::VerifyingKey;
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::RoomMessageBody;
 
@@ -162,12 +165,42 @@ fn get_message_textarea() -> Option<web_sys::HtmlTextAreaElement> {
         .ok()
 }
 
+/// What joining a failed send's text back into the draft gives: the failed
+/// text alone when the draft is empty, or both, the failed text first, so
+/// nothing typed meanwhile (in another room: the draft is shared) is lost.
+fn draft_with_failed(draft: &str, failed: &str) -> String {
+    if draft.trim().is_empty() || draft == failed {
+        failed.to_string()
+    } else {
+        format!("{failed}\n\n{draft}")
+    }
+}
+
 /// Message input component that owns its own state.
 /// This isolates keystroke handling from the parent component,
 /// preventing expensive re-renders of the message list on each keystroke.
+///
+/// # Sending
+///
+/// Enter and Send go through one guard (`send_message`). An accepted send
+/// enters the outbox (`outbox.rs`), and while it is signed and admitted the
+/// composer shows its text and reply target from there, read-only, with Send
+/// disabled; further Enters and clicks do nothing. Admitted, it leaves the
+/// outbox, the message shows once in the history, and the composer is empty
+/// and ready for the next. If it fails (signing, or the room refuses it), the
+/// composer takes the text and reply target back as its editable draft, with
+/// the reason, and Send sends it again as a new message through the same
+/// checks. A send belongs to the room and identity it was written in: another
+/// room's composer never shows it, and its outcome never clears another
+/// room's draft (`room`, `author`).
 #[component]
 pub fn MessageInput(
-    handle_send_message: EventHandler<(String, Option<ReplyContext>)>,
+    /// The open room and the identity it sends as.
+    room: VerifyingKey,
+    author: VerifyingKey,
+    /// Queues the message (`Ok`) or says why it cannot (`Err`). Queued, it
+    /// is in the outbox before anything this component defers afterwards.
+    handle_send_message: Callback<(String, Option<ReplyContext>), Result<(), String>>,
     replying_to: Signal<Option<ReplyContext>>,
     on_request_edit_last: EventHandler<()>,
     /// Maximum message content size in bytes (from room configuration).
@@ -186,20 +219,107 @@ pub fn MessageInput(
     let mut message_text = use_signal(String::new);
     let mut show_emoji_picker = use_signal(|| false);
     let mut mention = use_signal(|| None as Option<MentionAutocomplete>);
+    // Why the last send in `room` did not go: a refusal, or a failure the
+    // draft was taken back from. Cleared by typing and by the next send.
+    let mut send_error = use_signal(|| None as Option<(VerifyingKey, String)>);
+    // Set from an accepted send until the outbox holds it (the defer queued
+    // after `handle_send_message`'s): a second Enter or click before then,
+    // even before the next render, does nothing.
+    let mut queueing = use_hook(|| CopyValue::new(false));
+    // The failed send last taken back, so a render before its discard lands
+    // cannot take it twice.
+    let mut taken_back = use_hook(|| CopyValue::new(None::<u64>));
+    // The outbox as the last uncontended read saw it, for this room and
+    // identity only (freenet/river#555).
+    let mut last_good =
+        use_hook(|| CopyValue::new(None::<((VerifyingKey, VerifyingKey), Option<PendingRow>)>));
+
+    crate::util::signal_guard::anchor();
+    let composer_send: Option<PendingRow> = match OUTBOX.try_read() {
+        Ok(outbox) => {
+            let row = outbox.composer_send(&room, &author);
+            last_good.set(Some(((room, author), row.clone())));
+            row
+        }
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            last_good
+                .peek()
+                .as_ref()
+                .filter(|(key, _)| *key == (room, author))
+                .and_then(|(_, row)| row.clone())
+        }
+    };
+    // Being signed or admitted: shown read-only until it settles.
+    let sending: Option<PendingRow> = composer_send.filter(|row| row.failed.is_none());
+    let locked = sending.is_some() || *queueing.peek();
+
+    // The box swaps between the draft and the send it shows: size it again
+    // once that render is in the DOM (engines without `field-sizing`).
+    use_effect(use_reactive!(|locked| {
+        let _ = locked;
+        crate::util::defer(auto_resize_message_input);
+    }));
+
+    // A failed send comes back as the draft, with its reply target and why.
+    use_effect(use_reactive!(|(room, author)| {
+        crate::util::signal_guard::anchor();
+        let failed = match OUTBOX.try_read() {
+            Ok(outbox) => outbox
+                .composer_send(&room, &author)
+                .filter(|row| row.failed.is_some()),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
+        };
+        let Some(row) = failed else {
+            return;
+        };
+        if *taken_back.peek() == Some(row.id) {
+            return;
+        }
+        taken_back.set(Some(row.id));
+        let draft = draft_with_failed(&message_text.peek(), &row.text);
+        message_text.set(draft);
+        replying_to.set(row.reply.clone());
+        send_error.set(row.failed.clone().map(|reason| (room, reason)));
+        outbox_commit::discard(room, row.id);
+        crate::util::defer(auto_resize_message_input);
+    }));
 
     let mut send_message = move || {
+        // Read now, not as the last render saw it: two activations can land
+        // before the next render.
+        let busy = *queueing.peek()
+            || OUTBOX.try_peek().map_or(true, |o| {
+                o.composer_send(&room, &author)
+                    .is_some_and(|row| row.failed.is_none())
+            });
+        if busy {
+            return;
+        }
         let text = message_text.peek().to_string();
         let within_limit =
             measure_draft(&text, replying_to.peek().as_ref(), is_private) <= max_message_size;
-        if !text.is_empty() && within_limit {
-            let reply_ctx = replying_to.peek().clone();
-            message_text.set(String::new());
-            replying_to.set(None);
-            mention.set(None);
-            handle_send_message.call((text, reply_ctx));
-            // Defer resize so it runs after Dioxus flushes the cleared value to the DOM;
-            // measuring scrollHeight synchronously here still sees the pre-send content.
-            crate::util::defer(auto_resize_message_input);
+        if text.is_empty() || !within_limit {
+            return;
+        }
+        let reply_ctx = replying_to.peek().clone();
+        match handle_send_message.call((text, reply_ctx)) {
+            Ok(()) => {
+                queueing.set(true);
+                send_error.set(None);
+                mention.set(None);
+                // Queued after the outbox insert, so the composer shows the
+                // send from the outbox before its draft is emptied.
+                crate::util::defer(move || {
+                    queueing.set(false);
+                    message_text.set(String::new());
+                    replying_to.set(None);
+                });
+            }
+            Err(reason) => send_error.set(Some((room, reason))),
         }
     };
 
@@ -209,12 +329,23 @@ pub fn MessageInput(
         message_text.set(format!("{}{}", current, emoji));
     };
 
+    // What the box shows: the send being signed, or the draft.
+    let shown_text = match &sending {
+        Some(row) => row.text.clone(),
+        None => message_text.read().clone(),
+    };
+    let shown_reply = match &sending {
+        Some(row) => row.reply.clone(),
+        None => replying_to.read().clone(),
+    };
+    let shown_error = send_error
+        .read()
+        .as_ref()
+        .filter(|(r, _)| *r == room && sending.is_none())
+        .map(|(_, reason)| reason.clone());
+
     // Once per render, for the counter and Send; `send_message` re-measures on click.
-    let encoded_bytes = measure_draft(
-        &message_text.read(),
-        replying_to.read().as_ref(),
-        is_private,
-    );
+    let encoded_bytes = measure_draft(&shown_text, shown_reply.as_ref(), is_private);
     let over_limit = encoded_bytes > max_message_size;
 
     rsx! {
@@ -243,22 +374,28 @@ pub fn MessageInput(
             div { class: "px-3 md:px-5 pt-1 pb-3 md:pb-[18px] conversation-column",
                 // Reply preview strip
                 {
-                    let reply = replying_to.read();
-                    if let Some(ctx) = reply.as_ref() {
-                        let author = ctx.author_name.clone();
+                    if let Some(ctx) = shown_reply.as_ref() {
+                        let reply_author = ctx.author_name.clone();
                         let preview = ctx.content_preview.clone();
                         rsx! {
-                            div { class: "flex items-center gap-2 mb-1.5 px-1 text-[13px] text-text-quote",
+                            div {
+                                "data-testid": "composer-reply-preview",
+                                class: "flex items-center gap-2 mb-1.5 px-1 text-[13px] text-text-quote",
                                 span { "aria-hidden": "true", class: "flex-shrink-0 inline-flex", {line_icon(REPLY_TARGET_ICON_PATH, 14)} }
                                 span { class: "flex-1 truncate",
-                                    span { class: "font-bold text-text-secondary", "Replying to {author} " }
+                                    span { class: "font-bold text-text-secondary", "Replying to {reply_author} " }
                                     "{preview}"
                                 }
-                                button {
-                                    class: "text-text-muted hover:text-text transition-colors flex-shrink-0",
-                                    title: "Cancel reply",
-                                    onclick: move |_| replying_to.set(None),
-                                    "\u{00d7}"
+                                // The reply target goes with the send while it
+                                // is being signed.
+                                if !locked {
+                                    button {
+                                        "data-testid": "composer-reply-cancel",
+                                        class: "text-text-muted hover:text-text transition-colors flex-shrink-0",
+                                        title: "Cancel reply",
+                                        onclick: move |_| replying_to.set(None),
+                                        "\u{00d7}"
+                                    }
                                 }
                             }
                         }
@@ -270,6 +407,8 @@ pub fn MessageInput(
                 // focus ring, so the textarea inside needs none of its own.
                 form {
                     "data-testid": "message-composer-box",
+                    // A send being signed: the box shows it read-only.
+                    "data-sending": if locked { "true" } else { "false" },
                     class: "flex items-end gap-0.5 px-1.5 bg-surface border border-border rounded-xl focus-within:border-text-muted transition-colors",
                     onsubmit: move |evt| {
                         evt.prevent_default();
@@ -280,7 +419,8 @@ pub fn MessageInput(
                         button {
                             r#type: "button",
                             "data-testid": "composer-emoji-button",
-                            class: "inline-flex items-center justify-center w-9 h-9 rounded-lg text-text-muted hover:text-text hover:bg-surface-hover transition-colors",
+                            class: "inline-flex items-center justify-center w-9 h-9 rounded-lg text-text-muted hover:text-text hover:bg-surface-hover transition-colors disabled:opacity-50 disabled:cursor-default",
+                            disabled: locked,
                             title: "Insert emoji",
                             "aria-label": "Insert emoji",
                             onclick: move |_| {
@@ -341,10 +481,16 @@ pub fn MessageInput(
                             // forced layout per keystroke instead of saving one.
                             class: "w-full px-2 py-2.5 leading-6 text-[15px] bg-transparent border border-transparent text-text placeholder-text-muted focus:outline-hidden resize-none min-h-[44px] field-sizing-content max-h-[30dvh] [@media(min-width:48rem)_and_(min-height:40rem)]:max-h-[50dvh] overflow-y-auto",
                             placeholder: "Type your message...",
-                            value: "{message_text}",
+                            value: "{shown_text}",
+                            // The send being signed is shown, not edited.
+                            readonly: locked,
+                            "aria-readonly": if locked { "true" } else { "false" },
                             rows: "1",
                             oninput: move |evt| {
                                 let value = evt.value().to_string();
+                                if send_error.peek().is_some() {
+                                    send_error.set(None);
+                                }
                                 message_text.set(value.clone());
                                 auto_resize_message_input();
                                 // Detect / update the @mention autocomplete.
@@ -369,7 +515,7 @@ pub fn MessageInput(
                                     send_message();
                                 }
                                 // Up arrow in empty input: edit last sent message
-                                if key == Key::ArrowUp && message_text.peek().is_empty() {
+                                if key == Key::ArrowUp && message_text.peek().is_empty() && !locked {
                                     evt.prevent_default();
                                     on_request_edit_last.call(());
                                 }
@@ -405,13 +551,15 @@ pub fn MessageInput(
                     }
                     {
                         // An accent-coloured icon, no solid fill.
-                        let btn_class = if over_limit {
+                        let btn_class = if over_limit || locked {
                             "flex-shrink-0 mb-1 inline-flex items-center justify-center w-9 h-9 rounded-lg text-text-muted opacity-50 cursor-not-allowed"
                         } else {
                             "flex-shrink-0 mb-1 inline-flex items-center justify-center w-9 h-9 rounded-lg text-link hover:bg-surface-hover transition-colors cursor-pointer"
                         };
                         let tooltip = if over_limit {
                             format!("Message exceeds the {} byte limit", max_message_size)
+                        } else if locked {
+                            "Sending".to_string()
                         } else {
                             "Send".to_string()
                         };
@@ -420,7 +568,7 @@ pub fn MessageInput(
                                 r#type: "button",
                                 "data-testid": "send-message-button",
                                 class: "{btn_class}",
-                                disabled: over_limit,
+                                disabled: over_limit || locked,
                                 title: "{tooltip}",
                                 // Use explicit onclick instead of form submit — on iOS Safari,
                                 // tapping a submit button while the keyboard is visible causes
@@ -433,6 +581,14 @@ pub fn MessageInput(
                         }
                     }
                 }
+                if let Some(reason) = shown_error {
+                    div {
+                        "data-testid": "composer-send-error",
+                        role: "alert",
+                        class: "mt-1 px-1 text-xs text-danger [overflow-wrap:anywhere]",
+                        "Not sent: {reason}. Press Send to try again."
+                    }
+                }
             }
         }
     }
@@ -443,6 +599,17 @@ mod tests {
     use super::*;
     use freenet_scaffold::util::FastHash;
     use river_core::room_state::message::MessageId;
+
+    #[test]
+    fn a_failed_send_joins_the_draft_without_losing_either() {
+        assert_eq!(draft_with_failed("", "sent"), "sent");
+        assert_eq!(draft_with_failed("  ", "sent"), "sent");
+        assert_eq!(draft_with_failed("sent", "sent"), "sent");
+        assert_eq!(
+            draft_with_failed("typed since", "sent"),
+            "sent\n\ntyped since"
+        );
+    }
 
     fn reply_ctx() -> ReplyContext {
         ReplyContext {

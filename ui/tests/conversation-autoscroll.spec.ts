@@ -1205,7 +1205,7 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
-  test("sending from a held range while signing is slow shows the pending row in the latest range", { tag: "@chromium-only" }, async ({
+  test("a slow send from a held range takes the latest range when the room admits it", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await parkPastTheCeiling(page);
@@ -1213,12 +1213,16 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     await expect.poll(() => withheld(page), { message: "premise: newer messages are held back" }).toBeGreaterThan(0);
 
     await callRiverTest(page, "holdMessageSigning");
-    await sendWithEnter(page, "slow send from a held range");
-    const row = page.getByTestId("pending-message").filter({ hasText: "slow send from a held range" });
-    await expect(row, "the pending row shows before the signature").toBeInViewport();
-    expect(await withheld(page), "the send took the latest range").toBe(0);
+    const input = page.getByTestId("message-input");
+    await input.fill("slow send from a held range");
+    await input.press("Enter");
+    // Being signed, it is the composer's alone: nothing moves yet.
+    await expect(page.getByTestId("message-composer-box")).toHaveAttribute("data-sending", "true");
+    expect(await withheld(page), "nothing in the history to go to yet").toBeGreaterThan(0);
     await callRiverTest(page, "releaseMessageSigning");
     await expectAtEndShowing(page, "slow send from a held range", "the committed send is not at the end");
+    expect(await withheld(page), "the send took the latest range").toBe(0);
+    await expect(input).toHaveValue("");
   });
 
   // A send's scroll belongs to the room it was sent in. A switch that lands
@@ -1256,27 +1260,31 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     ).toHaveCount(1);
   });
 
-  test("a send while its signature is slow shows its pending row at the end at once", { tag: "@chromium-only" }, async ({
+  test("a send while its signature is slow leaves the reader in place, then goes to the end once admitted", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     await openRoomAtBottom(page, "Your Private Room");
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
     await expectParkedAwayFromEnd(page, "premise: reading older messages");
+    const reading = await expectReadingRow(page);
 
-    // The delegate has not answered: nothing reaches the room, so the only
-    // thing that can take the view to the end is the pending row itself.
+    // The delegate has not answered: nothing reaches the room, and the
+    // composer keeps the text, so nothing moves the reader.
     await callRiverTest(page, "holdMessageSigning");
-    await sendWithEnter(page, "own send while signing is slow");
-    const row = page.getByTestId("pending-message").filter({ hasText: "own send while signing is slow" });
-    await expect(row, "the pending row is shown at the end before the signature").toBeInViewport();
+    const input = page.getByTestId("message-input");
+    await input.fill("own send while signing is slow");
+    await input.press("Enter");
+    await expect(page.getByTestId("message-composer-box")).toHaveAttribute("data-sending", "true");
+    await expectRowHeld(page, reading.key, reading.top, "a send still being signed moved the reader");
     await callRiverTest(page, "releaseMessageSigning");
+    await expectAtEndShowing(page, "own send while signing is slow", "the admitted send is not at the end");
     await expect(
       page.getByTestId("conversation-history").getByText("own send while signing is slow", { exact: false }),
     ).toHaveCount(1);
   });
 
-  test("a send the room does not admit stays on screen, failed, for a retry", { tag: "@chromium-only" }, async ({
+  test("a send the room does not admit goes back to the composer with the reason, and the reader stays put", { tag: "@chromium-only" }, async ({
     page,
   }) => {
     const applyFailures: string[] = [];
@@ -1287,23 +1295,24 @@ test.describe("Own send goes to the newest message once (A06)", () => {
     await fillHistory(page);
     await readerScrollsWithoutGesture(page, 0);
     await expectParkedAwayFromEnd(page, "premise: reading older messages");
+    const reading = await expectReadingRow(page);
 
     // A message the room does not admit (its signature is corrupted), so the
-    // send fails at the local apply after the draft is handed off. The
-    // message showed, pending, on Enter (an own send goes to the end), so it
-    // must stay where the reader saw it, marked failed: the typed text is
-    // never dropped.
+    // send fails at the local apply. The typed text is never dropped: the
+    // composer takes it back, with the reason, and nothing moves.
     await callRiverTest(page, "forgeNextSendSignature");
-    await sendWithEnter(page, "own send that fails to apply");
+    const input = page.getByTestId("message-input");
+    await input.fill("own send that fails to apply");
+    await input.press("Enter");
     await expect
       .poll(() => applyFailures.length, {
         message: "premise: the send should reach the local apply and not be admitted there",
       })
       .toBeGreaterThan(0);
 
-    const failed = page.getByTestId("pending-message").filter({ hasText: "own send that fails to apply" });
-    await expect(failed).toHaveAttribute("data-pending-state", "failed");
-    await expect(failed, "the failed message is in view").toBeInViewport();
+    await expect(page.getByTestId("composer-send-error")).toContainText("did not admit");
+    await expect(input, "the draft is back").toHaveValue("own send that fails to apply");
+    await expectRowHeld(page, reading.key, reading.top, "a refused send moved the reader");
     await expect(
       page.getByTestId("conversation-history").getByText("own send that fails to apply", { exact: false }),
       "the room holds no copy of a message it did not admit",
