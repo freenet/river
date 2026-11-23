@@ -51,7 +51,7 @@ pub(crate) struct UserWaits {
 
 impl UserWaits {
     /// Marks `room` as waiting since `now_ms`; a later action restamps it.
-    pub fn mark(&mut self, room: VerifyingKey, now_ms: u64) {
+    fn mark(&mut self, room: VerifyingKey, now_ms: u64) {
         self.rooms.insert(room, now_ms);
     }
 
@@ -60,7 +60,7 @@ impl UserWaits {
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.rooms.is_empty()
     }
 
@@ -69,29 +69,25 @@ impl UserWaits {
         self.rooms.len()
     }
 
-    /// Ends `room`'s mark. Returns whether there was one.
-    pub fn complete(&mut self, room: &VerifyingKey) -> bool {
-        self.rooms.remove(room).is_some()
+    /// Ends `room`'s mark.
+    fn complete(&mut self, room: &VerifyingKey) {
+        self.rooms.remove(room);
     }
 
     /// Ends every room's mark: an UPDATE failure that names no contract.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub fn complete_all(&mut self) -> bool {
-        let had = !self.rooms.is_empty();
+    fn complete_all(&mut self) {
         self.rooms.clear();
-        had
     }
 
-    /// Ends the marks at or past their cap. Returns whether any ended.
-    pub fn sweep(&mut self, now_ms: u64) -> bool {
-        let before = self.rooms.len();
+    /// Ends the marks at or past their cap.
+    fn sweep(&mut self, now_ms: u64) {
         self.rooms
             .retain(|_, started| now_ms.saturating_sub(*started) < FEEDBACK_CAP_MS);
-        self.rooms.len() != before
     }
 
     /// When the next mark reaches its cap.
-    pub fn next_deadline(&self) -> Option<u64> {
+    fn next_deadline(&self) -> Option<u64> {
         self.rooms
             .values()
             .map(|started| started.saturating_add(FEEDBACK_CAP_MS))
@@ -224,13 +220,18 @@ mod tests {
         let mut waits = UserWaits::default();
         waits.mark(room(1), 1_000);
         waits.mark(room(2), 5_000);
-        assert!(waits.complete(&room(2)));
+        waits.complete(&room(2));
         assert!(waits.is_waiting(&room(1)));
         assert!(!waits.is_waiting(&room(2)));
-        assert!(!waits.complete(&room(2)), "nothing left to end");
+        waits.complete(&room(2));
+        assert!(
+            waits.is_waiting(&room(1)),
+            "ending a room with no mark ends nothing else"
+        );
 
         waits.mark(room(1), 15_000);
-        assert!(!waits.sweep(1_000 + FEEDBACK_CAP_MS), "restamped at 15s");
+        waits.sweep(1_000 + FEEDBACK_CAP_MS);
+        assert!(waits.is_waiting(&room(1)), "restamped at 15s");
         assert_eq!(waits.next_deadline(), Some(15_000 + FEEDBACK_CAP_MS));
     }
 
@@ -243,35 +244,42 @@ mod tests {
         waits.mark(room(1), 1_000);
         waits.mark(room(1), 2_000);
         waits.mark(room(2), 2_000);
-        assert!(waits.complete(&room(1)));
+        waits.complete(&room(1));
         assert!(!waits.is_waiting(&room(1)));
         assert!(
             waits.is_waiting(&room(2)),
             "another room's reply ends nothing here"
         );
+        assert_eq!(waits.next_deadline(), Some(2_000 + FEEDBACK_CAP_MS));
     }
 
     #[test]
     fn an_unkeyed_failure_ends_every_room() {
         let mut waits = UserWaits::default();
-        assert!(!waits.complete_all());
+        waits.complete_all();
+        assert_eq!(waits, UserWaits::default());
         waits.mark(room(1), 0);
         waits.mark(room(2), 0);
-        assert!(waits.complete_all());
+        waits.complete_all();
         assert!(waits.is_empty());
+        assert_eq!(waits.next_deadline(), None);
     }
 
     #[test]
     fn the_cap_ends_a_mark_at_exactly_twenty_seconds() {
         let mut waits = UserWaits::default();
         waits.mark(room(1), 1_000);
-        assert!(!waits.sweep(1_000 + FEEDBACK_CAP_MS - 1));
+        waits.sweep(1_000 + FEEDBACK_CAP_MS - 1);
         assert!(waits.is_waiting(&room(1)));
-        assert!(waits.sweep(1_000 + FEEDBACK_CAP_MS));
+        assert_eq!(waits.next_deadline(), Some(1_000 + FEEDBACK_CAP_MS));
+        waits.sweep(1_000 + FEEDBACK_CAP_MS);
+        assert!(!waits.is_waiting(&room(1)));
         assert_eq!(waits.next_deadline(), None);
         // A clock that went backwards keeps the mark until its cap.
         waits.mark(room(1), 50_000);
-        assert!(!waits.sweep(10_000));
+        waits.sweep(10_000);
+        assert!(waits.is_waiting(&room(1)));
+        assert_eq!(waits.next_deadline(), Some(50_000 + FEEDBACK_CAP_MS));
     }
 
     #[test]

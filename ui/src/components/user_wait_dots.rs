@@ -83,24 +83,6 @@ fn reason(connected: bool, joining: bool, room_change: bool) -> Option<UserWaitR
     }
 }
 
-/// What may cover the conversation, and so the mounted host.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Covering {
-    /// An app modal or the room's delete confirmation.
-    modal: bool,
-    dm_thread: bool,
-    /// The mobile message sheet (below 48rem).
-    mobile_sheet: bool,
-    /// Below 48rem, the Rooms or Members panel instead of the chat.
-    mobile_panel: bool,
-}
-
-impl Covering {
-    fn covered(self) -> bool {
-        self.modal || self.dm_thread || self.mobile_sheet || self.mobile_panel
-    }
-}
-
 /// The modals whose open state is a component's own signal rather than a
 /// global, provided by `App` so the hosts can see them.
 #[derive(Clone, Copy)]
@@ -110,9 +92,12 @@ pub(crate) struct LocalModals {
     pub export_identity: Signal<bool>,
 }
 
-/// What covers the conversation, read fallibly: `None` when an input is
-/// contended (the caller has anchored and schedules the nudge).
-fn covering_now(delete_confirmation: bool, mobile_sheet: bool) -> Option<Covering> {
+/// Whether anything covers the conversation, and so the mounted host: an app
+/// modal, the room's delete confirmation, the DM thread, the mobile message
+/// sheet, or, below 48rem, the Rooms or Members panel instead of the chat.
+/// Read fallibly: `None` when an input is contended (the caller has anchored
+/// and schedules the nudge).
+fn covering_now(delete_confirmation: bool, mobile_sheet: bool) -> Option<bool> {
     let local_modals = match try_consume_context::<LocalModals>() {
         Some(m) => {
             m.receive_invitation.try_read().ok()?.is_some()
@@ -130,12 +115,7 @@ fn covering_now(delete_confirmation: bool, mobile_sheet: bool) -> Option<Coverin
     let dm_thread = OPEN_DM_THREAD.try_read().ok()?.is_some();
     let mobile_panel = crate::components::conversation::narrow_window_for_render()
         && *MOBILE_VIEW.try_read().ok()? != MobileView::Chat;
-    Some(Covering {
-        modal: app_modal || delete_confirmation,
-        dm_thread,
-        mobile_sheet,
-        mobile_panel,
-    })
+    Some(app_modal || delete_confirmation || dm_thread || mobile_sheet || mobile_panel)
 }
 
 /// The current reason, shared by every host. A contended input keeps the
@@ -189,8 +169,7 @@ fn use_host_state(delete_confirmation: bool, mobile_sheet: bool) -> (bool, Optio
     let last_covered = use_hook(|| Rc::new(Cell::new(None)));
     signal_guard::anchor();
     let covered = match covering_now(delete_confirmation, mobile_sheet) {
-        Some(covering) => {
-            let covered = covering.covered();
+        Some(covered) => {
             last_covered.set(Some(covered));
             covered
         }
@@ -294,28 +273,5 @@ mod tests {
         assert_eq!(reason(true, true, true), Some(JoiningRoom));
         assert_eq!(reason(true, false, true), Some(SendingRoomChange));
         assert_eq!(reason(true, false, false), None);
-    }
-
-    #[test]
-    fn any_covering_surface_hides_the_dots() {
-        assert!(!Covering::default().covered());
-        let one = Covering::default();
-        for covering in [
-            Covering { modal: true, ..one },
-            Covering {
-                dm_thread: true,
-                ..one
-            },
-            Covering {
-                mobile_sheet: true,
-                ..one
-            },
-            Covering {
-                mobile_panel: true,
-                ..one
-            },
-        ] {
-            assert!(covering.covered(), "{covering:?}");
-        }
     }
 }
