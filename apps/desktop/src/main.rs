@@ -173,7 +173,8 @@ fn main() {
     if let Some(u) = &updater {
         u.on_start();
     }
-    // Started from a console (`cargo run`, PowerShell): Ctrl+C there quits River.
+    // Only where this process already owns a console (debug or console builds; a release GUI
+    // build never attaches to its parent's): Ctrl+C there quits River cleanly.
     #[cfg(windows)]
     console::quit_on_console_signals(handle.clone());
     let on_exit = updater.clone();
