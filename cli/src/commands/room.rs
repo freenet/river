@@ -432,6 +432,10 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                      one. Or ask a member for an invitation (`riverctl invite accept`)."
                 );
             }
+            // Stored before the send on purpose: it is a local write that is
+            // harmless if the send fails (the entry only holds the public key
+            // and proof), and the proof can cost minutes of work, so a retry
+            // with the same `--signing-key` reuses it instead of solving again.
             api.storage()
                 .put_provisional_entry(&owner_key, &sk.verifying_key(), &outcome.entry)?;
             api.send_state_delta(&owner_key, &delta).await?;
@@ -665,6 +669,11 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             } else {
                 (None, None)
             };
+
+            if !policy_edit.is_empty() {
+                let state = api.get_room(&owner_key, false).await?;
+                policy_edit.check_room(&state.configuration.configuration.privacy_mode)?;
+            }
 
             match api
                 .update_config(&owner_key, |cfg| {

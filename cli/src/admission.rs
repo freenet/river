@@ -436,6 +436,33 @@ impl PolicyEdit {
     }
 
     pub fn apply(&self, config: &mut river_core::room_state::configuration::Configuration) {
+        self.apply_with_epochs(config, random_epoch);
+    }
+
+    /// Open admission applies only to Public rooms. Refuse an admission edit
+    /// (other than turning it off) on a Private room, where the contract
+    /// ignores the policy and the edit would silently do nothing.
+    pub fn check_room(&self, privacy: &river_core::room_state::privacy::PrivacyMode) -> Result<()> {
+        if self.is_empty()
+            || self.enable == Some(false)
+            || *privacy == river_core::room_state::privacy::PrivacyMode::Public
+        {
+            return Ok(());
+        }
+        bail!(
+            "open admission (proof of work) applies only to Public rooms; this room is \
+             Private, so the admission options would have no effect. Members join a \
+             Private room by invitation."
+        )
+    }
+
+    /// [`Self::apply`] with the source of epochs given, so a test can fix it.
+    /// A new epoch is never equal to the one it replaces.
+    pub fn apply_with_epochs(
+        &self,
+        config: &mut river_core::room_state::configuration::Configuration,
+        mut next_epoch: impl FnMut() -> u32,
+    ) {
         use river_core::room_state::provisional::PowPolicy;
         if self.enable == Some(false) {
             config.public_admission = None;
@@ -461,7 +488,7 @@ impl PolicyEdit {
                 // admission is disabled and enabled again.
                 pow: Some(PowPolicy {
                     difficulty_bits: 20,
-                    epoch: random_epoch(),
+                    epoch: next_epoch(),
                 }),
             });
         }
@@ -481,13 +508,16 @@ impl PolicyEdit {
         if self.difficulty_bits.is_some() || self.new_epoch {
             let held = policy.pow.clone().unwrap_or(PowPolicy {
                 difficulty_bits: 20,
-                epoch: random_epoch(),
+                epoch: next_epoch(),
             });
             let mut epoch = held.epoch;
             if self.new_epoch {
                 // A fresh random epoch invalidates every proof, stockpiles
-                // included.
-                epoch = random_epoch();
+                // included, so it must differ from the one it replaces.
+                epoch = next_epoch();
+                while epoch == held.epoch {
+                    epoch = next_epoch();
+                }
             }
             policy.pow = Some(PowPolicy {
                 difficulty_bits: self.difficulty_bits.unwrap_or(held.difficulty_bits),
@@ -556,10 +586,32 @@ mod tests {
         let before = c.public_admission.clone().unwrap().pow.unwrap();
         let mut again = edit();
         again.new_epoch = true;
-        again.apply(&mut c);
+        // A source that first repeats the held epoch: the edit must skip it.
+        let mut seq = vec![before.epoch, before.epoch, before.epoch.wrapping_add(1)].into_iter();
+        again.apply_with_epochs(&mut c, || seq.next().unwrap());
         let after = c.public_admission.clone().unwrap().pow.unwrap();
         assert_eq!(before.difficulty_bits, after.difficulty_bits);
         assert_ne!(before.epoch, after.epoch);
+    }
+
+    #[test]
+    fn an_admission_edit_on_a_private_room_is_refused() {
+        use river_core::room_state::privacy::PrivacyMode;
+        let mut on = edit();
+        on.enable = Some(true);
+        let err = on
+            .check_room(&PrivacyMode::Private)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only to Public rooms"), "{err}");
+        let mut tune = edit();
+        tune.difficulty_bits = Some(5);
+        assert!(tune.check_room(&PrivacyMode::Private).is_err());
+        assert!(on.check_room(&PrivacyMode::Public).is_ok());
+        let mut off = edit();
+        off.enable = Some(false);
+        assert!(off.check_room(&PrivacyMode::Private).is_ok());
+        assert!(edit().check_room(&PrivacyMode::Private).is_ok());
     }
 
     #[test]
@@ -720,8 +772,9 @@ mod tests {
         let mut c = Configuration::default();
         let mut on = edit();
         on.enable = Some(true);
-        on.apply(&mut c);
+        on.apply_with_epochs(&mut c, || 111);
         let first = c.public_admission.clone().unwrap().pow.unwrap().epoch;
+        assert_eq!(first, 111);
         let mut other = edit();
         other.max_provisional = Some(4);
         other.difficulty_bits = Some(10);
@@ -733,9 +786,9 @@ mod tests {
         let mut off = edit();
         off.enable = Some(false);
         off.apply(&mut c);
-        on.apply(&mut c);
+        on.apply_with_epochs(&mut c, || 222);
         let second = c.public_admission.unwrap().pow.unwrap().epoch;
-        assert_ne!(second, 1);
+        assert_eq!(second, 222, "enabling again takes a newly drawn epoch");
         assert_ne!(second, first);
     }
 
