@@ -367,7 +367,7 @@ fn set_node(rt: &mut Runtime<RiverApp>, address: &str, source: chat::Source) {
 fn the_footer_of_a_local_node_does_not_move_between_connection_states() {
     for size in SIZES {
         let (mut rt, _) = rooms_app_sized(size);
-        let keys = ["enter-invite", "import-id", "dnd", "connection-row"];
+        let keys = ["enter-invite", "dnd", "connection-row"];
         let rects = |rt: &Runtime<RiverApp>| -> Vec<[f32; 4]> {
             keys.iter()
                 .map(|k| rect_of(rt, k).unwrap_or_else(|| panic!("no {k}")))
@@ -394,7 +394,7 @@ fn the_footer_of_a_local_node_does_not_move_between_connection_states() {
 }
 
 /// With more to say (example rooms, a node on another computer with its warning box) the
-/// footer legitimately grows upward. What must hold: the three buttons keep their order and the
+/// footer legitimately grows upward. What must hold: the footer's rows keep their order and the
 /// spacing between them and the status row, the status row stays above its warning, and
 /// nothing leaves the footer or the window.
 #[test]
@@ -410,13 +410,8 @@ fn a_taller_footer_keeps_its_order_and_spacing_and_stays_inside() {
         let r =
             |rt: &Runtime<RiverApp>, k: &str| rect_of(rt, k).unwrap_or_else(|| panic!("no {k}"));
         let spacing = |rt: &Runtime<RiverApp>| {
-            let (e, i, d, c) = (
-                r(rt, "enter-invite"),
-                r(rt, "import-id"),
-                r(rt, "dnd"),
-                r(rt, "connection-row"),
-            );
-            [i[1] - e[1], d[1] - i[1], c[1] - d[1]]
+            let (e, d, c) = (r(rt, "enter-invite"), r(rt, "dnd"), r(rt, "connection-row"));
+            [d[1] - e[1], c[1] - d[1]]
         };
         let base = spacing(&rt);
         let cases: [(&str, chat::Source, bool); 4] = [

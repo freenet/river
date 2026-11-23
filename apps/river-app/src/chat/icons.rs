@@ -107,20 +107,6 @@ pub static CHEVRON_DOWN: Icon = Icon {
     body: r#"<path d="M3.5 6 8 10.5 12.5 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-/// The web UI's `EXPORT_ICON_PATH` (a 24 point grid): an arrow leaving a tray.
-pub static EXPORT: Icon = Icon {
-    name: "river-export",
-    view: 24.0,
-    body: r#"<path d="M12 15V3M7 8l5-5 5 5M5 21h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-/// The web UI's `IMPORT_ICON_PATH` (a 24 point grid): an arrow entering a tray.
-pub static IMPORT: Icon = Icon {
-    name: "river-import",
-    view: 24.0,
-    body: r#"<path d="M12 3v12M7 10l5 5 5-5M5 21h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
 /// A gear with eight teeth and a hub: the settings button. (The first version, a circle with
 /// eight short spokes, read as a brightness control.)
 pub static GEAR: Icon = Icon {

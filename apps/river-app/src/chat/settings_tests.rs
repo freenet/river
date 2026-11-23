@@ -221,17 +221,22 @@ fn the_arrow_keys_choose_sections_and_move_the_keyboard_with_them() {
     key(&mut rt, Key::Down);
     assert_eq!(rt.state.chat.settings.section, Section::Connection);
     assert!(rt.find("settings-node-change").is_some());
+    key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.settings.section, Section::Identity);
     // The list stops at its end.
     key(&mut rt, Key::Down);
-    assert_eq!(rt.state.chat.settings.section, Section::Connection);
-    key(&mut rt, Key::Up);
-    key(&mut rt, Key::Up);
+    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
+    key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
+    for _ in 0..4 {
+        key(&mut rt, Key::Up);
+    }
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     assert_eq!(focused(&rt).as_deref(), Some("settings-section-updates"));
     key(&mut rt, Key::Up);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     key(&mut rt, Key::End);
-    assert_eq!(rt.state.chat.settings.section, Section::Connection);
+    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
     key(&mut rt, Key::Home);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     assert!(is_open(&rt), "arrows never close it");
@@ -411,9 +416,14 @@ fn the_old_entry_points_are_still_in_the_source() {
         assert!(src.contains(key), "{key} left {file}");
     }
     // The footer buttons that are still the only way to their dialogs.
-    for footer in ["dnd_entry", "\"Enter invite code\"", "\"Import ID\""] {
+    for footer in ["dnd_entry", "\"Enter invite code\""] {
         assert!(view.contains(footer), "{footer} left the room list");
     }
+    // Moved into Settings > Identity and Appearance.
+    assert!(
+        !view.contains("shortcuts::entry("),
+        "shortcuts::entry( is back in view.rs"
+    );
 }
 
 #[test]
@@ -976,6 +986,10 @@ fn every_scene_of_these_sections_exists() {
         "chat-settings-background-narrow",
         "chat-settings-background-no-tray",
         "chat-settings-background-no-tray-narrow",
+        "chat-settings-identity",
+        "chat-settings-identity-narrow",
+        "chat-settings-appearance",
+        "chat-settings-appearance-narrow",
         "chat-dnd-on",
     ] {
         assert!(names.contains(&want), "{want}");
@@ -1125,4 +1139,204 @@ fn the_notifications_pane_has_a_scroll_bar_and_is_taller_in_a_tall_window() {
         src.matches(".scroll_bar(k)").count() >= 2,
         "wide and narrow"
     );
+}
+
+#[test]
+fn identity_actions_are_unavailable_for_the_example_rooms() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    press(&mut rt, "settings-import-id");
+    assert!(is_open(&rt), "a disabled button does nothing");
+    assert!(rt.state.chat.form.open.is_none());
+}
+
+/// A shell on the node with the example rooms, so identity actions are available.
+fn node_state(edit: fn(&mut Vec<crate::chat::model::Room>)) -> RiverApp {
+    let mut s = connected();
+    let mut rooms = crate::chat::example::data().rooms;
+    edit(&mut rooms);
+    s.chat.source = crate::chat::Source::Node(crate::chat::LinkStatus::Live);
+    // The first live list is catch-up; the second is the whole list.
+    for _ in 0..2 {
+        s.chat.show_node_rooms(
+            rooms.clone(),
+            None,
+            crate::chat::LinkStatus::Live,
+            29_000_000,
+        );
+    }
+    s
+}
+
+fn export_button_keys(rt: &Runtime<RiverApp>) -> Vec<String> {
+    rt.elements()
+        .into_iter()
+        .filter_map(|e| e.key)
+        .filter(|k| k.starts_with("settings-export-row-"))
+        .collect()
+}
+
+#[test]
+fn the_export_dialog_names_the_room_it_is_for() {
+    let mut rt = render(node_state(|_| {}), WINDOW_SIZE);
+    let (key, name) = {
+        let r = &rt.state.chat.rooms()[1];
+        (r.key.clone(), r.name.clone())
+    };
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    press(&mut rt, &format!("settings-export-{key}"));
+    assert!(rt.find("export-identity-dialog").is_some());
+    assert!(
+        texts(&rt)
+            .iter()
+            .any(|t| t.contains(&name) && t.starts_with("Room:")),
+        "the dialog shows {name:?}: {:?}",
+        texts(&rt)
+    );
+}
+
+#[test]
+fn rooms_with_the_same_or_no_name_are_told_apart() {
+    let mut rt = render(
+        node_state(|rooms| {
+            rooms[0].name = "Same".into();
+            rooms[1].name = "Same".into();
+            rooms[2].name = String::new();
+        }),
+        WINDOW_SIZE,
+    );
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    let rooms = rt.state.chat.rooms().to_vec();
+    let labels: Vec<String> = rooms
+        .iter()
+        .map(|r| crate::chat::identity::room_label(&rooms, &r.key))
+        .collect();
+    for (i, a) in labels.iter().enumerate() {
+        for b in &labels[i + 1..] {
+            assert_ne!(a, b, "{labels:?}");
+        }
+    }
+    for l in &labels[..3] {
+        assert!(texts(&rt).iter().any(|t| t == l), "row {l:?} is shown");
+    }
+    assert!(labels[2].starts_with("Unnamed room"));
+    // A unique name stays as it is.
+    let mut solo = rooms.clone();
+    solo.truncate(1);
+    assert_eq!(
+        crate::chat::identity::room_label(&solo, &solo[0].key),
+        solo[0].name
+    );
+    // The dialog uses the same label.
+    let key = rooms[1].key.clone();
+    press(&mut rt, &format!("settings-export-{key}"));
+    assert!(shows(&rt, &format!("Room: {}", labels[1])));
+}
+
+#[test]
+fn the_export_dialog_closes_when_its_room_leaves_the_list() {
+    let mut rt = render(node_state(|_| {}), WINDOW_SIZE);
+    let key = rt.state.chat.rooms()[1].key.clone();
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    press(&mut rt, &format!("settings-export-{key}"));
+    assert!(rt.state.chat.export.is_some());
+    let rest: Vec<_> = rt
+        .state
+        .chat
+        .rooms()
+        .iter()
+        .filter(|r| r.key != key)
+        .cloned()
+        .collect();
+    // Another room going leaves the dialog alone.
+    let other: Vec<_> = rt.state.chat.rooms().iter().skip(1).cloned().collect();
+    rt.update(move |s, _| s.chat.set_rooms(other));
+    assert!(rt.state.chat.export.is_some());
+    rt.update(move |s, _| s.chat.set_rooms(rest));
+    settle(&mut rt);
+    assert!(rt.state.chat.export.is_none(), "dialog and token dropped");
+    assert!(rt.find("export-identity-dialog").is_none());
+}
+
+#[test]
+fn a_partial_list_while_reconnecting_keeps_the_export_dialog_and_a_full_one_closes_it() {
+    let mut rt = render(node_state(|_| {}), WINDOW_SIZE);
+    let key = rt.state.chat.rooms()[1].key.clone();
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    press(&mut rt, &format!("settings-export-{key}"));
+    assert!(rt.state.chat.export.is_some());
+    let rest: Vec<_> = rt
+        .state
+        .chat
+        .rooms()
+        .iter()
+        .filter(|r| r.key != key)
+        .cloned()
+        .collect();
+    // Reconnecting: the list lacks the room only because it is partial.
+    let partial = rest.clone();
+    rt.update(move |s, _| {
+        s.chat.show_node_rooms(
+            partial,
+            None,
+            crate::chat::LinkStatus::Reconnecting,
+            29_000_000,
+        );
+    });
+    assert!(rt.state.chat.export.is_some(), "a partial list keeps it");
+    // The first live list after that is still catch-up, not the whole list.
+    let catch_up = rest.clone();
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(catch_up, None, crate::chat::LinkStatus::Live, 29_000_000);
+    });
+    assert!(rt.state.chat.export.is_some(), "catch-up keeps it");
+    // A full live list without the room closes it.
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(rest, None, crate::chat::LinkStatus::Live, 29_000_000);
+    });
+    assert!(rt.state.chat.export.is_none(), "a full list closes it");
+}
+
+#[test]
+fn identity_buttons_are_disabled_with_a_reason_for_the_example_rooms() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-identity");
+    assert!(rt.find("settings-identity-unavailable").is_some());
+    assert!(shows(&rt, "example rooms"));
+    let key = rt.state.chat.rooms()[0].key.clone();
+    press(&mut rt, &format!("settings-export-{key}"));
+    assert!(is_open(&rt), "a disabled button does nothing");
+    assert!(rt.state.chat.export.is_none());
+    assert!(rt.state.chat.outgoing.is_empty());
+    // With the node there is nothing to explain.
+    let rt = {
+        let mut rt = render(node_state(|_| {}), WINDOW_SIZE);
+        press(&mut rt, "settings");
+        press(&mut rt, "settings-section-identity");
+        rt
+    };
+    assert!(rt.find("settings-identity-unavailable").is_none());
+    assert_eq!(export_button_keys(&rt).len(), rt.state.chat.rooms().len());
+}
+
+#[test]
+fn the_new_sections_are_listed_and_reachable_in_a_narrow_window() {
+    let mut rt = render(connected(), NARROW_SCENE_SIZE);
+    press(&mut rt, "settings");
+    for id in ["identity", "appearance"] {
+        assert!(rt.find(&format!("settings-section-{id}")).is_some(), "{id}");
+    }
+    press(&mut rt, "settings-section-appearance");
+    assert!(rt.find("settings-size-100").is_some());
+    press(&mut rt, "settings-back");
+    press(&mut rt, "settings-section-identity");
+    assert!(rt.find("settings-import-id").is_some());
 }

@@ -292,6 +292,29 @@ fn dialogs(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                     |s| &mut s.chat.form.nickname,
                 ));
             }
+            body = body.child(
+                row()
+                    .key("join-import-row")
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        label(
+                            "Have an identity from another device?",
+                            st::SMALL,
+                            st::palette().text_secondary,
+                        )
+                        .wrap()
+                        .min_w(0.0),
+                    )
+                    .child(
+                        Button::new("Import it")
+                            .variant(ButtonVariant::Ghost)
+                            .on_press(|s: &mut RiverApp| s.chat.open_import())
+                            .build(k)
+                            .key("join-import-id"),
+                    ),
+            );
         }
     }
     // A refusal the preview already shows is not said twice.
@@ -468,7 +491,6 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
         .child(label("Rooms", st::SECTION, p.text_muted))
         .child(spacer())
         .children(super::zoom::badge(chat))
-        .child(super::shortcuts::entry(p))
         .child(if chat.can_change_rooms() {
             icon_button("create-room", "Create room", &icons::PLUS, p)
                 .help("Create room")
@@ -490,7 +512,6 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
     }
     list = list.children(super::dm_view::rail(chat, p));
     let enter = outlined("enter-invite", "Enter invite code", &icons::INVITE, 34.0, p);
-    let import = outlined("import-id", "Import ID", &icons::IMPORT, 34.0, p);
     let mut footer = col()
         .key("rooms-footer")
         .px(12.0)
@@ -504,14 +525,6 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
                 .on_press(|s: &mut RiverApp| s.chat.open_dialog(DialogKind::Join))
         } else {
             not_yet(enter)
-        })
-        .child(if chat.can_change_rooms() {
-            import
-                .hover(p.surface_hover)
-                .cursor(rune::Cursor::Pointer)
-                .on_press(|s: &mut RiverApp| s.chat.open_import())
-        } else {
-            not_yet(import)
         });
     if let Some(n) = dnd_notice(chat, p, k) {
         footer = footer.child(n);
@@ -986,26 +999,6 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
             .on_press(|s: &mut RiverApp| s.chat.invite())
     } else {
         not_yet(invite)
-    });
-    // Quiet and secondary, below the invite, as the web UI's.
-    let export = row()
-        .key("export-id")
-        .role("button")
-        .label("Export ID")
-        .w_full()
-        .h(28.0)
-        .gap(6.0)
-        .radius(8.0)
-        .center()
-        .child(icon(&icons::EXPORT, 13.0).color(p.text_muted))
-        .child(label("Export ID", st::SMALL_STRONG, p.text_muted));
-    footer = footer.child(if chat.can_change_rooms() {
-        export
-            .hover(p.surface_hover)
-            .cursor(rune::Cursor::Pointer)
-            .on_press(|s: &mut RiverApp| s.chat.open_export())
-    } else {
-        not_yet(export)
     });
     match chat.open_invite() {
         None => {}

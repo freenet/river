@@ -14,7 +14,7 @@ use rune_kit::Kit;
 
 use super::Chat;
 use super::dialog_kit::{self as dk, DialogSpec};
-use super::style::{self as st, Palette};
+use super::style as st;
 use super::view::label;
 use crate::RiverApp;
 
@@ -208,28 +208,6 @@ impl Chat {
         }
         false
     }
-}
-
-/// The room list heading's entry: a small "?" button, so the page can be found without the
-/// keyboard and without adding to the footer, which already fills a short window.
-pub(super) fn entry(p: &Palette) -> El {
-    row()
-        .key("shortcuts-entry")
-        .role("button")
-        .label("Keyboard shortcuts")
-        .help(format!(
-            "Keyboard shortcuts ({})",
-            shown("Mod+/", cfg!(target_os = "macos"))
-        ))
-        .size(26.0, 26.0)
-        .radius(6.0)
-        .center()
-        .hover(p.surface_hover)
-        .cursor(rune::Cursor::Pointer)
-        .child(label("?", st::ROOM, p.text_muted))
-        .on_press(|s: &mut RiverApp| {
-            s.chat.open_shortcuts();
-        })
 }
 
 /// Height of the list's scroll area in a window `win_h` high: room is kept for the title, the
