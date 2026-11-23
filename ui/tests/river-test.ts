@@ -104,6 +104,12 @@ type RiverTestHooks = {
   setPendingJoin(on: boolean): void;
   // The current room's identity replaced by another key, as an identity import does.
   replaceRoomIdentity(): void;
+  // The current room (owned by this identity) made private, holding the secrets
+  // for versions 0 to `version`, `version` current.
+  makeRoomPrivate(version: number): void;
+  // The current room's secret pointer set to `version`, as a merge that leaves
+  // local state ahead of the contract's can.
+  setSecretVersion(version: number): void;
 };
 
 export type SyncStatus = "connected" | "connecting" | "disconnected" | "error" | `error:${string}`;

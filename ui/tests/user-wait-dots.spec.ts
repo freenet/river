@@ -11,9 +11,9 @@ import {
   reactTo,
   revealFooter,
   selectRoom,
+  sendCommitted,
   settle,
   sheet,
-  submitMessage,
   waitForApp,
 } from "./example-room";
 import {
@@ -173,14 +173,6 @@ async function reactAndMark(page: Page, row: Locator) {
   await expectMarks(page, 1, "the reaction marks its room");
 }
 
-/// An own committed message in the current room, sent from the composer.
-async function sendOwn(page: Page, text: string): Promise<Locator> {
-  const row = await submitMessage(page, text);
-  await expect(row).toHaveCount(1, { timeout: 5_000 });
-  await expect(page.getByTestId("message-input")).toHaveValue("");
-  return row;
-}
-
 /// Delete `row` through its footer Delete and the confirmation's Delete.
 async function confirmDelete(page: Page, row: Locator) {
   await clickFooter(page, row, "message-delete-button");
@@ -201,24 +193,10 @@ async function expectAtMostOnePainter(page: Page) {
 }
 
 test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
-  test("a reaction shows the room's dots until the room's UPDATE reply", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
-    await reactAndMark(page, row);
-    await expectShowing(roomDots(page), "a reaction shows the dots");
-    await expect(roomDots(page)).toHaveAttribute("data-reason", "sending");
-    await expect(spacer(page)).toHaveAttribute("data-active", "true");
-    await expect(status(page), "room changes are not announced").toHaveText("");
-
-    await callRiverTest(page, "deliverUpdateResponse");
-    await expectMarks(page, 0, "the reply ends the mark");
-    await expectIdle(page, "the reply ends the dots");
-    await expect(roomDots(page)).toHaveAttribute("data-reason", "");
-  });
-
   test("an edit marks its room, and a keyed UPDATE error for the room ends the mark", async ({ page }) => {
     await openRoomWithComposer(page);
     await connect(page);
-    const row = await sendOwn(page, "edit me");
+    const row = await sendCommitted(page, "edit me");
     expect(await marks(page), "premise: the send marked nothing").toBe(0);
     const editArea = await openOwnMessageEdit(page, row);
     await editArea.fill("edited once");
@@ -234,13 +212,15 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
   test("a delete through its confirmation marks its room", async ({ page }) => {
     await openRoomWithComposer(page);
     await connect(page);
-    const row = await sendOwn(page, "delete me");
+    const row = await sendCommitted(page, "delete me");
     await confirmDelete(page, row);
     await expect(committedRow(page, "delete me")).toHaveCount(0);
     await expectMarks(page, 1, "the delete marks its room");
     await expectShowing(roomDots(page), "a delete shows the dots once the confirmation closes");
     await callRiverTest(page, "deliverUpdateResponse");
+    await expectMarks(page, 0, "the reply ends the mark");
     await expectIdle(page, "the reply ends them");
+    await expect(roomDots(page)).toHaveAttribute("data-reason", "");
   });
 
   test("while disconnected the mark is kept but nothing shows; reconnecting shows it again", async ({ page }) => {
@@ -267,7 +247,7 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     const row = await connectedRoomWithTarget(page);
     await reactAndMark(page, row);
     await selectRoom(page, "Team Chat Room");
-    const team = await sendOwn(page, "team target");
+    const team = await sendCommitted(page, "team target");
     await reactTo(page, team);
     await expectMarks(page, 2, "premise: two rooms marked");
     await callRiverTest(page, "deliverUpdateError", "unkeyed");
@@ -477,7 +457,7 @@ test.describe("Ownership", () => {
     await waitForApp(page);
     await selectRoom(page, "Team Chat Room");
     await connect(page);
-    const row = await sendOwn(page, "dm cover target");
+    const row = await sendCommitted(page, "dm cover target");
     await reactAndMark(page, row);
     await expectPainted(page);
 

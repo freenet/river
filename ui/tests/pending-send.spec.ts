@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { clickFooter, committedRow, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, openRoomWithTarget, press, reactionChoices, reactTo, selectListedRoom, settle, submitMessage } from "./example-room";
+import { clickFooter, committedRow, openInlinePicker, openOwnMessageEdit, openRoomWithComposer, openRoomWithTarget, press, reactionChoices, reactTo, selectListedRoom, sendCommitted, settle, submitMessage } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // An own message is signed by the chat delegate, which can take seconds. The
@@ -15,14 +15,6 @@ const composerBox = (page: Page) => page.getByTestId("message-composer-box");
 const sendButton = (page: Page) => page.getByTestId("send-message-button");
 const replyPreview = (page: Page) => page.getByTestId("composer-reply-preview");
 const sendError = (page: Page) => page.getByTestId("composer-send-error");
-
-/// Submit `text` and wait for the room to admit it, so the next send starts
-/// from an empty draft.
-async function send(page: Page, text: string) {
-  await submitMessage(page, text);
-  await expect(committedRow(page, text)).toHaveCount(1);
-  await expect(input(page), "the draft clears once the room admits it").toHaveValue("");
-}
 
 /// A send marks no room wait and lights no wait dots (they are for edits,
 /// deletes, reactions and joins).
@@ -88,7 +80,7 @@ test("Enter keeps a held reply in the composer, read-only and sent once, then it
   await callRiverTest(page, "releaseMessageSigning");
 
   // The next message goes at once, and lights nothing either.
-  await send(page, "right after");
+  await sendCommitted(page, "right after");
   await expect(committedRow(page, "held reply"), "no duplicate").toHaveCount(1);
   await settle(page);
   await expectNoWait(page, "an ordinary send, connected");
@@ -260,6 +252,26 @@ test("a failed send's text stays in its room, and a draft in a room not shown ho
   await expect(input(page), "and this room's draft is its own").toHaveValue("typed elsewhere");
 });
 
+test("a draft outlives a room that shows a notice instead of the composer", { tag: "@chromium-only" }, async ({ page }) => {
+  // Self owns this room, which the hook needs. Without its key, the room
+  // shows a notice and no composer.
+  await openRoomWithComposer(page);
+  await callRiverTest(page, "makeRoomPrivateWithoutSecret");
+  await expect(page.getByTestId("missing-room-secret-notice")).toBeVisible();
+  await expect.poll(() => callRiverTest(page, "userIsBusy"), { message: "premise: idle" }).toBe(false);
+
+  await selectListedRoom(page, "Team Chat Room");
+  await input(page).fill("typed in team chat");
+
+  await selectListedRoom(page, "Your Private Room");
+  await expect(page.getByTestId("missing-room-secret-notice")).toBeVisible();
+  await expect(page.getByTestId("message-composer"), "no composer is mounted").toHaveCount(0);
+  expect(await callRiverTest(page, "userIsBusy"), "the draft in the room not shown holds a reload").toBe(true);
+
+  await selectListedRoom(page, "Team Chat Room");
+  await expect(input(page), "the draft is still there").toHaveValue("typed in team chat");
+});
+
 test("a send after a failure waits for the key it was first sealed under", { tag: "@chromium-only" }, async ({ page }) => {
   const keyNotHere = "does not have the room's newest key yet";
   await openRoomWithComposer(page);
@@ -307,9 +319,7 @@ test("a send from a replaced identity is never committed",{ tag: "@chromium-only
 
 test("an own reaction, a switch to another emoji, and an edit show while their signatures are held", async ({ page }) => {
   await openRoomWithComposer(page);
-  await send(page, "act on me");
-  const row = committedRow(page, "act on me");
-  await expect(row).toHaveCount(1);
+  const row = await sendCommitted(page, "act on me");
 
   await callRiverTest(page, "holdMessageSigning");
   const chip = await reactTo(page, row);
@@ -340,9 +350,7 @@ test("an own reaction, a switch to another emoji, and an edit show while their s
 
 test("a second click on a reaction still being signed undoes it", { tag: "@chromium-only" }, async ({ page }) => {
   await openRoomWithComposer(page);
-  await send(page, "react twice");
-  const row = committedRow(page, "react twice");
-  await expect(row).toHaveCount(1);
+  const row = await sendCommitted(page, "react twice");
 
   await callRiverTest(page, "holdMessageSigning");
   const chip = await reactTo(page, row);
