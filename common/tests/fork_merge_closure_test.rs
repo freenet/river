@@ -127,6 +127,9 @@ fn drain_not_idempotent() -> Vec<String> {
 /// generator stopped producing (or the contract stopped accepting) a shape.
 #[derive(Default, Debug)]
 struct Stats {
+    /// For pairs holding different records for an id: how many still differ
+    /// after gossip in each field, outside the contested ids.
+    contested_outside: std::collections::BTreeMap<String, usize>,
     produced: std::collections::BTreeMap<String, usize>,
     accepted: std::collections::BTreeMap<String, usize>,
     merge_rejections: usize,
@@ -1972,12 +1975,18 @@ fn contested_converges(w: &World, a: &ChatRoomStateV1, b: &ChatRoomStateV1) -> R
         (Ok(nx), Ok(ny)) => (nx, ny),
         _ => return Err("a merge was refused after gossip".to_string()),
     };
+    let contested = contested_ids(a, b);
+    let outside = differing_fields(
+        &without_contested(&x, &contested),
+        &without_contested(&y, &contested),
+    );
+    STATS.with(|s| {
+        let mut s = s.borrow_mut();
+        for f in &outside {
+            *s.contested_outside.entry(f.to_string()).or_default() += 1;
+        }
+    });
     if std::env::var("FORK_CONTESTED_REPORT").is_ok() {
-        let contested = contested_ids(a, b);
-        let outside = differing_fields(
-            &without_contested(&x, &contested),
-            &without_contested(&y, &contested),
-        );
         println!("contested pair: outside the contested ids differs in {outside:?}");
     }
     if ser(&nx) != ser(&x) || ser(&ny) != ser(&y) {
@@ -2551,4 +2560,49 @@ fn provisional_forks_converge() {
         stats.merge_rejections, 0,
         "a provisional-mode merge was rejected: {stats:?}"
     );
+}
+
+/// How far the split between two peers holding different records for one id
+/// reaches outside that id, pinned at fixed seeds so a change that leaves
+/// such pairs settled but further apart fails. The pairs are counted per
+/// field that still differs after gossip outside the contested ids (see
+/// `contested_converges`). Each bound is the count measured when this test
+/// was written (at seeds 0..60) plus a margin of 2; lower it when the split narrows
+/// (freenet/river#991 tracks closing it).
+#[test]
+fn the_split_around_a_contested_id_stays_bounded() {
+    let seeds: Vec<(u64, usize)> = (0..60u64)
+        .flat_map(|s| (0..SHAPES.len()).map(move |sh| (s, sh)))
+        .collect();
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for mode in [Mode::Provisional, Mode::Extended] {
+        let _ = endings(mode, &seeds);
+        for (f, n) in take_stats().contested_outside {
+            *counts.entry(f).or_default() += n;
+        }
+    }
+    println!("split outside contested ids at seeds 0..60: {counts:?}");
+    // Measured at seeds 0..60 (Provisional and Extended modes): members 2,
+    // member_info 1, recent_messages 6, every other field 0. Each bound is
+    // that count plus 2.
+    let bounds: &[(&str, usize)] = &[
+        ("members", 4),
+        ("member_info", 3),
+        ("recent_messages", 8),
+        ("bans", 2),
+        ("ban_evidence", 2),
+        ("provisional", 2),
+        ("direct_messages", 2),
+        ("secrets", 2),
+    ];
+    for (field, n) in &counts {
+        let bound = bounds
+            .iter()
+            .find(|(f, _)| f == field)
+            .map_or(0, |(_, b)| *b);
+        assert!(
+            *n <= bound,
+            "{n} pairs differ in {field} outside the contested ids (bound {bound}): {counts:?}"
+        );
+    }
 }
