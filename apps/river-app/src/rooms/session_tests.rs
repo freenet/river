@@ -1377,6 +1377,7 @@ fn quick() -> Pace {
         resync_focus: Duration::from_secs(3600),
         resync_spread: Duration::ZERO,
         resync_wait: Duration::from_secs(3600),
+        resync_late: Duration::from_secs(3600),
         update_wait: Duration::from_secs(60),
         owed_limit: Duration::from_secs(180),
         delegate_deadline: Duration::from_secs(5),
@@ -2673,20 +2674,74 @@ fn the_open_room_is_still_read_again_after_a_reconnect() {
     });
 }
 
-/// The node gives up on an operation after 60 s (freenet-core `OPERATION_TTL`) and only then
-/// reports a failed GET, with an error naming nothing. A read must still count as out by then,
-/// or that error is taken for whatever started after it was given up on.
-const NODE_OPERATION_TTL: Duration = Duration::from_secs(60);
+/// The node gives up on one attempt of a GET after 60 s (freenet-core `OPERATION_TTL`, the
+/// retry driver's per-attempt timeout) and makes up to 4 attempts (`MAX_RETRIES` = 3 more), then
+/// reports the failure with an error naming nothing: up to about 4 minutes after the read.
+const NODE_ATTEMPT_TTL: Duration = Duration::from_secs(60);
+const NODE_GET_ATTEMPTS: u32 = 4;
 
+/// A read blocks other requests for `resync_wait`, past one attempt's limit, and is then kept
+/// as late, its errors claimed by nobody, until past the node's limit for all attempts.
 #[test]
-fn a_read_is_waited_for_well_past_the_nodes_own_time_limit() {
+fn a_read_is_kept_late_past_the_nodes_limit_for_every_attempt() {
     let pace = Pace::default();
     assert!(
-        pace.resync_wait >= NODE_OPERATION_TTL * 2,
+        pace.resync_wait >= NODE_ATTEMPT_TTL * 2,
         "{:?}",
         pace.resync_wait
     );
     assert!(pace.resync_wait < pace.owed_limit);
+    assert!(
+        pace.resync_late > NODE_ATTEMPT_TTL * NODE_GET_ATTEMPTS,
+        "{:?}",
+        pace.resync_late
+    );
+}
+
+/// A read given up on, whose error naming nothing comes long after (the node retried it), while
+/// a read of the stored rooms started meanwhile is out: the error is claimed by nobody, so it
+/// does not abort that read.
+#[test]
+fn a_very_late_read_error_does_not_abort_a_stored_rooms_read_started_after() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let pace = Pace {
+        resync_idle: Duration::from_millis(50),
+        resync_wait: Duration::from_millis(300),
+        resync_late: Duration::from_secs(60),
+        refresh: Duration::from_millis(200),
+        delegate_deadline: Duration::from_secs(60),
+        ..quick()
+    };
+    let (session, _dir) = following(&node, &[&a], "resync-very-late", pace);
+    node.with(|w| w.read_play = ReadPlay::Silence);
+    session.act(&a, Action::Viewing);
+    wait_for_a_read(&session, &node, &a);
+    // The read is given up on; a read of the stored rooms starts, and the node holds it.
+    let lists = node.with(|w| {
+        w.silence_next_list = true;
+        w.lists
+    });
+    session.wait_on_one_connection(&node, "a stored-rooms read is out", || {
+        node.with(|w| w.lists > lists && !w.silence_next_list)
+    });
+    let lists = node.with(|w| w.lists);
+    node.with(|w| {
+        w.push_error(
+            ErrorKind::OperationError {
+                cause: "GET failed".into(),
+            }
+            .into(),
+        )
+    });
+    // Taken for the stored rooms' read, it would end it, and the next would start within
+    // `refresh`.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        node.with(|w| w.lists),
+        lists,
+        "the stored-rooms read was aborted"
+    );
 }
 
 /// Each `Pace` setting reaches the rules it is for.
@@ -2733,7 +2788,9 @@ fn after_a_read_is_given_up_the_next_waits_a_whole_idle_time() {
         node.with(|w| w.reads_of(a.id()) >= 2)
     });
     let gap = node.with(|w| w.reads[1].1 - w.reads[0].1);
-    assert!(gap >= wait + idle, "{gap:?}");
+    // The node stamps arrival, not sending: 20 ms of slack for that. Without the restart the
+    // gap would be about `wait` alone.
+    assert!(gap >= wait + idle - Duration::from_millis(20), "{gap:?}");
 }
 
 /// An error naming nothing that comes long after the read was asked, while a message is owed
@@ -2745,11 +2802,13 @@ fn a_late_read_error_is_not_blamed_on_what_came_after_the_read() {
     let a = TestRoom::new(1, "A", 1, &["a1"]);
     let pace = Pace {
         resync_idle: Duration::from_millis(50),
-        resync_wait: Duration::from_secs(3),
+        resync_wait: Duration::from_secs(10),
         refresh: Duration::from_millis(200),
         ..quick()
     };
     let (session, _dir) = following(&node, &[&a], "resync-late-error", pace);
+    // `resync_wait` (10 s) is far past the 1.5 s this test takes, so the read is still out
+    // when its error comes, however slow the machine.
     node.with(|w| {
         w.read_play = ReadPlay::Silence;
         w.update_play = UpdatePlay::Ignore;

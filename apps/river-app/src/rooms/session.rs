@@ -149,12 +149,16 @@ pub(super) struct Pace {
     /// ([`super::resync`]).
     pub resync_spread: Duration,
     /// How long such a read may go unanswered before River stops waiting for it. It frees the
-    /// room for the next read, a whole `resync_idle` later, and never reconnects. It must be
-    /// well past the node's own limit on an operation (freenet-core `OPERATION_TTL`, 60 s),
-    /// after which the node reports a failed GET with an error that names nothing: until then
-    /// the read counts as out, so that error is not taken for another request's
+    /// room for the next read, a whole `resync_idle` later, and the requests a read holds back;
+    /// it never reconnects. Past one attempt of the node's (freenet-core `OPERATION_TTL`, 60 s
+    /// per attempt), so a GET that fails at its first attempt is still out when its error comes
     /// ([`super::resync`]).
     pub resync_wait: Duration,
+    /// How long a read given up on is kept as late: it no longer holds anything back, but while
+    /// any read is late an error that could be its own is claimed by nobody. Past the node's
+    /// limit for every attempt of a GET (four attempts of 60 s, freenet-core `OPERATION_TTL`
+    /// and `MAX_RETRIES`), counted from when the read was asked ([`super::resync`]).
+    pub resync_late: Duration,
     /// How long the node may take to answer an update before the message counts as not sent.
     pub update_wait: Duration,
     /// How long an answer may be owed before the connection is dropped for it (three times
@@ -221,6 +225,7 @@ impl Default for Pace {
             resync_focus: Duration::from_secs(60),
             resync_spread: Duration::from_secs(10),
             resync_wait: Duration::from_secs(120),
+            resync_late: Duration::from_secs(300),
             update_wait: Duration::from_secs(60),
             owed_limit: Duration::from_secs(180),
             delegate_deadline: Duration::from_secs(20),
@@ -1040,7 +1045,9 @@ fn follow_on(
             return SocketError::Failed("the delegate did not answer about a signing key".into());
         }
         // Not beside a room read either: an error naming nothing could be either's, and taken
-        // for the read of the stored rooms it would abort it ([`super::resync`]).
+        // for the read of the stored rooms it would abort it ([`super::resync`]). The wait is
+        // at most `resync_wait`, and only on a node that answers no GET; this read runs in the
+        // background. The same holds for the create or join and the signing key sweep.
         if reload.is_none()
             && !rooms.keys.busy()
             && !resyncs.any_out()
@@ -1061,7 +1068,7 @@ fn follow_on(
         if std::mem::take(&mut rooms.resync_wanted) {
             resyncs.focus(&rooms.contract_ids(), Instant::now(), &pace.resync());
         }
-        resyncs.expire(pace.resync_wait, Instant::now());
+        resyncs.expire(pace.resync_wait, pace.resync_late, Instant::now());
         if reload.is_none() && !rooms.keys.busy() && !rooms.outbox.work.has_out() {
             let viewing = rooms.viewing_contract();
             let ids = rooms.contract_ids();
@@ -1224,7 +1231,19 @@ fn follow_on(
                         .list
                         .iter()
                         .any(|r| rooms.outbox.owes(&r.stored.owner_vk));
-                if rooms.outbox.work.on_error(&e, alone, &|id| {
+                // A read given up on may still fail (the node retries a GET, each attempt up to
+                // a minute): an error naming nothing, or naming its room with no other request
+                // out for that room, may be that read's, so it is claimed by nobody. What else
+                // it could have been runs to its own deadline instead.
+                let late_reads = (names_nothing(&e) && resyncs.any_late())
+                    || failed_contract(&e).is_some_and(|id| {
+                        resyncs.is_late(&id)
+                            && !resyncs.is_out(&id)
+                            && !subs.pending.contains_key(&id)
+                    });
+                if late_reads {
+                    eprintln!("River: an error that may be a read given up on, taken by none: {e}");
+                } else if rooms.outbox.work.on_error(&e, alone, &|id| {
                     subs.pending.contains_key(id) || resyncs.is_out(id)
                 }) {
                     changed = true;

@@ -36,31 +36,42 @@
 //! the stored rooms are being read, the signing key sweep has a request out or a create or join
 //! has one out, and none of those starts while a read is out. Such an error with one read out
 //! and nothing else that could have failed is the read's, and frees its room at once. One
-//! exception, chosen so a message is never held back for a read: an UPDATE goes out for a room
-//! whose read is out. Its answer and its contract error name the UPDATE. Two of its errors do
-//! not: `MissingContract`, which names only the room, and the errors naming nothing that the
-//! node sends for an UPDATE that failed to start (`OperationError`, `EmptyRing`...). While the
-//! room's read is out, a `MissingContract` for it is taken for the read's, and an error naming
-//! nothing is taken by neither, so a read's error never fails a message. The cost, accepted: an
-//! UPDATE that fails in one of those two ways while its room's read is out shows as failed only
-//! when its answer is given up on (`update_wait`), not at once, and the read waits out
-//! `resync_wait`. It needs the node to fail both at once (one degraded node), and a message
-//! never shows as failed when it may have been sent.
+//! exception, chosen so a message is never held back for a read: an UPDATE goes out while a
+//! read is out. Its answer and its contract error name the UPDATE. Two of its errors do not:
+//! `MissingContract`, which names only the room, and the errors naming nothing that the node
+//! sends for an UPDATE that failed to start (`OperationError`, `EmptyRing`...). While its room's
+//! read is out, a `MissingContract` is taken for the read's; while ANY read is out, an error
+//! naming nothing is taken by neither. So a read's error never fails a message. The cost,
+//! accepted: an UPDATE that fails in one of those two ways while a read is out shows as failed
+//! only when its answer is given up on (`update_wait`), not at once, even if the read is later
+//! answered: only the UPDATE has to fail. A message never shows as failed when it may have
+//! been sent.
 //!
-//! A read the node does not answer is given up after [`Pace::resync_wait`], which frees the room
-//! for the next read a whole [`Pace::resync_idle`] later. `resync_wait` is twice the node's own
-//! limit on an operation (freenet-core `OPERATION_TTL`, 60 s), after which the node reports a
-//! failed GET with an error that names nothing: the read still counts as out when that comes,
-//! so it is never taken for a request that started after the read was given up on. (A GET
-//! whose answer is still streaming in can outlast 60 s; a room state streams in far less than
-//! the minute of margin.) A read NEVER reconnects, and it is not an answer owed in the sense of
+//! The requests that wait for reads (a read of the stored rooms, the signing key sweep, a create
+//! or join) wait at most `resync_wait`, two minutes, and only on a node that answers no GET:
+//! a read is normally answered at once from the node's copy. On such a node a join, which needs
+//! a GET of the room, would fail anyway, and the stored rooms' read and the sweep run in the
+//! background. No wait counts against their own deadlines, which run from when they are sent.
+//!
+//! A read the node does not answer is given up after [`Pace::resync_wait`] (two minutes), which
+//! frees the room for the next read a whole [`Pace::resync_idle`] later and frees the requests
+//! above. The node gives up on one attempt of a GET after a minute (freenet-core
+//! `OPERATION_TTL`, a per-attempt timeout) and makes up to four attempts (`MAX_RETRIES`), then
+//! reports the failure with an error naming nothing: up to about four minutes after the read.
+//! So a read given up on is kept as late until [`Pace::resync_late`] (five minutes) after it
+//! was asked. A late read holds nothing back, but while any read is late an error naming
+//! nothing, or naming a late read's room with nothing else out for that room, is claimed by
+//! nobody: it is never taken for a request that started after the read was given up on, and
+//! that request, if it was the one that failed, runs to its own deadline instead. A read NEVER
+//! reconnects, and it is not an answer owed in the sense of
 //! [`super::outbox`]'s reconnect rule (`wants_reconnect`, `owed_limit`): that rule exists because
 //! an UPDATE's answer names only the room, so a room that owes one cannot send another on the
 //! same connection. A read's answer names its room and merges idempotently, so a late one is
 //! harmless. Whether the node is there at all is the ping's job ([`Pace::idle_check`],
 //! [`Pace::pong_wait`]), and a node that answers pings but not reads would not answer them any
 //! better on a new connection. So an unanswered read costs one read of the open room per
-//! `resync_wait + resync_idle` (three minutes), and reconnects nobody.
+//! `resync_wait + resync_idle` (three minutes), and reconnects nobody. (Coming to the front
+//! does not read such a room sooner: giving up on its read restarts its quiet clock.)
 //!
 //! The reads go out as GETs that do not subscribe. The node's answer to one looks exactly like
 //! its answer to a subscribe (a `GetResponse`), so the two are never out at once for one room:
@@ -76,6 +87,7 @@
 //! [`Pace::resync_focus`]: super::session::Pace
 //! [`Pace::resync_spread`]: super::session::Pace
 //! [`Pace::resync_wait`]: super::session::Pace
+//! [`Pace::resync_late`]: super::session::Pace
 //! [`Pace::resubscribe_first`]: super::session::Pace
 //! [`Pace::resubscribe_max`]: super::session::Pace
 //! [`Pace::idle_check`]: super::session::Pace
@@ -122,6 +134,8 @@ struct Heal {
 pub(super) struct Resyncs {
     /// Reads out, with when they were asked.
     out: HashMap<ContractInstanceId, Instant>,
+    /// Reads given up on that the node may still fail, with when they were asked.
+    late: HashMap<ContractInstanceId, Instant>,
     /// When the node last said anything about each room, or River last asked it to: the room's
     /// quiet clock. A room with none counts from when the connection was set up.
     heard: HashMap<ContractInstanceId, Instant>,
@@ -135,6 +149,7 @@ impl Resyncs {
     pub fn new(now: Instant) -> Self {
         Resyncs {
             out: HashMap::new(),
+            late: HashMap::new(),
             heard: HashMap::new(),
             heal: HashMap::new(),
             wanted: HashMap::new(),
@@ -160,6 +175,16 @@ impl Resyncs {
 
     pub fn any_out(&self) -> bool {
         !self.out.is_empty()
+    }
+
+    /// Whether a read given up on may still fail: its error could come now, naming nothing, or
+    /// naming its room.
+    pub fn any_late(&self) -> bool {
+        !self.late.is_empty()
+    }
+
+    pub fn is_late(&self, id: &ContractInstanceId) -> bool {
+        self.late.contains_key(id)
     }
 
     /// The one read out, when exactly one is.
@@ -219,25 +244,30 @@ impl Resyncs {
         }
     }
 
-    /// Give up reads out for `wait` or longer. Each one's room is quiet from now, so its next
-    /// read waits a whole idle time: on a node that answers no read, the requests a read keeps
-    /// out (a read of the stored rooms, a signing key request, a create or join) get a turn.
-    pub fn expire(&mut self, wait: Duration, now: Instant) {
-        let given_up: Vec<ContractInstanceId> = self
+    /// Give up reads out for `wait` or longer, keeping each as late until `late` after it was
+    /// asked. Each one's room is quiet from now, so its next read waits a whole idle time: on a
+    /// node that answers no read, the requests a read keeps out (a read of the stored rooms, a
+    /// signing key request, a create or join) get a turn.
+    pub fn expire(&mut self, wait: Duration, late: Duration, now: Instant) {
+        let given_up: Vec<(ContractInstanceId, Instant)> = self
             .out
             .iter()
             .filter(|(_, asked)| now.saturating_duration_since(**asked) >= wait)
-            .map(|(id, _)| *id)
+            .map(|(id, asked)| (*id, *asked))
             .collect();
-        for id in given_up {
+        for (id, asked) in given_up {
             self.out.remove(&id);
+            self.late.insert(id, asked);
             self.heard.insert(id, now);
         }
+        self.late
+            .retain(|_, asked| now.saturating_duration_since(*asked) < late);
     }
 
     /// Forget rooms no longer shown.
     pub fn keep_only(&mut self, shown: &[ContractInstanceId]) {
         self.out.retain(|id, _| shown.contains(id));
+        // `late` stays: a read of a room since left can still fail with an error naming nothing.
         self.heard.retain(|id, _| shown.contains(id));
         self.heal.retain(|id, _| shown.contains(id));
         self.wanted.retain(|id, _| shown.contains(id));
@@ -352,7 +382,7 @@ mod tests {
         );
         // Given up: the quiet clock restarts then, so the next waits a whole idle time.
         let gave_up = t1 + Duration::from_secs(45);
-        r.expire(Duration::from_secs(45), gave_up);
+        r.expire(Duration::from_secs(45), Duration::from_secs(300), gave_up);
         assert!(!r.is_out(&id(1)));
         assert!(
             r.due(

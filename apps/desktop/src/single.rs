@@ -418,10 +418,18 @@ mod tests {
     /// it, and so holds the lock that long after the guard drops. A launch that tries once can
     /// find it taken; one that tries a few times, as a real launch does, is first.
     #[test]
+    #[cfg(unix)]
     fn the_next_launch_is_first_while_this_process_starts_others() {
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        /// Stops the spawning thread however the test ends, a panic included.
+        struct Stop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = Stop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let spawner = {
-            let stop = stop.clone();
+            let stop = stop.0.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     let _ = std::process::Command::new("sh")
@@ -434,7 +442,7 @@ mod tests {
         for _ in 0..300 {
             drop(first_in(dir.path()));
         }
-        stop.store(true, Ordering::Relaxed);
+        drop(stop);
         spawner.join().unwrap();
     }
 
