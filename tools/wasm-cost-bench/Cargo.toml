@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasmtime = { version = "42", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime"] }
 anyhow = "1"
 
 [profile.release]
