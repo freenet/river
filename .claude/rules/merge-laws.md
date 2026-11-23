@@ -31,6 +31,36 @@ the cap counts, so they cannot evict a stored ban). An `Err` for such a
 record fails every merge with a peer holding it, in one direction only, and
 nothing but its author can repair it.
 
+A `MemberId` is a non-cryptographic hash, so two keys can share one. A peer
+keeps the record for an id that it took first, as a member or as ban
+evidence: a member or evidence record under another key for a held id is
+skipped. Everything the id signed (`member_info`, messages, DMs, purge
+records, bans, the records of members it invited) is checked against the held
+record's key and skipped when it does not verify; only an owner-signed record
+that fails is an error. So the key a peer holds for an id never changes while
+content checked against it is held, and no merge leaves content that fails
+`verify`.
+
+What this leaves open, stated plainly: the members summary carries ids only,
+so two peers holding different keys for one id never offer each other the
+member record, and each keeps its own. Such a record survives cleanup while
+something keeps the id required (a DM addressed to it, a current secret blob,
+a ban that keeps it as evidence), and nothing signed by the key it displaced
+can end that. If the real member has been pruned on every peer, a member can
+place a record under another key for that id with such a reference and every
+peer takes it, so that member's later records, messages, `member_info`,
+invitees and their subtree are skipped everywhere: a member silencing another
+member. The remedy is the owner removing the inviter of the displacing record.
+Deciding one key per id across peers is freenet/river#991. Two peers holding
+different keys for one id also keep re-offering each other the content the
+other skips, and the split is not confined to that id: the side missing the
+member's messages keeps an older message window (and the members it needs),
+and bans the member issued take effect on one side only. The fork fuzz
+requires such a pair to settle (one more exchange changes neither side) and
+reports what still differs under `FORK_CONTESTED_REPORT`. Three-way merges
+(`(a+b)+c` against `(a+c)+b`) also differ on the first exchange in rooms with
+no shared id at all; that gap is freenet/river#985, not the member-id rule.
+
 A configuration that fails the value checks is the one record that is never
 dropped: an owner-signed one ranks below every valid configuration, so a
 held one is replaced by any valid configuration, or by an invalid one of

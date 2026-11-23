@@ -154,11 +154,31 @@ impl ComposableState for MembersV1 {
             }
             let owner_id = parameters.owner_id();
             let held: HashSet<MemberId> = self.members.iter().map(|m| m.member.id()).collect();
+            // An id held as ban evidence under another key is held too: a
+            // `MemberId` is a non-cryptographic hash, so two keys can share
+            // one, and taking a member record under another key would leave
+            // what the evidenced member signed (its `member_info`, its bans)
+            // checked against a key that never signed it. The same key may
+            // come back as a member; its evidence record then leaves. This
+            // reads the evidence held before this apply, so an evidence record
+            // that this apply's cleanup drops still blocks another key for
+            // one round, deliberately (`member_info` is kept by id).
+            let evidence_keys: HashMap<MemberId, VerifyingKey> = parent_state
+                .ban_evidence
+                .members
+                .iter()
+                .map(|m| (m.member.id(), m.member.member_vk))
+                .collect();
             let mut in_delta = HashSet::new();
             let added: Vec<&AuthorizedMember> = delta
                 .added
                 .iter()
                 .filter(|m| m.member.id() != owner_id)
+                .filter(|m| {
+                    evidence_keys
+                        .get(&m.member.id())
+                        .is_none_or(|vk| *vk == m.member.member_vk)
+                })
                 .filter(|m| !held.contains(&m.member.id()) && in_delta.insert(evidence_digest(m)))
                 .collect();
             if !crate::room_state::work_bounds::lifted() && added.len() > work_bound {
@@ -212,8 +232,10 @@ impl MembersV1 {
     /// an inviter this peer has since pruned, and the next delta re-sends the
     /// record with its inviter (freenet/river#703 defect 2). Each record is
     /// visited once, so the work is linear in the records. Every reached
-    /// added record has its signature checked against its inviter's key, and
-    /// a bad one fails the delta. Held records are kept as they are, reached
+    /// added record has its signature checked against its inviter's key: a
+    /// bad one invited by the owner fails the delta, one invited by a member
+    /// is skipped (another key may share the inviter's id). Held records are
+    /// kept as they are, reached
     /// or not.
     fn resolve_records(
         held: &[AuthorizedMember],
@@ -249,14 +271,6 @@ impl MembersV1 {
                 .push(m);
         }
         let held_ids: HashSet<MemberId> = held.iter().map(|m| m.member.id()).collect();
-        // Every key some held or added record names for each id.
-        let mut by_id_keys: HashMap<MemberId, Vec<VerifyingKey>> = HashMap::new();
-        for m in held.iter().chain(added.iter().copied()) {
-            let keys = by_id_keys.entry(m.member.id()).or_default();
-            if !keys.contains(&m.member.member_vk) {
-                keys.push(m.member.member_vk);
-            }
-        }
         let mut reached: HashSet<MemberId> = HashSet::from([owner_id]);
         let mut kept: BTreeMap<MemberId, &AuthorizedMember> = BTreeMap::new();
         let mut frontier: Vec<(MemberId, VerifyingKey)> = vec![(owner_id, parameters.owner)];
@@ -286,19 +300,19 @@ impl MembersV1 {
                     #[cfg(test)]
                     tests::count_invite_signature_check();
                     if let Err(e) = record.verify_signature(inviter_vk) {
-                        // Signed by the key another record for its inviter's
-                        // id names: skipped, as a record whose inviter record
-                        // this peer does not keep. Otherwise the delta
-                        // fails.
-                        let other_key_signed = by_id_keys
-                            .get(inviter_id)
-                            .into_iter()
-                            .flatten()
-                            .any(|vk| vk != inviter_vk && record.verify_signature(vk).is_ok());
-                        if other_key_signed {
-                            continue;
+                        // Invited by the owner: the owner's key is the only
+                        // key for the owner's id, so this is a forgery and
+                        // the delta fails. Invited by a member: the record
+                        // may be signed by another key with the inviter's id
+                        // (a `MemberId` is a non-cryptographic hash), held by
+                        // a peer that took that key's record first. It is
+                        // skipped, as a record whose inviter this peer does
+                        // not keep; an error would stop this peer taking any
+                        // update from that peer.
+                        if *inviter_id == owner_id {
+                            return Err(format!("Invalid signature for member {:?}: {}", id, e));
                         }
-                        return Err(format!("Invalid signature for member {:?}: {}", id, e));
+                        continue;
                     }
                     if reached.contains(&id) {
                         continue;
@@ -1388,27 +1402,19 @@ impl fmt::Debug for Member {
 
 /*
 `MemberId` is a 64-bit *non-cryptographic* `FastHash` (a Java-style `h*31 + byte`
-polynomial hash) of the member's `VerifyingKey`, NOT a cryptographic digest. The
-8-char base32 `Display` label is lossier still — only 40 of those 64 bits.
+polynomial hash) of the member's `VerifyingKey`, NOT a cryptographic digest, so
+two keys can share one. The 8-char base32 `Display` label is lossier still (40 of
+the 64 bits) and is UI/mention-token only; see `mention.rs`.
 
-Collision cost is therefore modest, not astronomical (an earlier version of this
-comment claimed ~3 * 10^59 years, which was wrong):
-  - 40-bit `Display` label, targeted second-preimage: ~2^40 keypair generations
-    (hours on a GPU / small cluster). Any-collision (birthday): ~2^20, seconds.
-  - Full 64-bit id, targeted: ~2^64 (large but finite brute force over keypairs,
-    not 10^59 years). Any-collision (birthday): ~2^32, ~hours single-core.
-The one thing that keeps this from being trivial is that a usable member needs a
-real keypair (to sign), so the weak hash can't be inverted algebraically — an
-attacker must brute-force by generating ed25519 keypairs and hashing the pubkey.
-
-Why a collision is not a full compromise: authorization is anchored on the full
-ed25519 keys and signatures. `member_vk` carries the full key, and the invite
-chain verifies signatures against the looked-up member's real `member_vk`; a
-member colliding with the owner's id (or full key) is rejected in `verify`. A
-`MemberId` collision buys identity confusion / member-map shadowing (bans,
-invite refs and the member map are keyed by the 64-bit id), NOT signature
-forgery. The cheap 40-bit label is UI/mention-token only and never keys these
-maps. See `mention.rs` for the label's lossy round-trip handling.
+Authorization never rests on an id alone: every signature is checked against a
+full key, and a member colliding with the owner's id (or key) is rejected in
+`verify`. A peer keeps the record for an id that it took first (as a member or
+as ban evidence; a record under another key for a held id is skipped), and
+everything the id signed (its `member_info`, messages, DMs, purge records, bans
+and the records of members it invited) is checked against that record's key and
+skipped when it does not verify, never an error. Two peers that took different
+keys for one id therefore each keep their own and keep exchanging the rest of
+the room; removing the inviter of the record a peer holds clears it there.
 */
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Clone, Ord, PartialOrd, Copy)]
 pub struct MemberId(pub FastHash);
@@ -1827,10 +1833,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// A record whose own signature does not verify rejects the delta,
-    /// whatever else in the delta shares its id, in either order, unless its
-    /// id is already held: a record for a held id is skipped unchecked, since
-    /// the held record is kept whatever arrives (freenet/river#703).
+    /// A record whose own signature does not verify is never stored,
+    /// whatever else in the delta shares its id, in either order. One invited
+    /// by a member is skipped (another key may share its inviter's id); one
+    /// invited by the owner rejects the delta (the owner's key is the only
+    /// key for the owner's id). A record for a held id is skipped unchecked,
+    /// since the held record is kept whatever arrives (freenet/river#703).
     #[test]
     fn a_record_sharing_an_id_with_a_verified_one_is_still_checked() {
         let r = same_id_records();
@@ -1842,9 +1850,31 @@ pub(crate) mod tests {
                 &Some(MembersDelta::new(added)),
             )
         };
-        // Neither record held.
-        assert!(apply(vec![r.b.clone()], vec![r.genuine.clone(), r.other.clone()]).is_err());
-        assert!(apply(vec![r.b.clone()], vec![r.other.clone(), r.genuine.clone()]).is_err());
+        // Neither record held: `other` (invited by `b`) is skipped.
+        for added in [
+            vec![r.genuine.clone(), r.other.clone()],
+            vec![r.other.clone(), r.genuine.clone()],
+        ] {
+            let mut members = MembersV1 {
+                members: vec![r.b.clone()],
+            };
+            members
+                .apply_delta(
+                    &r.parent_state,
+                    &r.parameters,
+                    &Some(MembersDelta::new(added)),
+                )
+                .expect("a member-invited record that does not verify is skipped");
+            assert!(members.members.contains(&r.genuine));
+            assert!(!members.members.contains(&r.other));
+        }
+        // A bad record invited by the owner rejects the delta, in either order.
+        let forged = AuthorizedMember {
+            member: r.genuine.member.clone(),
+            signature: r.y.signature,
+        };
+        assert!(apply(vec![r.b.clone()], vec![r.genuine.clone(), forged.clone()]).is_err());
+        assert!(apply(vec![r.b.clone()], vec![forged, r.genuine.clone()]).is_err());
         // The genuine record held, with a member it invited in the delta.
         let held = vec![r.genuine.clone(), r.b.clone()];
         for added in [

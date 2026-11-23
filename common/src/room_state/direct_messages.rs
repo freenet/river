@@ -1238,7 +1238,21 @@ impl ComposableState for DirectMessagesV1 {
                     // once the member entry is present.
                     None => continue,
                 };
-            advance.verify_signature(&recipient_vk, &parameters.owner)?;
+            if advance
+                .verify_signature(&recipient_vk, &parameters.owner)
+                .is_err()
+            {
+                // The owner's key is the only key for the owner's id, so a
+                // bad owner envelope is a forgery. A member's may be signed
+                // by another key with the same id (a `MemberId` is a
+                // non-cryptographic hash) that a peer holding that key's
+                // record keeps validly: skipped, never an error, which would
+                // stop this peer taking any update from that peer.
+                if advance.recipient_id == owner_id {
+                    advance.verify_signature(&recipient_vk, &parameters.owner)?;
+                }
+                continue;
+            }
 
             let pos = self
                 .purges
