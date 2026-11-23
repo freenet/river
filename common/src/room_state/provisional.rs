@@ -811,17 +811,25 @@ impl ProvisionalV1 {
                 ));
             }
             let owner_id = parameters.owner_id();
-            let known = parent_state
-                .ban_evidence
-                .lookup(&parent_state.members, owner_id);
+            // Every key a `members` or evidence record names for the issuer:
+            // one id can be held under several keys until cleanup decides
+            // (`resolve_shared_ids`), and a ban signed under any is kept
+            // until then.
+            let known = crate::room_state::member::keys_by_member_id(
+                parent_state
+                    .members
+                    .members
+                    .iter()
+                    .chain(&parent_state.ban_evidence.members),
+            );
             for ban in new_bans {
                 if ban.ban.banned_by == owner_id {
                     ban.verify_signature(&parameters.owner, &parameters.owner)?;
                     self.bans.push(ban.clone());
-                } else if let Some(issuer) = known.get(&ban.ban.banned_by) {
-                    if ban
-                        .verify_signature(&parameters.owner, &issuer.member.member_vk)
-                        .is_ok()
+                } else if let Some(keys) = known.get(&ban.ban.banned_by) {
+                    if keys
+                        .iter()
+                        .any(|vk| ban.verify_signature(&parameters.owner, vk).is_ok())
                     {
                         self.bans.push(ban.clone());
                     }

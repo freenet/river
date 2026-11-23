@@ -233,8 +233,13 @@ impl ComposableState for MessagesV1 {
         // `parent_state.members` (final by field order). Others are dropped,
         // as `DirectMessagesV1::apply_delta` does, before the checks below
         // can reject the delta over them. Held messages are not re-checked,
-        // so the cost follows the delta.
-        let members_by_id = parent_state.members.members_by_member_id();
+        // so the cost follows the delta. Every key a `members` record names
+        // for the author counts: a `MemberId` is a non-cryptographic hash, so
+        // one id can be held under several keys until cleanup decides which
+        // it keeps (`resolve_shared_ids`), and a message by either is kept
+        // until then, whichever side of a merge held which record.
+        let members_by_id =
+            crate::room_state::member::keys_by_member_id(&parent_state.members.members);
         let owner_id = parameters.owner_id();
         // The provisional field as held at this point of the apply (every
         // entry that passed arrival, including one in this same delta), so a
@@ -260,8 +265,8 @@ impl ComposableState for MessagesV1 {
             }
             members_by_id
                 .get(author)
-                .map(|m| &m.member.member_vk)
                 .into_iter()
+                .flatten()
                 .chain(provisional_keys.get(author).into_iter().flatten())
                 .any(|key| msg.validate(key).is_ok())
         };

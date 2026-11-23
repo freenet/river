@@ -392,7 +392,7 @@ fn a_trimmed_delta_carries_no_message_whose_author_it_left_out() {
     for m in &msgs {
         let a = m.message.author;
         assert!(
-            a == r.owner || summary.members.contains(&a) || carried.contains(&a),
+            a == r.owner || summary.members.iter().any(|(id, _)| *id == a) || carried.contains(&a),
             "author left out"
         );
     }

@@ -389,7 +389,14 @@ impl ComposableState for BanEvidenceV1 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         let owner_id = parameters.owner_id();
-        let present = parent_state.members.members_by_member_id();
+        // Per (id, key): a `MemberId` is a non-cryptographic hash, so a record
+        // naming another key for a member's id is not that member's record.
+        // It is kept beside it until cleanup decides which key the id keeps
+        // (`ChatRoomStateV1::resolve_shared_ids`).
+        type Slot = (MemberId, [u8; 32]);
+        let slot =
+            |m: &AuthorizedMember| -> Slot { (m.member.id(), m.member.member_vk.to_bytes()) };
+        let present: HashSet<Slot> = parent_state.members.members.iter().map(slot).collect();
         if let Some(delta) = delta {
             // A bound on the work one delta can cause: no state this room's
             // configuration allows holds more evidence (see `verify`), so a
@@ -468,36 +475,35 @@ impl ComposableState for BanEvidenceV1 {
                 // as cleanup would drop it anyway. Otherwise a peer holding
                 // the stale record and a peer holding the resolvable one
                 // ended a merge differently (freenet/river#703).
-                let held: HashMap<MemberId, EvidenceDigest> = self
+                let held: HashMap<Slot, EvidenceDigest> = self
                     .members
                     .iter()
                     .filter(|m| within_depth(m, &combined, owner_id, depth_cap))
-                    .map(|m| (m.member.id(), evidence_digest(m)))
+                    .map(|m| (slot(m), evidence_digest(m)))
                     .collect();
-                // Two valid records for one id resolve the same way on every
-                // peer, whatever order they arrive in: of those whose chains
-                // resolve, the lower digest wins. Per id only the
-                // lowest-digest record that passes the cheap checks is
-                // considered, and only if it would replace what is held, so an
-                // id costs at most one chain check. If it fails, a peer holding
+                // Two valid records for one (id, key) resolve the same way on
+                // every peer, whatever order they arrive in: of those whose
+                // chains resolve, the lower digest wins. Per (id, key) only
+                // the lowest-digest record that passes the cheap checks is
+                // considered, and only if it would replace what is held, so
+                // an (id, key) costs at most one chain check. If it fails, a peer holding
                 // a valid record offers it on the next sync.
-                let mut best: BTreeMap<MemberId, (EvidenceDigest, &AuthorizedMember)> =
-                    BTreeMap::new();
+                let mut best: BTreeMap<Slot, (EvidenceDigest, &AuthorizedMember)> = BTreeMap::new();
                 for m in delta {
                     let id = m.member.id();
                     if id == owner_id
                         || !referenced.contains(&id)
-                        || present.contains_key(&id)
+                        || present.contains(&slot(m))
                         || !within_depth(m, &combined, owner_id, depth_cap)
                     {
                         continue;
                     }
                     let digest = evidence_digest(m);
-                    if held.get(&id).is_some_and(|h| *h <= digest) {
+                    if held.get(&slot(m)).is_some_and(|h| *h <= digest) {
                         continue;
                     }
-                    if best.get(&id).is_none_or(|(d, _)| digest < *d) {
-                        best.insert(id, (digest, m));
+                    if best.get(&slot(m)).is_none_or(|(d, _)| digest < *d) {
+                        best.insert(slot(m), (digest, m));
                     }
                 }
                 let mut verified = HashSet::new();
@@ -518,13 +524,13 @@ impl ComposableState for BanEvidenceV1 {
                 }
                 added
             };
-            let replaced: HashSet<MemberId> = added.iter().map(|m| m.member.id()).collect();
-            self.members.retain(|m| !replaced.contains(&m.member.id()));
+            let replaced: HashSet<Slot> = added.iter().map(slot).collect();
+            self.members.retain(|m| !replaced.contains(&slot(m)));
             self.members.extend(added);
         }
+        self.members.retain(|m| !present.contains(&slot(m)));
         self.members
-            .retain(|m| !present.contains_key(&m.member.id()));
-        self.members.sort_by_key(|m| m.member.id());
+            .sort_by(crate::room_state::member::record_order);
         Ok(())
     }
 }

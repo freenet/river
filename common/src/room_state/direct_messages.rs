@@ -1181,6 +1181,20 @@ impl ComposableState for DirectMessagesV1 {
     ) -> Result<(), String> {
         let owner_id = parameters.owner_id();
         let members_by_id = parent_state.members.members_by_member_id();
+        // Every key a `members` record names for each id. A `MemberId` is a
+        // non-cryptographic hash, so one id can be held under several keys
+        // until cleanup decides which it keeps (`resolve_shared_ids`); a
+        // record signed under any of them is kept until then, so both sides
+        // of a merge keep the same records.
+        let member_keys =
+            crate::room_state::member::keys_by_member_id(&parent_state.members.members);
+        let keys_of = |id: MemberId| -> Vec<VerifyingKey> {
+            if id == owner_id {
+                vec![parameters.owner]
+            } else {
+                member_keys.get(&id).cloned().unwrap_or_default()
+            }
+        };
 
         let Some(delta) = delta else {
             // Sweep unresolvable endpoints, then dedup and re-sort, even when
@@ -1226,19 +1240,30 @@ impl ComposableState for DirectMessagesV1 {
                     MAX_PURGED_TOMBSTONES_PER_RECIPIENT
                 ));
             }
-            let recipient_vk =
-                match resolve_member_vk(advance.recipient_id, owner_id, parameters, &members_by_id)
-                {
-                    Some(vk) => vk,
-                    // Recipient is either not yet a member on this peer
-                    // (member-add and purge envelope arriving in
-                    // separate deltas in the wrong order) or no longer
-                    // a member at all. Silent-drop; a subsequent
-                    // summary-driven sync will deliver the envelope
-                    // once the member entry is present.
-                    None => continue,
-                };
-            advance.verify_signature(&recipient_vk, &parameters.owner)?;
+            let recipient_keys = keys_of(advance.recipient_id);
+            if recipient_keys.is_empty() {
+                // Recipient is either not yet a member on this peer
+                // (member-add and purge envelope arriving in
+                // separate deltas in the wrong order) or no longer
+                // a member at all. Silent-drop; a subsequent
+                // summary-driven sync will deliver the envelope
+                // once the member entry is present.
+                continue;
+            }
+            if !recipient_keys
+                .iter()
+                .any(|vk| advance.verify_signature(vk, &parameters.owner).is_ok())
+            {
+                // The owner's key is the only key for the owner's id, so a
+                // bad owner envelope is a forgery. A member's may be signed
+                // by another key for the same id that this peer does not
+                // hold: skipped, as `MembersV1::resolve_records` skips such a
+                // record.
+                if advance.recipient_id == owner_id {
+                    advance.verify_signature(&parameters.owner, &parameters.owner)?;
+                }
+                continue;
+            }
 
             let pos = self
                 .purges
@@ -1285,19 +1310,19 @@ impl ComposableState for DirectMessagesV1 {
                 continue;
             }
 
-            let sender_vk =
-                match resolve_member_vk(msg.message.sender, owner_id, parameters, &members_by_id) {
-                    Some(vk) => vk,
-                    None => continue, // sender no longer a member - silently drop
-                };
+            let sender_keys = keys_of(msg.message.sender);
+            if sender_keys.is_empty() {
+                continue; // sender no longer a member - silently drop
+            }
 
-            if resolve_member_vk(msg.message.recipient, owner_id, parameters, &members_by_id)
-                .is_none()
-            {
+            if keys_of(msg.message.recipient).is_empty() {
                 continue; // recipient no longer a member - silently drop
             }
 
-            if msg.verify_signature(&sender_vk, &parameters.owner).is_err() {
+            if !sender_keys
+                .iter()
+                .any(|vk| msg.verify_signature(vk, &parameters.owner).is_ok())
+            {
                 continue; // bad signature - silently drop
             }
 

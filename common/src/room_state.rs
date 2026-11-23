@@ -16,6 +16,7 @@ pub mod message;
 pub mod privacy;
 pub mod provisional;
 pub mod secret;
+mod shared_id;
 pub mod upgrade;
 pub mod version;
 
@@ -808,6 +809,14 @@ impl ChatRoomStateV1 {
         {
             self.ban_evidence = pruned;
         }
+        // One key per member id, before anything below reads a record by id:
+        // an id held under two keys (a `MemberId` is a non-cryptographic
+        // hash) keeps the key that has signed something here, and what the
+        // other keys brought goes (`resolve_shared_ids`). It runs after the
+        // keys above are read, so C3 still re-checks an entry whose id a
+        // dropped record held. A no-op when no id is held twice, so it adds
+        // no pass of its own: what it drops is gone before the next pass.
+        self.resolve_shared_ids(parameters);
         // Every record known at the start of this pass: members plus ban
         // evidence. Step 5 and the evidence recomputation read THIS, never the
         // pruned member set, so nothing this pass removes can change which
@@ -1242,7 +1251,9 @@ impl ChatRoomStateV1 {
         );
 
         // 7. Re-sort for deterministic ordering
-        self.members.members.sort_by_key(|m| m.member.id());
+        self.members
+            .members
+            .sort_by(crate::room_state::member::record_order);
         self.member_info
             .member_info
             .sort_by_key(|info| info.member_info.member_id);
@@ -2020,6 +2031,21 @@ fn trim_to_work_bounds(
     // in the records); a record whose chain does not reach the owner sorts
     // last.
     let known = sender.ban_evidence.lookup(&sender.members, owner_id);
+    // Whether the receiver's summary lists the sender's record for `id`
+    // under the same key (a `MemberId` is a non-cryptographic hash, so the
+    // receiver may hold the id under another key, and then needs the
+    // sender's record). An id the sender does not know counts as held when
+    // the summary lists it under any key.
+    let receiver_holds = |id: MemberId| match known.get(&id) {
+        Some(m) => summary
+            .members
+            .contains(&(id, crate::room_state::member::key_tag(&m.member.member_vk))),
+        None => summary
+            .members
+            .range((id, 0)..=(id, u64::MAX))
+            .next()
+            .is_some(),
+    };
     let depth_in_sender = || {
         let mut children: HashMap<MemberId, Vec<MemberId>> = HashMap::new();
         for (id, m) in &known {
@@ -2079,9 +2105,7 @@ fn trim_to_work_bounds(
                 let mut chain: Vec<MemberId> = Vec::new();
                 let mut current = author;
                 let mut complete = true;
-                while current != owner_id
-                    && !summary.members.contains(&current)
-                    && !needed.contains(&current)
+                while current != owner_id && !receiver_holds(current) && !needed.contains(&current)
                 {
                     if chain.len() >= members_bound {
                         complete = false;
@@ -2201,7 +2225,7 @@ fn trim_to_work_bounds(
         msgs.retain(|m| {
             let author = m.message.author;
             author == owner_id
-                || summary.members.contains(&author)
+                || receiver_holds(author)
                 || carried.contains(&author)
                 || held_entries.contains(&author)
                 || carried_entries.contains(&author)

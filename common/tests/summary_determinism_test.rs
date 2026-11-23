@@ -31,7 +31,7 @@ use river_core::room_state::message::{
 };
 use river_core::room_state::secret::SecretsSummary;
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Summary};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 // Reference the ACTUAL associated `Summary` types (not a hard-coded `BTreeSet`),
@@ -93,8 +93,8 @@ fn bans_summary_serialization_is_order_independent() {
 
 #[test]
 fn members_summary_serialization_is_order_independent() {
-    let s_fwd: MemberSummary = (0..N).map(member_id).collect();
-    let s_rev: MemberSummary = (0..N).rev().map(member_id).collect();
+    let s_fwd: MemberSummary = (0..N).map(|i| (member_id(i), i as u64)).collect();
+    let s_rev: MemberSummary = (0..N).rev().map(|i| (member_id(i), i as u64)).collect();
 
     assert_eq!(
         cbor(&s_fwd),
@@ -277,7 +277,9 @@ fn top_level_summary_serialization_is_order_independent() {
     fn build(reversed: bool) -> ChatRoomStateV1Summary {
         let order = |i: i64| if reversed { N - 1 - i } else { i };
         let bans = (0..N).map(|i| ban_id(order(i))).collect();
-        let members = (0..N).map(|i| member_id(order(i))).collect();
+        let members = (0..N)
+            .map(|i| (member_id(order(i)), order(i) as u64))
+            .collect();
         // freenet/river#702: the ban-evidence summary is a BTreeMap of
         // record digests.
         let ban_evidence = (0..N)
@@ -562,11 +564,11 @@ fn ban_evidence_summary_bytes_per_entry() {
     );
 }
 
-/// The members summary carries member ids only (main's shape): a peer keeps
-/// the record it holds for an id, so the summary need not tell two records
-/// apart (freenet/river#703). Measured against the `(id, record digest)`
-/// shape this branch used before that decision, rebuilt from the same
-/// records with real keys.
+/// The members summary carries each id with a 64-bit tag of its key
+/// (`key_tag`): a `MemberId` is a non-cryptographic hash, so two keys can
+/// share one, and an id-only summary never offered a peer holding one key
+/// the record naming the other. Measured against the id-only shape it
+/// replaces, rebuilt from the same records with real keys.
 #[test]
 fn members_summary_bytes_per_entry() {
     use river_core::room_state::member::{AuthorizedMember, Member};
@@ -597,93 +599,51 @@ fn members_summary_bytes_per_entry() {
     let bytes = cbor(&summary).len();
     let per_entry = bytes as f64 / MEMBERS as f64;
 
-    let with_digest: BTreeMap<MemberId, river_core::room_state::ban_evidence::EvidenceDigest> =
-        state
-            .members
-            .iter()
-            .map(|m| {
-                (
-                    m.member.id(),
-                    river_core::room_state::ban_evidence::evidence_digest(m),
-                )
-            })
-            .collect();
-    let digest_bytes = cbor(&with_digest).len();
-    let digest_per_entry = digest_bytes as f64 / MEMBERS as f64;
+    let ids_only: BTreeSet<MemberId> = state.members.iter().map(|m| m.member.id()).collect();
+    let ids_bytes = cbor(&ids_only).len();
+    let ids_per_entry = ids_bytes as f64 / MEMBERS as f64;
 
     println!(
         "members summary over {MEMBERS} members:\n  \
-         ids only:     {bytes} B = {per_entry:.2} B/entry\n  \
-         (id, digest): {digest_bytes} B = {digest_per_entry:.2} B/entry"
+         (id, key tag): {bytes} B = {per_entry:.2} B/entry\n  \
+         ids only:      {ids_bytes} B = {ids_per_entry:.2} B/entry"
     );
 
-    // Measured 9.01 B/entry (4.2 KB at 470 members), against 26.01 for the
-    // (id, digest) shape (12.2 KB): a real key's `MemberId` is about 9 CBOR
-    // bytes, and nothing else goes in an entry.
+    // Measured 19.01 B/entry (8.9 KB at 470 members), against 9.01 for ids
+    // only (4.2 KB): a CBOR pair of the id (about 9 bytes) and the tag (9).
     assert!(
-        per_entry < 9.5,
-        "members summary must carry ids only (got {per_entry:.2} B/entry)"
+        per_entry < 19.5,
+        "members summary entry grew past (id, u64 tag) (got {per_entry:.2} B/entry)"
     );
     assert!(
-        digest_per_entry - per_entry >= 17.0,
-        "the comparison shape must carry a 17-byte digest per entry (got \
-         {digest_per_entry:.2} vs {per_entry:.2} B/entry)"
+        per_entry - ids_per_entry >= 9.0,
+        "every entry must carry the key tag (got {per_entry:.2} vs {ids_per_entry:.2} B/entry)"
     );
 }
 
-/// The bans summary is keyed by each ban's whole-record digest
-/// (freenet/river#703) instead of its signature-only `BanId`. Measured against
-/// the `BanId` shape it replaced, rebuilt from the same bans.
+/// `key_tag` pinned to one fixed key: the hash, the width, the kept bytes,
+/// their order and the encoding are wire format (they decide what a members
+/// delta offers).
 #[test]
-fn bans_summary_bytes_per_entry() {
-    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
-    use std::collections::BTreeSet;
-    const BANS: u64 = 100;
-
-    let owner_sk = SigningKey::from_bytes(blake3::hash(b"owner").as_bytes());
-    let owner_id = MemberId::from(&owner_sk.verifying_key());
-    let bans: Vec<AuthorizedUserBan> = (0..BANS)
-        .map(|i| {
-            let target = SigningKey::from_bytes(blake3::hash(&i.to_le_bytes()).as_bytes());
-            AuthorizedUserBan::new(
-                UserBan {
-                    owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + i),
-                    banned_user: MemberId::from(&target.verifying_key()),
-                },
-                owner_id,
-                &owner_sk,
-            )
-        })
-        .collect();
-    let state = BansV1(bans);
-    let parameters = ChatRoomParametersV1 {
-        owner: owner_sk.verifying_key(),
-    };
-
-    let summary: BanSummary = state.summarize(&ChatRoomStateV1::default(), &parameters);
-    assert_eq!(summary.len() as u64, BANS, "one entry per ban");
-    let bytes = cbor(&summary).len();
-    let per_entry = bytes as f64 / BANS as f64;
-
-    let before: BTreeSet<river_core::room_state::ban::BanId> =
-        state.0.iter().map(|b| b.id()).collect();
-    let before_bytes = cbor(&before).len();
-    let before_per_entry = before_bytes as f64 / BANS as f64;
-
-    println!(
-        "bans summary over {BANS} bans:\n  \
-         before (BanId):         {before_bytes} B = {before_per_entry:.2} B/entry\n  \
-         after  (record digest): {bytes} B = {per_entry:.2} B/entry"
+fn key_tag_golden_vector() {
+    use river_core::room_state::member::key_tag;
+    let vk = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+    let tag = key_tag(&vk);
+    let hash = blake3::hash(vk.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    assert_eq!(tag, u64::from_le_bytes(first));
+    assert_eq!(tag, GOLDEN_KEY_TAG, "key_tag changed: {tag:#018x}");
+    let mut encoded = cbor(&tag);
+    assert_eq!(
+        encoded.remove(0),
+        0x1b,
+        "a u64 tag encodes as a CBOR 8-byte integer here"
     );
-
-    // Measured 9.02 -> 17.02 B/entry at 100 bans: a 16-byte digest is a
-    // 17-byte CBOR byte string per entry, where a `BanId` took about 9.
-    assert!(
-        (17.0..18.0).contains(&per_entry),
-        "each entry must be one 17-byte digest (got {per_entry:.2} B/entry)"
-    );
+    assert_eq!(encoded, GOLDEN_KEY_TAG.to_be_bytes());
 }
+
+const GOLDEN_KEY_TAG: u64 = 0x58e4_26bc_aaf3_7108;
 
 /// The provisional field's summary (freenet/river#974): entries as
 /// `(MemberId, EntryDigest)` pairs and provisional bans as `BanDigest`s,

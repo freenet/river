@@ -654,28 +654,25 @@ impl ComposableState for BansV1 {
             // delta re-adds is verified at step 0 against that issuer's key,
             // and takes no effect if the issuer is banned by a ban that does.
             //
-            // Signatures are still checked here for every NEW ban whose issuer
-            // this peer knows, and one that does not verify is skipped, not
-            // an error: a peer that does not know its issuer holds it validly
-            // (`verify` has no key to check it against there), and an error
-            // would fail every merge with that peer in one direction only.
-            // Held bans are not re-checked here: post_apply_cleanup step 4
-            // sweeps a held ban whose issuer's key does not verify it
-            // (freenet/river#703).
-            let known = parent_state
-                .ban_evidence
-                .lookup(&parent_state.members, parameters.owner_id());
+            // An owner ban's signature is checked here, and one that does not
+            // verify is skipped. A member's ban is kept whatever key this
+            // peer holds for its issuer: bans apply BEFORE members in field
+            // order, and a `MemberId` is a non-cryptographic hash, so the
+            // issuer's record may arrive in this same delta under another key
+            // than the one held here. Cleanup step 0-sig drops, before the
+            // cap or ban resolution reads it, every ban no key known at the
+            // start of the pass verifies, after one key per id has been
+            // decided (`resolve_shared_ids`), so the same bans stand whichever
+            // side of a merge held them. Skipping here instead, against the
+            // pre-update key, made a merge keep the ban in one direction only.
+            // Held bans are not re-checked here: step 4 sweeps a held ban
+            // whose issuer's key does not verify it (freenet/river#703).
             let owner_id = parameters.owner_id();
             self.0.extend(
                 new_bans
                     .into_iter()
                     .filter(|ban| {
-                        let key = if ban.banned_by == owner_id {
-                            Some(parameters.owner)
-                        } else {
-                            known.get(&ban.banned_by).map(|m| m.member.member_vk)
-                        };
-                        key.is_none_or(|vk| ban.verify_signature(&vk).is_ok())
+                        ban.banned_by != owner_id || ban.verify_signature(&parameters.owner).is_ok()
                     })
                     .cloned(),
             );

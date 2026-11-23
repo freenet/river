@@ -45,10 +45,14 @@ fn claimed_as(
     }
 }
 
-/// A new ban whose issuer this peer knows, and whose signature that issuer's
-/// key does not verify (the owner's, or a held member's), is skipped, not an
-/// error: erroring fails the merge one way only, for a peer that does not know
-/// the issuer holds the same ban validly.
+/// A new ban whose signature its claimed issuer's key does not verify is
+/// never refused: erroring fails the merge one way only, for a peer that does
+/// not know the issuer holds the same ban validly. An owner ban is checked on
+/// arrival and skipped. A member's ban is kept by the field apply whatever key
+/// is held for its issuer (bans apply before members, and a `MemberId` can be
+/// shared by two keys, so the issuer's record may arrive in the same delta
+/// under another key), and cleanup step 0-sig drops it, so the room never
+/// holds it after an apply.
 #[test]
 fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
     let o = sk(1);
@@ -68,6 +72,7 @@ fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
     let a_id = a_rec.member.id();
     let target = MemberId::from(&sk(50).verifying_key());
     let parent = ChatRoomStateV1 {
+        configuration: room_config(&o, 10, 10, 10),
         members: MembersV1 {
             members: vec![a_rec],
         },
@@ -87,22 +92,24 @@ fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
     for delta in [
         vec![as_owner.clone()],
         vec![as_member.clone()],
-        vec![as_owner, as_member, genuine.clone()],
+        vec![as_owner.clone(), as_member.clone(), genuine.clone()],
     ] {
         let mut bans = BansV1(vec![]);
         bans.apply_delta(&parent, &params, &Some(delta.clone()))
-            .expect("a ban its known issuer's key does not verify is skipped, not refused");
-        let kept: Vec<_> = bans.0.iter().collect();
-        if delta.contains(&genuine) {
-            assert_eq!(kept, vec![&genuine], "only the genuine ban is kept");
-        } else {
-            assert!(kept.is_empty(), "the ban is not stored");
-        }
+            .expect("a ban its known issuer's key does not verify is not refused");
+        assert!(!bans.0.contains(&as_owner), "a bad owner ban is skipped");
+        let mut room = parent.clone();
+        room.bans = bans;
+        room.post_apply_cleanup(&params).unwrap();
+        assert!(
+            !room.bans.0.contains(&as_member) && !room.bans.0.contains(&as_owner),
+            "cleanup drops a ban its issuer's key does not verify"
+        );
     }
 }
 
 /// A ban claiming an issuer known here only through ban evidence (a
-/// removed member whose record a stored ban still needs) is skipped too.
+/// removed member whose record a stored ban still needs) is dropped too.
 #[test]
 fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
     use river_core::room_state::ban_evidence::BanEvidenceV1;
@@ -122,6 +129,7 @@ fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
     );
     let e_id = e_rec.member.id();
     let parent = ChatRoomStateV1 {
+        configuration: room_config(&o, 10, 10, 10),
         ban_evidence: BanEvidenceV1 {
             members: vec![e_rec],
         },
@@ -139,9 +147,16 @@ fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
         &e,
     );
     let mut bans = BansV1(vec![]);
-    bans.apply_delta(&parent, &params, &Some(vec![unverified, genuine.clone()]))
-        .expect("skipped, not refused");
-    assert_eq!(bans.0, vec![genuine]);
+    bans.apply_delta(
+        &parent,
+        &params,
+        &Some(vec![unverified.clone(), genuine.clone()]),
+    )
+    .expect("not refused");
+    let mut room = parent.clone();
+    room.bans = bans;
+    room.post_apply_cleanup(&params).unwrap();
+    assert!(!room.bans.0.contains(&unverified));
 }
 
 fn room_config(

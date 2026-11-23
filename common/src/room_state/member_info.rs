@@ -512,9 +512,17 @@ impl ComposableState for MemberInfoV1 {
             // the provisional entries held at this point of the apply, so a
             // provisional member's first record is accepted with its entry
             // (freenet/river#974).
-            let known = parent_state
-                .ban_evidence
-                .lookup(&parent_state.members, parameters.owner_id());
+            // Every key a `members` or evidence record names for each id: a
+            // `MemberId` is a non-cryptographic hash, so one id can be held
+            // under several keys until cleanup decides
+            // (`resolve_shared_ids`).
+            let known = crate::room_state::member::keys_by_member_id(
+                parent_state
+                    .members
+                    .members
+                    .iter()
+                    .chain(&parent_state.ban_evidence.members),
+            );
             let provisional_keys = parent_state
                 .provisional
                 .admitted_keys(&parent_state.configuration.configuration, &parameters.owner);
@@ -554,20 +562,21 @@ impl ComposableState for MemberInfoV1 {
                     // member held in ban evidence counts (freenet/river#702): its
                     // record keeps merging by rank like any other. Freezing it
                     // at removal cannot converge, see `BanEvidenceV1`.
-                    // The keys the id may sign with here: its `members` or
-                    // evidence record's, and those of its held entries that
+                    // The keys the id may sign with here: its `members` and
+                    // evidence records', and those of its held entries that
                     // pass the current policy (freenet/river#974). A record
                     // that verifies under none of them is skipped, never an
                     // error: another key may hold the same id on this peer
                     // (see the `MemberId` docs), and an error would fail every
                     // merge with a peer holding the other record. Which key
-                    // the id ends with is decided by cleanup (C1, C2, C3), so
+                    // the id ends with is decided by cleanup (C1, C2, C3,
+                    // `resolve_shared_ids`), so
                     // an arrival is never skipped over a record or entry that
                     // cleanup goes on to drop.
                     let mut keys = known
                         .get(member_id)
-                        .map(|m| &m.member.member_vk)
                         .into_iter()
+                        .flatten()
                         .chain(provisional_keys.get(member_id).into_iter().flatten())
                         .peekable();
                     if keys.peek().is_none() {
