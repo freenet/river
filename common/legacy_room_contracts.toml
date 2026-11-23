@@ -271,3 +271,9 @@ version = "V39"
 description = "Last room-contract generation before open admission to public rooms (provisional members, freenet/river#974): no provisional field, no public_admission policy"
 date = "2026-11-22"
 code_hash = "bc9b4066fccc37435556295871c567e455b48832eb0a72623d399b354471aef5"
+
+[[entry]]
+version = "V40"
+description = "Open-admission room contract (freenet/river#974, merged as #979), the last generation before member content was checked against the key that holds the id"
+date = "2026-11-23"
+code_hash = "86c0fce06032efc32c024f3cb03b767f399592c5464272f677fa48567c1b10bf"
