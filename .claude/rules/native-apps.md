@@ -75,6 +75,10 @@ Anything the app stores in the chat delegate must stay decodable by the web UI b
 
 When a pointer record names a generation newer than the WASM the app carries, the app stops writing and asks the user to update (`apps/river-app/src/rooms/generation.rs`).
 
+## The update key
+
+The public key River's self-update trusts is committed in `apps/desktop/update-pubkey.hex` and compiled into each release build; `.github/workflows/release-desktop.yml` reads it into `RIVER_UPDATE_PUBKEY_HEX` for the Build step and the tag check compares the built binary's key with the file. The repository variable of that name is no longer used. Rotating the key is a new release: `update_tool keygen`, commit the public half by reviewed PR, keep the private half in `~/.freenet-signing` and 1Password. `build.rs` deliberately has no fallback to the file (tests and `apps/scripts/update-ci.sh` build with their own or no key).
+
 ## What it shares with the root workspace
 
 It depends on `river-core` (`common/`) by path, with the client-only features `ecies-randomized`, `ecies-client`, `mentions`, `stored-rooms` and `invitation`. A change under `common/`, or to the root `Cargo.toml` (river-core inherits versions from it), runs `apps.yml`.
