@@ -41,7 +41,6 @@ use dioxus::prelude::*;
 use ed25519_dalek::{Signature, VerifyingKey};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1};
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 pub(crate) static OUTBOX: GlobalSignal<Outbox> = Global::new(Outbox::default);
 
@@ -169,12 +168,20 @@ impl PendingEntry {
         })
     }
 
-    /// When the user acted (the first message's timestamp).
-    pub fn time(&self) -> SystemTime {
-        self.messages
-            .first()
-            .map(|m| m.message.time)
-            .unwrap_or(SystemTime::UNIX_EPOCH)
+    /// This entry as the composer shows it, if it is a composer send.
+    fn send_row(&self) -> Option<PendingRow> {
+        match &self.kind {
+            PendingKind::Send { text, reply } => Some(PendingRow {
+                id: self.id,
+                text: text.clone(),
+                reply: reply.clone(),
+                failed: match &self.state {
+                    PendingState::Failed(reason) => Some(reason.clone()),
+                    PendingState::Signing => None,
+                },
+            }),
+            PendingKind::Action { .. } => None,
+        }
     }
 }
 
@@ -235,7 +242,6 @@ pub(crate) struct PendingRow {
     pub id: u64,
     pub text: String,
     pub reply: Option<super::ReplyContext>,
-    pub time: SystemTime,
     pub failed: Option<String>,
 }
 
@@ -594,33 +600,30 @@ impl Outbox {
     }
 
     /// `author`'s composer messages waiting in `room`, in the order they were
-    /// sent (see `pending_effects` for why only `author`'s).
+    /// sent (see `pending_effects` for why only `author`'s). The whole queue,
+    /// for tests: the composer looks up one send (`composer_send`).
+    #[cfg(test)]
     pub fn pending_rows(&self, room: &VerifyingKey, author: &VerifyingKey) -> Vec<PendingRow> {
         self.rooms
             .get(room)
             .into_iter()
             .flatten()
             .filter(|e| e.author_vk == *author)
-            .filter_map(|e| match &e.kind {
-                PendingKind::Send { text, reply } => Some(PendingRow {
-                    id: e.id,
-                    text: text.clone(),
-                    reply: reply.clone(),
-                    time: e.time(),
-                    failed: match &e.state {
-                        PendingState::Failed(reason) => Some(reason.clone()),
-                        PendingState::Signing => None,
-                    },
-                }),
-                PendingKind::Action { .. } => None,
-            })
+            .filter_map(PendingEntry::send_row)
             .collect()
     }
 
-    /// The composer's send in `room` as `author`, if one is waiting: the
-    /// newest, since the composer submits one at a time.
+    /// The composer's send in `room` as `author`, if one is waiting, failed
+    /// or not: the newest, since the composer submits one at a time (see
+    /// `pending_effects` for why only `author`'s). Walks the queue from the
+    /// end and copies only that send.
     pub fn composer_send(&self, room: &VerifyingKey, author: &VerifyingKey) -> Option<PendingRow> {
-        self.pending_rows(room, author).pop()
+        self.rooms
+            .get(room)?
+            .iter()
+            .rev()
+            .filter(|e| e.author_vk == *author)
+            .find_map(PendingEntry::send_row)
     }
 }
 

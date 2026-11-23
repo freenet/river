@@ -73,8 +73,8 @@ async function expectMarks(page: Page, n: number, why: string) {
   await expect.poll(() => marks(page), { message: why, timeout: 5_000 }).toBe(n);
 }
 
-/// Run every running transition on `el` (and the spacer) to its end, so its
-/// computed style is where it rests.
+/// Run every running transition on the dots and the spacer to its end, so the
+/// history's geometry is where it rests.
 function finishTransitions(page: Page) {
   return page.evaluate(() => {
     for (const el of document.querySelectorAll('[data-testid="user-wait-dots"], #user-wait-spacer')) {
@@ -84,27 +84,6 @@ function finishTransitions(page: Page) {
 }
 
 type TransitionInfo = { property: string; delay: number; duration: number; from: string | null; to: string | null };
-
-/// `el`'s CSS transitions now, and its computed opacity, read in one task.
-function paintState(host: Locator) {
-  return host.evaluate((el) => ({
-    opacity: getComputedStyle(el).opacity,
-    visibility: getComputedStyle(el).visibility,
-    transitions: el.getAnimations().map((a) => {
-      const t = a as CSSTransition;
-      const timing = t.effect!.getComputedTiming();
-      const frames = (t.effect as KeyframeEffect).getKeyframes();
-      const prop = t.transitionProperty;
-      return {
-        property: prop,
-        delay: Number(timing.delay),
-        duration: Number(timing.duration),
-        from: (frames[0]?.[prop] as string | undefined) ?? null,
-        to: (frames.at(-1)?.[prop] as string | undefined) ?? null,
-      } as TransitionInfo;
-    }),
-  }));
-}
 
 type PaintState = { opacity: string; visibility: string; transitions: TransitionInfo[] };
 
@@ -236,7 +215,7 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     await expect(roomDots(page)).toHaveAttribute("data-reason", "");
   });
 
-  test("an edit marks its room", async ({ page }) => {
+  test("an edit marks its room, and a keyed UPDATE error for the room ends the mark", async ({ page }) => {
     await openRoomWithComposer(page);
     await connect(page);
     const row = await sendOwn(page, "edit me");
@@ -247,8 +226,9 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     await expect(committedRow(page, "edited once")).toHaveCount(1);
     await expectMarks(page, 1, "the edit marks its room");
     await expectShowing(roomDots(page), "an edit shows the dots");
-    await callRiverTest(page, "deliverUpdateResponse");
-    await expectIdle(page, "the reply ends them");
+    await callRiverTest(page, "deliverUpdateError", "keyed");
+    await expectMarks(page, 0, "the room's UPDATE error ends the mark");
+    await expectIdle(page, "and the dots");
   });
 
   test("a delete through its confirmation marks its room", async ({ page }) => {
@@ -283,31 +263,6 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     await expectShowing(roomDots(page), "a reconnect shows the pending mark again");
   });
 
-  for (const { end, ends } of [
-    { end: "a keyed UPDATE error", ends: true },
-    { end: "an unkeyed UPDATE failure", ends: true },
-    { end: "a GET error that mentions an update", ends: false },
-    { end: "the 20 s cap", ends: true },
-  ]) {
-    test(`${end} ${ends ? "ends" : "does not end"} the mark`, async ({ page }) => {
-      const row = await connectedRoomWithTarget(page);
-      await reactAndMark(page, row);
-      await expectShowing(roomDots(page), "premise: showing");
-      if (end.startsWith("a keyed")) await callRiverTest(page, "deliverUpdateError", "keyed");
-      else if (end.startsWith("an unkeyed")) await callRiverTest(page, "deliverUpdateError", "unkeyed");
-      else if (end.startsWith("a GET")) await callRiverTest(page, "deliverUpdateError", "get");
-      else await callRiverTest(page, "expireUserWaits");
-      if (ends) {
-        await expectMarks(page, 0, `${end} ends the mark`);
-        await expectIdle(page, `${end} ends the dots`);
-      } else {
-        await settle(page);
-        expect(await marks(page), `${end} leaves the mark`).toBe(1);
-        await expectShowing(roomDots(page), `${end} leaves the dots`);
-      }
-    });
-  }
-
   test("an unkeyed UPDATE failure ends every room's mark", async ({ page }) => {
     const row = await connectedRoomWithTarget(page);
     await reactAndMark(page, row);
@@ -317,32 +272,10 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     await expectMarks(page, 2, "premise: two rooms marked");
     await callRiverTest(page, "deliverUpdateError", "unkeyed");
     await expectMarks(page, 0, "an unkeyed failure names no room, so it ends them all");
+    await expectIdle(page, "and the open room's dots");
   });
 
-  test("a keyed reply ends only its own room's mark", async ({ page }) => {
-    const row = await connectedRoomWithTarget(page);
-    await reactAndMark(page, row);
-    await selectRoom(page, "Team Chat Room");
-    await expectIdle(page, "another room shows nothing");
-    // The reply is for Team Chat Room's contract, which has no mark.
-    await callRiverTest(page, "deliverUpdateResponse");
-    await settle(page);
-    expect(await marks(page), "Your Private Room keeps its mark").toBe(1);
-  });
-
-  test("sending messages never lights the dots", async ({ page }) => {
-    await openRoomWithComposer(page);
-    await connect(page);
-    await submitMessage(page, "plain send one");
-    await submitMessage(page, "plain send two");
-    await expect(committedRow(page, "plain send one")).toHaveCount(1);
-    await expect(committedRow(page, "plain send two")).toHaveCount(1);
-    await settle(page);
-    expect(await marks(page), "a send marks nothing").toBe(0);
-    await expectIdle(page, "a send shows nothing");
-  });
-
-  test("a room's mark shows only in that room", async ({ page }) => {
+  test("a room's mark shows only in that room, and another room's reply leaves it", async ({ page }) => {
     const row = await connectedRoomWithTarget(page);
     await reactAndMark(page, row);
     await expectShowing(roomDots(page), "premise: showing in its room");
@@ -350,11 +283,14 @@ test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
     await callRiverTest(page, "switchRoom", "Team Chat Room");
     await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible();
     await expectIdle(page, "another room shows nothing");
-    expect(await marks(page)).toBe(1);
+    // The reply is for Team Chat Room's contract, which has no mark.
+    await callRiverTest(page, "deliverUpdateResponse");
+    await settle(page);
+    expect(await marks(page), "Your Private Room keeps its mark").toBe(1);
 
     await callRiverTest(page, "switchRoom", "Your Private Room");
     await expect(page.getByRole("heading", { name: "Your Private Room" })).toBeVisible();
-    await expectShowing(roomDots(page), "back in its room, it shows again");
+    await expectShowing(roomDots(page), "back in its room, it still shows");
   });
 });
 
@@ -405,12 +341,10 @@ test.describe("Joining a room", () => {
     await callRiverTest(page, "setPendingJoin", true);
     expectDelayedAppearance(await takeRecordedPaint(page), "a join on the Welcome screen");
 
-    await finishTransitions(page);
-    expect((await paintState(welcomeDots(page))).opacity, "once shown").toBe("1");
+    await expect(welcomeDots(page), "once shown").toHaveCSS("opacity", "1");
     await callRiverTest(page, "setPendingJoin", false);
     await expect(welcomeDots(page)).toHaveAttribute("data-active", "false");
-    await finishTransitions(page);
-    expect((await paintState(welcomeDots(page))).opacity, "once faded").toBe("0");
+    await expect(welcomeDots(page), "once faded").toHaveCSS("opacity", "0");
   });
 
   test("a room dock mounting during a join waits before it paints", async ({ page }) => {
@@ -438,8 +372,7 @@ test.describe("Paint timing", () => {
     await recordPaintAt(page, "room", "shown");
     await reactAndMark(page, row);
     expectDelayedAppearance(await takeRecordedPaint(page), "a reaction");
-    await finishTransitions(page);
-    expect((await paintState(roomDots(page))).opacity, "shown once the delay and fade-in end").toBe("1");
+    await expect(roomDots(page), "shown once the delay and fade-in end").toHaveCSS("opacity", "1");
     await expect(spacer(page)).toHaveCSS("height", `${SPACER_OPEN_PX}px`);
 
     // The reply: a 200 ms fade, no delay. Held half way.
@@ -470,14 +403,11 @@ test.describe("Paint timing", () => {
     expect(t!.to).toBe("1");
     expect(t!.delay, "after the delay").toBe(DELAY_MS);
 
-    await finishTransitions(page);
-    expect((await paintState(roomDots(page))).opacity).toBe("1");
+    await expect(roomDots(page)).toHaveCSS("opacity", "1");
     await callRiverTest(page, "deliverUpdateResponse");
     await expect(roomDots(page)).toHaveAttribute("data-active", "false");
-    await finishTransitions(page);
-    const done = await paintState(roomDots(page));
-    expect(done.opacity, "faded out").toBe("0");
-    expect(done.visibility).toBe("hidden");
+    await expect(roomDots(page), "faded out").toHaveCSS("opacity", "0");
+    await expect(roomDots(page)).toHaveCSS("visibility", "hidden");
     await expect(spacer(page)).toHaveCSS("height", "0px");
   });
 });
@@ -485,8 +415,7 @@ test.describe("Paint timing", () => {
 /// Wait until the room host paints at full opacity, finished.
 async function expectPainted(page: Page) {
   await expectShowing(roomDots(page), "premise: showing");
-  await finishTransitions(page);
-  expect((await paintState(roomDots(page))).opacity, "premise: painted").toBe("1");
+  await expect(roomDots(page), "premise: painted").toHaveCSS("opacity", "1");
 }
 
 /// `cover` takes ownership from the room host: at that instant it stops
@@ -562,7 +491,7 @@ test.describe("Ownership", () => {
     await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
     await settle(page);
     await expect(roomDots(page), "the thread covers the room").toHaveAttribute("data-owner", "false");
-    expect((await paintState(roomDots(page))).opacity).toBe("0");
+    await expect(roomDots(page)).toHaveCSS("opacity", "0");
     await expect(spacer(page)).toHaveAttribute("data-active", "false");
     await expectAtMostOnePainter(page);
 

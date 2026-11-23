@@ -234,17 +234,14 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
     }
     if any_applied {
         crate::util::debug_log("[send] delta applied OK, marking NEEDS_SYNC");
-        // Only an edit, delete or reaction lights the room's wait dots; a
-        // send-only batch just queues its sync. Either way the sync is queued
-        // synchronously, here (`mark_needs_sync`).
-        if action_applied {
-            crate::components::app::user_waits::mark_user_change(
-                room,
-                crate::components::app::user_waits::ActionKind::Sending,
-            );
-        } else {
-            crate::components::app::mark_needs_sync(room);
-        }
+        // Queued synchronously, here, so the reload protection it gives is
+        // not delayed by a task hop.
+        crate::components::app::mark_needs_sync(room);
+    }
+    if action_applied {
+        // Only an edit, delete or reaction lights the room's wait dots, and
+        // restarts its cap; the feedback mark itself is deferred.
+        crate::components::app::user_waits::mark_user_change(room);
     }
 }
 

@@ -440,9 +440,10 @@ pub fn install_test_hooks() {
     );
 
     // The room wait feedback's inputs (`user_waits.rs`), at its adapters: an
-    // UPDATE reply for the current room's contract, an UPDATE error as the
-    // socket would report it (classified by the production classifier), and
-    // the 20 s cap reached. Real-node checks cover the call sites themselves.
+    // UPDATE reply for the current room's contract, and an UPDATE error as the
+    // socket would report it (classified by the production classifier). The
+    // native wait-state tests cover GET errors and the 20 s cap; real-node
+    // checks cover the call sites themselves.
     set_hook(
         "deliverUpdateResponse",
         Closure::<dyn FnMut()>::new(move || {
@@ -477,10 +478,6 @@ pub fn install_test_hooks() {
                 "unkeyed" => ErrorKind::OperationError {
                     cause: "UPDATE failed: timed out (test)".into(),
                 },
-                "get" => ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
-                    key,
-                    cause: "update failed (test)".into(),
-                })),
                 other => wasm_bindgen::throw_str(&format!("unknown UPDATE error kind {other:?}")),
             };
             if let Some(failure) =
@@ -488,20 +485,6 @@ pub fn install_test_hooks() {
             {
                 crate::components::app::user_waits::note_update_failure(failure);
             }
-        })
-        .into_js_value(),
-    );
-    set_hook(
-        "expireUserWaits",
-        Closure::<dyn FnMut()>::new(move || {
-            crate::util::defer(|| {
-                use crate::components::app::user_waits::{FEEDBACK_CAP_MS, USER_WAITS};
-                let now = crate::util::get_current_system_time()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                USER_WAITS.with_mut(|w| w.sweep(now + FEEDBACK_CAP_MS));
-            });
         })
         .into_js_value(),
     );

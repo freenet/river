@@ -2,7 +2,7 @@ use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::RoomMessageBody;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 fn room() -> VerifyingKey {
     SigningKey::from_bytes(&[1u8; 32]).verifying_key()
@@ -63,11 +63,6 @@ fn a_send_shows_as_pending_until_its_signature_arrives_then_commits_once() {
     assert_eq!(rows[0].text, "hello");
     assert_eq!(rows[0].reply, None);
     assert_eq!(rows[0].failed, None);
-    assert_eq!(
-        rows[0].time,
-        SystemTime::UNIX_EPOCH + Duration::from_millis(10),
-        "the row keeps the time the user sent it"
-    );
     assert!(
         outbox.take_ready(&room()).is_empty(),
         "nothing commits before it is signed"
@@ -142,6 +137,56 @@ fn a_failed_message_stays_and_does_not_hold_back_later_ones() {
     assert_eq!(rows.len(), 1, "the failed text is kept, never dropped");
     assert_eq!(rows[0].text, "a");
     assert_eq!(rows[0].failed.as_deref(), Some("no signing key"));
+}
+
+/// The composer shows one send: the newest by the room's current identity,
+/// failed or not, never an action or another identity's send.
+#[test]
+fn the_composer_send_is_the_newest_send_by_the_author_failed_or_not() {
+    let mut outbox = Outbox::default();
+    let me = author().verifying_key();
+    assert_eq!(outbox.composer_send(&room(), &me), None, "nothing waits");
+
+    let (a, _) = send(&mut outbox, "a", 1);
+    let (b, _) = send(&mut outbox, "b", 2);
+    outbox.enqueue(
+        room(),
+        PendingKind::Action {
+            label: "edit",
+            effects: vec![],
+        },
+        me,
+        vec![message("edit", 3)],
+    );
+    let other = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+    outbox.enqueue(
+        room(),
+        PendingKind::Send {
+            text: "someone else".to_string(),
+            reply: None,
+        },
+        other,
+        vec![message("someone else", 4)],
+    );
+
+    let shown = outbox.composer_send(&room(), &me).expect("b waits");
+    assert_eq!((shown.id, shown.text.as_str()), (b, "b"));
+    assert_eq!(shown.failed, None);
+
+    outbox.record_failure(&room(), b, "timed out".to_string());
+    let shown = outbox
+        .composer_send(&room(), &me)
+        .expect("b failed, still shown");
+    assert_eq!(shown.id, b, "a failed send is still found, to take back");
+    assert_eq!(shown.failed.as_deref(), Some("timed out"));
+
+    outbox.discard(&room(), b);
+    assert_eq!(outbox.composer_send(&room(), &me).map(|r| r.id), Some(a));
+    assert_eq!(
+        outbox.composer_send(&room(), &other).map(|r| r.text),
+        Some("someone else".to_string()),
+        "each identity sees only its own"
+    );
 }
 
 #[test]

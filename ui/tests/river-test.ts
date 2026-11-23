@@ -94,11 +94,10 @@ type RiverTestHooks = {
   // The automatic generation reload's busy check, the production predicate.
   userIsBusy(): Promise<boolean>;
   // Room wait feedback (user_waits.rs), at its adapters: an UPDATE reply for the
-  // current room's contract; an UPDATE error the socket could report ("get" is a
-  // GET failure, which must not count); every mark past its 20s cap.
+  // current room's contract; an UPDATE error the socket could report, naming the
+  // current room's contract ("keyed") or no contract ("unkeyed").
   deliverUpdateResponse(): void;
-  deliverUpdateError(kind: "keyed" | "unkeyed" | "get"): void;
-  expireUserWaits(): void;
+  deliverUpdateError(kind: "keyed" | "unkeyed"): void;
   // Rooms with a wait mark, read without rendering.
   userWaitRooms(): number;
   // An accepted invitation subscribing (true) or none (false).

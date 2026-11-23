@@ -16,15 +16,15 @@
 //!
 //! # One visible host
 //!
-//! The reason is shared; exactly one surface may paint it, chosen by
-//! [`visible_surface`]: the frontmost covering action surface (an app modal,
-//! the room's delete confirmation, the DM thread, the mobile message sheet),
-//! else the mobile panel that replaces the chat, else the open room's dock
-//! above the composer, else the Welcome screen's slot. This plan mounts the
-//! room dock and the Welcome slot; a covered surface paints nothing here (its
-//! own slot is mounted by the plan that tracks its actions), so covering a
-//! room hides its dots at once rather than leaving them under a translucent
-//! backdrop.
+//! The reason is shared; a mounted host paints it only while nothing covers
+//! it (`covered`): an app modal, the room's delete confirmation, the DM
+//! thread, the mobile message sheet, or, below 48rem, the Rooms or Members
+//! panel that replaces the chat. At 48rem and wider the Members panel sits
+//! beside the chat and covers nothing. This plan mounts the room dock and the
+//! Welcome slot, which are never on screen together; a covering surface
+//! paints nothing here (its own slot is mounted by the plan that tracks its
+//! actions), so covering a room hides its dots at once rather than leaving
+//! them under a translucent backdrop.
 //!
 //! Each host stays mounted and says two things: whether there is activity
 //! (`data-active`, logical, which also drives the room spacer) and whether it
@@ -55,7 +55,7 @@ use dioxus::prelude::*;
 use std::{cell::Cell, rc::Rc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UserWaitReason {
+enum UserWaitReason {
     JoiningRoom,
     SendingRoomChange,
 }
@@ -83,44 +83,21 @@ fn reason(connected: bool, joining: bool, room_change: bool) -> Option<UserWaitR
     }
 }
 
-/// Where the shared dots may paint, frontmost first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Surface {
-    Modal,
-    DmThread,
-    MobileSheet,
-    MobilePanel,
-    Room,
-    Welcome,
-}
-
-/// What covers the conversation now.
+/// What may cover the conversation, and so the mounted host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Covering {
+struct Covering {
     /// An app modal or the room's delete confirmation.
-    pub modal: bool,
-    pub dm_thread: bool,
+    modal: bool,
+    dm_thread: bool,
     /// The mobile message sheet (below 48rem).
-    pub mobile_sheet: bool,
-    /// Below 48rem, the Rooms or Members panel instead of the chat. (At
-    /// 48rem and wider the Members panel sits beside the chat and covers
-    /// nothing.)
-    pub mobile_panel: bool,
+    mobile_sheet: bool,
+    /// Below 48rem, the Rooms or Members panel instead of the chat.
+    mobile_panel: bool,
 }
 
-pub(crate) fn visible_surface(covering: Covering, room_open: bool) -> Surface {
-    if covering.modal {
-        Surface::Modal
-    } else if covering.dm_thread {
-        Surface::DmThread
-    } else if covering.mobile_sheet {
-        Surface::MobileSheet
-    } else if covering.mobile_panel {
-        Surface::MobilePanel
-    } else if room_open {
-        Surface::Room
-    } else {
-        Surface::Welcome
+impl Covering {
+    fn covered(self) -> bool {
+        self.modal || self.dm_thread || self.mobile_sheet || self.mobile_panel
     }
 }
 
@@ -134,8 +111,8 @@ pub(crate) struct LocalModals {
 }
 
 /// What covers the conversation, read fallibly: `None` when an input is
-/// contended (and a nudge is scheduled; the caller has anchored).
-fn covering_now(local_modal: bool) -> Option<Covering> {
+/// contended (the caller has anchored and schedules the nudge).
+fn covering_now(delete_confirmation: bool, mobile_sheet: bool) -> Option<Covering> {
     let local_modals = match try_consume_context::<LocalModals>() {
         Some(m) => {
             m.receive_invitation.try_read().ok()?.is_some()
@@ -154,48 +131,16 @@ fn covering_now(local_modal: bool) -> Option<Covering> {
     let mobile_panel = crate::components::conversation::narrow_window_for_render()
         && *MOBILE_VIEW.try_read().ok()? != MobileView::Chat;
     Some(Covering {
-        modal: app_modal || local_modal,
+        modal: app_modal || delete_confirmation,
         dm_thread,
-        mobile_sheet: false,
+        mobile_sheet,
         mobile_panel,
     })
 }
 
-/// The surface that owns the dots now. `delete_confirmation` and
-/// `mobile_sheet` are what only the conversation knows.
-fn surface_for_render(
-    last_good: &Rc<Cell<Option<Covering>>>,
-    delete_confirmation: bool,
-    mobile_sheet: bool,
-    room_open: bool,
-) -> Surface {
-    signal_guard::anchor();
-    let covering = match covering_now(delete_confirmation) {
-        Some(covering) => {
-            last_good.set(Some(covering));
-            covering
-        }
-        None => {
-            signal_guard::schedule_nudge();
-            // As last seen; never seen: assume covered, so nothing paints.
-            last_good.get().unwrap_or(Covering {
-                modal: true,
-                ..Covering::default()
-            })
-        }
-    };
-    visible_surface(
-        Covering {
-            mobile_sheet,
-            ..covering
-        },
-        room_open,
-    )
-}
-
 /// The current reason, shared by every host. A contended input keeps the
 /// last good reason for this mounted host.
-pub(crate) fn use_user_wait_reason() -> Option<UserWaitReason> {
+fn use_user_wait_reason() -> Option<UserWaitReason> {
     let snapshot = use_memo(move || {
         signal_guard::anchor();
         let Ok(connected) = SYNC_STATUS
@@ -209,10 +154,13 @@ pub(crate) fn use_user_wait_reason() -> Option<UserWaitReason> {
             signal_guard::schedule_nudge();
             return None;
         };
-        let room = CURRENT_ROOM.read().owner_key;
+        let Ok(room) = CURRENT_ROOM.try_read().map(|c| c.owner_key) else {
+            signal_guard::schedule_nudge();
+            return None;
+        };
         let Ok(room_change) = USER_WAITS
             .try_read()
-            .map(|w| room.is_some_and(|room| w.active(&room).is_some()))
+            .map(|w| room.is_some_and(|room| w.is_waiting(&room)))
         else {
             signal_guard::schedule_nudge();
             return None;
@@ -230,6 +178,28 @@ pub(crate) fn use_user_wait_reason() -> Option<UserWaitReason> {
         Err(_) => signal_guard::schedule_nudge(),
     }
     last_good.get()
+}
+
+/// A mounted host's state: whether it owns the dots (nothing covers it) and
+/// the current reason. A contended input keeps the last good covering; one
+/// never read counts as covered, so nothing paints. `delete_confirmation`
+/// and `mobile_sheet` are what only the conversation knows.
+fn use_host_state(delete_confirmation: bool, mobile_sheet: bool) -> (bool, Option<UserWaitReason>) {
+    let reason = use_user_wait_reason();
+    let last_covered = use_hook(|| Rc::new(Cell::new(None)));
+    signal_guard::anchor();
+    let covered = match covering_now(delete_confirmation, mobile_sheet) {
+        Some(covering) => {
+            let covered = covering.covered();
+            last_covered.set(Some(covered));
+            covered
+        }
+        None => {
+            signal_guard::schedule_nudge();
+            delete_confirmation || mobile_sheet || last_covered.get().unwrap_or(true)
+        }
+    };
+    (!covered, reason)
 }
 
 /// One host: decorative, always mounted where it is used.
@@ -253,10 +223,7 @@ fn UserWaitDots(surface: &'static str, owner: bool, reason: Option<UserWaitReaso
 /// column, taking no hits, under Latest.
 #[component]
 pub(crate) fn RoomWaitDock(delete_confirmation: bool, mobile_sheet: bool) -> Element {
-    let reason = use_user_wait_reason();
-    let last_good = use_hook(|| Rc::new(Cell::new(None)));
-    let owner =
-        surface_for_render(&last_good, delete_confirmation, mobile_sheet, true) == Surface::Room;
+    let (owner, reason) = use_host_state(delete_confirmation, mobile_sheet);
     rsx! {
         div { class: "user-wait-dock",
             div { class: "conversation-column px-3 md:px-5",
@@ -271,10 +238,7 @@ pub(crate) fn RoomWaitDock(delete_confirmation: bool, mobile_sheet: bool) -> Ele
 /// ever count it.
 #[component]
 pub(crate) fn RoomWaitSpacer(delete_confirmation: bool, mobile_sheet: bool) -> Element {
-    let reason = use_user_wait_reason();
-    let last_good = use_hook(|| Rc::new(Cell::new(None)));
-    let owner =
-        surface_for_render(&last_good, delete_confirmation, mobile_sheet, true) == Surface::Room;
+    let (owner, reason) = use_host_state(delete_confirmation, mobile_sheet);
     let active = owner && reason.is_some();
     rsx! {
         div {
@@ -290,9 +254,7 @@ pub(crate) fn RoomWaitSpacer(delete_confirmation: bool, mobile_sheet: bool) -> E
 /// The Welcome screen's host, in a slot of fixed height below its text.
 #[component]
 pub(crate) fn WelcomeWaitSlot() -> Element {
-    let reason = use_user_wait_reason();
-    let last_good = use_hook(|| Rc::new(Cell::new(None)));
-    let owner = surface_for_render(&last_good, false, false, false) == Surface::Welcome;
+    let (owner, reason) = use_host_state(false, false);
     rsx! {
         div { class: "user-wait-welcome-slot",
             UserWaitDots { surface: "welcome", owner, reason }
@@ -335,32 +297,25 @@ mod tests {
     }
 
     #[test]
-    fn the_frontmost_surface_owns_the_dots() {
-        let none = Covering::default();
-        assert_eq!(visible_surface(none, true), Surface::Room);
-        assert_eq!(visible_surface(none, false), Surface::Welcome);
-        let all = Covering {
-            modal: true,
-            dm_thread: true,
-            mobile_sheet: true,
-            mobile_panel: true,
-        };
-        assert_eq!(visible_surface(all, true), Surface::Modal);
-        let dm = Covering {
-            modal: false,
-            ..all
-        };
-        assert_eq!(visible_surface(dm, true), Surface::DmThread);
-        let sheet = Covering {
-            dm_thread: false,
-            ..dm
-        };
-        assert_eq!(visible_surface(sheet, true), Surface::MobileSheet);
-        let panel = Covering {
-            mobile_sheet: false,
-            ..sheet
-        };
-        assert_eq!(visible_surface(panel, true), Surface::MobilePanel);
-        assert_eq!(visible_surface(panel, false), Surface::MobilePanel);
+    fn any_covering_surface_hides_the_dots() {
+        assert!(!Covering::default().covered());
+        let one = Covering::default();
+        for covering in [
+            Covering { modal: true, ..one },
+            Covering {
+                dm_thread: true,
+                ..one
+            },
+            Covering {
+                mobile_sheet: true,
+                ..one
+            },
+            Covering {
+                mobile_panel: true,
+                ..one
+            },
+        ] {
+            assert!(covering.covered(), "{covering:?}");
+        }
     }
 }

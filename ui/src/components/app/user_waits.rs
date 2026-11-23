@@ -34,7 +34,7 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use std::collections::HashMap;
 
 /// The longest a room's wait dots show without a reply.
-pub(crate) const FEEDBACK_CAP_MS: u64 = 20_000;
+const FEEDBACK_CAP_MS: u64 = 20_000;
 
 /// Prefix of freenet-core's synthesized UPDATE failure, which names no
 /// contract (`operations/update/op_ctx_task.rs`: an infrastructure error).
@@ -42,26 +42,21 @@ pub(crate) const FEEDBACK_CAP_MS: u64 = 20_000;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const UNKEYED_UPDATE_FAILURE: &str = "UPDATE failed";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActionKind {
-    /// An edit, a delete or a reaction.
-    Sending,
-}
-
 /// Local UI state, never a contract summary, so a `HashMap` is fine.
 #[derive(Default, Debug, PartialEq)]
 pub(crate) struct UserWaits {
-    rooms: HashMap<VerifyingKey, (ActionKind, u64)>,
+    /// When each waiting room was last marked.
+    rooms: HashMap<VerifyingKey, u64>,
 }
 
 impl UserWaits {
     /// Marks `room` as waiting since `now_ms`; a later action restamps it.
-    pub fn mark(&mut self, room: VerifyingKey, kind: ActionKind, now_ms: u64) {
-        self.rooms.insert(room, (kind, now_ms));
+    pub fn mark(&mut self, room: VerifyingKey, now_ms: u64) {
+        self.rooms.insert(room, now_ms);
     }
 
-    pub fn active(&self, room: &VerifyingKey) -> Option<ActionKind> {
-        self.rooms.get(room).map(|(kind, _)| *kind)
+    pub fn is_waiting(&self, room: &VerifyingKey) -> bool {
+        self.rooms.contains_key(room)
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -91,7 +86,7 @@ impl UserWaits {
     pub fn sweep(&mut self, now_ms: u64) -> bool {
         let before = self.rooms.len();
         self.rooms
-            .retain(|_, (_, started)| now_ms.saturating_sub(*started) < FEEDBACK_CAP_MS);
+            .retain(|_, started| now_ms.saturating_sub(*started) < FEEDBACK_CAP_MS);
         self.rooms.len() != before
     }
 
@@ -99,7 +94,7 @@ impl UserWaits {
     pub fn next_deadline(&self) -> Option<u64> {
         self.rooms
             .values()
-            .map(|(_, started)| started.saturating_add(FEEDBACK_CAP_MS))
+            .map(|started| started.saturating_add(FEEDBACK_CAP_MS))
             .min()
     }
 }
@@ -137,15 +132,13 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// An eligible action has been applied to `room` locally: queue its sync and
-/// show its room's wait dots. The sync is queued synchronously, here, so the
-/// reload protection `mark_needs_sync` gives is not delayed by a task hop;
-/// only the feedback is deferred.
-pub(crate) fn mark_user_change(room: VerifyingKey, kind: ActionKind) {
+/// An edit, a delete or a reaction has been applied to `room` locally: show
+/// its room's wait dots. Its sync is the caller's to queue, synchronously
+/// (`outbox_commit::commit_ready_now`); only this feedback is deferred.
+pub(crate) fn mark_user_change(room: VerifyingKey) {
     let now = now_ms();
-    crate::components::app::mark_needs_sync(room);
     crate::util::defer(move || {
-        USER_WAITS.with_mut(|w| w.mark(room, kind, now));
+        USER_WAITS.with_mut(|w| w.mark(room, now));
         arm_sweep();
     });
 }
@@ -178,7 +171,7 @@ fn end_for_contract(id: ContractInstanceId) {
         .map(|(owner, _)| *owner);
     if let Some(room) = room {
         // Checked first so a reply for a room with no mark writes nothing.
-        if USER_WAITS.peek().active(&room).is_some() {
+        if USER_WAITS.peek().is_waiting(&room) {
             USER_WAITS.with_mut(|w| w.complete(&room));
         }
     }
@@ -229,14 +222,14 @@ mod tests {
     #[test]
     fn rooms_are_independent_and_a_later_action_restamps() {
         let mut waits = UserWaits::default();
-        waits.mark(room(1), ActionKind::Sending, 1_000);
-        waits.mark(room(2), ActionKind::Sending, 5_000);
+        waits.mark(room(1), 1_000);
+        waits.mark(room(2), 5_000);
         assert!(waits.complete(&room(2)));
-        assert_eq!(waits.active(&room(1)), Some(ActionKind::Sending));
-        assert_eq!(waits.active(&room(2)), None);
+        assert!(waits.is_waiting(&room(1)));
+        assert!(!waits.is_waiting(&room(2)));
         assert!(!waits.complete(&room(2)), "nothing left to end");
 
-        waits.mark(room(1), ActionKind::Sending, 15_000);
+        waits.mark(room(1), 15_000);
         assert!(!waits.sweep(1_000 + FEEDBACK_CAP_MS), "restamped at 15s");
         assert_eq!(waits.next_deadline(), Some(15_000 + FEEDBACK_CAP_MS));
     }
@@ -247,14 +240,13 @@ mod tests {
     #[test]
     fn an_earlier_actions_reply_ends_a_later_ones_feedback() {
         let mut waits = UserWaits::default();
-        waits.mark(room(1), ActionKind::Sending, 1_000);
-        waits.mark(room(1), ActionKind::Sending, 2_000);
-        waits.mark(room(2), ActionKind::Sending, 2_000);
+        waits.mark(room(1), 1_000);
+        waits.mark(room(1), 2_000);
+        waits.mark(room(2), 2_000);
         assert!(waits.complete(&room(1)));
-        assert_eq!(waits.active(&room(1)), None);
-        assert_eq!(
-            waits.active(&room(2)),
-            Some(ActionKind::Sending),
+        assert!(!waits.is_waiting(&room(1)));
+        assert!(
+            waits.is_waiting(&room(2)),
             "another room's reply ends nothing here"
         );
     }
@@ -263,8 +255,8 @@ mod tests {
     fn an_unkeyed_failure_ends_every_room() {
         let mut waits = UserWaits::default();
         assert!(!waits.complete_all());
-        waits.mark(room(1), ActionKind::Sending, 0);
-        waits.mark(room(2), ActionKind::Sending, 0);
+        waits.mark(room(1), 0);
+        waits.mark(room(2), 0);
         assert!(waits.complete_all());
         assert!(waits.is_empty());
     }
@@ -272,13 +264,13 @@ mod tests {
     #[test]
     fn the_cap_ends_a_mark_at_exactly_twenty_seconds() {
         let mut waits = UserWaits::default();
-        waits.mark(room(1), ActionKind::Sending, 1_000);
+        waits.mark(room(1), 1_000);
         assert!(!waits.sweep(1_000 + FEEDBACK_CAP_MS - 1));
-        assert_eq!(waits.active(&room(1)), Some(ActionKind::Sending));
+        assert!(waits.is_waiting(&room(1)));
         assert!(waits.sweep(1_000 + FEEDBACK_CAP_MS));
         assert_eq!(waits.next_deadline(), None);
         // A clock that went backwards keeps the mark until its cap.
-        waits.mark(room(1), ActionKind::Sending, 50_000);
+        waits.mark(room(1), 50_000);
         assert!(!waits.sweep(10_000));
     }
 

@@ -24,13 +24,19 @@ async function send(page: Page, text: string) {
   await expect(input(page), "the draft clears once the room admits it").toHaveValue("");
 }
 
+/// A send marks no room wait and lights no wait dots (they are for edits,
+/// deletes, reactions and joins).
+async function expectNoWait(page: Page, why: string) {
+  expect(await callRiverTest(page, "userWaitRooms"), `${why}: no room wait`).toBe(0);
+  await expect(page.locator('[data-testid="user-wait-dots"][data-active="true"]'), `${why}: no dots`).toHaveCount(0);
+  await expect(page.getByTestId("user-wait-spacer"), `${why}: no spacer`).toHaveAttribute("data-active", "false");
+}
+
 /// Nothing of a send is in the history, and it lights no wait dots.
 async function expectNoInterimRowOrWait(page: Page, text: string) {
   await expect(committedRow(page, text)).toHaveCount(0);
   await expect(page.getByTestId("pending-message"), "no interim history row").toHaveCount(0);
-  expect(await callRiverTest(page, "userWaitRooms"), "a send marks no room wait").toBe(0);
-  await expect(page.locator('[data-testid="user-wait-dots"][data-active="true"]')).toHaveCount(0);
-  await expect(page.getByTestId("user-wait-spacer")).toHaveAttribute("data-active", "false");
+  await expectNoWait(page, "a send being signed");
 }
 
 async function expectLocked(page: Page, text: string) {
@@ -78,13 +84,14 @@ test("Enter keeps a held reply in the composer, read-only and sent once, then it
   await expect(input(page)).not.toHaveAttribute("readonly", /.*/);
   await expect(replyPreview(page)).toHaveCount(0);
   await expect(composerBox(page)).toHaveAttribute("data-sending", "false");
-  expect(await callRiverTest(page, "userWaitRooms"), "admitted: still no wait").toBe(0);
+  await expectNoWait(page, "admitted");
   await callRiverTest(page, "releaseMessageSigning");
 
   // The next message goes at once, and lights nothing either.
   await send(page, "right after");
   await expect(committedRow(page, "held reply"), "no duplicate").toHaveCount(1);
-  expect(await callRiverTest(page, "userWaitRooms")).toBe(0);
+  await settle(page);
+  await expectNoWait(page, "an ordinary send, connected");
 });
 
 test("the composer is one line again once a multi-line send is admitted", async ({ page }) => {

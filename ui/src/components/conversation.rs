@@ -210,17 +210,20 @@ fn action_body(
     }
 }
 
-/// A message by `identity` in `room`, stamped now, with the CBOR bytes its
-/// signature will cover and, for a sealed body, what it was sealed from.
-/// `None` (logged) if it does not serialize.
+/// A message by `author_vk` in `room`, with the CBOR bytes its signature
+/// will cover and, for a sealed body, what it was sealed from. `None`
+/// (logged) if it does not serialize.
+///
+/// Stamped now, when the user acts, and never restamped: several messages
+/// made quickly keep their order however their signatures arrive.
 fn unsigned_message(
     room: ed25519_dalek::VerifyingKey,
-    identity: &ActionIdentity,
+    author_vk: &ed25519_dalek::VerifyingKey,
     (content, seal): (RoomMessageBody, Option<SealInput>),
 ) -> Option<NewMessage> {
     let message = MessageV1 {
         room_owner: MemberId::from(room),
-        author: MemberId::from(&identity.author_vk),
+        author: MemberId::from(author_vk),
         content,
         time: get_current_system_time(),
     };
@@ -2062,7 +2065,9 @@ pub fn Conversation() -> Element {
                         warn!("Room is private but no secret available");
                         return;
                     };
-                    let Some(message) = unsigned_message(current_room, &identity, content) else {
+                    let Some(message) =
+                        unsigned_message(current_room, &identity.author_vk, content)
+                    else {
                         return;
                     };
                     messages.push(message);
@@ -2111,7 +2116,8 @@ pub fn Conversation() -> Element {
                     warn!("Room is private but no secret available, cannot send delete");
                     return;
                 };
-                let Some(message) = unsigned_message(current_room, &identity, content) else {
+                let Some(message) = unsigned_message(current_room, &identity.author_vk, content)
+                else {
                     return;
                 };
                 info!("Sending delete action");
@@ -2184,7 +2190,8 @@ pub fn Conversation() -> Element {
                     warn!("Room is private but no secret available, cannot send edit");
                     return;
                 };
-                let Some(message) = unsigned_message(current_room, &identity, content) else {
+                let Some(message) = unsigned_message(current_room, &identity.author_vk, content)
+                else {
                     return;
                 };
                 info!("Sending edit action");
@@ -2217,145 +2224,124 @@ pub fn Conversation() -> Element {
                 warn!("Message is empty");
                 return Err("the message is empty".to_string());
             }
-            crate::util::debug_log(&format!(
-                "[send] start: {}...",
-                crate::util::truncate_str(&message_text, 30)
-            ));
-            let current_room_opt = CURRENT_ROOM.read().owner_key;
-            if current_room_opt.is_none() {
+            let open_room = { CURRENT_ROOM.read().owner_key };
+            let Some(current_room) = open_room else {
                 error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
                 return Err("no room is open".to_string());
-            }
-            // Re-read room data from ROOMS signal (don't rely on stale closure capture)
-            let fresh_room_data =
-                current_room_opt.and_then(|key| ROOMS.try_read().ok()?.map.get(&key).cloned());
-            if fresh_room_data.is_none() {
-                error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
-                return Err("the room is not loaded yet".to_string());
-            }
-            if let (Some(current_room), Some(current_room_data)) =
-                (current_room_opt, fresh_room_data)
-            {
-                // Everything up to the outbox insert is synchronous: the
-                // message must show, pending, before anything is awaited
-                // (freenet/river#512). Signing happens after, through the
-                // chat delegate (`outbox_commit`).
-                let Some(author_vk) = current_room_data.self_verifying_key() else {
+            };
+            // Read now from ROOMS, not from a render-time capture, so a room
+            // or identity change since the last render is seen. Only what a
+            // send needs, and the borrow ends here, before the message is
+            // built or queued.
+            let (identity, secret, max_size) = {
+                let Ok(rooms) = ROOMS.try_read() else {
+                    warn!("ROOMS signal busy while sending; the draft is kept");
+                    return Err("the room is busy, try again".to_string());
+                };
+                let Some(room_data) = rooms.map.get(&current_room) else {
+                    error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
+                    return Err("the room is not loaded yet".to_string());
+                };
+                let Some(identity) = ActionIdentity::of(room_data) else {
                     error!("Cannot send message: no identity for this room");
                     return Err("this device has no identity for this room".to_string());
                 };
-                // The local fallback while this build still holds the key.
-                let fallback_key = current_room_data.signing_key().cloned();
-                let is_private = current_room_data.is_private();
-                // Copy the secret data (get_secret returns Option<(&[u8; 32], u32)>)
-                let secret_opt: Option<([u8; 32], u32)> = current_room_data
-                    .get_secret()
-                    .map(|(secret, version)| (*secret, version));
-                let max_size = current_room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .max_message_size;
-                drop(current_room_data);
+                (
+                    identity,
+                    action_secret(room_data),
+                    room_data
+                        .room_state
+                        .configuration
+                        .configuration
+                        .max_message_size,
+                )
+            };
 
-                // Build content based on whether this is a reply or regular
-                // message. A private body keeps what it was sealed from, so
-                // it can be sealed again if the room's secret rotates while
-                // it is being signed (`seal.rs`).
-                let reply = reply_ctx.clone();
-                let (content, seal) = match (reply_ctx, is_private) {
-                    (Some(reply), false) => (
-                        RoomMessageBody::reply(
-                            message_text.clone(),
-                            reply.message_id,
-                            reply.author_name,
-                            reply.content_preview,
-                        ),
-                        None,
+            // Everything up to the outbox insert is synchronous: the message
+            // must show, pending, before anything is awaited
+            // (freenet/river#512). Signing happens after, through the chat
+            // delegate (`outbox_commit`).
+            //
+            // Build content based on whether this is a reply or regular
+            // message. A private body keeps what it was sealed from, so it
+            // can be sealed again if the room's secret rotates while it is
+            // being signed (`seal.rs`).
+            let reply = reply_ctx.clone();
+            let content = match (reply_ctx, secret) {
+                (Some(reply), None) => (
+                    RoomMessageBody::reply(
+                        message_text.clone(),
+                        reply.message_id,
+                        reply.author_name,
+                        reply.content_preview,
                     ),
-                    (None, false) => (RoomMessageBody::public(message_text.clone()), None),
-                    (reply, true) => {
-                        let Some((secret, version)) = secret_opt else {
-                            // The composer is not offered without the
-                            // secret (see `missing_room_secret`); this
-                            // is the backstop. A public body in a private
-                            // room is not admitted.
-                            error!("Cannot send: this private room's secret is not on this device");
-                            return Err("this private room's key is not on this device".to_string());
-                        };
-                        let seal = match reply {
-                            Some(reply) => SealInput::Reply {
-                                text: message_text.clone(),
-                                message_id: reply.message_id,
-                                author_name: reply.author_name,
-                                content_preview: reply.content_preview,
-                            },
-                            None => SealInput::Text(message_text.clone()),
-                        };
-                        (seal.seal(&secret, version), Some(seal))
-                    }
-                };
-
-                // Safety net: check encoded content size before signing.
-                // Should be unreachable — the input gate measures the same
-                // encoded size via RoomMessageBody::measure_* (pinned equal
-                // to content_len() by river-core tests). If this fires, the
-                // measure helpers have drifted from the body construction
-                // above and the draft is already cleared: the message is
-                // LOST, which is the HostFat bug. Fix the drift, don't
-                // relax this check.
-                let content_size = content.content_len();
-                if content_size > max_size {
-                    error!(
-                        "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; message dropped",
-                        content_size, max_size
-                    );
-                    return Err(format!(
-                        "the message is too long ({content_size} of {max_size} bytes)"
-                    ));
+                    None,
+                ),
+                (None, None) => (RoomMessageBody::public(message_text.clone()), None),
+                (_, Some(None)) => {
+                    // The composer is not offered without the secret (see
+                    // `missing_room_secret`); this is the backstop. A public
+                    // body in a private room is not admitted.
+                    error!("Cannot send: this private room's secret is not on this device");
+                    return Err("this private room's key is not on this device".to_string());
                 }
-
-                // Stamped now, at Enter, and never restamped: several messages
-                // typed quickly keep their typed order however their
-                // signatures arrive.
-                let message = MessageV1 {
-                    room_owner: MemberId::from(current_room),
-                    author: MemberId::from(&author_vk),
-                    content,
-                    time: get_current_system_time(),
-                };
-
-                // Serialize message to CBOR: the bytes the signature covers.
-                let mut message_bytes = Vec::new();
-                if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
-                    error!("Failed to serialize message for signing: {:?}", e);
-                    return Err("the message could not be encoded".to_string());
-                }
-
-                crate::util::debug_log("[send] queued, signing via the delegate");
-                // Defer the signal writes to a clean execution context to
-                // prevent RefCell re-entrant borrow panics.
-                crate::util::defer(move || {
-                    outbox_commit::submit_now(
-                        current_room,
-                        PendingKind::Send {
-                            text: message_text,
-                            reply,
+                (reply, Some(Some((secret, version)))) => {
+                    let seal = match reply {
+                        Some(reply) => SealInput::Reply {
+                            text: message_text.clone(),
+                            message_id: reply.message_id,
+                            author_name: reply.author_name,
+                            content_preview: reply.content_preview,
                         },
-                        author_vk,
-                        vec![(message, message_bytes, seal)],
-                        fallback_key,
-                    );
-                    // The conversation goes to the end when the room admits
-                    // the message (`outbox_commit::take_own_send_committed`),
-                    // not now: nothing of it is in the history yet.
-                    #[cfg(target_arch = "wasm32")]
-                    request_permission_on_first_message();
-                });
-                Ok(())
-            } else {
-                Err("the room is not loaded yet".to_string())
+                        None => SealInput::Text(message_text.clone()),
+                    };
+                    (seal.seal(&secret, version), Some(seal))
+                }
+            };
+
+            // Safety net: check encoded content size before signing. Should
+            // be unreachable: the input gate measures the same encoded size
+            // via RoomMessageBody::measure_* (pinned equal to content_len()
+            // by river-core tests). If this fires, the measure helpers have
+            // drifted from the body construction above. The send is refused
+            // and the composer keeps the draft. Fix the drift, don't relax
+            // this check.
+            let content_size = content.0.content_len();
+            if content_size > max_size {
+                error!(
+                    "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; send refused, draft kept",
+                    content_size, max_size
+                );
+                return Err(format!(
+                    "the message is too long ({content_size} of {max_size} bytes)"
+                ));
             }
+
+            let Some(message) = unsigned_message(current_room, &identity.author_vk, content) else {
+                return Err("the message could not be encoded".to_string());
+            };
+
+            crate::util::debug_log("[send] queued, signing via the delegate");
+            // Defer the signal writes to a clean execution context to
+            // prevent RefCell re-entrant borrow panics.
+            crate::util::defer(move || {
+                outbox_commit::submit_now(
+                    current_room,
+                    PendingKind::Send {
+                        text: message_text,
+                        reply,
+                    },
+                    identity.author_vk,
+                    vec![message],
+                    identity.fallback_key,
+                );
+                // The conversation goes to the end when the room admits
+                // the message (`outbox_commit::take_own_send_committed`),
+                // not now: nothing of it is in the history yet.
+                #[cfg(target_arch = "wasm32")]
+                request_permission_on_first_message();
+            });
+            Ok(())
         }
     };
 
