@@ -58,6 +58,10 @@
 //!   user sends, creates or joins fails at once with why, the composer is blocked with why,
 //!   and the store is not registered. The rooms still show and still receive. Each
 //!   connection's write gate refuses writes too.
+//! - **Reading rooms again.** While connected, the open room is read again when the node has said
+//!   nothing about it for [`Pace::resync_idle`], every room not heard about lately when the window
+//!   comes to the front, and a room whose update could not be merged after a backoff
+//!   ([`super::resync`] has the rules and what bounds them). Such a read never reconnects.
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -96,6 +100,7 @@ use super::generation::{
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
 use super::modes::{NotificationMode, decode_modes};
 use super::outbox::{Action, Command, Outbox};
+use super::resync::{ResyncPace, Resyncs};
 use super::room::{LiveRoom, local_minutes};
 use super::socket::{NodeSocket, SocketError, TokenVerdict, token_verdict};
 use super::token::TokenStore;
@@ -132,6 +137,17 @@ pub(super) struct Pace {
     pub resubscribe_max: Duration,
     /// How often the stored rooms are read again while connected.
     pub refresh: Duration,
+    /// How long the open room may go with nothing from the node about it (no notification, no
+    /// answer to a read) before River reads it again, and so also the most often it is read
+    /// again for that reason. The web UI's watchdog waits the same 60 seconds
+    /// (`LIVENESS_IDLE_PROBE_MS`) ([`super::resync`]).
+    pub resync_idle: Duration,
+    /// When the window comes to the front, every room with nothing from the node for at least
+    /// this long is read again ([`super::resync`]).
+    pub resync_focus: Duration,
+    /// How long such a read may go unanswered before River stops waiting for it. It only frees
+    /// the room for the next read: it never reconnects ([`super::resync`]).
+    pub resync_wait: Duration,
     /// How long the node may take to answer an update before the message counts as not sent.
     pub update_wait: Duration,
     /// How long an answer may be owed before the connection is dropped for it (three times
@@ -167,6 +183,17 @@ pub(super) struct Pace {
     pub pointers: CheckPace,
 }
 
+impl Pace {
+    fn resync(&self) -> ResyncPace {
+        ResyncPace {
+            idle: self.resync_idle,
+            focus: self.resync_focus,
+            heal_first: self.resubscribe_first,
+            heal_max: self.resubscribe_max,
+        }
+    }
+}
+
 impl Default for Pace {
     fn default() -> Self {
         Pace {
@@ -182,6 +209,9 @@ impl Default for Pace {
             resubscribe_first: Duration::from_secs(5),
             resubscribe_max: Duration::from_secs(300),
             refresh: Duration::from_secs(60),
+            resync_idle: Duration::from_secs(60),
+            resync_focus: Duration::from_secs(30),
+            resync_wait: Duration::from_secs(45),
             update_wait: Duration::from_secs(60),
             owed_limit: Duration::from_secs(180),
             delegate_deadline: Duration::from_secs(20),
@@ -770,13 +800,18 @@ impl Subscriptions {
             .insert(id, (attempts.saturating_add(1), Instant::now() + wait));
     }
 
-    /// Ask again for every room whose wait is over.
-    fn ask_due(&mut self, socket: &mut NodeSocket) -> Result<(), SocketError> {
+    /// Ask again for every room whose wait is over, except one with a read out: the node's answer
+    /// to that read could not be told from the subscribe's ([`super::resync`]).
+    fn ask_due(
+        &mut self,
+        socket: &mut NodeSocket,
+        reading: &dyn Fn(&ContractInstanceId) -> bool,
+    ) -> Result<(), SocketError> {
         let now = Instant::now();
         let due: Vec<ContractInstanceId> = self
             .retry
             .iter()
-            .filter(|(id, (_, at))| *at <= now && !self.pending.contains_key(*id))
+            .filter(|(id, (_, at))| *at <= now && !self.pending.contains_key(*id) && !reading(id))
             .map(|(id, _)| *id)
             .collect();
         for id in due {
@@ -858,6 +893,11 @@ fn follow_on(
             return e;
         }
     }
+    // Reading rooms again belongs to the connection too, and every room was just read: a
+    // focus that came meanwhile has nothing left to do.
+    let mut resyncs = Resyncs::new(Instant::now());
+    rooms.resync_wanted = false;
+    rooms.merge_results.clear();
     rooms.report(LinkStatus::Loading, report);
     report(RoomsUpdate::Access(Access::Ready));
     if let Err(e) = socket.set_read_timeout(pace.tick) {
@@ -891,7 +931,7 @@ fn follow_on(
             }
             None => {}
         }
-        if let Err(e) = subs.ask_due(socket) {
+        if let Err(e) = subs.ask_due(socket, &|id| resyncs.is_out(id)) {
             return e;
         }
         // What the user did, then the updates it makes.
@@ -1002,6 +1042,33 @@ fn follow_on(
             rooms.dm_read_began = Some(rooms.dm_cache.save_seq());
             reload = Some((loader, Instant::now()));
         }
+        // Rooms read again (freenet/river#971; [`super::resync`]). Not beside a read of the
+        // stored rooms, a signing key request or a create's or join's request: an error that
+        // names nothing could then be either's.
+        if std::mem::take(&mut rooms.resync_wanted) {
+            resyncs.focus(&rooms.contract_ids());
+        }
+        resyncs.expire(pace.resync_wait, Instant::now());
+        if reload.is_none() && !rooms.keys.busy() && !rooms.outbox.work.has_out() {
+            let viewing = rooms.viewing_contract();
+            let ids = rooms.contract_ids();
+            let blocked = |id: &ContractInstanceId| {
+                subs.pending.contains_key(id)
+                    || subs.retry.contains_key(id)
+                    || rooms.blocks_read(id)
+            };
+            for id in resyncs.due(viewing, &ids, &blocked, Instant::now(), &pace.resync()) {
+                let get = ContractRequest::Get {
+                    key: id,
+                    return_contract_code: false,
+                    subscribe: false,
+                    blocking_subscribe: false,
+                };
+                if let Err(e) = socket.send(&ClientRequest::ContractOp(get)) {
+                    return e;
+                }
+            }
+        }
         // The signing key sweep comes last, after a read has had its chance to start: it is the
         // lowest priority. It sends one request and waits for its answer before the next.
         let gate = SweepGate {
@@ -1053,8 +1120,11 @@ fn follow_on(
                 state,
                 ..
             }))) => {
-                subs.answered(key.id());
-                changed |= rooms.following(key.id(), true);
+                // A read's answer says nothing about the subscription.
+                if !resyncs.answered(key.id(), Instant::now()) {
+                    subs.answered(key.id());
+                    changed |= rooms.following(key.id(), true);
+                }
                 changed |= rooms.merge_bytes(key.id(), state.as_ref());
             }
             // A notification shows the subscription is in place, whatever came of its ask.
@@ -1063,11 +1133,19 @@ fn follow_on(
                 update,
             }))) => {
                 subs.answered(key.id());
+                resyncs.heard(key.id(), Instant::now());
                 changed |= rooms.following(key.id(), true);
                 changed |= rooms.apply_update(key.id(), &update);
             }
             // The network has no copy. The web UI would seed one with a PUT; this app PUTs only
             // a room it has just created, so it keeps showing the stored copy and asks again.
+            Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                instance_id,
+            }))) if resyncs.is_out(&instance_id) && !subs.pending.contains_key(&instance_id) => {
+                // A read found nothing: the subscription is not in question, and the next read
+                // comes by the usual rules.
+                resyncs.failed(&instance_id);
+            }
             Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
                 instance_id,
             }))) => {
@@ -1104,6 +1182,7 @@ fn follow_on(
                                     }
                                 }
                                 subs.keep_only(&rooms.contract_ids());
+                                resyncs.keep_only(&rooms.contract_ids());
                                 reload = None;
                                 last_read = Instant::now();
                                 changed = true;
@@ -1121,16 +1200,15 @@ fn follow_on(
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
                 let alone = subs.pending.is_empty()
+                    && !resyncs.any_out()
                     && reload.is_none()
                     && !rooms
                         .list
                         .iter()
                         .any(|r| rooms.outbox.owes(&r.stored.owner_vk));
-                if rooms
-                    .outbox
-                    .work
-                    .on_error(&e, alone, &|id| subs.pending.contains_key(id))
-                {
+                if rooms.outbox.work.on_error(&e, alone, &|id| {
+                    subs.pending.contains_key(id) || resyncs.is_out(id)
+                }) {
                     changed = true;
                     taken_by_work = true;
                 } else if rooms.keys.busy()
@@ -1145,10 +1223,17 @@ fn follow_on(
                 } else if let Some((id, cause)) = failed_update(&e) {
                     changed |= rooms.update_answered(&id, Err(cause));
                 } else if let Some((id, cause)) =
-                    rooms.failed_update_unnamed(&e, &subs, reload.is_some())
+                    rooms.failed_update_unnamed(&e, &subs, reload.is_some() || resyncs.any_out())
                 {
                     // Not a reload failure either, so the reload goes on.
                     changed |= rooms.update_answered(&id, Err(cause));
+                } else if let Some(id) = failed_contract(&e)
+                    && resyncs.is_out(&id)
+                    && !subs.pending.contains_key(&id)
+                {
+                    // A read of the room failed: the subscription is not in question.
+                    eprintln!("River: reading a room again failed: {e}");
+                    resyncs.failed(&id);
                 } else if let Some(id) = failed_contract(&e) {
                     changed |= rooms.subscribe_failed(&mut subs, id, pace);
                 } else if reload.is_some() {
@@ -1195,6 +1280,10 @@ fn follow_on(
                     );
                 }
             }
+        }
+        // Merges that failed are read again, after a while ([`super::resync`]).
+        for (id, ok) in rooms.merge_results.drain(..) {
+            resyncs.merged(id, ok, Instant::now(), &pace.resync());
         }
         // An ask that went unanswered for the catch-up time counts as failed: named on screen
         // and asked again later. This holds for every ask, not only the first ones.
@@ -1788,6 +1877,14 @@ struct Rooms {
     update_required: bool,
     /// The store needs registering, and waits for the first pointer check to settle.
     register_deferred: bool,
+    /// The room the window shows, by key (`Room::key`), as [`Action::Viewing`] last said.
+    viewing: Option<String>,
+    /// The window came to the front ([`Action::Resync`]): read again the rooms not heard about
+    /// lately.
+    resync_wanted: bool,
+    /// Each merge of what the network sent since the session last looked: the room, and
+    /// whether it merged. The session reads again a room whose merge failed.
+    merge_results: Vec<(ContractInstanceId, bool)>,
 }
 
 impl Rooms {
@@ -2092,7 +2189,15 @@ impl Rooms {
 
     /// Take what the user did since the last call. True when it changed what shows.
     fn take_commands(&mut self, commands: &Receiver<Command>) -> bool {
-        self.outbox.waiting.extend(commands.try_iter());
+        // What the window shows, and its coming to the front, are not the user's doing: taken at
+        // once, and never kept in the outbox.
+        for command in commands.try_iter() {
+            match command.action {
+                Action::Viewing => self.viewing = Some(command.room),
+                Action::Resync => self.resync_wanted = true,
+                _ => self.outbox.waiting.push(command),
+            }
+        }
         if !self.loaded || self.outbox.waiting.is_empty() {
             return false;
         }
@@ -2863,13 +2968,14 @@ impl Rooms {
     /// `MissingContract` for a room that owes an answer and has no subscribe waiting for one,
     /// or an error that names nothing (`EmptyRing`, `PeerNotJoined`, `Shutdown`, an operation
     /// error or timeout, as the node reports a failed start) when exactly one room owes an
-    /// answer, no subscribe is waiting for one, and no read of the stored rooms nor request of
-    /// a create or join is under way (whose requests can fail the same way).
+    /// answer, no subscribe is waiting for one, and no read of the stored rooms or of a room
+    /// (`other_out`) nor request of a create or join is under way (whose requests can fail the
+    /// same way).
     fn failed_update_unnamed(
         &self,
         e: &ClientError,
         subs: &Subscriptions,
-        reloading: bool,
+        other_out: bool,
     ) -> Option<(ContractInstanceId, String)> {
         let owing: Vec<ContractInstanceId> = self
             .list
@@ -2891,7 +2997,7 @@ impl Rooms {
                 if owing.len() == 1
                     && !self.outbox.has_stale()
                     && subs.pending.is_empty()
-                    && !reloading
+                    && !other_out
                     && !self.outbox.work.has_out() =>
             {
                 Some((owing[0], e.kind().to_string()))
@@ -2958,6 +3064,27 @@ impl Rooms {
         self.outbox.reconcile(room) | changed
     }
 
+    /// The contract of the room the window shows, if it is listed.
+    fn viewing_contract(&self) -> Option<ContractInstanceId> {
+        let key = self.viewing.as_deref()?;
+        self.list
+            .iter()
+            .find(|r| r.key() == key)
+            .map(LiveRoom::contract_id)
+    }
+
+    /// Whether the room under contract `id` may not be read again now: it owes an update's
+    /// answer, or a create or join holds it. Either's error could name nothing, and then could
+    /// not be told from the read's.
+    fn blocks_read(&self, id: &ContractInstanceId) -> bool {
+        self.list
+            .iter()
+            .find(|r| r.contract_id() == *id)
+            .is_none_or(|r| {
+                self.outbox.owes(&r.stored.owner_vk) || self.outbox.work.holds(&r.stored.owner_vk)
+            })
+    }
+
     fn contract_ids(&self) -> Vec<ContractInstanceId> {
         self.list.iter().map(LiveRoom::contract_id).collect()
     }
@@ -2999,6 +3126,7 @@ impl Rooms {
         let Some(vk) = self.by_contract(id).map(|r| r.stored.owner_vk) else {
             return false;
         };
+        self.merge_results.push((*id, result.is_ok()));
         match result {
             Ok(()) => {
                 self.not_updated.remove(&vk);
@@ -3017,7 +3145,7 @@ impl Rooms {
         };
         let result = ciborium::de::from_reader::<ChatRoomStateV1, _>(bytes)
             .map_err(|e| format!("unreadable state: {e}"))
-            .and_then(|incoming| room.merge_state(&incoming));
+            .and_then(|incoming| room.merge_network_state(&incoming));
         let sent = self.outbox.reconcile(room);
         if result.is_ok() {
             let owner = room.stored.owner_vk;
@@ -3036,7 +3164,7 @@ impl Rooms {
                 };
                 let result = ciborium::de::from_reader::<ChatRoomStateV1Delta, _>(delta.as_ref())
                     .map_err(|e| format!("unreadable delta: {e}"))
-                    .and_then(|delta| room.apply_delta(delta));
+                    .and_then(|delta| room.apply_network_delta(delta));
                 let sent = self.outbox.reconcile(room);
                 self.outcome(id, result) | sent
             }

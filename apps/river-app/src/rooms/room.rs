@@ -323,6 +323,50 @@ impl LiveRoom {
         Ok(())
     }
 
+    /// Merge a whole room state from the network (a notification, or the answer to a subscribe
+    /// or a read). Unlike [`merge_state`](Self::merge_state) this is NOT all or nothing: as in
+    /// the web UI (`room_synchronizer.rs`, which merges into its copy in place), the steps that
+    /// succeeded before the failing one stay, and the error is still returned so the room is
+    /// named as not updated and read again (freenet/river#971).
+    ///
+    /// Why not roll back: the node sends the whole state with every notification, and a read
+    /// again returns the same whole state, so a step that fails against this copy fails on
+    /// every later delivery too. Rolled back, everything after the first step that failed
+    /// would stay missing for good, a message included, however often the room is read. Kept,
+    /// only the failing step and the ones after it wait. What is kept is safe to show: the room
+    /// applies its fields in a fixed order, each checked against the fields before it, so the
+    /// result is the state a valid delta carrying only those fields would make. The room's
+    /// cleanup after a whole merge does not run on a failed one; it runs on the next merge that
+    /// succeeds.
+    ///
+    /// What River composes and checks itself (the outbox, direct messages) uses the
+    /// all-or-nothing [`apply_delta`](Self::apply_delta): there, a change that fails partway
+    /// must not be shown at all.
+    pub fn merge_network_state(&mut self, incoming: &ChatRoomStateV1) -> Result<(), String> {
+        let params = self.params();
+        let result = self
+            .stored
+            .room_state
+            .merge_through_summary(&params, incoming)
+            .map(|_| ());
+        self.refresh();
+        result
+    }
+
+    /// Apply a delta from an update notification, keeping the steps before a failing one, as
+    /// [`merge_network_state`](Self::merge_network_state) does and for the same reasons.
+    pub fn apply_network_delta(&mut self, delta: ChatRoomStateV1Delta) -> Result<(), String> {
+        let params = self.params();
+        // The composed `apply_delta` ignores its parent-state argument (see
+        // [`apply_delta`](Self::apply_delta)), so a default stands in for it.
+        let result =
+            self.stored
+                .room_state
+                .apply_delta(&ChatRoomStateV1::default(), &params, &Some(delta));
+        self.refresh();
+        result
+    }
+
     /// Rebuild what the stored copy does not persist: the secrets, then the edits, deletions
     /// and reactions (which, in a private room, need the secrets).
     fn refresh(&mut self) {

@@ -255,6 +255,9 @@ impl RiverApp {
         // What the user does in a room goes to the background work, which sends it.
         let sink = link.clone();
         chat.set_sink(Box::new(move |command| sink.send(command)));
+        // So does which room is open: that room is read again when the node goes quiet on it.
+        let shown = link.clone();
+        chat.set_view_hook(Box::new(move |room| shown.viewing(room)));
         let link_generation = link.generation();
         RiverApp {
             setup: if waiting {
@@ -388,6 +391,14 @@ impl RiverApp {
 
     /// The window gained or lost focus.
     pub fn focus_changed(&mut self, focused: bool) {
+        // Back in front from away: read again the rooms the node has said nothing about lately
+        // (freenet/river#971), as the web UI does when its page becomes visible.
+        if focused
+            && !self.focused
+            && let Some(link) = &self.link
+        {
+            link.resync();
+        }
         self.focused = focused;
         self.focus_known = true;
         if focused {
@@ -942,6 +953,8 @@ impl RiverApp {
         if let Some(link) = &self.link {
             let sink = link.clone();
             chat.set_sink(Box::new(move |command| sink.send(command)));
+            let shown = link.clone();
+            chat.set_view_hook(Box::new(move |room| shown.viewing(room)));
         }
         self.chat = chat;
         self.access = Access::Connecting;

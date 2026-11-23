@@ -115,6 +115,9 @@ pub enum Mode {
 /// Where commands for the node go.
 pub type Sink = Box<dyn Fn(Command)>;
 
+/// Told the key of each room the window opens ([`Chat::set_view_hook`]).
+pub type ViewHook = Box<dyn Fn(&str)>;
+
 /// A dialog over the chat screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DialogKind {
@@ -348,6 +351,8 @@ pub struct Chat {
     /// Commands for the node, when there is no sink (tests); with one they go straight to it.
     pub outgoing: Vec<Command>,
     sink: Option<Sink>,
+    /// Told each room opened, so the background work knows which room to keep fresh.
+    view_hook: Option<ViewHook>,
     /// The create or join dialog.
     pub form: Form,
     /// Rooms being created or joined, and those that failed.
@@ -520,6 +525,7 @@ impl Chat {
             picker: None,
             outgoing: Vec::new(),
             sink: None,
+            view_hook: None,
             form: Form::default(),
             work: Vec::new(),
             opened: HashSet::new(),
@@ -866,6 +872,7 @@ impl Chat {
                 self.composer = draft;
             }
             self.selected = key.to_owned();
+            self.opened_room();
             return;
         }
         let incoming = self.drafts.remove(key).unwrap_or_else(|| TextEdit::new(""));
@@ -873,6 +880,7 @@ impl Chat {
         outgoing.focused = false;
         self.park_draft(self.selected.clone(), outgoing);
         self.selected = key.to_owned();
+        self.opened_room();
     }
     /// Send what the composer holds to the open room. Blank text sends nothing; otherwise the
     /// composer clears (keeping focus, so the next message can be typed straight away).
@@ -1023,6 +1031,20 @@ impl Chat {
     /// Send commands for the node to `sink` from now on.
     pub fn set_sink(&mut self, sink: Sink) {
         self.sink = Some(sink);
+    }
+
+    /// Tell `hook` the key of the room open now, if any, and of every room opened from now on.
+    pub fn set_view_hook(&mut self, hook: ViewHook) {
+        if !self.selected.is_empty() {
+            hook(&self.selected);
+        }
+        self.view_hook = Some(hook);
+    }
+
+    fn opened_room(&self) {
+        if let Some(hook) = &self.view_hook {
+            hook(&self.selected);
+        }
     }
 
     fn emit(&mut self, room: String, action: Action) {
@@ -2060,6 +2082,28 @@ mod state_tests {
         };
         let shown = format!("{command:?}");
         assert!(!shown.contains("SECRETCODE"), "{shown}");
+    }
+
+    /// The background work is told which room the window shows (freenet/river#971): the one
+    /// open when the hook is set, then each room opened, and not the same room again.
+    #[test]
+    fn the_view_hook_hears_each_room_opened() {
+        let mut chat = Chat::example();
+        let heard = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let first = chat.room().unwrap().key.clone();
+        let other = chat
+            .rooms
+            .iter()
+            .find(|r| r.key != first)
+            .unwrap()
+            .key
+            .clone();
+        let log = heard.clone();
+        chat.set_view_hook(Box::new(move |k| log.borrow_mut().push(k.to_owned())));
+        chat.select(&first);
+        chat.select(&other);
+        assert_eq!(*heard.borrow(), [first, other]);
+        assert!(chat.outgoing.is_empty(), "not a command the user sent");
     }
 
     #[test]

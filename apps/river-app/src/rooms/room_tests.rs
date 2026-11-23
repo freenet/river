@@ -642,6 +642,68 @@ fn a_rejected_merge_changes_nothing() {
     assert_eq!(live.stored.room_state, before);
 }
 
+/// An upgrade pointer signed by someone other than the owner: every merge refuses it, and the
+/// upgrade is the room's last step but two, after the messages.
+fn forged_upgrade(f: &Fixture) -> river_core::room_state::upgrade::OptionalUpgradeV1 {
+    river_core::room_state::upgrade::OptionalUpgradeV1(Some(
+        river_core::room_state::upgrade::AuthorizedUpgradeV1::new(
+            river_core::room_state::upgrade::UpgradeV1 {
+                owner_member_id: f.owner_id(),
+                version: 1,
+                new_chatroom_address: blake3::Hash::from([0; 32]),
+            },
+            &SigningKey::from_bytes(&[99; 32]),
+        ),
+    ))
+}
+
+/// What the network sends is merged as the web UI merges it (`room_synchronizer.rs`), in place:
+/// the steps before the one that fails stay. Rolling it all back would keep a message out for
+/// good, since every later notification and every read again carries the same failing step
+/// (freenet/river#971). The merge still says it failed, so the room is named as not updated.
+#[test]
+fn a_network_state_that_fails_partway_keeps_the_steps_before_the_failure() {
+    let f = Fixture::new();
+    let state = f.private_state();
+    let mut live = LiveRoom::new(f.stored(state.clone()));
+    let mut incoming = state;
+    incoming
+        .recent_messages
+        .messages
+        .push(text_at(&f, 700, 0, &SECRET, "lands anyway"));
+    incoming.upgrade = forged_upgrade(&f);
+    assert!(live.merge_network_state(&incoming).is_err());
+    let room = live.view(&minutes);
+    assert_eq!(
+        room.messages.last().map(|m| m.text.as_str()),
+        Some("lands anyway"),
+        "the messages step came before the failing one and stays, decrypted"
+    );
+    assert!(
+        live.stored.room_state.upgrade.0.is_none(),
+        "the forged pointer is not kept"
+    );
+}
+
+/// The same for a delta from a notification.
+#[test]
+fn a_network_delta_that_fails_partway_keeps_the_steps_before_the_failure() {
+    let f = Fixture::new();
+    let mut live = LiveRoom::new(f.stored(f.private_state()));
+    let delta = river_core::room_state::ChatRoomStateV1Delta {
+        recent_messages: Some(vec![text_at(&f, 700, 0, &SECRET, "lands anyway")]),
+        upgrade: forged_upgrade(&f).0,
+        ..Default::default()
+    };
+    assert!(live.apply_network_delta(delta).is_err());
+    let room = live.view(&minutes);
+    assert_eq!(
+        room.messages.last().map(|m| m.text.as_str()),
+        Some("lands anyway")
+    );
+    assert!(live.stored.room_state.upgrade.0.is_none());
+}
+
 /// A secret blob addressed to this member that does not decrypt is skipped, not fatal: the
 /// room still opens, with the invitation's copy of that version's secret.
 #[test]
