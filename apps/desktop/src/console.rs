@@ -1,20 +1,19 @@
-//! Windows: quit River on Ctrl+C, Ctrl+Break and closing the console window.
+//! Windows: quit River cleanly on Ctrl+C, Ctrl+Break and closing the console window, when
+//! this process already owns a console (a console-subsystem or debug build).
 //!
-//! The release build is a GUI program with no console, so a River started from PowerShell or
-//! `cargo run` would otherwise ignore Ctrl+C. This attaches to the parent's console when there
-//! is one and installs a control handler that quits through the same path as the tray's Quit.
-//! With no console to attach to (Explorer, login item, tray) nothing happens and nothing is
-//! said. A debug build already has a console, so the attach is refused as already attached and
-//! the handler is installed all the same.
+//! The release build is a GUI program and does NOT attach to its parent's console: the shell
+//! prompt comes back at once, and an attached River would quit on a later Ctrl+C meant for an
+//! unrelated command, or when that terminal closes. The close notice covers that case. Where a
+//! console is already ours, the handler quits through the same path as the tray's Quit instead
+//! of the default exit.
 
 use std::sync::Mutex;
 
 use river_app::RiverApp;
 use rune::AppHandle;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, FALSE, GetLastError, TRUE};
+use windows_sys::Win32::Foundation::{FALSE, TRUE};
 use windows_sys::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
-    SetConsoleCtrlHandler,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, GetConsoleProcessList, SetConsoleCtrlHandler,
 };
 
 static APP: Mutex<Option<AppHandle<RiverApp>>> = Mutex::new(None);
@@ -41,17 +40,23 @@ unsafe extern "system" fn on_event(event: u32) -> i32 {
     }
 }
 
+/// Whether this process already has a console (it never attaches to one).
+fn owns_console() -> bool {
+    let mut pid = 0u32;
+    // SAFETY: one valid u32 for a list of length 1; the result is the count of processes
+    // attached to the console, 0 when there is none.
+    unsafe { GetConsoleProcessList(&mut pid, 1) != 0 }
+}
+
 pub fn quit_on_console_signals(handle: AppHandle<RiverApp>) {
-    // SAFETY: plain Win32 calls with no pointers; the handler is a valid `extern "system"` fn.
+    if !owns_console() {
+        return;
+    }
+    if let Ok(mut app) = APP.lock() {
+        *app = Some(handle);
+    }
+    // SAFETY: the handler is a valid `extern "system"` fn.
     unsafe {
-        // Zero is failure. "Access denied" means this process already has a console (a debug
-        // build); any other failure means there is no parent console to listen on.
-        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 && GetLastError() != ERROR_ACCESS_DENIED {
-            return;
-        }
-        if let Ok(mut app) = APP.lock() {
-            *app = Some(handle);
-        }
         SetConsoleCtrlHandler(Some(on_event), TRUE);
     }
 }

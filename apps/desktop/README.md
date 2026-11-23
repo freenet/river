@@ -108,7 +108,7 @@ window quits. The first time closing hides River, it shows a notification saying
 quit; it is not shown again.
 
 On Windows the tray icon may be in the hidden icons area (the `^` by the clock), where new icons
-start. Started from PowerShell or another console, Ctrl+C (or closing that console) quits River.
+start.
 
 Only one River runs per user. Starting it a second time shows the window of the first one.
 
