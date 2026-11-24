@@ -929,10 +929,13 @@ pub fn cancel() {
 /// be started: a key must never be made for a room the user already holds.
 fn start_blocker(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
     use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
-    let loaded = ROOMS_LOAD_STATE
-        .try_peek()
-        .map(|s| *s == RoomsLoadState::Loaded)
-        .unwrap_or(false);
+    // The example build has no delegate to load from: its rooms are all there
+    // is, and the load state never leaves `Loading`.
+    let loaded = cfg!(feature = "no-sync")
+        || ROOMS_LOAD_STATE
+            .try_peek()
+            .map(|s| *s == RoomsLoadState::Loaded)
+            .unwrap_or(false);
     if !loaded {
         return Some(JoinFailure::NotReady);
     }
@@ -1096,17 +1099,20 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
         if !is_current(generation) {
             return;
         }
+        // Test hook: a held solver skips the hashing but still re-checks the
+        // room below, so a ban or policy change is seen.
         #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-        if HOLD_SOLVER.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::util::sleep(std::time::Duration::from_millis(10)).await;
-            continue;
-        }
-        match solver.step(SLICE) {
-            PowStep::Found { nonce, .. } => break nonce,
-            PowStep::Progress { tried, expected } => {
-                slices += 1;
-                if slices % PROGRESS_EVERY == 1 {
-                    step(|m| m.progress(generation, tried, expected));
+        let held_for_test = HOLD_SOLVER.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+        let held_for_test = false;
+        if !held_for_test {
+            match solver.step(SLICE) {
+                PowStep::Found { nonce, .. } => break nonce,
+                PowStep::Progress { tried, expected } => {
+                    slices += 1;
+                    if slices % PROGRESS_EVERY == 1 {
+                        step(|m| m.progress(generation, tried, expected));
+                    }
                 }
             }
         }
