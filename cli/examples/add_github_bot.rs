@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! Add GitHub bot to Freenet Official room
 //!
 //! Run with: cargo run --example add_github_bot

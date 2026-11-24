@@ -24,6 +24,8 @@ fn trunc(d: Duration) -> Duration {
 }
 
 /// The current time, as a whole millisecond. Use for every signed timestamp.
+// The one raw clock read for signed times; it is rounded on the next line.
+#[allow(clippy::disallowed_methods)]
 pub fn now() -> SystemTime {
     whole_millis(SystemTime::now())
 }
@@ -51,56 +53,112 @@ mod tests {
         SigningKey::from_bytes(&[7u8; 32])
     }
 
-    fn message_at(t: SystemTime, sk: &SigningKey) -> AuthorizedMessageV1 {
-        AuthorizedMessageV1::new(
-            MessageV1 {
-                room_owner: MemberId::from(sk.verifying_key()),
-                author: MemberId::from(sk.verifying_key()),
-                time: t,
-                content: RoomMessageBody::public("hi".to_string()),
-            },
-            sk,
-        )
+    #[derive(serde::Serialize)]
+    struct RawTime {
+        secs_since_epoch: u64,
+        nanos_since_epoch: u32,
     }
 
-    fn ban_at(t: SystemTime, sk: &SigningKey) -> AuthorizedUserBan {
+    /// `MessageV1` as the signer's CBOR holds it, with the time written as raw numbers so it is
+    /// not floored to this platform's clock resolution before it is signed.
+    #[derive(serde::Serialize)]
+    struct RawMessage {
+        room_owner: MemberId,
+        author: MemberId,
+        time: RawTime,
+        content: RoomMessageBody,
+    }
+
+    #[derive(serde::Serialize)]
+    struct RawBan {
+        owner_member_id: MemberId,
+        banned_at: RawTime,
+        banned_user: MemberId,
+    }
+
+    fn raw(nanos: u32) -> RawTime {
+        RawTime {
+            secs_since_epoch: 1_700_000_000,
+            nanos_since_epoch: nanos,
+        }
+    }
+
+    fn cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(v, &mut out).unwrap();
+        out
+    }
+
+    /// What a verifier does: decode the signed bytes into the real struct. On Windows that decode
+    /// floors the time to 100 ns by itself; elsewhere `windows_decode` does what it does, so the
+    /// check fails for the same reason on every platform.
+    fn decoded_message(bytes: &[u8], sig: ed25519_dalek::Signature) -> AuthorizedMessageV1 {
+        let mut m: MessageV1 = ciborium::de::from_reader(bytes).unwrap();
+        m.time = windows_decode(m.time);
+        AuthorizedMessageV1::with_signature(m, sig)
+    }
+
+    fn decoded_ban(bytes: &[u8], by: MemberId, sig: ed25519_dalek::Signature) -> AuthorizedUserBan {
+        let mut b: UserBan = ciborium::de::from_reader(bytes).unwrap();
+        b.banned_at = windows_decode(b.banned_at);
+        AuthorizedUserBan::with_signature(b, by, sig)
+    }
+
+    fn signed_raw(
+        nanos: u32,
+    ) -> (
+        SigningKey,
+        Vec<u8>,
+        ed25519_dalek::Signature,
+        Vec<u8>,
+        ed25519_dalek::Signature,
+    ) {
+        use ed25519_dalek::Signer;
+        let sk = key();
         let me = MemberId::from(sk.verifying_key());
-        AuthorizedUserBan::new(
-            UserBan {
-                owner_member_id: me,
-                banned_at: t,
-                banned_user: MemberId::from(&SigningKey::from_bytes(&[9u8; 32]).verifying_key()),
-            },
-            me,
-            sk,
-        )
+        let other = MemberId::from(&SigningKey::from_bytes(&[9u8; 32]).verifying_key());
+        let m = cbor(&RawMessage {
+            room_owner: me,
+            author: me,
+            time: raw(nanos),
+            content: RoomMessageBody::public("hi".to_string()),
+        });
+        let b = cbor(&RawBan {
+            owner_member_id: me,
+            banned_at: raw(nanos),
+            banned_user: other,
+        });
+        let (ms, bs) = (sk.sign(&m), sk.sign(&b));
+        (sk, m, ms, b, bs)
     }
 
     #[test]
-    fn unrounded_time_fails_after_a_windows_decode() {
-        let sk = key();
-        let mut m = message_at(awkward(), &sk);
-        m.message.time = windows_decode(m.message.time);
-        assert!(m.validate(&sk.verifying_key()).is_err());
-
-        let mut b = ban_at(awkward(), &sk);
-        b.ban.banned_at = windows_decode(b.ban.banned_at);
-        assert!(b.verify_signature(&sk.verifying_key()).is_err());
+    fn a_time_with_nanoseconds_signed_by_another_platform_fails_after_decode() {
+        // 123_456_789 ns is what `SystemTime::now()` gives on Linux, not a multiple of 100.
+        let (sk, m, ms, b, bs) = signed_raw(123_456_789);
+        let me = MemberId::from(sk.verifying_key());
+        assert!(
+            decoded_message(&m, ms)
+                .validate(&sk.verifying_key())
+                .is_err()
+        );
+        assert!(
+            decoded_ban(&b, me, bs)
+                .verify_signature(&sk.verifying_key())
+                .is_err()
+        );
     }
 
     #[test]
-    fn rounded_time_survives_a_windows_decode() {
-        let sk = key();
-        let t = whole_millis(awkward());
-        assert_eq!(windows_decode(t), t);
-
-        let mut m = message_at(t, &sk);
-        m.message.time = windows_decode(m.message.time);
-        m.validate(&sk.verifying_key()).unwrap();
-
-        let mut b = ban_at(t, &sk);
-        b.ban.banned_at = windows_decode(b.ban.banned_at);
-        b.verify_signature(&sk.verifying_key()).unwrap();
+    fn a_whole_millisecond_signed_the_same_way_verifies_after_decode() {
+        let (sk, m, ms, b, bs) = signed_raw(123_000_000);
+        let me = MemberId::from(sk.verifying_key());
+        decoded_message(&m, ms)
+            .validate(&sk.verifying_key())
+            .unwrap();
+        decoded_ban(&b, me, bs)
+            .verify_signature(&sk.verifying_key())
+            .unwrap();
     }
 
     #[test]
@@ -109,7 +167,12 @@ mod tests {
         assert_eq!(t, UNIX_EPOCH + Duration::new(1_700_000_000, 123_000_000));
         assert_eq!(whole_millis(t), t);
         let before = UNIX_EPOCH - Duration::new(5, 123_456_789);
-        assert!(whole_millis(before).duration_since(UNIX_EPOCH).is_err());
+        // Truncation is toward the epoch, as for a time after it.
+        assert_eq!(
+            whole_millis(before),
+            UNIX_EPOCH - Duration::new(5, 123_000_000)
+        );
+        assert_eq!(whole_millis(whole_millis(before)), whole_millis(before));
     }
 
     #[test]
@@ -118,76 +181,5 @@ mod tests {
             let d = now().duration_since(UNIX_EPOCH).unwrap();
             assert_eq!(d.subsec_nanos() % 1_000_000, 0);
         }
-    }
-    fn production(src: &str) -> &str {
-        let cut = src
-            .find("\n#[cfg(test)]\nmod ")
-            .or_else(|| src.find("\n#[cfg(test)]\n#[path"))
-            .unwrap_or(src.len());
-        &src[..cut]
-    }
-
-    /// Every signed-time constructor in the app rounds. A new one that stamps a raw clock value
-    /// fails here rather than on a Windows user's machine.
-    #[test]
-    fn every_signed_time_in_production_code_is_rounded() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rooms");
-        let mut checked = 0;
-        for name in ["bans.rs", "create.rs", "outbox.rs", "work.rs"] {
-            let src = std::fs::read_to_string(root.join(name)).unwrap();
-            for (n, line) in production(&src).lines().enumerate() {
-                let t = line.trim_start();
-                if t.starts_with("//") {
-                    continue;
-                }
-                if ["banned_at:", "created_at:"]
-                    .iter()
-                    .any(|p| t.starts_with(p))
-                {
-                    checked += 1;
-                    assert!(
-                        t.contains("signed_time::")
-                            || t == "banned_at: time,"
-                            || t == "created_at: time,",
-                        "{name}:{}: {t}",
-                        n + 1
-                    );
-                }
-                if t.starts_with("time:") && !t.contains("SystemTime") && name == "outbox.rs" {
-                    checked += 1;
-                    assert!(
-                        t == "time: self.now()," || t == "time,",
-                        "{name}:{}: {t}",
-                        n + 1
-                    );
-                }
-                assert!(
-                    !line.contains("(self.clock)()")
-                        || t.contains("fn now")
-                        || t.starts_with("crate::signed_time::whole_millis")
-                        || t.starts_with("let now = (self.clock)()"),
-                    "{name}:{}: use self.now(): {t}",
-                    n + 1
-                );
-            }
-        }
-        assert!(checked >= 10, "scan found only {checked} signed times");
-    }
-
-    /// The parameters that reach the signature are rounded again where they are used, so an
-    /// entry queued before this fix (stored with a full-nanosecond time) is signed rounded.
-    #[test]
-    fn builders_round_the_time_they_are_given() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rooms");
-        let bans = std::fs::read_to_string(root.join("bans.rs")).unwrap();
-        assert_eq!(
-            bans.matches("let time = crate::signed_time::whole_millis(time);")
-                .count(),
-            2
-        );
-        let outbox = std::fs::read_to_string(root.join("outbox.rs")).unwrap();
-        assert!(outbox.contains("let time = crate::signed_time::whole_millis(time);"));
-        let create = std::fs::read_to_string(root.join("create.rs")).unwrap();
-        assert!(create.contains("time: crate::signed_time::whole_millis(now),"));
     }
 }

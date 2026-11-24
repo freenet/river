@@ -138,6 +138,8 @@ pub struct Config {
 }
 
 impl Config {
+    // Unix seconds for update checks; nothing is signed.
+    #[allow(clippy::disallowed_methods)]
     pub fn system_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
         Arc::new(|| {
             SystemTime::now()
@@ -646,6 +648,8 @@ impl Updater {
 
     /// Start the swapped-in binary and wait for it to confirm. If it does not, restore the
     /// previous binary and say so. On `Ok` the caller should exit: the new binary is running.
+    // A unique handshake file name; nothing is signed.
+    #[allow(clippy::disallowed_methods)]
     pub fn launch(&self, applied: &Applied, args: &[OsString]) -> Result<(), String> {
         let marker = self.dir().join(format!(
             "handshake-{}-{}",

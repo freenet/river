@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! The release-signing tool for River's self-update. Not shipped in the app.
 //!
 //! ```text

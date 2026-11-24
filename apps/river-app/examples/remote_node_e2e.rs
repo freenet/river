@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! End-to-end run of the app pointed at a Freenet node it was told about, not found: the node's
 //! address comes from the saved setting, the `FREENET_NODE` variable, or a forwarded port (what
 //! an SSH tunnel to a node on another machine looks like), always on a port other than 7509.

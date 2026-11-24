@@ -160,6 +160,8 @@ fn write_cache(path: &PathBuf, checked_at: u64, latest: Option<&str>) {
     let _ = std::fs::write(path, json.to_string());
 }
 
+// Read-side clock for the update-check throttle; nothing here is signed.
+#[allow(clippy::disallowed_methods)]
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

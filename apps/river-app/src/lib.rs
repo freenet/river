@@ -2,6 +2,8 @@
 //!
 //! A shell (today `apps/desktop`) supplies a [`NodeHost`] that knows how to find, install and
 //! start Freenet on its platform; everything the user sees lives here.
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod address;
 pub mod chat;

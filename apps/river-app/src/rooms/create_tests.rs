@@ -64,6 +64,22 @@ fn a_new_public_room_is_the_web_uis() {
     assert_eq!(state.member_info.member_info[0].member_info.version, 0);
 }
 
+/// The new room's secret record is stamped from the real clock.
+#[test]
+fn a_new_private_rooms_secret_record_is_stamped_a_whole_millisecond() {
+    let plan = new_room(SigningKey::from_bytes(&[43; 32]), "Club", "Ada", true).unwrap();
+    let versions = &plan.room.room_state.secrets.versions;
+    assert!(!versions.is_empty());
+    for v in versions {
+        let d = v
+            .record
+            .created_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(d.subsec_nanos() % 1_000_000, 0, "{d:?}");
+    }
+}
+
 #[test]
 fn a_new_private_room_seals_its_name_and_nickname_and_gives_the_owner_the_secret() {
     let owner = SigningKey::from_bytes(&[41; 32]);

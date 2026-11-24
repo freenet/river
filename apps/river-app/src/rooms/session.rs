@@ -1944,6 +1944,8 @@ struct DmMemo {
 const REREAD_EVERY: Duration = Duration::from_secs(30);
 
 /// The time in unix seconds.
+// Unix seconds, not a signed SystemTime.
+#[allow(clippy::disallowed_methods)]
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3761,7 +3763,12 @@ impl Rooms {
                 .collect(),
             settled,
             status,
-            now: local_minutes(SystemTime::now()),
+            // For display only; nothing is signed.
+            now: {
+                #[allow(clippy::disallowed_methods)]
+                let t = SystemTime::now();
+                local_minutes(t)
+            },
             issues: self.issues(),
             work: self.outbox.work.views(),
         });

@@ -1962,7 +1962,7 @@ impl Default for Outbox {
             next: 0,
             waiting: Vec::new(),
             work: Default::default(),
-            clock: Box::new(SystemTime::now),
+            clock: Box::new(crate::signed_time::now),
             owed: HashMap::new(),
             reconnect: false,
             stale: HashMap::new(),

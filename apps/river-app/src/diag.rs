@@ -49,6 +49,8 @@ pub fn on_failure(f: fn(&std::io::Error)) {
     let _ = FAILURE.set(f);
 }
 
+// A log timestamp; nothing is signed.
+#[allow(clippy::disallowed_methods)]
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

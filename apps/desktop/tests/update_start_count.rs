@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! A River that was just swapped in and is run with a bad option, over and over, must not be
 //! rolled back: a start that exits on its command line is not a failed update. Runs the real
 //! binary on a pseudo-terminal (`script`), because only a terminal makes a bad `--node` exit

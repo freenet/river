@@ -4814,11 +4814,53 @@ fn a_ban_names_no_member_in_any_debug_output() {
     }
 }
 
+/// A clock whose nanoseconds a Windows decode would change (freenet/river#971).
+fn awkward_clock() -> Outbox {
+    Outbox::with_clock(Box::new(|| {
+        SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
+    }))
+}
+
+fn assert_whole_ms(t: SystemTime) {
+    let d = t.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(d.subsec_nanos() % 1_000_000, 0, "{d:?}");
+}
+
 #[test]
-fn every_time_the_outbox_stamps_is_a_whole_millisecond() {
-    // A clock with a nanosecond field a Windows decode would change (freenet/river#971).
-    let awkward = || SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
-    let ob = Outbox::with_clock(Box::new(awkward));
-    let d = ob.now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-    assert_eq!(d, Duration::new(1_700_000_000, 123_000_000));
+fn every_message_the_outbox_signs_is_stamped_a_whole_millisecond() {
+    let f = Fixture::new();
+    let room = public_room(&f);
+    let theirs = key_of(&room, &f.owner);
+    let mine = key_of(&room, &f.me);
+    let actions = [
+        say("hello"),
+        Action::Send {
+            text: "re".into(),
+            reply_to: Some(theirs.clone()),
+        },
+        Action::Edit {
+            target: mine.clone(),
+            text: "fixed".into(),
+        },
+        Action::Delete { target: mine },
+        Action::React {
+            target: theirs,
+            emoji: "👍".into(),
+        },
+    ];
+    for action in actions {
+        let mut outbox = awkward_clock();
+        let messages = sent(&mut outbox, &room, action);
+        assert!(!messages.is_empty());
+        for m in messages {
+            assert_whole_ms(m.message.time);
+        }
+    }
+}
+
+#[test]
+fn the_outbox_clock_that_stamps_a_send_and_a_retry_is_rounded() {
+    // `Outbox::now()` is what stamps a new send and a retry.
+    let ob = awkward_clock();
+    assert_whole_ms(ob.now());
 }

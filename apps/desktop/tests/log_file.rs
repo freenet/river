@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! The diagnostics log, end to end. A real process starts the redirect (this file includes
 //! `src/log.rs`) with a stderr of each kind, writes, and the test reads what landed where. The
 //! probe is this test binary run again with `RIVER_LOG_PROBE` set, so each case has its own
