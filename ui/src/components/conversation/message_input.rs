@@ -183,7 +183,7 @@ pub fn MessageInput(
     members: Vec<(MemberId, String)>,
 ) -> Element {
     // Own the message state locally - keystrokes only re-render this component
-    let mut message_text = use_signal(String::new);
+    let mut message_text = use_signal(crate::public_join::take_carried_draft);
     let mut show_emoji_picker = use_signal(|| false);
     let mut mention = use_signal(|| None as Option<MentionAutocomplete>);
 

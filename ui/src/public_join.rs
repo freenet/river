@@ -70,6 +70,14 @@ pub enum JoinFailure {
     PolicyChanged,
     /// The message is longer than the room allows.
     TooLong(usize),
+    /// A re-admission needs the member's own key, and this browser does not
+    /// hold it.
+    NoKey,
+    /// The user's rooms have not finished loading, so it is not yet known
+    /// whether they are already in this room.
+    NotReady,
+    /// The user already holds this room.
+    AlreadyMember,
     /// The browser could not hash.
     Internal(String),
 }
@@ -81,9 +89,15 @@ impl JoinFailure {
                 Try again later, or ask a member for an invitation."
                 .to_string(),
             Self::Banned => "You are banned from this room.".to_string(),
-            Self::Shadowed => "Another key already holds this identity in the room. \
-                Try again to join with a new one."
+            Self::Shadowed => "Another key already holds this identity in the room, and \
+                your key stays the same, so trying again will not help. \
+                Ask a member for an invitation."
                 .to_string(),
+            Self::NoKey => "This browser no longer holds your key for this room. \
+                Ask a member for an invitation."
+                .to_string(),
+            Self::NotReady => "Your rooms are still loading. Try again in a moment.".to_string(),
+            Self::AlreadyMember => "You are already in this room.".to_string(),
             Self::NotOpen => "This room no longer admits new members this way. \
                 Ask a member for an invitation."
                 .to_string(),
@@ -101,7 +115,7 @@ impl JoinFailure {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::RoomFull | Self::Shadowed | Self::PolicyChanged | Self::Internal(_)
+            Self::RoomFull | Self::PolicyChanged | Self::NotReady | Self::Internal(_)
         )
     }
 }
@@ -162,12 +176,7 @@ pub struct Submission {
     pub nickname: String,
 }
 
-/// Build the one delta that admits `signing_key` with `text` as its first
-/// message, and apply it to a copy of `state`.
-///
-/// Refuses, with the reason, when the room would not keep the entry or the
-/// message: the status is asked of the room's own cleanup, and the result is
-/// checked to hold both.
+/// [`build_submission_many`] for one message.
 pub fn build_submission(
     state: &ChatRoomStateV1,
     owner_vk: &VerifyingKey,
@@ -177,8 +186,37 @@ pub fn build_submission(
     nickname: &str,
     now: SystemTime,
 ) -> Result<Submission, JoinFailure> {
+    build_submission_many(
+        state,
+        owner_vk,
+        signing_key,
+        entry,
+        &[text.to_string()],
+        nickname,
+        now,
+    )
+}
+
+/// Build the one delta that admits `signing_key` with `texts` as its first
+/// messages (in order, a millisecond apart), and apply it to a copy of `state`.
+///
+/// Refuses, with the reason, when the room would not keep the entry or every
+/// message: the status is asked of the room's own cleanup, and the result is
+/// checked to hold all of them.
+pub fn build_submission_many(
+    state: &ChatRoomStateV1,
+    owner_vk: &VerifyingKey,
+    signing_key: &SigningKey,
+    entry: &AuthorizedProvisionalMember,
+    texts: &[String],
+    nickname: &str,
+    now: SystemTime,
+) -> Result<Submission, JoinFailure> {
     let config = &state.configuration.configuration;
-    if text.len() > config.max_message_size {
+    if texts.is_empty() {
+        return Err(JoinFailure::Internal("no message to post".to_string()));
+    }
+    if texts.iter().any(|t| t.len() > config.max_message_size) {
         return Err(JoinFailure::TooLong(config.max_message_size));
     }
     let member_vk = signing_key.verifying_key();
@@ -197,33 +235,45 @@ pub fn build_submission(
         MemberInfo::new_public(id, next_version, nickname.to_string()),
         signing_key,
     );
-    let message = AuthorizedMessageV1::new(
-        MessageV1 {
-            room_owner: MemberId::from(owner_vk),
-            author: id,
-            content: RoomMessageBody::public(text.to_string()),
-            time: now,
-        },
-        signing_key,
-    );
-    let message_id = message.id();
-    let delta = admission_delta(state, &params, entry, info.clone(), message);
+    let messages: Vec<AuthorizedMessageV1> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(owner_vk),
+                    author: id,
+                    content: RoomMessageBody::public(text.clone()),
+                    time: now + std::time::Duration::from_millis(i as u64),
+                },
+                signing_key,
+            )
+        })
+        .collect();
+    let message_ids: Vec<_> = messages.iter().map(|m| m.id()).collect();
+    let mut messages = messages.into_iter();
+    let first = messages.next().expect("texts is not empty");
+    let mut delta = admission_delta(state, &params, entry, info.clone(), first);
+    if let Some(list) = delta.recent_messages.as_mut() {
+        list.extend(messages);
+    }
     let mut state_after = state.clone();
     state_after
         .apply_delta(state, &params, &Some(delta.clone()))
         .map_err(|e| JoinFailure::Internal(format!("{e:?}")))?;
-    let kept = state_after
-        .recent_messages
-        .messages
-        .iter()
-        .any(|m| m.id() == message_id)
-        && state_after
-            .provisional
-            .entries
+    let kept = message_ids.iter().all(|id| {
+        state_after
+            .recent_messages
+            .messages
             .iter()
-            .any(|e| e.provisional.member_vk == member_vk);
+            .any(|m| m.id() == *id)
+    }) && state_after
+        .provisional
+        .entries
+        .iter()
+        .any(|e| e.provisional.member_vk == member_vk);
     if !kept {
-        // The room's cleanup dropped the entry or the message: the pool or the
+        // The room's cleanup dropped the entry or a message: the pool or the
         // quota is held by newer messages.
         return Err(JoinFailure::RoomFull);
     }
@@ -277,50 +327,491 @@ pub enum JoinPhase {
     Failed(JoinFailure),
 }
 
-/// What the view shows. Nothing secret.
+/// What the view shows. Nothing secret. `owner` says which room the state is
+/// about: a composer for any other room shows an idle join.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinUi {
+    pub owner: Option<VerifyingKey>,
     pub phase: JoinPhase,
-    /// A message sent before admission: shown as pending, posted once.
-    pub queued: Option<String>,
-    /// A queued message handed back after a failure or cancel. The composer
-    /// puts it back in its draft box (in front of anything typed since) and
-    /// clears this.
-    pub returned: Option<String>,
+    /// Messages sent before admission, in order: shown as pending, posted once.
+    pub queued: Vec<String>,
+    /// Text handed back after a failure, cancel or close, per room. The
+    /// composer of that room puts it back in its draft box and takes it.
+    pub returned: Vec<(VerifyingKey, String)>,
+    /// A refusal that does not stop the join in progress (a message that is
+    /// too long, or one sent while posting): shown with the composer.
+    pub notice: Option<String>,
 }
 
 impl Default for JoinUi {
     fn default() -> Self {
         Self {
+            owner: None,
             phase: JoinPhase::Idle,
-            queued: None,
-            returned: None,
+            queued: Vec::new(),
+            returned: Vec::new(),
+            notice: None,
         }
+    }
+}
+
+impl JoinUi {
+    /// The phase as `owner`'s composer shows it.
+    pub fn phase_for(&self, owner: &VerifyingKey) -> JoinPhase {
+        if self.owner.as_ref() == Some(owner) {
+            self.phase.clone()
+        } else {
+            JoinPhase::Idle
+        }
+    }
+
+    /// The pending messages of `owner`'s room.
+    pub fn queued_for(&self, owner: &VerifyingKey) -> Vec<String> {
+        if self.owner.as_ref() == Some(owner) {
+            self.queued.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn notice_for(&self, owner: &VerifyingKey) -> Option<String> {
+        if self.owner.as_ref() == Some(owner) {
+            self.notice.clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn has_returned_for(&self, owner: &VerifyingKey) -> bool {
+        self.returned.iter().any(|(o, _)| o == owner)
     }
 }
 
 pub static JOIN: GlobalSignal<JoinUi> = Global::new(JoinUi::default);
 
-/// The member key and proof of the join in progress. Process memory only.
-struct Session {
-    /// Increases on every start and cancel; a task that finds another value
-    /// stops.
-    generation: u64,
-    owner_vk: Option<VerifyingKey>,
-    signing_key: Option<SigningKey>,
-    entry: Option<AuthorizedProvisionalMember>,
-    /// Re-admitting a member already in `ROOMS` (pruned), not joining from the
-    /// viewer: the key is the room's own and the state is the room's.
-    readmit: bool,
+/// What the next step is, once a transition has been recorded. Returned by the
+/// [`Machine`] so the driver does nothing but carry it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Nothing,
+    /// Solve the proof of work for this generation.
+    Solve(u64),
+    /// Post the in-flight messages for this generation.
+    Submit(u64),
 }
 
-static SESSION: Mutex<Session> = Mutex::new(Session {
-    generation: 0,
-    owner_vk: None,
-    signing_key: None,
-    entry: None,
-    readmit: false,
-});
+/// What a join starts from, worked out by the caller from `ROOMS`.
+pub struct StartPlan {
+    /// Re-admitting a member already in `ROOMS` (pruned), not joining from the
+    /// viewer: the key is the room's own.
+    pub readmit: bool,
+    /// The key to join with: fresh for a join, the room's own for a re-admission
+    /// (`None` when this browser does not hold it).
+    pub key: Option<SigningKey>,
+    /// The proof held from earlier, if the room's own member has one.
+    pub entry: Option<AuthorizedProvisionalMember>,
+    /// A reason not to start at all (rooms still loading, already a member).
+    pub blocker: Option<JoinFailure>,
+}
+
+/// What the room allows a message, as far as the queue is concerned.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_message_size: usize,
+    /// How many messages the entry may carry (the room's provisional message
+    /// quota). More than this would be dropped by the room's own cleanup.
+    pub max_queued: usize,
+}
+
+/// The state of the join in progress, and every transition it can make. Pure:
+/// no signals, no browser, so each rule is tested natively and the driver
+/// below only carries out the [`Action`] a transition returns.
+///
+/// Rules this type owns:
+/// * a message is in exactly one of: the queue, the in-flight batch, the
+///   returned text. It leaves the in-flight batch only by `succeed`.
+/// * the phase flips to `Submitting` in the same step that takes the queue, so
+///   two sends cannot both submit.
+/// * a message is never dropped: every refusal and failure hands it back.
+pub struct Machine {
+    generation: u64,
+    owner: Option<VerifyingKey>,
+    phase: JoinPhase,
+    queue: Vec<String>,
+    /// The batch being posted. Not in `queue`, not yet in the room.
+    in_flight: Vec<String>,
+    returned: Vec<(VerifyingKey, String)>,
+    notice: Option<String>,
+    signing_key: Option<SigningKey>,
+    entry: Option<AuthorizedProvisionalMember>,
+    readmit: bool,
+    /// The room a join just completed for: lets its composer's leftover draft
+    /// follow the user into the member room.
+    joined: Option<VerifyingKey>,
+}
+
+impl Machine {
+    pub const fn new() -> Self {
+        Self {
+            generation: 0,
+            owner: None,
+            phase: JoinPhase::Idle,
+            queue: Vec::new(),
+            in_flight: Vec::new(),
+            returned: Vec::new(),
+            notice: None,
+            signing_key: None,
+            entry: None,
+            readmit: false,
+            joined: None,
+        }
+    }
+
+    /// What the view shows.
+    pub fn ui(&self) -> JoinUi {
+        JoinUi {
+            owner: self.owner,
+            phase: self.phase.clone(),
+            queued: self.in_flight.iter().chain(&self.queue).cloned().collect(),
+            returned: self.returned.clone(),
+            notice: self.notice.clone(),
+        }
+    }
+
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    fn active(&self) -> bool {
+        matches!(
+            self.phase,
+            JoinPhase::Solving { .. } | JoinPhase::Ready | JoinPhase::Submitting
+        )
+    }
+
+    /// Put `text` back for `owner`'s composer, after anything already waiting.
+    fn give_back(&mut self, owner: VerifyingKey, text: String) {
+        match self.returned.iter_mut().find(|(o, _)| *o == owner) {
+            Some((_, t)) => {
+                if t.trim().is_empty() {
+                    *t = text;
+                } else {
+                    t.push('\n');
+                    t.push_str(&text);
+                }
+            }
+            None => self.returned.push((owner, text)),
+        }
+    }
+
+    /// Hand every message not yet in the room back, in the order sent.
+    fn hand_back_all(&mut self) {
+        let Some(owner) = self.owner else {
+            self.queue.clear();
+            self.in_flight.clear();
+            return;
+        };
+        let mut all = std::mem::take(&mut self.in_flight);
+        all.append(&mut self.queue);
+        if !all.is_empty() {
+            self.give_back(owner, all.join("\n"));
+        }
+    }
+
+    fn clear_secrets(&mut self) {
+        self.signing_key = None;
+        self.entry = None;
+        self.readmit = false;
+    }
+
+    /// Stop whatever is under way for another room. Its messages are handed
+    /// back to that room's composer.
+    fn abandon(&mut self) {
+        self.generation += 1;
+        self.hand_back_all();
+        self.clear_secrets();
+        self.phase = JoinPhase::Idle;
+        self.notice = None;
+    }
+
+    fn begin(&mut self, owner: VerifyingKey, plan: StartPlan) -> Action {
+        if let Some(blocker) = plan.blocker {
+            self.generation += 1;
+            self.owner = Some(owner);
+            self.hand_back_all();
+            self.clear_secrets();
+            self.phase = JoinPhase::Failed(blocker);
+            return Action::Nothing;
+        }
+        let Some(key) = plan.key else {
+            self.generation += 1;
+            self.owner = Some(owner);
+            self.hand_back_all();
+            self.clear_secrets();
+            self.phase = JoinPhase::Failed(JoinFailure::NoKey);
+            return Action::Nothing;
+        };
+        self.generation += 1;
+        self.owner = Some(owner);
+        self.signing_key = Some(key);
+        self.entry = plan.entry;
+        self.readmit = plan.readmit;
+        self.joined = None;
+        self.notice = None;
+        self.phase = JoinPhase::Solving {
+            tried: 0,
+            expected: 0.0,
+        };
+        Action::Solve(self.generation)
+    }
+
+    /// Whether a join for `owner` can start from here.
+    fn can_start(&self, owner: &VerifyingKey) -> bool {
+        match (&self.owner, &self.phase) {
+            (_, JoinPhase::Submitting) => false,
+            (Some(o), p) if o == owner => matches!(p, JoinPhase::Idle | JoinPhase::Failed(_)),
+            // Another room's join: only an unfinished one that is not posting
+            // is dropped for this one.
+            _ => true,
+        }
+    }
+
+    /// Join pressed. Nothing happens while one is under way for this room.
+    pub fn start(&mut self, owner: VerifyingKey, plan: StartPlan) -> Action {
+        if !self.can_start(&owner) {
+            return Action::Nothing;
+        }
+        if self.owner.is_some_and(|o| o != owner) && self.active() {
+            self.abandon();
+        }
+        self.begin(owner, plan)
+    }
+
+    /// Send pressed with `text`: queue it, start admission or post it.
+    pub fn send(
+        &mut self,
+        owner: VerifyingKey,
+        text: &str,
+        limits: Limits,
+        plan: StartPlan,
+    ) -> Action {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Action::Nothing;
+        }
+        if text.len() > limits.max_message_size {
+            // Before any work is done: a valid proof would be wasted on it.
+            self.give_back(owner, text);
+            self.notice = Some(JoinFailure::TooLong(limits.max_message_size).message());
+            if self.owner != Some(owner) && !self.active() {
+                self.owner = Some(owner);
+            }
+            return Action::Nothing;
+        }
+        let mine = self.owner == Some(owner);
+        if matches!(self.phase, JoinPhase::Submitting) {
+            // The text goes back to the box it came from; the posting batch is
+            // not touched.
+            self.give_back(owner, text);
+            if mine {
+                self.notice =
+                    Some("Still posting your last message. Send again in a moment.".into());
+            }
+            return Action::Nothing;
+        }
+        if self.owner.is_some_and(|o| o != owner) && self.active() {
+            self.abandon();
+        }
+        let mine = self.owner == Some(owner);
+        if mine && matches!(self.phase, JoinPhase::Solving { .. } | JoinPhase::Ready) {
+            if self.queue.len() + self.in_flight.len() >= limits.max_queued {
+                self.give_back(owner, text);
+                self.notice = Some(format!(
+                    "You can queue {} messages before you are admitted. Wait for admission to send more.",
+                    limits.max_queued
+                ));
+                return Action::Nothing;
+            }
+            self.notice = None;
+            self.queue.push(text);
+            if matches!(self.phase, JoinPhase::Ready) {
+                self.in_flight = std::mem::take(&mut self.queue);
+                self.phase = JoinPhase::Submitting;
+                return Action::Submit(self.generation);
+            }
+            return Action::Nothing;
+        }
+        // Idle or failed (or another room's finished state): start.
+        self.owner = Some(owner);
+        self.queue.push(text);
+        self.begin(owner, plan)
+    }
+
+    pub fn progress(&mut self, generation: u64, tried: u64, expected: f64) {
+        if self.is_current(generation) && matches!(self.phase, JoinPhase::Solving { .. }) {
+            self.phase = JoinPhase::Solving { tried, expected };
+        }
+    }
+
+    /// The proof is solved (or a held one still passes). Posts the queue, or
+    /// waits for the first message.
+    pub fn solved(&mut self, generation: u64, entry: AuthorizedProvisionalMember) -> Action {
+        if !self.is_current(generation) || !matches!(self.phase, JoinPhase::Solving { .. }) {
+            return Action::Nothing;
+        }
+        self.entry = Some(entry);
+        if self.queue.is_empty() {
+            self.phase = JoinPhase::Ready;
+            Action::Nothing
+        } else {
+            self.in_flight = std::mem::take(&mut self.queue);
+            self.phase = JoinPhase::Submitting;
+            Action::Submit(generation)
+        }
+    }
+
+    /// The proof stopped passing before it could be posted: solve again with
+    /// the same key, keeping every message.
+    pub fn restart_solving(&mut self, generation: u64) -> Action {
+        if !self.is_current(generation) {
+            return Action::Nothing;
+        }
+        let mut all = std::mem::take(&mut self.in_flight);
+        all.append(&mut self.queue);
+        self.queue = all;
+        self.entry = None;
+        self.generation += 1;
+        self.phase = JoinPhase::Solving {
+            tried: 0,
+            expected: 0.0,
+        };
+        Action::Solve(self.generation)
+    }
+
+    pub fn fail(&mut self, generation: u64, failure: JoinFailure) {
+        if !self.is_current(generation) {
+            return;
+        }
+        self.hand_back_all();
+        self.clear_secrets();
+        self.phase = JoinPhase::Failed(failure);
+    }
+
+    /// Cancel solving. Every pending message returns to the composer, and the
+    /// key made for it is forgotten.
+    pub fn cancel(&mut self) {
+        self.generation += 1;
+        self.hand_back_all();
+        self.clear_secrets();
+        self.notice = None;
+        self.phase = JoinPhase::Idle;
+    }
+
+    /// The viewer closed or the room changed: as cancel, and no room is
+    /// remembered.
+    pub fn reset(&mut self) {
+        self.cancel();
+        self.owner = None;
+    }
+
+    /// The batch is in the room. Returns the messages that were posted.
+    pub fn succeed(&mut self, generation: u64) -> Option<Vec<String>> {
+        if !self.is_current(generation) || !matches!(self.phase, JoinPhase::Submitting) {
+            return None;
+        }
+        let posted = std::mem::take(&mut self.in_flight);
+        let readmit = self.readmit;
+        self.joined = if readmit { None } else { self.owner };
+        self.clear_secrets();
+        self.owner = None;
+        self.notice = None;
+        self.phase = JoinPhase::Idle;
+        Some(posted)
+    }
+
+    pub fn take_returned(&mut self, owner: &VerifyingKey) -> Option<String> {
+        let i = self.returned.iter().position(|(o, _)| o == owner)?;
+        Some(self.returned.remove(i).1)
+    }
+
+    /// The text of a composer that closes after a successful join, for the
+    /// member room's own composer.
+    pub fn carry_draft(&mut self, owner: VerifyingKey, text: String) -> bool {
+        if self.joined != Some(owner) || text.trim().is_empty() {
+            return false;
+        }
+        self.give_back(owner, text);
+        true
+    }
+
+    /// The draft a composer left for `owner`'s member room, once.
+    pub fn take_carried(&mut self, owner: &VerifyingKey) -> Option<String> {
+        if self.joined.as_ref() != Some(owner) {
+            return None;
+        }
+        let text = self.take_returned(owner)?;
+        self.joined = None;
+        Some(text)
+    }
+
+    fn submit_inputs(
+        &self,
+        generation: u64,
+    ) -> Option<(SigningKey, AuthorizedProvisionalMember, Vec<String>, bool)> {
+        if !self.is_current(generation) || !matches!(self.phase, JoinPhase::Submitting) {
+            return None;
+        }
+        Some((
+            self.signing_key.clone()?,
+            self.entry.clone()?,
+            self.in_flight.clone(),
+            self.readmit,
+        ))
+    }
+}
+
+impl Default for Machine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static MACHINE: Mutex<Machine> = Mutex::new(Machine::new());
+
+fn machine() -> std::sync::MutexGuard<'static, Machine> {
+    MACHINE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f` on the machine, show the result, and carry out what it returns.
+fn step<T>(f: impl FnOnce(&mut Machine) -> T) -> T {
+    let (out, ui) = {
+        let mut m = machine();
+        let out = f(&mut m);
+        (out, m.ui())
+    };
+    update_ui(move |j| *j = ui);
+    out
+}
+
+fn act(action: Action, owner_vk: VerifyingKey) {
+    match action {
+        Action::Nothing => {}
+        Action::Solve(generation) => {
+            crate::util::safe_spawn_local(async move { run(generation, owner_vk).await });
+        }
+        Action::Submit(generation) => {
+            crate::util::safe_spawn_local(async move { submit(generation, owner_vk).await });
+        }
+    }
+}
+
+fn is_current(generation: u64) -> bool {
+    machine().is_current(generation)
+}
+
+fn fail(generation: u64, failure: JoinFailure) {
+    step(|m| m.fail(generation, failure));
+}
 
 /// The proof each room last admitted this session, so a member the room pruned
 /// is re-submitted at once when the policy still accepts it. Process memory
@@ -353,12 +844,12 @@ pub fn forget_held_entries() {
 
 /// The room state the join works against: the viewed room, or for a
 /// re-admission the member's own room.
-fn source_state(owner_vk: &VerifyingKey) -> Option<ChatRoomStateV1> {
-    if session().readmit {
+fn source_state(owner_vk: &VerifyingKey, readmit: bool) -> Option<ChatRoomStateV1> {
+    if readmit {
         let rooms = crate::components::app::ROOMS.try_peek().ok()?;
         return rooms.map.get(owner_vk).map(|r| r.room_state.clone());
     }
-    viewed_state().map(|(_, s)| s)
+    viewed_state().and_then(|(o, s)| (o == *owner_vk).then_some(s))
 }
 
 /// What to tell a member the room pruned, and what their next message does.
@@ -393,38 +884,10 @@ pub fn readmit_note_for(room: &crate::room_data::RoomData) -> Option<String> {
     ))
 }
 
-fn session() -> std::sync::MutexGuard<'static, Session> {
-    SESSION.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn is_current(generation: u64) -> bool {
-    session().generation == generation
-}
-
 /// Write the UI state from a clean execution context.
 fn update_ui(f: impl FnOnce(&mut JoinUi) + 'static) {
     crate::util::defer(move || {
         JOIN.with_mut(f);
-    });
-}
-
-/// A queued message goes back to the composer: it is never lost.
-fn hand_back(ui: &mut JoinUi) {
-    if let Some(q) = ui.queued.take() {
-        ui.returned = Some(restore_draft(
-            ui.returned.as_deref().unwrap_or(""),
-            Some(&q),
-        ));
-    }
-}
-
-fn fail(generation: u64, failure: JoinFailure) {
-    if !is_current(generation) {
-        return;
-    }
-    update_ui(move |ui| {
-        hand_back(ui);
-        ui.phase = JoinPhase::Failed(failure);
     });
 }
 
@@ -443,171 +906,177 @@ fn viewed_state() -> Option<(VerifyingKey, ChatRoomStateV1)> {
 /// The verifying key of the join in progress (test hooks).
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
 pub fn session_member_vk() -> Option<VerifyingKey> {
-    session().signing_key.as_ref().map(|k| k.verifying_key())
+    machine().signing_key.as_ref().map(|k| k.verifying_key())
 }
 
-/// Forget the join: it is over, or the viewer closed.
+/// Test hook support: while set, the solver does no work, so a test that must
+/// cancel or ban mid-solve does not race a lucky proof.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub static HOLD_SOLVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Forget the join: it is over, or the viewer closed. Messages not yet in the
+/// room go back to their composer.
 pub fn reset() {
-    {
-        let mut s = session();
-        s.generation += 1;
-        s.owner_vk = None;
-        s.signing_key = None;
-        s.entry = None;
-        s.readmit = false;
-    }
-    update_ui(|ui| *ui = JoinUi::default());
+    step(|m| m.reset());
 }
 
-/// Cancel solving. The draft, and any queued message, return to the draft box.
+/// Cancel solving. The queued messages return to the draft box.
 pub fn cancel() {
-    {
-        let mut s = session();
-        s.generation += 1;
-        s.signing_key = None;
-        s.entry = None;
-    }
-    update_ui(|ui| {
-        hand_back(ui);
-        ui.phase = JoinPhase::Idle;
-    });
+    step(|m| m.cancel());
 }
 
-/// Start admission (Join pressed, or Send pressed before admission). A
-/// no-op while one is under way.
-pub fn start(owner_vk: VerifyingKey) {
-    let generation = {
-        let mut s = session();
-        if matches!(
-            JOIN.try_peek().map(|u| u.phase.clone()),
-            Ok(JoinPhase::Solving { .. })
-        ) {
-            return;
-        }
-        s.generation += 1;
-        s.owner_vk = Some(owner_vk);
-        // A fresh member key for every attempt. The old one, if any, is
-        // forgotten: a failed or cancelled attempt posted nothing under it.
-        s.signing_key = Some(SigningKey::generate(&mut rand::thread_rng()));
-        s.entry = None;
-        s.readmit = false;
-        s.generation
-    };
-    update_ui(|ui| {
-        ui.phase = JoinPhase::Solving {
-            tried: 0,
-            expected: 0.0,
-        };
-    });
-    crate::util::safe_spawn_local(async move {
-        run(generation, owner_vk).await;
-    });
-}
-
-/// Re-admit the member of a room the room pruned, with the SAME key: the held
-/// proof is re-submitted when the policy still accepts it, otherwise the proof
-/// is solved again. A no-op while one is under way.
-pub fn start_readmit(owner_vk: VerifyingKey) {
-    let Some(signing_key) = crate::components::app::ROOMS
+/// A room's own messages and rooms loading are both needed before a join can
+/// be started: a key must never be made for a room the user already holds.
+fn start_blocker(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
+    use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+    let loaded = ROOMS_LOAD_STATE
         .try_peek()
-        .ok()
-        .and_then(|r| r.map.get(&owner_vk).and_then(|d| d.signing_key().cloned()))
-    else {
-        return;
-    };
-    let generation = {
-        let mut s = session();
-        if matches!(
-            JOIN.try_peek().map(|u| u.phase.clone()),
-            Ok(JoinPhase::Solving { .. })
-        ) {
-            return;
+        .map(|s| *s == RoomsLoadState::Loaded)
+        .unwrap_or(false);
+    if !loaded {
+        return Some(JoinFailure::NotReady);
+    }
+    match crate::components::app::ROOMS.try_peek() {
+        Ok(rooms) if rooms.map.contains_key(owner_vk) => Some(JoinFailure::AlreadyMember),
+        Ok(_) => None,
+        Err(_) => Some(JoinFailure::NotReady),
+    }
+}
+
+/// A fresh member key for a join from the viewer. The key is only stored once
+/// the entry is posted (`submit`), so an abandoned attempt leaves nothing.
+fn fresh_plan(owner_vk: &VerifyingKey) -> StartPlan {
+    StartPlan {
+        readmit: false,
+        key: Some(SigningKey::generate(&mut rand::thread_rng())),
+        entry: None,
+        blocker: start_blocker(owner_vk),
+    }
+}
+
+/// The member's own key and held proof, for a room the room pruned them from.
+fn readmit_plan(owner_vk: &VerifyingKey) -> StartPlan {
+    StartPlan {
+        readmit: true,
+        key: crate::components::app::ROOMS
+            .try_peek()
+            .ok()
+            .and_then(|r| r.map.get(owner_vk).and_then(|d| d.signing_key().cloned())),
+        entry: held_entry(owner_vk),
+        blocker: None,
+    }
+}
+
+fn plan_for(owner_vk: &VerifyingKey) -> (StartPlan, Option<ChatRoomStateV1>) {
+    match viewed_state() {
+        Some((o, state)) if o == *owner_vk => (fresh_plan(owner_vk), Some(state)),
+        _ => {
+            let state = crate::components::app::ROOMS
+                .try_peek()
+                .ok()
+                .and_then(|r| r.map.get(owner_vk).map(|d| d.room_state.clone()));
+            (readmit_plan(owner_vk), state)
         }
-        s.generation += 1;
-        s.owner_vk = Some(owner_vk);
-        s.entry = held_entry(&owner_vk);
-        s.signing_key = Some(signing_key);
-        s.readmit = true;
-        s.generation
-    };
-    update_ui(|ui| {
-        ui.phase = JoinPhase::Solving {
-            tried: 0,
-            expected: 0.0,
-        };
-    });
-    crate::util::safe_spawn_local(async move {
-        run(generation, owner_vk).await;
-    });
+    }
+}
+
+/// Start admission (Join pressed). A no-op while one is under way.
+pub fn start(owner_vk: VerifyingKey) {
+    let action = step(|m| m.start(owner_vk, fresh_plan(&owner_vk)));
+    act(action, owner_vk);
+}
+
+/// Re-admit the member of a room the room pruned, with the SAME key. A no-op
+/// while one is under way.
+pub fn start_readmit(owner_vk: VerifyingKey) {
+    let action = step(|m| m.start(owner_vk, readmit_plan(&owner_vk)));
+    act(action, owner_vk);
 }
 
 /// Send pressed with `text`: queue it, and start admission or post it.
 pub fn send(owner_vk: VerifyingKey, text: String) {
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return;
+    let (plan, state) = plan_for(&owner_vk);
+    let limits = match &state {
+        Some(s) => Limits {
+            max_message_size: s.configuration.configuration.max_message_size,
+            max_queued: s
+                .configuration
+                .configuration
+                .public_admission
+                .as_ref()
+                .map_or(1, |p| (p.max_provisional_messages as usize).max(1)),
+        },
+        None => Limits {
+            max_message_size: usize::MAX,
+            max_queued: 1,
+        },
+    };
+    let action = step(|m| m.send(owner_vk, &text, limits, plan));
+    act(action, owner_vk);
+}
+
+/// Take the text handed back to `owner`'s composer, if any.
+pub fn take_returned(owner_vk: &VerifyingKey) -> Option<String> {
+    let taken = machine().take_returned(owner_vk);
+    if taken.is_some() {
+        let ui = machine().ui();
+        update_ui(move |j| *j = ui);
     }
-    let phase = JOIN.try_peek().map(|u| u.phase.clone()).ok();
-    let ready = matches!(phase, Some(JoinPhase::Ready));
-    let solving = matches!(phase, Some(JoinPhase::Solving { .. }));
-    let submitting = matches!(phase, Some(JoinPhase::Submitting));
-    if submitting {
-        return;
+    taken
+}
+
+/// A composer closing right after a successful join leaves its draft here for
+/// the member room's composer.
+pub fn carry_draft(owner_vk: VerifyingKey, text: String) {
+    // Stays in `returned`: the member room's composer takes it.
+    machine().carry_draft(owner_vk, text);
+}
+
+/// The draft the viewer's composer left for the room now selected, for the
+/// member room's composer to start with.
+pub fn take_carried_draft() -> String {
+    let Some(owner) = crate::components::app::CURRENT_ROOM
+        .try_peek()
+        .ok()
+        .and_then(|c| c.owner_key)
+    else {
+        return String::new();
+    };
+    let taken = machine().take_carried(&owner);
+    if taken.is_some() {
+        let ui = machine().ui();
+        update_ui(move |j| *j = ui);
     }
-    let queued = text.clone();
-    update_ui(move |ui| ui.queued = Some(queued));
-    if ready {
-        let generation = session().generation;
-        crate::util::safe_spawn_local(async move {
-            submit(generation, owner_vk, text).await;
-        });
-    } else if !solving {
-        // Not viewing the room: the sender is a member the room pruned.
-        if viewed_state().is_some() {
-            start(owner_vk);
-        } else {
-            start_readmit(owner_vk);
-        }
-    }
+    taken.unwrap_or_default()
 }
 
 async fn run(generation: u64, owner_vk: VerifyingKey) {
-    let Some(signing_key) = session().signing_key.clone() else {
-        return;
+    let (signing_key, readmit, held) = {
+        let m = machine();
+        if !m.is_current(generation) {
+            return;
+        }
+        let Some(k) = m.signing_key.clone() else {
+            return;
+        };
+        (k, m.readmit, m.entry.clone())
     };
     let member_vk = signing_key.verifying_key();
 
-    // The key goes through the delegate like an invited member's, so the hosted
-    // delegate's quota applies and the key is the one used afterwards. The
-    // example build has no delegate.
-    #[cfg(not(feature = "no-sync"))]
-    if !session().readmit {
-        let room_key = owner_vk.to_bytes();
-        let stored = crate::signing::migrate_signing_key(room_key, &signing_key, true).await;
-        if stored == crate::signing::MigrationResult::Failed {
-            // The same fallback as an invitation: the key is also kept in the
-            // room's own record, which signs when the delegate cannot.
-            dioxus::logger::tracing::warn!(
-                "public join: could not store the member key in the delegate"
-            );
-        }
-        if !is_current(generation) {
-            return;
-        }
-    }
-
-    let Some(state) = source_state(&owner_vk) else {
+    let Some(state) = source_state(&owner_vk, readmit) else {
         fail(generation, JoinFailure::NotOpen);
         return;
     };
     // A proof held from earlier is re-submitted when the room's current policy
     // still accepts it; otherwise it is solved again with the same key.
-    let held = session().entry.clone();
     if let Some(entry) = held {
         let now = crate::util::get_current_system_time();
         match check_admission_status(&state, &owner_vk, &member_vk, Some(&entry), now) {
-            Ok(_) => return finish(generation, owner_vk).await,
-            Err(JoinFailure::PolicyChanged) => session().entry = None,
+            Ok(_) => {
+                let action = step(|m| m.solved(generation, entry));
+                return act(action, owner_vk);
+            }
+            Err(JoinFailure::PolicyChanged) => {}
             Err(f) => return fail(generation, f),
         }
     }
@@ -627,23 +1096,24 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
         if !is_current(generation) {
             return;
         }
+        #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+        if HOLD_SOLVER.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::util::sleep(std::time::Duration::from_millis(10)).await;
+            continue;
+        }
         match solver.step(SLICE) {
             PowStep::Found { nonce, .. } => break nonce,
             PowStep::Progress { tried, expected } => {
                 slices += 1;
                 if slices % PROGRESS_EVERY == 1 {
-                    update_ui(move |ui| {
-                        if matches!(ui.phase, JoinPhase::Solving { .. }) {
-                            ui.phase = JoinPhase::Solving { tried, expected };
-                        }
-                    });
+                    step(|m| m.progress(generation, tried, expected));
                 }
             }
         }
         // The room may change what it asks of newcomers while this runs
         // (a new epoch restarts the search, more bits raise the target); one
         // that no longer admits stops it.
-        if let Some(now_state) = source_state(&owner_vk) {
+        if let Some(now_state) = source_state(&owner_vk, readmit) {
             match check_admission_status(
                 &now_state,
                 &owner_vk,
@@ -666,92 +1136,134 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
         return;
     }
     let entry = entry_for_nonce(&owner_vk, &signing_key, nonce);
-    session().entry = Some(entry);
-    finish(generation, owner_vk).await
+    let action = step(|m| m.solved(generation, entry));
+    act(action, owner_vk);
 }
 
-/// The proof is held: post the queued message, or wait for the first one.
-async fn finish(generation: u64, owner_vk: VerifyingKey) {
-    let queued = JOIN.try_peek().ok().and_then(|u| u.queued.clone());
-    match queued {
-        Some(text) => submit(generation, owner_vk, text).await,
-        None => update_ui(|ui| {
-            if matches!(ui.phase, JoinPhase::Solving { .. }) {
-                ui.phase = JoinPhase::Ready;
-            }
-        }),
-    }
-}
-
-/// Post the entry with `text`, and make the room the visitor's own.
-async fn submit(generation: u64, owner_vk: VerifyingKey, text: String) {
-    let (signing_key, entry) = {
-        let s = session();
-        match (s.signing_key.clone(), s.entry.clone()) {
-            (Some(k), Some(e)) if s.generation == generation => (k, e),
-            _ => return,
+/// The nickname a join or re-admission publishes: a re-admitted member keeps
+/// the one they have.
+fn nickname_for(owner_vk: &VerifyingKey, signing_key: &SigningKey, readmit: bool) -> String {
+    if readmit {
+        if let Some(n) = crate::components::app::ROOMS
+            .try_peek()
+            .ok()
+            .and_then(|r| r.map.get(owner_vk).and_then(|d| d.self_nickname.clone()))
+        {
+            return n;
         }
+    }
+    crate::nickname::generate_default_nickname(&signing_key.verifying_key())
+}
+
+/// Post the entry with the in-flight messages, and make the room the
+/// visitor's own.
+async fn submit(generation: u64, owner_vk: VerifyingKey) {
+    let Some((signing_key, entry, texts, readmit)) = machine().submit_inputs(generation) else {
+        return;
     };
-    update_ui(|ui| ui.phase = JoinPhase::Submitting);
-    let Some(state) = source_state(&owner_vk) else {
+    let Some(state) = source_state(&owner_vk, readmit) else {
         return fail(generation, JoinFailure::NotOpen);
     };
-    let nickname = crate::nickname::generate_default_nickname(&signing_key.verifying_key());
-    let submission = match build_submission(
+    let nickname = nickname_for(&owner_vk, &signing_key, readmit);
+    let submission = match build_submission_many(
         &state,
         &owner_vk,
         &signing_key,
         &entry,
-        &text,
+        &texts,
         &nickname,
         crate::util::get_current_system_time(),
     ) {
         Ok(s) => s,
         Err(JoinFailure::PolicyChanged) => {
-            // The proof no longer passes: solve again, keeping the queued
-            // message, instead of dropping the visitor into an error.
-            session().entry = None;
-            session().generation += 1;
-            let generation = session().generation;
-            update_ui(|ui| {
-                ui.phase = JoinPhase::Solving {
-                    tried: 0,
-                    expected: 0.0,
-                }
-            });
-            crate::util::safe_spawn_local(async move { run(generation, owner_vk).await });
-            return;
+            // The proof no longer passes: solve again, keeping the messages,
+            // instead of dropping the visitor into an error.
+            let action = step(|m| m.restart_solving(generation));
+            return act(action, owner_vk);
         }
         Err(f) => return fail(generation, f),
     };
+
+    // The key is stored now, not when the join started: a cancelled, banned or
+    // failed attempt never reaches here, so it leaves no key in the delegate.
+    // Rooms must still be loaded and not hold this room, or the authoritative
+    // store would replace the key of a room the user is already in.
+    if !readmit {
+        if let Some(blocker) = start_blocker(&owner_vk) {
+            return fail(generation, blocker);
+        }
+        #[cfg(not(feature = "no-sync"))]
+        {
+            let room_key = owner_vk.to_bytes();
+            let stored = crate::signing::migrate_signing_key(room_key, &signing_key, true).await;
+            if stored == crate::signing::MigrationResult::Failed {
+                // The same fallback as an invitation: the key is also kept in
+                // the room's own record, which signs when the delegate cannot.
+                dioxus::logger::tracing::warn!(
+                    "public join: could not store the member key in the delegate"
+                );
+            }
+        }
+    }
     if !is_current(generation) {
         return;
     }
-    let readmit = session().readmit;
-    remember_entry(owner_vk, entry);
     crate::util::defer(move || {
+        if !is_current(generation) {
+            return;
+        }
+        if !readmit {
+            if let Some(blocker) = start_blocker(&owner_vk) {
+                return fail(generation, blocker);
+            }
+        }
+        remember_entry(owner_vk, entry);
         if readmit {
             apply_readmission(owner_vk, submission);
         } else {
             insert_member_room(owner_vk, signing_key, submission);
+        }
+        step(|m| m.succeed(generation));
+        if !readmit {
             crate::public_room::close();
         }
-        reset();
     });
 }
 
-/// The member room for a completed join: the viewed state with the entry and
-/// first message applied, holding the new key.
+/// `delta` applied to `live`, the state as it is now. Falls back to the state
+/// the submission was built from if the room refuses it.
+fn apply_to_live(
+    live: &ChatRoomStateV1,
+    owner_vk: &VerifyingKey,
+    submission: &Submission,
+) -> ChatRoomStateV1 {
+    let params = ChatRoomParametersV1 { owner: *owner_vk };
+    let mut next = live.clone();
+    match next.apply_delta(live, &params, &Some(submission.delta.clone())) {
+        Ok(()) => {
+            next.recent_messages.rebuild_actions_state();
+            next
+        }
+        Err(e) => {
+            dioxus::logger::tracing::warn!("public join: live state refused the delta: {e:?}");
+            submission.state_after.clone()
+        }
+    }
+}
+
+/// The member room for a completed join: the viewed state as it is now with
+/// the entry and messages applied, holding the new key.
 fn build_room_data(
     owner_vk: VerifyingKey,
     signing_key: SigningKey,
+    state: ChatRoomStateV1,
     submission: Submission,
 ) -> crate::room_data::RoomData {
     use river_core::chat_delegate::RoomKey;
     let _: RoomKey = owner_vk.to_bytes();
     crate::room_data::RoomData {
         owner_vk,
-        room_state: submission.state_after,
+        room_state: state,
         self_vk: Some(signing_key.verifying_key()),
         self_sk: Some(signing_key),
         contract_key: crate::util::owner_vk_to_contract_key(&owner_vk),
@@ -772,12 +1284,14 @@ fn build_room_data(
 }
 
 /// The pruned member's own room takes the admission: the entry, the
-/// `member_info` and the message, applied once.
+/// `member_info` and the messages, applied once to the room as it is now, so
+/// updates that arrived while the proof was solved are kept.
 fn apply_readmission(owner_vk: VerifyingKey, submission: Submission) {
     use crate::components::app::{mark_needs_sync, ROOMS};
     ROOMS.with_mut(|rooms| {
         if let Some(room) = rooms.map.get_mut(&owner_vk) {
-            room.room_state = submission.state_after;
+            let next = apply_to_live(&room.room_state, &owner_vk, &submission);
+            room.room_state = next;
             room.self_member_info = Some(submission.info);
             room.self_nickname = Some(submission.nickname);
         }
@@ -785,14 +1299,26 @@ fn apply_readmission(owner_vk: VerifyingKey, submission: Submission) {
     mark_needs_sync(owner_vk);
 }
 
+/// Insert the joined room. Never replaces a room already in `ROOMS`: the
+/// caller has checked, and this keeps the existing entry if it is wrong.
 fn insert_member_room(owner_vk: VerifyingKey, signing_key: SigningKey, submission: Submission) {
     use crate::components::app::{mark_needs_sync, CURRENT_ROOM, ROOMS};
-    let data = build_room_data(owner_vk, signing_key, submission);
-    ROOMS.with_mut(|rooms| {
-        rooms.map.insert(owner_vk, data);
+    let live = viewed_state()
+        .and_then(|(o, s)| (o == owner_vk).then_some(s))
+        .map(|s| apply_to_live(&s, &owner_vk, &submission))
+        .unwrap_or_else(|| submission.state_after.clone());
+    let data = build_room_data(owner_vk, signing_key, live, submission);
+    let inserted = ROOMS.with_mut(|rooms| match rooms.map.entry(owner_vk) {
+        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(data);
+            true
+        }
     });
-    CURRENT_ROOM.with_mut(|current| current.owner_key = Some(owner_vk));
-    mark_needs_sync(owner_vk);
+    if inserted {
+        CURRENT_ROOM.with_mut(|current| current.owner_key = Some(owner_vk));
+        mark_needs_sync(owner_vk);
+    }
 }
 
 #[cfg(test)]
@@ -1054,7 +1580,7 @@ mod tests {
             SystemTime::now(),
         )
         .unwrap();
-        let data = build_room_data(owner_vk, sk.clone(), sub);
+        let data = build_room_data(owner_vk, sk.clone(), sub.state_after.clone(), sub);
         assert_eq!(data.self_verifying_key(), Some(sk.verifying_key()));
         assert!(
             data.can_send_message().is_ok(),
@@ -1089,7 +1615,7 @@ mod tests {
             SystemTime::now(),
         )
         .unwrap();
-        let mut data = build_room_data(owner_vk, sk.clone(), sub);
+        let mut data = build_room_data(owner_vk, sk.clone(), sub.state_after.clone(), sub);
         assert!(!data.is_pruned_open_member(), "held, so not pruned");
         data.room_state.provisional.entries.clear();
         data.room_state.recent_messages.messages.clear();
@@ -1212,5 +1738,276 @@ mod tests {
         for needle in ["local_storage", "session_storage", "set_item"] {
             assert!(!production.contains(needle), "{needle} in production code");
         }
+    }
+
+    // ---- the state machine: exactly-once, queue, scoping, no lost text ----
+
+    fn vk(seed: u8) -> VerifyingKey {
+        SigningKey::from_bytes(&[seed; 32]).verifying_key()
+    }
+
+    fn limits() -> Limits {
+        Limits {
+            max_message_size: 100,
+            max_queued: 3,
+        }
+    }
+
+    fn fresh() -> StartPlan {
+        StartPlan {
+            readmit: false,
+            key: Some(SigningKey::generate(&mut rand::thread_rng())),
+            entry: None,
+            blocker: None,
+        }
+    }
+
+    fn some_entry() -> AuthorizedProvisionalMember {
+        let state = room(PrivacyMode::Public, Some(policy(2, 2)));
+        let sk = SigningKey::from_bytes(&[40u8; 32]);
+        solved(&state, &sk).1
+    }
+
+    fn returned(m: &mut Machine, owner: &VerifyingKey) -> String {
+        m.take_returned(owner).unwrap_or_default()
+    }
+
+    #[test]
+    fn two_sends_while_solving_are_both_queued_and_post_once_in_order() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "one", limits(), fresh()) else {
+            panic!("the first send starts the solve");
+        };
+        assert_eq!(m.send(a, "two", limits(), fresh()), Action::Nothing);
+        assert_eq!(m.ui().queued, vec!["one", "two"]);
+        // Solved: one Submit for the whole queue.
+        assert_eq!(m.solved(g, some_entry()), Action::Submit(g));
+        assert!(matches!(m.ui().phase, JoinPhase::Submitting));
+        assert_eq!(m.ui().queued, vec!["one", "two"], "pending until posted");
+        // The batch can be submitted from `submit_inputs` once; a second
+        // `solved` or `send` cannot start another submit.
+        assert_eq!(m.solved(g, some_entry()), Action::Nothing);
+        assert_eq!(m.send(a, "three", limits(), fresh()), Action::Nothing);
+        assert_eq!(
+            m.submit_inputs(g).map(|(_, _, t, _)| t),
+            Some(vec!["one".to_string(), "two".to_string()])
+        );
+        // Posted once: succeed returns the batch and a second succeed nothing.
+        assert_eq!(m.succeed(g), Some(vec!["one".into(), "two".into()]));
+        assert_eq!(m.succeed(g), None);
+        // "three" came back to the box it was typed in, it was not posted.
+        assert_eq!(returned(&mut m, &a), "three");
+    }
+
+    #[test]
+    fn two_quick_sends_when_ready_submit_once() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.start(a, fresh()) else {
+            panic!("start solves");
+        };
+        assert_eq!(m.solved(g, some_entry()), Action::Nothing);
+        assert!(matches!(m.ui().phase, JoinPhase::Ready));
+        assert_eq!(m.send(a, "x", limits(), fresh()), Action::Submit(g));
+        // The phase flipped in the same step: the second send cannot submit.
+        assert_eq!(m.send(a, "y", limits(), fresh()), Action::Nothing);
+        assert_eq!(m.succeed(g), Some(vec!["x".to_string()]));
+        assert_eq!(returned(&mut m, &a), "y");
+    }
+
+    #[test]
+    fn enter_while_submitting_hands_the_text_back_and_says_why() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "first", limits(), fresh()) else {
+            panic!()
+        };
+        m.solved(g, some_entry());
+        m.send(a, "again", limits(), fresh());
+        assert_eq!(returned(&mut m, &a), "again");
+        assert!(m.ui().notice.is_some());
+        assert_eq!(m.ui().queued, vec!["first"], "the batch is untouched");
+    }
+
+    #[test]
+    fn cancel_hands_every_message_back_and_forgets_the_key() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "one", limits(), fresh()) else {
+            panic!()
+        };
+        m.send(a, "two", limits(), fresh());
+        m.cancel();
+        assert!(m.signing_key.is_none(), "no key outlives a cancel");
+        assert!(matches!(m.ui().phase, JoinPhase::Idle));
+        assert_eq!(returned(&mut m, &a), "one\ntwo");
+        // The cancelled task finds itself stale and cannot post.
+        assert!(!m.is_current(g));
+        assert_eq!(m.solved(g, some_entry()), Action::Nothing);
+        assert!(m.submit_inputs(g).is_none());
+        assert_eq!(m.succeed(g), None);
+    }
+
+    #[test]
+    fn failure_hands_messages_back_and_forgets_the_key() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "hi", limits(), fresh()) else {
+            panic!()
+        };
+        m.fail(g, JoinFailure::Banned);
+        assert!(m.signing_key.is_none());
+        assert_eq!(returned(&mut m, &a), "hi");
+        assert!(matches!(
+            m.ui().phase,
+            JoinPhase::Failed(JoinFailure::Banned)
+        ));
+    }
+
+    #[test]
+    fn a_message_that_is_too_long_is_refused_before_any_solving() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let long = "x".repeat(101);
+        assert_eq!(m.send(a, &long, limits(), fresh()), Action::Nothing);
+        assert!(matches!(m.ui().phase, JoinPhase::Idle), "no solve started");
+        assert!(m.signing_key.is_none(), "no key made");
+        assert_eq!(returned(&mut m, &a), long);
+        assert!(m.ui().notice.is_some());
+    }
+
+    #[test]
+    fn the_queue_is_capped_at_what_the_entry_can_carry() {
+        let (a, mut m) = (vk(1), Machine::new());
+        m.send(a, "1", limits(), fresh());
+        m.send(a, "2", limits(), fresh());
+        m.send(a, "3", limits(), fresh());
+        m.send(a, "4", limits(), fresh());
+        assert_eq!(m.ui().queued, vec!["1", "2", "3"]);
+        assert_eq!(returned(&mut m, &a), "4");
+    }
+
+    #[test]
+    fn a_join_for_another_room_never_receives_this_rooms_messages() {
+        let (a, b, mut m) = (vk(1), vk(2), Machine::new());
+        let Action::Solve(ga) = m.send(a, "for A", limits(), fresh()) else {
+            panic!()
+        };
+        // The user switches to room B and sends there.
+        let Action::Solve(gb) = m.send(b, "for B", limits(), fresh()) else {
+            panic!("B starts its own join");
+        };
+        assert_ne!(ga, gb);
+        assert_eq!(m.ui().owner, Some(b));
+        assert_eq!(m.ui().queued, vec!["for B"]);
+        // A's task is stale and A's text went back to A's composer.
+        assert_eq!(m.solved(ga, some_entry()), Action::Nothing);
+        assert_eq!(returned(&mut m, &a), "for A");
+        assert_eq!(m.solved(gb, some_entry()), Action::Submit(gb));
+        assert_eq!(m.succeed(gb), Some(vec!["for B".to_string()]));
+        // A's composer sees an idle join, B's state is not A's.
+        assert_eq!(m.ui().phase_for(&a), JoinPhase::Idle);
+    }
+
+    #[test]
+    fn nothing_is_posted_after_the_viewer_closes() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "hi", limits(), fresh()) else {
+            panic!()
+        };
+        m.reset();
+        assert_eq!(m.solved(g, some_entry()), Action::Nothing);
+        assert!(m.submit_inputs(g).is_none());
+        assert_eq!(returned(&mut m, &a), "hi");
+        assert_eq!(m.ui().owner, None);
+    }
+
+    #[test]
+    fn a_refused_start_hands_the_text_back_with_the_reason() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let blocked = StartPlan {
+            blocker: Some(JoinFailure::AlreadyMember),
+            ..fresh()
+        };
+        assert_eq!(m.send(a, "hi", limits(), blocked), Action::Nothing);
+        assert!(matches!(
+            m.ui().phase,
+            JoinPhase::Failed(JoinFailure::AlreadyMember)
+        ));
+        assert_eq!(returned(&mut m, &a), "hi");
+        // No key is made for a room that is already held.
+        assert!(m.signing_key.is_none());
+    }
+
+    #[test]
+    fn a_readmission_without_the_members_key_fails_clearly_not_pending() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let no_key = StartPlan {
+            readmit: true,
+            key: None,
+            entry: None,
+            blocker: None,
+        };
+        assert_eq!(m.send(a, "hi", limits(), no_key), Action::Nothing);
+        let JoinPhase::Failed(f) = m.ui().phase else {
+            panic!("must not stay pending");
+        };
+        assert_eq!(f, JoinFailure::NoKey);
+        assert!(!f.retryable());
+        assert_eq!(returned(&mut m, &a), "hi");
+    }
+
+    #[test]
+    fn a_proof_that_stops_passing_is_solved_again_keeping_every_message() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "one", limits(), fresh()) else {
+            panic!()
+        };
+        m.solved(g, some_entry());
+        let Action::Solve(g2) = m.restart_solving(g) else {
+            panic!()
+        };
+        assert_ne!(g, g2);
+        assert_eq!(m.ui().queued, vec!["one"]);
+        assert!(matches!(m.ui().phase, JoinPhase::Solving { .. }));
+        assert_eq!(m.solved(g2, some_entry()), Action::Submit(g2));
+        assert_eq!(m.succeed(g2), Some(vec!["one".to_string()]));
+    }
+
+    #[test]
+    fn a_draft_left_by_the_closing_composer_follows_a_completed_join_only() {
+        let (a, mut m) = (vk(1), Machine::new());
+        // Before any join, or after a cancel, nothing is carried.
+        assert!(!m.carry_draft(a, "left".into()));
+        let Action::Solve(g) = m.send(a, "sent", limits(), fresh()) else {
+            panic!()
+        };
+        m.solved(g, some_entry());
+        m.succeed(g);
+        assert!(m.carry_draft(a, "left".into()));
+        assert_eq!(m.take_carried(&vk(2)), None);
+        assert_eq!(m.take_carried(&a), Some("left".to_string()));
+        assert_eq!(m.take_carried(&a), None);
+    }
+
+    #[test]
+    fn several_messages_are_admitted_in_one_delta_and_kept() {
+        let state = room(PrivacyMode::Public, Some(policy(2, 2)));
+        let sk = SigningKey::from_bytes(&[41u8; 32]);
+        let (owner_vk, entry) = solved(&state, &sk);
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let sub = build_submission_many(
+            &state,
+            &owner_vk,
+            &sk,
+            &entry,
+            &texts,
+            "Me",
+            SystemTime::now(),
+        )
+        .expect("admits");
+        let kept: Vec<String> = sub
+            .state_after
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| format!("{:?}", m.message.content))
+            .collect();
+        assert_eq!(kept.len(), 3, "every message once: {kept:?}");
     }
 }

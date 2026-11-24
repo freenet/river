@@ -267,7 +267,14 @@ fn PublicRoomView(
     let note = composer_note(&state);
     let rows = lines(&state);
     let can_join = offers_join(&state);
-    let queued = JOIN.try_read().ok().and_then(|j| j.queued.clone());
+    let queued = match owner_vk {
+        Some(o) => JOIN
+            .try_read()
+            .ok()
+            .map(|j| j.queued_for(&o))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     rsx! {
         div { class: "flex items-start gap-3 px-4 py-3 border-b border-border",
@@ -310,8 +317,9 @@ fn PublicRoomView(
                     }
                 }
             }
-            if let Some(text) = queued {
+            for (i, text) in queued.into_iter().enumerate() {
                 div {
+                    key: "pending-{i}",
                     class: "mb-3 opacity-60",
                     "data-testid": "viewed-room-pending-message",
                     div { class: "text-xs text-text-muted", "You, waiting to join" }
@@ -353,28 +361,43 @@ pub(crate) fn JoinComposer(
 ) -> Element {
     let mut draft = use_signal(String::new);
 
-    // A queued message handed back after a failure or cancel returns to the
-    // draft in front of what was typed since. The clear is synchronous: a
-    // deferred one would re-run this effect forever.
-    use_effect(move || {
-        crate::util::signal_guard::anchor();
-        let Ok(j) = JOIN.try_read() else {
-            crate::util::signal_guard::schedule_nudge();
-            return;
-        };
-        if let Some(back) = j.returned.clone() {
-            drop(j);
-            let current = draft.peek().clone();
-            draft.set(public_join::restore_draft(&current, Some(&back)));
-            JOIN.with_mut(|w| w.returned = None);
+    // After a successful join this composer closes with the viewer: whatever
+    // is left in the draft box goes to the member room's composer.
+    use_drop(move || {
+        if let Ok(d) = draft.try_peek() {
+            public_join::carry_draft(owner_vk, d.clone());
         }
     });
 
-    let phase = match JOIN.try_read() {
-        Ok(j) => j.phase.clone(),
+    // Text handed back after a failure, cancel or close returns to the draft in
+    // front of what was typed since. The text is taken from the join itself,
+    // so a second run of this effect finds nothing to take.
+    use_effect(move || {
+        crate::util::signal_guard::anchor();
+        let has = match JOIN.try_read() {
+            Ok(j) => j.has_returned_for(&owner_vk),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
+        };
+        if has {
+            if let Some(back) = public_join::take_returned(&owner_vk) {
+                let current = draft.peek().clone();
+                draft.set(public_join::restore_draft(&current, Some(&back)));
+            }
+        }
+    });
+
+    let (phase, queued_here, notice) = match JOIN.try_read() {
+        Ok(j) => (
+            j.phase_for(&owner_vk),
+            j.queued_for(&owner_vk),
+            j.notice_for(&owner_vk),
+        ),
         Err(_) => {
             crate::util::signal_guard::schedule_nudge();
-            JoinPhase::Idle
+            (JoinPhase::Idle, Vec::new(), None)
         }
     };
     let busy = matches!(phase, JoinPhase::Solving { .. } | JoinPhase::Submitting);
@@ -395,11 +418,11 @@ pub(crate) fn JoinComposer(
             "viewed-room-join-progress",
             if *expected > 0.0 {
                 format!(
-                    "Joining: proving you are not a bot ({}%). You can keep writing.",
+                    "Joining: proving you are not a bot ({}%). You can keep writing. Keep this tab visible: a hidden tab works slowly.",
                     ((*tried as f64 / expected) * 100.0).min(99.0) as u32
                 )
             } else {
-                "Joining: proving you are not a bot. You can keep writing.".to_string()
+                "Joining: proving you are not a bot. You can keep writing. Keep this tab visible: a hidden tab works slowly.".to_string()
             },
         ),
         JoinPhase::Ready => (
@@ -413,17 +436,14 @@ pub(crate) fn JoinComposer(
     let retryable = matches!(&phase, JoinPhase::Failed(f) if f.retryable());
     let can_start = matches!(phase, JoinPhase::Idle) || retryable;
 
-    // A re-admitted member's message waits here: it is not in the room yet.
-    let pending = if readmit {
-        JOIN.try_read().ok().and_then(|j| j.queued.clone())
-    } else {
-        None
-    };
+    // A re-admitted member's messages wait here: they are not in the room yet.
+    let pending = if readmit { queued_here } else { Vec::new() };
 
     rsx! {
         div { class: "px-4 py-3 border-t border-border",
-            if let Some(text) = pending {
+            for (i, text) in pending.into_iter().enumerate() {
                 div {
+                    key: "readmit-{i}",
                     class: "mb-2 opacity-60 text-sm whitespace-pre-wrap break-words",
                     "data-testid": "readmit-pending-message",
                     "{text}"
@@ -474,6 +494,9 @@ pub(crate) fn JoinComposer(
                 class: "mt-2 text-xs text-text-muted flex items-center gap-2",
                 "data-testid": "{status_testid}",
                 "{status}"
+                if let Some(notice) = notice {
+                    span { "data-testid": "viewed-room-join-notice", "{notice}" }
+                }
                 if busy && matches!(phase, JoinPhase::Solving { .. }) {
                     button {
                         r#type: "button",

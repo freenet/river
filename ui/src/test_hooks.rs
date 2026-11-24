@@ -223,6 +223,65 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Pin or release the join's solver (see `public_join::HOLD_SOLVER`).
+    set_hook(
+        "holdSolver",
+        Closure::<dyn FnMut(bool)>::new(move |hold: bool| {
+            crate::public_join::HOLD_SOLVER.store(hold, std::sync::atomic::Ordering::Relaxed);
+        })
+        .into_js_value(),
+    );
+
+    // Base58 of the verifying key the join in progress holds, "" when none:
+    // empty after a cancel, ban or failure means no key was kept.
+    set_hook(
+        "joinSessionKey",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            crate::public_join::session_member_vk()
+                .map(|vk| crate::public_room::owner_key_b58(&vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // Base58 of the current room's own member key, "" when none: compared
+    // before and after a re-admission, which must keep it.
+    set_hook(
+        "currentRoomSelfKey",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return String::new();
+            };
+            crate::components::app::ROOMS
+                .try_read()
+                .ok()
+                .and_then(|r| r.map.get(&owner).and_then(|d| d.self_verifying_key()))
+                .map(|vk| crate::public_room::owner_key_b58(&vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // How many times `text` is in the rooms the user holds (all rooms, every
+    // message body). The exactly-once checks count this, not DOM text.
+    set_hook(
+        "roomMessageCount",
+        Closure::<dyn FnMut(String) -> u32>::new(move |text: String| {
+            ROOMS
+                .try_read()
+                .map(|rooms| {
+                    rooms
+                        .map
+                        .values()
+                        .flat_map(|r| r.room_state.recent_messages.messages.iter())
+                        .filter(|m| m.message.content.to_string_lossy() == text)
+                        .count() as u32
+                })
+                .unwrap_or(0)
+        })
+        .into_js_value(),
+    );
+
     // The room prunes the current room's open-admission member: their entry,
     // messages and member_info go, as the room's cleanup drops them. With
     // `forget`, the proof held this session is forgotten too, as a reload does.

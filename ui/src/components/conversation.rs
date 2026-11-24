@@ -3381,7 +3381,7 @@ pub fn Conversation() -> Element {
                                 // An open-admission member the room pruned: the
                                 // next message re-admits with the same key.
                                 let readmit_note = if room_data.is_pruned_open_member() {
-                                    crate::public_join::readmit_note_for(&room_data)
+                                    crate::public_join::readmit_note_for(room_data)
                                 } else {
                                     None
                                 };

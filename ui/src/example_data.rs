@@ -327,15 +327,15 @@ pub fn viewable_fixtures() -> &'static [(&'static str, VerifyingKey, ChatRoomSta
             state.configuration = AuthorizedConfigurationV1::new(config, &room.owner_sk);
             (room.owner_vk, state)
         };
-        let (open_vk, open_state) = open_room("Open Join Room", 0x54, 4, 4);
-        let (hard_vk, hard_state) = open_room("Hard Join Room", 0x55, 26, 4);
-        let (full_vk, mut full_state) = open_room("Full Join Room", 0x56, 2, 1);
+        let (open_vk, open_state) = open_room("Open Join Room", 0x58, 4, 4);
+        let (hard_vk, hard_state) = open_room("Hard Join Room", 0x59, 26, 4);
+        let (full_vk, mut full_state) = open_room("Full Join Room", 0x5a, 2, 1);
         // The room's one open-member slot is held by an author whose message is
         // newer than any a visitor can send, so a visitor's entry is dropped.
         {
             use crate::public_join::{build_submission, check_admission_status, entry_for_nonce};
             use river_core::room_state::admission::{PowSolver, PowStep};
-            let holder = SigningKey::from_bytes(&[0x57; 32]);
+            let holder = SigningKey::from_bytes(&[0x5b; 32]);
             let now = crate::util::get_current_system_time();
             let req =
                 check_admission_status(&full_state, &full_vk, &holder.verifying_key(), None, now)
@@ -374,9 +374,9 @@ pub fn viewable_fixtures() -> &'static [(&'static str, VerifyingKey, ChatRoomSta
 /// The owner key of an open fixture room, so a test can act as its owner.
 pub fn fixture_owner_sk(kind: &str) -> Option<SigningKey> {
     let seed = match kind {
-        "open" => 0x54,
-        "hard" => 0x55,
-        "full" => 0x56,
+        "open" => 0x58,
+        "hard" => 0x59,
+        "full" => 0x5a,
         _ => return None,
     };
     Some(SigningKey::from_bytes(&[seed; 32]))
@@ -1189,6 +1189,20 @@ fn get_time_from_millis(ms: u64) -> SystemTime {
 // Test function to create the example data
 #[cfg(test)]
 mod tests {
+    /// A fixture a `?room=` link opens must not also be one of the user's own
+    /// rooms: the viewer closes itself for a room the user holds, so a seed
+    /// collision (0x54 once did) makes the fixture unopenable.
+    #[test]
+    fn viewable_fixtures_are_not_in_the_example_room_list() {
+        let rooms = create_example_rooms();
+        for (kind, vk, _) in viewable_fixtures() {
+            assert!(
+                !rooms.map.contains_key(vk),
+                "fixture {kind} collides with an example room"
+            );
+        }
+    }
+
     use super::*;
 
     /// The deep-history fixture must actually put the windowed render path in
