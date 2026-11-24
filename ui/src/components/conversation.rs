@@ -33,6 +33,7 @@ use crate::util::{
 };
 pub(crate) mod avatar;
 mod emoji_picker;
+mod failed_send_notice;
 mod history_scroll;
 mod history_window;
 mod markdown;
@@ -51,9 +52,11 @@ mod mobile_message_sheet;
 mod mobile_sheet_drag;
 mod mobile_surface;
 #[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+pub(crate) use self::message_input::has_unsent_draft as composer_has_unsent_draft;
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
+pub(crate) use self::mobile_surface::narrow_for_render as narrow_window_for_render;
 mod pending_effects;
-mod pending_sends;
 mod reaction_focus;
 mod reaction_order;
 mod reaction_picker;
@@ -61,6 +64,7 @@ mod reply_highlight;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::reaction_picker::is_open as reaction_picker_is_open;
 mod seal;
+use self::failed_send_notice::FailedSendNotice;
 #[cfg(target_arch = "wasm32")]
 use self::history_scroll::{
     complete_scroll_request, correct_view_after_patch, follow_arrival_at_end,
@@ -80,10 +84,10 @@ use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
-use self::pending_sends::PendingSends;
 use self::reaction_picker::{ReactionInvoker, ReactionPicker, ReactionSurfaces};
 use self::seal::SealInput;
 use crate::components::conversation::message_input::MessageInput;
+use crate::components::user_wait_dots::{RoomWaitDock, RoomWaitSpacer, WelcomeWaitSlot};
 use chrono::{DateTime, Utc};
 use dioxus::logger::tracing::*;
 use dioxus::prelude::*;
@@ -184,45 +188,212 @@ fn action_secret(room_data: &crate::room_data::RoomData) -> Option<Option<([u8; 
     })
 }
 
-/// An action's message body: sealed under the room secret in a private room,
-/// plain in a public one. `None` when the room is private and the secret is
-/// missing.
+/// The secret a new body in `room` is sealed under, given `action_secret`'s
+/// answer for the room: `Ok(None)` in a public room, which seals nothing.
+///
+/// Every message this device authors goes through here before it is sealed:
+/// a send, and an edit, a delete and a reaction, which are sealed messages
+/// too (an edit carries new private text). `Err` is why it is not sealed, for
+/// the user: the private room's secret is not on this device, or it is older
+/// than a version this device has already sealed a message under in `room`
+/// (`Outbox::may_seal_at`), which waits for that key as the outbox's own
+/// reseal does. A contended outbox read is refused as well, to be tried
+/// again: nothing is sealed unchecked.
+fn sealing_secret(
+    room: &ed25519_dalek::VerifyingKey,
+    secret: Option<Option<([u8; 32], u32)>>,
+) -> Result<Option<([u8; 32], u32)>, String> {
+    let Some(secret) = secret else {
+        return Ok(None);
+    };
+    let Some((secret, version)) = secret else {
+        // The composer is not offered without the secret (see
+        // `missing_room_secret`); this is the backstop. A public body in a
+        // private room is not admitted.
+        error!("Not sealed: this private room's secret is not on this device");
+        return Err("this private room's key is not on this device".to_string());
+    };
+    let Ok(outbox) = OUTBOX.try_peek() else {
+        warn!("OUTBOX signal busy while sealing; nothing is sent");
+        return Err("the room is busy, try again".to_string());
+    };
+    if !outbox.may_seal_at(room, version) {
+        warn!("Not sealed: this device's room key (v{version}) is older than one it already sealed under");
+        return Err(outbox::KEY_NOT_YET_HERE.to_string());
+    }
+    Ok(Some((secret, version)))
+}
+
+/// An action's message body: sealed under `seal_under` (the room's secret,
+/// checked by `sealing_secret`) in a private room, plain in a public one.
 fn action_body(
     action: river_core::room_state::content::ActionContentV1,
-    secret: Option<Option<([u8; 32], u32)>>,
-) -> Option<(RoomMessageBody, Option<SealInput>)> {
-    match secret {
+    seal_under: Option<([u8; 32], u32)>,
+) -> (RoomMessageBody, Option<SealInput>) {
+    match seal_under {
         // What `RoomMessageBody::{edit, delete, reaction, remove_reaction}`
         // build: the same encoding, so the same bytes.
-        None => Some((
+        None => (
             RoomMessageBody::Public {
                 content_type: river_core::room_state::content::CONTENT_TYPE_ACTION,
                 content_version: river_core::room_state::content::ACTION_CONTENT_VERSION,
                 data: action.encode(),
             },
             None,
-        )),
-        Some(None) => None,
-        Some(Some((secret, version))) => {
+        ),
+        Some((secret, version)) => {
             let seal = SealInput::Action(action);
-            Some((seal.seal(&secret, version), Some(seal)))
+            (seal.seal(&secret, version), Some(seal))
         }
     }
 }
 
-/// A message by `identity` in `room`, stamped now, with the CBOR bytes its
-/// signature will cover and, for a sealed body, what it was sealed from.
-/// `None` (logged) if it does not serialize.
+/// Seal `actions` (an edit, a delete, or a reaction toggle's one or two)
+/// under `room`'s secret as it is now and put them in the outbox as one
+/// entry, written as `author_vk` and stamped `acted_at`. From a deferred
+/// closure only (it writes `OUTBOX`, as `outbox_commit::submit_now` does).
+///
+/// The room's secret is read, checked against the version this device last
+/// sealed under there (`sealing_secret`) and used, and the entry inserted,
+/// in this one synchronous call: nothing can move the room's secret pointer,
+/// or raise that version, between the check and the entry existing. Every
+/// message of the entry is sealed under that one checked version.
+///
+/// `Err` is why nothing was queued, for the user. Then nothing is signed,
+/// nothing shows early (`pending_effects`), and no sync or wait mark is made.
+fn submit_action_now(
+    room: ed25519_dalek::VerifyingKey,
+    author_vk: ed25519_dalek::VerifyingKey,
+    acted_at: std::time::SystemTime,
+    label: &'static str,
+    actions: Vec<river_core::room_state::content::ActionContentV1>,
+    effects: Vec<PendingEffect>,
+) -> Result<(), String> {
+    // The borrow ends with this block, before the outbox is read or written.
+    let (secret, fallback_key) = {
+        let Ok(rooms) = ROOMS.try_peek() else {
+            warn!("ROOMS signal busy while queueing a {label}; nothing is sent");
+            return Err("the room is busy, try again".to_string());
+        };
+        let Some(room_data) = rooms.map.get(&room) else {
+            return Err("the room is no longer here".to_string());
+        };
+        if room_data.self_verifying_key() != Some(author_vk) {
+            return Err("this room's identity changed".to_string());
+        }
+        (action_secret(room_data), room_data.signing_key().cloned())
+    };
+    let seal_under = sealing_secret(&room, secret)?;
+    let mut messages = Vec::with_capacity(actions.len());
+    for action in actions {
+        let content = action_body(action, seal_under);
+        let Some(message) = unsigned_message_at(room, &author_vk, content, acted_at) else {
+            return Err("it could not be encoded".to_string());
+        };
+        messages.push(message);
+    }
+    info!("Queueing {label} action");
+    outbox_commit::submit_now(
+        room,
+        PendingKind::Action { label, effects },
+        author_vk,
+        messages,
+        fallback_key,
+    );
+    Ok(())
+}
+
+/// Say why a reaction or a delete was not queued (`submit_action_now`): it
+/// has no form of its own to show the reason in, as an edit has.
+fn report_refused_action(label: &'static str, outcome: Result<(), String>) {
+    if let Err(reason) = outcome {
+        warn!("The {label} was not queued: {reason}");
+        crate::components::toast::show_toast(format!("Your {label} was not sent: {reason}"), None);
+    }
+}
+
+/// Edit `target_message_id` in the open room to `new_text`. From a deferred
+/// closure only (`submit_action_now`). `Err` is why the edit was not queued,
+/// for the edit form to show beside the text it keeps.
+///
+/// Captures nothing, and reads the room now: see `current_room_data_snapshot`.
+fn edit_message_now(target_message_id: MessageId, new_text: String) -> Result<(), String> {
+    if new_text.is_empty() {
+        warn!("Edit text is empty");
+        return Err("the message is empty".to_string());
+    }
+    let open_room = { CURRENT_ROOM.read().owner_key };
+    let (Some(current_room), Some(current_room_data)) = (open_room, current_room_data_snapshot())
+    else {
+        return Err("the room is busy, try again".to_string());
+    };
+    let Some(author_vk) = current_room_data.self_verifying_key() else {
+        warn!("Cannot edit message: no identity for this room");
+        return Err("this device has no identity for this room".to_string());
+    };
+    let is_private = current_room_data.is_private();
+    // Safety net (see the send-path twin): the edit form disables Save when
+    // the encoded action exceeds max_message_size. If this fires, the UI gate
+    // drifted from the body construction: fix the drift.
+    let max_size = current_room_data
+        .room_state
+        .configuration
+        .configuration
+        .max_message_size;
+    drop(current_room_data);
+    let measured = RoomMessageBody::measure_edit(target_message_id.clone(), &new_text, is_private);
+    if measured > max_size {
+        error!(
+            "BUG: over-size edit passed the UI gate ({} encoded bytes, max {}); edit refused",
+            measured, max_size
+        );
+        return Err(format!(
+            "the message is too long ({measured} of {max_size} bytes)"
+        ));
+    }
+
+    use river_core::room_state::content::ActionContentV1;
+    let effects = vec![PendingEffect::Edit {
+        target: target_message_id.clone(),
+        text: new_text.clone(),
+    }];
+    submit_action_now(
+        current_room,
+        author_vk,
+        get_current_system_time(),
+        "edit",
+        vec![ActionContentV1::edit(target_message_id, new_text)],
+        effects,
+    )
+}
+
+/// A message by `author_vk` in `room`, with the CBOR bytes its signature
+/// will cover and, for a sealed body, what it was sealed from. `None`
+/// (logged) if it does not serialize.
+///
+/// Stamped now, when the user acts, and never restamped: several messages
+/// made quickly keep their order however their signatures arrive.
 fn unsigned_message(
     room: ed25519_dalek::VerifyingKey,
-    identity: &ActionIdentity,
+    author_vk: &ed25519_dalek::VerifyingKey,
+    body: (RoomMessageBody, Option<SealInput>),
+) -> Option<NewMessage> {
+    unsigned_message_at(room, author_vk, body, get_current_system_time())
+}
+
+/// `unsigned_message`, stamped `time`: when the user acted, for a message
+/// built a task later (`submit_action_now`).
+fn unsigned_message_at(
+    room: ed25519_dalek::VerifyingKey,
+    author_vk: &ed25519_dalek::VerifyingKey,
     (content, seal): (RoomMessageBody, Option<SealInput>),
+    time: std::time::SystemTime,
 ) -> Option<NewMessage> {
     let message = MessageV1 {
         room_owner: MemberId::from(room),
-        author: MemberId::from(&identity.author_vk),
+        author: MemberId::from(author_vk),
         content,
-        time: get_current_system_time(),
+        time,
     };
     let mut bytes = Vec::new();
     if let Err(e) = ciborium::ser::into_writer(&message, &mut bytes) {
@@ -232,25 +403,9 @@ fn unsigned_message(
     Some((message, bytes, seal))
 }
 
-/// The sender's own nickname, as the room shows it, for a pending row.
-fn own_display_name(
-    room_data: &crate::room_data::RoomData,
-    author_vk: &ed25519_dalek::VerifyingKey,
-) -> String {
-    let self_id = MemberId::from(author_vk);
-    room_data
-        .room_state
-        .member_info
-        .member_info
-        .iter()
-        .find(|info| info.member_info.member_id == self_id)
-        .map(|info| display_nickname(&info.member_info.preferred_nickname, &room_data.secrets))
-        .unwrap_or_else(|| "You".to_string())
-}
-
 /// Context for a reply-in-progress (held in a signal)
 #[derive(Clone, PartialEq, Debug)]
-struct ReplyContext {
+pub(crate) struct ReplyContext {
     message_id: MessageId,
     author_name: String,
     content_preview: String,
@@ -1137,9 +1292,9 @@ fn newest_key(items: &[DisplayItem]) -> Option<NewestKey> {
     items.last().and_then(display_item_newest)
 }
 
-/// The value a contended read stands in with: the last good one, but only if
-/// it was taken for `room`. Another room's rows never render in this one.
-fn last_good_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) -> Option<T> {
+/// The value `cache` holds, only if it was stored for `room`: what a
+/// contended read stands in with, or a reply target, is never another room's.
+fn value_for_room<K: PartialEq, T: Clone>(cache: &Option<(K, T)>, room: &K) -> Option<T> {
     cache
         .as_ref()
         .filter(|(cached, _)| cached == room)
@@ -1404,6 +1559,142 @@ fn banner_sync_read_fails() -> bool {
     false
 }
 
+/// Sends `message_text`, which the composer has checked is not empty and
+/// within the room's limit, in `room`, the composer's room, as a reply to
+/// `reply_ctx` if there is one. `Ok` means the message is queued: it enters
+/// the outbox in the `defer` below, before anything the composer defers after
+/// this returns, and the composer shows it from there until the room admits
+/// it. `Err` is why it was not, for the composer to show beside the draft it
+/// keeps.
+fn queue_message(
+    room: ed25519_dalek::VerifyingKey,
+    message_text: String,
+    reply_ctx: Option<ReplyContext>,
+) -> Result<(), String> {
+    let open_room = { CURRENT_ROOM.read().owner_key };
+    let Some(current_room) = open_room else {
+        error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
+        return Err("no room is open".to_string());
+    };
+    // The text and reply target were written in `room`:
+    // they are never sent to another one.
+    if room != current_room {
+        return Err("the room changed, try again".to_string());
+    }
+    // Read now from ROOMS, not from a render-time capture, so a room
+    // or identity change since the last render is seen. Only what a
+    // send needs, and the borrow ends here, before the message is
+    // built or queued.
+    let (identity, secret, max_size) = {
+        let Ok(rooms) = ROOMS.try_read() else {
+            warn!("ROOMS signal busy while sending; the draft is kept");
+            return Err("the room is busy, try again".to_string());
+        };
+        let Some(room_data) = rooms.map.get(&current_room) else {
+            error!(
+                "Cannot send message: room data not loaded (ROOMS has no entry for current room)"
+            );
+            return Err("the room is not loaded yet".to_string());
+        };
+        let Some(identity) = ActionIdentity::of(room_data) else {
+            error!("Cannot send message: no identity for this room");
+            return Err("this device has no identity for this room".to_string());
+        };
+        (
+            identity,
+            action_secret(room_data),
+            room_data
+                .room_state
+                .configuration
+                .configuration
+                .max_message_size,
+        )
+    };
+
+    // Everything up to the outbox insert is synchronous: the message
+    // must show, pending, before anything is awaited
+    // (freenet/river#512). Signing happens after, through the chat
+    // delegate (`outbox_commit`).
+    //
+    // Build content based on whether this is a reply or regular
+    // message. A private body keeps what it was sealed from, so it
+    // can be sealed again if the room's secret rotates while it is
+    // being signed (`seal.rs`).
+    let reply = reply_ctx.clone();
+    // Never below a version this device already sealed a message under
+    // here: a failed send sent again waits for that key (`sealing_secret`).
+    // A refusal keeps the draft.
+    let seal_under = sealing_secret(&current_room, secret)?;
+    let content = match (reply_ctx, seal_under) {
+        (Some(reply), None) => (
+            RoomMessageBody::reply(
+                message_text.clone(),
+                reply.message_id,
+                reply.author_name,
+                reply.content_preview,
+            ),
+            None,
+        ),
+        (None, None) => (RoomMessageBody::public(message_text.clone()), None),
+        (reply, Some((secret, version))) => {
+            let seal = match reply {
+                Some(reply) => SealInput::Reply {
+                    text: message_text.clone(),
+                    message_id: reply.message_id,
+                    author_name: reply.author_name,
+                    content_preview: reply.content_preview,
+                },
+                None => SealInput::Text(message_text.clone()),
+            };
+            (seal.seal(&secret, version), Some(seal))
+        }
+    };
+
+    // Safety net: check encoded content size before signing. Should
+    // be unreachable: the input gate measures the same encoded size
+    // via RoomMessageBody::measure_* (pinned equal to content_len()
+    // by river-core tests). If this fires, the measure helpers have
+    // drifted from the body construction above. The send is refused
+    // and the composer keeps the draft. Fix the drift, don't relax
+    // this check.
+    let content_size = content.0.content_len();
+    if content_size > max_size {
+        error!(
+            "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; send refused, draft kept",
+            content_size, max_size
+        );
+        return Err(format!(
+            "the message is too long ({content_size} of {max_size} bytes)"
+        ));
+    }
+
+    let Some(message) = unsigned_message(current_room, &identity.author_vk, content) else {
+        return Err("the message could not be encoded".to_string());
+    };
+
+    crate::util::debug_log("[send] queued, signing via the delegate");
+    // Defer the signal writes to a clean execution context to
+    // prevent RefCell re-entrant borrow panics.
+    crate::util::defer(move || {
+        outbox_commit::submit_now(
+            current_room,
+            PendingKind::Send {
+                text: message_text,
+                reply,
+            },
+            identity.author_vk,
+            vec![message],
+            identity.fallback_key,
+        );
+        // The conversation goes to the end when the room admits
+        // the message (`outbox_commit::take_own_send_committed`),
+        // not now: nothing of it is in the history yet.
+        #[cfg(target_arch = "wasm32")]
+        request_permission_on_first_message();
+    });
+    Ok(())
+}
+
 #[component]
 pub fn Conversation() -> Element {
     // The open room as the last render whose `ROOMS` read succeeded saw it.
@@ -1420,7 +1711,7 @@ pub fn Conversation() -> Element {
             // contended read renders the open room as last seen, never
             // nothing: with no rows the container collapses, `scrollTop`
             // drops to 0, and nothing puts the reader back when the rows
-            // return. Only ever the same room's data (`last_good_for_room`).
+            // return. Only ever the same room's data (`value_for_room`).
             match ROOMS.try_read() {
                 Ok(rooms) => {
                     let fresh = rooms.map.get(&key).cloned().map(Rc::new);
@@ -1432,21 +1723,13 @@ pub fn Conversation() -> Element {
                     // renders it again (freenet/river#555).
                     crate::util::signal_guard::anchor();
                     crate::util::signal_guard::schedule_nudge();
-                    last_good_for_room(&last_good_room.borrow(), &key)
+                    value_for_room(&last_good_room.borrow(), &key)
                 }
             }
         } else {
             None
         }
     };
-    // Render again when this room's pending sends change, not only the
-    // `PendingSends` child: an own send requests the end when its pending row
-    // is added, and this render is what takes the latest range for a reader
-    // in a held range before the scroll effect lands the request.
-    if OUTBOX.try_read().is_err() {
-        crate::util::signal_guard::anchor();
-        crate::util::signal_guard::schedule_nudge();
-    }
     // Drives the scroll-to-latest button: "is the newest message's bottom on
     // screen right now?".
     let mut newest_in_view = use_signal(|| true);
@@ -1566,7 +1849,10 @@ pub fn Conversation() -> Element {
         });
     }
 
-    let mut replying_to: Signal<Option<ReplyContext>> = use_signal(|| None);
+    // The message being replied to, with the room it is in: only that
+    // room's composer shows it or sends with it.
+    let mut replying_to: Signal<Option<(ed25519_dalek::VerifyingKey, ReplyContext)>> =
+        use_signal(|| None);
 
     // State for delete confirmation modal
     let mut pending_delete: Signal<Option<MessageId>> = use_signal(|| None);
@@ -1795,7 +2081,7 @@ pub fn Conversation() -> Element {
         let Ok(rooms) = ROOMS.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             // This room's groups as last computed: another room's never.
-            return last_good_for_room(&last_good_groups.borrow(), &key).flatten();
+            return value_for_room(&last_good_groups.borrow(), &key).flatten();
         };
         let groups = rooms.map.get(&key).and_then(|room_data| {
             let room_state = &room_data.room_state;
@@ -1965,12 +2251,6 @@ pub fn Conversation() -> Element {
             // and heads swap on content changes too.
             let _ = message_groups.read().is_some();
             let _ = window_items();
-            // And the outbox: an own send requests the end when its pending
-            // row is added, which changes neither of the above, so without
-            // this the request would wait for the commit (`pending_sends.rs`).
-            if OUTBOX.try_read().is_err() {
-                crate::util::signal_guard::schedule_nudge();
-            }
             note_patch_while_hidden(&reader_position);
             correct_view_after_patch(&reader_position);
             complete_scroll_request(&reader_position, opening_snap_done);
@@ -2016,15 +2296,14 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let Some(identity) = ActionIdentity::of(&current_room_data) else {
+                let Some(author_vk) = current_room_data.self_verifying_key() else {
                     warn!("Cannot toggle reaction: no identity for this room");
                     return;
                 };
-                let secret_opt = action_secret(&current_room_data);
 
                 // Check user's existing reaction on this message (if any)
                 // Rule: one reaction per user per message
-                let self_member_id = MemberId::from(&identity.author_vk);
+                let self_member_id = MemberId::from(&author_vk);
                 let existing_reaction: Option<String> = current_room_data
                     .room_state
                     .recent_messages
@@ -2043,7 +2322,7 @@ pub fn Conversation() -> Element {
                 // screen already shows them (`pending_effects.rs`), so a second
                 // click must undo the pending one, not add it again.
                 let pending = match OUTBOX.try_read() {
-                    Ok(outbox) => outbox.pending_effects(&current_room, &identity.author_vk),
+                    Ok(outbox) => outbox.pending_effects(&current_room, &author_vk),
                     Err(_) => {
                         warn!("Outbox busy while toggling a reaction; using committed reactions");
                         Vec::new()
@@ -2086,30 +2365,21 @@ pub fn Conversation() -> Element {
                         emoji,
                     });
                 }
-                let mut messages = Vec::new();
-                for action in actions {
-                    let Some(content) = action_body(action, secret_opt) else {
-                        warn!("Room is private but no secret available");
-                        return;
-                    };
-                    let Some(message) = unsigned_message(current_room, &identity, content) else {
-                        return;
-                    };
-                    messages.push(message);
-                }
                 info!("Toggling reaction (clicked_same={})", clicked_same);
-                // Defer the signal write to a clean execution context to
-                // prevent RefCell re-entrant borrow panics.
+                let acted_at = get_current_system_time();
+                // Sealed and queued in a clean execution context, under the
+                // room's secret as it is then (`submit_action_now`).
                 crate::util::defer(move || {
-                    outbox_commit::submit_now(
-                        current_room,
-                        PendingKind::Action {
-                            label: "reaction",
+                    report_refused_action(
+                        "reaction",
+                        submit_action_now(
+                            current_room,
+                            author_vk,
+                            acted_at,
+                            "reaction",
+                            actions,
                             effects,
-                        },
-                        identity.author_vk,
-                        messages,
-                        identity.fallback_key,
+                        ),
                     );
                 });
             }
@@ -2124,267 +2394,41 @@ pub fn Conversation() -> Element {
             if let (Some(current_room), Some(current_room_data)) =
                 (open_room, current_room_data_snapshot())
             {
-                let Some(identity) = ActionIdentity::of(&current_room_data) else {
+                let Some(author_vk) = current_room_data.self_verifying_key() else {
                     warn!("Cannot delete message: no identity for this room");
                     return;
                 };
-                let secret_opt = action_secret(&current_room_data);
                 drop(current_room_data);
 
                 use river_core::room_state::content::ActionContentV1;
                 let effects = vec![PendingEffect::Delete {
                     target: target_message_id.clone(),
                 }];
-                let Some(content) =
-                    action_body(ActionContentV1::delete(target_message_id), secret_opt)
-                else {
-                    warn!("Room is private but no secret available, cannot send delete");
-                    return;
-                };
-                let Some(message) = unsigned_message(current_room, &identity, content) else {
-                    return;
-                };
-                info!("Sending delete action");
-                // Defer the signal write to a clean execution context to
-                // prevent RefCell re-entrant borrow panics.
+                let actions = vec![ActionContentV1::delete(target_message_id)];
+                let acted_at = get_current_system_time();
+                // Sealed and queued in a clean execution context, under the
+                // room's secret as it is then (`submit_action_now`).
                 crate::util::defer(move || {
-                    outbox_commit::submit_now(
-                        current_room,
-                        PendingKind::Action {
-                            label: "delete",
+                    report_refused_action(
+                        "delete",
+                        submit_action_now(
+                            current_room,
+                            author_vk,
+                            acted_at,
+                            "delete",
+                            actions,
                             effects,
-                        },
-                        identity.author_vk,
-                        vec![message],
-                        identity.fallback_key,
-                    );
-                });
-            }
-        }
-    };
-
-    // Handler for editing a message
-    let handle_edit_message = {
-        // Captures NOTHING — see `current_room_data_snapshot`.
-        move |target_message_id: MessageId, new_text: String| {
-            if new_text.is_empty() {
-                warn!("Edit text is empty");
-                return;
-            }
-            let open_room = { CURRENT_ROOM.read().owner_key };
-            if let (Some(current_room), Some(current_room_data)) =
-                (open_room, current_room_data_snapshot())
-            {
-                let Some(identity) = ActionIdentity::of(&current_room_data) else {
-                    warn!("Cannot edit message: no identity for this room");
-                    return;
-                };
-                let is_private = current_room_data.is_private();
-                let secret_opt = action_secret(&current_room_data);
-
-                // Safety net (see the send-path twin): the edit form disables
-                // Save when the encoded action exceeds max_message_size. If
-                // this fires, the UI gate drifted from the body construction
-                // and the edit is silently dropped — fix the drift.
-                let max_size = current_room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .max_message_size;
-                drop(current_room_data);
-                let measured =
-                    RoomMessageBody::measure_edit(target_message_id.clone(), &new_text, is_private);
-                if measured > max_size {
-                    error!(
-                        "BUG: over-size edit passed the UI gate ({} encoded bytes, max {}) — edit dropped",
-                        measured, max_size
-                    );
-                    return;
-                }
-
-                use river_core::room_state::content::ActionContentV1;
-                let effects = vec![PendingEffect::Edit {
-                    target: target_message_id.clone(),
-                    text: new_text.clone(),
-                }];
-                let Some(content) = action_body(
-                    ActionContentV1::edit(target_message_id, new_text),
-                    secret_opt,
-                ) else {
-                    warn!("Room is private but no secret available, cannot send edit");
-                    return;
-                };
-                let Some(message) = unsigned_message(current_room, &identity, content) else {
-                    return;
-                };
-                info!("Sending edit action");
-                // Defer the signal write to a clean execution context to
-                // prevent RefCell re-entrant borrow panics.
-                crate::util::defer(move || {
-                    outbox_commit::submit_now(
-                        current_room,
-                        PendingKind::Action {
-                            label: "edit",
-                            effects,
-                        },
-                        identity.author_vk,
-                        vec![message],
-                        identity.fallback_key,
-                    );
-                });
-            }
-        }
-    };
-
-    // Message sending handler - receives message text from MessageInput component
-    let handle_send_message = {
-        let reader_position = reader_position.clone();
-        move |(message_text, reply_ctx): (String, Option<ReplyContext>)| {
-            if message_text.is_empty() {
-                warn!("Message is empty");
-                return;
-            }
-            crate::util::debug_log(&format!(
-                "[send] start: {}...",
-                crate::util::truncate_str(&message_text, 30)
-            ));
-            let current_room_opt = CURRENT_ROOM.read().owner_key;
-            if current_room_opt.is_none() {
-                error!("Cannot send message: no room selected (CURRENT_ROOM is None)");
-                return;
-            }
-            // Re-read room data from ROOMS signal (don't rely on stale closure capture)
-            let fresh_room_data =
-                current_room_opt.and_then(|key| ROOMS.try_read().ok()?.map.get(&key).cloned());
-            if fresh_room_data.is_none() {
-                error!("Cannot send message: room data not loaded (ROOMS has no entry for current room)");
-                return;
-            }
-            if let (Some(current_room), Some(current_room_data)) =
-                (current_room_opt, fresh_room_data)
-            {
-                // Everything up to the outbox insert is synchronous: the
-                // message must show, pending, before anything is awaited
-                // (freenet/river#512). Signing happens after, through the
-                // chat delegate (`outbox_commit`).
-                let Some(author_vk) = current_room_data.self_verifying_key() else {
-                    error!("Cannot send message: no identity for this room");
-                    return;
-                };
-                // The local fallback while this build still holds the key.
-                let fallback_key = current_room_data.signing_key().cloned();
-                let author_name = own_display_name(&current_room_data, &author_vk);
-                let is_private = current_room_data.is_private();
-                // Copy the secret data (get_secret returns Option<(&[u8; 32], u32)>)
-                let secret_opt: Option<([u8; 32], u32)> = current_room_data
-                    .get_secret()
-                    .map(|(secret, version)| (*secret, version));
-                let max_size = current_room_data
-                    .room_state
-                    .configuration
-                    .configuration
-                    .max_message_size;
-                drop(current_room_data);
-
-                // Build content based on whether this is a reply or regular
-                // message. A private body keeps what it was sealed from, so
-                // it can be sealed again if the room's secret rotates while
-                // it is being signed (`seal.rs`).
-                let (content, seal) = match (reply_ctx, is_private) {
-                    (Some(reply), false) => (
-                        RoomMessageBody::reply(
-                            message_text.clone(),
-                            reply.message_id,
-                            reply.author_name,
-                            reply.content_preview,
                         ),
-                        None,
-                    ),
-                    (None, false) => (RoomMessageBody::public(message_text.clone()), None),
-                    (reply, true) => {
-                        let Some((secret, version)) = secret_opt else {
-                            // The composer is not offered without the
-                            // secret (see `missing_room_secret`); this
-                            // is the backstop. A public body in a private
-                            // room is not admitted.
-                            error!("Cannot send: this private room's secret is not on this device");
-                            return;
-                        };
-                        let seal = match reply {
-                            Some(reply) => SealInput::Reply {
-                                text: message_text.clone(),
-                                message_id: reply.message_id,
-                                author_name: reply.author_name,
-                                content_preview: reply.content_preview,
-                            },
-                            None => SealInput::Text(message_text.clone()),
-                        };
-                        (seal.seal(&secret, version), Some(seal))
-                    }
-                };
-
-                // Safety net: check encoded content size before signing.
-                // Should be unreachable — the input gate measures the same
-                // encoded size via RoomMessageBody::measure_* (pinned equal
-                // to content_len() by river-core tests). If this fires, the
-                // measure helpers have drifted from the body construction
-                // above and the draft is already cleared: the message is
-                // LOST, which is the HostFat bug. Fix the drift, don't
-                // relax this check.
-                let content_size = content.content_len();
-                if content_size > max_size {
-                    error!(
-                        "BUG: over-size message passed the input gate ({} encoded bytes, max {}) — measure_* drifted from body construction; message dropped",
-                        content_size, max_size
                     );
-                    return;
-                }
-
-                // Stamped now, at Enter, and never restamped: several messages
-                // typed quickly keep their typed order however their
-                // signatures arrive.
-                let message = MessageV1 {
-                    room_owner: MemberId::from(current_room),
-                    author: MemberId::from(&author_vk),
-                    content,
-                    time: get_current_system_time(),
-                };
-
-                // Serialize message to CBOR: the bytes the signature covers.
-                let mut message_bytes = Vec::new();
-                if let Err(e) = ciborium::ser::into_writer(&message, &mut message_bytes) {
-                    error!("Failed to serialize message for signing: {:?}", e);
-                    return;
-                }
-
-                let reader_position = reader_position.clone();
-                crate::util::debug_log("[send] queued, signing via the delegate");
-                // Defer the signal writes to a clean execution context to
-                // prevent RefCell re-entrant borrow panics.
-                crate::util::defer(move || {
-                    outbox_commit::submit_now(
-                        current_room,
-                        PendingKind::Send {
-                            text: message_text,
-                            author_name,
-                        },
-                        author_vk,
-                        vec![(message, message_bytes, seal)],
-                        fallback_key,
-                    );
-                    // An own send goes to the end, now, to show the pending
-                    // row; the committed message replaces it in place. Only
-                    // if the user is still in the room this send targeted
-                    // (#402): the defer is a task hop after the keypress.
-                    if CURRENT_ROOM.peek().owner_key == Some(current_room) {
-                        reader_position.request_end(Some(current_room));
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    request_permission_on_first_message();
                 });
             }
         }
     };
+
+    // What covers the room for the wait dots (`user_wait_dots.rs`): its
+    // delete confirmation and the mobile message sheet.
+    let wait_covered_by_delete = pending_delete.read().is_some();
+    let wait_covered_by_sheet = reaction_surfaces.mobile_for_render().is_some();
 
     // The message groups' handlers, created once. An `EventHandler` compares
     // by pointer, so a closure written in the row loop is a new handler on
@@ -2398,11 +2442,16 @@ pub fn Conversation() -> Element {
     let on_group_request_delete = use_callback(move |msg_id: MessageId| {
         pending_delete.set(Some(msg_id));
     });
+    // Called from the edit form's deferred save, which keeps the form open
+    // with the reason when the edit is refused (`save_edit_now`).
     let on_group_edit = use_callback(move |(msg_id, new_text): (MessageId, String)| {
-        handle_edit_message(msg_id, new_text);
+        edit_message_now(msg_id, new_text)
     });
     let on_group_reply = use_callback(move |ctx: ReplyContext| {
-        replying_to.set(Some(ctx));
+        let Some(room) = CURRENT_ROOM.peek().owner_key else {
+            return;
+        };
+        replying_to.set(Some((room, ctx)));
         if let Some(window) = web_sys::window() {
             if let Some(doc) = window.document() {
                 if let Some(el) = doc.get_element_by_id("message-input") {
@@ -2841,6 +2890,13 @@ pub fn Conversation() -> Element {
                                     } else {
                                         subscribed_window
                                     };
+                                    // An own send the room just admitted goes
+                                    // to the end, like a followed arrival, in
+                                    // the render that shows it, and only in
+                                    // the room it was sent to.
+                                    if outbox_commit::take_own_send_committed(CURRENT_ROOM.peek().owner_key) {
+                                        reader_position.request_end(CURRENT_ROOM.peek().owner_key);
+                                    }
                                     // Before the range resolves, so a follow
                                     // selects the latest range in this render.
                                     #[cfg(target_arch = "wasm32")]
@@ -3155,18 +3211,6 @@ pub fn Conversation() -> Element {
                             None
                         }
                     }
-                    // The sender's own messages still being signed, or that
-                    // failed, below the newest message (`pending_sends.rs`).
-                    // Not under a held range: they belong after the latest
-                    // message, and an own send requests the latest range.
-                    if let Some((room, author)) = current_room_data
-                        .as_ref()
-                        .and_then(|r| Some((r.owner_vk, r.self_verifying_key()?)))
-                    {
-                        if !reader_position.has_newer.get() {
-                            PendingSends { room, author }
-                        }
-                    }
                     // Invisible sentinel right under the newest rendered row,
                     // after the history list and above `#chat-content`'s bottom
                     // padding, so its top edge is that row's bottom (the
@@ -3176,8 +3220,26 @@ pub fn Conversation() -> Element {
                         id: "bottom-sentinel",
                         class: "h-px pointer-events-none",
                     }
+                    // Room for the wait dots' dock below the newest message,
+                    // while they show (`user_wait_dots.rs`). After the
+                    // sentinel, so Latest and the read rule still measure the
+                    // message's edge.
+                    if current_room_data.is_some() {
+                        RoomWaitSpacer {
+                            delete_confirmation: wait_covered_by_delete,
+                            mobile_sheet: wait_covered_by_sheet,
+                        }
+                    }
                 }
             }
+                // The wait dots' dock, 12px above the composer. Before Latest,
+                // which paints over it.
+                if current_room_data.is_some() {
+                    RoomWaitDock {
+                        delete_confirmation: wait_covered_by_delete,
+                        mobile_sheet: wait_covered_by_sheet,
+                    }
+                }
                 // Latest (#402): shown while the newest message's bottom is off
                 // screen, or a held range withholds newer items.
                 if !newest_in_view() || reader_position.has_newer.get() {
@@ -3292,10 +3354,17 @@ pub fn Conversation() -> Element {
                         }
                     });
 
+                // A failed send has no composer to come back to while a
+                // notice replaces it: it shows beside the notice instead
+                // (`failed_send_notice.rs`).
+                let failed_send = |room_data: &crate::room_data::RoomData| rsx! {
+                    FailedSendNotice { room: room_data.owner_vk, author: room_data.self_verifying_key() }
+                };
                 match current_room_data.as_ref() {
-                    Some(_) if initial_sync_error.is_some() => {
+                    Some(room_data) if initial_sync_error.is_some() => {
                         let report = initial_sync_error.unwrap();
                         rsx! {
+                            {failed_send(room_data)}
                             div { class: "px-4 mb-4",
                                 WithTooltip {
                                     tip: report.summary.clone(),
@@ -3310,6 +3379,7 @@ pub fn Conversation() -> Element {
                     },
                     Some(room_data) if room_data.is_awaiting_initial_sync() => {
                         rsx! {
+                            {failed_send(room_data)}
                             div { class: "px-4 py-3 mx-4 mb-4 bg-surface rounded-lg text-sm text-text-muted flex items-center gap-3",
                                 SmallDots { test_id: "room-sync-banner-dots" }
                                 span { "Syncing room state from the network. You'll be able to send messages once sync completes." }
@@ -3322,13 +3392,16 @@ pub fn Conversation() -> Element {
                             // messages are encrypted with its secret, and a
                             // message sent without it would not be admitted.
                             Ok(()) if room_data.missing_room_secret() => rsx! {
+                                {failed_send(room_data)}
                                 div {
                                     "data-testid": "missing-room-secret-notice",
                                     class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "This private room's key hasn't reached this device yet, so you can't send messages here until it does."
                                 }
                             },
-                            Ok(()) => {
+                            Ok(()) if room_data.self_verifying_key().is_some() => {
+                                let composer_room = room_data.owner_vk;
+                                let composer_author = room_data.self_verifying_key().unwrap();
                                 let max_msg_size = room_data.room_state.configuration.configuration.max_message_size;
                                 let room_is_private = room_data.is_private();
                                 // Mentionable members for the @ autocomplete: every member
@@ -3360,10 +3433,8 @@ pub fn Conversation() -> Element {
                                     .sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
                                 rsx! {
                                     MessageInput {
-                                        handle_send_message: move |msg: (String, Option<ReplyContext>)| {
-                                            let handle = handle_send_message.clone();
-                                            handle(msg)
-                                        },
+                                        room: composer_room,
+                                        author: composer_author,
                                         replying_to: replying_to,
                                         on_request_edit_last: request_edit_last,
                                         max_message_size: max_msg_size,
@@ -3372,6 +3443,9 @@ pub fn Conversation() -> Element {
                                     }
                                 }
                             },
+                            // `can_participate` is Ok only with a key (see
+                            // `IdentityUnavailable` below).
+                            Ok(()) => rsx! {},
                             Err(SendMessageError::UserNotMember) => {
                                 // `can_participate` reports IdentityUnavailable
                                 // (below), never UserNotMember, when the key is
@@ -3380,6 +3454,7 @@ pub fn Conversation() -> Element {
                                 // instead of panicking the whole conversation.
                                 match room_data.self_verifying_key() {
                                     Some(user_vk) => rsx! {
+                                        {failed_send(room_data)}
                                         NotMemberNotification {
                                             user_verifying_key: user_vk
                                         }
@@ -3388,7 +3463,10 @@ pub fn Conversation() -> Element {
                                 }
                             },
                             Err(SendMessageError::UserBanned) => rsx! {
-                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
+                                {failed_send(room_data)}
+                                div {
+                                    "data-testid": "banned-notice",
+                                    class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "You have been banned from sending messages in this room."
                                 }
                             },
@@ -3397,7 +3475,10 @@ pub fn Conversation() -> Element {
                             // `NotMemberNotification` cannot be used here — it
                             // needs the verifying key, which is what is missing.
                             Err(SendMessageError::IdentityUnavailable) => rsx! {
-                                div { class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
+                                {failed_send(room_data)}
+                                div {
+                                    "data-testid": "identity-unavailable-notice",
+                                    class: "px-4 py-3 mx-4 mb-4 bg-error-bg text-danger rounded-lg text-sm",
                                     "This device doesn't hold your key for this room, so you can't send messages here."
                                 }
                             },
@@ -3510,6 +3591,7 @@ pub fn Conversation() -> Element {
                                     p { class: "text-text-muted",
                                         "Create a new room, or get invited to an existing one."
                                     }
+                                    WelcomeWaitSlot {}
                                     NoRoomFooter {}
                                 }
                             },
@@ -4043,6 +4125,27 @@ fn reply_preview(text: &str, member_names: &HashMap<MemberId, String>) -> String
 /// handlers are `Conversation`'s `use_callback`s, which stay the same. So
 /// anything its render reads must be a prop or a signal; any other input would
 /// go stale.
+/// Save from the edit form, by Enter or the button. From a deferred closure
+/// only: `on_edit` queues the edit (`edit_message_now`) and this writes the
+/// form's signals. `edit` is the changed text, or `None` when nothing
+/// changed. A queued or unchanged edit closes the form; a refused one keeps
+/// it open, with what was typed and why, to be saved again.
+fn save_edit_now(
+    on_edit: Callback<(MessageId, String), Result<(), String>>,
+    mut editing_message: Signal<Option<String>>,
+    mut edit_error: Signal<Option<String>>,
+    edit: Option<(MessageId, String)>,
+) {
+    if let Some(edit) = edit {
+        if let Err(reason) = on_edit.call(edit) {
+            edit_error.set(Some(reason));
+            return;
+        }
+    }
+    edit_error.set(None);
+    editing_message.set(None);
+}
+
 #[component]
 fn MessageGroupComponent(
     group: MessageGroup,
@@ -4063,7 +4166,9 @@ fn MessageGroupComponent(
     edit_trigger: Signal<Option<(String, String)>>,
     on_react: EventHandler<(MessageId, String)>,
     on_request_delete: EventHandler<MessageId>,
-    on_edit: EventHandler<(MessageId, String)>,
+    /// Queues the edit, from a deferred closure; `Err` is why it was not
+    /// queued (`edit_message_now`).
+    on_edit: Callback<(MessageId, String), Result<(), String>>,
     on_reply: EventHandler<ReplyContext>,
     /// The author's avatar hue under this viewer's salt for the room, or
     /// `None` for the neutral disc (no salt yet, or an author the room no
@@ -4175,6 +4280,9 @@ fn MessageGroupComponent(
     // Track which message is being edited and its current text
     let mut editing_message: Signal<Option<String>> = use_signal(|| None);
     let mut edit_text: Signal<String> = use_signal(String::new);
+    // Why the last Save was refused, shown in the open form, which keeps
+    // what was typed. Cleared by typing, and when a form opens.
+    let mut edit_error: Signal<Option<String>> = use_signal(|| None);
     // @mention autocomplete state for the inline edit form (mirrors the
     // composer in message_input.rs). One signal suffices: at most one message
     // in this group is edited at a time.
@@ -4214,6 +4322,7 @@ fn MessageGroupComponent(
         if let Some((trigger_id, trigger_text)) = trigger {
             if message_ids.contains(&trigger_id) {
                 edit_text.set(trigger_text);
+                edit_error.set(None);
                 request_reveal(format!("edit-form-{trigger_id}"));
                 editing_message.set(Some(trigger_id));
                 edit_trigger.set(None);
@@ -4464,10 +4573,12 @@ fn MessageGroupComponent(
                                                                 let msg_id = msg_id.clone();
                                                                 let changed = !new_text.is_empty() && new_text != original;
                                                                 crate::util::defer(move || {
-                                                                    if changed {
-                                                                        on_edit.call((msg_id, new_text));
-                                                                    }
-                                                                    editing_message.set(None);
+                                                                    save_edit_now(
+                                                                        on_edit,
+                                                                        editing_message,
+                                                                        edit_error,
+                                                                        changed.then_some((msg_id, new_text)),
+                                                                    );
                                                                 });
                                                             }
                                                         }
@@ -4511,6 +4622,9 @@ fn MessageGroupComponent(
                                                             oninput: move |e| {
                                                                 let value = e.value().to_string();
                                                                 edit_text.set(value.clone());
+                                                                if edit_error.peek().is_some() {
+                                                                    edit_error.set(None);
+                                                                }
                                                                 // Detect / update the @mention autocomplete.
                                                                 mention::update_mention_from_input(
                                                                     &input_id, &value, &input_members, edit_mention,
@@ -4568,6 +4682,14 @@ fn MessageGroupComponent(
                                                                     }
                                                                 }
                                                             }
+                                                            if let Some(reason) = edit_error.read().as_ref() {
+                                                                div {
+                                                                    "data-testid": "edit-save-error",
+                                                                    role: "alert",
+                                                                    class: "text-xs text-right mt-1 pr-1 text-danger [overflow-wrap:anywhere]",
+                                                                    "Not saved: {reason}. Save to try again."
+                                                                }
+                                                            }
                                                             div { class: "flex justify-end gap-3 mt-3",
                                                                 style: "overflow: visible;",
                                                                 button {
@@ -4606,10 +4728,12 @@ fn MessageGroupComponent(
                                                                         let msg_id = save_msg_id.clone();
                                                                         let changed = !new_text.is_empty() && new_text != save_original;
                                                                         crate::util::defer(move || {
-                                                                            if changed {
-                                                                                on_edit.call((msg_id, new_text));
-                                                                            }
-                                                                            editing_message.set(None);
+                                                                            save_edit_now(
+                                                                                on_edit,
+                                                                                editing_message,
+                                                                                edit_error,
+                                                                                changed.then_some((msg_id, new_text)),
+                                                                            );
                                                                         });
                                                                     },
                                                                     "Save (Enter)"
@@ -5054,6 +5178,7 @@ fn MessageGroupComponent(
                                                                 let (t, id) = (current_text.clone(), msg_id_str_for_edit.clone());
                                                                 crate::util::defer(move || {
                                                                     edit_text.set(t);
+                                                                    edit_error.set(None);
                                                                     request_reveal(format!("edit-form-{id}"));
                                                                     editing_message.set(Some(id));
                                                                 });
@@ -5375,15 +5500,21 @@ mod tests {
     ///
     /// Messages are signed by the chat delegate, which usually answers in a
     /// millisecond but sometimes takes seconds (delegate requests queue behind
-    /// contract WASM on the node). A sent message shows as a pending row from
-    /// the outbox meanwhile, so the outbox insert is the write the user sees,
-    /// and every suspension point before it is dead air with the composer
-    /// already cleared.
+    /// contract WASM on the node). The composer shows a send, and the history
+    /// an edit, a delete or a reaction, from the outbox meanwhile, so the
+    /// outbox insert is the write the user sees, and every suspension point
+    /// before it is dead air.
     ///
     /// It is also invisible in development: with `--features no-sync` the
     /// delegate request fails instantly. `pending-send.spec.ts` holds signing
-    /// open through a test hook to see the pending row; this pin covers the
-    /// edit, delete and reaction paths that spec does not drive.
+    /// open through a test hook; this pin covers the wiring of all four ways
+    /// in: the composer's send, and an edit, a delete and a reaction.
+    ///
+    /// It pins the private-room seal check with it (freenet/river#984): a
+    /// body is sealed only under a secret `sealing_secret` has checked
+    /// against the version this device last sealed under in the room, and an
+    /// action is checked, sealed and inserted in one synchronous call, so
+    /// nothing can raise that version in between.
     #[test]
     fn nothing_is_awaited_between_acting_on_a_message_and_it_entering_the_outbox() {
         let source = include_str!("conversation.rs");
@@ -5405,77 +5536,161 @@ mod tests {
         // Whitespace-stripped so a rustfmt re-wrap cannot silently disarm it.
         let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
-        for handler in [
-            "lethandle_send_message={",
-            "lethandle_toggle_reaction={",
-            "lethandle_delete_message={",
-            "lethandle_edit_message={",
-        ] {
-            let start = squashed.find(handler).unwrap_or_else(|| {
+        // `squashed[start..end]`: from `from` to the first `to` after it.
+        let region = |from: &str, to: &str| -> &str {
+            let start = squashed.find(from).unwrap_or_else(|| {
                 panic!(
-                    "conversation.rs no longer defines `{handler}` — re-anchor \
-                     this pin on whatever replaced it, do not delete it"
+                    "conversation.rs no longer has `{from}` — re-anchor this \
+                     pin on whatever replaced it, do not delete it"
                 )
             });
             let end = squashed[start..]
-                .find("outbox_commit::submit_now(")
+                .find(to)
                 .map(|i| start + i)
                 .unwrap_or_else(|| {
                     panic!(
-                        "`{handler}` no longer puts its message in the outbox — \
-                         re-anchor this pin, do not delete it"
+                        "`{from}` no longer reaches `{to}` — re-anchor this pin, do not delete it"
                     )
                 });
-            let region = &squashed[start..end];
+            &squashed[start..end]
+        };
+        let assert_nothing_awaited_or_signed = |from: &str, region: &str| {
             assert!(
                 !region.contains(".await"),
-                "`{handler}` awaits something before its message enters the \
+                "`{from}` awaits something before its message enters the \
                  outbox, so the user waits with nothing on screen for as long \
                  as that future takes (freenet/river#512)"
             );
             // Signing belongs after the insert, in `outbox_commit`.
             assert!(
                 !region.contains("sign_message") && !region.contains(".sign("),
-                "`{handler}` signs before the outbox insert"
+                "`{from}` signs before the outbox insert"
             );
-            // The insert is a global signal write: it must run in `defer`'s
-            // clean execution context, not on the event handler's stack. So
-            // the last `defer` before it must still be open at the insert.
+        };
+        // The outbox insert is a global signal write: it must run in
+        // `defer`'s clean execution context, not on the event handler's
+        // stack. So the last `defer` before `region`'s end must still be open
+        // there.
+        let assert_ends_inside_defer = |from: &str, region: &str| {
             let opened = region
                 .rfind("crate::util::defer(move||{")
                 .unwrap_or_else(|| {
-                    panic!("`{handler}`'s outbox insert must be inside `crate::util::defer`")
+                    panic!("`{from}`'s outbox insert must be inside `crate::util::defer`")
                 });
             assert!(
                 !region[opened..].contains("});"),
-                "`{handler}`'s outbox insert is after its `defer` closed, so it \
+                "`{from}`'s outbox insert is after its `defer` closed, so it \
                  runs on the event handler's stack"
             );
-        }
-        // An own send requests the end when its pending row is added. That
-        // write changes neither `message_groups` nor `window_items`, so both
-        // the render (which takes the latest range for a held reader) and the
-        // post-render scroll effect (which lands the request) must subscribe
-        // to the outbox, or the view waits for the commit.
-        let body = &squashed[squashed.find("pubfnConversation()->Element{").unwrap()..];
-        let render = &body[..body.find("letmutnewest_in_view=").unwrap()];
-        assert!(
-            render.contains("OUTBOX.try_read()"),
-            "the Conversation render must subscribe to OUTBOX"
-        );
-        let effect_end = body
-            .find("complete_scroll_request(&reader_position")
-            .unwrap();
-        let effect = &body[body[..effect_end].rfind("use_effect(").unwrap()..effect_end];
-        assert!(
-            effect.contains("OUTBOX.try_read()"),
-            "the scroll effect must subscribe to OUTBOX"
-        );
-        // Every path into the outbox is one of the four above.
+        };
+
+        // The two functions that insert: the composer's send, and every
+        // action.
+        let send = region("fnqueue_message(", "outbox_commit::submit_now(");
+        assert_nothing_awaited_or_signed("fnqueue_message(", send);
+        assert_ends_inside_defer("fnqueue_message(", send);
+        let action = region("fnsubmit_action_now(", "outbox_commit::submit_now(");
+        assert_nothing_awaited_or_signed("fnsubmit_action_now(", action);
         assert_eq!(
             squashed.matches("outbox_commit::submit_now(").count(),
-            4,
+            2,
             "a new path puts messages in the outbox: add it to this pin"
+        );
+
+        // Both seal only under a checked secret.
+        let send_check = send
+            .find("sealing_secret(")
+            .expect("a send's secret is checked against the room's sealed version");
+        assert!(
+            send_check < send.find(".seal(").expect("a private send is sealed"),
+            "a send is sealed before its secret is checked"
+        );
+        let action_check = action
+            .find("sealing_secret(")
+            .expect("an action's secret is checked against the room's sealed version");
+        assert!(
+            action_check < action.find("action_body(").expect("an action is sealed"),
+            "an action is sealed before its secret is checked"
+        );
+        // An action's check, seal and insert are one synchronous call: a
+        // `defer` between them would let another queued action raise the
+        // room's sealed version after the check.
+        assert!(
+            !action.contains("defer("),
+            "`submit_action_now` defers between checking the secret and the outbox insert"
+        );
+        // Nothing else seals: one seal in the composer's path, one for actions.
+        assert_eq!(
+            squashed.matches("action_body(").count(),
+            2,
+            "an action body is built outside `submit_action_now`: its secret is unchecked"
+        );
+        assert_eq!(
+            squashed.matches(".seal(").count(),
+            2,
+            "a body is sealed outside `queue_message` and `action_body`: its secret is unchecked"
+        );
+
+        // The three ways to an action. A reaction and a delete call
+        // `submit_action_now` from their own `defer`.
+        for handler in ["lethandle_toggle_reaction={", "lethandle_delete_message={"] {
+            let before = region(handler, "submit_action_now(");
+            assert_nothing_awaited_or_signed(handler, before);
+            assert_ends_inside_defer(handler, before);
+        }
+        // An edit calls it synchronously from `edit_message_now`, which only
+        // the edit form's Save reaches (`on_edit`, in `save_edit_now`), from
+        // the `defer` of each of its two triggers, Enter and the button.
+        let edit = region("fnedit_message_now(", "submit_action_now(");
+        assert_nothing_awaited_or_signed("fnedit_message_now(", edit);
+        assert!(
+            !edit.contains("defer("),
+            "`edit_message_now` defers, so its caller cannot tell a queued edit from a refused one"
+        );
+        assert_eq!(
+            squashed.matches("submit_action_now(").count(),
+            4,
+            "`submit_action_now` and its three callers: add a new one to this pin"
+        );
+        assert_eq!(
+            squashed.matches("edit_message_now(").count(),
+            2,
+            "`edit_message_now` is called from somewhere other than `on_group_edit`"
+        );
+        assert_eq!(
+            squashed.matches("on_edit.call(").count(),
+            1,
+            "an edit is queued from somewhere other than `save_edit_now`"
+        );
+        assert_eq!(
+            squashed
+                .matches("crate::util::defer(move||{save_edit_now(")
+                .count(),
+            2,
+            "Enter and Save each call `save_edit_now` first thing in their `defer`"
+        );
+        assert_eq!(
+            squashed.matches("save_edit_now(").count(),
+            3,
+            "`save_edit_now` is called outside those two `defer`s"
+        );
+        // An own send goes to the end when the room admits it, not on Enter:
+        // the render that shows it takes the note `commit_ready_now` leaves,
+        // before the range resolves, so a held reader gets the latest range.
+        let body = &squashed[squashed.find("pubfnConversation()->Element{").unwrap()..];
+        let take = body
+            .find("outbox_commit::take_own_send_committed(")
+            .expect("the render takes the own-send note");
+        let resolve = body
+            .find("resolve_rendered_range(")
+            .expect("the render resolves its range");
+        assert!(
+            take < resolve,
+            "the own send's request must come before the range resolves"
+        );
+        assert!(
+            body[take..resolve].contains("reader_position.request_end("),
+            "an admitted own send requests the end"
         );
     }
 

@@ -152,6 +152,17 @@ export async function submitMessage(page: Page, text: string): Promise<Locator> 
   return committedRow(page, text);
 }
 
+/// `submitMessage`, then wait for the room to admit it: the message shows
+/// once in the history and the draft clears, so the next send starts from an
+/// empty composer. Returns the committed row. Tests that hold signing use
+/// `submitMessage` instead.
+export async function sendCommitted(page: Page, text: string): Promise<Locator> {
+  const row = await submitMessage(page, text);
+  await expect(row, "the room admits it once").toHaveCount(1);
+  await expect(page.getByTestId("message-input"), "the draft clears once the room admits it").toHaveValue("");
+  return row;
+}
+
 /// Focus `target` as a keyboard user would, so it is `:focus-visible`. A key
 /// press first, so a scripted focus counts as keyboard focus (WebKit's Tab
 /// skips buttons).

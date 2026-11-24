@@ -2,20 +2,26 @@
 //!
 //! Chat messages are signed by the chat delegate (`signing::sign_message_with_fallback`).
 //! That round trip is usually ~1 ms but sometimes seconds, because delegate
-//! requests queue behind contract WASM on the node. The reader must never wait
-//! for it, so a composed message goes into this outbox the moment it is sent,
-//! renders from here as a pending row (`pending_sends.rs`), and moves into
-//! `ROOMS` when its signature arrives. Unsigned messages live only here: never
-//! in `ROOMS`, the delegate's rooms blob, or anything sent to the network.
+//! requests queue behind contract WASM on the node. Nothing else waits for it:
+//! a composed message goes into this outbox the moment it is sent and moves
+//! into `ROOMS` when its signature arrives. The composer keeps showing the
+//! text (read-only, `message_input.rs`) until then, and takes it back as an
+//! editable draft if it fails, so a send has no row of its own in the history
+//! before the room admits it. Unsigned messages live only here: never in
+//! `ROOMS`, the delegate's rooms blob, or anything sent to the network.
 //!
 //! Per room, entries commit in the order they were made. A later entry whose
 //! signature arrives first waits for the earlier ones, so a send followed by an
 //! edit of an earlier message, or three messages typed quickly, reach `ROOMS`
 //! (and so the network) in the order the user made them. A failed entry does
-//! not hold back the ones after it: it stays, marked failed, until the user
-//! retries or discards it (a retried message is restamped, and commits after
-//! them). Leaving the room drops what is waiting in it
-//! (`outbox_commit::clear_room_now`).
+//! not hold back the ones after it: it stays, marked failed, until the
+//! composer takes a failed send back as its draft (sending it again is a new
+//! entry) or an action is reported (a retried entry is restamped, and commits
+//! after them). While the room shows a notice instead of the composer (its key
+//! not here, self banned, a sync), the notice shows a failed send, and the
+//! user can discard it there (`failed_send_notice.rs`); otherwise the
+//! composer takes it back once it returns. Leaving the room drops what is
+//! waiting in it (`outbox_commit::clear_room_now`).
 //!
 //! A private room's secret rotates (on a ban, a join or a prune). A message
 //! sealed under the previous secret whose signature arrives after a rotation
@@ -23,32 +29,39 @@
 //! excluded: it is sealed again under the current secret from what the user
 //! wrote (`seal.rs`) and signed again, keeping its timestamp and its place,
 //! and what follows it waits for it (`take_committable`). At most
-//! `MAX_RESEALS` times; then it fails, and Retry seals it again.
+//! `MAX_RESEALS` times; then it fails (a send goes back to the composer, and
+//! sending it again seals it under the room's secret at that time).
+//!
+//! Sealing only ever moves forward. The outbox keeps, per room, the highest
+//! secret version it has sealed an entry under (`may_seal_at`), past the
+//! entries themselves: a send, an edit, a delete and a reaction are all
+//! refused while this device's current secret is older than that
+//! (`conversation.rs`, `sealing_secret`). A failed send taken back and sent
+//! again, or an edit's new text, would otherwise be sealed under a key a
+//! newer rotation excluded someone from.
 //!
 //! The outbox is memory only: a reload while a message is still being signed
 //! loses it.
 //!
 //! Each message keeps the timestamp it was given when the user acted; signing
-//! later does not restamp it, so the order on screen is the typed order. Only
-//! a Retry restamps.
+//! later does not restamp it, so the order on screen is the typed order. A
+//! failed send sent again from the composer is a new message, stamped then.
 
 use super::seal::SealInput;
 use dioxus::prelude::*;
 use ed25519_dalek::{Signature, VerifyingKey};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageId, MessageV1};
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 pub(crate) static OUTBOX: GlobalSignal<Outbox> = Global::new(Outbox::default);
 
 /// How many times one entry is sealed again for a rotating room secret
-/// before it is shown as failed (where Retry seals it once more).
+/// before it fails.
 pub(crate) const MAX_RESEALS: u32 = 3;
 
 /// Why a sealed message waits: this device does not yet hold the room's
 /// current secret (or holds an older one than the message was sealed under).
-const KEY_NOT_YET_HERE: &str =
-    "this device does not have the room's newest key yet; Retry once it arrives";
+pub(crate) const KEY_NOT_YET_HERE: &str = "this device does not have the room's newest key yet";
 
 /// A message to enqueue: the message, its CBOR bytes, and for a sealed body
 /// what the user wrote (`SealInput`).
@@ -57,9 +70,13 @@ pub(crate) type NewMessage = (MessageV1, Vec<u8>, Option<SealInput>);
 /// What the user did, which decides how a pending entry shows.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum PendingKind {
-    /// A message or reply from the composer. Shown as a pending row, with the
-    /// typed text, until it commits; kept as a failed row if it cannot.
-    Send { text: String, author_name: String },
+    /// A message or reply from the composer. The composer shows its text and
+    /// reply target, read-only, until it commits; if it cannot, the composer
+    /// takes both back as an editable draft with the reason.
+    Send {
+        text: String,
+        reply: Option<super::ReplyContext>,
+    },
     /// An edit, a delete or a reaction toggle. Shown while pending by applying
     /// `effects` over the committed messages (`pending_effects`); a failure is
     /// reported with a toast and the entry dropped (`label` names the action
@@ -68,6 +85,23 @@ pub(crate) enum PendingKind {
         label: &'static str,
         effects: Vec<PendingEffect>,
     },
+}
+
+impl PendingKind {
+    /// Whether the room's wait dots light once the room admits this
+    /// (`app/user_waits.rs`): an edit or a delete only. A send keeps the
+    /// composer's draft instead, and a reaction lights nothing.
+    pub fn lights_wait_dots(&self) -> bool {
+        match self {
+            Self::Send { .. } => false,
+            Self::Action { effects, .. } => effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    PendingEffect::Edit { .. } | PendingEffect::Delete { .. }
+                )
+            }),
+        }
+    }
 }
 
 /// What a pending action does to the conversation, in plaintext: the
@@ -162,12 +196,28 @@ impl PendingEntry {
         })
     }
 
-    /// When the user acted (the first message's timestamp).
-    pub fn time(&self) -> SystemTime {
+    /// The highest secret version any of its bodies is sealed under.
+    fn highest_sealed(&self) -> Option<u32> {
         self.messages
-            .first()
-            .map(|m| m.message.time)
-            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .iter()
+            .filter_map(|m| m.message.content.secret_version())
+            .max()
+    }
+
+    /// This entry as the composer shows it, if it is a composer send.
+    fn send_row(&self) -> Option<PendingRow> {
+        match &self.kind {
+            PendingKind::Send { text, reply } => Some(PendingRow {
+                id: self.id,
+                text: text.clone(),
+                reply: reply.clone(),
+                failed: match &self.state {
+                    PendingState::Failed(reason) => Some(reason.clone()),
+                    PendingState::Signing => None,
+                },
+            }),
+            PendingKind::Action { .. } => None,
+        }
     }
 }
 
@@ -188,33 +238,23 @@ impl PendingEntry {
         }
     }
 
-    /// Rebuild every message: when `reseal` is given, each sealed body is
-    /// sealed again from its `SealInput` under that secret and version; when
-    /// `restamp` is given, each message takes that time. Encodes everything
-    /// first and replaces nothing on failure, so a signature can never cover
-    /// bytes other than the message's. Clears signatures; the entry is
-    /// Signing again.
-    fn seal_again(
-        &mut self,
-        reseal: Option<(&[u8; 32], u32)>,
-        restamp: Option<SystemTime>,
-    ) -> bool {
+    /// Rebuild every message, each sealed body sealed again from its
+    /// `SealInput` under `secret` at `version`, keeping its timestamp.
+    /// Encodes everything first and replaces nothing on failure, so a
+    /// signature can never cover bytes other than the message's. Clears
+    /// signatures; the entry is Signing again.
+    fn seal_again(&mut self, secret: &[u8; 32], version: u32) -> bool {
         let mut rebuilt = Vec::with_capacity(self.messages.len());
         for m in &self.messages {
             let mut message = m.message.clone();
-            if let Some((secret, version)) = reseal {
-                if matches!(
-                    message.content,
-                    river_core::room_state::message::RoomMessageBody::Private { .. }
-                ) {
-                    let Some(seal) = &m.seal else {
-                        return false;
-                    };
-                    message.content = seal.seal(secret, version);
-                }
-            }
-            if let Some(time) = restamp {
-                message.time = time;
+            if matches!(
+                message.content,
+                river_core::room_state::message::RoomMessageBody::Private { .. }
+            ) {
+                let Some(seal) = &m.seal else {
+                    return false;
+                };
+                message.content = seal.seal(secret, version);
             }
             let mut bytes = Vec::new();
             if ciborium::ser::into_writer(&message, &mut bytes).is_err() {
@@ -232,13 +272,12 @@ impl PendingEntry {
     }
 }
 
-/// A pending row as the conversation shows it.
+/// A composer send waiting in the outbox, as the composer shows it.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct PendingRow {
     pub id: u64,
     pub text: String,
-    pub author_name: String,
-    pub time: SystemTime,
+    pub reply: Option<super::ReplyContext>,
     pub failed: Option<String>,
 }
 
@@ -249,6 +288,10 @@ pub(crate) type SigningWork = Vec<(usize, Vec<u8>)>;
 pub(crate) struct Outbox {
     rooms: HashMap<VerifyingKey, Vec<PendingEntry>>,
     next_id: u64,
+    /// Per room, the highest secret version an entry was sealed under
+    /// (`may_seal_at`). Kept when the entry commits, fails or is discarded;
+    /// dropped when the room is left.
+    sealed_high: HashMap<VerifyingKey, u32>,
 }
 
 impl Outbox {
@@ -281,7 +324,7 @@ impl Outbox {
             .enumerate()
             .map(|(i, (_, bytes, _))| (i, bytes.clone()))
             .collect();
-        self.rooms.entry(room).or_default().push(PendingEntry {
+        let entry = PendingEntry {
             id,
             kind,
             author_vk,
@@ -296,8 +339,30 @@ impl Outbox {
                 .collect(),
             state: PendingState::Signing,
             reseals: 0,
-        });
+        };
+        self.note_sealed(room, entry.highest_sealed());
+        self.rooms.entry(room).or_default().push(entry);
         (id, work)
+    }
+
+    fn note_sealed(&mut self, room: VerifyingKey, version: Option<u32>) {
+        if let Some(version) = version {
+            let high = self.sealed_high.entry(room).or_insert(version);
+            *high = (*high).max(version);
+        }
+    }
+
+    /// Whether a new message in `room` (a send, or an edit, a delete or a
+    /// reaction, which are messages too) may be sealed under secret
+    /// `version`: not if this device has already sealed one there under a
+    /// newer version.
+    /// The room's secret pointer can move back (`RoomData`'s alignment with
+    /// the contract's current version), and a member the newer rotation
+    /// excluded can read a message sealed under the older key.
+    pub fn may_seal_at(&self, room: &VerifyingKey, version: u32) -> bool {
+        self.sealed_high
+            .get(room)
+            .is_none_or(|high| version >= *high)
     }
 
     fn entry_mut(&mut self, room: &VerifyingKey, id: u64) -> Option<&mut PendingEntry> {
@@ -308,9 +373,9 @@ impl Outbox {
     /// has failed (a late answer to an abandoned attempt). Results are keyed
     /// by entry and index, not by attempt: a late result from an earlier
     /// attempt would land on the new one. A reseal starts a new attempt only
-    /// for a fully signed entry, so nothing of the old one is outstanding; a
-    /// Retry is offered only for sends (one message, failed once its request
-    /// completed). A stray late signature cannot publish old content anyway:
+    /// for a fully signed entry, so nothing of the old one is outstanding,
+    /// and a failed send is never signed again (the composer sends it as a
+    /// new entry, never sealed below the failed one's version: `may_seal_at`). A stray late signature cannot publish old content anyway:
     /// it does not verify over the new bytes, and the room skips the message.
     pub fn record_signature(&mut self, room: &VerifyingKey, id: u64, index: usize, sig: Signature) {
         if let Some(entry) = self.entry_mut(room, id) {
@@ -322,7 +387,7 @@ impl Outbox {
         }
     }
 
-    /// Mark an entry failed. Its signatures are dropped, so a retry signs again.
+    /// Mark an entry failed. Its signatures are dropped.
     pub fn record_failure(&mut self, room: &VerifyingKey, id: u64, reason: String) {
         if let Some(entry) = self.entry_mut(room, id) {
             entry.state = PendingState::Failed(reason);
@@ -447,12 +512,14 @@ impl Outbox {
             entry.fail("the room's key kept changing while this was sending");
             return None;
         }
-        if !entry.seal_again(Some((secret, version)), None) {
+        if !entry.seal_again(secret, version) {
             entry.fail("this message could not be sealed again");
             return None;
         }
         entry.reseals += 1;
-        Some((entry.author_vk, entry.work()))
+        let resealed = (entry.author_vk, entry.work());
+        self.note_sealed(*room, Some(version));
+        Some(resealed)
     }
 
     /// One commit step for `room`, given the room's current secret: the
@@ -518,52 +585,6 @@ impl Outbox {
         queue.insert(at, entry);
     }
 
-    /// Start a failed entry signing again, restamped `now` and, if `current`
-    /// (the room's current secret) is newer than what it was sealed under,
-    /// sealed again under it, so Retry can succeed whatever happened to the
-    /// key. Resets the reseal count. A retry is a new
-    /// send. (Keeping the original stamp would let a room at its message cap
-    /// prune the retried message the moment it lands, so Retry could never
-    /// succeed.) Returns the author's key and the work, or `None` if the entry
-    /// is gone or not failed.
-    pub fn retry(
-        &mut self,
-        room: &VerifyingKey,
-        id: u64,
-        now: SystemTime,
-        current: Option<([u8; 32], u32)>,
-    ) -> Option<(VerifyingKey, SigningWork)> {
-        let entry = self.entry_mut(room, id)?;
-        if !matches!(entry.state, PendingState::Failed(_)) {
-            return None;
-        }
-        // Sealed again under the room's current secret if it has rotated, so
-        // a Retry can succeed whatever happened to the key meanwhile. Only
-        // ever forward: a body sealed under a newer version than this device
-        // holds is never sealed down to the older secret, which a member the
-        // newer rotation excluded can read. That Retry waits for the key.
-        let waits_for_key = match current {
-            Some((_, version)) => !entry.sealed_at_or_below(version),
-            None => entry.is_stale_sealed(None),
-        };
-        if waits_for_key {
-            entry.state = PendingState::Failed(KEY_NOT_YET_HERE.to_string());
-            return None;
-        }
-        let resealing = current.filter(|(_, v)| entry.is_stale_sealed(Some(*v)));
-        let reseal = resealing
-            .as_ref()
-            .map(|(secret, version)| (secret, *version));
-        if !entry.seal_again(reseal, Some(now)) {
-            entry.state =
-                PendingState::Failed("this message could not be sealed again".to_string());
-            return None;
-        }
-        entry.reseals = 0;
-        entry.state = PendingState::Signing;
-        Some((entry.author_vk, entry.work()))
-    }
-
     /// Drop `room`'s entries written as any identity but `author` (the room's
     /// identity was replaced while they waited). Returns how many.
     pub fn drop_other_identities(&mut self, room: &VerifyingKey, author: &VerifyingKey) -> usize {
@@ -586,8 +607,10 @@ impl Outbox {
             .is_some_and(|q| q.iter().any(|e| e.author_vk != *author))
     }
 
-    /// Drop everything waiting in `room` (the user left it).
+    /// Drop everything waiting in `room`, and its sealed mark (the user left
+    /// it). Returns how many entries were waiting.
     pub fn clear_room(&mut self, room: &VerifyingKey) -> usize {
+        self.sealed_high.remove(room);
         self.rooms.remove(room).map_or(0, |q| q.len())
     }
 
@@ -600,6 +623,43 @@ impl Outbox {
             self.rooms.remove(room);
         }
         Some(entry)
+    }
+
+    /// Whether entry `id` in `room` is `author`'s composer send, and failed.
+    pub fn is_failed_send(&self, room: &VerifyingKey, author: &VerifyingKey, id: u64) -> bool {
+        self.entry(room, id).is_some_and(|e| {
+            e.author_vk == *author
+                && matches!(e.kind, PendingKind::Send { .. })
+                && matches!(e.state, PendingState::Failed(_))
+        })
+    }
+
+    /// Drop entry `id` if it is still `author`'s failed composer send in
+    /// `room` (the user discarded it from the notice a room shows instead of
+    /// the composer), and say whether it was. Anything else is left as it is:
+    /// a send still being signed, an action, another identity's entry, an id
+    /// already gone (a second click, or the composer took the send back).
+    /// Like `discard`, it keeps the room's sealed mark (`may_seal_at`).
+    pub fn discard_failed_send(
+        &mut self,
+        room: &VerifyingKey,
+        author: &VerifyingKey,
+        id: u64,
+    ) -> bool {
+        self.is_failed_send(room, author, id) && self.discard(room, id).is_some()
+    }
+
+    /// Whether a failed composer send waits in `room`, written as any
+    /// identity. Only that: for the notice a room shows while this device
+    /// does not know who self is there, which must not show the text or the
+    /// quote of a send it cannot attribute.
+    pub fn has_failed_send(&self, room: &VerifyingKey) -> bool {
+        self.rooms.get(room).is_some_and(|queue| {
+            queue.iter().any(|e| {
+                matches!(e.kind, PendingKind::Send { .. })
+                    && matches!(e.state, PendingState::Failed(_))
+            })
+        })
     }
 
     /// Remove and return the failed actions (edit, delete, reaction) in
@@ -643,27 +703,30 @@ impl Outbox {
     }
 
     /// `author`'s composer messages waiting in `room`, in the order they were
-    /// sent (see `pending_effects` for why only `author`'s).
+    /// sent (see `pending_effects` for why only `author`'s). The whole queue,
+    /// for tests: the composer looks up one send (`composer_send`).
+    #[cfg(test)]
     pub fn pending_rows(&self, room: &VerifyingKey, author: &VerifyingKey) -> Vec<PendingRow> {
         self.rooms
             .get(room)
             .into_iter()
             .flatten()
             .filter(|e| e.author_vk == *author)
-            .filter_map(|e| match &e.kind {
-                PendingKind::Send { text, author_name } => Some(PendingRow {
-                    id: e.id,
-                    text: text.clone(),
-                    author_name: author_name.clone(),
-                    time: e.time(),
-                    failed: match &e.state {
-                        PendingState::Failed(reason) => Some(reason.clone()),
-                        PendingState::Signing => None,
-                    },
-                }),
-                PendingKind::Action { .. } => None,
-            })
+            .filter_map(PendingEntry::send_row)
             .collect()
+    }
+
+    /// The composer's send in `room` as `author`, if one is waiting, failed
+    /// or not: the newest, since the composer submits one at a time (see
+    /// `pending_effects` for why only `author`'s). Walks the queue from the
+    /// end and copies only that send.
+    pub fn composer_send(&self, room: &VerifyingKey, author: &VerifyingKey) -> Option<PendingRow> {
+        self.rooms
+            .get(room)?
+            .iter()
+            .rev()
+            .filter(|e| e.author_vk == *author)
+            .find_map(PendingEntry::send_row)
     }
 }
 

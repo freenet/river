@@ -22,6 +22,15 @@ type RiverTestHooks = {
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
+  // Self, owning the current room, becomes a plain member of it under a new
+  // identity the owner invited; the owner's key is kept for setSelfStanding.
+  makeSelfPlainMember(): void;
+  // Self's standing in that room: an owner-signed ban, or removed with no
+  // stored invitation, or a member again.
+  setSelfStanding(standing: "member" | "banned" | "not-member"): void;
+  // The current room's identity (private and verifying key) taken off this
+  // device, or given back.
+  setRoomIdentityAvailable(available: boolean): void;
   // The current room under a new contract key, as a room-contract re-key leaves it.
   rekeyCurrentRoom(): void;
   // Show one mobile panel, as its buttons do, whatever covers them.
@@ -93,6 +102,23 @@ type RiverTestHooks = {
   takeBannerReadFailures(): number;
   // The automatic generation reload's busy check, the production predicate.
   userIsBusy(): Promise<boolean>;
+  // Room wait feedback (user_waits.rs), at its adapters: an UPDATE reply for the
+  // current room's contract; an UPDATE error the socket could report, naming the
+  // current room's contract ("keyed") or no contract ("unkeyed").
+  deliverUpdateResponse(): void;
+  deliverUpdateError(kind: "keyed" | "unkeyed"): void;
+  // Rooms with a wait mark, read without rendering.
+  userWaitRooms(): number;
+  // An accepted invitation subscribing (true) or none (false).
+  setPendingJoin(on: boolean): void;
+  // The current room's identity replaced by another key, as an identity import does.
+  replaceRoomIdentity(): void;
+  // The current room (owned by this identity) made private, holding the secrets
+  // for versions 0 to `version`, `version` current.
+  makeRoomPrivate(version: number): void;
+  // The current room's secret pointer set to `version`, as a merge that leaves
+  // local state ahead of the contract's can.
+  setSecretVersion(version: number): void;
 };
 
 export type SyncStatus = "connected" | "connecting" | "disconnected" | "error" | `error:${string}`;

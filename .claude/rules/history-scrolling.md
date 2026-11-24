@@ -164,8 +164,9 @@ Known limitations:
 
 ## Room history
 
-- Opening a room, an own send, Latest, and a followed arrival request one
-  instant move to the end. A pending request carries its room so a room
+- Opening a room, an own send (in the render that shows it, once the room
+  admits it: the composer holds it until then, `message_input.rs`), Latest,
+  and a followed arrival request one instant move to the end. A pending request carries its room so a room
   change cannot apply it to the next room. It waits for rows and visible
   layout when necessary. A request whose render would hold the range's end at
   the ceiling takes the latest range instead.
@@ -228,6 +229,13 @@ Known limitations:
   history, and a quoted message that is not rendered is left alone (no
   paging). The highlight is a two-second Web Animations API animation on the
   whole row; it changes no height.
+- While an edit or delete's wait dots show over the history's
+  bottom edge, a decorative spacer after `bottom-sentinel`
+  (`user_wait_dots.rs`) adds a dot row and a gap below the newest message,
+  snapping open after the dots' delay and shut once they have faded. It is
+  content changing height below the view: a held end stays held, a parked
+  reader is not moved, and Latest, the read rule and following still measure
+  the message's edge, never the spacer. It carries no row or anchor key.
 - Latest appears when the newest message's bottom is more than 4px below
   the visible area, or a held range withholds newer messages. The margin is
   measured against the message, not the padding below it.

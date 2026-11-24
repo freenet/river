@@ -178,6 +178,24 @@ pub fn update_mention_from_input(
     }
 }
 
+/// The text a mention is inserted into: a plain signal, or the composer's
+/// draft for the open room (`message_input.rs`).
+pub trait MentionText: Copy + 'static {
+    /// The text now, without subscribing.
+    fn current(&self) -> String;
+    fn replace(&mut self, value: String);
+}
+
+impl MentionText for Signal<String> {
+    fn current(&self) -> String {
+        self.peek().to_string()
+    }
+
+    fn replace(&mut self, value: String) {
+        self.set(value);
+    }
+}
+
 /// Replace the `@query` span in textarea `id` with the chosen member's wire
 /// token and a trailing space, then reposition the caret after the inserted
 /// token. `after` runs in the same deferred tick as the caret reposition (used
@@ -185,7 +203,7 @@ pub fn update_mention_from_input(
 /// is needed.
 pub fn apply_mention_selection(
     id: String,
-    mut text: Signal<String>,
+    mut text: impl MentionText,
     mut mention: Signal<Option<MentionAutocomplete>>,
     idx: usize,
     after: impl FnOnce() + 'static,
@@ -196,7 +214,7 @@ pub fn apply_mention_selection(
     let Some((member_id, name)) = m.candidates.get(idx).cloned() else {
         return;
     };
-    let value = text.peek().to_string();
+    let value = text.current();
     // Guard the stored offsets against a value that changed out from under us
     // (they are only valid for the value captured at the last keystroke).
     if m.anchor > m.query_end
@@ -214,7 +232,7 @@ pub fn apply_mention_selection(
     new_value.push(' ');
     new_value.push_str(&value[m.query_end..]);
     let caret_byte = m.anchor + token.len() + 1;
-    text.set(new_value.clone());
+    text.replace(new_value.clone());
     mention.set(None);
     // The caret must be set after Dioxus flushes the new value to the DOM.
     crate::util::defer(move || {
@@ -232,7 +250,7 @@ pub fn apply_mention_selection(
 pub fn handle_mention_keydown(
     id: &str,
     evt: &KeyboardEvent,
-    text: Signal<String>,
+    text: impl MentionText,
     mut mention: Signal<Option<MentionAutocomplete>>,
     after: impl FnOnce() + 'static,
 ) -> bool {

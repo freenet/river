@@ -1325,3 +1325,80 @@ button:hover .tooltip-host:not(.tooltip-host--copy) > .tooltip-card,
     .wave-dots > span { animation-name: dot-shimmer; animation-duration: 3s; }
     .small-dots > span { animation-name: dot-shimmer; animation-duration: 2s; }
 }
+
+/* User-wait dots (`user_wait_dots.rs`). A host paints only while it owns the
+ * dots and there is activity: the dots appear 300 ms after activity starts,
+ * also on a host that mounts with activity already under way
+ * (`@starting-style`), and fade over 200 ms when it ends. A host that stops
+ * being the owner stops painting at once, mid-fade or not. The ten dots and
+ * their wave are `.wave-dots`'. */
+:root {
+    --user-wait-row: 14px;
+    --user-wait-gap: 12px;
+    --user-wait-delay: 300ms;
+    --user-wait-fade: 200ms;
+}
+
+.user-wait-dots {
+    display: flex;
+    align-items: center;
+    height: var(--user-wait-row);
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity var(--user-wait-fade) ease, visibility 0s linear var(--user-wait-fade);
+}
+
+.user-wait-dots[data-active="true"][data-owner="true"] {
+    opacity: 1;
+    visibility: visible;
+    transition: opacity var(--user-wait-fade) ease var(--user-wait-delay), visibility 0s linear var(--user-wait-delay);
+}
+
+@starting-style {
+    .user-wait-dots[data-active="true"][data-owner="true"] {
+        opacity: 0;
+        visibility: hidden;
+    }
+}
+
+.user-wait-dots[data-owner="false"] {
+    transition: none;
+}
+
+/* 12px above the composer, across the conversation column. No z-index: the
+ * Latest frame comes later in the panel and paints over it. */
+.user-wait-dock {
+    position: absolute;
+    inset-inline: 0;
+    bottom: var(--user-wait-gap);
+    pointer-events: none;
+}
+
+/* After `bottom-sentinel`: with the history held at its end, the newest
+ * message sits a dot row and a gap higher while the dots show. Snaps open
+ * with the dots' delay and shut once they have faded; never animated, so the
+ * end hold sees one resize each way. */
+.user-wait-spacer {
+    height: 0;
+    transition: height 0s linear var(--user-wait-fade);
+}
+
+.user-wait-spacer[data-active="true"] {
+    height: calc(var(--user-wait-row) + var(--user-wait-gap));
+    transition-delay: var(--user-wait-delay);
+}
+
+@starting-style {
+    .user-wait-spacer[data-active="true"] {
+        height: 0;
+    }
+}
+
+/* Reserved whether or not the dots show, so they never move the screen. */
+.user-wait-welcome-slot {
+    display: flex;
+    justify-content: center;
+    height: var(--user-wait-row);
+    margin-top: 1.5rem;
+}

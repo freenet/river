@@ -3,7 +3,7 @@
 //! Every signal write here runs in a clean execution context (inside
 //! `crate::util::defer`), per `.claude/rules/dioxus-signal-safety.md`. The
 //! `*_now` functions write directly and must be called from a deferred
-//! closure; `retry` and `discard` defer themselves.
+//! closure; `discard` and `discard_failed_send` defer themselves.
 
 use super::outbox::{NewMessage, PendingEntry, PendingKind, SigningWork, OUTBOX};
 use crate::components::app::ROOMS;
@@ -27,22 +27,6 @@ pub(crate) fn submit_now(
     let (id, work) = OUTBOX.with_mut(|o| o.enqueue_sealed(room, kind, author_vk, messages));
     start_signing(room, id, author_vk, work, fallback_key);
     id
-}
-
-/// Sign a failed entry again. The fallback key is read afresh from `ROOMS`.
-pub(crate) fn retry(room: VerifyingKey, id: u64) {
-    crate::util::defer(move || {
-        let (fallback_key, current) = room_signing_context(&room);
-        // The fallback key is the current identity's; `sign_message_with_fallback`
-        // uses it only if it matches `author_vk`, so a row from a replaced
-        // identity cannot be signed with the new key. A private body is
-        // sealed again under the room's current secret if it has rotated.
-        if let Some((author_vk, work)) =
-            OUTBOX.with_mut(|o| o.retry(&room, id, crate::util::get_current_system_time(), current))
-        {
-            start_signing(room, id, author_vk, work, fallback_key);
-        }
-    });
 }
 
 /// The room's local fallback key and current secret (`(secret, version)`),
@@ -80,18 +64,34 @@ pub(crate) fn has_signing() -> bool {
     OUTBOX.try_read().map_or(true, |o| o.has_unsent(|_| None))
 }
 
-/// Drop everything waiting in `room`: the user left it. From a deferred
-/// closure only.
+/// Drop everything the outbox keeps for `room`: the user left it. From a
+/// deferred closure only.
+///
+/// Unconditional: a drained queue can still hold the room's sealed mark
+/// (`Outbox::may_seal_at`), so "nothing waits" is no reason to skip it. A
+/// leave is a single user action that already writes `ROOMS`, so the one
+/// extra write costs nothing worth guarding against.
 pub(crate) fn clear_room_now(room: VerifyingKey) {
-    if OUTBOX.peek().has_room(&room) {
-        OUTBOX.with_mut(|o| o.clear_room(&room));
-    }
+    OUTBOX.with_mut(|o| o.clear_room(&room));
 }
 
-/// Drop a failed entry at the user's request.
+/// Drop a failed entry: the composer has taken the send back as its draft.
 pub(crate) fn discard(room: VerifyingKey, id: u64) {
     crate::util::defer(move || {
         OUTBOX.with_mut(|o| o.discard(&room, id));
+    });
+}
+
+/// Drop `author`'s failed send `id` in `room`: the user discarded it from the
+/// notice the room shows instead of the composer (`failed_send_notice.rs`).
+/// Deferred, and checked again when it runs, so a second click, an id that is
+/// gone, or a send the composer has taken back since does nothing (and writes
+/// no signal).
+pub(crate) fn discard_failed_send(room: VerifyingKey, author: VerifyingKey, id: u64) {
+    crate::util::defer(move || {
+        if OUTBOX.peek().is_failed_send(&room, &author, id) {
+            OUTBOX.with_mut(|o| o.discard_failed_send(&room, &author, id));
+        }
     });
 }
 
@@ -224,9 +224,18 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
         return;
     };
     let mut any_applied = false;
+    let mut lights_wait_dots = false;
     for (entry, outcome) in ready.into_iter().zip(outcomes) {
         match outcome {
-            Ok(()) => any_applied = true,
+            Ok(()) => {
+                any_applied = true;
+                lights_wait_dots |= entry.kind.lights_wait_dots();
+                // The composer's send is done: it clears as the entry leaves
+                // the outbox, and its conversation goes to the end.
+                if matches!(entry.kind, PendingKind::Send { .. }) {
+                    note_own_send_committed(room);
+                }
+            }
             Err(reason) => {
                 error!("Failed to apply message delta: {reason}");
                 crate::util::debug_log(&format!("[send] delta FAILED: {reason}"));
@@ -241,8 +250,35 @@ pub(crate) fn commit_ready_now(room: VerifyingKey) {
     }
     if any_applied {
         crate::util::debug_log("[send] delta applied OK, marking NEEDS_SYNC");
+        // Queued synchronously, here, so the reload protection it gives is
+        // not delayed by a task hop.
         crate::components::app::mark_needs_sync(room);
     }
+    if lights_wait_dots {
+        // Only an edit or a delete lights the room's wait dots, and restarts
+        // its cap; the feedback mark itself is deferred.
+        crate::components::app::user_waits::mark_user_change(room);
+    }
+}
+
+thread_local! {
+    /// The room whose own send the room admitted last, until `Conversation`
+    /// takes it to go to the end (`take_own_send_committed`).
+    static OWN_SEND_COMMITTED: std::cell::Cell<Option<VerifyingKey>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn note_own_send_committed(room: VerifyingKey) {
+    OWN_SEND_COMMITTED.with(|c| c.set(Some(room)));
+}
+
+/// Whether an own send to `room` was admitted since the last call: the
+/// conversation showing `room` then goes to the end, in the render that
+/// shows the message. Any other room's note is dropped: its conversation is
+/// not on screen, so nothing moves.
+pub(crate) fn take_own_send_committed(room: Option<VerifyingKey>) -> bool {
+    let committed = OWN_SEND_COMMITTED.with(|c| c.take());
+    committed.is_some() && committed == room
 }
 
 /// A failed edit, delete or reaction has no row to show it on: say so once and
@@ -272,7 +308,7 @@ fn apply_entry(room_data: &mut RoomData, entry: &PendingEntry) -> Result<(), Str
     // member the rotation excluded, and the room itself admits any version
     // it has a record of, so the sender is the only check.
     if entry.is_stale_sealed(room_data.get_secret().map(|(_, version)| version)) {
-        return Err("the room's key changed while this was sending; Retry to send it".to_string());
+        return Err("the room's key changed while this was sending".to_string());
     }
     // Written as an identity this room no longer uses (an identity import
     // replaced it while this was signing): never publish it under the old one.
@@ -357,7 +393,7 @@ mod tests {
             room,
             PendingKind::Send {
                 text: text.to_string(),
-                author_name: "Owner".to_string(),
+                reply: None,
             },
             owner_sk().verifying_key(),
             vec![(message, bytes)],
@@ -396,14 +432,13 @@ mod tests {
         let room = owner_sk().verifying_key();
         let mut room_data = crate::room_data::test_minimal_room_data(room);
         let mut outbox = Outbox::default();
-        let id = queue_send(&mut outbox, room, "forged", 1);
+        queue_send(&mut outbox, room, "forged", 1);
         // A signature by some other key: what a stale delegate key would give
         // if the fallback check were bypassed.
         let other = SigningKey::from_bytes(&[7u8; 32]);
-        outbox.record_failure(&room, id, String::new());
-        let (_, work) = outbox.retry(&room, id, SystemTime::now(), None).unwrap();
-        outbox.record_signature(&room, id, 0, other.sign(&work[0].1));
-        let entry = outbox.take_ready(&room).pop().unwrap();
+        let mut entry = outbox.take_ready(&room).pop().unwrap();
+        let bytes = entry.messages[0].bytes.clone();
+        entry.messages[0].signature = Some(other.sign(&bytes));
         assert!(apply_entry(&mut room_data, &entry).is_err());
         assert!(texts_in(&room_data).is_empty());
     }
@@ -655,7 +690,7 @@ mod tests {
         };
         let kind = || PendingKind::Send {
             text: "x".to_string(),
-            author_name: "Owner".to_string(),
+            reply: None,
         };
         let vk = owner_sk().verifying_key();
         outbox.enqueue(room, kind(), vk, vec![sealed(1)]);
@@ -707,7 +742,7 @@ mod tests {
                 room,
                 PendingKind::Send {
                     text: "secret".to_string(),
-                    author_name: "Owner".to_string(),
+                    reply: None,
                 },
                 owner_sk().verifying_key(),
                 vec![(message, bytes)],
@@ -764,7 +799,7 @@ mod tests {
             room,
             PendingKind::Send {
                 text: "rotated".to_string(),
-                author_name: "Owner".to_string(),
+                reply: None,
             },
             owner_sk().verifying_key(),
             vec![(message, bytes, Some(seal))],

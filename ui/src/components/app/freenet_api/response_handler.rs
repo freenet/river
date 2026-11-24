@@ -6,7 +6,6 @@ pub(crate) mod get_response;
 mod put_response;
 mod subscribe_response;
 mod update_notification;
-mod update_response;
 
 use super::delegate_migration::{is_migration_bookkeeping_key, SweepWrite};
 use super::error::SynchronizerError;
@@ -53,7 +52,6 @@ use river_core::room_state::privacy::PrivacyMode;
 use std::collections::HashMap;
 pub use subscribe_response::handle_subscribe_response;
 pub use update_notification::handle_update_notification;
-pub use update_response::handle_update_response;
 
 /// Handles responses from the Freenet API
 pub struct ResponseHandler {
@@ -118,8 +116,10 @@ impl ResponseHandler {
                 ContractResponse::UpdateNotification { key, update } => {
                     handle_update_notification(&mut self.room_synchronizer, key, update)?;
                 }
-                ContractResponse::UpdateResponse { key, summary } => {
-                    handle_update_response(key, summary.to_vec());
+                ContractResponse::UpdateResponse { key, .. } => {
+                    // It names the contract, not the request, so all it does
+                    // is end that room's best-effort wait feedback.
+                    crate::components::app::user_waits::note_update_response(key);
                 }
                 ContractResponse::SubscribeResponse { key, subscribed } => {
                     flags.needs_reput = handle_subscribe_response(key, subscribed);

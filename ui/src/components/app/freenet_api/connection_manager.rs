@@ -566,6 +566,20 @@ mod imp {
                         }
                     }
 
+                    // An UPDATE failure ends its room's wait feedback. Read
+                    // from the typed error, before it is flattened to text
+                    // below, and only for the current attempt: a replaced
+                    // socket's error is not about this connection's work.
+                    // Nothing else about the error's handling changes.
+                    if let Err(ref e) = result {
+                        if let Some(failure) = crate::components::app::user_waits::update_failure(e)
+                        {
+                            if control::get().is_current(attempt) {
+                                crate::components::app::user_waits::note_update_failure(failure);
+                            }
+                        }
+                    }
+
                     let mapped_result: Result<
                         freenet_stdlib::client_api::HostResponse,
                         SynchronizerError,

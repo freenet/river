@@ -13,6 +13,7 @@ pub mod room_list;
 pub mod scroll_to_latest;
 pub mod toast;
 pub mod tooltip;
+pub(crate) mod user_wait_dots;
 
 /// Tree-wide audit for freenet/river#564: every EDITABLE form control that
 /// binds `value:` must also handle `oninput`.
@@ -103,7 +104,7 @@ mod volatile_value_binding_audit {
     /// you have confirmed the control handles `oninput`.
     const EXPECTED_EDITABLE: &[&str] = &[
         r#"components/conversation.rs <textarea> "{edit_text}""#,
-        r#"components/conversation/message_input.rs <textarea> "{message_text}""#,
+        r#"components/conversation/message_input.rs <textarea> "{shown_text}""#,
         r#"components/direct_messages/dm_thread_modal.rs <textarea> "{draft.read()}""#,
         r#"components/direct_messages/invite_via_dm_picker_modal.rs <textarea> "{personal_message_value}""#,
         r#"components/members.rs <input> "{member_query}""#,

@@ -198,13 +198,13 @@ message. Appears automatically on any crash, no query param needed.
 ### Signing flow
 
 1. **Room creation** → `create_room_modal.rs` generates `SigningKey`, stores it in the ROOMS signal as `RoomData::self_sk`, and calls `store_signing_key()` to save a copy in the chat delegate
-2. **Message send, edit, delete, reaction** → the unsigned message goes into the outbox (`ui/src/components/conversation/outbox.rs`) on Enter; a sent message shows at once as a pending row (`pending_sends.rs`). Then `outbox_commit.rs` asks the delegate (`sign_message_with_fallback` → `SignMessage`). Nothing on screen waits for that answer (freenet/river#512). Per room, messages commit in the order they were made
+2. **Message send, edit, delete, reaction** → the unsigned message goes into the outbox (`ui/src/components/conversation/outbox.rs`) on Enter, and the composer keeps showing it, read-only, until the room admits it (`message_input.rs`); an edit, delete or reaction shows at once over the committed messages (`pending_effects.rs`). Then `outbox_commit.rs` asks the delegate (`sign_message_with_fallback` → `SignMessage`). The rest of the UI does not wait for that answer (freenet/river#512). Per room, messages commit in the order they were made
 3. **Everything else** (member, ban, config, member_info, secret, upgrade) → `sign_*_with_fallback` → `send_delegate_request(Sign*{...})` → delegate looks up `signing_key:{origin}:{room_key}` → returns signature
-4. **Fallback** → the delegate's answer is used only if it verifies under the author's key; otherwise (and on any delegate failure) the payload is signed locally with `self_sk` while the UI still holds it. A message with no fallback stays as a failed row with Retry
-5. **Delta applied** → Message added to local state, pending row removed in the same tick → `NEEDS_SYNC` set → `ProcessRooms` → UPDATE sent
+4. **Fallback** → the delegate's answer is used only if it verifies under the author's key; otherwise (and on any delegate failure) the payload is signed locally with `self_sk` while the UI still holds it. A message with no fallback goes back to the composer as its draft, with the reason
+5. **Delta applied** → Message added to local state and removed from the outbox in the same tick (the composer clears) → `NEEDS_SYNC` set → `ProcessRooms` → UPDATE sent. An edit, delete or reaction also lights its room's wait dots until the UPDATE reply or 20 s (`app/user_waits.rs`); a send lights nothing
 
 Key debugging points:
-- A message stuck on "Sending…" is waiting for the delegate's signature:
+- A composer stuck read-only (Send disabled) is waiting for the delegate's signature:
   delegate requests queue behind contract WASM on the node, so ~1% take
   0.3-2 s, and a lost answer falls back to the local key after 10 s. The
   `NEEDS_SYNC` effect in step 5 also fires `save_rooms_to_delegate()`, which
@@ -221,7 +221,7 @@ riverctl --node-url ws://127.0.0.1:7510/v1/contract/command?encodingProtocol=nat
 
 ### Timeline analysis for message send
 
-1. `[send] queued, signing via the delegate` (browser, with `?debug=1`) → the pending row is on screen
+1. `[send] queued, signing via the delegate` (browser, with `?debug=1`) → the composer shows it read-only
 2. `[send] signed via Delegate` (or `LocalAfterDelegateFailed` / `LocalAfterStaleDelegate`) → which key signed it; the gap from step 1 is the delegate round trip
 3. `[send] delta applied OK, marking NEEDS_SYNC` → it is in local state, committed
 4. `Update { key: ... }` → UPDATE arrived at node

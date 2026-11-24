@@ -5,6 +5,7 @@ pub mod notifications;
 pub mod receive_times;
 pub mod sync_info;
 pub mod update_banner;
+pub(crate) mod user_waits;
 
 use super::{conversation::Conversation, members::MemberList, room_list::RoomList};
 use crate::components::app::document_title::DocumentTitleUpdater;
@@ -256,6 +257,15 @@ pub fn App() -> Element {
     crate::util::watch_media(WIDE_VIEWPORT_QUERY, &WIDE_VIEWPORT);
 
     let mut receive_invitation = use_signal(|| None::<Invitation>);
+    // The modals whose open state is a component's own signal, for the user
+    // wait dots' surface choice (`user_wait_dots.rs`).
+    use_context_provider(|| crate::components::user_wait_dots::LocalModals {
+        receive_invitation,
+        invite_member: Signal::new(false),
+        export_identity: Signal::new(false),
+        join_with_code: Signal::new(false),
+        import_identity: Signal::new(false),
+    });
 
     // One-shot guard for the localStorage auto-resume path (#218). The
     // recovery block below runs in the `App` component BODY, which re-executes
@@ -728,6 +738,7 @@ pub fn App() -> Element {
             invitation: receive_invitation
         }
         DocumentTitleUpdater {}
+        crate::components::user_wait_dots::UserWaitStatus {}
         update_banner::UpdateBanner {}
         // Last, so it paints above the ordinary modals and the banner.
         crate::components::toast::ToastHost {}

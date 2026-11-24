@@ -1,0 +1,735 @@
+import { test, expect, Locator, Page } from "@playwright/test";
+import {
+  clickFooter,
+  committedRow,
+  memberRows,
+  narrowLayout,
+  openOwnMessageEdit,
+  openRoomWithComposer,
+  openRoomWithTarget,
+  openSheetFromRow,
+  reactTo,
+  revealFooter,
+  selectRoom,
+  sendCommitted,
+  settle,
+  sheet,
+  waitForApp,
+} from "./example-room";
+import {
+  AT_BOTTOM_EPSILON_PX,
+  distanceFromBottom,
+  expectParkedAwayFromEnd,
+  expectReadingRow,
+  expectSettledAtBottom,
+  fillHistory,
+  readerScrollsWithoutGesture,
+  rowOffset,
+  READING_ROW_BUDGET_PX,
+  scrollMetrics,
+  WELL_AWAY_FROM_END_PX,
+} from "./history-geometry";
+import { callRiverTest } from "./river-test";
+
+// The ten wave dots that say an edit, a delete or a join is still on its way
+// (`user_wait_dots.rs`, `app/user_waits.rs`). A send and a reaction light
+// nothing. One host paints at a
+// time: the open room's dock above the composer, else the Welcome slot, and
+// nothing while something covers the room. Dots appear 300 ms after activity,
+// fade over 200 ms, and vanish at once when their host stops being the owner.
+// The room spacer after `bottom-sentinel` makes room for the dock.
+//
+// The no-sync build starts Disconnected; the dots show only while connected,
+// so every test connects first unless it is testing the disconnected case.
+
+/// `user-wait-spacer`'s open height: the dot row and its gap (main.css).
+const SPACER_OPEN_PX = 26;
+/// main.css `--user-wait-delay` and `--user-wait-fade`.
+const DELAY_MS = 300;
+const FADE_MS = 200;
+
+const roomDots = (page: Page) => page.locator('[data-testid="user-wait-dots"][data-surface="room"]');
+const welcomeDots = (page: Page) => page.locator('[data-testid="user-wait-dots"][data-surface="welcome"]');
+const spacer = (page: Page) => page.getByTestId("user-wait-spacer");
+const status = (page: Page) => page.locator("#user-wait-status");
+const marks = (page: Page) => callRiverTest(page, "userWaitRooms");
+
+async function connect(page: Page) {
+  await callRiverTest(page, "setSyncStatus", "connected");
+}
+
+/// The host is the painting one: the owner, with activity.
+async function expectShowing(host: Locator, why: string) {
+  await expect(host, why).toHaveAttribute("data-active", "true");
+  await expect(host, why).toHaveAttribute("data-owner", "true");
+}
+
+async function expectIdle(page: Page, why: string) {
+  await expect(roomDots(page), why).toHaveAttribute("data-active", "false");
+  await expect(spacer(page), why).toHaveAttribute("data-active", "false");
+}
+
+/// The marks drop to `n` (they are written in a deferred closure).
+async function expectMarks(page: Page, n: number, why: string) {
+  await expect.poll(() => marks(page), { message: why, timeout: 5_000 }).toBe(n);
+}
+
+/// Run every running transition on the dots and the spacer to its end, so the
+/// history's geometry is where it rests.
+function finishTransitions(page: Page) {
+  return page.evaluate(() => {
+    for (const el of document.querySelectorAll('[data-testid="user-wait-dots"], #user-wait-spacer')) {
+      for (const a of el.getAnimations()) a.finish();
+    }
+  });
+}
+
+type TransitionInfo = { property: string; delay: number; duration: number; from: string | null; to: string | null };
+
+type PaintState = { opacity: string; visibility: string; transitions: TransitionInfo[] };
+
+/// From now on, record a host's paint state in the same task as the first DOM
+/// change that brings it to `moment` ("shown": owner with activity, including
+/// a host that mounts that way; "unowned": active but no longer the owner).
+/// Before any frame has painted, so a full-opacity first paint or a fade on
+/// losing ownership shows, however slow the surface around it is. Read with
+/// `takeRecordedPaint`.
+function recordPaintAt(page: Page, surface: "room" | "welcome", moment: "shown" | "unowned") {
+  return page.evaluate(
+    ({ surface, moment }) => {
+      const w = window as unknown as { __waitProbe?: unknown; __waitObserver?: MutationObserver };
+      w.__waitProbe = null;
+      w.__waitObserver?.disconnect();
+      const selector = `[data-testid="user-wait-dots"][data-surface="${surface}"]`;
+      const take = () => {
+        const el = document.querySelector(selector);
+        if (!el || el.getAttribute("data-active") !== "true") return;
+        if (el.getAttribute("data-owner") !== (moment === "shown" ? "true" : "false")) return;
+        w.__waitObserver!.disconnect();
+        // getAnimations flushes style: the transitions this change starts.
+        const transitions = el.getAnimations().map((a) => {
+          const t = a as CSSTransition;
+          const frames = (t.effect as KeyframeEffect).getKeyframes();
+          const prop = t.transitionProperty;
+          return {
+            property: prop,
+            delay: Number(t.effect!.getComputedTiming().delay),
+            duration: Number(t.effect!.getComputedTiming().duration),
+            from: (frames[0]?.[prop] as string | undefined) ?? null,
+            to: (frames.at(-1)?.[prop] as string | undefined) ?? null,
+          };
+        });
+        const cs = getComputedStyle(el);
+        w.__waitProbe = { opacity: cs.opacity, visibility: cs.visibility, transitions };
+      };
+      w.__waitObserver = new MutationObserver(take);
+      w.__waitObserver.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ["data-active", "data-owner"],
+      });
+    },
+    { surface, moment },
+  );
+}
+
+async function takeRecordedPaint(page: Page): Promise<PaintState> {
+  let probe: PaintState | null = null;
+  await expect
+    .poll(async () => (probe = await page.evaluate(() => (window as unknown as { __waitProbe: never }).__waitProbe)) !== null, {
+      message: "the host reached the recorded moment",
+      timeout: 5_000,
+    })
+    .toBe(true);
+  return probe!;
+}
+
+function opacityTransition(transitions: TransitionInfo[]): TransitionInfo | undefined {
+  return transitions.find((t) => t.property === "opacity");
+}
+
+/// The delayed appearance: an opacity transition from 0 to 1 after 300 ms.
+function expectDelayedAppearance(state: PaintState, why: string) {
+  const t = opacityTransition(state.transitions);
+  expect(t, `${why}: an opacity transition`).toBeDefined();
+  expect(t!.delay, `${why}: it waits 300 ms`).toBe(DELAY_MS);
+  expect(t!.duration, `${why}: and fades in over 200 ms`).toBe(FADE_MS);
+  expect(t!.to, `${why}: to full opacity`).toBe("1");
+  expect(Number(state.opacity), `${why}: not painted at full opacity first`).toBeLessThan(1);
+}
+
+/// Connect the open room, with no mark yet.
+async function connectIdle(page: Page) {
+  await connect(page);
+  await expectIdle(page, "premise: nothing on its way yet");
+  expect(await marks(page), "premise: no marks").toBe(0);
+}
+
+/// An open room, connected, and no mark yet.
+async function connectedRoom(page: Page) {
+  await openRoomWithComposer(page);
+  await connectIdle(page);
+}
+
+/// `connectedRoom` with a received message at the end. Returns its row.
+async function connectedRoomWithTarget(page: Page): Promise<Locator> {
+  const row = await openRoomWithTarget(page);
+  await connectIdle(page);
+  return row;
+}
+
+/// Edit own `row` to `text` and wait for the room to admit it. Returns the
+/// edited row.
+async function saveEdit(page: Page, row: Locator, text: string): Promise<Locator> {
+  const editArea = await openOwnMessageEdit(page, row);
+  await editArea.fill(text);
+  await page.getByTestId("edit-save-button").click();
+  const edited = committedRow(page, text);
+  await expect(edited).toHaveCount(1);
+  return edited;
+}
+
+/// Send a message and edit it, and wait for the room's mark (`marked` rooms
+/// in all). Returns its row, the newest in the history.
+async function editAndMark(page: Page, text = "edit target", marked = 1): Promise<Locator> {
+  const row = await sendCommitted(page, text);
+  const edited = await saveEdit(page, row, `${text}, edited`);
+  await expectMarks(page, marked, "the edit marks its room");
+  return edited;
+}
+
+/// Delete `row` through its footer Delete and the confirmation's Delete.
+async function confirmDelete(page: Page, row: Locator) {
+  await clickFooter(page, row, "message-delete-button");
+  const dialog = deleteDialog(page);
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Delete", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+}
+
+function deleteDialog(page: Page): Locator {
+  return page.locator("div.fixed.inset-0").filter({ has: page.getByRole("heading", { name: "Delete Message?" }) });
+}
+
+/// No two hosts paint at once.
+async function expectAtMostOnePainter(page: Page) {
+  const painters = await page.locator('[data-testid="user-wait-dots"][data-owner="true"][data-active="true"]').count();
+  expect(painters, "at most one host paints").toBeLessThanOrEqual(1);
+}
+
+test.describe("Room changes on their way", { tag: "@chromium-only" }, () => {
+  test("an edit marks its room, and a keyed UPDATE error for the room ends the mark", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await connect(page);
+    const row = await sendCommitted(page, "edit me");
+    expect(await marks(page), "premise: the send marked nothing").toBe(0);
+    await saveEdit(page, row, "edited once");
+    await expectMarks(page, 1, "the edit marks its room");
+    await expectShowing(roomDots(page), "an edit shows the dots");
+    await callRiverTest(page, "deliverUpdateError", "keyed");
+    await expectMarks(page, 0, "the room's UPDATE error ends the mark");
+    await expectIdle(page, "and the dots");
+  });
+
+  test("a delete through its confirmation marks its room", async ({ page }) => {
+    await openRoomWithComposer(page);
+    await connect(page);
+    const row = await sendCommitted(page, "delete me");
+    await confirmDelete(page, row);
+    await expect(committedRow(page, "delete me")).toHaveCount(0);
+    await expectMarks(page, 1, "the delete marks its room");
+    await expectShowing(roomDots(page), "a delete shows the dots once the confirmation closes");
+    await callRiverTest(page, "deliverUpdateResponse");
+    await expectMarks(page, 0, "the reply ends the mark");
+    await expectIdle(page, "the reply ends them");
+    await expect(roomDots(page)).toHaveAttribute("data-reason", "");
+  });
+
+  test("a reaction, and taking it back, marks nothing and shows no dots", async ({ page }) => {
+    const row = await connectedRoomWithTarget(page);
+    const signs = () => callRiverTest(page, "messageSignsRecorded");
+    const signed = await signs();
+    const chip = await reactTo(page, row);
+    await expect.poll(signs, { message: "the room admits the reaction" }).toBe(signed + 1);
+    await settle(page);
+    expect(await marks(page), "a reaction marks nothing").toBe(0);
+    await expectIdle(page, "and shows no dots");
+
+    await chip.click();
+    await expect(chip).toHaveCount(0);
+    await expect.poll(signs, { message: "the room admits its removal" }).toBe(signed + 2);
+    await settle(page);
+    expect(await marks(page), "taking it back marks nothing").toBe(0);
+    await expectIdle(page, "and shows no dots");
+  });
+
+  test("while disconnected the mark is kept but nothing shows; reconnecting shows it again", async ({ page }) => {
+    await openRoomWithComposer(page);
+    // The no-sync build starts Disconnected.
+    await editAndMark(page);
+    await settle(page);
+    await expectIdle(page, "nothing shows while disconnected");
+
+    await connect(page);
+    await expectShowing(roomDots(page), "connected, the mark shows");
+    await expect(spacer(page)).toHaveAttribute("data-active", "true");
+
+    for (const s of ["connecting", "disconnected", "error"] as const) {
+      await callRiverTest(page, "setSyncStatus", s);
+      await expect(roomDots(page), `${s}: hidden`).toHaveAttribute("data-active", "false");
+      expect(await marks(page), `${s}: the mark is kept`).toBe(1);
+    }
+    await connect(page);
+    await expectShowing(roomDots(page), "a reconnect shows the pending mark again");
+  });
+
+  test("an unkeyed UPDATE failure ends every room's mark", async ({ page }) => {
+    await connectedRoom(page);
+    await editAndMark(page);
+    await selectRoom(page, "Team Chat Room");
+    await editAndMark(page, "team target", 2);
+    await callRiverTest(page, "deliverUpdateError", "unkeyed");
+    await expectMarks(page, 0, "an unkeyed failure names no room, so it ends them all");
+    await expectIdle(page, "and the open room's dots");
+  });
+
+  test("a room's mark shows only in that room, and another room's reply leaves it", async ({ page }) => {
+    await connectedRoom(page);
+    await editAndMark(page);
+    await expectShowing(roomDots(page), "premise: showing in its room");
+
+    await callRiverTest(page, "switchRoom", "Team Chat Room");
+    await expect(page.getByRole("heading", { name: "Team Chat Room" })).toBeVisible();
+    await expectIdle(page, "another room shows nothing");
+    // The reply is for Team Chat Room's contract, which has no mark.
+    await callRiverTest(page, "deliverUpdateResponse");
+    await settle(page);
+    expect(await marks(page), "Your Private Room keeps its mark").toBe(1);
+
+    await callRiverTest(page, "switchRoom", "Your Private Room");
+    await expect(page.getByRole("heading", { name: "Your Private Room" })).toBeVisible();
+    await expectShowing(roomDots(page), "back in its room, it still shows");
+  });
+});
+
+test.describe("Joining a room", () => {
+  test("the Welcome screen shows and announces a join while connected", { tag: "@chromium-only" }, async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await expect(page.getByRole("heading", { name: "Welcome to River" })).toBeVisible({ timeout: 10_000 });
+    await expect(welcomeDots(page)).toHaveAttribute("data-owner", "true");
+    await expect(welcomeDots(page)).toHaveAttribute("data-active", "false");
+
+    await callRiverTest(page, "setPendingJoin", true);
+    await settle(page);
+    await expect(welcomeDots(page), "nothing while disconnected").toHaveAttribute("data-active", "false");
+    await expect(status(page)).toHaveText("");
+
+    await connect(page);
+    await expectShowing(welcomeDots(page), "a join shows on the Welcome screen");
+    await expect(welcomeDots(page)).toHaveAttribute("data-reason", "joining-room");
+    await expect(status(page), "a join is announced").toHaveText("Joining room");
+    await expect(status(page)).toHaveAttribute("role", "status");
+    await expect(welcomeDots(page)).toHaveAttribute("aria-hidden", "true");
+
+    await callRiverTest(page, "setPendingJoin", false);
+    await expect(welcomeDots(page)).toHaveAttribute("data-active", "false");
+    await expect(welcomeDots(page)).toHaveAttribute("data-reason", "");
+    await expect(status(page)).toHaveText("");
+  });
+
+  test("a join outranks the room's own change", { tag: "@chromium-only" }, async ({ page }) => {
+    await connectedRoom(page);
+    await editAndMark(page);
+    await callRiverTest(page, "setPendingJoin", true);
+    await expect(roomDots(page)).toHaveAttribute("data-reason", "joining-room");
+    await expect(status(page)).toHaveText("Joining room");
+    await callRiverTest(page, "setPendingJoin", false);
+    await expect(roomDots(page)).toHaveAttribute("data-reason", "sending");
+    await expect(status(page)).toHaveText("");
+  });
+
+  test("the Welcome slot's dots appear after the delay, from nothing", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await expect(page.getByRole("heading", { name: "Welcome to River" })).toBeVisible({ timeout: 10_000 });
+    await connect(page);
+    await settle(page);
+    await recordPaintAt(page, "welcome", "shown");
+    await callRiverTest(page, "setPendingJoin", true);
+    expectDelayedAppearance(await takeRecordedPaint(page), "a join on the Welcome screen");
+
+    await expect(welcomeDots(page), "once shown").toHaveCSS("opacity", "1");
+    await callRiverTest(page, "setPendingJoin", false);
+    await expect(welcomeDots(page)).toHaveAttribute("data-active", "false");
+    await expect(welcomeDots(page), "once faded").toHaveCSS("opacity", "0");
+  });
+
+  test("a room dock mounting during a join waits before it paints", async ({ page }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await expect(page.getByRole("heading", { name: "Welcome to River" })).toBeVisible({ timeout: 10_000 });
+    await connect(page);
+    await callRiverTest(page, "setPendingJoin", true);
+    await expectShowing(welcomeDots(page), "premise: the join shows on the Welcome screen");
+    await expect(roomDots(page), "premise: no room dock yet").toHaveCount(0);
+
+    await recordPaintAt(page, "room", "shown");
+    await selectRoom(page, "Your Private Room");
+    // The dock mounts already active: @starting-style makes it fade in after
+    // the delay too, instead of painting at once.
+    expectDelayedAppearance(await takeRecordedPaint(page), "a dock mounting during a join");
+    await expect(welcomeDots(page)).toHaveCount(0);
+    await callRiverTest(page, "setPendingJoin", false);
+  });
+});
+
+test.describe("Paint timing", () => {
+  test("dots fade in after the delay, fade out when done, and a new change during the fade does not jump", async ({ page }) => {
+    await connectedRoom(page);
+    await recordPaintAt(page, "room", "shown");
+    const row = await editAndMark(page, "paint target");
+    expectDelayedAppearance(await takeRecordedPaint(page), "an edit");
+    await expect(roomDots(page), "shown once the delay and fade-in end").toHaveCSS("opacity", "1");
+    await expect(spacer(page)).toHaveCSS("height", `${SPACER_OPEN_PX}px`);
+
+    // A second edit, typed and one click from saved. Below 48rem its way in
+    // is the message sheet, which covers the room and then gives it back.
+    const editArea = await openOwnMessageEdit(page, row);
+    await editArea.fill("paint target, edited twice");
+    await expectPainted(page);
+
+    // The reply: a 200 ms fade, no delay. Held half way.
+    await callRiverTest(page, "deliverUpdateResponse");
+    await expect(roomDots(page)).toHaveAttribute("data-active", "false");
+    const fading = await roomDots(page).evaluate((el) => {
+      const t = el.getAnimations().find((a) => (a as CSSTransition).transitionProperty === "opacity") as CSSTransition | undefined;
+      if (!t) return null;
+      const timing = t.effect!.getComputedTiming();
+      t.pause();
+      t.currentTime = Number(timing.delay) + Number(timing.duration) / 2;
+      return { delay: Number(timing.delay), duration: Number(timing.duration), opacity: Number(getComputedStyle(el).opacity) };
+    });
+    expect(fading, "the end fades").not.toBeNull();
+    expect(fading!.delay, "at once").toBe(0);
+    expect(fading!.duration).toBe(FADE_MS);
+    expect(fading!.opacity, "premise: half way through the fade").toBeGreaterThan(0.05);
+    expect(fading!.opacity).toBeLessThan(0.95);
+
+    // Busy again mid-fade (the second edit is saved): no jump back to full
+    // opacity.
+    await recordPaintAt(page, "room", "shown");
+    await page.getByTestId("edit-save-button").click();
+    const again = await takeRecordedPaint(page);
+    expect(Number(again.opacity), "busy again does not jump to full opacity").toBeLessThan(0.95);
+    const t = opacityTransition(again.transitions);
+    expect(t, "it transitions back up").toBeDefined();
+    expect(t!.to).toBe("1");
+    expect(t!.delay, "after the delay").toBe(DELAY_MS);
+
+    await expect(roomDots(page)).toHaveCSS("opacity", "1");
+    await callRiverTest(page, "deliverUpdateResponse");
+    await expect(roomDots(page)).toHaveAttribute("data-active", "false");
+    await expect(roomDots(page), "faded out").toHaveCSS("opacity", "0");
+    await expect(roomDots(page)).toHaveCSS("visibility", "hidden");
+    await expect(spacer(page)).toHaveCSS("height", "0px");
+  });
+});
+
+/// Wait until the room host paints at full opacity, finished.
+async function expectPainted(page: Page) {
+  await expectShowing(roomDots(page), "premise: showing");
+  await expect(roomDots(page), "premise: painted").toHaveCSS("opacity", "1");
+}
+
+/// `cover` takes ownership from the room host: at that instant it stops
+/// painting, with no fade, while its activity goes on, and the spacer starts
+/// closing.
+async function expectSuppressedAtOnce(page: Page, why: string, cover: () => Promise<void>) {
+  await recordPaintAt(page, "room", "unowned");
+  await cover();
+  const s = await takeRecordedPaint(page);
+  expect(s.opacity, `${why}: no paint at once`).toBe("0");
+  expect(s.visibility, `${why}: hidden at once`).toBe("hidden");
+  expect(opacityTransition(s.transitions), `${why}: no fade`).toBeUndefined();
+  await expect(roomDots(page), why).toHaveAttribute("data-owner", "false");
+  await expect(roomDots(page), `${why}: still active, logically`).toHaveAttribute("data-active", "true");
+  await expect(spacer(page), why).toHaveAttribute("data-active", "false");
+  await expectAtMostOnePainter(page);
+}
+
+async function expectOwnerAgain(page: Page, why: string) {
+  await expectShowing(roomDots(page), why);
+  await expect(spacer(page), why).toHaveAttribute("data-active", "true");
+  await expectAtMostOnePainter(page);
+}
+
+/// The rooms rail's dialogs: what, the rail button, the backdrop.
+const RAIL_DIALOGS = [
+  ["Enter invite code", "join-with-code-button", "join-with-code-backdrop"],
+  ["Import ID", "import-id-button", "import-identity-backdrop"],
+] as const;
+
+test.describe("Ownership", () => {
+  test("the delete confirmation hides the room's dots at once", async ({ page }) => {
+    await connectedRoom(page);
+    const own = await editAndMark(page);
+    await expectPainted(page);
+    await expectSuppressedAtOnce(page, "the delete confirmation covers the room", async () => {
+      await clickFooter(page, own, "message-delete-button");
+      await expect(deleteDialog(page)).toBeVisible();
+    });
+
+    await deleteDialog(page).getByRole("button", { name: "Cancel" }).click();
+    await expect(deleteDialog(page)).toHaveCount(0);
+    await expectOwnerAgain(page, "closing it gives the dots back");
+  });
+
+  test("the member info modal hides the room's dots at once", async ({ page }) => {
+    await connectedRoom(page);
+    test.skip(await narrowLayout(page), "below 48rem the member list replaces the chat (the panel test covers it)");
+    await editAndMark(page);
+    await expectPainted(page);
+    await expectSuppressedAtOnce(page, "the member info modal covers the room", async () => {
+      await memberRows(page).first().click();
+      await expect(page.getByTestId("member-info-modal")).toBeVisible();
+    });
+    await page.getByTestId("member-info-close-button").click();
+    await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+    await expectOwnerAgain(page, "closing it gives the dots back");
+  });
+
+  test("a DM thread keeps the room's dots hidden while it is open", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+    await waitForApp(page);
+    await selectRoom(page, "Team Chat Room");
+    await connect(page);
+    await editAndMark(page, "dm cover target");
+    await expectPainted(page);
+
+    const other = memberRows(page).filter({ hasNot: page.getByTestId("member-list-self") }).first();
+    await expectSuppressedAtOnce(page, "member info, on the way to the thread, covers the room", async () => {
+      await other.click();
+      await expect(page.getByTestId("member-info-modal")).toBeVisible();
+    });
+    await page.locator('button[aria-label="Send direct message"]').first().click();
+    await expect(page.getByTestId("dm-thread-modal")).toBeVisible();
+    await expect(page.getByTestId("member-info-modal")).toHaveCount(0);
+    await settle(page);
+    await expect(roomDots(page), "the thread covers the room").toHaveAttribute("data-owner", "false");
+    await expect(roomDots(page)).toHaveCSS("opacity", "0");
+    await expect(spacer(page)).toHaveAttribute("data-active", "false");
+    await expectAtMostOnePainter(page);
+
+    await page.getByTestId("dm-thread-close-button").click();
+    await expect(page.getByTestId("dm-thread-modal")).toHaveCount(0);
+    await expectOwnerAgain(page, "closing the thread gives the dots back");
+  });
+
+  test("below 48rem the message sheet and the members panel hide the room's dots at once", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await connectedRoom(page);
+    expect(await narrowLayout(page), "premise: below 48rem").toBe(true);
+    const row = await editAndMark(page);
+    await expect(sheet(page)).toBeHidden();
+    await expectPainted(page);
+
+    await expectSuppressedAtOnce(page, "the message sheet covers the room", () => openSheetFromRow(page, row));
+    await page.keyboard.press("Escape");
+    await expect(sheet(page)).toBeHidden();
+    await expectOwnerAgain(page, "the sheet closed");
+
+    await expectPainted(page);
+    await expectSuppressedAtOnce(page, "the members panel replaces the chat", () =>
+      callRiverTest(page, "setMobileView", "members"),
+    );
+    await callRiverTest(page, "setMobileView", "chat");
+    await expectOwnerAgain(page, "back to the chat");
+  });
+
+  // The rooms rail's two dialogs: their open state is `RoomList`'s, and their
+  // full-screen backdrop covers the room and the Welcome screen alike. At a
+  // desktop width, so the rail sits beside the chat and only the dialog can
+  // cover it.
+  for (const [what, open, backdrop] of RAIL_DIALOGS) {
+    test(`the ${what} dialog hides the room's dots at once`, async ({ page }) => {
+      await page.setViewportSize({ width: 1280, height: 800 });
+      await connectedRoom(page);
+      expect(await narrowLayout(page), "premise: the rail sits beside the chat").toBe(false);
+      await editAndMark(page);
+      await expectPainted(page);
+      await expectSuppressedAtOnce(page, `the ${what} dialog covers the room`, async () => {
+        await page.getByTestId(open).click();
+        await expect(page.getByTestId(backdrop)).toBeVisible();
+      });
+
+      await closeRailDialog(page, backdrop);
+      expect(await marks(page), "premise: the edit is still on its way").toBe(1);
+      await expectOwnerAgain(page, "closing it gives the dots back");
+    });
+  }
+
+  test("the Enter invite code dialog hides the Welcome screen's join dots while it is open", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+    await waitForApp(page);
+    await expect(page.getByRole("heading", { name: "Welcome to River" })).toBeVisible({ timeout: 10_000 });
+    expect(await narrowLayout(page), "premise: the rail sits beside the Welcome screen").toBe(false);
+    await connect(page);
+    await callRiverTest(page, "setPendingJoin", true);
+    await expectShowing(welcomeDots(page), "premise: the join shows on the Welcome screen");
+
+    await page.getByTestId("join-with-code-button").click();
+    await expect(page.getByTestId("join-with-code-backdrop")).toBeVisible();
+    await expect(welcomeDots(page), "the dialog covers the Welcome screen").toHaveAttribute("data-owner", "false");
+    await expect(welcomeDots(page), "the join goes on").toHaveAttribute("data-active", "true");
+    await expect(welcomeDots(page)).toHaveAttribute("data-reason", "joining-room");
+    await expect(welcomeDots(page), "nothing paints under the backdrop").toHaveCSS("opacity", "0");
+    await expectAtMostOnePainter(page);
+
+    await closeRailDialog(page, "join-with-code-backdrop");
+    await expectShowing(welcomeDots(page), "closing it gives the dots back");
+    await expectAtMostOnePainter(page);
+    await callRiverTest(page, "setPendingJoin", false);
+  });
+});
+
+/// Close a rail dialog through its own Cancel button.
+async function closeRailDialog(page: Page, backdrop: string) {
+  await page.getByTestId(backdrop).getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.getByTestId(backdrop)).toHaveCount(0);
+}
+
+/// The newest row in the history and the dots, in viewport px.
+function endGeometry(page: Page) {
+  return page.evaluate(() => {
+    const c = document.getElementById("chat-scroll-container")!;
+    const rows = c.querySelectorAll<HTMLElement>("[data-item-key]");
+    const newest = rows[rows.length - 1].getBoundingClientRect();
+    const dots = document.querySelector('[data-testid="user-wait-dots"][data-surface="room"]')!.getBoundingClientRect();
+    const view = c.getBoundingClientRect();
+    return {
+      newestBottom: newest.bottom,
+      viewBottom: view.bottom,
+      dotsTop: dots.top,
+      dotsBottom: dots.bottom,
+      overflowX: c.scrollWidth - c.clientWidth,
+    };
+  });
+}
+
+test.describe("History", () => {
+  test("held at the end, the newest message stays in view above the dots", async ({ page }) => {
+    await connectedRoom(page);
+    // A delete above the newest message: the newest stays, so the end hold
+    // does, and the history only gets shorter.
+    const older = await sendCommitted(page, "delete target");
+    await sendCommitted(page, "end target");
+    await expectSettledAtBottom(page, "premise: at the end");
+    await confirmDelete(page, older);
+    await expectMarks(page, 1, "the delete marks its room");
+    await expectShowing(roomDots(page), "premise: showing");
+    // The removed row's clamp has its own scroll event, a frame later. The
+    // dots' delay keeps the spacer shut until long after it; finishing the
+    // transitions before it would open the spacer under that event, which
+    // the hold reads as the reader scrolling up.
+    await settle(page);
+    await finishTransitions(page);
+    await expect(spacer(page)).toHaveCSS("height", `${SPACER_OPEN_PX}px`);
+    await settle(page);
+
+    await expectSettledAtBottom(page, "the end hold takes in the spacer");
+    const g = await endGeometry(page);
+    expect(g.newestBottom, "the newest message is in view").toBeLessThanOrEqual(g.viewBottom + 1);
+    expect(g.dotsTop, "the dots sit below the newest message").toBeGreaterThanOrEqual(g.newestBottom - 0.5);
+    expect(g.dotsBottom, "and inside the history's view").toBeLessThanOrEqual(g.viewBottom + 0.5);
+    expect(g.overflowX, "no horizontal overflow").toBeLessThanOrEqual(0);
+    await expect(page.getByTestId("scroll-to-bottom"), "Latest stays hidden").toHaveCount(0);
+
+    await callRiverTest(page, "deliverUpdateResponse");
+    await expect(spacer(page)).toHaveAttribute("data-active", "false");
+    await finishTransitions(page);
+    await expect(spacer(page), "the spacer collapses after the reply").toHaveCSS("height", "0px");
+    await settle(page);
+    await expectSettledAtBottom(page, "still at the end once it collapses");
+    await expect(page.getByTestId("scroll-to-bottom")).toHaveCount(0);
+  });
+
+  test("the spacer follows the sentinel, keyless, and never moves a parked reader", async ({ page }) => {
+    await connectedRoom(page);
+    const order = await page.evaluate(() => {
+      const s = document.getElementById("bottom-sentinel")!;
+      const next = s.nextElementSibling;
+      return {
+        parent: s.parentElement!.id,
+        next: next?.id ?? null,
+        keys: next ? [next.getAttribute("data-item-key"), next.getAttribute("data-anchor-key")] : null,
+      };
+    });
+    expect(order, "the spacer comes right after bottom-sentinel, with no row or anchor key").toEqual({
+      parent: "chat-content",
+      next: "user-wait-spacer",
+      keys: [null, null],
+    });
+
+    await editAndMark(page);
+    // Disconnected, the mark stays and the spacer closes: the reader parks
+    // with it closed, then it opens and closes under them.
+    await callRiverTest(page, "setSyncStatus", "disconnected");
+    await expect(spacer(page)).toHaveAttribute("data-active", "false");
+    await finishTransitions(page);
+    await expect(spacer(page)).toHaveCSS("height", "0px");
+    await fillHistory(page);
+    const { top } = await scrollMetrics(page);
+    await readerScrollsWithoutGesture(page, top - 400);
+    await expectParkedAwayFromEnd(page);
+    const reading = await expectReadingRow(page);
+
+    await connect(page);
+    await expect(spacer(page)).toHaveAttribute("data-active", "true");
+    await finishTransitions(page);
+    await expect(spacer(page)).toHaveCSS("height", `${SPACER_OPEN_PX}px`);
+    await settle(page);
+    const opened = await rowOffset(page, reading.key);
+    expect(Math.abs(opened! - reading.top), "opening does not move the reader").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
+    expect(await distanceFromBottom(page)).toBeGreaterThan(WELL_AWAY_FROM_END_PX);
+
+    await callRiverTest(page, "deliverUpdateResponse");
+    await expect(spacer(page)).toHaveAttribute("data-active", "false");
+    await finishTransitions(page);
+    await expect(spacer(page)).toHaveCSS("height", "0px");
+    await settle(page);
+    const closed = await rowOffset(page, reading.key);
+    expect(Math.abs(closed! - reading.top), "closing does not move the reader").toBeLessThanOrEqual(READING_ROW_BUDGET_PX);
+    expect((await scrollMetrics(page)).top, "premise: still parked").toBeLessThan((await scrollMetrics(page)).max - AT_BOTTOM_EPSILON_PX);
+  });
+});
+
+test.describe("Hits", () => {
+  test("the dots take no clicks", async ({ page }) => {
+    const row = await connectedRoomWithTarget(page);
+    await editAndMark(page);
+    await expectPainted(page);
+
+    const hit = await roomDots(page).evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return {
+        onDots: !!at && (el.contains(at) || !!at.closest(".user-wait-dock")),
+        pointerEvents: [getComputedStyle(el).pointerEvents, getComputedStyle(el.closest(".user-wait-dock")!).pointerEvents],
+      };
+    });
+    expect(hit.onDots, "a hit at the dots' centre goes through them").toBe(false);
+    expect(hit.pointerEvents).toEqual(["none", "none"]);
+
+    await page.getByTestId("message-input").fill("through the dots");
+    await page.getByTestId("send-message-button").click({ trial: true });
+    if (!(await narrowLayout(page))) {
+      await revealFooter(page, row);
+      await row.getByTestId("message-reply-button").click({ trial: true });
+    }
+    await row.getByTestId("message-react-button").click({ trial: true });
+  });
+});
