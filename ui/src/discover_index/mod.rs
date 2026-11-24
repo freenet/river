@@ -12,6 +12,15 @@
 //! `root_vk || "default"`. If the pointer cannot be resolved there is no
 //! fallback key: the state is `Unavailable`, never an empty list.
 //!
+//! # Limits worth knowing
+//!
+//! The pointer floor (the newest pointer record seen) lives for one page load.
+//! A fresh load starts with none, so a peer can serve it an older validly
+//! signed pointer and pin it to an older, frozen index until a newer record is
+//! seen; persisting a floor would need storage this module must not touch.
+//! Retries of a failed index request do not re-resolve the pointer, so a
+//! republished pointer is picked up on the next [`open`] from a failure state.
+//!
 //! # Where the answer lives
 //!
 //! In [`DISCOVER_INDEX`], a session-only signal. Nothing here writes `ROOMS`,
