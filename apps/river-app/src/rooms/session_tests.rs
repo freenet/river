@@ -11020,3 +11020,52 @@ fn owed_keys_go_from_the_stored_slot_to_the_rooms() {
     rooms.replace(*l);
     assert_eq!(rooms.owed.get(&room.vk()), Some(&vec![earlier[3]]));
 }
+
+// The record of the user's own deletions (freenet/river#945) ----------------------------------
+
+/// Leaving a room removes that room's entry from the device's record of its deletions, once the
+/// leave has ended well, and leaves the other rooms' entries. The record was on disk before the
+/// session started, as after a restart.
+#[test]
+fn leaving_a_room_removes_its_record_of_deletions() {
+    use crate::rooms::purge_record::PurgeRecord;
+    use river_core::room_state::direct_messages::PurgeToken;
+
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    node.with(|w| {
+        w.add_room(&a);
+        w.add_room(&b);
+    });
+    let real = super::super::create::contract_key(&a.vk());
+    node.with(|w| {
+        w.contracts
+            .insert(*real.id(), (real, Contract::State(cbor(&a.state))));
+    });
+    let dir = temp_dir("purge-record-leave");
+    save_token(&dir, "kept-token");
+    // Recorded as each room's owner, a recipient the room always lists (so pruning keeps it).
+    let mut record = PurgeRecord::open(&dir);
+    record
+        .record(&a.vk(), MemberId::from(&a.vk()), &[PurgeToken([1; 16])])
+        .unwrap();
+    record
+        .record(&b.vk(), MemberId::from(&b.vk()), &[PurgeToken([2; 16])])
+        .unwrap();
+    drop(record);
+
+    let session = Running::start(&node, &dir, quick());
+    session.wait_rooms("the rooms are live", |r, _, s| {
+        r.len() == 2 && s == LinkStatus::Live
+    });
+    session.act(&a, Action::LeaveRoom);
+    session.wait_until("the leave is stored and done", || {
+        tombstoned(&node, &a) && session.last_work().is_empty()
+    });
+    session.wait_until("its record is gone", || {
+        PurgeRecord::open(&dir).for_room(&a.vk()).is_none()
+    });
+    let after = PurgeRecord::open(&dir);
+    assert!(after.for_room(&b.vk()).is_some(), "the other room's stays");
+}

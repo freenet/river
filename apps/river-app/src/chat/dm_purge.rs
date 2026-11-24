@@ -598,8 +598,7 @@ pub(super) fn confirm_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     .child(
         label(
             "Each deleted message is recorded in the room so that it stays deleted. A \
-             room records at most 1000 deleted messages for you. If another device signed \
-             in as you has deleted messages recently, some messages can come back.",
+             room records at most 1000 deleted messages for you.",
             st::SMALL,
             p.text_muted,
         )

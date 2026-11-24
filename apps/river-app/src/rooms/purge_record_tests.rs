@@ -6,15 +6,16 @@ use std::path::PathBuf;
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use river_core::own_purges::OwnPurges;
+use river_core::room_state::ChatRoomStateV1;
 use river_core::room_state::direct_messages::PurgeToken;
 use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
-use river_core::room_state::ChatRoomStateV1;
 
 use super::*;
 use crate::rooms::room_tests::Fixture;
 
 fn dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("river-purge-record-{}-{name}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("river-purge-record-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -70,7 +71,10 @@ fn the_file_is_riverctls_record_serialized_per_room_and_owner_only() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(dir.join(FILE_NAME)).unwrap().permissions().mode();
+        let mode = fs::metadata(dir.join(FILE_NAME))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
     // No temporary file is left behind.
@@ -124,9 +128,11 @@ fn leaving_a_room_removes_its_entry_and_only_its_entry() {
     let reloaded = PurgeRecord::open(&dir);
     assert!(reloaded.for_room(&owner(1)).is_none());
     assert!(reloaded.for_room(&owner(5)).is_some());
-    assert!(!fs::read_to_string(dir.join(FILE_NAME))
-        .unwrap()
-        .contains(&bs58::encode(owner(1).as_bytes()).into_string()));
+    assert!(
+        !fs::read_to_string(dir.join(FILE_NAME))
+            .unwrap()
+            .contains(&bs58::encode(owner(1).as_bytes()).into_string())
+    );
 }
 
 #[test]
@@ -180,21 +186,22 @@ fn the_record_is_bounded_by_the_rooms_members() {
     let state = room_with(&f, &[&f.me]);
     record.prune(&owner_vk, &state).unwrap();
     let after = PurgeRecord::open(&dir);
-    assert_eq!(
-        after.for_room(&owner_vk).unwrap().purged,
-        {
-            let mut expected = vec![(f.me_id(), t(1)), (f.owner_id(), t(2))];
-            expected.sort();
-            expected
-        }
-    );
+    assert_eq!(after.for_room(&owner_vk).unwrap().purged, {
+        let mut expected = vec![(f.me_id(), t(1)), (f.owner_id(), t(2))];
+        expected.sort();
+        expected
+    });
 
     // A state whose configuration the owner did not sign prunes nothing.
     let mut forged = room_with(&f, &[]);
     forged.configuration.signature = SigningKey::from_bytes(&[8; 32]).sign(b"x");
     record.prune(&owner_vk, &forged).unwrap();
     assert_eq!(
-        PurgeRecord::open(&dir).for_room(&owner_vk).unwrap().purged.len(),
+        PurgeRecord::open(&dir)
+            .for_room(&owner_vk)
+            .unwrap()
+            .purged
+            .len(),
         2
     );
 }

@@ -224,7 +224,10 @@ fn settle(devices: &mut [Device], node: &mut Node) -> usize {
             return node.took - before;
         }
     }
-    panic!("the devices kept signing envelopes: {} taken", node.took - before);
+    panic!(
+        "the devices kept signing envelopes: {} taken",
+        node.took - before
+    );
 }
 
 fn sorted(mut t: Vec<PurgeToken>) -> Vec<PurgeToken> {
@@ -251,7 +254,11 @@ fn the_race(msgs: &[AuthorizedDirectMessage], first_deletes: usize, name: &str) 
     assert!(devices[1].send(&mut node));
     assert_eq!(node.versions, vec![1, 1]);
     let kept = node.purged(me);
-    assert_eq!(kept.len(), 1, "the room kept one of the two, not their union");
+    assert_eq!(
+        kept.len(),
+        1,
+        "the room kept one of the two, not their union"
+    );
     assert_eq!(node.version(me), 1);
 
     for d in &mut devices {
@@ -260,14 +267,22 @@ fn the_race(msgs: &[AuthorizedDirectMessage], first_deletes: usize, name: &str) 
     // The device whose token the winner omits.
     let lost: Vec<usize> = (0..2)
         .filter(|&i| {
-            let mine = tokens[if i == 0 { first_deletes } else { 1 - first_deletes }];
+            let mine = tokens[if i == 0 {
+                first_deletes
+            } else {
+                1 - first_deletes
+            }];
             !kept.contains(&mine)
         })
         .collect();
     assert_eq!(lost.len(), 1);
 
     let signed = settle(&mut devices, &mut node);
-    assert_eq!(signed, 1, "the loser signs the union once: {:?}", node.versions);
+    assert_eq!(
+        signed, 1,
+        "the loser signs the union once: {:?}",
+        node.versions
+    );
     assert_eq!(node.versions, vec![1, 1, 2]);
     let both = sorted(tokens.clone());
     assert_eq!(node.purged(me), both);
@@ -299,7 +314,10 @@ fn the_losing_device_signs_the_union_once_in_both_orders() {
     let b = the_race(&msgs, 1, "race-1");
     // The same two envelopes with the devices swapped: the winner is decided by the signature
     // digest of the envelope, so the other device loses. Both orders were exercised.
-    assert_ne!(a, b, "the device that loses changes with which one deleted what");
+    assert_ne!(
+        a, b,
+        "the device that loses changes with which one deleted what"
+    );
 }
 
 /// Three devices each delete a different message at version 1 and the room keeps one envelope.
@@ -484,7 +502,13 @@ fn a_deletion_whose_record_cannot_be_saved_is_not_sent() {
     assert!(sent.is_none());
     assert!(changed);
     let owner = device.rooms.list[0].stored.owner_vk;
-    let failed = device.rooms.outbox.purge_rows(&owner).remove(0).pending.failed;
+    let failed = device
+        .rooms
+        .outbox
+        .purge_rows(&owner)
+        .remove(0)
+        .pending
+        .failed;
     assert!(failed.unwrap().contains("not sent"));
     assert!(node.purged(device.me()).is_empty());
 }
@@ -503,9 +527,7 @@ fn the_record_is_pruned_to_the_rooms_members() {
     let me = device.me();
     let record = device.rooms.outbox.purge_record_mut();
     record.record(&owner, gone, &[PurgeToken([7; 16])]).unwrap();
-    record
-        .record(&owner, me, &[msgs[0].purge_token()])
-        .unwrap();
+    record.record(&owner, me, &[msgs[0].purge_token()]).unwrap();
     device.hear(&node);
     let on_disk = PurgeRecord::open(&dir);
     let own = on_disk.for_room(&owner).unwrap();

@@ -2598,9 +2598,7 @@ impl Outbox {
     /// room did not keep is not waited for: re-signing is what repairs it.
     pub fn purge_pending(&self, room: &VerifyingKey) -> bool {
         self.entries.iter().any(|e| {
-            e.room == *room
-                && e.purge.is_some()
-                && !matches!(e.status, Status::Unconfirmed(_))
+            e.room == *room && e.purge.is_some() && !matches!(e.status, Status::Unconfirmed(_))
         })
     }
 

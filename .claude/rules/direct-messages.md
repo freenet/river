@@ -312,9 +312,8 @@ plaintext in the chat delegate.
   (and, past 4 MiB, oldest first), and an entry whose token a recipient's purge envelope NAMES
   (in a room read from the network) is removed, as the web UI does. "Delete their messages" is
   `src/rooms/dm_purge.rs` (envelope by `advance_recipient_purges` from the room's current
-  envelope; NO own-purge healing in the native app: an envelope another device signed that our copy
-  had not seen can outrank ours and lift its tokens (copy lags the node; river#945), and the
-  confirmation says so) See `.claude/rules/native-apps.md`.
+  envelope; own-purge healing through a per-device record file, `src/rooms/purge_record.rs`,
+  river#945) See `.claude/rules/native-apps.md`.
   Invitation DMs are `src/rooms/dm_invite.rs`: send builds the same `Invite` body the web
   picker does (`encode_body` of an `InvitePayload` holding the CBOR of the user's `Invitation`)
   and caches only the `[Invitation]` summary; accept re-reads the invitation from the room,

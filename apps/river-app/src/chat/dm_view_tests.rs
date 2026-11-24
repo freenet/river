@@ -2349,7 +2349,7 @@ mod purging {
         let (mut rt, _f) = open_thread();
         press(&mut rt, "dm-purge");
         assert!(rt.find("dm-purge-confirm").is_some());
-        assert!(shows(&rt, "some messages can come back"));
+        assert!(shows(&rt, "cannot be undone"));
         for key in [Key::Enter, Key::Text(" ".into())] {
             rt.key(KeyEvent {
                 key,
