@@ -82,9 +82,9 @@ state = "0000000ea365799aa6d679d6aa3522e33c6dab1c56c7c0a323b97ff058b721b52ba5c86
 app_id = "river.chat-delegate"
 wasm_path = "ui/public/contracts/chat_delegate.wasm"
 pointer_key = "6qF2H5JRPBxbKC45UtPnzdDzyfsejYFW1UwDLGDU66mu"
-version = 13
-code_hash = "110b4dff1fcacd8658ea7a464ff9591508b056721c1bff5d06ba45bfa5931e2c"
-state = "0000000d110b4dff1fcacd8658ea7a464ff9591508b056721c1bff5d06ba45bfa5931e2c4647e84567621e273e661a85e32d93e65fc788df883e011057e22977fffc2d7f663e5e2dd7f679becdaaa2c861f650d900cbebbf14c8aad6834278df451c0b09"
+version = 14
+code_hash = "0a2a6b2bb672bc00d72c617fb80dd8b7885721a08342c7adf22744033d3518c2"
+state = "0000000e0a2a6b2bb672bc00d72c617fb80dd8b7885721a08342c7adf22744033d3518c2b6115ed9b19d537f5dce7ef3bcf9abfa14a0555461f9c7811d88ae8c6de3dc605087fcb936dd1a9ae86039f1d1b25ec795fe192c9d4cb23a4ec50eadb8c86b02"
 # SCOPE, and it matters most here. Resolving this pointer correctly tells you
 # the delegate's current key. It does NOT tell you that the user's secrets came
 # with it: delegate secrets only move when River's own UI has run on that user's

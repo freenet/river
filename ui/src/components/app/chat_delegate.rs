@@ -6813,12 +6813,16 @@ mod tests {
     /// Updated for V40 (the room subscription record requires the room
     /// owner's signing key): a check in `subscription.rs`. V40 (`4fbc0f3a…`)
     /// is the outgoing generation.
+    ///
+    /// Updated for V41 (a failed secret write during rotation is reported
+    /// and publishes nothing, freenet/river#1006). V41 (`110b4dff…`) is the
+    /// outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "110b4dff1fcacd8658ea7a464ff9591508b056721c1bff5d06ba45bfa5931e2c",
+            "0a2a6b2bb672bc00d72c617fb80dd8b7885721a08342c7adf22744033d3518c2",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
