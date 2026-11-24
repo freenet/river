@@ -37,6 +37,7 @@ net = ["freenet-stdlib/net"]
 integration-test = ["net"]
 
 [dev-dependencies]
+serde.workspace = true
 anyhow = "1.0"
 freenet = "0.1.179"
 once_cell.workspace = true

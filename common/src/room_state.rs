@@ -16,6 +16,7 @@ pub mod message;
 pub mod privacy;
 pub mod provisional;
 pub mod secret;
+pub mod sigcheck;
 pub mod upgrade;
 pub mod version;
 

@@ -30,19 +30,23 @@ impl ContractInterface for Contract {
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // `verify`, and then that cleanup leaves the state unchanged, so every
-        // state a peer holds is canonical (`validate_whole_state` explains the
-        // byte comparison and the shared signature memo). Every merge and
-        // delta apply ends in cleanup, so a state a peer produced already is;
-        // clients send `ChatRoomStateV1::normalized` in whole-state PUTs. Not
-        // in `ComposableState::verify`, which also runs on partial states
-        // while a delta's fields are applied.
-        chat_state
-            .validate_whole_state(&parameters, bytes)
-            .map_err(|e| ContractError::InvalidUpdateWithInfo {
-                reason: e.to_string(),
-            })?;
-        Ok(ValidateResult::Valid)
+        // One signature memo for the whole call, so a signature checked twice
+        // inside it is verified once. It never seeds: this input is untrusted.
+        river_core::room_state::sigcheck::scope(|| {
+            // `verify`, and then that cleanup leaves the state unchanged, so every
+            // state a peer holds is canonical (`validate_whole_state` explains the
+            // byte comparison and the shared signature memo). Every merge and
+            // delta apply ends in cleanup, so a state a peer produced already is;
+            // clients send `ChatRoomStateV1::normalized` in whole-state PUTs. Not
+            // in `ComposableState::verify`, which also runs on partial states
+            // while a delta's fields are applied.
+            chat_state
+                .validate_whole_state(&parameters, bytes)
+                .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                    reason: e.to_string(),
+                })?;
+            Ok(ValidateResult::Valid)
+        })
     }
 
     fn update_state(
@@ -50,62 +54,84 @@ impl ContractInterface for Contract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, freenet_stdlib::prelude::ContractError> {
-        let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        river_core::room_state::sigcheck::scope(|| {
+            let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?;
+            let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        for update in data {
-            match update {
-                UpdateData::State(new_state) => {
-                    let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
-                        .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    // The room's own whole-state merge (the trait default is
-                    // not commutative for rooms, freenet/river#703), called
-                    // without the parent argument it ignores, so the state is
-                    // not cloned to supply one.
-                    chat_state
-                        .merge_from(&parameters, &new_state)
-                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
-                            reason: e.to_string(),
-                        })?;
-                }
-                UpdateData::Delta(d) => {
-                    if d.as_ref().is_empty() {
-                        continue;
+            // Validate deltas incrementally: the stored state passed
+            // `validate_state` on this node, so the signatures its `verify`
+            // relies on are recorded as already checked and only signatures a
+            // delta adds cost crypto. Apply, cleanup and the whole-state check
+            // below are the unchanged rules. A seeding failure (a stored state
+            // that no longer verifies) continues unseeded, which is correct but
+            // slower. `seed_from` is called from here and nowhere else.
+            let _ = river_core::room_state::sigcheck::seed_from(|| {
+                chat_state.verify(&chat_state, &parameters)
+            });
+
+            for update in data {
+                match update {
+                    UpdateData::State(new_state) => {
+                        let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
+                            .map_err(|e| ContractError::Deser(e.to_string()))?;
+                        // The room's own whole-state merge (the trait default is
+                        // not commutative for rooms, freenet/river#703), called
+                        // without the parent argument it ignores, so the state is
+                        // not cloned to supply one.
+                        chat_state
+                            .merge_from(&parameters, &new_state)
+                            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                                reason: e.to_string(),
+                            })?;
                     }
-                    let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
-                        .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    chat_state
-                        .apply_delta(&chat_state.clone(), &parameters, &Some(delta))
-                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
-                            reason: e.to_string(),
-                        })?;
-                }
-                UpdateData::RelatedState {
-                    related_to: _,
-                    state: _,
-                } => {
-                    // TODO: related room_state handling not needed for river
-                }
-                // `UpdateData` became `#[non_exhaustive]` in freenet-stdlib
-                // 0.6.0. Unknown variants (including other Related* shapes
-                // we don't handle) are rejected rather than panicking with
-                // `unreachable!()` — a panic inside contract WASM would
-                // kill the runtime for this room and surface as a generic
-                // execution error. Returning `InvalidUpdate` is
-                // recoverable and gives a clearer diagnostic.
-                _ => {
-                    return Err(ContractError::InvalidUpdate);
+                    UpdateData::Delta(d) => {
+                        if d.as_ref().is_empty() {
+                            continue;
+                        }
+                        let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
+                            .map_err(|e| ContractError::Deser(e.to_string()))?;
+                        chat_state
+                            .apply_delta(&chat_state.clone(), &parameters, &Some(delta))
+                            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                                reason: e.to_string(),
+                            })?;
+                    }
+                    UpdateData::RelatedState {
+                        related_to: _,
+                        state: _,
+                    } => {
+                        // TODO: related room_state handling not needed for river
+                    }
+                    // `UpdateData` became `#[non_exhaustive]` in freenet-stdlib
+                    // 0.6.0. Unknown variants (including other Related* shapes
+                    // we don't handle) are rejected rather than panicking with
+                    // `unreachable!()` — a panic inside contract WASM would
+                    // kill the runtime for this room and surface as a generic
+                    // execution error. Returning `InvalidUpdate` is
+                    // recoverable and gives a clearer diagnostic.
+                    _ => {
+                        return Err(ContractError::InvalidUpdate);
+                    }
                 }
             }
-        }
 
-        let mut updated_state = vec![];
-        into_writer(&chat_state, &mut updated_state)
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+            let mut updated_state = vec![];
+            into_writer(&chat_state, &mut updated_state)
+                .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        Ok(UpdateModification::valid(updated_state.into()))
+            // The same whole-state check `validate_state` runs, on the result, so
+            // an `Ok` here is a state that passes `validate_state`. Its
+            // signature checks are memo hits.
+            chat_state
+                .validate_whole_state(&parameters, &updated_state)
+                .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                    reason: e.to_string(),
+                })?;
+
+            Ok(UpdateModification::valid(updated_state.into()))
+        })
     }
 
     fn summarize_state(
@@ -155,6 +181,9 @@ impl ContractInterface for Contract {
         }
     }
 }
+
+#[cfg(test)]
+mod incremental_tests;
 
 #[cfg(test)]
 mod tests {

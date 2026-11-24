@@ -347,14 +347,13 @@ impl AuthorizedProvisionalMember {
         }
         // `verify_strict`: also refuses a small-order key or `R`, so no
         // signature verifies without the key's secret.
-        let ok = self
-            .provisional
-            .member_vk
-            .verify_strict(
-                &provisional_signing_bytes(owner_vk, &self.provisional),
-                &self.signature,
-            )
-            .is_ok();
+        let ok = crate::room_state::sigcheck::verify(
+            crate::room_state::sigcheck::Kind::Strict,
+            &self.provisional.member_vk,
+            &provisional_signing_bytes(owner_vk, &self.provisional),
+            &self.signature,
+        )
+        .is_ok();
         crate::room_state::ban::signature_memo::record_provisional(key, ok);
         ok_or_invalid(ok, "provisional member")
     }
@@ -433,12 +432,13 @@ impl AuthorizedProvisionalBan {
         }
         // `verify_strict`, as for entry signatures: also refuses a small-order
         // key or `R`.
-        let ok = issuer_vk
-            .verify_strict(
-                &provisional_ban_signing_bytes(owner_vk, &self.ban),
-                &self.signature,
-            )
-            .is_ok();
+        let ok = crate::room_state::sigcheck::verify(
+            crate::room_state::sigcheck::Kind::Strict,
+            issuer_vk,
+            &provisional_ban_signing_bytes(owner_vk, &self.ban),
+            &self.signature,
+        )
+        .is_ok();
         crate::room_state::ban::signature_memo::record_provisional(key, ok);
         ok_or_invalid(ok, "provisional ban")
     }

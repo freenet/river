@@ -125,7 +125,7 @@ use crate::room_state::member::{AuthorizedMember, MemberId};
 use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::ChatRoomParametersV1;
 use crate::ChatRoomStateV1;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -649,9 +649,13 @@ impl AuthorizedDirectMessage {
             self.message.timestamp,
             &self.message.ciphertext,
         )?;
-        sender_vk
-            .verify(&bytes, &self.sender_signature)
-            .map_err(|e| format!("Invalid DM sender signature: {}", e))
+        crate::room_state::sigcheck::verify(
+            crate::room_state::sigcheck::Kind::Plain,
+            sender_vk,
+            &bytes,
+            &self.sender_signature,
+        )
+        .map_err(|e| format!("Invalid DM sender signature: {}", e))
     }
 
     /// BLAKE3-derived tombstone token for this signature; what the
@@ -687,9 +691,13 @@ impl AuthorizedRecipientPurges {
     ) -> Result<(), String> {
         let bytes =
             build_recipient_purges_signed_bytes(self.recipient_id, room_owner_vk, &self.state)?;
-        recipient_vk
-            .verify(&bytes, &self.recipient_signature)
-            .map_err(|e| format!("Invalid recipient purges signature: {}", e))
+        crate::room_state::sigcheck::verify(
+            crate::room_state::sigcheck::Kind::Plain,
+            recipient_vk,
+            &bytes,
+            &self.recipient_signature,
+        )
+        .map_err(|e| format!("Invalid recipient purges signature: {}", e))
     }
 }
 

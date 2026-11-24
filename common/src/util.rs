@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use data_encoding::BASE32;
-use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 
 pub fn sign_struct<T: Serialize>(message: T, signing_key: &SigningKey) -> Signature {
@@ -16,7 +16,12 @@ pub fn verify_struct<T: Serialize>(
 ) -> Result<(), SignatureError> {
     let mut data_to_sign = Vec::new();
     ciborium::ser::into_writer(message, &mut data_to_sign).expect("Serialization should not fail");
-    verifying_key.verify(&data_to_sign, signature)
+    crate::room_state::sigcheck::verify(
+        crate::room_state::sigcheck::Kind::Plain,
+        verifying_key,
+        &data_to_sign,
+        signature,
+    )
 }
 
 /// BLAKE3 of a value's CBOR encoding, identifying a record by its full

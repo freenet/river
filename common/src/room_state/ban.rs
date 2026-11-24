@@ -973,6 +973,24 @@ pub(crate) mod signature_memo {
         });
     }
 
+    /// The entries of the two signature memos, to put back with [`restore`].
+    pub(crate) type Snapshot = (
+        Option<HashMap<Key, bool>>,
+        Option<HashMap<ProvisionalKey, bool>>,
+    );
+
+    pub(crate) fn snapshot() -> Snapshot {
+        (
+            MEMO.with(|m| m.borrow().clone()),
+            PROVISIONAL_MEMO.with(|m| m.borrow().clone()),
+        )
+    }
+
+    pub(crate) fn restore(held: Snapshot) {
+        MEMO.with(|m| *m.borrow_mut() = held.0);
+        PROVISIONAL_MEMO.with(|m| *m.borrow_mut() = held.1);
+    }
+
     /// Run `f` with the memo set aside (neither read nor written), restoring
     /// it afterwards: for the debug-build cross-check in cleanup, so debug
     /// builds verify the same signatures release builds do.
@@ -981,7 +999,7 @@ pub(crate) mod signature_memo {
         let held = MEMO.with(|m| m.borrow_mut().take());
         let held_provisional = PROVISIONAL_MEMO.with(|m| m.borrow_mut().take());
         let held_cap = LAST_CAP.with(|c| c.borrow_mut().take());
-        let r = f();
+        let r = crate::room_state::sigcheck::set_aside(f);
         MEMO.with(|m| *m.borrow_mut() = held);
         PROVISIONAL_MEMO.with(|m| *m.borrow_mut() = held_provisional);
         LAST_CAP.with(|c| *c.borrow_mut() = held_cap);

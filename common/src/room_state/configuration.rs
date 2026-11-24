@@ -5,7 +5,7 @@ use crate::room_state::provisional::PublicRoomPolicy;
 use crate::room_state::ChatRoomParametersV1;
 use crate::util::truncated_base64;
 use crate::ChatRoomStateV1;
-use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::util::{fast_hash, FastHash};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
@@ -175,7 +175,12 @@ impl AuthorizedConfigurationV1 {
         let mut serialized_config = Vec::new();
         ciborium::ser::into_writer(&self.configuration, &mut serialized_config)
             .expect("Serialization should not fail");
-        owner_verifying_key.verify(&serialized_config, &self.signature)
+        crate::room_state::sigcheck::verify(
+            crate::room_state::sigcheck::Kind::Plain,
+            owner_verifying_key,
+            &serialized_config,
+            &self.signature,
+        )
     }
 
     pub fn id(&self) -> FastHash {

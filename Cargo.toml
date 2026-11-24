@@ -78,6 +78,16 @@ strip = true        # Strip symbols from binary
 [profile.release.package."*"]
 opt-level = 'z'     # Optimize all dependencies for size as well
 
+# The signature and hash crates are built for speed in release, over the size
+# setting above: verifying signatures dominates the room contract's cost per
+# update, and this roughly halves it for +18 KB of WASM.
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+
 # Debug and test builds compile the signature and hash crates optimized.
 # Unoptimized ed25519/curve25519 made the randomized fork-merge test
 # (common/tests/fork_merge_closure_test.rs) take ~300 s in CI's debug
