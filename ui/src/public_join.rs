@@ -309,6 +309,9 @@ struct Session {
     owner_vk: Option<VerifyingKey>,
     signing_key: Option<SigningKey>,
     entry: Option<AuthorizedProvisionalMember>,
+    /// Re-admitting a member already in `ROOMS` (pruned), not joining from the
+    /// viewer: the key is the room's own and the state is the room's.
+    readmit: bool,
 }
 
 static SESSION: Mutex<Session> = Mutex::new(Session {
@@ -316,7 +319,79 @@ static SESSION: Mutex<Session> = Mutex::new(Session {
     owner_vk: None,
     signing_key: None,
     entry: None,
+    readmit: false,
 });
+
+/// The proof each room last admitted this session, so a member the room pruned
+/// is re-submitted at once when the policy still accepts it. Process memory
+/// only: after a reload the proof is solved again, with the same key.
+static HELD: Mutex<Vec<(VerifyingKey, AuthorizedProvisionalMember)>> = Mutex::new(Vec::new());
+
+fn held_lock() -> std::sync::MutexGuard<'static, Vec<(VerifyingKey, AuthorizedProvisionalMember)>> {
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn remember_entry(owner_vk: VerifyingKey, entry: AuthorizedProvisionalMember) {
+    let mut held = held_lock();
+    held.retain(|(o, _)| *o != owner_vk);
+    held.push((owner_vk, entry));
+}
+
+/// The proof held for `owner_vk`'s room, if this session made one.
+pub fn held_entry(owner_vk: &VerifyingKey) -> Option<AuthorizedProvisionalMember> {
+    held_lock()
+        .iter()
+        .find(|(o, _)| o == owner_vk)
+        .map(|(_, e)| e.clone())
+}
+
+/// Test hook support: forget every held proof, as a reload does.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub fn forget_held_entries() {
+    held_lock().clear();
+}
+
+/// The room state the join works against: the viewed room, or for a
+/// re-admission the member's own room.
+fn source_state(owner_vk: &VerifyingKey) -> Option<ChatRoomStateV1> {
+    if session().readmit {
+        let rooms = crate::components::app::ROOMS.try_peek().ok()?;
+        return rooms.map.get(owner_vk).map(|r| r.room_state.clone());
+    }
+    viewed_state().map(|(_, s)| s)
+}
+
+/// What to tell a member the room pruned, and what their next message does.
+/// `entry` is the proof held for the room, if any.
+pub fn readmit_note(
+    state: &ChatRoomStateV1,
+    owner_vk: &VerifyingKey,
+    member_vk: &VerifyingKey,
+    entry: Option<&AuthorizedProvisionalMember>,
+    now: SystemTime,
+) -> String {
+    match check_admission_status(state, owner_vk, member_vk, entry, now) {
+        Ok(_) if entry.is_some() => {
+            "The room removed you for being quiet. Your next message rejoins.".to_string()
+        }
+        Ok(_) | Err(JoinFailure::PolicyChanged) => "The room removed you for being quiet. \
+            Your next message rejoins after a short proof of work."
+            .to_string(),
+        Err(f) => f.message(),
+    }
+}
+
+/// [`readmit_note`] for a room the user holds.
+pub fn readmit_note_for(room: &crate::room_data::RoomData) -> Option<String> {
+    let member_vk = room.self_verifying_key()?;
+    Some(readmit_note(
+        &room.room_state,
+        &room.owner_vk,
+        &member_vk,
+        held_entry(&room.owner_vk).as_ref(),
+        crate::util::get_current_system_time(),
+    ))
+}
 
 fn session() -> std::sync::MutexGuard<'static, Session> {
     SESSION.lock().unwrap_or_else(|e| e.into_inner())
@@ -379,6 +454,7 @@ pub fn reset() {
         s.owner_vk = None;
         s.signing_key = None;
         s.entry = None;
+        s.readmit = false;
     }
     update_ui(|ui| *ui = JoinUi::default());
 }
@@ -414,6 +490,44 @@ pub fn start(owner_vk: VerifyingKey) {
         // forgotten: a failed or cancelled attempt posted nothing under it.
         s.signing_key = Some(SigningKey::generate(&mut rand::thread_rng()));
         s.entry = None;
+        s.readmit = false;
+        s.generation
+    };
+    update_ui(|ui| {
+        ui.phase = JoinPhase::Solving {
+            tried: 0,
+            expected: 0.0,
+        };
+    });
+    crate::util::safe_spawn_local(async move {
+        run(generation, owner_vk).await;
+    });
+}
+
+/// Re-admit the member of a room the room pruned, with the SAME key: the held
+/// proof is re-submitted when the policy still accepts it, otherwise the proof
+/// is solved again. A no-op while one is under way.
+pub fn start_readmit(owner_vk: VerifyingKey) {
+    let Some(signing_key) = crate::components::app::ROOMS
+        .try_peek()
+        .ok()
+        .and_then(|r| r.map.get(&owner_vk).and_then(|d| d.signing_key().cloned()))
+    else {
+        return;
+    };
+    let generation = {
+        let mut s = session();
+        if matches!(
+            JOIN.try_peek().map(|u| u.phase.clone()),
+            Ok(JoinPhase::Solving { .. })
+        ) {
+            return;
+        }
+        s.generation += 1;
+        s.owner_vk = Some(owner_vk);
+        s.entry = held_entry(&owner_vk);
+        s.signing_key = Some(signing_key);
+        s.readmit = true;
         s.generation
     };
     update_ui(|ui| {
@@ -448,7 +562,12 @@ pub fn send(owner_vk: VerifyingKey, text: String) {
             submit(generation, owner_vk, text).await;
         });
     } else if !solving {
-        start(owner_vk);
+        // Not viewing the room: the sender is a member the room pruned.
+        if viewed_state().is_some() {
+            start(owner_vk);
+        } else {
+            start_readmit(owner_vk);
+        }
     }
 }
 
@@ -462,7 +581,7 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
     // delegate's quota applies and the key is the one used afterwards. The
     // example build has no delegate.
     #[cfg(not(feature = "no-sync"))]
-    {
+    if !session().readmit {
         let room_key = owner_vk.to_bytes();
         let stored = crate::signing::migrate_signing_key(room_key, &signing_key, true).await;
         if stored == crate::signing::MigrationResult::Failed {
@@ -477,10 +596,21 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
         }
     }
 
-    let Some((_, state)) = viewed_state() else {
+    let Some(state) = source_state(&owner_vk) else {
         fail(generation, JoinFailure::NotOpen);
         return;
     };
+    // A proof held from earlier is re-submitted when the room's current policy
+    // still accepts it; otherwise it is solved again with the same key.
+    let held = session().entry.clone();
+    if let Some(entry) = held {
+        let now = crate::util::get_current_system_time();
+        match check_admission_status(&state, &owner_vk, &member_vk, Some(&entry), now) {
+            Ok(_) => return finish(generation, owner_vk).await,
+            Err(JoinFailure::PolicyChanged) => session().entry = None,
+            Err(f) => return fail(generation, f),
+        }
+    }
     let mut req = match check_admission_status(
         &state,
         &owner_vk,
@@ -513,7 +643,7 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
         // The room may change what it asks of newcomers while this runs
         // (a new epoch restarts the search, more bits raise the target); one
         // that no longer admits stops it.
-        if let Some((_, now_state)) = viewed_state() {
+        if let Some(now_state) = source_state(&owner_vk) {
             match check_admission_status(
                 &now_state,
                 &owner_vk,
@@ -537,6 +667,11 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
     }
     let entry = entry_for_nonce(&owner_vk, &signing_key, nonce);
     session().entry = Some(entry);
+    finish(generation, owner_vk).await
+}
+
+/// The proof is held: post the queued message, or wait for the first one.
+async fn finish(generation: u64, owner_vk: VerifyingKey) {
     let queued = JOIN.try_peek().ok().and_then(|u| u.queued.clone());
     match queued {
         Some(text) => submit(generation, owner_vk, text).await,
@@ -558,7 +693,7 @@ async fn submit(generation: u64, owner_vk: VerifyingKey, text: String) {
         }
     };
     update_ui(|ui| ui.phase = JoinPhase::Submitting);
-    let Some((_, state)) = viewed_state() else {
+    let Some(state) = source_state(&owner_vk) else {
         return fail(generation, JoinFailure::NotOpen);
     };
     let nickname = crate::nickname::generate_default_nickname(&signing_key.verifying_key());
@@ -592,9 +727,15 @@ async fn submit(generation: u64, owner_vk: VerifyingKey, text: String) {
     if !is_current(generation) {
         return;
     }
+    let readmit = session().readmit;
+    remember_entry(owner_vk, entry);
     crate::util::defer(move || {
-        insert_member_room(owner_vk, signing_key, submission);
-        crate::public_room::close();
+        if readmit {
+            apply_readmission(owner_vk, submission);
+        } else {
+            insert_member_room(owner_vk, signing_key, submission);
+            crate::public_room::close();
+        }
         reset();
     });
 }
@@ -628,6 +769,20 @@ fn build_room_data(
         own_purges: Default::default(),
         invitation_secrets: Default::default(),
     }
+}
+
+/// The pruned member's own room takes the admission: the entry, the
+/// `member_info` and the message, applied once.
+fn apply_readmission(owner_vk: VerifyingKey, submission: Submission) {
+    use crate::components::app::{mark_needs_sync, ROOMS};
+    ROOMS.with_mut(|rooms| {
+        if let Some(room) = rooms.map.get_mut(&owner_vk) {
+            room.room_state = submission.state_after;
+            room.self_member_info = Some(submission.info);
+            room.self_nickname = Some(submission.nickname);
+        }
+    });
+    mark_needs_sync(owner_vk);
 }
 
 fn insert_member_room(owner_vk: VerifyingKey, signing_key: SigningKey, submission: Submission) {
@@ -913,6 +1068,141 @@ mod tests {
         assert_eq!(back.room_state.provisional.entries.len(), 1);
         assert_eq!(back.room_state.recent_messages.messages.len(), 1);
         assert_eq!(back.self_verifying_key(), Some(sk.verifying_key()));
+    }
+
+    /// A joined member whose entry and messages the room then pruned.
+    fn pruned_member() -> (
+        crate::room_data::RoomData,
+        SigningKey,
+        AuthorizedProvisionalMember,
+    ) {
+        let state = room(PrivacyMode::Public, Some(policy(6, 2)));
+        let sk = SigningKey::from_bytes(&[21u8; 32]);
+        let (owner_vk, entry) = solved(&state, &sk);
+        let sub = build_submission(
+            &state,
+            &owner_vk,
+            &sk,
+            &entry,
+            "before",
+            "Me",
+            SystemTime::now(),
+        )
+        .unwrap();
+        let mut data = build_room_data(owner_vk, sk.clone(), sub);
+        assert!(!data.is_pruned_open_member(), "held, so not pruned");
+        data.room_state.provisional.entries.clear();
+        data.room_state.recent_messages.messages.clear();
+        (data, sk, entry)
+    }
+
+    #[test]
+    fn a_pruned_open_member_is_told_and_a_held_proof_is_resubmitted_with_the_same_key() {
+        let (data, sk, entry) = pruned_member();
+        assert!(data.is_pruned_open_member());
+        assert!(
+            data.can_send_message().is_err(),
+            "the normal composer is not offered"
+        );
+        let owner_vk = data.owner_vk;
+        let now = SystemTime::now();
+        let note = readmit_note(
+            &data.room_state,
+            &owner_vk,
+            &sk.verifying_key(),
+            Some(&entry),
+            now,
+        );
+        assert!(note.contains("Your next message rejoins."), "{note}");
+        // The held proof still passes, so it goes out as it is.
+        let sub = build_submission(&data.room_state, &owner_vk, &sk, &entry, "again", "Me", now)
+            .expect("re-admitted");
+        let keys: Vec<_> = sub
+            .state_after
+            .provisional
+            .entries
+            .iter()
+            .map(|e| e.provisional.member_vk)
+            .collect();
+        assert_eq!(keys, vec![sk.verifying_key()], "the same identity");
+        assert_eq!(sub.state_after.recent_messages.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_proof_the_policy_no_longer_accepts_is_solved_again_with_the_same_key() {
+        let (mut data, sk, old_entry) = pruned_member();
+        let owner_vk = data.owner_vk;
+        // The owner moves to a new epoch while the member was away.
+        let mut moved = policy(6, 2);
+        moved.pow = Some(PowPolicy {
+            difficulty_bits: 6,
+            epoch: 77,
+        });
+        let newer = room(PrivacyMode::Public, Some(moved));
+        data.room_state.configuration = newer.configuration;
+        let now = SystemTime::now();
+        let note = readmit_note(
+            &data.room_state,
+            &owner_vk,
+            &sk.verifying_key(),
+            Some(&old_entry),
+            now,
+        );
+        assert!(note.contains("proof of work"), "{note}");
+        assert_eq!(
+            build_submission(&data.room_state, &owner_vk, &sk, &old_entry, "x", "Me", now)
+                .unwrap_err(),
+            JoinFailure::PolicyChanged
+        );
+        // Solved again for the new epoch, by the same key.
+        let (_, fresh) = solved(&data.room_state, &sk);
+        assert_eq!(fresh.provisional.member_vk, sk.verifying_key());
+        let sub = build_submission(&data.room_state, &owner_vk, &sk, &fresh, "back", "Me", now)
+            .expect("re-admitted");
+        assert_eq!(sub.state_after.provisional.entries.len(), 1);
+        assert_eq!(sub.state_after.recent_messages.messages.len(), 1);
+    }
+
+    #[test]
+    fn re_admission_gives_the_rooms_own_reason_when_it_cannot() {
+        let (mut data, sk, entry) = pruned_member();
+        let owner_vk = data.owner_vk;
+        let now = SystemTime::now();
+        // Banned by the owner while away.
+        data.room_state
+            .provisional
+            .bans
+            .push(AuthorizedProvisionalBan::new(
+                &owner_vk,
+                ProvisionalBan {
+                    banned_by: MemberId::from(&owner_vk),
+                    banned_at: now,
+                    target: MemberId::from(&sk.verifying_key()),
+                },
+                &owner(),
+            ));
+        let note = readmit_note(
+            &data.room_state,
+            &owner_vk,
+            &sk.verifying_key(),
+            Some(&entry),
+            now,
+        );
+        assert_eq!(note, JoinFailure::Banned.message());
+    }
+
+    #[test]
+    fn a_member_who_joined_by_invitation_is_not_a_pruned_open_member() {
+        let (mut data, _, _) = pruned_member();
+        data.self_authorized_member = Some(river_core::room_state::member::AuthorizedMember::new(
+            river_core::room_state::member::Member {
+                owner_member_id: MemberId::from(&data.owner_vk),
+                invited_by: MemberId::from(&data.owner_vk),
+                member_vk: data.self_verifying_key().unwrap(),
+            },
+            &owner(),
+        ));
+        assert!(!data.is_pruned_open_member());
     }
 
     #[test]

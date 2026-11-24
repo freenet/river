@@ -321,7 +321,7 @@ fn PublicRoomView(
         }
         if can_join {
             if let Some(owner) = owner_vk {
-                JoinComposer { owner_vk: owner, note: note.to_string() }
+                JoinComposer { owner_vk: owner, note: note.to_string(), readmit: false }
             }
         } else {
             div { class: "px-4 py-3 border-t border-border",
@@ -346,7 +346,11 @@ fn PublicRoomView(
 /// and Send. Sending before admission queues the message, shown as pending
 /// above; it posts once admission completes.
 #[component]
-fn JoinComposer(owner_vk: ed25519_dalek::VerifyingKey, note: String) -> Element {
+pub(crate) fn JoinComposer(
+    owner_vk: ed25519_dalek::VerifyingKey,
+    note: String,
+    #[props(default = false)] readmit: bool,
+) -> Element {
     let mut draft = use_signal(String::new);
 
     // A queued message handed back after a failure or cancel returns to the
@@ -409,8 +413,22 @@ fn JoinComposer(owner_vk: ed25519_dalek::VerifyingKey, note: String) -> Element 
     let retryable = matches!(&phase, JoinPhase::Failed(f) if f.retryable());
     let can_start = matches!(phase, JoinPhase::Idle) || retryable;
 
+    // A re-admitted member's message waits here: it is not in the room yet.
+    let pending = if readmit {
+        JOIN.try_read().ok().and_then(|j| j.queued.clone())
+    } else {
+        None
+    };
+
     rsx! {
         div { class: "px-4 py-3 border-t border-border",
+            if let Some(text) = pending {
+                div {
+                    class: "mb-2 opacity-60 text-sm whitespace-pre-wrap break-words",
+                    "data-testid": "readmit-pending-message",
+                    "{text}"
+                }
+            }
             div { class: "flex items-end gap-2",
                 textarea {
                     class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text",
@@ -432,9 +450,15 @@ fn JoinComposer(owner_vk: ed25519_dalek::VerifyingKey, note: String) -> Element 
                         "data-testid": "viewed-room-join",
                         class: "flex-shrink-0 px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text text-sm transition-colors",
                         onclick: move |_| {
-                            crate::util::defer(move || public_join::start(owner_vk));
+                            crate::util::defer(move || {
+                                if readmit {
+                                    public_join::start_readmit(owner_vk)
+                                } else {
+                                    public_join::start(owner_vk)
+                                }
+                            });
                         },
-                        if failed { "Try again" } else { "Join" }
+                        if failed { "Try again" } else if readmit { "Rejoin" } else { "Join" }
                     }
                 }
                 button {

@@ -1186,6 +1186,27 @@ impl RoomData {
         })
     }
 
+    /// An open-admission member (no invitation) the room no longer holds: it
+    /// pruned the entry, so the next message needs re-admission (#975).
+    pub fn is_pruned_open_member(&self) -> bool {
+        let Some(vk) = self.self_verifying_key() else {
+            return false;
+        };
+        let config = &self.room_state.configuration.configuration;
+        vk != self.owner_vk
+            && self.self_authorized_member.is_none()
+            && self.self_member_info.is_some()
+            && !self
+                .room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == vk)
+            && !self.is_self_provisional()
+            && config.privacy_mode == PrivacyMode::Public
+            && river_core::room_state::admission::admits_by_pow(config)
+    }
+
     /// Check if the user can send a message in the room.
     /// A user is considered a member if they are the owner, are in the active
     /// members list, or have a stored invitation (self_authorized_member).

@@ -223,6 +223,44 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The room prunes the current room's open-admission member: their entry,
+    // messages and member_info go, as the room's cleanup drops them. With
+    // `forget`, the proof held this session is forgotten too, as a reload does.
+    set_hook(
+        "pruneJoiner",
+        Closure::<dyn FnMut(bool) -> bool>::new(move |forget: bool| {
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return false;
+            };
+            if forget {
+                crate::public_join::forget_held_entries();
+            }
+            crate::components::app::ROOMS.with_mut(|rooms| {
+                let Some(room) = rooms.map.get_mut(&owner) else {
+                    return false;
+                };
+                let Some(vk) = room.self_verifying_key() else {
+                    return false;
+                };
+                let id = river_core::room_state::member::MemberId::from(&vk);
+                room.room_state
+                    .provisional
+                    .entries
+                    .retain(|e| e.provisional.member_vk != vk);
+                room.room_state
+                    .recent_messages
+                    .messages
+                    .retain(|m| m.message.author != id);
+                room.room_state
+                    .member_info
+                    .member_info
+                    .retain(|i| i.member_info.member_id != id);
+                true
+            })
+        })
+        .into_js_value(),
+    );
+
     set_hook(
         "takeMessageGroupRenders",
         Closure::<dyn FnMut() -> u32>::new(move || MESSAGE_GROUP_RENDERS.with(|n| n.replace(0)))

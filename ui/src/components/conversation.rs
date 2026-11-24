@@ -3378,13 +3378,27 @@ pub fn Conversation() -> Element {
                                 // absent — so this is Some. Matched rather than
                                 // unwrapped so an absent key renders nothing
                                 // instead of panicking the whole conversation.
-                                match room_data.self_verifying_key() {
-                                    Some(user_vk) => rsx! {
+                                // An open-admission member the room pruned: the
+                                // next message re-admits with the same key.
+                                let readmit_note = if room_data.is_pruned_open_member() {
+                                    crate::public_join::readmit_note_for(&room_data)
+                                } else {
+                                    None
+                                };
+                                match (readmit_note, room_data.self_verifying_key()) {
+                                    (Some(note), _) => rsx! {
+                                        crate::components::viewed_room::JoinComposer {
+                                            owner_vk: room_data.owner_vk,
+                                            note,
+                                            readmit: true,
+                                        }
+                                    },
+                                    (None, Some(user_vk)) => rsx! {
                                         NotMemberNotification {
                                             user_verifying_key: user_vk
                                         }
                                     },
-                                    None => rsx! {},
+                                    (None, None) => rsx! {},
                                 }
                             },
                             Err(SendMessageError::UserBanned) => rsx! {
