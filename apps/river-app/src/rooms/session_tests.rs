@@ -10767,6 +10767,94 @@ mod rekey_state {
         assert!(rooms.outbox.work.busy());
     }
 
+    /// A move whose state came from the key it was stored under, while an older key its slot
+    /// still owes a merge from answered NotFound: moved, and that key is read again later, at
+    /// most `MAX_FOLD_RETRIES` times.
+    #[test]
+    fn an_owed_key_answering_not_found_is_read_again_a_bounded_number_of_times() {
+        let owner = SigningKey::from_bytes(&[6; 32]);
+        let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key());
+        let mut room = TestRoom::new(6, "A", 1, &["mine"]);
+        room.key = earlier[0];
+        let mut rooms = Rooms::default();
+        let mut l = loaded(vec![room.stored()]);
+        l.owed.insert(room.vk(), vec![earlier[2]]);
+        rooms.replace(l);
+        let current = *contract_key(&room.vk()).id();
+        let pace = pace();
+        let mut state = Vec::new();
+        ciborium::ser::into_writer(&room.state, &mut state).unwrap();
+        let mut now = Instant::now();
+        rooms.seed_if_rekeyed(&current);
+        let mut moves = 0;
+        loop {
+            let work = &mut rooms.outbox.work;
+            loop {
+                match work.next_request(false, now) {
+                    Some(ClientRequest::ContractOp(CR::Get { key, .. }))
+                        if key == *earlier[0].id() =>
+                    {
+                        assert!(work.on_contract(&ContractResponse::GetResponse {
+                            key: earlier[0],
+                            contract: None,
+                            state: WrappedState::new(state.clone()),
+                        }));
+                    }
+                    Some(ClientRequest::ContractOp(CR::Get { key, .. })) => {
+                        assert!(work.on_contract(&ContractResponse::NotFound { instance_id: key }));
+                    }
+                    Some(ClientRequest::ContractOp(CR::Put { contract, .. })) => {
+                        assert!(work.on_contract(&ContractResponse::PutResponse {
+                            key: contract.key()
+                        }));
+                        break;
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                }
+            }
+            moves += 1;
+            assert_eq!(rooms.seed_ends(&pace, now), vec![current]);
+            match rooms.seed_retry.get(&room.vk()).cloned() {
+                Some((_, Some(due), candidates)) => {
+                    if moves == 1 {
+                        // Only the owed key that answered NotFound, not the ones between.
+                        assert_eq!(candidates, vec![*earlier[2].id()]);
+                    }
+                    now = due;
+                    rooms.seeds_due(now);
+                    assert!(rooms.outbox.work.busy());
+                }
+                other => {
+                    assert!(other.is_none());
+                    break;
+                }
+            }
+        }
+        assert_eq!(moves as u32, 1 + MAX_FOLD_RETRIES);
+    }
+
+    /// A key a move gave up reading is no longer treated as such once the room is followed
+    /// under it: its answers are the session's.
+    #[test]
+    fn a_followed_key_is_not_a_read_given_up_on() {
+        let (mut rooms, room, earlier) = rekeyed(8);
+        let current = *contract_key(&room.vk()).id();
+        rooms.seed_if_rekeyed(&current);
+        let t0 = Instant::now();
+        let work = &mut rooms.outbox.work;
+        let _ = work.next_request(false, t0);
+        assert!(!work.expire(
+            Duration::from_secs(20),
+            Duration::from_secs(60),
+            t0 + Duration::from_secs(61)
+        ));
+        assert!(work.has_late());
+        // The room is followed under that key meanwhile.
+        assert_eq!(rooms.contract_ids(), vec![*earlier.id()]);
+        rooms.forget_followed_late();
+        assert!(!rooms.outbox.work.has_late());
+    }
+
     #[test]
     fn a_move_of_a_room_left_meanwhile_is_dropped() {
         let (mut rooms, room, _) = rekeyed(4);

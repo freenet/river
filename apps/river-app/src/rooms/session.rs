@@ -969,8 +969,7 @@ fn follow_on(
             }
             None => {}
         }
-        // A room followed under a key a move gave up reading: its answers are the session's.
-        rooms.outbox.work.forget_late(&rooms.contract_ids());
+        rooms.forget_followed_late();
         if let Err(e) = subs.ask_due(socket, &|id| resyncs.is_out(id)) {
             return e;
         }
@@ -3382,6 +3381,13 @@ impl Rooms {
         let mut owed = vec![earlier];
         owed.extend(self.owed.get(owner).into_iter().flatten().copied());
         super::rekey::candidates_down_to_owed(owner, &owed)
+    }
+
+    /// A room followed under a key a move gave up reading: its answers are the session's, so the
+    /// move's work stops treating that key as a read given up on.
+    fn forget_followed_late(&mut self) {
+        let followed = self.contract_ids();
+        self.outbox.work.forget_late(&followed);
     }
 
     /// Start moving `owner`'s room from the earlier keys `candidates`.
