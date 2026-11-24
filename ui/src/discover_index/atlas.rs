@@ -18,24 +18,36 @@
 //! * [`IndexParams::to_bytes`], which is the index's identity.
 //! * [`IndexState::verify`]: root-signed `KeyAuth`, app registry signature and
 //!   slug binding, record keying, record authorisation, record signatures.
-//!   Not mirrored: the per-field structural checks (`check_structure`). Those
-//!   bound size and printability, the contract enforces them on every write,
-//!   and a peer cannot forge a record without the curator's online key, so
-//!   leaving them out can only make this reader accept a state Atlas would
-//!   also accept. Text reaches the DOM through Dioxus, which escapes it.
+//!   Not mirrored: the per-field structural checks (`check_structure`) and the
+//!   registry version check. So this reader accepts a SUPERSET of what Atlas's
+//!   `verify` accepts. That is safe only while the contract enforces those
+//!   bounds on every write and the online key is the curator's; to limit what
+//!   a mistake there could do, [`search`] strips control and bidirectional
+//!   characters from the text it returns and truncates it to Atlas's bounds.
 //! * [`search`]: `atlas_rooms::search::search`, with the same safe-search rule.
 //!
-//! The golden test in `mod.rs` decodes, verifies and filters bytes produced by
-//! the real Atlas crates and compares against the hits `atlas_rooms::search`
-//! returned for the same bytes, so a schema or rule change in Atlas that this
-//! file has not followed fails CI here instead of showing up as an empty list.
-//! A new field on a SIGNED Atlas type that this mirror does not declare would
-//! make every signature fail; that reads as "Discover unavailable" with a
+//! # What guards the mirror
+//!
+//! The golden fixture `testdata/atlas_index_golden.json` is a STATIC snapshot:
+//! a signed `IndexState` built once with the real `fn-atlas-common` and
+//! `atlas-rooms` crates (atlas `origin/main` cf93c24, test keys only), plus the
+//! hits `atlas_rooms::search` returned for it under eight filters. The test in
+//! `mod.rs` decodes, verifies and filters those bytes and compares. It catches
+//! an edit to THIS file that breaks agreement with Atlas as of that commit. It
+//! does not notice a later change in Atlas: nothing regenerates or compares the
+//! fixture automatically. To refresh it after an Atlas change, rebuild the
+//! sample with the Atlas crates at the new commit and replace the file (the
+//! generator used for cf93c24 is a throwaway `main.rs` that depends on the
+//! two Atlas crates by path, builds the state with test keys, runs `verify`
+//! and `search`, and prints the JSON).
+//!
+//! A new field on a SIGNED Atlas type that this mirror does not declare makes
+//! every signature fail. That reads as "Discover unavailable" with a
 //! verification error, never as an empty list.
 
 use std::collections::BTreeMap;
 
-use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// Atlas's `MAX_ENTRIES`.
@@ -146,6 +158,13 @@ impl RecordBody {
             RecordBody::Tomb(t) => &t.subject_id,
         }
     }
+
+    fn version(&self) -> u64 {
+        match self {
+            RecordBody::Live(e) => e.version,
+            RecordBody::Tomb(t) => t.version,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -212,7 +231,7 @@ impl IndexParams {
 }
 
 /// Canonical bytes a signature covers: the CBOR of the value.
-fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+pub(crate) fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     ciborium::ser::into_writer(value, &mut buf).map_err(|e| format!("cannot re-encode: {e}"))?;
     Ok(buf)
@@ -225,12 +244,11 @@ fn verify_sig<T: Serialize>(value: &T, sig: &Signature, vk: &VerifyingKey) -> Re
         .map_err(|e| e.to_string())
 }
 
-// `Verifier` is imported for the trait-bound check above; keep the import
-// used so a dalek change that drops `verify_strict` fails to compile here.
-#[allow(dead_code)]
-fn _assert_verifier(vk: &VerifyingKey, m: &[u8], s: &Signature) -> bool {
-    vk.verify(m, s).is_ok()
-}
+/// How new an index state is: the key_auth version, then the sum of every
+/// record's version. States merge per subject by highest version, so the sum
+/// never drops as a state gains updates, and a lagging peer's older state
+/// stamps lower.
+pub type Stamp = (u64, u128);
 
 impl IndexState {
     /// Decode the CBOR state a node serves.
@@ -275,6 +293,16 @@ impl IndexState {
                 .map_err(|e| format!("bad record signature: {e}"))?;
         }
         Ok(())
+    }
+
+    pub fn stamp(&self) -> Stamp {
+        (
+            self.key_auth.as_ref().map_or(0, |k| k.body.version),
+            self.records
+                .values()
+                .map(|r| u128::from(r.body.version()))
+                .sum(),
+        )
     }
 
     fn live_entries(&self) -> impl Iterator<Item = &IndexEntry> {
@@ -402,6 +430,33 @@ fn passes_safe(h: &RoomHit) -> bool {
     h.landing.as_deref() == Some(LANDING_GENERAL)
 }
 
+/// Atlas's `MAX_TITLE`, `MAX_SNIPPET`, `MAX_TAG_LEN` (bytes).
+const MAX_TITLE: usize = 200;
+const MAX_SNIPPET: usize = 500;
+const MAX_TAG_LEN: usize = 40;
+
+fn is_bidi_or_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}')
+}
+
+/// Text from the index as shown: control, bidirectional and zero-width
+/// characters removed, cut to `max` bytes on a character boundary.
+fn clean_text(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max));
+    for c in s.chars() {
+        if c.is_control() || is_bidi_or_invisible(c) {
+            continue;
+        }
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn hit(e: &IndexEntry, f: &RoomFilter) -> Option<RoomHit> {
     if e.kind.0 != ROOM_KIND {
         return None;
@@ -412,10 +467,10 @@ fn hit(e: &IndexEntry, f: &RoomFilter) -> Option<RoomHit> {
     Some(RoomHit {
         owner_key: bs58::encode(owner.to_bytes()).into_string(),
         subject_id: e.subject_id.0.clone(),
-        title: e.title.clone(),
-        snippet: e.snippet.clone(),
+        title: clean_text(&e.title, MAX_TITLE),
+        snippet: clean_text(&e.snippet, MAX_SNIPPET),
         snippet_source: snippet_source(e),
-        tags: e.tags.clone(),
+        tags: e.tags.iter().map(|t| clean_text(t, MAX_TAG_LEN)).collect(),
         featured: e.featured,
         added_at: e.added_at,
         availability: availability(e, f),
@@ -485,4 +540,124 @@ pub fn search(state: &IndexState, filter: &RoomFilter) -> Vec<RoomHit> {
             .then(a.owner_key.cmp(&b.owner_key))
     });
     hits.into_iter().map(|(_, h)| h).collect()
+}
+
+/// Builders for tests that need a state signed with keys of their own.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    pub fn sk(n: u8) -> SigningKey {
+        SigningKey::from_bytes(&[n; 32])
+    }
+
+    pub fn owner_b58(n: u8) -> String {
+        bs58::encode(sk(n).verifying_key().to_bytes()).into_string()
+    }
+
+    pub fn sid(n: u8) -> SubjectId {
+        SubjectId(bs58::encode([n; 9]).into_string())
+    }
+
+    pub fn sid_str(s: &str) -> SubjectId {
+        SubjectId(s.to_string())
+    }
+
+    pub fn sign<T: Serialize>(v: &T, k: &SigningKey) -> Signature {
+        k.sign(&canonical(v).unwrap())
+    }
+
+    /// A general-audience, live room listing for `resource` (an owner key in
+    /// base58).
+    pub fn room(n: u8, version: u64, title: &str, resource: String) -> IndexEntry {
+        IndexEntry {
+            subject_id: sid(n),
+            version,
+            kind: Kind(ROOM_KIND.to_string()),
+            title: title.to_string(),
+            snippet: String::new(),
+            tags: vec![],
+            locator: Locator::AppResource {
+                app: RIVER_APP.to_string(),
+                resource,
+                path: String::new(),
+            },
+            featured: false,
+            added_at: 0,
+            class: Some(Classification {
+                landing: Audience(LANDING_GENERAL.to_string()),
+                has_adult_sections: false,
+                volatility: Volatility("static".to_string()),
+                classifier: 1,
+                classified_at: 0,
+            }),
+            verified: Some(Verification {
+                last_verified_at: 1,
+                status: VerifyStatus("live".to_string()),
+            }),
+            ext: None,
+        }
+    }
+
+    pub struct Built {
+        pub state: IndexState,
+        pub params: IndexParams,
+        pub root: SigningKey,
+        pub online: SigningKey,
+    }
+
+    pub fn params() -> IndexParams {
+        IndexParams {
+            root_vk: sk(3).verifying_key(),
+            slug: "default".to_string(),
+        }
+    }
+
+    pub fn key_auth(root: &SigningKey, online: &[SigningKey], version: u64) -> KeyAuth {
+        let body = KeyAuthBody {
+            version,
+            authorized: online.iter().map(|k| k.verifying_key()).collect(),
+        };
+        KeyAuth {
+            sig: sign(&body, root),
+            body,
+        }
+    }
+
+    /// A verifying state: root key 3, online key 4, slug `default`.
+    pub fn build(entries: Vec<IndexEntry>) -> Built {
+        let root = sk(3);
+        let online = sk(4);
+        let mut state = IndexState {
+            key_auth: Some(key_auth(&root, std::slice::from_ref(&online), 1)),
+            ..IndexState::default()
+        };
+        for e in entries {
+            let body = RecordBody::Live(e);
+            let sid = body.subject_id().clone();
+            state.records.insert(
+                sid,
+                SignedRecord {
+                    sig: sign(&body, &online),
+                    by: online.verifying_key(),
+                    body,
+                },
+            );
+        }
+        let b = Built {
+            state,
+            params: params(),
+            root,
+            online,
+        };
+        b.state.verify(&b.params).expect("fixture state verifies");
+        b
+    }
+
+    pub fn encode(state: &IndexState) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(state, &mut buf).unwrap();
+        buf
+    }
 }

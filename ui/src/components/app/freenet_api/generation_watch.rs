@@ -2845,7 +2845,12 @@ mod tests {
             "a pointer subscribe must never ask for a room re-PUT"
         );
 
-        let dispatch = src(include_str!("response_handler.rs"));
+        // Whitespace-insensitive: rustfmt wraps the condition as other
+        // readers (the public viewer, Discover) are added to it.
+        let dispatch = src(include_str!("response_handler.rs"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             dispatch.contains("subscribed && !is_pointer"),
             "a pointer subscribe must not trigger the room re-GET"

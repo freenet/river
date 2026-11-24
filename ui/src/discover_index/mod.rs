@@ -47,7 +47,7 @@ use freenet_migrate::{
 };
 use freenet_stdlib::prelude::{ContractInstanceId, Parameters, UpdateData};
 
-use atlas::{search, IndexParams, IndexState, RoomFilter, RoomHit};
+use atlas::{search, IndexParams, IndexState, RoomFilter, RoomHit, Stamp};
 
 /// Atlas's root identity: the trust anchor for its pointer records AND the
 /// root key of the index itself (FREENET.md, "The author verifying key").
@@ -58,6 +58,9 @@ pub const POINTER_APP_ID: &[u8] = b"atlas.index-contract";
 /// The main index (`IndexParams::slug`).
 pub const INDEX_SLUG: &str = "default";
 
+/// At most one delta-triggered re-GET per this long; deltas in between are
+/// folded into one more read when it passes.
+const REFETCH_COALESCE_MS: u64 = 5_000;
 /// How long a request may go unanswered before it counts as failed.
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
 /// Failed attempts before a retryable failure is shown instead of "Loading".
@@ -97,8 +100,19 @@ pub enum DiscoverIndex {
     Unavailable(Unavailable),
     /// Verified, safe-search-filtered room listings, best first.
     Ready(Vec<RoomHit>),
-    /// A verified index with no room that passes the filter.
+    /// A verified index with no room listed at all.
     Empty,
+    /// A verified index that lists rooms, none of which safe search lets
+    /// through (unclassified, or not `general`). Not the same as `Empty`.
+    Hidden,
+}
+
+impl DiscoverIndex {
+    /// Whether this is a verified answer about the index (as opposed to
+    /// `Loading` or a failure).
+    pub fn is_answer(&self) -> bool {
+        matches!(self, Self::Ready(_) | Self::Empty | Self::Hidden)
+    }
 }
 
 /// Session-only. Never persisted.
@@ -178,19 +192,36 @@ pub fn map_pointer_outcome(
     }
 }
 
-/// Decode, verify and filter one served index state.
-pub fn view_from_state(bytes: &[u8], params: &IndexParams) -> Result<DiscoverIndex, Unavailable> {
+/// Decode, verify and filter one served index state, with its [`Stamp`].
+pub fn read_state(
+    bytes: &[u8],
+    params: &IndexParams,
+) -> Result<(DiscoverIndex, Stamp), Unavailable> {
     let state = IndexState::decode(bytes)
         .map_err(|e| Unavailable::IndexInvalid(format!("cannot decode: {e}")))?;
     state
         .verify(params)
         .map_err(|e| Unavailable::IndexInvalid(format!("not verified: {e}")))?;
     let hits = search(&state, &RoomFilter::default());
-    Ok(if hits.is_empty() {
-        DiscoverIndex::Empty
-    } else {
+    let view = if !hits.is_empty() {
         DiscoverIndex::Ready(hits)
-    })
+    } else {
+        let all = RoomFilter {
+            safe_search: false,
+            ..RoomFilter::default()
+        };
+        if search(&state, &all).is_empty() {
+            DiscoverIndex::Empty
+        } else {
+            DiscoverIndex::Hidden
+        }
+    };
+    Ok((view, state.stamp()))
+}
+
+/// [`read_state`] without the stamp.
+pub fn view_from_state(bytes: &[u8], params: &IndexParams) -> Result<DiscoverIndex, Unavailable> {
+    read_state(bytes, params).map(|(v, _)| v)
 }
 
 /// A good list is never replaced by a later failure; anything else takes the
@@ -220,6 +251,8 @@ pub enum Timer {
     Timeout(u64),
     /// Time to ask again for the request that failed at this epoch.
     Retry(u64),
+    /// The coalescing window after a delta-triggered re-GET has passed.
+    RefetchDone(u64),
 }
 
 /// A network answer about one of the two contracts this module reads.
@@ -261,6 +294,12 @@ pub struct Session {
     attempt: u32,
     active: bool,
     view: DiscoverIndex,
+    /// The newest index state accepted from the current index contract. An
+    /// older, validly signed state (a lagging peer) is refused.
+    stamp: Option<Stamp>,
+    refetching: bool,
+    refetch_pending: bool,
+    refetch_token: u64,
 }
 
 impl Session {
@@ -281,6 +320,10 @@ impl Session {
             attempt: 0,
             active: false,
             view: DiscoverIndex::Loading,
+            stamp: None,
+            refetching: false,
+            refetch_pending: false,
+            refetch_token: 0,
         })
     }
 
@@ -321,6 +364,10 @@ impl Session {
 
     fn ask_index(&mut self, id: ContractInstanceId, fx: &mut impl Effects) {
         self.phase = Phase::Index;
+        if self.index_id != Some(id) {
+            // Another contract: its states are not ordered against the old one's.
+            self.stamp = None;
+        }
         self.index_id = Some(id);
         fx.get(id, true);
         self.arm_timeout(fx);
@@ -334,11 +381,7 @@ impl Session {
         let was_active = std::mem::replace(&mut self.active, true);
         match (&self.view, self.index_id) {
             (DiscoverIndex::Loading, _) if was_active && self.epoch != 0 => {}
-            (DiscoverIndex::Ready(_) | DiscoverIndex::Empty, Some(id))
-                if self.phase == Phase::Index =>
-            {
-                self.ask_index(id, fx)
-            }
+            (v, Some(id)) if v.is_answer() && self.phase == Phase::Index => self.ask_index(id, fx),
             _ => {
                 self.attempt = 0;
                 if matches!(self.view, DiscoverIndex::Unavailable(_)) {
@@ -418,28 +461,69 @@ impl Session {
         if self.index_id.as_ref() != Some(id) {
             return;
         }
+        // While Discover is closed the subscription stays, but updates are not
+        // decoded and verified (up to 20,000 records on the main thread); the
+        // next `open` reads the state again.
+        if !self.active {
+            return;
+        }
         match answer {
             Answer::State(bytes) => {
-                self.epoch += 1;
-                self.attempt = 0;
-                let next = view_from_state(bytes, &self.params);
-                let v = merge_view(&self.view, next);
-                self.set_view(v, fx);
+                // Only an answer to the index request cancels its timers. One
+                // from an old subscription during the pointer phase must not
+                // cancel the pointer's timeout or retry.
+                if self.phase == Phase::Index {
+                    self.epoch += 1;
+                    self.attempt = 0;
+                }
+                match read_state(bytes, &self.params) {
+                    Ok((view, stamp)) => {
+                        if self.stamp.is_some_and(|s| stamp < s) {
+                            return;
+                        }
+                        self.stamp = Some(stamp);
+                        self.set_view(view, fx);
+                    }
+                    Err(e) => {
+                        let v = merge_view(&self.view, Err(e));
+                        self.set_view(v, fx);
+                    }
+                }
             }
             // A shown list stays; the retry loop only matters while there is
             // nothing to show.
             Answer::NotFound => {
-                if !matches!(self.view, DiscoverIndex::Ready(_) | DiscoverIndex::Empty) {
+                if !self.view.is_answer() {
                     self.fail(Unavailable::IndexNotFound, true, fx);
                 }
             }
-            // A delta is not applied here: the state is read again, a local
-            // read for a subscribed contract.
-            Answer::Delta => fx.get(*id, false),
+            // A delta is not applied here: the state is read again. Reads are
+            // coalesced to one per `REFETCH_COALESCE_MS`.
+            Answer::Delta => {
+                if self.refetching {
+                    self.refetch_pending = true;
+                } else {
+                    self.refetching = true;
+                    self.refetch_token += 1;
+                    fx.get(*id, false);
+                    fx.after(REFETCH_COALESCE_MS, Timer::RefetchDone(self.refetch_token));
+                }
+            }
         }
     }
 
     pub fn on_timer(&mut self, timer: Timer, fx: &mut impl Effects) {
+        if let Timer::RefetchDone(t) = timer {
+            if t == self.refetch_token {
+                self.refetching = false;
+                if std::mem::take(&mut self.refetch_pending) {
+                    if let Some(id) = self.index_id {
+                        self.on_answer(&id, Answer::Delta, fx);
+                    }
+                }
+            }
+            return;
+        }
         if !self.active {
             return;
         }
@@ -453,7 +537,7 @@ impl Session {
                     }
                 }
                 Phase::Index => {
-                    if !matches!(self.view, DiscoverIndex::Ready(_) | DiscoverIndex::Empty) {
+                    if !self.view.is_answer() {
                         self.fail(Unavailable::IndexNotFound, true, fx);
                     }
                 }
@@ -773,10 +857,17 @@ mod tests {
 
     #[test]
     fn a_record_from_an_unauthorized_key_is_refused() {
-        let (mut state, params, _) = golden_state();
-        state.key_auth.as_mut().unwrap().body.authorized.clear();
-        // The key_auth signature now fails first; either way it is invalid.
-        assert!(state.verify(&params).is_err());
+        use atlas::fixtures::*;
+        let b = build(vec![room(1, 1, "A", owner_b58(11))]);
+        let mut st = b.state.clone();
+        // key_auth stays valid and root-signed; the record is re-signed by a
+        // key it does not authorize.
+        let rogue = sk(9);
+        let rec = st.records.values_mut().next().unwrap();
+        rec.by = rogue.verifying_key();
+        rec.sig = sign(&rec.body, &rogue);
+        let err = st.verify(&b.params).unwrap_err();
+        assert!(err.contains("unauthorized key"), "{err}");
     }
 
     #[test]
@@ -1050,8 +1141,11 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with(golden_state().1)
+    }
+
+    fn rig_with(params: IndexParams) -> Rig {
         let sk = pointer_sk();
-        let (_, params, _) = golden_state();
         let s = Session::new(sk.verifying_key(), POINTER_APP_ID, params).unwrap();
         Rig {
             s,
@@ -1320,13 +1414,55 @@ mod tests {
 
     #[test]
     fn nothing_is_fetched_at_startup() {
-        // The only senders are reached from `open`/`on_timer`; no module-level
-        // initialiser or app startup refers to them.
-        let app = production_source("components/app.rs");
-        assert!(
-            !app.contains("discover_index::"),
-            "Discover must be fetched only when opened"
-        );
+        // Only R2's Discover view may call `open`. Nothing the app runs at
+        // startup (main, the App component, anything under components/app/)
+        // may, and no startup file may even name the module except the
+        // response handlers' hooks, which call `is_discover`/`deliver_*`.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = crate::util::source_scan::rust_files(&src_dir.join("components/app"));
+        files.push(src_dir.join("components/app.rs"));
+        files.push(src_dir.join("main.rs"));
+        for f in files {
+            let text = std::fs::read_to_string(&f).expect("readable");
+            let src = crate::util::source_scan::production_only(&text);
+            assert!(
+                !src.contains("discover_index::open"),
+                "{f:?} must not open Discover: it is fetched only when the view is opened"
+            );
+            let hooks = f.to_string_lossy().contains("response_handler");
+            if !hooks {
+                assert!(
+                    !src.replace("mod discover_index;", "")
+                        .contains("discover_index"),
+                    "{f:?} must not refer to the Discover reader"
+                );
+            }
+        }
+    }
+
+    /// The block opened right after `needle`, brace-matched (same helper
+    /// generation_watch pins its hooks with).
+    fn hook_block<'a>(src: &'a str, needle: &str) -> Option<&'a str> {
+        let at = src.find(needle)?;
+        let open = at + src[at..].find('{')?;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[open..open + i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn hook_block_exits(src: &str, needle: &str) -> bool {
+        hook_block(src, needle).is_some_and(|b| b.contains("return") || b.contains("continue"))
     }
 
     fn handler_source(rel: &str) -> String {
@@ -1336,6 +1472,8 @@ mod tests {
     #[test]
     fn every_response_path_offers_the_answer_to_discover_before_any_room_lookup() {
         let get = handler_source("response_handler/get_response.rs");
+        assert!(hook_block_exits(&get, "discover_index::deliver_state("));
+        assert!(hook_block_exits(&get, "discover_index::deliver_not_found("));
         let at = get
             .find("discover_index::deliver_state(")
             .expect("GET hook");
@@ -1356,9 +1494,29 @@ mod tests {
                     .find("get_owner_vk_for_instance_id(key.id())")
                     .expect("lookup")
         );
-        assert!(handler_source("response_handler/subscribe_response.rs")
-            .contains("discover_index::is_discover("));
-        assert!(handler_source("response_handler.rs").contains("discover_index::is_discover("));
+        let upd_fn = upd.find("pub fn handle_update_notification").unwrap();
+        assert!(hook_block_exits(
+            &upd[upd_fn..],
+            "discover_index::deliver_update("
+        ));
+        let sub = handler_source("response_handler/subscribe_response.rs");
+        assert!(
+            hook_block(&sub, "discover_index::is_discover(")
+                .is_some_and(|b| b.contains("return false")),
+            "a subscribe to the index must never ask for a room re-PUT"
+        );
+        assert!(
+            sub.find("discover_index::is_discover(").unwrap()
+                < sub.find("get_owner_vk_for_instance_id").unwrap()
+        );
+        let dispatch: String = handler_source("response_handler.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            dispatch.contains("&& !crate::discover_index::is_discover(key.id())"),
+            "an index subscribe must not trigger the room re-GET"
+        );
     }
 
     #[test]
@@ -1366,5 +1524,338 @@ mod tests {
         assert!(atlas_root_vk().is_some());
         assert_eq!(ATLAS_ROOT_VK_HEX.len(), 64);
         assert_eq!(&ATLAS_ROOT_VK_HEX[..8], "430b530d");
+    }
+
+    // ---- verification vectors (own keys) ---------------------------------------
+
+    #[test]
+    fn verify_strict_refuses_a_small_order_root_that_plain_verify_accepts() {
+        use ed25519_dalek::{Signature, Verifier};
+        // The identity point is a small-order key; with R = identity and S = 0
+        // the signature verifies for EVERY message under non-strict checking.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).expect("identity decompresses");
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[0] = 1;
+        let sig = Signature::from_bytes(&sig_bytes);
+        let body = atlas::KeyAuthBody {
+            version: 1,
+            authorized: vec![],
+        };
+        assert!(
+            weak.verify(&atlas::canonical(&body).unwrap(), &sig).is_ok(),
+            "the vector must fool plain `verify`, or it proves nothing"
+        );
+        let state = IndexState {
+            key_auth: Some(atlas::KeyAuth { body, sig }),
+            ..IndexState::default()
+        };
+        let params = IndexParams {
+            root_vk: weak,
+            slug: "default".into(),
+        };
+        let err = state.verify(&params).unwrap_err();
+        assert!(err.contains("key_auth signature"), "{err}");
+    }
+
+    #[test]
+    fn the_authorized_key_and_record_count_bounds_are_enforced() {
+        use atlas::fixtures::*;
+        let b = build(vec![room(1, 1, "A", owner_b58(11))]);
+        // 33 authorized keys, validly root-signed.
+        let keys: Vec<_> = (0..33u8).map(|i| sk(100 + i)).collect();
+        let mut st = b.state.clone();
+        st.key_auth = Some(key_auth(&b.root, &keys, 1));
+        let err = st.verify(&b.params).unwrap_err();
+        assert!(err.contains("too many keys"), "{err}");
+        // 20,001 records (the count is checked before any record is read).
+        let mut st = b.state.clone();
+        let one = st.records.values().next().unwrap().clone();
+        for i in 0..20_001 {
+            st.records.insert(sid_str(&format!("s{i}")), one.clone());
+        }
+        let err = st.verify(&b.params).unwrap_err();
+        assert!(err.contains("too many records"), "{err}");
+    }
+
+    #[test]
+    fn a_record_filed_under_the_wrong_subject_id_is_refused() {
+        use atlas::fixtures::*;
+        let b = build(vec![room(1, 1, "A", owner_b58(11))]);
+        let mut st = b.state.clone();
+        let rec = st.records.values().next().unwrap().clone();
+        st.records.clear();
+        st.records.insert(sid(99), rec);
+        let err = st.verify(&b.params).unwrap_err();
+        assert!(err.contains("wrong subject id"), "{err}");
+    }
+
+    #[test]
+    fn a_weak_owner_key_is_never_listed() {
+        use atlas::fixtures::*;
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = bs58::encode(identity).into_string();
+        let b = build(vec![
+            room(1, 1, "Weak", weak),
+            room(2, 1, "Good", owner_b58(12)),
+        ]);
+        let titles: Vec<_> = search(&b.state, &RoomFilter::default())
+            .into_iter()
+            .map(|h| h.title)
+            .collect();
+        assert_eq!(titles, ["Good"]);
+    }
+
+    #[test]
+    fn a_title_match_outranks_a_tag_match_outranks_a_snippet_match() {
+        use atlas::fixtures::*;
+        let mut a = room(1, 1, "Zeta club", owner_b58(11));
+        a.added_at = 1;
+        let mut b = room(2, 1, "Other", owner_b58(12));
+        b.tags = vec!["zeta".into()];
+        b.featured = true;
+        b.added_at = 5;
+        let mut c = room(3, 1, "Third", owner_b58(13));
+        c.snippet = "all about zeta".into();
+        c.featured = true;
+        c.added_at = 9;
+        let built = build(vec![c, b, a]);
+        let f = RoomFilter {
+            query: Some("ZETA".into()),
+            ..RoomFilter::default()
+        };
+        let titles: Vec<_> = search(&built.state, &f)
+            .into_iter()
+            .map(|h| h.title)
+            .collect();
+        assert_eq!(titles, ["Zeta club", "Other", "Third"]);
+    }
+
+    #[test]
+    fn displayed_text_loses_control_and_bidi_characters_and_is_bounded() {
+        use atlas::fixtures::*;
+        let mut e = room(1, 1, "Hi\u{202E}evil\u{0007}\u{200B}!", owner_b58(11));
+        e.snippet = "é".repeat(600);
+        e.tags = vec!["a\u{2066}b".into()];
+        let b = build(vec![e]);
+        let h = &search(&b.state, &RoomFilter::default())[0];
+        assert_eq!(h.title, "Hievil!");
+        assert!(h.snippet.len() <= 500 && h.snippet.chars().all(|c| c == 'é'));
+        assert_eq!(h.tags, ["ab"]);
+    }
+
+    #[test]
+    fn rooms_that_safe_search_hides_are_hidden_not_empty() {
+        use atlas::fixtures::*;
+        let mut e = room(1, 1, "Unclassified", owner_b58(11));
+        e.class = None;
+        let b = build(vec![e]);
+        let bytes = encode(&b.state);
+        assert_eq!(
+            view_from_state(&bytes, &b.params),
+            Ok(DiscoverIndex::Hidden)
+        );
+    }
+
+    #[test]
+    fn the_index_id_for_atlas_code_hash_and_root_is_pinned() {
+        let hash: [u8; 32] =
+            unhex("ee6713f87a43f870f8c697f1749b4e367cb3dd2d5affb9d7a51cd27dce12647b")
+                .try_into()
+                .unwrap();
+        let params = IndexParams {
+            root_vk: atlas_root_vk().unwrap(),
+            slug: INDEX_SLUG.into(),
+        };
+        // blake3(code_hash || root_vk || "default"), computed independently
+        // with b3sum and base58-encoded.
+        assert_eq!(
+            index_id(&hash, &params).to_string(),
+            "2fX8DTqY59Gi4DhUNUF5WuoKwk9vDQStM4ibaP5wqqCt"
+        );
+    }
+
+    // ---- the session around the pointer floor and ordering ----------------------
+
+    impl Rig {
+        fn answer_pointer_with(&mut self, version: u32, hash: [u8; 32]) {
+            let rec = signed_record(&self.sk, version, hash);
+            let id = self.pointer_id();
+            self.s.on_answer(&id, Answer::State(&rec), &mut self.fx);
+        }
+
+        /// Fail the index request until the failure is shown.
+        fn surface_index_not_found(&mut self) {
+            let idx = self.idx();
+            for _ in 0..SURFACE_AFTER {
+                self.s.on_answer(&idx, Answer::NotFound, &mut self.fx);
+                if let Timer::Retry(e) = self.last_timer() {
+                    self.s.on_timer(Timer::Retry(e), &mut self.fx);
+                }
+            }
+            assert_eq!(
+                self.fx.views.last(),
+                Some(&DiscoverIndex::Unavailable(Unavailable::IndexNotFound))
+            );
+        }
+    }
+
+    #[test]
+    fn a_reopen_that_is_served_an_older_pointer_keeps_the_index_it_resolved() {
+        let mut r = rig();
+        r.s.open(&mut r.fx);
+        r.answer_pointer_with(2, r.index_hash);
+        let kept = r.idx();
+        r.surface_index_not_found();
+        r.s.open(&mut r.fx);
+        assert_eq!(*r.fx.gets.last().unwrap(), (r.pointer_id(), false));
+        // A peer now serves the older v1 record, naming another code hash.
+        let older = [1u8; 32];
+        r.answer_pointer_with(1, older);
+        assert_eq!(
+            *r.fx.gets.last().unwrap(),
+            (kept, true),
+            "the floor refused v1 and the verified hash was kept"
+        );
+        assert!(r
+            .fx
+            .gets
+            .iter()
+            .all(|(g, _)| *g != index_id(&older, &r.s.params)));
+    }
+
+    #[test]
+    fn a_withdrawn_pointer_is_not_resurrected_by_a_replayed_record() {
+        let mut r = rig();
+        r.s.open(&mut r.fx);
+        r.answer_pointer_with(2, r.index_hash);
+        r.surface_index_not_found();
+        r.s.open(&mut r.fx);
+        r.answer_pointer_with(3, [0u8; 32]);
+        assert_eq!(
+            r.fx.views.last(),
+            Some(&DiscoverIndex::Unavailable(Unavailable::PointerWithdrawn))
+        );
+        // Reopen, and a peer replays the genuine pre-withdrawal v2 record.
+        r.s.open(&mut r.fx);
+        let n = r.fx.gets.len();
+        assert_eq!(r.fx.gets[n - 1], (r.pointer_id(), false));
+        r.answer_pointer_with(2, r.index_hash);
+        assert_eq!(r.fx.gets.len(), n, "no index request after a replay");
+        assert!(!matches!(r.fx.views.last(), Some(DiscoverIndex::Ready(_))));
+    }
+
+    #[test]
+    fn an_old_subscription_state_during_the_pointer_phase_keeps_the_pointer_timer() {
+        let mut r = rig();
+        r.s.open(&mut r.fx);
+        r.answer_pointer();
+        let idx = r.idx();
+        r.s.on_answer(&idx, Answer::State(b"junk"), &mut r.fx);
+        assert!(matches!(
+            r.fx.views.last(),
+            Some(DiscoverIndex::Unavailable(Unavailable::IndexInvalid(_)))
+        ));
+        // Reopening restarts from the pointer; its timeout is armed.
+        r.s.open(&mut r.fx);
+        let timeout = r.last_timer();
+        assert!(matches!(timeout, Timer::Timeout(_)));
+        // The old index subscription pushes a good state meanwhile.
+        let (bytes, _) = golden_bytes();
+        r.s.on_answer(&idx, Answer::State(&bytes), &mut r.fx);
+        // The pointer GET was lost: the timeout must still fire. Having
+        // resolved before, the session carries on with that verified index.
+        let n = r.fx.gets.len();
+        r.s.on_timer(timeout, &mut r.fx);
+        assert_eq!(r.fx.gets.len(), n + 1);
+        assert_eq!(*r.fx.gets.last().unwrap(), (idx, true));
+    }
+
+    #[test]
+    fn an_older_or_emptier_valid_state_never_replaces_a_newer_list() {
+        use atlas::fixtures::*;
+        let owner = owner_b58(11);
+        let state_at = |version: u64, title: &str| {
+            let b = build(vec![room(1, version, title, owner.clone())]);
+            encode(&b.state)
+        };
+        let v1 = state_at(1, "Old name");
+        let v2 = state_at(2, "New name");
+        let empty = encode(&build(vec![]).state);
+        let mut r = rig_with(params());
+        r.s.open(&mut r.fx);
+        r.answer_pointer();
+        let idx = r.idx();
+        let title = |r: &Rig| match r.s.view() {
+            DiscoverIndex::Ready(h) => h[0].title.clone(),
+            other => panic!("{other:?}"),
+        };
+        r.s.on_answer(&idx, Answer::State(&v2), &mut r.fx);
+        assert_eq!(title(&r), "New name");
+        r.s.on_answer(&idx, Answer::State(&v1), &mut r.fx);
+        assert_eq!(
+            title(&r),
+            "New name",
+            "a lagging peer's older state is refused"
+        );
+        r.s.on_answer(&idx, Answer::State(&empty), &mut r.fx);
+        assert_eq!(title(&r), "New name", "an older empty index is refused");
+        let v3 = state_at(3, "Newer name");
+        r.s.on_answer(&idx, Answer::State(&v3), &mut r.fx);
+        assert_eq!(title(&r), "Newer name");
+    }
+
+    #[test]
+    fn a_closed_discover_ignores_updates_and_reads_again_when_reopened() {
+        let mut r = rig();
+        r.s.open(&mut r.fx);
+        r.answer_pointer();
+        let idx = r.idx();
+        let (bytes, _) = golden_bytes();
+        r.s.on_answer(&idx, Answer::State(&bytes), &mut r.fx);
+        let shown = r.s.view().clone();
+        r.s.close();
+        let (gets, views) = (r.fx.gets.len(), r.fx.views.len());
+        r.s.on_answer(&idx, Answer::State(b"junk"), &mut r.fx);
+        r.s.on_answer(&idx, Answer::Delta, &mut r.fx);
+        r.s.on_answer(&idx, Answer::NotFound, &mut r.fx);
+        assert_eq!((r.fx.gets.len(), r.fx.views.len()), (gets, views));
+        assert_eq!(*r.s.view(), shown);
+        r.s.open(&mut r.fx);
+        assert_eq!(*r.fx.gets.last().unwrap(), (idx, true));
+    }
+
+    #[test]
+    fn a_burst_of_deltas_is_read_once_per_window() {
+        let mut r = rig();
+        r.s.open(&mut r.fx);
+        r.answer_pointer();
+        let idx = r.idx();
+        let (bytes, _) = golden_bytes();
+        r.s.on_answer(&idx, Answer::State(&bytes), &mut r.fx);
+        let n = r.fx.gets.len();
+        for _ in 0..5 {
+            r.s.on_answer(&idx, Answer::Delta, &mut r.fx);
+        }
+        assert_eq!(r.fx.gets.len(), n + 1, "five deltas, one read");
+        let Timer::RefetchDone(t) = r.last_timer() else {
+            panic!("a coalescing window is armed");
+        };
+        r.s.on_timer(Timer::RefetchDone(t), &mut r.fx);
+        assert_eq!(
+            r.fx.gets.len(),
+            n + 2,
+            "the deltas that arrived meanwhile are read once"
+        );
+        let Timer::RefetchDone(t2) = r.last_timer() else {
+            panic!("next window");
+        };
+        r.s.on_timer(Timer::RefetchDone(t2), &mut r.fx);
+        assert_eq!(r.fx.gets.len(), n + 2, "nothing pending, nothing read");
+        // A new delta after the window reads again.
+        r.s.on_answer(&idx, Answer::Delta, &mut r.fx);
+        assert_eq!(r.fx.gets.len(), n + 3);
     }
 }
