@@ -1155,6 +1155,7 @@ impl RoomWatch {
     }
 
     /// Whether `nonce` meets what the room now asks.
+    #[cfg(target_arch = "wasm32")]
     fn accepts(&self, nonce: u64) -> bool {
         let hash = river_core::room_state::provisional::pow_hash(
             &self.owner_vk,
