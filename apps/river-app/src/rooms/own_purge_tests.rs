@@ -1232,3 +1232,73 @@ fn a_token_taken_over_from_an_owed_take_back_is_taken_back_with_its_new_deletion
         "the deletion that took the token over took it back"
     );
 }
+
+/// A deletion of a token whose take-back is owed, when its own record cannot be written: it is
+/// not sent and the take-back stays owed, so the refused token is never left recorded and
+/// unsuppressed.
+#[test]
+fn an_owed_take_back_stays_owed_when_the_new_deletions_record_fails() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let token = msgs[0].purge_token();
+    let dir = dir("owed-stays");
+    let mut device = device(&dir, &msgs);
+    device.delete(&[token]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent");
+    break_storage(&dir);
+    let id = device.rooms.list[0].contract_id();
+    device.rooms.update_answered(&id, Err("refused".into()));
+    assert!(device.rooms.outbox.retry_takebacks(), "owed");
+    device.delete(&[token]);
+    let mut changed = false;
+    assert!(
+        device
+            .rooms
+            .outbox
+            .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+            .is_none(),
+        "not sent: its record cannot be written"
+    );
+    assert!(
+        device.rooms.outbox.retry_takebacks(),
+        "the take-back is still owed"
+    );
+}
+
+/// Pruning reads what the room holds and needs no permission to write: it happens for a room
+/// the user cannot write in, and a re-sign follows when the user can.
+#[test]
+fn pruning_does_not_wait_for_permission_to_write_but_a_re_sign_does() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let dir = dir("prune-blocked");
+    let mut device = device(&dir, &msgs);
+    let owner = owner_of(&device);
+    let me = device.me();
+    let gone = MemberId::from(&SigningKey::from_bytes(&[94; 32]).verifying_key());
+    let record = device.rooms.outbox.purge_record_mut();
+    record.record(&owner, gone, &[PurgeToken([2; 16])]).unwrap();
+    record.record(&owner, me, &[msgs[0].purge_token()]).unwrap();
+    // No key on this computer: the user cannot write in the room.
+    let sk = device.rooms.list[0].stored.self_sk.take();
+    device.rooms.own_purges_tick();
+    let own = PurgeRecord::open(&dir);
+    assert!(
+        own.for_room(&owner)
+            .unwrap()
+            .purged
+            .iter()
+            .all(|(r, _)| *r != gone),
+        "pruned while blocked"
+    );
+    assert!(device.rooms.outbox.is_empty(), "no re-sign while blocked");
+    // The key comes back, nothing else changed: the re-sign follows.
+    device.rooms.list[0].stored.self_sk = sk;
+    device.rooms.own_purges_tick();
+    assert!(device.rooms.outbox.heal_in_progress(&owner));
+}

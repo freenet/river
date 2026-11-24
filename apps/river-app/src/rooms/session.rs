@@ -2070,6 +2070,9 @@ struct Rooms {
     purge_tick_seen: HashMap<VerifyingKey, u64>,
     /// Rooms whose record is to be removed (the user left): retried until it is.
     purge_forget_owed: HashSet<VerifyingKey>,
+    /// Rooms where the user could not write when the tick last looked, so a re-sign waits (it is
+    /// looked at again every tick; pruning is not held up by it).
+    purge_heal_blocked: HashSet<VerifyingKey>,
     /// Failed storage work on the record of deletions waits until then to be tried again.
     purge_retry_at: Option<Instant>,
     /// A message was sent into a thread this copy of the archive list does not hold: the stored
@@ -3083,27 +3086,34 @@ impl Rooms {
             {
                 continue;
             }
-            // Only when what it depends on changed: the held envelope, the members, the room's
-            // configuration, the record. A room the user cannot write in is looked at again
-            // every tick, since what unblocks it (a key arriving) is not one of those.
+            // Only when what it depends on changed: the held envelope, who the user is, the
+            // members, the room's configuration, the record. Pruning needs no permission to
+            // write (it reads what the room holds); re-signing does, and a room the user cannot
+            // write in is looked at again every tick, since what unblocks it (a key arriving)
+            // is not one of those inputs.
             let seen = self.own_purges_fingerprint(room);
-            if self.purge_tick_seen.get(&vk) == Some(&seen) {
+            let same = self.purge_tick_seen.get(&vk) == Some(&seen);
+            if same && !self.purge_heal_blocked.contains(&vk) {
                 continue;
+            }
+            if !same {
+                self.purge_tick_seen.insert(vk, seen);
+                if let Err(e) = self
+                    .outbox
+                    .purge_record_mut()
+                    .prune(&vk, &room.stored.room_state)
+                {
+                    crate::diag!(
+                        "River: the record of your deletions was not pruned: {}",
+                        crate::diag::scrub(&e)
+                    );
+                }
             }
             if super::outbox::participation(room).is_err() {
+                self.purge_heal_blocked.insert(vk);
                 continue;
             }
-            self.purge_tick_seen.insert(vk, seen);
-            if let Err(e) = self
-                .outbox
-                .purge_record_mut()
-                .prune(&vk, &room.stored.room_state)
-            {
-                crate::diag!(
-                    "River: the record of your deletions was not pruned: {}",
-                    crate::diag::scrub(&e)
-                );
-            }
+            self.purge_heal_blocked.remove(&vk);
             let Some(record) = self.outbox.purge_record().for_room(&vk) else {
                 continue;
             };

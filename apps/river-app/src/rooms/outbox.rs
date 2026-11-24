@@ -3196,21 +3196,24 @@ impl Outbox {
                 // storage failed) is asked for again by this deletion: that take-back must not
                 // undo it, and the token is this deletion's now.
                 let me = work.envelope.recipient_id;
-                let mut taken_over = Vec::new();
-                for owed in &mut self.takeback_owed {
-                    if owed.1 == vk && owed.2 == me {
-                        owed.3.retain(|t| {
-                            let ours = work.tokens.contains(t);
-                            if ours {
-                                taken_over.push(*t);
-                            }
-                            !ours
-                        });
-                    }
-                }
-                self.takeback_owed.retain(|o| !o.3.is_empty());
+                let taken_over: Vec<PurgeToken> = self
+                    .takeback_owed
+                    .iter()
+                    .filter(|o| o.1 == vk && o.2 == me)
+                    .flat_map(|o| o.3.iter().copied())
+                    .filter(|t| work.tokens.contains(t))
+                    .collect();
                 match self.purge_record.record(&vk, me, &work.tokens) {
                     Ok(mut added) => {
+                        // Only now, with the record written, is the take-back given up: a
+                        // record that failed leaves it owed, so a refused token is never left
+                        // recorded and unsuppressed.
+                        for owed in &mut self.takeback_owed {
+                            if owed.1 == vk && owed.2 == me {
+                                owed.3.retain(|t| !work.tokens.contains(t));
+                            }
+                        }
+                        self.takeback_owed.retain(|o| !o.3.is_empty());
                         added.extend(taken_over);
                         added.sort();
                         added.dedup();
