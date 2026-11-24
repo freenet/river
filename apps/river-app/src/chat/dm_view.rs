@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 
 use rune::tok::TextStyle;
 use rune::{El, ScrollSpec, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Kit, ScrollBar};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar, ScrollBarStyle};
 
 use super::Chat;
 use super::conversation::{day_divider, message_body};
@@ -1177,7 +1177,11 @@ fn history(chat: &Chat, shown: &Shown<'_>, hydrated: bool, p: &Palette, k: &Kit)
             .label("Conversation history")
             .scroll_edge_fade(40.0)
             .on_at_bottom(|s: &mut RiverApp, at| s.chat.dm.at_bottom = at)
-            .scroll_bar(k),
+            .on_scroll_offset({
+                let at = chat.history_offset.clone();
+                move |p| at.set(p.offset[1])
+            })
+            .scroll_bar_styled(ScrollBarStyle::scroll_view(k)),
     );
     if !chat.dm.at_bottom {
         frame = frame.child(

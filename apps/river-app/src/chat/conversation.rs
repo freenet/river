@@ -2,7 +2,7 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
-use rune_kit::{Kit, ScrollBar};
+use rune_kit::{Kit, ScrollBar, ScrollBarStyle};
 
 use super::emoji;
 use super::icons;
@@ -263,7 +263,11 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
                 .label("Conversation history")
                 .scroll_edge_fade(40.0)
                 .on_at_bottom(|s: &mut RiverApp, at| s.chat.at_bottom = at)
-                .scroll_bar(k),
+                .on_scroll_offset({
+                    let at = chat.history_offset.clone();
+                    move |p| at.set(p.offset[1])
+                })
+                .scroll_bar_styled(ScrollBarStyle::scroll_view(k)),
         );
     // Latest: the web UI's round button in the corner, while the newest message is off screen.
     if !chat.at_bottom {

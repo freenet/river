@@ -309,6 +309,10 @@ pub struct Chat {
     /// Whether the open room's history shows its newest message (the Latest button hides
     /// then). Reported by the history's scroll area.
     pub at_bottom: bool,
+    /// Where the open history (the room's, or the direct-message thread's) is scrolled to, in
+    /// points from its top. Written by the history's scroll area, read by the arrow keys
+    /// (`history_arrow`), which move it by a line.
+    pub history_offset: std::rc::Rc<std::cell::Cell<f32>>,
     /// The "N people joined" lines (by `Join::key`) opened to show who, as the web UI's
     /// `details` does. Not kept across runs.
     pub joins_open: std::collections::HashSet<String>,
@@ -514,6 +518,7 @@ impl Chat {
             mention_sel: (String::new(), 0),
             mention_off: None,
             at_bottom: true,
+            history_offset: Default::default(),
             joins_open: Default::default(),
             member_modal: None,
             member_modal_full: None,
@@ -1163,8 +1168,9 @@ impl Chat {
     /// when a control in it has focus): closes the emoji picker, then abandons a reply or an
     /// edit. Does nothing while a dialog or the narrow members panel is open, which take their
     /// own Escape. Returns whether it acted.
-    pub fn escape(&mut self) -> bool {
-        let covered_by_other = self.form.open.is_some()
+    /// A dialog, menu or picker is open over the window.
+    fn dialog_open(&self) -> bool {
+        self.form.open.is_some()
             || self.member_modal.is_some()
             || self.details.is_some()
             || self.notify_dialog.is_some()
@@ -1174,7 +1180,48 @@ impl Chat {
             || self.overview
             || self.shortcuts_open
             || self.link_menu.is_some()
-            || self.picker.is_some();
+            || self.picker.is_some()
+    }
+
+    /// Up and Down scroll the open history by a line, as they scroll a web page, while nothing
+    /// has keyboard focus (`tx.focused()` is none: the window hears a key first only then) and no
+    /// dialog, popup or overlay is open. A click on message text leaves nothing focused (text
+    /// is selectable, so it does not take focus), and this is what the arrows do then. With the
+    /// history itself focused rune scrolls it, and a field keeps its own arrows.
+    pub fn history_arrow(&mut self, ev: &rune::KeyEvent, tx: &mut rune::Tx) -> bool {
+        const LINE: f32 = 40.0;
+        let step = match ev.key {
+            rune::Key::Up => -LINE,
+            rune::Key::Down => LINE,
+            _ => return false,
+        };
+        // A direct-message thread's own box counts as nothing while it is empty: it has no
+        // Up-to-edit, and a click in the thread leaves the box focused (rune does not blur a box
+        // focused by `open_dm`), so the thread's arrows must work from there.
+        let in_empty_dm_box = tx.focused() == Some("dm-composer-field")
+            && self.dm.is_open()
+            && self.dm_draft_is_empty();
+        if ev.mods != rune::Mods::default()
+            || (tx.focused().is_some() && !in_empty_dm_box)
+            || self.dialog_open()
+            || self.members_overlay
+            || self.emoji_open
+        {
+            return false;
+        }
+        let key = if let Some((room, uid)) = self.dm.open_key() {
+            dm_view::scroll_key(room, uid)
+        } else if let Some(room) = self.room() {
+            format!("history-scroll-{}", room.key)
+        } else {
+            return false;
+        };
+        tx.scroll_to_y(key, (self.history_offset.get() + step).max(0.0));
+        true
+    }
+
+    pub fn escape(&mut self) -> bool {
+        let covered_by_other = self.dialog_open();
         // The members box, when its field has the keyboard, takes Escape first, even inside a
         // narrow window's overlay: the first press closes the box, the next closes the overlay.
         if !covered_by_other && self.member_search_escape(true) {

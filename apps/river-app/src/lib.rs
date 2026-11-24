@@ -3026,6 +3026,9 @@ pub fn spec() -> AppSpec<RiverApp> {
             if s.chat.app_key(ev, tx) {
                 return true;
             }
+            if s.chat.history_arrow(ev, tx) {
+                return true;
+            }
             ev.key == rune::Key::Escape && s.chat.escape()
         }),
         ..AppSpec::new("River", WINDOW_SIZE, RiverApp::detached, view)
