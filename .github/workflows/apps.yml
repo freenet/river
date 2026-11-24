@@ -129,7 +129,9 @@ jobs:
   # Format, clippy and unit tests. The screen renders and the self-update checks
   # are separate jobs below so the three run in parallel: run in sequence they
   # took about 20 minutes on main and hit the 30-minute limit on branches. All
-  # three share one rust-cache key, since the dependencies they build are the same.
+  # three restore one rust-cache key; only this job saves it, because it builds the
+  # most (dev-dependencies, clippy, tests). A faster job saving first would store a
+  # cache without those and every later run would rebuild them here.
   desktop:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -190,6 +192,8 @@ jobs:
         with:
           workspaces: apps
           shared-key: apps-desktop
+          # Restore only: the desktop job saves this key (see the comment above it).
+          save-if: false
 
       # Render every named screen (setup and chat) and keep the PNGs for review. This
       # fails when rendering panics or writes nothing; it does not compare
@@ -236,8 +240,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Rune links libxkbcommon and libwayland-client at build time; the
-      # software Vulkan driver lets the headless renderer run with no GPU.
+      # Rune links libxkbcommon and libwayland-client at build time. This job renders
+      # nothing; it installs the same packages as the other two so the builds match.
       - name: Install system libraries
         run: |
           sudo apt-get update
@@ -251,6 +255,8 @@ jobs:
         with:
           workspaces: apps
           shared-key: apps-desktop
+          # Restore only: the desktop job saves this key (see the comment above it).
+          save-if: false
 
       # River's self-update against a local server with a throwaway key: a current manifest
       # is "up to date", and tampered, unsigned, wrongly signed and replayed manifests are
