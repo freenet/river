@@ -1299,9 +1299,14 @@ impl Work {
         self.active_ref().is_some()
     }
 
-    /// Whether the working task has a request out.
+    /// Whether the working task has a request out whose answer or error another request's could
+    /// be taken for. A read of an earlier chat delegate is not one: its answers name that
+    /// delegate, its errors are typed delegate errors (an error that names nothing is never a
+    /// delegate's: a delegate runs on the node itself, with no ring), and an `Unhandled` is taken
+    /// for it only when nothing else is out.
     pub fn has_out(&self) -> bool {
-        self.active_ref().is_some_and(|t| t.out.is_some())
+        self.active_ref()
+            .is_some_and(|t| t.out.as_ref().is_some_and(|(o, _)| !matches!(o, Out::Pred(_))))
     }
 
     /// Whether a task is working on the room owned by `owner`, so nothing else may be sent to

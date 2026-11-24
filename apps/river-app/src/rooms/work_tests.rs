@@ -1794,6 +1794,23 @@ mod importing {
             panic!("a GET");
         };
         assert!(w.on_contract(&ContractResponse::NotFound { instance_id: id }));
+        // The current key has no state: the room's earlier contract keys are read, newest
+        // first, and none holds it either (freenet/river#889).
+        let owner = world.owner.verifying_key();
+        let earlier: Vec<ContractInstanceId> =
+            river_core::migration::legacy_contract_keys_for_owner(&owner)
+                .iter()
+                .map(|k| *k.id())
+                .collect();
+        let mut read = Vec::new();
+        while let Some(ClientRequest::ContractOp(ContractRequest::Get { key, subscribe, .. })) =
+            w.next_request(false, Instant::now())
+        {
+            assert!(!subscribe);
+            read.push(key);
+            assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+        }
+        assert_eq!(read, earlier);
         let (why, retry) = failed(&w);
         assert!(why.contains("couldn't find this room"), "{why}");
         assert!(retry);
