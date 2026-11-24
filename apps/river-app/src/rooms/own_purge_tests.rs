@@ -946,12 +946,21 @@ fn a_re_signed_envelope_the_room_did_not_keep_is_dropped() {
         .outbox
         .next_update(&d.rooms.list[0], Instant::now(), &mut changed)
         .expect("sent");
-    // Meanwhile a higher-ranked envelope reached this device.
+    // Meanwhile a higher-ranked envelope reached this device: two versions above the winner,
+    // so it outranks our re-signed one whatever the signature digests are.
     let held = node.state.direct_messages.purges[0].clone();
-    let next = river_core::room_state::direct_messages::advance_recipient_purges(
-        &Fixture::new().me,
+    let sk = Fixture::new().me;
+    let two = river_core::room_state::direct_messages::advance_recipient_purges(
+        &sk,
         &owner,
         Some(&held),
+        [PurgeToken([8; 16])],
+    )
+    .unwrap();
+    let next = river_core::room_state::direct_messages::advance_recipient_purges(
+        &sk,
+        &owner,
+        Some(&two),
         [PurgeToken([9; 16])],
     )
     .unwrap();
@@ -974,7 +983,7 @@ fn a_re_signed_envelope_the_room_did_not_keep_is_dropped() {
     // The winning version is one this run has signed against already, so the tick derives
     // nothing new and only the dropping shows.
     let me = devices[loser].me();
-    devices[loser].rooms.healed_run.insert(owner, vec![(me, 2)]);
+    devices[loser].rooms.healed_run.insert(owner, vec![(me, 3)]);
     devices[loser].rooms.own_purges_tick();
     assert!(devices[loser].rooms.outbox.is_empty(), "dropped");
 }
@@ -1007,38 +1016,53 @@ fn a_sent_deletion_that_was_stopped_says_it_may_still_be_signed() {
 
 // What the tick reads: each input of the fingerprint, changed on its own, makes it look again.
 
-/// With the user not listed nothing is re-signed; when they are listed again the tick looks
-/// again and signs (the record and the envelopes are as they were).
+/// A recipient the room lists is kept; when the room stops listing them, the tick looks again
+/// (the record, the envelopes and the configuration are as they were) and drops their entry.
 #[test]
 fn a_change_of_members_makes_the_tick_look_again() {
     let f = Fixture::new();
     let msgs = messages(&f, 1);
-    let mut device = device(&dir("members"), &msgs);
+    let dir = dir("members");
+    let mut device = device(&dir, &msgs);
     let owner = owner_of(&device);
-    let me = device.me();
-    device
-        .rooms
-        .outbox
-        .purge_record_mut()
-        .record(&owner, me, &[msgs[0].purge_token()])
-        .unwrap();
-    let listed = device.rooms.list[0]
-        .stored
-        .room_state
-        .members
-        .members
-        .clone();
+    let other = SigningKey::from_bytes(&[96; 32]);
+    let other_id = MemberId::from(&other.verifying_key());
+    let listed = river_core::room_state::member::AuthorizedMember::new(
+        river_core::room_state::member::Member {
+            owner_member_id: f.owner_id(),
+            invited_by: f.owner_id(),
+            member_vk: other.verifying_key(),
+        },
+        &f.owner,
+    );
     device.rooms.list[0]
         .stored
         .room_state
         .members
         .members
-        .clear();
+        .push(listed);
+    device
+        .rooms
+        .outbox
+        .purge_record_mut()
+        .record(&owner, other_id, &[PurgeToken([6; 16])])
+        .unwrap();
     device.rooms.own_purges_tick();
-    assert!(device.rooms.outbox.is_empty());
-    device.rooms.list[0].stored.room_state.members.members = listed;
+    assert!(
+        PurgeRecord::open(&dir).for_room(&owner).is_some(),
+        "listed: kept"
+    );
+    device.rooms.list[0]
+        .stored
+        .room_state
+        .members
+        .members
+        .retain(|m| m.member.id() != other_id);
     device.rooms.own_purges_tick();
-    assert!(device.rooms.outbox.heal_in_progress(&owner));
+    assert!(
+        PurgeRecord::open(&dir).for_room(&owner).is_none(),
+        "not listed: dropped"
+    );
 }
 
 /// Pruning needs a configuration the owner signed: when it becomes valid the tick looks again.
