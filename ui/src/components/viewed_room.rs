@@ -5,6 +5,7 @@ use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{CURRENT_ROOM, ROOMS, SYNC_STATUS};
 use crate::components::room_list::edit_room_modal::CopyButton;
+use crate::public_join::{self, offers_join, JoinPhase, JOIN};
 use crate::public_room::{
     close, composer_note, fetch_action, public_room_link, request_fetch, request_subscribe, retry,
     FetchAction, ViewedRoom, ViewedRoomStatus, VIEWED_ROOM,
@@ -265,6 +266,8 @@ fn PublicRoomView(
     let link = owner_vk.map(|vk| public_room_link(&vk));
     let note = composer_note(&state);
     let rows = lines(&state);
+    let can_join = offers_join(&state);
+    let queued = JOIN.try_read().ok().and_then(|j| j.queued.clone());
 
     rsx! {
         div { class: "flex items-start gap-3 px-4 py-3 border-b border-border",
@@ -307,19 +310,155 @@ fn PublicRoomView(
                     }
                 }
             }
+            if let Some(text) = queued {
+                div {
+                    class: "mb-3 opacity-60",
+                    "data-testid": "viewed-room-pending-message",
+                    div { class: "text-xs text-text-muted", "You, waiting to join" }
+                    div { class: "text-sm text-text whitespace-pre-wrap break-words", "{text}" }
+                }
+            }
         }
+        if can_join {
+            if let Some(owner) = owner_vk {
+                JoinComposer { owner_vk: owner, note: note.to_string() }
+            }
+        } else {
+            div { class: "px-4 py-3 border-t border-border",
+                textarea {
+                    class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text-muted opacity-60 cursor-not-allowed",
+                    "data-testid": "viewed-room-composer",
+                    disabled: true,
+                    rows: "1",
+                    placeholder: "Joining is required to post",
+                }
+                p {
+                    class: "mt-2 text-xs text-text-muted",
+                    "data-testid": "viewed-room-composer-note",
+                    "{note}"
+                }
+            }
+        }
+    }
+}
+
+/// The composer of a public room that admits by proof of work: Join, or type
+/// and Send. Sending before admission queues the message, shown as pending
+/// above; it posts once admission completes.
+#[component]
+fn JoinComposer(owner_vk: ed25519_dalek::VerifyingKey, note: String) -> Element {
+    let mut draft = use_signal(String::new);
+
+    // A queued message handed back after a failure or cancel returns to the
+    // draft in front of what was typed since. The clear is synchronous: a
+    // deferred one would re-run this effect forever.
+    use_effect(move || {
+        crate::util::signal_guard::anchor();
+        let Ok(j) = JOIN.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return;
+        };
+        if let Some(back) = j.returned.clone() {
+            drop(j);
+            let current = draft.peek().clone();
+            draft.set(public_join::restore_draft(&current, Some(&back)));
+            JOIN.with_mut(|w| w.returned = None);
+        }
+    });
+
+    let phase = match JOIN.try_read() {
+        Ok(j) => j.phase.clone(),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            JoinPhase::Idle
+        }
+    };
+    let busy = matches!(phase, JoinPhase::Solving { .. } | JoinPhase::Submitting);
+    let can_send = !draft.read().trim().is_empty() && phase != JoinPhase::Submitting;
+
+    let mut send = move || {
+        let text = draft.peek().clone();
+        if text.trim().is_empty() {
+            return;
+        }
+        draft.set(String::new());
+        crate::util::defer(move || public_join::send(owner_vk, text));
+    };
+
+    let (status_testid, status) = match &phase {
+        JoinPhase::Idle => ("viewed-room-join-idle", note.clone()),
+        JoinPhase::Solving { tried, expected } => (
+            "viewed-room-join-progress",
+            if *expected > 0.0 {
+                format!(
+                    "Joining: proving you are not a bot ({}%). You can keep writing.",
+                    ((*tried as f64 / expected) * 100.0).min(99.0) as u32
+                )
+            } else {
+                "Joining: proving you are not a bot. You can keep writing.".to_string()
+            },
+        ),
+        JoinPhase::Ready => (
+            "viewed-room-join-ready",
+            "Ready. Your first message makes you a member.".to_string(),
+        ),
+        JoinPhase::Submitting => ("viewed-room-join-submitting", "Posting...".to_string()),
+        JoinPhase::Failed(f) => ("viewed-room-join-error", f.message()),
+    };
+    let failed = matches!(phase, JoinPhase::Failed(_));
+    let retryable = matches!(&phase, JoinPhase::Failed(f) if f.retryable());
+    let can_start = matches!(phase, JoinPhase::Idle) || retryable;
+
+    rsx! {
         div { class: "px-4 py-3 border-t border-border",
-            textarea {
-                class: "w-full px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text-muted opacity-60 cursor-not-allowed",
-                "data-testid": "viewed-room-composer",
-                disabled: true,
-                rows: "1",
-                placeholder: "Joining is required to post",
+            div { class: "flex items-end gap-2",
+                textarea {
+                    class: "flex-1 px-3 py-2 bg-surface border border-border rounded-lg text-sm text-text",
+                    "data-testid": "viewed-room-composer",
+                    rows: "1",
+                    placeholder: "Write a message",
+                    value: "{draft}",
+                    oninput: move |evt| draft.set(evt.value()),
+                    onkeydown: move |evt| {
+                        if evt.key() == Key::Enter && !evt.modifiers().shift() {
+                            evt.prevent_default();
+                            send();
+                        }
+                    },
+                }
+                if can_start {
+                    button {
+                        r#type: "button",
+                        "data-testid": "viewed-room-join",
+                        class: "flex-shrink-0 px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text text-sm transition-colors",
+                        onclick: move |_| {
+                            crate::util::defer(move || public_join::start(owner_vk));
+                        },
+                        if failed { "Try again" } else { "Join" }
+                    }
+                }
+                button {
+                    r#type: "button",
+                    "data-testid": "viewed-room-send",
+                    class: "flex-shrink-0 px-3 py-2 bg-accent text-white rounded-lg text-sm disabled:opacity-50",
+                    disabled: !can_send,
+                    onclick: move |_| send(),
+                    "Send"
+                }
             }
             p {
-                class: "mt-2 text-xs text-text-muted",
-                "data-testid": "viewed-room-composer-note",
-                "{note}"
+                class: "mt-2 text-xs text-text-muted flex items-center gap-2",
+                "data-testid": "{status_testid}",
+                "{status}"
+                if busy && matches!(phase, JoinPhase::Solving { .. }) {
+                    button {
+                        r#type: "button",
+                        "data-testid": "viewed-room-join-cancel",
+                        class: "underline text-text-secondary",
+                        onclick: move |_| crate::util::defer(public_join::cancel),
+                        "Cancel"
+                    }
+                }
             }
         }
     }

@@ -206,11 +206,10 @@ pub fn classify_state(state: Option<ChatRoomStateV1>) -> ViewedRoomStatus {
 }
 
 /// What the composer's note says for a viewer. The room's own policy decides
-/// whether joining is on the way (step 2 of #975); this PR does not implement
-/// admission.
+/// whether joining is offered (`public_join::offers_join`).
 pub fn composer_note(state: &ChatRoomStateV1) -> &'static str {
-    if state.configuration.configuration.public_admission.is_some() {
-        "You are viewing this room read-only. Joining without an invitation is coming soon."
+    if crate::public_join::offers_join(state) {
+        "Join to post: your device does a little work to prove you are not a bot."
     } else {
         "You are viewing this room read-only. Joining needs an invitation from a member."
     }
@@ -369,6 +368,20 @@ fn set_status(owner_vk: VerifyingKey, status: ViewedRoomStatus) {
     });
 }
 
+/// Test hook support: change the viewed room's state in place. `false` when no
+/// public room is being viewed.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub fn edit_viewed_state(f: impl FnOnce(&mut ChatRoomStateV1)) -> bool {
+    let mut guard = VIEWED_ROOM.write();
+    match guard.as_mut().map(|v| &mut v.status) {
+        Some(ViewedRoomStatus::Public(state)) => {
+            f(state);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// What a `?room=` value opens: the room (waiting for the network) or the
 /// reason it was refused. Records what the response handlers match on.
 fn viewed_from_param(raw: &str) -> ViewedRoom {
@@ -431,6 +444,7 @@ fn initial_viewed_room() -> Option<ViewedRoom> {
 /// lasts until the socket closes.
 pub fn close() {
     crate::util::defer(|| {
+        crate::public_join::reset();
         set_mirror(None);
         let showing = VIEWED_ROOM.try_read().ok().is_some_and(|v| v.is_some());
         if showing {

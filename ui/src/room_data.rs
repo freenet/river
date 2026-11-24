@@ -1174,6 +1174,18 @@ impl RoomData {
             .contains(&self_id)
     }
 
+    /// Whether the room holds a provisional (proof-of-work) entry for this
+    /// identity: it joined a public room without an invitation.
+    pub fn is_self_provisional(&self) -> bool {
+        self.self_verifying_key().is_some_and(|vk| {
+            self.room_state
+                .provisional
+                .entries
+                .iter()
+                .any(|e| e.provisional.member_vk == vk)
+        })
+    }
+
     /// Check if the user can send a message in the room.
     /// A user is considered a member if they are the owner, are in the active
     /// members list, or have a stored invitation (self_authorized_member).
@@ -1219,6 +1231,11 @@ impl RoomData {
 
         // Has stored invite (can re-add with first message)
         if self.self_authorized_member.is_some() {
+            return Ok(());
+        }
+
+        // An open-admission member the room holds an entry for (#975).
+        if self.is_self_provisional() {
             return Ok(());
         }
 
@@ -1270,6 +1287,10 @@ impl RoomData {
 
         // Has stored invite (was previously a member, can re-add)
         if self.self_authorized_member.is_some() {
+            return Ok(());
+        }
+
+        if self.is_self_provisional() {
             return Ok(());
         }
 

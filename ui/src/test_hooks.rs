@@ -194,6 +194,35 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The room's owner bans the key the join in progress is using, as a
+    // provisional ban in the viewed state, as if learned from the network.
+    set_hook(
+        "banJoiner",
+        Closure::<dyn FnMut(String) -> bool>::new(move |kind: String| {
+            use river_core::room_state::member::MemberId;
+            use river_core::room_state::provisional::{AuthorizedProvisionalBan, ProvisionalBan};
+            let (Some(owner_sk), Some(vk)) = (
+                crate::example_data::fixture_owner_sk(&kind),
+                crate::public_join::session_member_vk(),
+            ) else {
+                return false;
+            };
+            let owner_vk = owner_sk.verifying_key();
+            crate::public_room::edit_viewed_state(move |state| {
+                state.provisional.bans.push(AuthorizedProvisionalBan::new(
+                    &owner_vk,
+                    ProvisionalBan {
+                        banned_by: MemberId::from(&owner_vk),
+                        banned_at: crate::util::get_current_system_time(),
+                        target: MemberId::from(&vk),
+                    },
+                    &owner_sk,
+                ));
+            })
+        })
+        .into_js_value(),
+    );
+
     set_hook(
         "takeMessageGroupRenders",
         Closure::<dyn FnMut() -> u32>::new(move || MESSAGE_GROUP_RENDERS.with(|n| n.replace(0)))

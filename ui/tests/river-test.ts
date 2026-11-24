@@ -23,7 +23,9 @@ type RiverTestHooks = {
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
   // Base58 owner key of an example room a ?room= link can open ("public" or "private"; "missing" is a valid key no room has). Not in the room list.
-  viewableRoomKey(kind: "public" | "private" | "missing" | "member"): string;
+  viewableRoomKey(kind: "public" | "private" | "missing" | "member" | "open" | "hard" | "full"): string;
+  // The owner of that open room bans the key the join in progress uses (a provisional ban). False if none.
+  banJoiner(kind: "open" | "hard" | "full"): boolean;
   // The current room under a new contract key, as a room-contract re-key leaves it.
   rekeyCurrentRoom(): void;
   // Show one mobile panel, as its buttons do, whatever covers them.

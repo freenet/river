@@ -302,11 +302,84 @@ pub fn viewable_fixtures() -> &'static [(&'static str, VerifyingKey, ChatRoomSta
         let mut config = private_state.configuration.configuration.clone();
         config.privacy_mode = river_core::room_state::privacy::PrivacyMode::Private;
         private_state.configuration = AuthorizedConfigurationV1::new(config, &private.owner_sk);
+        // Public rooms that admit by proof of work (#975). The bits are low so a
+        // test finishes at once, except `hard`, which a test cancels.
+        let open_room = |name: &str, seed: u8, bits: u8, max_provisional: u32| {
+            let room = create_room_with_owner(
+                &name.to_string(),
+                SelfIs::Observer,
+                Some("Join with a little proof of work."),
+                HistoryDepth::Standard,
+                Some([seed; 32]),
+            );
+            let mut state = room.room_data.room_state.clone();
+            let mut config = state.configuration.configuration.clone();
+            config.public_admission = Some(river_core::room_state::provisional::PublicRoomPolicy {
+                listed: false,
+                max_provisional,
+                max_provisional_messages: 4,
+                max_provisional_bans: 4,
+                pow: Some(river_core::room_state::provisional::PowPolicy {
+                    difficulty_bits: bits,
+                    epoch: 1,
+                }),
+            });
+            state.configuration = AuthorizedConfigurationV1::new(config, &room.owner_sk);
+            (room.owner_vk, state)
+        };
+        let (open_vk, open_state) = open_room("Open Join Room", 0x54, 4, 4);
+        let (hard_vk, hard_state) = open_room("Hard Join Room", 0x55, 26, 4);
+        let (full_vk, mut full_state) = open_room("Full Join Room", 0x56, 2, 1);
+        // The room's one open-member slot is held by an author whose message is
+        // newer than any a visitor can send, so a visitor's entry is dropped.
+        {
+            use crate::public_join::{build_submission, check_admission_status, entry_for_nonce};
+            use river_core::room_state::admission::{PowSolver, PowStep};
+            let holder = SigningKey::from_bytes(&[0x57; 32]);
+            let now = crate::util::get_current_system_time();
+            let req =
+                check_admission_status(&full_state, &full_vk, &holder.verifying_key(), None, now)
+                    .expect("the fixture admits");
+            let mut solver =
+                PowSolver::new(&full_vk, &holder.verifying_key(), &req, req.difficulty_bits);
+            let nonce = loop {
+                if let PowStep::Found { nonce, .. } = solver.step(1000) {
+                    break nonce;
+                }
+            };
+            let entry = entry_for_nonce(&full_vk, &holder, nonce);
+            let later = now + std::time::Duration::from_secs(86_400);
+            full_state = build_submission(
+                &full_state,
+                &full_vk,
+                &holder,
+                &entry,
+                "I hold the slot",
+                "Slot Holder",
+                later,
+            )
+            .expect("the first open member is admitted")
+            .state_after;
+        }
         vec![
             ("public", public.owner_vk, public.room_data.room_state),
             ("private", private.owner_vk, private_state),
+            ("open", open_vk, open_state),
+            ("hard", hard_vk, hard_state),
+            ("full", full_vk, full_state),
         ]
     })
+}
+
+/// The owner key of an open fixture room, so a test can act as its owner.
+pub fn fixture_owner_sk(kind: &str) -> Option<SigningKey> {
+    let seed = match kind {
+        "open" => 0x54,
+        "hard" => 0x55,
+        "full" => 0x56,
+        _ => return None,
+    };
+    Some(SigningKey::from_bytes(&[seed; 32]))
 }
 
 /// The fixture room whose owner key is `owner_vk`.
