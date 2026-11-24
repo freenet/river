@@ -326,8 +326,8 @@ fn join_el(chat: &Chat, j: &model::Join, p: &Palette) -> El {
         .w(GUTTER)
         .center()
         .child(icon(&icons::JOIN, 14.0).color(p.text_muted));
-    // Three or more are counted, not named: pressing the line (or Enter on it) lists them, as
-    // the web UI's `details` does, and the names are in its label and tooltip too.
+    // Three or more are counted, not named: pressing the line (or Space or Enter on it) lists
+    // them, as the web UI's `details` does, and the names are in its label and tooltip too.
     let names = j.names.join(", ");
     let counted = j.names.len() > 2;
     let open = counted && chat.joins_open.contains(&j.key);
@@ -341,28 +341,36 @@ fn join_el(chat: &Chat, j: &model::Join, p: &Palette) -> El {
         .child(icon_cell)
         .child(text);
     if counted {
-        let toggle = j.key.clone();
+        let toggle_key = j.key.clone();
+        let toggle = move |s: &mut RiverApp| {
+            if !s.chat.joins_open.remove(&toggle_key) {
+                s.chat.joins_open.insert(toggle_key.clone());
+            }
+        };
+        let on_enter = toggle.clone();
         line_row = line_row
             .role("button")
             .label(format!("{said} at {when}: {names}"))
             .help(names.clone())
+            .focusable(true)
             .cursor(rune::Cursor::Pointer)
-            .on_press(move |s: &mut RiverApp| {
-                if !s.chat.joins_open.remove(&toggle) {
-                    s.chat.joins_open.insert(toggle.clone());
+            .on_press(toggle)
+            // Space presses a focused control; Return is the app's to take.
+            .on_key(move |s: &mut RiverApp, ev, _| {
+                let enter = ev.key == rune::Key::Enter && ev.mods == rune::Mods::default();
+                if enter {
+                    on_enter(s);
                 }
+                enter
             });
     } else {
         line_row = line_row.label(format!("{said} at {when}"));
     }
-    if !open {
-        return line_row;
-    }
-    col()
-        .key(format!("{key}-open"))
-        .w_full()
-        .child(line_row)
-        .child(
+    // Always a column, so the line keeps its place in the tree (and the keyboard focus) when
+    // the names open under it.
+    let mut c = col().key(format!("{key}-item")).w_full().child(line_row);
+    if open {
+        c = c.child(
             row().w_full().pr(24.0).pb(3.0).child(el().w(GUTTER)).child(
                 label(names, st::JOIN, p.text_muted)
                     .key(format!("{key}-names"))
@@ -370,7 +378,9 @@ fn join_el(chat: &Chat, j: &model::Join, p: &Palette) -> El {
                     .shrink()
                     .selectable(true),
             ),
-        )
+        );
+    }
+    c
 }
 
 pub(super) fn day_divider(day: u32, text: String, p: &Palette) -> El {

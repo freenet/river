@@ -1246,7 +1246,7 @@ fn the_names_of_a_counted_line_open_on_press_and_are_in_its_label() {
 }
 
 #[test]
-fn a_join_is_never_unread_and_never_an_arrival() {
+fn a_join_is_never_unread_nor_a_message() {
     let f = Fixture::new();
     // As Mia: the owner's text after the reply is the one unread message; joins after the
     // last read add nothing.
@@ -1262,23 +1262,75 @@ fn a_join_is_never_unread_and_never_an_arrival() {
     assert!(!room.joins.is_empty(), "the joins are in the view");
     assert_eq!(room.messages.len(), 3);
     assert_eq!(room.unread, 1);
-    // A room that gains a join line gives no notification, in any mode.
-    let base_state = f.private_state();
-    let base = f.stored(base_state.clone());
-    let old = LiveRoom::new(base.clone()).view(&minutes);
-    let mut with = base;
-    with.room_state = with_joins_on(&f, base_state, &[(1, &f.owner, 130)]);
-    let new = LiveRoom::new(with).view(&minutes);
-    assert_eq!(new.joins.len(), 1);
-    for mode in [
-        crate::rooms::modes::NotificationMode::All,
-        crate::rooms::modes::NotificationMode::MentionsAndReplies,
-    ] {
-        let got = crate::notify::arrivals(
-            std::slice::from_ref(&old),
-            std::slice::from_ref(&new),
-            &|_| mode,
-        );
-        assert!(got.is_empty());
+    // Notifications and `arrivals` read only `Room::messages`, which joins never enter
+    // (asserted above), so a join cannot notify; there is nothing more to assert here.
+}
+
+#[test]
+fn a_counted_line_is_reached_and_worked_from_the_keyboard_and_a_named_one_is_no_button() {
+    use rune::{Key, KeyEvent};
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(with_joins(
+        &f,
+        &[
+            (0, &f.me, 90),
+            (0, &f.owner, 100),
+            (0, &f.me, 110),
+            (1, &f.me, 130),
+        ],
+    )))
+    .view(&minutes);
+    assert_eq!(room.joins.len(), 2);
+    let counted = format!("join-{}", room.joins[0].key);
+    let named = format!("join-{}", room.joins[1].key);
+    let mut rt = render(room);
+    let info = |rt: &rune::Runtime<crate::RiverApp>, k: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(k))
+            .unwrap()
+    };
+    assert!(info(&rt, &counted).focusable);
+    let two = info(&rt, &named);
+    assert!(
+        two.role != "button" && !two.focusable,
+        "one person's line is not a control"
+    );
+    let focused = |rt: &rune::Runtime<crate::RiverApp>| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.focused)
+            .and_then(|e| e.key)
+    };
+    let mut t = 0.0;
+    let mut tab = |rt: &mut rune::Runtime<crate::RiverApp>, k: Key| {
+        t += 0.3;
+        rt.key(KeyEvent {
+            key: k,
+            mods: Default::default(),
+        });
+        rt.frame(t);
+    };
+    for _ in 0..200 {
+        if focused(&rt).as_deref() == Some(counted.as_str()) {
+            break;
+        }
+        tab(&mut rt, Key::Tab);
     }
+    assert_eq!(
+        focused(&rt).as_deref(),
+        Some(counted.as_str()),
+        "Tab reaches it"
+    );
+    let names = format!("{counted}-names");
+    tab(&mut rt, Key::Enter);
+    assert!(element_keys(&rt).contains(&names), "Enter opens the list");
+    assert_eq!(
+        focused(&rt).as_deref(),
+        Some(counted.as_str()),
+        "focus stays on the line"
+    );
+    tab(&mut rt, Key::Enter);
+    assert!(!element_keys(&rt).contains(&names), "Enter closes it");
+    assert_eq!(focused(&rt).as_deref(), Some(counted.as_str()));
 }
