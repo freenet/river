@@ -1577,6 +1577,23 @@ impl Carol {
         carol
     }
 
+    /// An invitation Carol writes for a new member, as the app writes one for its user.
+    fn invitation(&self) -> river_core::invitation::Invitation {
+        use river_core::room_state::member::{AuthorizedMember, Member, MemberId};
+        let invitee = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+        let member = Member {
+            owner_member_id: MemberId::from(&self.owner),
+            invited_by: MemberId::from(&self.sk.verifying_key()),
+            member_vk: invitee.verifying_key(),
+        };
+        river_core::invitation::Invitation {
+            room: self.owner,
+            invitee: AuthorizedMember::new(member, &self.sk),
+            invitee_signing_key: invitee,
+            room_secrets: Vec::new(),
+        }
+    }
+
     /// How many messages the room holds on the node.
     fn message_count(&self) -> usize {
         self.state().recent_messages.messages.len()
@@ -2166,6 +2183,130 @@ fn moving_an_identity(
 /// node holds those messages too, cannot open them. Then the owner's own Rotate does the same
 /// once more. (`ban_and_lock_out` covers the other way round: the app banned, a bystander
 /// staying.)
+/// An invitation whose inviter has since been banned: the app that accepts it must say so, in
+/// good time, and must neither join nor leave anything on the node. Carol (played by the example,
+/// see [`Carol`]) joins a public room, writes an invitation of her own, and the owner bans her;
+/// Bob's app, which holds no such room, then tries to join with it.
+fn invitation_from_a_banned_inviter(alice: &mut App, bob: &mut App, b: &str, dir_b: &Path) {
+    const ROOM: &str = "Fresh node pruned-inviter room";
+    alice.send(
+        "",
+        Action::CreateRoom {
+            name: ROOM.into(),
+            nickname: "Alice".into(),
+            private: false,
+        },
+    );
+    alice.until("the pruned-inviter room is created", |app| {
+        app.room(ROOM).is_some()
+    });
+    let key = alice.room(ROOM).unwrap().key.clone();
+    alice.invites.clear();
+    alice.send(&key, Action::Invite);
+    alice.until("an invitation to the pruned-inviter room is made", |app| {
+        !app.invites.is_empty()
+    });
+    let link = match alice.invites.pop().unwrap() {
+        (room, Ok(link)) if room == key => link,
+        other => panic!("no invitation: {:?}", other.1.map(|_| "<link>")),
+    };
+    let carol = Carol::join(b, dir_b, &link);
+    let invitation = carol.invitation();
+    let invitee = invitation.invitee.member.member_vk;
+    alice.until("node A sees Carol in the pruned-inviter room", |app| {
+        app.room(ROOM)
+            .is_some_and(|r| r.members.iter().any(|m| m.nickname == "Carol"))
+    });
+    let carol_uid = alice
+        .room(ROOM)
+        .and_then(|r| r.members.iter().find(|m| m.nickname == "Carol"))
+        .map(|m| m.uid.clone())
+        .expect("Carol is a member on node A");
+    alice.send(&key, Action::Ban { target: carol_uid });
+    alice.until("node A dropped Carol", |app| {
+        app.room(ROOM).is_some_and(|r| {
+            !r.members.iter().any(|m| m.nickname == "Carol") && r.notices.is_empty()
+        })
+    });
+    // The node B copy of the room has the ban too, so the app reads what the owner left.
+    let deadline = Instant::now() + STEP;
+    while carol
+        .state()
+        .members
+        .members
+        .iter()
+        .any(|m| m.member.member_vk == carol.sk.verifying_key())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "node B never learned that Carol was banned"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let code = invitation.to_encoded_string().expect("an invite code");
+    let started = Instant::now();
+    bob.send(
+        "",
+        Action::Join {
+            code: InviteCode(code),
+            nickname: "Bob".into(),
+        },
+    );
+    let failed = |app: &App| {
+        app.work.iter().find_map(|t| match &t.state {
+            WorkState::Failed { why, retry } if t.room.as_deref() == Some(key.as_str()) => {
+                Some((why.clone(), *retry))
+            }
+            _ => None,
+        })
+    };
+    bob.until("the app says the join failed", |app| {
+        assert!(
+            app.room(ROOM).is_none(),
+            "the app joined a room through an invitation from a banned member"
+        );
+        failed(app).is_some()
+    });
+    let (why, retry) = failed(bob).expect("a failure was shown");
+    println!(
+        "D: the join with a banned inviter's invitation failed after {:?}: {why:?} (Try again: {retry})",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(120),
+        "the failure took too long to show"
+    );
+    // The reason names the cause, and Try again is not offered: asking again cannot help.
+    assert!(
+        why.contains("banned") && why.contains("no longer be valid"),
+        "the failure does not say why: {why:?}"
+    );
+    assert!(
+        !retry,
+        "Try again is offered for an invitation that cannot work"
+    );
+    // Nothing reached the room: the invitee is not a member on the node.
+    assert!(
+        !carol
+            .state()
+            .members
+            .members
+            .iter()
+            .any(|m| m.member.member_vk == invitee),
+        "the invitee reached the room through a banned inviter"
+    );
+    // Dismiss the failed task, as the user would, so the app has nothing left over.
+    let id = bob
+        .work
+        .iter()
+        .find(|t| matches!(t.state, WorkState::Failed { .. }))
+        .expect("the failed join is still listed")
+        .id;
+    bob.send("", Action::DismissWork { id });
+    bob.until("the failed join is dismissed", |app| app.work.is_empty());
+}
+
 const ROTATION_ROOM: &str = "Fresh node rotation room";
 
 fn rotation_keeps_a_member_and_drops_another(
@@ -2567,6 +2708,7 @@ fn main() {
         app.has_text(BAN_ROOM, "Bob speaks in the ban room")
     });
     ban_and_lock_out(&mut alice, &mut bob, None, BAN_ROOM, &bkey, false);
+    invitation_from_a_banned_inviter(&mut alice, &mut bob, b, &dir_b);
     let rkey = rotation_keeps_a_member_and_drops_another(&mut alice, &mut bob, b, &dir_b);
     // Each app's own key is in its node's delegate for the room, asked of the delegate itself:
     // the creator's is the owner's, the joiner's is the invitee's own, and they differ.
