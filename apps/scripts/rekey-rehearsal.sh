@@ -57,6 +57,7 @@ for d in node old0 app; do
 done
 mkdir -p "$WORK/node/cfg" "$WORK/node/data" "$WORK/node/log" "$WORK/app"
 echo "freenet: $("$FREENET_BIN" --version | head -n1)"
+echo "app: $(git -C "$REPO" rev-parse HEAD)$(git -C "$REPO" diff --quiet HEAD -- apps || echo " (with uncommitted changes in apps/)")"
 
 openssl genpkey -algorithm X25519 -out "$WORK/node/x25519.pem" 2>/dev/null
 openssl pkey -in "$WORK/node/x25519.pem" -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n' \
