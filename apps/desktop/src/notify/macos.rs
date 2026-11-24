@@ -47,7 +47,7 @@ impl Backend {
         if let State::Unasked = self.state {
             self.state = match notify_rust::check_bundle() {
                 Err(e) => {
-                    eprintln!("river: no notifications outside the River app bundle: {e}");
+                    river_app::diag!("river: no notifications outside the River app bundle: {e}");
                     State::NoBundle
                 }
                 // The system asks the person the first time only; later calls return the
@@ -55,11 +55,11 @@ impl Backend {
                 Ok(()) => match notify_rust::request_auth_blocking() {
                     Ok(true) => State::Ready,
                     Ok(false) => {
-                        eprintln!("river: notifications are not allowed in System Settings");
+                        river_app::diag!("river: notifications are not allowed in System Settings");
                         State::Denied(Instant::now())
                     }
                     Err(e) => {
-                        eprintln!("river: could not ask to show notifications: {e}");
+                        river_app::diag!("river: could not ask to show notifications: {e}");
                         State::Denied(Instant::now())
                     }
                 },
@@ -81,7 +81,7 @@ impl Backend {
         let shown = match note.show() {
             Ok(shown) => shown,
             Err(e) => {
-                eprintln!("river: could not show a notification: {e}");
+                river_app::diag!("river: could not show a notification: {e}");
                 return;
             }
         };
@@ -107,7 +107,7 @@ impl Backend {
                     static SAID: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !SAID.swap(true, Ordering::Relaxed) {
-                        eprintln!("river: lost track of a notification, so a click on it will not open its room: {e}");
+                        river_app::diag!("river: lost track of a notification, so a click on it will not open its room: {e}");
                     }
                 }
             });

@@ -140,7 +140,7 @@ impl Waiters {
             // Said once: a click on later notifications will not open their room until some
             // of these are dismissed.
             if !self.capped.swap(true, Ordering::Relaxed) {
-                eprintln!(
+                river_app::diag!(
                     "river: too many notifications waiting; clicks on new ones will not open their room until old ones are dismissed"
                 );
             }
@@ -205,7 +205,7 @@ impl Waiters {
             });
         if let Err(e) = spawned {
             // The closure, and the slot in it, are dropped: the slot is free again.
-            eprintln!("river: clicking a notification will not open its room: {e}");
+            river_app::diag!("river: clicking a notification will not open its room: {e}");
         }
     }
 }
@@ -224,7 +224,7 @@ impl DesktopNotifier {
             .spawn(move || worker(rx, handle));
         if let Err(e) = spawned {
             // The sender then has no receiver and every notification is dropped.
-            eprintln!("river: notifications are off, could not start their thread: {e}");
+            river_app::diag!("river: notifications are off, could not start their thread: {e}");
         }
         DesktopNotifier {
             jobs,
@@ -242,7 +242,7 @@ impl Notifier for DesktopNotifier {
                 if matches!(e, mpsc::TrySendError::Full(_))
                     && !self.dropped.swap(true, Ordering::Relaxed)
                 {
-                    eprintln!("river: notifications are backed up; dropping some");
+                    river_app::diag!("river: notifications are backed up; dropping some");
                 }
                 false
             }
@@ -259,7 +259,7 @@ fn worker(rx: mpsc::Receiver<Notification>, handle: AppHandle<RiverApp>) {
     for notification in rx {
         let shown = catch_unwind(AssertUnwindSafe(|| backend.show(&notification, &handle)));
         if shown.is_err() {
-            eprintln!("river: showing a notification panicked; carrying on");
+            river_app::diag!("river: showing a notification panicked; carrying on");
         }
     }
 }
@@ -325,7 +325,9 @@ fn perform(handle: &AppHandle<RiverApp>, room: String, message: String, intent: 
             // The window and the open room are left alone.
             handle.update(move |s, _| {
                 if let Err(refusal) = s.reply_from_notification(&room, &text) {
-                    eprintln!("river: a reply from a notification was not sent: {refusal:?}");
+                    river_app::diag!(
+                        "river: a reply from a notification was not sent: {refusal:?}"
+                    );
                 }
             });
         }

@@ -1,54 +1,83 @@
-//! The diagnostics log, end to end: a real process starts the redirect (this file includes
-//! `src/log.rs`), writes with `eprintln!`, and the lines must be in the file. The probe is
-//! this test binary run again with `RIVER_LOG_PROBE` set, so each case has its own process and
-//! this test's own stderr is never the one redirected. Unix only: the Windows redirect is
-//! built by CI and checked by hand (see the PR).
+//! The diagnostics log, end to end. A real process starts the redirect (this file includes
+//! `src/log.rs`) with a stderr of each kind, writes, and the test reads what landed where. The
+//! probe is this test binary run again with `RIVER_LOG_PROBE` set, so each case has its own
+//! process and this test's own stderr is never the one redirected. Unix only: the Windows
+//! handle code is built by CI and checked by hand (see the PR).
 #![cfg(unix)]
 #![allow(dead_code)]
 
 #[path = "../src/log.rs"]
 mod log;
 
+use std::fs::File;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+const SEP: char = '\u{1f}';
+
 /// The probe. Does nothing in a normal run. Run as a child with `RIVER_LOG_PROBE=<config dir>
-/// <off|file|tee> <command>...` (see `run`), it starts the log as `main` does and executes
-/// the commands: `say:TEXT`, `partial:TEXT` (no newline), `child:TEXT` (a child process
-/// writes TEXT to its stderr), `bulk:N` (N lines of about 1000 bytes) or `panic`.
+/// <command>...`, it calls `log::start` as `main` does (so the choice is made from its real
+/// stderr), prints `log=<path or none>` on stdout, then runs the commands: `say:TEXT`
+/// (`diag!`), `eprintln:TEXT` (std's, which panics if stderr is broken), `child:TEXT` (a
+/// process that inherits stderr writes TEXT), `relaunch:TEXT` (a new probe started the way the
+/// updater starts River, run to the end) and `exec:TEXT` (replace this process with one),
+/// `panic:TEXT`.
 #[test]
 fn probe_entry() {
     let Ok(spec) = std::env::var("RIVER_LOG_PROBE") else {
         return;
     };
-    let args: Vec<&str> = spec.split('\u{1f}').collect();
-    let mode = match args[1] {
-        "off" => log::Mode::Off,
-        "tee" => log::Mode::Tee,
-        _ => log::Mode::File,
-    };
-    log::start(Path::new(args[0]), mode);
-    for cmd in &args[2..] {
-        match cmd.split_once(':') {
-            Some(("say", t)) => eprintln!("{t}"),
-            Some(("partial", t)) => eprint!("{t}"),
-            Some(("child", t)) => {
+    let args: Vec<&str> = spec.split(SEP).collect();
+    let started = log::start(Path::new(args[0]));
+    println!(
+        "log={}",
+        started.map_or("none".into(), |p| p.display().to_string())
+    );
+    for cmd in &args[1..] {
+        let (what, text) = cmd.split_once(':').unwrap();
+        match what {
+            "say" => river_app::diag!("{text}"),
+            "eprintln" => eprintln!("{text}"),
+            "child" => {
                 let status = Command::new("sh")
-                    .args(["-c", &format!("echo '{t}' >&2")])
+                    .args(["-c", &format!("echo '{text}' >&2")])
                     .status()
                     .unwrap();
                 assert!(status.success());
             }
-            Some(("bulk", n)) => {
-                for i in 0..n.parse::<u32>().unwrap() {
-                    eprintln!("bulk {i:06} {}", "z".repeat(980));
-                }
+            "relaunch" => {
+                let status = nested(args[0], text).status().unwrap();
+                assert!(status.success(), "the relaunched probe failed");
             }
-            _ if *cmd == "panic" => panic!("probe panic message"),
+            "exec" => {
+                let err = nested(args[0], text).exec();
+                panic!("exec failed: {err}");
+            }
+            "panic" => panic!("probe panic {text}"),
             _ => panic!("unknown command {cmd}"),
         }
     }
-    log::flush();
+}
+
+/// A probe started as `restart_into` and the Linux relaunch start River: stderr from
+/// `log::child_stderr()`.
+fn nested(dir: &str, text: &str) -> Command {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "probe_entry", "--nocapture", "--test-threads=1"])
+        .env(
+            "RIVER_LOG_PROBE",
+            [
+                dir,
+                &format!("say:{text}"),
+                &format!("eprintln:{text} (eprintln)"),
+            ]
+            .join(&SEP.to_string()),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log::child_stderr());
+    cmd
 }
 
 fn temp(name: &str) -> PathBuf {
@@ -58,19 +87,24 @@ fn temp(name: &str) -> PathBuf {
     dir
 }
 
-fn run(dir: &Path, mode: &str, cmds: &[&str]) -> Output {
-    let mut spec = vec![dir.to_str().unwrap(), mode];
+fn run(dir: &Path, stderr: Stdio, cmds: &[&str]) -> Output {
+    let mut spec = vec![dir.to_str().unwrap()];
     spec.extend_from_slice(cmds);
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "probe_entry", "--nocapture", "--test-threads=1"])
-        .env("RIVER_LOG_PROBE", spec.join("\u{1f}"))
+        .env("RIVER_LOG_PROBE", spec.join(&SEP.to_string()))
         .stdin(Stdio::null())
+        .stderr(stderr)
         .output()
         .unwrap()
 }
 
 fn log_of(dir: &Path) -> String {
     std::fs::read_to_string(dir.join("logs/river.log")).unwrap_or_default()
+}
+
+fn said(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// `2026-11-23T14:05:09.123Z text`
@@ -83,87 +117,141 @@ fn stamped(line: &str, text: &str) -> bool {
 }
 
 #[test]
-fn eprintln_lands_in_the_file_with_a_timestamp_and_not_on_stderr() {
-    let dir = temp("file");
-    let out = run(&dir, "file", &["say:hello from eprintln"]);
+fn a_null_stderr_goes_to_the_file_with_timestamps() {
+    let dir = temp("null");
+    let out = run(
+        &dir,
+        Stdio::null(),
+        &["say:hello from diag", "eprintln:plain eprintln"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        said(&out).contains("log=") && !said(&out).contains("log=none"),
+        "{}",
+        said(&out)
+    );
+    let log = log_of(&dir);
+    assert!(log.lines().any(|l| stamped(l, "hello from diag")), "{log}");
+    assert!(log.contains("plain eprintln"), "{log}");
+    assert!(log.lines().next().unwrap().contains("River"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_closed_stderr_goes_to_the_file() {
+    let dir = temp("closed");
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    let spec = [dir.to_str().unwrap(), "say:after close"];
+    cmd.args(["--exact", "probe_entry", "--nocapture", "--test-threads=1"])
+        .env("RIVER_LOG_PROBE", spec.join(&SEP.to_string()))
+        .stdin(Stdio::null());
+    // SAFETY: close(2) between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc_close_stderr();
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(log_of(&dir).contains("after close"), "{}", log_of(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn libc_close_stderr() {
+    // SAFETY: closing an inherited descriptor in the child before exec.
+    unsafe { libc::close(2) };
+}
+
+/// The #971 recipe: `river 2> river-log.txt` keeps working, and no log file is made.
+#[test]
+fn stderr_sent_to_a_file_is_left_alone() {
+    let dir = temp("tofile");
+    let mine = dir.join("river-log.txt");
+    let out = run(
+        &dir,
+        Stdio::from(File::create(&mine).unwrap()),
+        &["say:to my file", "eprintln:plain"],
+    );
+    assert!(said(&out).contains("log=none"), "{}", said(&out));
+    let text = std::fs::read_to_string(&mine).unwrap();
+    assert!(text.lines().any(|l| stamped(l, "to my file")), "{text}");
+    assert!(text.contains("plain"));
+    assert!(
+        !dir.join("logs").exists(),
+        "no log file when stderr is a file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `river 2>&1 | tee`, journald and a supervisor's pipe: the parent reads them.
+#[test]
+fn stderr_sent_to_a_pipe_is_left_alone() {
+    let dir = temp("pipe");
+    let out = run(&dir, Stdio::piped(), &["say:to the pipe"]);
+    assert!(said(&out).contains("log=none"));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.lines().any(|l| stamped(l, "to the pipe")), "{text}");
+    assert!(!dir.join("logs").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_child_and_a_relaunched_or_exec_ed_river_write_to_the_same_file_and_none_panics() {
+    let dir = temp("children");
+    let out = run(
+        &dir,
+        Stdio::null(),
+        &["child:from a child", "relaunch:relaunched", "exec:exec-ed"],
+    );
     assert!(out.status.success(), "{out:?}");
     let log = log_of(&dir);
-    assert!(
-        log.lines().any(|l| stamped(l, "hello from eprintln")),
-        "{log}"
+    assert!(log.contains("from a child"), "{log}");
+    assert!(log.lines().any(|l| stamped(l, "relaunched")), "{log}");
+    assert!(log.contains("relaunched (eprintln)"), "{log}");
+    assert!(log.lines().any(|l| stamped(l, "exec-ed")), "{log}");
+    assert!(log.contains("exec-ed (eprintln)"), "{log}");
+    // Each started River wrote its own header: the relaunched one set up its own log.
+    assert!(log.matches("--- River").count() >= 3, "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_panic_message_is_in_the_file_without_the_values_it_quotes() {
+    let dir = temp("panic");
+    let out = run(
+        &dir,
+        Stdio::null(),
+        &["say:before", "panic:\"my secret nickname\""],
     );
-    assert!(log.lines().next().unwrap().contains("River"), "{log}");
-    assert!(out.stderr.is_empty(), "stderr was redirected: {out:?}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The control: without the redirect, the same program writes nothing to the file. This is
-/// what shows the test above is checking the redirect and not some other writer.
-#[test]
-fn without_the_redirect_the_line_goes_to_stderr_and_not_the_file() {
-    let dir = temp("off");
-    let out = run(&dir, "off", &["say:hello from eprintln"]);
-    assert!(!log_of(&dir).contains("hello from eprintln"));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("hello from eprintln"));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_terminal_run_prints_as_before_and_also_logs() {
-    let dir = temp("tee");
-    let out = run(&dir, "tee", &["say:one", "partial:two"]);
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "one\ntwo");
+    assert!(!out.status.success());
     let log = log_of(&dir);
-    assert!(log.lines().any(|l| stamped(l, "one")), "{log}");
-    assert!(log.lines().any(|l| stamped(l, "two")), "{log}");
+    assert!(log.contains("panic in thread"), "{log}");
+    assert!(log.contains("probe panic"), "{log}");
+    assert!(!log.contains("my secret nickname"), "{log}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn a_child_process_writes_to_the_same_log() {
-    let dir = temp("child");
-    run(&dir, "file", &["child:from the child"]);
+fn a_file_over_the_limit_is_rotated_when_the_next_run_starts() {
+    let dir = temp("rotate");
+    let path = dir.join("logs/river.log");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "old run\n".repeat(300_000)).unwrap(); // about 2.4 MB
+    run(&dir, Stdio::null(), &["say:new run"]);
+    let current = std::fs::read_to_string(&path).unwrap();
     assert!(
-        log_of(&dir).lines().any(|l| stamped(l, "from the child")),
-        "{}",
-        log_of(&dir)
+        current.contains("new run") && !current.contains("old run"),
+        "{current}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_panic_message_is_in_the_file_when_the_process_ends() {
-    for i in 0..20 {
-        let dir = temp(&format!("panic{i}"));
-        let out = run(&dir, "file", &["say:before", "panic"]);
-        assert!(!out.status.success());
-        let log = log_of(&dir);
-        assert!(log.contains("probe panic message"), "run {i}: {log}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[test]
-fn the_file_stays_near_two_megabytes_and_keeps_the_current_runs_last_lines() {
-    let dir = temp("bulk");
-    // About 5 MB in one run.
-    run(&dir, "file", &["bulk:5000", "say:the very last line"]);
-    let current = std::fs::metadata(dir.join("logs/river.log")).unwrap().len();
-    let previous = std::fs::metadata(dir.join("logs/river.log.1"))
-        .unwrap()
-        .len();
-    assert!(current <= 2 * 1024 * 1024, "{current}");
     assert!(
-        previous <= 2 * 1024 * 1024 && previous > 1024 * 1024,
-        "{previous}"
+        std::fs::read_to_string(dir.join("logs/river.log.1"))
+            .unwrap()
+            .contains("old run")
     );
-    assert!(!dir.join("logs/river.log.2").exists());
-    let log = log_of(&dir);
-    assert!(log.contains("bulk 004999"), "newest bulk line kept");
-    assert!(log.contains("the very last line"));
-    assert!(!log.contains("bulk 000000"), "the oldest were dropped");
-    // A new run keeps appending and does not start over.
-    run(&dir, "file", &["say:second run"]);
-    assert!(log_of(&dir).contains("the very last line") && log_of(&dir).contains("second run"));
+    // Under the limit: the next run appends.
+    run(&dir, Stdio::null(), &["say:third run"]);
+    let again = std::fs::read_to_string(&path).unwrap();
+    assert!(again.contains("new run") && again.contains("third run"));
     let _ = std::fs::remove_dir_all(&dir);
 }

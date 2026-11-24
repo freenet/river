@@ -140,7 +140,7 @@ fn save_pref<T: serde::Serialize + ?Sized>(key: &str, value: &T) {
         return;
     };
     if let Err(e) = merge_pref(&path, key, value) {
-        eprintln!("River: couldn't save {key}: {e}");
+        crate::diag!("River: couldn't save {key}: {e}");
     }
 }
 
@@ -759,7 +759,7 @@ impl RiverApp {
             && let Err(e) = ctl.save_node(&choice)
         {
             // Used for this run; chosen again next time.
-            eprintln!("River: {e}");
+            crate::diag!("River: {e}");
         }
         // A change of the node's version is not a new connection: the rooms link already
         // follows the node through its restart.
@@ -947,7 +947,7 @@ impl RiverApp {
             } else {
                 self.pending_save = None;
                 if let Err(e) = ctl.save_node(&choice) {
-                    eprintln!("River: {e}");
+                    crate::diag!("River: {e}");
                 }
             }
             ctl.set_node(choice.clone());
@@ -1228,8 +1228,10 @@ fn background_scene(s: &mut RiverApp, tray: bool) {
 struct PreviewLog;
 
 impl chat::LogHost for PreviewLog {
-    fn log_path(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from(r"C:\Users\Ada\AppData\Local\Freenet\River\config\logs\river.log")
+    fn log_path(&self) -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from(
+            r"C:\Users\Ada\AppData\Local\Freenet\River\config\logs\river.log",
+        ))
     }
     fn open_log_folder(&self) -> Result<(), String> {
         Ok(())

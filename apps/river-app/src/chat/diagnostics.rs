@@ -2,9 +2,10 @@
 //! and a button that opens that folder.
 //!
 //! River's diagnostics are lines on stderr, which a Windows release build, or a River started
-//! from a launcher or the tray, has nowhere to show. The shell writes them to a file (see
-//! `apps/desktop/src/log.rs`); this section tells the user where, so a bug report can attach
-//! it. What the file is and how it is opened belongs to the shell, which passes a
+//! from a launcher or the tray, has nowhere to show. The shell writes them to a file when
+//! nothing else is reading stderr (see `apps/desktop/src/log.rs`); this section tells the user
+//! where, so a bug report can attach it, or says that the output goes where River was started
+//! from. What the file is and how it is opened belongs to the shell, which passes a
 //! [`LogHost`]. A shell without one (snapshots, tests) has no such section.
 
 use std::path::PathBuf;
@@ -20,8 +21,9 @@ use crate::RiverApp;
 
 /// What the shell offers for its log file.
 pub trait LogHost: Send + Sync + 'static {
-    /// The file River is writing its diagnostics to.
-    fn log_path(&self) -> PathBuf;
+    /// The file River is writing its diagnostics to, or `None` when it keeps none because its
+    /// stderr goes somewhere else (a terminal, a file, a system logger).
+    fn log_path(&self) -> Option<PathBuf>;
 
     /// Show the folder that holds it in the system's file manager.
     fn open_log_folder(&self) -> Result<(), String>;
@@ -40,7 +42,7 @@ impl DiagnosticsUi {
     }
 
     /// The log file, as the shell says.
-    pub fn path(&self) -> PathBuf {
+    pub fn path(&self) -> Option<PathBuf> {
         self.host.log_path()
     }
 }
@@ -59,19 +61,36 @@ pub(super) fn diagnostics_section(chat: &super::Chat, p: &Palette, k: &Kit) -> E
     let Some(d) = chat.diagnostics.as_ref() else {
         return col().key("settings-diagnostics");
     };
+    let Some(path) = d.path() else {
+        // The one sentence is true whatever is reading stderr: that is why there is no file.
+        return col().key("settings-diagnostics").w_full().child(
+            label(
+                "River was started with its output going elsewhere (a terminal, a file or the \
+                 system's log), so its diagnostics go there and River keeps no log file of its \
+                 own.",
+                st::BODY,
+                p.text_secondary,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-log-elsewhere"),
+        );
+    };
     let note = col()
         .gap(2.0)
         .child(
-            label(d.path().display().to_string(), st::BODY, p.text_secondary)
+            label(path.display().to_string(), st::BODY, p.text_secondary)
                 .wrap()
                 .w_full()
                 .key("settings-log-path"),
         )
         .child(
             label(
-                "River writes what it reports here, with the time of each line. It keeps this \
-                 file and the one before it, about 2 MB each. It holds no message text or \
-                 keys. Attach it when you report a problem.",
+                "River writes what it reports here, with the time of each line. It does not \
+                 write message text, nicknames or signing keys, but it does write room and \
+                 contract keys, and your user name where it is part of a path: look through \
+                 it before you share it. A new file starts when this one is over 2 MB at \
+                 startup; the old one is kept as river.log.1.",
                 st::SMALL,
                 p.text_muted,
             )

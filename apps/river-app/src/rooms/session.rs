@@ -556,7 +556,7 @@ fn run_with(
                             && let Err(e) = store.save(&t)
                         {
                             // Keep using it for this run; the next run asks again.
-                            eprintln!("River: {}", crate::diag::scrub(&e));
+                            crate::diag!("River: {}", crate::diag::scrub(&e));
                         }
                         unconfirmed = true;
                         report(RoomsUpdate::Access(Access::Connecting));
@@ -1253,7 +1253,7 @@ fn follow_on(
                             && !subs.pending.contains_key(&id)
                     });
                 if late_reads {
-                    eprintln!(
+                    crate::diag!(
                         "River: an error that may be a read given up on, taken by none: {}",
                         crate::diag::scrub(&e)
                     );
@@ -1290,7 +1290,7 @@ fn follow_on(
                 } else if let Some(id) = rooms.nameless_read(&e, &subs, &resyncs, reload.is_some())
                 {
                     // It frees the room for the next read now, instead of after `resync_wait`.
-                    eprintln!(
+                    crate::diag!(
                         "River: reading a room again failed: {}",
                         crate::diag::scrub(&e)
                     );
@@ -1300,7 +1300,7 @@ fn follow_on(
                     && !subs.pending.contains_key(&id)
                 {
                     // A read of the room failed: the subscription is not in question.
-                    eprintln!(
+                    crate::diag!(
                         "River: reading a room again failed: {}",
                         crate::diag::scrub(&e)
                     );
@@ -1310,8 +1310,10 @@ fn follow_on(
                 } else if reload.is_some() {
                     match delegate_error(&e) {
                         // The store went away: keep the list shown (see the module docs).
-                        Ok(()) => eprintln!("River: the stored rooms are gone; keeping the list"),
-                        Err(e) => eprintln!(
+                        Ok(()) => {
+                            crate::diag!("River: the stored rooms are gone; keeping the list")
+                        }
+                        Err(e) => crate::diag!(
                             "River: reading the stored rooms again failed: {}",
                             crate::diag::scrub(&e)
                         ),
@@ -1571,7 +1573,7 @@ impl Loader {
         let (meta, modes) = match wanted.remove(ROOMS_META_KEY) {
             Some(Some(Some(bytes))) if !bytes.is_empty() => (
                 decode_rooms_meta(&bytes).unwrap_or_else(|e| {
-                    eprintln!("River: {}", crate::diag::scrub(&e));
+                    crate::diag!("River: {}", crate::diag::scrub(&e));
                     StoredRoomsMeta::default()
                 }),
                 decode_modes(&bytes),
@@ -1584,7 +1586,7 @@ impl Loader {
             Some(Some(Some(bytes))) => match OutboundCache::from_bytes(&bytes) {
                 Ok(cache) => DmRead::Read(Box::new(cache)),
                 Err(e) => {
-                    eprintln!("River: {}", crate::diag::scrub(&e));
+                    crate::diag!("River: {}", crate::diag::scrub(&e));
                     DmRead::Unreadable
                 }
             },
@@ -1605,7 +1607,7 @@ impl Loader {
                 Ok(StoredRoomSlot::Tombstone) => {}
                 // One unreadable room must not hide the others; the screen counts it.
                 Err(e) => {
-                    eprintln!("River: skipping a stored room: {}", crate::diag::scrub(&e));
+                    crate::diag!("River: skipping a stored room: {}", crate::diag::scrub(&e));
                     unreadable += 1;
                 }
             }
@@ -1675,13 +1677,15 @@ fn register_logged(socket: &mut NodeSocket, pace: &Pace) -> Result<(), SocketErr
     match register(socket, pace)? {
         Registered::Yes => {}
         Registered::Refused(why) => {
-            eprintln!(
+            crate::diag!(
                 "River: Freenet refused to register River's storage: {}",
                 crate::diag::scrub(&why)
             )
         }
         Registered::Unanswered => {
-            eprintln!("River: no answer to registering River's storage; reading the rooms anyway")
+            crate::diag!(
+                "River: no answer to registering River's storage; reading the rooms anyway"
+            )
         }
     }
     Ok(())
@@ -2033,7 +2037,7 @@ impl Rooms {
                         text.as_str().to_owned(),
                     )
                 {
-                    eprintln!(
+                    crate::diag!(
                         "River: too many sent direct messages are unsaved; the oldest text was dropped"
                     );
                 }
@@ -2183,7 +2187,7 @@ impl Rooms {
                 .note_read_from(std::mem::take(&mut loaded.dms), authoritative, began);
         }
         if self.loaded && (loaded.store_missing || loaded.listed == 0) && !self.list.is_empty() {
-            eprintln!("River: the stored rooms read as empty; keeping the list shown");
+            crate::diag!("River: the stored rooms read as empty; keeping the list shown");
             // Still recorded: a store that could not be set up again is not registered again
             // on every re-read (`follow_on`).
             self.store_missing = loaded.store_missing;
@@ -2210,7 +2214,7 @@ impl Rooms {
                     kept.stored.last_read_message_id = slot.last_read_message_id.clone();
                     newer_self_cache(&mut kept.stored, &slot);
                     if let Err(e) = kept.merge_state(&slot.room_state) {
-                        eprintln!(
+                        crate::diag!(
                             "River: the stored copy of a room was not merged: {}",
                             crate::diag::scrub(&e)
                         );
@@ -2229,7 +2233,7 @@ impl Rooms {
                             new_ids.push(fresh.contract_id());
                         }
                         if let Err(e) = fresh.merge_state(&previous.stored.room_state) {
-                            eprintln!(
+                            crate::diag!(
                                 "River: a room's earlier copy was not merged: {}",
                                 crate::diag::scrub(&e)
                             );
@@ -2380,7 +2384,7 @@ impl Rooms {
                 // Left, in the browser, before this arrived. An invitation asked for there is
                 // said to have failed, so the screen does not wait for it.
                 None => {
-                    eprintln!("River: a command for a room no longer shown was dropped");
+                    crate::diag!("River: a command for a room no longer shown was dropped");
                     if command.action == Action::Invite {
                         self.invites
                             .push((command.room, Err("This room is no longer here.".into())));
@@ -2419,7 +2423,7 @@ impl Rooms {
                         queued.timestamp,
                         text.to_owned(),
                     ) {
-                        eprintln!("River: too many sent direct messages are unsaved; the oldest text was dropped");
+                        crate::diag!("River: too many sent direct messages are unsaved; the oldest text was dropped");
                     }
                     self.dm_saver.new_work();
                     // Sending into a thread brings it back, whatever its cutoff: the user did
@@ -2496,7 +2500,7 @@ impl Rooms {
                                     queued.timestamp,
                                     summary,
                                 ) {
-                                    eprintln!("River: too many sent direct messages are unsaved; the oldest text was dropped");
+                                    crate::diag!("River: too many sent direct messages are unsaved; the oldest text was dropped");
                                 }
                                 self.dm_saver.new_work();
                             }
@@ -2576,7 +2580,7 @@ impl Rooms {
             if !self.complete {
                 return None;
             }
-            eprintln!("River: an archive command for a room no longer shown was dropped");
+            crate::diag!("River: an archive command for a room no longer shown was dropped");
             return Some(());
         };
         let owner = room.stored.owner_vk.to_bytes();
@@ -2703,11 +2707,14 @@ impl Rooms {
                 // Said once, without a word of what was written.
                 let kind = end.refusal.map_or("other", |r| r.kind());
                 if archive_write {
-                    eprintln!("River: saving archive changes failed ({kind}), {failures} in a row");
+                    crate::diag!(
+                        "River: saving archive changes failed ({kind}), {failures} in a row"
+                    );
                 } else {
-                    eprintln!(
+                    crate::diag!(
                         "River: saving sent direct messages failed ({}), {} in a row",
-                        kind, failures
+                        kind,
+                        failures
                     );
                 }
                 if end.refusal == Some(super::dm_store::Refusal::Vanished) {
@@ -2993,7 +3000,7 @@ impl Rooms {
         match action {
             Action::LeaveRoom => {
                 let Some(owner) = shown_owner() else {
-                    eprintln!("River: leaving a room no longer shown was dropped");
+                    crate::diag!("River: leaving a room no longer shown was dropped");
                     return false;
                 };
                 let name = self
@@ -3016,7 +3023,7 @@ impl Rooms {
             Action::SetNotificationMode { mode } => {
                 let owner = shown_owner();
                 let Some(owner) = owner else {
-                    eprintln!(
+                    crate::diag!(
                         "River: a notification setting for a room no longer shown was dropped"
                     );
                     return false;
@@ -3252,7 +3259,7 @@ impl Rooms {
                 true
             }
             Err(e) => {
-                eprintln!(
+                crate::diag!(
                     "River: a room's update from the network was not applied: {}",
                     crate::diag::scrub(&e)
                 );
@@ -3509,7 +3516,7 @@ impl Rooms {
 
     /// The connection is gone: keep showing the rooms if there are any, and say so.
     fn lost(&self, why: &str, report: &dyn Fn(RoomsUpdate)) {
-        eprintln!(
+        crate::diag!(
             "River: lost the connection to Freenet: {}",
             crate::diag::scrub(why)
         );

@@ -7,22 +7,25 @@ use std::process::{Command, Stdio};
 use river_app::chat::LogHost;
 
 pub struct DesktopLog {
-    path: PathBuf,
+    /// `None` when stderr was left alone (a terminal, a file, a system logger): there is no
+    /// log file.
+    path: Option<PathBuf>,
 }
 
 impl DesktopLog {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: Option<PathBuf>) -> Self {
         DesktopLog { path }
     }
 }
 
 impl LogHost for DesktopLog {
-    fn log_path(&self) -> PathBuf {
+    fn log_path(&self) -> Option<PathBuf> {
         self.path.clone()
     }
 
     fn open_log_folder(&self) -> Result<(), String> {
-        let dir = self.path.parent().ok_or("the log has no folder")?;
+        let path = self.path.as_ref().ok_or("River keeps no log file")?;
+        let dir = path.parent().ok_or("the log has no folder")?;
         let mut cmd = opener(dir);
         // This process may have no console (a Windows release build, a launcher), and a child
         // that inherits invalid standard handles fails with "The handle is invalid". The
@@ -61,8 +64,11 @@ mod tests {
 
     #[test]
     fn it_reports_the_path_it_was_given() {
-        let log = DesktopLog::new(PathBuf::from("/c/River/logs/river.log"));
-        assert_eq!(log.log_path(), Path::new("/c/River/logs/river.log"));
+        let log = DesktopLog::new(Some(PathBuf::from("/c/River/logs/river.log")));
+        assert_eq!(
+            log.log_path().as_deref(),
+            Some(Path::new("/c/River/logs/river.log"))
+        );
     }
 
     #[test]
@@ -74,7 +80,8 @@ mod tests {
 
     #[test]
     fn a_path_with_no_folder_is_an_error_not_a_panic() {
-        let log = DesktopLog::new(PathBuf::from("/"));
+        let log = DesktopLog::new(Some(PathBuf::from("/")));
         assert!(log.open_log_folder().is_err());
+        assert!(DesktopLog::new(None).open_log_folder().is_err());
     }
 }

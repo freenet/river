@@ -64,11 +64,14 @@ fn with_shell(tray: bool) -> (RiverApp, std::sync::Arc<Shell>) {
 struct LogShell {
     opened: std::sync::atomic::AtomicUsize,
     refuse: bool,
+    /// Keeps no file: stderr goes elsewhere.
+    elsewhere: bool,
 }
 
 impl super::LogHost for LogShell {
-    fn log_path(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from("/home/ada/.config/River/logs/river.log")
+    fn log_path(&self) -> Option<std::path::PathBuf> {
+        (!self.elsewhere)
+            .then(|| std::path::PathBuf::from("/home/ada/.config/River/logs/river.log"))
     }
     fn open_log_folder(&self) -> Result<(), String> {
         self.opened
@@ -85,6 +88,7 @@ fn log_host() -> std::sync::Arc<LogShell> {
     std::sync::Arc::new(LogShell {
         opened: 0.into(),
         refuse: false,
+        elsewhere: false,
     })
 }
 
@@ -1036,10 +1040,27 @@ fn diagnostics_shows_the_log_path_and_the_button_opens_its_folder() {
 }
 
 #[test]
+fn without_a_log_file_diagnostics_says_where_the_output_goes_and_has_no_button() {
+    let host = std::sync::Arc::new(LogShell {
+        opened: 0.into(),
+        refuse: false,
+        elsewhere: true,
+    });
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));
+    s.chat.settings.open_at(Section::Diagnostics);
+    let rt = render(s, WINDOW_SIZE);
+    assert!(shows(&rt, "output going elsewhere"));
+    assert!(rt.find("settings-log-open").is_none());
+    assert!(rt.find("settings-log-path").is_none());
+}
+
+#[test]
 fn a_folder_that_will_not_open_says_why() {
     let host = std::sync::Arc::new(LogShell {
         opened: 0.into(),
         refuse: true,
+        elsewhere: false,
     });
     let mut s = connected();
     s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));

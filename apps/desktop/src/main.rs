@@ -100,6 +100,9 @@ fn main() {
                 if asked && let Some(u) = &updater {
                     u.second_launch_here();
                 }
+                for line in &early {
+                    say(line);
+                }
                 if !asked {
                     tell_user(
                         "River is already running but did not answer. Look for its icon \
@@ -116,15 +119,9 @@ fn main() {
         }
     });
     // Diagnostics go to a file when nobody is reading stderr (see `log`).
-    let log_path = host.config_dir().and_then(|dir| {
-        let windows_release = cfg!(all(windows, not(debug_assertions)));
-        log::start(
-            &dir,
-            log::decide(std::io::stderr().is_terminal(), windows_release),
-        )
-    });
+    let log_path = host.config_dir().and_then(|dir| log::start(&dir));
     for line in &early {
-        say(line);
+        river_app::diag!("river: {line}");
     }
     let for_app = updater.clone();
     let for_settings = settings.clone();
@@ -167,10 +164,7 @@ fn main() {
         )
         .with_notifier(Box::new(notifier))
         .with_background(for_settings);
-        let app = match log_path {
-            Some(path) => app.with_log(Arc::new(diagnostics::DesktopLog::new(path))),
-            None => app,
-        };
+        let app = app.with_log(Arc::new(diagnostics::DesktopLog::new(log_path)));
         match updates {
             Some(updates) => app.with_updates(updates),
             None => app,
@@ -223,7 +217,6 @@ fn main() {
     drop(instance);
     #[cfg(windows)]
     console::finished();
-    log::flush();
 }
 
 /// `--node-check`: say which node the arguments and environment name, and exit without opening a

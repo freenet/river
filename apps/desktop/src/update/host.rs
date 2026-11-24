@@ -116,7 +116,6 @@ impl DesktopUpdate {
     /// new one has confirmed it started (the lock is released first).
     fn restart_with(&self, args: &[OsString]) -> Result<(), String> {
         self.restart_and_release(args)?;
-        crate::log::flush();
         std::process::exit(0);
     }
 
@@ -170,12 +169,14 @@ fn restart_into(path: &std::path::Path) {
             Err::<(), String>(
                 std::process::Command::new(path)
                     .args(std::env::args_os().skip(1))
+                    // The previous build starts its own log; see `log::child_stderr`.
+                    .stderr(crate::log::child_stderr())
                     .exec()
                     .to_string(),
             )
         });
         let Err(err) = failed else { return };
-        eprintln!(
+        river_app::diag!(
             "River: couldn't start the previous version {}: {err}",
             path.display()
         );
@@ -261,13 +262,13 @@ impl UpdateHost for DesktopUpdate {
 /// end-to-end test; the app does the same on its own schedule.
 pub fn run_cli() -> i32 {
     let Some(u) = DesktopUpdate::new() else {
-        eprintln!("river: no place to keep update state");
+        river_app::diag!("river: no place to keep update state");
         return 1;
     };
     println!("river {}: checking for an update", u.version());
     match u.check() {
         Err(e) => {
-            eprintln!("river: update refused: {e}");
+            river_app::diag!("river: update refused: {e}");
             1
         }
         Ok(UpdateCheck::UpToDate) => {
@@ -284,14 +285,14 @@ pub fn run_cli() -> i32 {
                 return 11;
             }
             if let Err(e) = u.download(&mut |_, _| {}) {
-                eprintln!("river: update refused: {e}");
+                river_app::diag!("river: update refused: {e}");
                 return 1;
             }
             println!("river: downloaded and verified {}", info.version);
             // No arguments: the new River opens its window, not another update run.
             match u.restart_with(&[]) {
                 Err(e) => {
-                    eprintln!("river: update failed: {e}");
+                    river_app::diag!("river: update failed: {e}");
                     1
                 }
                 Ok(()) => 0,

@@ -3194,7 +3194,7 @@ impl Outbox {
                         ));
                     }
                     Err(e) => {
-                        eprintln!(
+                        crate::diag!(
                             "River: a message Freenet took was not applied here: {}",
                             crate::diag::scrub(&e)
                         );

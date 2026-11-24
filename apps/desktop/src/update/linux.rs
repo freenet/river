@@ -249,7 +249,10 @@ impl Installer for LinuxInstaller {
         env: &[(&str, String)],
     ) -> std::io::Result<Child> {
         let mut cmd = Command::new(install_path);
-        cmd.args(args).stdin(Stdio::null());
+        // The new River starts its own log (see `log::child_stderr`).
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stderr(crate::log::child_stderr());
         for (k, v) in env {
             cmd.env(k, v);
         }

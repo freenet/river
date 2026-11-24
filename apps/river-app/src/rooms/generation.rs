@@ -255,7 +255,7 @@ pub fn watched_pointers(
     embedded: impl Fn(Artifact) -> &'static [u8],
 ) -> Vec<Watched> {
     let Some(author_vk) = decode_author_vk(&records.author) else {
-        eprintln!(
+        crate::diag!(
             "River: not watching for a newer River: the pointer author key {:?} does not decode",
             records.author
         );
@@ -266,13 +266,13 @@ pub fn watched_pointers(
         .filter_map(|artifact| {
             let app_id = artifact.app_id();
             let Some(record) = records.records.iter().find(|r| r.app_id == app_id) else {
-                eprintln!("River: not watching {app_id}: no pointer record");
+                crate::diag!("River: not watching {app_id}: no pointer record");
                 return None;
             };
             if *blake3::hash(embedded(artifact)).as_bytes() != record.code_hash {
                 // A build whose WASM was rebuilt without re-signing. It cannot say which
                 // generation it is, so it must not judge whether the network is ahead of it.
-                eprintln!(
+                crate::diag!(
                     "River: not watching {app_id}: the WASM this build carries is not the one \
                      its pointer record v{} names",
                     record.version
@@ -556,7 +556,7 @@ impl Watch {
         let records = match Records::shipped() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("River: not watching for a newer River: pointer-records.toml: {e}");
+                crate::diag!("River: not watching for a newer River: pointer-records.toml: {e}");
                 Records {
                     author: String::new(),
                     records: Vec::new(),
@@ -618,7 +618,7 @@ impl Shared {
             };
             match evaluate(w, &bytes) {
                 Verdict::Newer(v) => {
-                    eprintln!(
+                    crate::diag!(
                         "River: {} moved to v{v} (seen earlier); this build is v{}",
                         w.artifact.app_id(),
                         w.build_version()
@@ -656,7 +656,7 @@ impl Shared {
             .and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
-            eprintln!("River: couldn't keep the newer River's pointer record: {e}");
+            crate::diag!("River: couldn't keep the newer River's pointer record: {e}");
         }
     }
 
@@ -676,7 +676,7 @@ impl Shared {
             // The gate first: logging and keeping the record can block (a stderr nobody
             // drains, a hung config directory), and writes must not go out meanwhile.
             self.record(w, version);
-            eprintln!(
+            crate::diag!(
                 "River: {} moved to v{version}; this build is v{}. It no longer writes.",
                 w.artifact.app_id(),
                 w.build_version()
