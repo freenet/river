@@ -230,6 +230,24 @@ fn held_arrow_repeats_add_up_until_the_view_reports_the_move() {
 }
 
 #[test]
+fn presses_past_the_bottom_do_not_pile_up() {
+    let mut rt = long_room(|_| {});
+    // Nothing has focus, so the keys take the app's route (`history_arrow`).
+    assert_eq!(focused_key(&rt), None);
+    // The history opens at its newest message, the bottom.
+    let bottom = y_of(&rt, "row-long-59");
+    for _ in 0..5 {
+        key(&mut rt, Key::Down);
+    }
+    assert!(
+        (y_of(&rt, "row-long-59") - bottom).abs() < 1.0,
+        "nothing below"
+    );
+    key(&mut rt, Key::Up);
+    assert!(y_of(&rt, "row-long-59") > bottom + 20.0, "one Up moves it");
+}
+
+#[test]
 fn the_arrows_do_not_scroll_while_the_composer_has_focus() {
     let mut rt = long_room(|_| {});
     let (x, y) = rt.find("composer-field").expect("the composer is drawn");

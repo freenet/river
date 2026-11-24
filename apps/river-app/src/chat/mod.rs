@@ -444,6 +444,8 @@ pub struct Chat {
 pub struct HistoryPos {
     key: String,
     offset: f32,
+    /// The furthest offset the view reports it can scroll to.
+    max: f32,
     pending: Option<f32>,
 }
 
@@ -462,7 +464,9 @@ impl HistoryPos {
     /// offset when none is waiting: held-key repeats arrive before the frame that reports the
     /// new offset, and they add up.
     pub(super) fn next_target(&mut self, step: f32) -> f32 {
-        let target = (self.pending.unwrap_or(self.offset) + step).max(0.0);
+        // Clamped to the ends, as the view clamps it: a press past an end must not leave a target
+        // the next press in the other direction has to work back from.
+        let target = (self.pending.unwrap_or(self.offset) + step).clamp(0.0, self.max.max(0.0));
         self.pending = Some(target);
         target
     }
@@ -1277,6 +1281,7 @@ impl Chat {
                 pos.key.clone_from(&key);
             }
             pos.offset = offset;
+            pos.max = p.max[1];
         }
     }
 
