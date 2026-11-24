@@ -99,11 +99,16 @@ cleanup() {
       echo "--- last lines of the $n node's log"
       tail -n 40 "$WORK/$n/stdout.log" 2>/dev/null || true
       tail -n 40 "$WORK/$n/log/"freenet.*.log 2>/dev/null | grep -v '^$' | tail -n 40 || true
-      # Delegate request timing (#1017): which request a delegate timeout hit, and how long
-      # each secret write took. The whole logs stay in $WORK/$n/ (CI uploads them).
+      # Delegate request timing (#1017). The chat delegate logs each request as it arrives
+      # ("Delegate received ...") and each finished write ("CasStore stored ..."), so the gap
+      # between a pair is that write's time, and the last request before freenet's "WASM
+      # execution timed out" warning is the one that ran out of time. The error log repeats
+      # the main log's warnings, so only the main log is read. The whole logs stay in
+      # $WORK/$n/ (CI uploads them).
       echo "--- delegate requests and timeouts on the $n node"
-      grep -hE "Delegate received|CasStore|GetVersioned|timed out|GuestOverran|QueuedTooLong" \
-        "$WORK/$n/log/"freenet.*.log 2>/dev/null | tail -n 200 || true
+      find "$WORK/$n/log" -name 'freenet.*.log' ! -name 'freenet.error.*' -print0 2>/dev/null \
+        | sort -z | xargs -0 -r grep -hE "Delegate received|CasStore|timed out" 2>/dev/null \
+        | tail -n 200 || true
     done
     echo "--- full node logs: $WORK/gw/ and $WORK/peer/ (stdout.log and log/)"
   fi
