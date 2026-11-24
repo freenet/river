@@ -1174,6 +1174,39 @@ impl RoomData {
             .contains(&self_id)
     }
 
+    /// Whether the room holds a provisional (proof-of-work) entry for this
+    /// identity: it joined a public room without an invitation.
+    pub fn is_self_provisional(&self) -> bool {
+        self.self_verifying_key().is_some_and(|vk| {
+            self.room_state
+                .provisional
+                .entries
+                .iter()
+                .any(|e| e.provisional.member_vk == vk)
+        })
+    }
+
+    /// An open-admission member (no invitation) the room no longer holds: it
+    /// pruned the entry, so the next message needs re-admission (#975).
+    pub fn is_pruned_open_member(&self) -> bool {
+        let Some(vk) = self.self_verifying_key() else {
+            return false;
+        };
+        let config = &self.room_state.configuration.configuration;
+        vk != self.owner_vk
+            && self.self_authorized_member.is_none()
+            && self.self_member_info.is_some()
+            && !self
+                .room_state
+                .members
+                .members
+                .iter()
+                .any(|m| m.member.member_vk == vk)
+            && !self.is_self_provisional()
+            && config.privacy_mode == PrivacyMode::Public
+            && river_core::room_state::admission::admits_by_pow(config)
+    }
+
     /// Check if the user can send a message in the room.
     /// A user is considered a member if they are the owner, are in the active
     /// members list, or have a stored invitation (self_authorized_member).
@@ -1219,6 +1252,11 @@ impl RoomData {
 
         // Has stored invite (can re-add with first message)
         if self.self_authorized_member.is_some() {
+            return Ok(());
+        }
+
+        // An open-admission member the room holds an entry for (#975).
+        if self.is_self_provisional() {
             return Ok(());
         }
 
@@ -1270,6 +1308,10 @@ impl RoomData {
 
         // Has stored invite (was previously a member, can re-add)
         if self.self_authorized_member.is_some() {
+            return Ok(());
+        }
+
+        if self.is_self_provisional() {
             return Ok(());
         }
 

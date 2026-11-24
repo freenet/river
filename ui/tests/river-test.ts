@@ -22,8 +22,26 @@ type RiverTestHooks = {
   // The seed is read (32 bytes of `fill`) but no salt is stored for the current room.
   setSeedReadUnstored(fill: number): void;
   makeRoomPrivateWithoutSecret(): void;
-  // Base58 owner key of an example room a ?room= link can open ("public" or "private"; "missing" is a valid key no room has). Not in the room list.
-  viewableRoomKey(kind: "public" | "private" | "missing" | "member"): string;
+  // Base58 owner key of an example room a ?room= link can open: "public" or "private"; "member" is a room in the list; "open", "hard" and "full" are public rooms that admit by proof of work (full has its one open slot held); "missing" is a valid key no room has. Only "member" is in the room list.
+  viewableRoomKey(kind: "public" | "private" | "missing" | "member" | "open" | "hard" | "full"): string;
+  // The owner of that open room bans the key the join in progress uses (a provisional ban). False if none.
+  banJoiner(kind: "open" | "hard" | "full"): boolean;
+  // The room prunes the current room's open-admission member (entry, messages, member_info). `forget` also forgets the proof held this session, as a reload does.
+  pruneJoiner(forget: boolean): boolean;
+  // While true the join's solver does no work, so cancel and ban tests do not race a lucky proof.
+  holdSolver(hold: boolean): void;
+  // Base58 key the join in progress holds; "" when none (after a cancel, ban or failure).
+  joinSessionKey(): string;
+  // Base58 own member key of the current room; "" when none.
+  currentRoomSelfKey(): string;
+  // View another example room in place (as a link followed inside the page would), without closing the viewer.
+  viewRoom(kind: "public" | "private" | "open" | "hard" | "full"): void;
+  // The current room's own nickname; "" when none.
+  currentRoomSelfNickname(): string;
+  // Base58 key of whoever authored the first message with this exact text in the current room; "" when unknown.
+  messageAuthorKey(text: string): string;
+  // How many times this exact text is in the rooms the user holds (every room, every message).
+  roomMessageCount(text: string): number;
   // The current room under a new contract key, as a room-contract re-key leaves it.
   rekeyCurrentRoom(): void;
   // Show one mobile panel, as its buttons do, whatever covers them.

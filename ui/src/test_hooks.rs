@@ -194,6 +194,212 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The room's owner bans the key the join in progress is using, as a
+    // provisional ban in the viewed state, as if learned from the network.
+    set_hook(
+        "banJoiner",
+        Closure::<dyn FnMut(String) -> bool>::new(move |kind: String| {
+            use river_core::room_state::member::MemberId;
+            use river_core::room_state::provisional::{AuthorizedProvisionalBan, ProvisionalBan};
+            let (Some(owner_sk), Some(vk)) = (
+                crate::example_data::fixture_owner_sk(&kind),
+                crate::public_join::session_member_vk(),
+            ) else {
+                return false;
+            };
+            let owner_vk = owner_sk.verifying_key();
+            crate::public_room::edit_viewed_state(move |state| {
+                state.provisional.bans.push(AuthorizedProvisionalBan::new(
+                    &owner_vk,
+                    ProvisionalBan {
+                        banned_by: MemberId::from(&owner_vk),
+                        banned_at: crate::util::get_current_system_time(),
+                        target: MemberId::from(&vk),
+                    },
+                    &owner_sk,
+                ));
+            })
+        })
+        .into_js_value(),
+    );
+
+    // Pin or release the join's solver (see `public_join::HOLD_SOLVER`).
+    set_hook(
+        "holdSolver",
+        Closure::<dyn FnMut(bool)>::new(move |hold: bool| {
+            crate::public_join::HOLD_SOLVER.store(hold, std::sync::atomic::Ordering::Relaxed);
+        })
+        .into_js_value(),
+    );
+
+    // Base58 of the verifying key the join in progress holds, "" when none:
+    // empty after a cancel, ban or failure means no key was kept.
+    set_hook(
+        "joinSessionKey",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            crate::public_join::session_member_vk()
+                .map(|vk| crate::public_room::owner_key_b58(&vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // Base58 of the current room's own member key, "" when none: compared
+    // before and after a re-admission, which must keep it.
+    set_hook(
+        "currentRoomSelfKey",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return String::new();
+            };
+            crate::components::app::ROOMS
+                .try_read()
+                .ok()
+                .and_then(|r| r.map.get(&owner).and_then(|d| d.self_verifying_key()))
+                .map(|vk| crate::public_room::owner_key_b58(&vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // How many times `text` is in the rooms the user holds (all rooms, every
+    // message body). The exactly-once checks count this, not DOM text.
+    set_hook(
+        "roomMessageCount",
+        Closure::<dyn FnMut(String) -> u32>::new(move |text: String| {
+            ROOMS
+                .try_read()
+                .map(|rooms| {
+                    rooms
+                        .map
+                        .values()
+                        .flat_map(|r| r.room_state.recent_messages.messages.iter())
+                        .filter(|m| m.message.content.to_string_lossy() == text)
+                        .count() as u32
+                })
+                .unwrap_or(0)
+        })
+        .into_js_value(),
+    );
+
+    // View another example room in place, without closing the current viewer.
+    set_hook(
+        "viewRoom",
+        Closure::<dyn FnMut(String)>::new(move |kind: String| {
+            let Some(vk) = crate::example_data::viewable_fixtures()
+                .iter()
+                .find(|(k, _, _)| *k == kind)
+                .map(|(_, vk, _)| *vk)
+            else {
+                return;
+            };
+            crate::util::defer(move || {
+                crate::public_room::view_for_test(&crate::public_room::owner_key_b58(&vk))
+            });
+        })
+        .into_js_value(),
+    );
+
+    // The current room's own nickname, "" when none.
+    set_hook(
+        "currentRoomSelfNickname",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return String::new();
+            };
+            ROOMS
+                .try_read()
+                .ok()
+                .and_then(|r| r.map.get(&owner).and_then(|d| d.self_nickname.clone()))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // Base58 key of whoever authored the (first) message with this exact text
+    // in the current room, found through the room's members and provisional
+    // entries; "" when unknown. Compared with the key before a re-admission.
+    set_hook(
+        "messageAuthorKey",
+        Closure::<dyn FnMut(String) -> String>::new(move |text: String| {
+            use river_core::room_state::member::MemberId;
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return String::new();
+            };
+            let Ok(rooms) = ROOMS.try_read() else {
+                return String::new();
+            };
+            let Some(room) = rooms.map.get(&owner) else {
+                return String::new();
+            };
+            let state = &room.room_state;
+            let Some(author) = state
+                .recent_messages
+                .messages
+                .iter()
+                .find(|m| m.message.content.to_string_lossy() == text)
+                .map(|m| m.message.author)
+            else {
+                return String::new();
+            };
+            let vk = state
+                .provisional
+                .entries
+                .iter()
+                .find(|e| e.member_id() == author)
+                .map(|e| e.provisional.member_vk)
+                .or_else(|| {
+                    state
+                        .members
+                        .members
+                        .iter()
+                        .find(|m| MemberId::from(&m.member.member_vk) == author)
+                        .map(|m| m.member.member_vk)
+                });
+            vk.map(|vk| crate::public_room::owner_key_b58(&vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // The room prunes the current room's open-admission member: their entry,
+    // messages and member_info go, as the room's cleanup drops them. With
+    // `forget`, the proof held this session is forgotten too, as a reload does.
+    set_hook(
+        "pruneJoiner",
+        Closure::<dyn FnMut(bool) -> bool>::new(move |forget: bool| {
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return false;
+            };
+            if forget {
+                crate::public_join::forget_held_entries();
+            }
+            crate::components::app::ROOMS.with_mut(|rooms| {
+                let Some(room) = rooms.map.get_mut(&owner) else {
+                    return false;
+                };
+                let Some(vk) = room.self_verifying_key() else {
+                    return false;
+                };
+                let id = river_core::room_state::member::MemberId::from(&vk);
+                room.room_state
+                    .provisional
+                    .entries
+                    .retain(|e| e.provisional.member_vk != vk);
+                room.room_state
+                    .recent_messages
+                    .messages
+                    .retain(|m| m.message.author != id);
+                room.room_state
+                    .member_info
+                    .member_info
+                    .retain(|i| i.member_info.member_id != id);
+                true
+            })
+        })
+        .into_js_value(),
+    );
+
     set_hook(
         "takeMessageGroupRenders",
         Closure::<dyn FnMut() -> u32>::new(move || MESSAGE_GROUP_RENDERS.with(|n| n.replace(0)))

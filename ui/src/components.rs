@@ -118,6 +118,8 @@ mod volatile_value_binding_audit {
         r#"components/room_list/join_with_code_modal.rs <textarea> "{code_input}""#,
         r#"components/room_list/receive_invitation_modal.rs <input> "{nickname}""#,
         r#"components/room_list/room_name_field.rs <input> "{room_name}""#,
+        // The join composer: `oninput` writes every keystroke into `draft`.
+        r#"components/viewed_room.rs <textarea> "{draft}""#,
     ];
 
     /// Read-only display controls, pinned exactly for the same reason: a bare

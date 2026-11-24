@@ -429,6 +429,11 @@ pub fn remove_unverifiable_messages(
 ) -> usize {
     let owner_id = parameters.owner_id();
     let members_by_id = state.members.members_by_member_id();
+    // A provisional (proof-of-work) member has no `members` record; its
+    // messages verify against the key its held entries share, as the contract
+    // does. Dropping them here made a reloaded joiner lose its own message
+    // and then be pruned as quiet (#975).
+    let provisional_keys = state.provisional.key_map();
     let before = state.recent_messages.messages.len();
 
     state.recent_messages.messages.retain(|message| {
@@ -436,6 +441,8 @@ pub fn remove_unverifiable_messages(
             &parameters.owner
         } else if let Some(member) = members_by_id.get(&message.message.author) {
             &member.member.member_vk
+        } else if let Some(Some(key)) = provisional_keys.get(&message.message.author) {
+            key
         } else {
             // Author not in members list — remove
             return false;
@@ -987,6 +994,38 @@ mod tests {
         let removed = remove_unverifiable_messages(&mut state, &params);
         assert_eq!(removed, 1);
         assert_eq!(state.recent_messages.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_unverifiable_messages_keeps_a_provisional_authors_message() {
+        use river_core::room_state::provisional::{
+            AdmissionEvidence, AuthorizedProvisionalMember, ProvisionalMember,
+        };
+        let mut rng = rand::thread_rng();
+        let owner_sk = SigningKey::generate(&mut rng);
+        let owner_vk = owner_sk.verifying_key();
+        let joiner_sk = SigningKey::generate(&mut rng);
+        let params = ChatRoomParametersV1 { owner: owner_vk };
+
+        let mut state = ChatRoomStateV1::default();
+        state
+            .provisional
+            .entries
+            .push(AuthorizedProvisionalMember::new(
+                &owner_vk,
+                ProvisionalMember {
+                    member_vk: joiner_sk.verifying_key(),
+                    evidence: AdmissionEvidence::Pow { nonce: 1 },
+                },
+                &joiner_sk,
+            ));
+        state
+            .recent_messages
+            .messages
+            .push(make_signed_message(&joiner_sk, &owner_vk));
+
+        assert_eq!(remove_unverifiable_messages(&mut state, &params), 0);
+        assert_eq!(state.recent_messages.messages.len(), 1);
     }
 
     #[test]
