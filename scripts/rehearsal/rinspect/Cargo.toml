@@ -1,0 +1,25 @@
+# Own workspace: never a member of River's, so building it cannot move a
+# dependency the contracts compile against.
+[workspace]
+
+[package]
+name = "rinspect"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# run.sh copies this crate into its work dir and rewrites this path to the
+# common/ of the commit under rehearsal, so states are decoded by that commit's code.
+river-core = { path = "../../../common", features = ["migration"] }
+freenet-stdlib = { version = "0.12.1", features = ["net"] }
+ciborium = "0.2.2"
+blake3 = "1"
+hex = "0.4"
+bs58 = "0.5"
+serde_json = "1"
+ed25519-dalek = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+serde = "1"
+freenet-scaffold = "*"
