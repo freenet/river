@@ -562,6 +562,7 @@ pub fn App() -> Element {
 
     // `?room=<owner key>` (freenet/river#513) opens a public room read-only,
     // without membership; `VIEWED_ROOM` reads the address itself.
+    crate::util::signal_guard::anchor();
     let viewing_room = match crate::public_room::VIEWED_ROOM.try_read() {
         Ok(v) => v.is_some(),
         Err(_) => {
@@ -570,7 +571,8 @@ pub fn App() -> Element {
         }
     };
 
-    // The Discover Rooms view (freenet/river#975) fills the main pane.
+    // The Discover Rooms view (freenet/river#975) fills the main pane. The
+    // anchor above covers this read too.
     let discover_open = match crate::discover_view::DISCOVER_OPEN.try_read() {
         Ok(v) => *v,
         Err(_) => {
@@ -724,10 +726,16 @@ pub fn App() -> Element {
                 },
                 if viewing_room {
                     crate::components::viewed_room::ViewedRoomPane {}
-                } else if discover_open {
-                    crate::components::discover::DiscoverPane {}
                 } else {
-                    Conversation {}
+                    if discover_open {
+                        crate::components::discover::DiscoverPane {}
+                    }
+                    // Stays mounted (hidden) under Discover, so an unsent
+                    // draft survives opening and closing it.
+                    div {
+                        class: if discover_open { "hidden" } else { "flex flex-1 min-w-0" },
+                        Conversation {}
+                    }
                 }
             }
             div {

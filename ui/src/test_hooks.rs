@@ -56,8 +56,9 @@ thread_local! {
     static HELD_MESSAGE_SIGNS: std::cell::RefCell<Option<Vec<Option<futures::channel::oneshot::Sender<()>>>>> =
         const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_MESSAGE_SIGN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Message signing results recorded in the outbox since the page loaded.
+    /// Requests handed to the chat delegate since the page loaded.
     static DELEGATE_REQUESTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Message signing results recorded in the outbox since the page loaded.
     static MESSAGE_SIGNS_RECORDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Runs of a `showToast` action since `takeToastActionRuns` last read them.
     static TOAST_ACTION_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -128,8 +129,8 @@ pub async fn message_sign_gate() {
     }
 }
 
-/// Counts one request queued for the chat delegate (reads and writes), for
-/// `delegateRequestsSent`: browsing Discover must queue none.
+/// Counts one request handed to the chat delegate (at every site that builds
+/// a `DelegateOp`), for `delegateRequestsSent`.
 pub fn note_delegate_request() {
     DELEGATE_REQUESTS.with(|n| n.set(n.get() + 1));
 }
@@ -245,6 +246,19 @@ pub fn install_test_hooks() {
         "joinSessionKey",
         Closure::<dyn FnMut() -> String>::new(move || {
             crate::public_join::session_member_vk()
+                .map(|vk| crate::public_room::owner_key_b58(&vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // Base58 owner key of the current room, "" when none.
+    set_hook(
+        "currentRoomOwnerKey",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            crate::components::app::CURRENT_ROOM
+                .read()
+                .owner_key
                 .map(|vk| crate::public_room::owner_key_b58(&vk))
                 .unwrap_or_default()
         })
@@ -1004,13 +1018,70 @@ pub fn install_test_hooks() {
             .into_js_value(),
     );
 
-    // What the Discover index request is answered with: "ready", "hidden",
-    // "empty" or "unavailable" (built through the real decode, verify and
-    // safe-search pipeline), or anything else for no answer ("Loading").
+    // A positive control for `delegateRequestsSent`: one real delegate request,
+    // through the production send path. This build has no node, so it never
+    // completes; the counter moves when it is queued.
+    set_hook(
+        "probeDelegateRequest",
+        Closure::<dyn FnMut()>::new(move || {
+            crate::util::safe_spawn_local(async move {
+                use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg};
+                let _ = crate::components::app::chat_delegate::send_delegate_request(
+                    ChatDelegateRequestMsg::GetRequest {
+                        key: ChatDelegateKey::new(b"discover-probe".to_vec()),
+                    },
+                )
+                .await;
+            });
+        })
+        .into_js_value(),
+    );
+
+    // Everything in `ROOMS` as one string: the keys, order and current room,
+    // and a hash of each room's serialised state. Equal before and after means
+    // nothing in the rooms the user holds changed.
+    set_hook(
+        "roomsFingerprint",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            use std::hash::{Hash, Hasher};
+            let Ok(rooms) = ROOMS.try_read() else {
+                return String::from("unreadable");
+            };
+            let mut keys: Vec<_> = rooms.map.keys().collect();
+            keys.sort_by_key(|k| k.to_bytes());
+            let mut out = format!(
+                "{} rooms; current {:?}; order {:?}; removed {}",
+                keys.len(),
+                rooms.current_room_key,
+                rooms.room_order,
+                rooms.removed_rooms.len()
+            );
+            for k in keys {
+                let mut bytes = Vec::new();
+                let _ = ciborium::ser::into_writer(&rooms.map[k].room_state, &mut bytes);
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                out.push_str(&format!(
+                    "; {} {} {:x}",
+                    crate::public_room::owner_key_b58(k),
+                    bytes.len(),
+                    h.finish()
+                ));
+            }
+            out
+        })
+        .into_js_value(),
+    );
+
+    // What the Discover index is served as, through the real session (pointer
+    // record, index state, timers): "ready", "hidden", "empty" (signed states
+    // built by the real decode, verify and safe-search pipeline) or
+    // "unavailable" (an index state that fails verification); anything else is
+    // never answered ("Loading").
     set_hook(
         "setDiscoverFixture",
         Closure::<dyn FnMut(String)>::new(move |kind: String| {
-            crate::discover_index::fixture::set_answer(crate::discover_index::fixture::view(&kind));
+            crate::discover_index::fixture::set_kind(&kind);
         })
         .into_js_value(),
     );

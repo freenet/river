@@ -480,29 +480,32 @@ impl Session {
         }
         match answer {
             Answer::State(bytes) => {
-                // Only an answer to the index request cancels its timers. One
-                // from an old subscription during the pointer phase must not
-                // cancel the pointer's timeout or retry.
+                let decoded = read_state(bytes, &self.params);
+                // A valid but older state (a lagging peer) is refused BEFORE
+                // it cancels the request's timers: they stay armed, so a
+                // request answered only with stale state retries and, after
+                // `SURFACE_AFTER` attempts, shows the failure. The stamp is
+                // never cleared: junk followed by an older signed state must
+                // not bring a delisted room back.
+                if let Ok((_, stamp)) = &decoded {
+                    if self.stamp.is_some_and(|s| *stamp < s) {
+                        return;
+                    }
+                }
+                // Only an answer to the index request cancels its timers.
+                // One from an old subscription during the pointer phase must
+                // not cancel the pointer's timeout or retry.
                 if self.phase == Phase::Index {
                     self.epoch += 1;
                     self.attempt = 0;
                 }
-                match read_state(bytes, &self.params) {
+                match decoded {
                     Ok((view, stamp)) => {
-                        if self.stamp.is_some_and(|s| stamp < s) {
-                            return;
-                        }
                         self.stamp = Some(stamp);
                         self.set_view(view, fx);
                     }
                     Err(e) => {
                         let v = merge_view(&self.view, Err(e));
-                        // Once the view is no longer an answer, the stamp of
-                        // the state it came from must not refuse the next
-                        // valid one: that would leave "Loading" with no timer.
-                        if !v.is_answer() {
-                            self.stamp = None;
-                        }
                         self.set_view(v, fx);
                     }
                 }
@@ -575,14 +578,25 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 fn with_session<R>(f: impl FnOnce(&mut Session, &mut Live) -> R) -> Option<R> {
     let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
-        let root = atlas_root_vk()?;
-        let params = IndexParams {
-            root_vk: root,
-            slug: INDEX_SLUG.to_string(),
-        };
-        *guard = Session::new(root, POINTER_APP_ID, params);
+        *guard = new_session();
     }
     guard.as_mut().map(|s| f(s, &mut Live))
+}
+
+#[cfg(not(all(feature = "no-sync", feature = "example-data")))]
+fn new_session() -> Option<Session> {
+    let root = atlas_root_vk()?;
+    let params = IndexParams {
+        root_vk: root,
+        slug: INDEX_SLUG.to_string(),
+    };
+    Session::new(root, POINTER_APP_ID, params)
+}
+
+/// The example build reads a fixture index with its own keys.
+#[cfg(all(feature = "no-sync", feature = "example-data"))]
+fn new_session() -> Option<Session> {
+    fixture::session()
 }
 
 struct Live;
@@ -607,13 +621,15 @@ impl Effects for Live {
         });
     }
 
-    // The example build has no network. It answers from a fixture a test
-    // chose, or not at all (the view then stays on "Loading").
+    // The example build has no network. A fixture answers the request later,
+    // through the same delivery path a node's response takes.
     #[cfg(all(feature = "no-sync", feature = "example-data"))]
-    fn get(&mut self, _id: ContractInstanceId, _subscribe: bool) {
-        if let Some(view) = fixture::answer() {
-            self.set_view(view);
-        }
+    fn get(&mut self, id: ContractInstanceId, _subscribe: bool) {
+        crate::util::defer(move || {
+            if let Some(bytes) = fixture::reply(&id) {
+                deliver_state(&id, &bytes);
+            }
+        });
     }
 
     #[cfg(all(feature = "no-sync", not(feature = "example-data")))]
@@ -1834,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_valid_state_after_a_failure_is_shown_not_left_on_loading() {
+    fn an_older_state_after_a_failure_is_refused_and_the_request_keeps_retrying() {
         use atlas::fixtures::*;
         let hidden_at = |version: u64| {
             let mut e = room(1, version, "Unclassified", owner_b58(11));
@@ -1854,9 +1870,31 @@ mod tests {
         r.s.open(&mut r.fx);
         r.answer_pointer();
         let idx = r.idx();
-        // A lagging peer serves an older state: it is the best there is.
+        // A peer serves an older, validly signed state: it must not bring back
+        // what the newer state delisted.
         r.s.on_answer(&idx, Answer::State(&hidden_at(1)), &mut r.fx);
-        assert_eq!(*r.s.view(), DiscoverIndex::Hidden);
+        assert!(
+            !r.s.view().is_answer(),
+            "the older state was accepted: {:?}",
+            r.s.view()
+        );
+        // The refusal left the request's timeout armed, so it retries and,
+        // after SURFACE_AFTER attempts, shows the failure instead of "Loading".
+        let before = r.fx.gets.len();
+        for _ in 0..SURFACE_AFTER {
+            let timeout = r.last_timer();
+            assert!(matches!(timeout, Timer::Timeout(_)), "{timeout:?}");
+            r.s.on_timer(timeout, &mut r.fx);
+            let retry = r.last_timer();
+            assert!(matches!(retry, Timer::Retry(_)), "{retry:?}");
+            r.s.on_timer(retry, &mut r.fx);
+        }
+        assert!(r.fx.gets.len() > before, "it asked again");
+        assert!(
+            matches!(r.s.view(), DiscoverIndex::Unavailable(_)),
+            "{:?}",
+            r.s.view()
+        );
     }
 
     #[test]

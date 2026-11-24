@@ -1,13 +1,16 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, panicsOf } from "./example-room";
+import { waitForApp, selectRoom, panicsOf } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // freenet/river#975: the Discover Rooms view. The example build has no
 // network; `setDiscoverFixture` chooses what the index request is answered
 // with, built through the real decode, verify and safe-search pipeline from a
 // signed state holding: a public general room (featured), a room Atlas lists
-// but that is private now, an unreachable room, and three safe search hides
-// (unclassified, adult, malformed locator).
+// but that is private now, an unreachable room, a room the user already
+// belongs to, and three safe search hides (unclassified, adult, malformed
+// locator). The real session serves them: it asks for the pointer and then the
+// index, and the fixture answers each GET through the delivery path a node's
+// response takes, so retries, timers and verification are production code.
 
 const SHOTS = "/home/ian/code/tmp/river-972-journey/discover";
 const shot = (page: Page, name: string) => (process.env.DISCOVER_SHOTS ? page.screenshot({ path: `${SHOTS}/${name}.png` }) : undefined);
@@ -20,6 +23,7 @@ async function start(page: Page, fixture: "ready" | "hidden" | "empty" | "unavai
 }
 
 async function openFromHeader(page: Page) {
+  await expect(page.getByTestId("discover-rooms-button")).toBeAttached();
   // On a phone the rail is a panel of its own, reached from the conversation.
   await callRiverTest(page, "setMobileView", "rooms");
   await page.getByTestId("discover-rooms-button").click();
@@ -46,7 +50,7 @@ test("the header button is there with rooms, and the list shows listed rooms but
   await expect(page.getByTestId("room-list-empty")).toHaveCount(0);
   await openFromHeader(page);
 
-  await expect(titles(page)).toHaveText(["Atlas Open Room", "Atlas Quiet Room", "Atlas Faraway Room"]);
+  await expect(titles(page)).toHaveText(["Atlas Open Room", "Atlas Quiet Room", "Atlas Faraway Room", "Atlas Team Room"]);
   for (const hidden of ["Hidden Unclassified Room", "Hidden Adult Room", "Hidden Malformed Room"]) {
     await expect(page.getByTestId("discover")).not.toContainText(hidden);
   }
@@ -63,8 +67,35 @@ test("the header button is there with rooms, and the list shows listed rooms but
   await expect(page.getByTestId("discover-card-unavailable")).toHaveCount(1);
   await expect(cards.nth(2).getByTestId("discover-card-unavailable")).toHaveText("may be unavailable");
   await expect(page.getByTestId("discover")).not.toContainText(/dead/i);
+  // Valid markup: nothing but phrasing content inside a card's button.
+  await expect(cards.first().locator("div, p")).toHaveCount(0);
   await shot(page, `list-${test.info().project.name}`);
   expect(panics).toEqual([]);
+});
+
+test("the header button is a touch-sized target and focus moves into the view when it opens", async ({ page }) => {
+  await start(page, "ready");
+  await callRiverTest(page, "setMobileView", "rooms");
+  const box = await page.getByTestId("discover-rooms-button").boundingBox();
+  expect(box!.height).toBeGreaterThanOrEqual(40);
+  await openFromHeader(page);
+  await expect(page.getByTestId("discover")).toBeFocused();
+  await page.getByTestId("discover-close").click();
+  await expect(page.getByTestId("discover")).toHaveCount(0);
+});
+
+test("loading, empty and error are announced to assistive technology", async ({ page }) => {
+  await start(page, "loading");
+  await openFromHeader(page);
+  await expect(page.getByTestId("discover-loading")).toHaveAttribute("role", "status");
+  await page.getByTestId("discover-close").click();
+  await callRiverTest(page, "setDiscoverFixture", "empty");
+  await openFromHeader(page);
+  await expect(page.getByTestId("discover-empty")).toHaveAttribute("role", "status");
+  await page.getByTestId("discover-close").click();
+  await callRiverTest(page, "setDiscoverFixture", "unavailable");
+  await openFromHeader(page);
+  await expect(page.getByTestId("discover-error")).toHaveAttribute("role", "alert");
 });
 
 test("search and tag chips narrow the list", async ({ page }) => {
@@ -82,7 +113,7 @@ test("search and tag chips narrow the list", async ({ page }) => {
   await expect(page.getByTestId("discover-no-match")).toBeVisible();
   await expect(titles(page)).toHaveCount(0);
   await search.fill("");
-  await expect(titles(page)).toHaveCount(3);
+  await expect(titles(page)).toHaveCount(4);
 
   // "chat" is on two rooms.
   await page.getByTestId("discover-tag").filter({ hasText: /^chat$/ }).click();
@@ -93,7 +124,7 @@ test("search and tag chips narrow the list", async ({ page }) => {
   // Unselecting restores.
   await page.getByTestId("discover-tag").filter({ hasText: /^hobby$/ }).click();
   await page.getByTestId("discover-tag").filter({ hasText: /^chat$/ }).click();
-  await expect(titles(page)).toHaveCount(3);
+  await expect(titles(page)).toHaveCount(4);
 });
 
 test("clicking a card opens the room read-only, with its owner description", async ({ page }) => {
@@ -125,6 +156,31 @@ test("an unreachable room is still openable", async ({ page }) => {
   await expect(page.getByTestId("viewed-room-not-found")).toBeVisible();
 });
 
+test("a card for a room the user already belongs to opens their own room, not a visitor view", async ({ page }) => {
+  const panics = panicsOf(page);
+  await start(page, "ready");
+  await openFromHeader(page);
+  await page.getByTestId("discover-card").filter({ hasText: "Atlas Team Room" }).click();
+  await expect(page.getByTestId("discover")).toHaveCount(0);
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0);
+  await expect(page.getByTestId("message-composer").first()).toBeVisible();
+  const member = await callRiverTest(page, "viewableRoomKey", "member");
+  expect(await callRiverTest(page, "currentRoomOwnerKey")).toBe(member);
+  expect(panics).toEqual([]);
+});
+
+test("an unsent draft survives opening and closing Discover", async ({ page }) => {
+  await start(page, "ready");
+  await selectRoom(page, "Team Chat Room");
+  const composer = page.getByTestId("message-input");
+  await composer.fill("a half-written thought");
+  await openFromHeader(page);
+  await expect(composer).toBeHidden();
+  await page.getByTestId("discover-close").click();
+  await expect(composer).toBeVisible();
+  await expect(composer).toHaveValue("a half-written thought");
+});
+
 test("closing Discover returns to the user's rooms; picking a room leaves it", async ({ page }) => {
   await start(page, "ready");
   await openFromHeader(page);
@@ -147,10 +203,11 @@ test("an error is not the empty state, and Retry recovers", async ({ page }) => 
   await expect(page.getByTestId("discover-card")).toHaveCount(0);
   await shot(page, `error-${test.info().project.name}`);
 
+  // Retry restarts the real session, which asks again and is now served a good index.
   await callRiverTest(page, "setDiscoverFixture", "ready");
   await page.getByTestId("discover-retry").click();
   await expect(page.getByTestId("discover-error")).toHaveCount(0);
-  await expect(titles(page)).toHaveCount(3);
+  await expect(titles(page)).toHaveCount(4);
   expect(panics).toEqual([]);
 });
 
@@ -181,42 +238,54 @@ test("while the index has not answered it shows Loading, not empty", async ({ pa
   await shot(page, `loading-${test.info().project.name}`);
 });
 
-test("browsing writes nothing: no delegate request, no rooms change, no browser storage", async ({ page }) => {
+test("the delegate-request counter moves when a request IS sent (positive control)", async ({ page }) => {
+  await start(page, "ready");
+  const before = await callRiverTest(page, "delegateRequestsSent");
+  await callRiverTest(page, "probeDelegateRequest");
+  await expect.poll(() => callRiverTest(page, "delegateRequestsSent")).toBeGreaterThan(before);
+});
+
+test("browsing writes nothing: no delegate request, no change to the rooms, no browser storage", async ({ page }) => {
   await page.addInitScript(() => {
     const w = window as any;
     w.__storageWrites = 0;
-    for (const store of [Storage.prototype]) {
-      const set = store.setItem;
-      store.setItem = function (...a: [string, string]) {
-        w.__storageWrites++;
-        return set.apply(this, a);
-      };
-      const rm = store.removeItem;
-      store.removeItem = function (...a: [string]) {
-        w.__storageWrites++;
-        return rm.apply(this, a);
-      };
-    }
+    const set = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (...a: [string, string]) {
+      w.__storageWrites++;
+      return set.apply(this, a);
+    };
+    const rm = Storage.prototype.removeItem;
+    Storage.prototype.removeItem = function (...a: [string]) {
+      w.__storageWrites++;
+      return rm.apply(this, a);
+    };
   });
   await start(page, "ready");
-  await page.waitForTimeout(500);
-  const roomsBefore = await page.getByTestId("room-list").locator("li").count();
-  const delegateBefore = await callRiverTest(page, "delegateRequestsSent");
-  const storageBefore = await page.evaluate(() => (window as any).__storageWrites as number);
+  await expect(page.getByTestId("room-list")).toBeAttached();
+  const snapshot = () =>
+    page.evaluate(() => ({
+      writes: (window as any).__storageWrites as number,
+      local: JSON.stringify({ ...localStorage }),
+      session: JSON.stringify({ ...sessionStorage }),
+    }));
+  const rooms = await callRiverTest(page, "roomsFingerprint");
+  const delegate = await callRiverTest(page, "delegateRequestsSent");
+  const storage = await snapshot();
 
   await openFromHeader(page);
+  await expect(page.getByTestId("discover-card")).toHaveCount(4);
   await page.getByTestId("discover-search").fill("chat");
   await page.getByTestId("discover-tag").first().click();
   await page.getByTestId("discover-close").click();
   await openFromHeader(page);
   await page.getByTestId("discover-card").first().click();
-  await expect(page.getByTestId("viewed-room")).toBeVisible();
-  await page.waitForTimeout(500);
-
-  expect(await callRiverTest(page, "delegateRequestsSent")).toBe(delegateBefore);
-  expect(await page.evaluate(() => (window as any).__storageWrites as number)).toBe(storageBefore);
+  await expect(page.getByTestId("viewed-room-name")).toBeVisible();
   await page.getByTestId("viewed-room-close").click();
-  expect(await page.getByTestId("room-list").locator("li").count()).toBe(roomsBefore);
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0);
+
+  expect(await callRiverTest(page, "delegateRequestsSent")).toBe(delegate);
+  expect(await callRiverTest(page, "roomsFingerprint")).toBe(rooms);
+  expect(await snapshot()).toEqual(storage);
 });
 
 test.describe("narrow screens", () => {
@@ -225,7 +294,7 @@ test.describe("narrow screens", () => {
   test("Discover works at phone width and does not overflow sideways", async ({ page }) => {
     await start(page, "ready");
     await openFromHeader(page);
-    await expect(titles(page)).toHaveCount(3);
+    await expect(titles(page)).toHaveCount(4);
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     expect(overflow).toBeLessThanOrEqual(0);
     const card = await page.getByTestId("discover-card").first().boundingBox();

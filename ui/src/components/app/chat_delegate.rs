@@ -796,6 +796,7 @@ async fn register_then_load(attempt: u32, reload: Reload) -> Result<(), String> 
             // Perform the operation while holding the lock
             info!("Registering chat delegate");
             let (cipher, nonce) = chat_delegate_cipher_material();
+            note_delegate_send();
             api.send(DelegateOp(DelegateRequest::RegisterDelegate {
                 delegate,
                 cipher,
@@ -8092,6 +8093,7 @@ async fn fire_list_rooms_request() {
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
+    note_delegate_send();
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
         key: delegate_key,
         params: Parameters::from(Vec::<u8>::new()),
@@ -9224,6 +9226,7 @@ async fn fire_load_outbound_dms_request(attempt: u32) {
     let delegate_key = CHAT_DELEGATE_KEY.clone();
 
     let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
+    note_delegate_send();
     let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
         key: delegate_key,
         params: Parameters::from(Vec::<u8>::new()),
@@ -10768,6 +10771,16 @@ pub(crate) fn legacy_scoped_correlation(delegate_key: &DelegateKey, base: &[u8])
     k
 }
 
+/// Counts one request handed to the chat delegate, for the test hook
+/// `delegateRequestsSent`. Called at every site that builds a `DelegateOp`.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+fn note_delegate_send() {
+    crate::test_hooks::note_delegate_request();
+}
+
+#[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+fn note_delegate_send() {}
+
 pub async fn send_delegate_request(
     request: ChatDelegateRequestMsg,
 ) -> Result<ChatDelegateResponseMsg, String> {
@@ -10845,8 +10858,7 @@ async fn enqueue_delegate_request_inner(
     request: ChatDelegateRequestMsg,
     key_bytes: Vec<u8>,
 ) -> Result<PendingDelegateRequest, String> {
-    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-    crate::test_hooks::note_delegate_request();
+    note_delegate_send();
     debug!(
         "Sending delegate request: {}",
         crate::components::app::freenet_api::response_handler::describe_delegate_request(&request)
@@ -12216,6 +12228,7 @@ async fn send_sweep_generation(i: usize, attempt: u32, wave: u64) -> SweepSent {
 
         let app_msg = freenet_stdlib::prelude::ApplicationMessage::new(payload);
 
+        note_delegate_send();
         let delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
             key: legacy_delegate_key.clone(),
             params: Parameters::from(Vec::<u8>::new()),
@@ -12277,6 +12290,7 @@ async fn send_sweep_generation(i: usize, attempt: u32, wave: u64) -> SweepSent {
         return sent;
     }
     let list_app_msg = freenet_stdlib::prelude::ApplicationMessage::new(list_payload);
+    note_delegate_send();
     let list_delegate_request = DelegateOp(DelegateRequest::ApplicationMessages {
         key: legacy_delegate_key.clone(),
         params: Parameters::from(Vec::<u8>::new()),

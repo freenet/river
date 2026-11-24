@@ -469,7 +469,7 @@ pub fn close() {
         if showing {
             *VIEWED_ROOM.write() = None;
         }
-        // Wherever the selected room changes, the Discover view goes too.
+        // Choosing a room from the rail, or closing the viewer, closes Discover too.
         if DISCOVER_OPEN.try_read().is_ok_and(|open| *open) {
             *DISCOVER_OPEN.write() = false;
         }

@@ -480,7 +480,7 @@ pub fn RoomList() -> Element {
                     button {
                         r#type: "button",
                         "data-testid": "discover-rooms-button",
-                        class: "flex items-center gap-1 px-1.5 py-1 rounded-md text-xs text-link hover:bg-surface transition-colors",
+                        class: "flex items-center gap-1 px-2 min-h-10 rounded-md text-xs text-link hover:bg-surface transition-colors",
                         title: "Discover public rooms",
                         onclick: move |_| crate::components::discover::open_discover(),
                         {line_icon(SEARCH_ICON_PATH, 13)}

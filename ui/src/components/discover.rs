@@ -33,6 +33,25 @@ fn close_discover() {
     });
 }
 
+/// Give focus back to the button that opened the view (when it is on screen).
+fn focus_discover_button() {
+    #[cfg(target_arch = "wasm32")]
+    crate::util::defer(|| {
+        use wasm_bindgen::JsCast;
+        if let Some(button) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| {
+                d.query_selector("[data-testid=\"discover-rooms-button\"]")
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            let _ = button.focus();
+        }
+    });
+}
+
 fn open_card(owner_key: String) {
     crate::util::defer(move || {
         *DISCOVER_OPEN.write() = false;
@@ -56,6 +75,9 @@ pub fn DiscoverPane() -> Element {
     use_hook(|| crate::util::defer(discover_index::open));
     use_drop(discover_index::close);
 
+    // Read the anchor first: a contended read below must not leave this pane
+    // with no subscription at all (dioxus-signal-safety).
+    crate::util::signal_guard::anchor();
     let index = match DISCOVER_INDEX.try_read() {
         Ok(v) => v.clone(),
         Err(_) => {
@@ -66,15 +88,27 @@ pub fn DiscoverPane() -> Element {
 
     rsx! {
         div {
-            class: "flex-1 flex flex-col min-w-0 bg-bg",
+            class: "flex-1 flex flex-col min-w-0 bg-bg outline-none",
             "data-testid": "discover",
+            role: "region",
+            "aria-label": "Discover rooms",
+            tabindex: "-1",
+            // Keyboard and screen reader users land in the view that opened.
+            onmounted: move |e| {
+                crate::util::safe_spawn_local(async move {
+                    let _ = e.set_focus(true).await;
+                });
+            },
             div { class: "flex items-center justify-between gap-3 px-4 md:px-6 h-[60px] flex-shrink-0 border-b border-border",
                 h1 { class: "text-lg font-semibold text-text", "Discover rooms" }
                 button {
                     r#type: "button",
                     "data-testid": "discover-close",
                     class: "flex-shrink-0 px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text text-sm transition-colors",
-                    onclick: move |_| close_discover(),
+                    onclick: move |_| {
+                        close_discover();
+                        focus_discover_button();
+                    },
                     "Close"
                 }
             }
@@ -89,7 +123,7 @@ pub fn DiscoverPane() -> Element {
                             }
                         },
                         Pane::Error(message) => rsx! {
-                            Notice { testid: "discover-error", title: message, body: "" ,
+                            Notice { testid: "discover-error", title: message, body: "", alert: true,
                                 button {
                                     r#type: "button",
                                     "data-testid": "discover-retry",
@@ -188,12 +222,15 @@ fn Notice(
     testid: &'static str,
     title: &'static str,
     body: &'static str,
+    #[props(default)] alert: bool,
     children: Element,
 ) -> Element {
     rsx! {
         div {
             class: "py-12 text-center",
             "data-testid": "{testid}",
+            // Announced when it appears: a failure at once, the rest politely.
+            role: if alert { "alert" } else { "status" },
             h2 { class: "text-base font-semibold text-text mb-2", "{title}" }
             if !body.is_empty() {
                 p { class: "text-sm text-text-muted mb-4", "{body}" }
@@ -215,12 +252,12 @@ fn Card(hit: RoomHit) -> Element {
                 "data-owner": "{hit.owner_key}",
                 class: "w-full text-left p-4 rounded-xl bg-surface hover:bg-surface-hover border border-border transition-colors",
                 onclick: move |_| open_card(owner_key.clone()),
-                div { class: "flex items-start justify-between gap-2",
-                    div { class: "min-w-0",
-                        div { class: "text-base font-semibold text-text break-words", "data-testid": "discover-card-title", "{hit.title}" }
-                        div { class: "text-[11px] text-text-muted", "Name as Atlas listed it" }
+                span { class: "flex items-start justify-between gap-2",
+                    span { class: "block min-w-0",
+                        span { class: "block text-base font-semibold text-text break-words", "data-testid": "discover-card-title", "{hit.title}" }
+                        span { class: "block text-[11px] text-text-muted", "Name as Atlas listed it" }
                     }
-                    div { class: "flex flex-col items-end gap-1 flex-shrink-0",
+                    span { class: "flex flex-col items-end gap-1 flex-shrink-0",
                         if hit.featured {
                             span { class: "px-2 py-0.5 rounded-full text-[11px] bg-accent-soft text-link", "data-testid": "discover-card-featured", "Featured" }
                         }
@@ -230,13 +267,13 @@ fn Card(hit: RoomHit) -> Element {
                     }
                 }
                 if !hit.snippet.is_empty() {
-                    p { class: "mt-2 text-sm text-text break-words", "data-testid": "discover-card-snippet", "{hit.snippet}" }
-                    p { class: "mt-1 text-[11px] italic text-text-muted", "data-testid": "discover-card-attribution",
+                    span { class: "block mt-2 text-sm text-text break-words", "data-testid": "discover-card-snippet", "{hit.snippet}" }
+                    span { class: "block mt-1 text-[11px] italic text-text-muted", "data-testid": "discover-card-attribution",
                         "{attribution(hit.snippet_source)}"
                     }
                 }
                 if !hit.tags.is_empty() {
-                    div { class: "mt-2 flex flex-wrap gap-1",
+                    span { class: "mt-2 flex flex-wrap gap-1",
                         for tag in hit.tags.iter() {
                             span { key: "{tag}", class: "px-2 py-0.5 rounded-full text-[11px] border border-border text-text-muted", "{tag}" }
                         }

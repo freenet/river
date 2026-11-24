@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 mod avatar_salt;
 mod components;
 mod constants;
-// R2 adds the callers of `discover_index::open`/`close` and `DISCOVER_INDEX`.
+// Some of the reader's API is used only by its tests.
 #[allow(dead_code)]
 mod discover_index;
 mod discover_view;
