@@ -51,12 +51,58 @@ fn shell(tray: bool) -> std::sync::Arc<Shell> {
     })
 }
 
-/// A connected app whose shell offers Background and startup.
+/// A connected app whose shell offers Background and startup, and keeps a log.
 fn with_shell(tray: bool) -> (RiverApp, std::sync::Arc<Shell>) {
     let mut s = connected();
     let host = shell(tray);
     s.chat.background = Some(super::BackgroundUi::new(host.clone()));
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(log_host()));
     (s, host)
+}
+
+/// A shell with a log file, which remembers how often its folder was opened and can refuse.
+struct LogShell {
+    opened: std::sync::atomic::AtomicUsize,
+    refuse: bool,
+    /// Keeps no file: stderr goes elsewhere.
+    elsewhere: bool,
+    /// Keeps no file and has nowhere to write.
+    unavailable: bool,
+    /// Was writing to its file and stopped.
+    stopped: bool,
+}
+
+impl super::LogHost for LogShell {
+    fn log_state(&self) -> super::LogState {
+        if self.stopped {
+            super::LogState::Stopped
+        } else if self.unavailable {
+            super::LogState::Unavailable
+        } else if self.elsewhere {
+            super::LogState::Elsewhere
+        } else {
+            super::LogState::File("/home/ada/.config/River/logs/river.log".into())
+        }
+    }
+    fn open_log_folder(&self) -> Result<(), String> {
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refuse {
+            Err("couldn't open /home/ada/.config/River/logs: no file manager".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn log_host() -> std::sync::Arc<LogShell> {
+    std::sync::Arc::new(LogShell {
+        opened: 0.into(),
+        refuse: false,
+        elsewhere: false,
+        unavailable: false,
+        stopped: false,
+    })
 }
 
 fn render(state: RiverApp, size: (f32, f32)) -> Runtime<RiverApp> {
@@ -977,6 +1023,107 @@ fn the_background_section_in_a_narrow_window_and_reopening_reads_the_shell_again
 }
 
 #[test]
+fn diagnostics_is_listed_only_where_the_shell_keeps_a_log() {
+    let rt = open(WINDOW_SIZE);
+    assert!(rt.find("settings-section-diagnostics").is_none());
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(log_host()));
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings");
+    assert_eq!(
+        find(&rt, "settings-section-diagnostics").label.as_deref(),
+        Some("Diagnostics")
+    );
+}
+
+#[test]
+fn diagnostics_shows_the_log_path_and_the_button_opens_its_folder() {
+    let host = log_host();
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(host.clone()));
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings");
+    press(&mut rt, "settings-section-diagnostics");
+    assert!(shows(&rt, "/home/ada/.config/River/logs/river.log"));
+    assert_eq!(find(&rt, "settings-log-open").role, "button");
+    assert!(rt.find("settings-log-error").is_none());
+    press(&mut rt, "settings-log-open");
+    assert_eq!(host.opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(rt.find("settings-log-error").is_none());
+}
+
+#[test]
+fn without_a_log_file_diagnostics_says_where_the_output_goes_and_has_no_button() {
+    let host = std::sync::Arc::new(LogShell {
+        opened: 0.into(),
+        refuse: false,
+        elsewhere: true,
+        unavailable: false,
+        stopped: false,
+    });
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));
+    s.chat.settings.open_at(Section::Diagnostics);
+    let rt = render(s, WINDOW_SIZE);
+    assert!(shows(&rt, "output going elsewhere"));
+    assert!(rt.find("settings-log-open").is_none());
+    assert!(rt.find("settings-log-path").is_none());
+}
+
+#[test]
+fn a_log_that_could_not_be_made_says_diagnostics_are_lost() {
+    let host = std::sync::Arc::new(LogShell {
+        opened: 0.into(),
+        refuse: false,
+        elsewhere: false,
+        unavailable: true,
+        stopped: false,
+    });
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));
+    s.chat.settings.open_at(Section::Diagnostics);
+    let rt = render(s, WINDOW_SIZE);
+    assert!(shows(&rt, "could not open its log file"));
+    assert!(!shows(&rt, "output going elsewhere"));
+    assert!(rt.find("settings-log-open").is_none());
+}
+
+#[test]
+fn a_log_that_stopped_says_so_and_is_not_shown_as_live() {
+    let host = std::sync::Arc::new(LogShell {
+        opened: 0.into(),
+        refuse: false,
+        elsewhere: false,
+        unavailable: false,
+        stopped: true,
+    });
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));
+    s.chat.settings.open_at(Section::Diagnostics);
+    let rt = render(s, WINDOW_SIZE);
+    assert!(shows(&rt, "log file stopped"));
+    assert!(rt.find("settings-log-open").is_none());
+    assert!(rt.find("settings-log-path").is_none());
+}
+
+#[test]
+fn a_folder_that_will_not_open_says_why() {
+    let host = std::sync::Arc::new(LogShell {
+        opened: 0.into(),
+        refuse: true,
+        elsewhere: false,
+        unavailable: false,
+        stopped: false,
+    });
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));
+    s.chat.settings.open_at(Section::Diagnostics);
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings-log-open");
+    assert!(shows(&rt, "no file manager"));
+}
+
+#[test]
 fn every_scene_of_these_sections_exists() {
     let names: Vec<&str> = crate::SCENES.iter().map(|(n, _)| *n).collect();
     for want in [
@@ -990,6 +1137,7 @@ fn every_scene_of_these_sections_exists() {
         "chat-settings-identity-narrow",
         "chat-settings-appearance",
         "chat-settings-appearance-narrow",
+        "chat-settings-diagnostics",
         "chat-dnd-on",
     ] {
         assert!(names.contains(&want), "{want}");

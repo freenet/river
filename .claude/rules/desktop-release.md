@@ -76,7 +76,7 @@ A re-keying River publish needs a new desktop release ready first. Once its poin
 | Linux | `river --version` runs |
 | macOS arm64 slice | `river --version` runs |
 | macOS x86_64 slice | Compiled and linked, never executed |
-| Windows | The exe's `ProductVersion` resource. `river.exe --version` prints nothing: release builds use the GUI subsystem, so there is no console |
+| Windows | The exe's `ProductVersion` resource. `river.exe --version` prints nothing: release builds use the GUI subsystem, so there is no console (diagnostics go to the log file, `desktop/src/log.rs`) |
 
 ## Packaging and signing
 

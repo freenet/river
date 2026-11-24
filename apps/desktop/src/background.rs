@@ -124,7 +124,7 @@ fn tell_with(
         if let Some(dir) = dir
             && let Err(e) = save(dir, close_to_tray, true)
         {
-            eprintln!("river: couldn't remember that the close notice was shown: {e}");
+            river_app::diag!("river: couldn't remember that the close notice was shown: {e}");
         }
     }
 }

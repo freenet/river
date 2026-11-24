@@ -662,6 +662,8 @@ fn nothing_prints_the_text_a_key_or_the_ciphertext() {
     for banned in [
         "println!",
         "eprintln!",
+        "diag!(",
+        "diag::line(",
         "dbg!",
         "tracing::",
         "log::",

@@ -162,19 +162,20 @@ fn hand_over_instance<T>(start: impl FnOnce() -> Result<T, String>) -> Result<T,
 fn restart_into(path: &std::path::Path) {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         // The lock is not carried over an exec (the file is close-on-exec) but is let go of
         // explicitly, and taken back if the exec fails.
         let failed = hand_over_instance(|| {
+            // The previous build starts its own log, and a failed exec leaves our stderr as it
+            // was: see `log::exec_with_child_stderr`.
             Err::<(), String>(
-                std::process::Command::new(path)
-                    .args(std::env::args_os().skip(1))
-                    .exec()
-                    .to_string(),
+                crate::log::exec_with_child_stderr(
+                    std::process::Command::new(path).args(std::env::args_os().skip(1)),
+                )
+                .to_string(),
             )
         });
         let Err(err) = failed else { return };
-        eprintln!(
+        river_app::diag!(
             "River: couldn't start the previous version {}: {err}",
             path.display()
         );
@@ -260,13 +261,13 @@ impl UpdateHost for DesktopUpdate {
 /// end-to-end test; the app does the same on its own schedule.
 pub fn run_cli() -> i32 {
     let Some(u) = DesktopUpdate::new() else {
-        eprintln!("river: no place to keep update state");
+        river_app::diag!("river: no place to keep update state");
         return 1;
     };
     println!("river {}: checking for an update", u.version());
     match u.check() {
         Err(e) => {
-            eprintln!("river: update refused: {e}");
+            river_app::diag!("river: update refused: {e}");
             1
         }
         Ok(UpdateCheck::UpToDate) => {
@@ -283,14 +284,14 @@ pub fn run_cli() -> i32 {
                 return 11;
             }
             if let Err(e) = u.download(&mut |_, _| {}) {
-                eprintln!("river: update refused: {e}");
+                river_app::diag!("river: update refused: {e}");
                 return 1;
             }
             println!("river: downloaded and verified {}", info.version);
             // No arguments: the new River opens its window, not another update run.
             match u.restart_with(&[]) {
                 Err(e) => {
-                    eprintln!("river: update failed: {e}");
+                    river_app::diag!("river: update failed: {e}");
                     1
                 }
                 Ok(()) => 0,

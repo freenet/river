@@ -3694,6 +3694,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "ksni",
+ "libc",
  "notify-rust",
  "png 0.18.1",
  "river-app",

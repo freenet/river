@@ -256,7 +256,7 @@ impl KeySweep {
                 }
                 (Phase::Check, Some(_)) => {
                     // The owner's key names the room; a room's own name may be private.
-                    eprintln!(
+                    crate::diag!(
                         "River: the delegate holds a different signing key for room {}; \
                          leaving it for River in your browser to replace",
                         bs58::encode(owner.to_bytes()).into_string()
@@ -274,7 +274,10 @@ impl KeySweep {
             ) if *room_key == owner.to_bytes() => match result {
                 Ok(()) => self.go(Phase::Verify),
                 Err(e) => {
-                    eprintln!("River: the delegate refused a room's signing key: {e}");
+                    crate::diag!(
+                        "River: the delegate refused a room's signing key: {}",
+                        crate::diag::scrub(e)
+                    );
                     self.fail(cur.room, pace, now)
                 }
             },
@@ -289,7 +292,10 @@ impl KeySweep {
         let Some(cur) = self.current.filter(|c| c.sent.is_some()) else {
             return false;
         };
-        eprintln!("River: asking the delegate about a room's signing key failed: {why}");
+        crate::diag!(
+            "River: asking the delegate about a room's signing key failed: {}",
+            crate::diag::scrub(why)
+        );
         self.fail(cur.room, pace, now);
         true
     }

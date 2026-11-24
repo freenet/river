@@ -12,6 +12,7 @@
 mod background;
 mod conversation;
 mod details;
+mod diagnostics;
 mod dialog_kit;
 pub mod dm_archive;
 pub mod dm_compose;
@@ -72,6 +73,7 @@ pub(crate) mod visual_fold;
 pub mod zoom;
 
 pub use background::{BackgroundHost, BackgroundUi};
+pub use diagnostics::{DiagnosticsUi, LogHost, LogState};
 pub use dm_model::DmArrival;
 /// The preference key of [`Chat::private_previews`], unchanged from before it had a switch.
 pub const PREVIEWS_PREF: &str = "notification_previews";
@@ -370,6 +372,8 @@ pub struct Chat {
     pub export: Option<identity::ExportDialog>,
     /// "Background and startup", when the shell offers it ([`background`]).
     pub background: Option<background::BackgroundUi>,
+    /// "Diagnostics", when the shell keeps a log file ([`diagnostics`]).
+    pub diagnostics: Option<diagnostics::DiagnosticsUi>,
     /// "Node status" ([`node_status`]).
     pub status: node_status::NodeStatusUi,
     /// Do not disturb: this device's switch and schedule ([`dnd`]).
@@ -537,6 +541,7 @@ impl Chat {
             invite: None,
             export: None,
             background: None,
+            diagnostics: None,
             status: Default::default(),
             dnd: Default::default(),
             private_previews: false,

@@ -83,14 +83,16 @@ pub fn register_identity() {
         )
     };
     if status != ERROR_SUCCESS {
-        eprintln!("river: could not register River for notifications (registry error {status})");
+        river_app::diag!(
+            "river: could not register River for notifications (registry error {status})"
+        );
     } else {
         let named = set_string(key, "DisplayName", "River");
         let icon = logo_file()
             .map(|p| set_string(key, "IconUri", &p.to_string_lossy()))
             .unwrap_or(Ok(()));
         if let Err(status) = named.and(icon) {
-            eprintln!("river: could not fully register River for notifications ({status})");
+            river_app::diag!("river: could not fully register River for notifications ({status})");
         }
         // SAFETY: `key` was opened by RegCreateKeyExW above and is closed once.
         unsafe { RegCloseKey(key) };
@@ -99,7 +101,7 @@ pub fn register_identity() {
     // SAFETY: `id` is NUL-terminated and outlives the call.
     let hr = unsafe { SetCurrentProcessExplicitAppUserModelID(id.as_ptr()) };
     if hr < 0 {
-        eprintln!("river: could not set River's app id (HRESULT {hr:#x})");
+        river_app::diag!("river: could not set River's app id (HRESULT {hr:#x})");
     }
 }
 
@@ -142,7 +144,7 @@ impl Backend {
         let shown = match note.show() {
             Ok(shown) => shown,
             Err(e) => {
-                eprintln!("river: could not show a notification: {e}");
+                river_app::diag!("river: could not show a notification: {e}");
                 return;
             }
         };

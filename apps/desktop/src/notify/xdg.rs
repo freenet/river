@@ -102,7 +102,7 @@ impl Backend {
         let shown = match note.show() {
             Ok(shown) => shown,
             Err(e) => {
-                eprintln!("river: could not show a notification: {e}");
+                river_app::diag!("river: could not show a notification: {e}");
                 // The server may have restarted and forgotten the ids.
                 self.ids.clear();
                 self.caps = None;
