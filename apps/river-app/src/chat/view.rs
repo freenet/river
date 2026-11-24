@@ -4,7 +4,7 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, Cx, El, Pixels, ScrollSpec, col, el, icon, row, spacer, text};
-use rune_kit::{Button, ButtonVariant, Checkbox, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, Checkbox, Kit, ScrollBar, ScrollBarStyle, TextInput};
 
 use super::conversation::{avatar, conversation, mention_overlay, picker_overlay};
 use super::dialog_kit::{self as dk, DialogSpec};
@@ -549,7 +549,9 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
                 stick_bottom: false,
             })
             .grow(1.0)
-            .min_h(0.0),
+            .min_h(0.0)
+            .pr(ScrollBarStyle::from_kit(k).strip())
+            .scroll_bar(k),
         )
         .child(hline(p))
         .child(footer);
@@ -1079,7 +1081,9 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
                     stick_bottom: false,
                 })
                 .grow(1.0)
-                .min_h(0.0),
+                .min_h(0.0)
+                .pr(ScrollBarStyle::from_kit(k).strip())
+                .scroll_bar(k),
             )
             .child(footer),
     )

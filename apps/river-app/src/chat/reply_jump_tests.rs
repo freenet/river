@@ -10,7 +10,7 @@ const WINDOW: &str = "history-scroll-town-square";
 
 /// The example Town Square with 60 filler messages and then three replies: to the oldest
 /// message, to the newest filler, and (twice) to message 6.
-fn long_room(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
+pub(super) fn long_room(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
     let mut s = RiverApp::detached();
     s.setup = Setup::Connected {
         version: "0.2.155".into(),
@@ -85,7 +85,7 @@ fn long_room(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
     rt
 }
 
-fn settle(rt: &mut Runtime<RiverApp>) {
+pub(super) fn settle(rt: &mut Runtime<RiverApp>) {
     for i in 1..=30 {
         rt.frame(10.0 + f64::from(i) * 0.05);
     }

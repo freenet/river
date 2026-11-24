@@ -52,6 +52,8 @@ pub mod overview;
 mod quick_reply;
 #[cfg(test)]
 mod reply_jump_tests;
+#[cfg(test)]
+mod scroll_tests;
 pub mod search;
 pub mod settings;
 #[cfg(test)]
@@ -307,6 +309,9 @@ pub struct Chat {
     /// Whether the open room's history shows its newest message (the Latest button hides
     /// then). Reported by the history's scroll area.
     pub at_bottom: bool,
+    /// Where the open history (the room's, or the direct-message thread's) is scrolled to.
+    /// Written by the history's scroll area, read by the arrow keys (`history_arrow`).
+    pub history_pos: std::rc::Rc<std::cell::RefCell<HistoryPos>>,
     /// The "N people joined" lines (by `Join::key`) opened to show who, as the web UI's
     /// `details` does. Not kept across runs.
     pub joins_open: std::collections::HashSet<String>,
@@ -433,6 +438,40 @@ pub struct Chat {
     pub dm: dm_view::DmUi,
 }
 
+/// Where the open history is scrolled to: which scroll view reported it, its offset from the top
+/// in points, and the offset the arrow keys asked for that the view has not reported yet.
+#[derive(Default)]
+pub struct HistoryPos {
+    key: String,
+    offset: f32,
+    /// The furthest offset the view reports it can scroll to.
+    max: f32,
+    pending: Option<f32>,
+}
+
+impl HistoryPos {
+    #[cfg(test)]
+    pub(super) fn key_for_test(&self) -> &str {
+        &self.key
+    }
+
+    #[cfg(test)]
+    pub(super) fn offset_for_test(&self) -> f32 {
+        self.offset
+    }
+
+    /// The offset `step` points on from where the last arrow key went, or from the reported
+    /// offset when none is waiting: held-key repeats arrive before the frame that reports the
+    /// new offset, and they add up.
+    pub(super) fn next_target(&mut self, step: f32) -> f32 {
+        // Clamped to the ends, as the view clamps it: a press past an end must not leave a target
+        // the next press in the other direction has to work back from.
+        let target = (self.pending.unwrap_or(self.offset) + step).clamp(0.0, self.max.max(0.0));
+        self.pending = Some(target);
+        target
+    }
+}
+
 impl Chat {
     /// The notification mode of the room keyed `room`.
     pub fn mode_of(&self, room: &str) -> NotificationMode {
@@ -512,6 +551,7 @@ impl Chat {
             mention_sel: (String::new(), 0),
             mention_off: None,
             at_bottom: true,
+            history_pos: Default::default(),
             joins_open: Default::default(),
             member_modal: None,
             member_modal_full: None,
@@ -1157,12 +1197,18 @@ impl Chat {
         self.mention_off = None;
     }
 
-    /// Escape with focus nowhere in particular (the window's key handler, and the conversation's
-    /// when a control in it has focus): closes the emoji picker, then abandons a reply or an
-    /// edit. Does nothing while a dialog or the narrow members panel is open, which take their
-    /// own Escape. Returns whether it acted.
-    pub fn escape(&mut self) -> bool {
-        let covered_by_other = self.form.open.is_some()
+    #[cfg(test)]
+    pub(super) fn dialog_open_for_test(&self) -> bool {
+        self.dialog_open()
+    }
+
+    /// A dialog, menu or picker is open over the window.
+    fn dialog_open(&self) -> bool {
+        self.form.open.is_some()
+            || self.export.is_some()
+            || self.dm.purge.confirming()
+            || self.invite_picker_open()
+            || self.node.form.is_some()
             || self.member_modal.is_some()
             || self.details.is_some()
             || self.notify_dialog.is_some()
@@ -1172,7 +1218,79 @@ impl Chat {
             || self.overview
             || self.shortcuts_open
             || self.link_menu.is_some()
-            || self.picker.is_some();
+            || self.picker.is_some()
+    }
+
+    /// Up and Down scroll the open history by a line, as they scroll a web page, while nothing
+    /// has keyboard focus (`tx.focused()` is none: the window hears a key first only then) and no
+    /// dialog, popup or overlay is open. A click on message text leaves nothing focused (text
+    /// is selectable, so it does not take focus), and this is what the arrows do then. With the
+    /// history itself focused rune scrolls it, and a field keeps its own arrows.
+    pub fn history_arrow(&mut self, ev: &rune::KeyEvent, tx: &mut rune::Tx) -> bool {
+        const LINE: f32 = 40.0;
+        let step = match ev.key {
+            rune::Key::Up => -LINE,
+            rune::Key::Down => LINE,
+            _ => return false,
+        };
+        // A direct-message thread's own box counts as nothing while it is empty (the DM box
+        // focus-flag issue, #1022, is why this workaround exists; remove it with
+        // that fix): it has no
+        // Up-to-edit, and a click in the thread leaves the box focused (rune does not blur a box
+        // focused by `open_dm`), so the thread's arrows must work from there.
+        let in_empty_dm_box = tx.focused() == Some("dm-composer-field")
+            && self.dm.is_open()
+            && self.dm_draft_is_empty();
+        if ev.mods != rune::Mods::default()
+            || (tx.focused().is_some() && !in_empty_dm_box)
+            || self.dialog_open()
+            || self.members_overlay
+            || self.emoji_open
+        {
+            return false;
+        }
+        let key = if let Some((room, uid)) = self.dm.open_key() {
+            dm_view::scroll_key(room, uid)
+        } else if let Some(room) = self.room() {
+            format!("history-scroll-{}", room.key)
+        } else {
+            return false;
+        };
+        let mut pos = self.history_pos.borrow_mut();
+        // Not drawn (yet): nothing to scroll, and the key is no use to anyone else.
+        if pos.key != key {
+            return false;
+        }
+        // Held-key repeats arrive before the frame that reports the new offset: they add up
+        // from the last target, not from the old offset.
+        let target = pos.next_target(step);
+        tx.scroll_to_y(key, target);
+        true
+    }
+
+    /// The scroll-offset handler of the history keyed `key`, which keeps `history_pos`.
+    pub(super) fn history_probe(&self, key: String) -> impl Fn(rune::ScrollPos) + 'static {
+        let at = self.history_pos.clone();
+        move |p| {
+            let mut pos = at.borrow_mut();
+            let offset = p.offset[1];
+            if pos.key != key || (pos.offset - offset).abs() > 0.01 {
+                pos.pending = None;
+            }
+            if pos.key != key {
+                pos.key.clone_from(&key);
+            }
+            pos.offset = offset;
+            pos.max = p.max[1];
+        }
+    }
+
+    /// Escape with focus nowhere in particular (the window's key handler, and the conversation's
+    /// when a control in it has focus): closes the emoji picker, then abandons a reply or an
+    /// edit. Does nothing while a dialog or the narrow members panel is open, which take their
+    /// own Escape. Returns whether it acted.
+    pub fn escape(&mut self) -> bool {
+        let covered_by_other = self.dialog_open();
         // The members box, when its field has the keyboard, takes Escape first, even inside a
         // narrow window's overlay: the first press closes the box, the next closes the overlay.
         if !covered_by_other && self.member_search_escape(true) {

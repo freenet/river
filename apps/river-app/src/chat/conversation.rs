@@ -2,7 +2,7 @@
 
 use rune::tok::TextStyle;
 use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
-use rune_kit::Kit;
+use rune_kit::{Kit, ScrollBar, ScrollBarStyle};
 
 use super::emoji;
 use super::icons;
@@ -256,8 +256,17 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
                 .w_full()
                 .child(items.selection_group(true))
                 .scroll(ScrollSpec { stick_bottom: true })
+                // Focusable, so a click on the history puts keyboard focus on it and Up and
+                // Down scroll it by a line (rune does that for a focused scroll view), as in
+                // the web UI where the arrows scroll the page when no field has focus.
+                .focusable(true)
+                .label("Conversation history")
                 .scroll_edge_fade(40.0)
-                .on_at_bottom(|s: &mut RiverApp, at| s.chat.at_bottom = at),
+                .on_at_bottom(|s: &mut RiverApp, at| s.chat.at_bottom = at)
+                .on_scroll_offset(chat.history_probe(scroll_key.clone()))
+                // Room for the bar's track, so nothing at the right edge sits under it.
+                .pr(ScrollBarStyle::from_kit(k).strip())
+                .scroll_bar(k),
         );
     // Latest: the web UI's round button in the corner, while the newest message is off screen.
     if !chat.at_bottom {
@@ -1145,7 +1154,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         column = column.child(bar);
     }
     if chat.emoji_open && can_send {
-        column = column.child(emoji_panel(chat, p));
+        column = column.child(emoji_panel(chat, p, k));
     }
     column = column.child(
         row()
@@ -1198,7 +1207,7 @@ fn composer(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
 
 /// The composer's emoji picker: the web UI's categories as a row of tabs, and the chosen
 /// category's emoji below, scrolling when there are more than fit.
-fn emoji_panel(chat: &Chat, p: &Palette) -> El {
+fn emoji_panel(chat: &Chat, p: &Palette, k: &Kit) -> El {
     let cats = emoji::EMOJI_CATEGORIES;
     let current = chat.emoji_category.min(cats.len() - 1);
     let mut tabs = row().key("emoji-tabs").gap(2.0);
@@ -1264,7 +1273,8 @@ fn emoji_panel(chat: &Chat, p: &Palette) -> El {
                 .scroll(ScrollSpec {
                     stick_bottom: false,
                 })
-                .child(grid),
+                .child(grid)
+                .scroll_bar(k),
         )
 }
 

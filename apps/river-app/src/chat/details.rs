@@ -26,7 +26,7 @@
 //! Privacy is shown, never changed: the web UI cannot change it either.
 
 use rune::{El, TextEdit, col, el, icon, row};
-use rune_kit::{Button, ButtonVariant, Kit, TextArea, TextInput};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar, TextArea, TextInput};
 
 use super::dialog_kit::{
     self as dk, DialogSpec, KEY_TEXT, NoticeKind, copy_field, disclosure, label_value, notice,
@@ -608,7 +608,8 @@ fn description_section(
             .scroll(rune::ScrollSpec {
                 stick_bottom: false,
             })
-            .child(body),
+            .child(body)
+            .scroll_bar(k),
     );
     section
 }
@@ -1226,7 +1227,8 @@ pub(super) fn details_modal(
             stick_bottom: false,
         })
         .scroll_edge_fade(24.0)
-        .child(body);
+        .child(body)
+        .scroll_bar(k);
     // Pinned under the fields, so Save is never scrolled out of reach.
     let mut footer = col()
         .key("details-footer")
