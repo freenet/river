@@ -1873,6 +1873,9 @@ impl Work {
         };
         if let Some(id) = late_named
             && self.late.contains_key(&id)
+            // The session's own subscribe or read of that key (a room followed under it): the
+            // error is theirs.
+            && !subscribing(&id)
             && !self
                 .active_ref()
                 .is_some_and(|t| matches!(&t.out, Some((Out::Contract(out), _)) if *out == id))

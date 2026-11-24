@@ -1108,3 +1108,39 @@ fn a_lost_slot_keeps_the_rank_for_the_same_identity_and_removes_it_otherwise() {
     other.written(true);
     assert!(other.write().is_none());
 }
+
+/// A rank this carry added stays remembered across Try again: when the slot write never ended
+/// (it failed, or got no answer) and the room's key, read again, holds another identity, the
+/// rank is taken out; for the same copy it stays.
+#[test]
+fn a_rank_added_before_try_again_is_taken_out_when_the_room_turned_out_to_be_another() {
+    let stores: Stores = BTreeMap::from([(39, store(vec![(key(1), slot(1, 11))]))]);
+    let interrupted = || {
+        let mut c = Carry::new(preds(&[39]), Vec::new(), true);
+        walk_reads(&mut c, &stores, &[]);
+        assert!(matches!(c.write(), Some(Write::Check(_))));
+        c.checked(None);
+        c.written(false);
+        assert!(matches!(c.write(), Some(Write::AddRank(..))));
+        c.written(true);
+        assert!(matches!(c.write(), Some(Write::Slot(..))));
+        // The slot write fails, or never gets an answer: the task fails, and Try again.
+        c.restart();
+        walk_reads(&mut c, &stores, &[]);
+        assert!(matches!(c.write(), Some(Write::Check(_))));
+        c
+    };
+    let mut other = interrupted();
+    other.checked(Some(&slot(1, 99)));
+    other.written(false);
+    assert_eq!(
+        other.write(),
+        Some(Write::RemoveRank(owner(1).verifying_key(), [39; 32]))
+    );
+    other.written(true);
+    assert!(other.write().is_none());
+    let mut same = interrupted();
+    same.checked(Some(&slot(1, 11)));
+    same.written(false);
+    assert!(same.write().is_none(), "the same copy keeps its rank");
+}

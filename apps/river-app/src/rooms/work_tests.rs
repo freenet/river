@@ -3238,4 +3238,23 @@ fn an_error_naming_a_key_given_up_on_and_a_followed_key() {
     // Not awaited by the session: nobody's.
     assert!(w.on_contract(&answer));
     assert!(!w.has_late());
+    // An error naming a key the session itself awaits is the session's, not the late read's.
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..2]),
+        plan.room.room_state.clone(),
+    );
+    let _ = w.next_request(false, t0);
+    assert!(!w.expire(Duration::from_secs(20), Duration::from_secs(60), gave_up));
+    let _ = w.next_request(false, gave_up);
+    let named: ClientError =
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
+            key: earlier[0],
+            cause: "no route".into(),
+        }))
+        .into();
+    assert!(!w.on_error(&named, false, &|id| *id == *earlier[0].id()));
+    assert!(w.has_late());
 }
