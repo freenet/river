@@ -226,16 +226,15 @@ fn stderr_sent_to_a_pipe_is_left_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A stderr the user chose, here `/dev/full` (every write fails with ENOSPC): River does not
-/// own it, so it is not silenced, and `diag!` never panics on it.
+/// A stderr the user chose that fails every write, here a pipe whose reader has gone (EPIPE;
+/// `/dev/full` would be Linux only): River does not own it, so it is not silenced, and `diag!`
+/// never panics on it.
 #[test]
 fn a_failing_stderr_that_is_not_ours_is_left_alone_and_diag_does_not_panic() {
-    let dir = temp("full");
-    let full = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .unwrap();
-    let out = run(&dir, Stdio::from(full), &["say:one", "say:two"]);
+    let dir = temp("broken-pipe");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = run(&dir, Stdio::from(writer), &["say:one", "say:two"]);
     assert!(out.status.success(), "{out:?}");
     assert!(said(&out).contains("log=none"), "{}", said(&out));
     assert!(said(&out).contains("silenced=false"), "{}", said(&out));
