@@ -54,6 +54,10 @@ type RiverTestHooks = {
   releaseMessageSign(index: number): number;
   // Release every held request and stop holding.
   releaseMessageSigning(): void;
+  // Chat delegate requests queued since the page loaded (reads and writes).
+  delegateRequestsSent(): number;
+  // What the Discover index request is answered with: "ready", "hidden", "empty", "unavailable"; any other value leaves it unanswered ("Loading").
+  setDiscoverFixture(kind: "ready" | "hidden" | "empty" | "unavailable" | "loading"): void;
   // Own-message signing results (signature or failure) recorded since the page loaded.
   messageSignsRecorded(): number;
   // The next own-message signing fails with no local key to fall back on.

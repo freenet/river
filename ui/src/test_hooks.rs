@@ -57,6 +57,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_MESSAGE_SIGN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Message signing results recorded in the outbox since the page loaded.
+    static DELEGATE_REQUESTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static MESSAGE_SIGNS_RECORDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Runs of a `showToast` action since `takeToastActionRuns` last read them.
     static TOAST_ACTION_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -125,6 +126,12 @@ pub async fn message_sign_gate() {
     if let Some(rx) = waiting {
         let _ = rx.await;
     }
+}
+
+/// Counts one request queued for the chat delegate (reads and writes), for
+/// `delegateRequestsSent`: browsing Discover must queue none.
+pub fn note_delegate_request() {
+    DELEGATE_REQUESTS.with(|n| n.set(n.get() + 1));
 }
 
 /// Counts one signing result (signature or failure) reaching the outbox, for
@@ -987,6 +994,23 @@ pub fn install_test_hooks() {
             for tx in senders.into_iter().flatten().flatten() {
                 let _ = tx.send(());
             }
+        })
+        .into_js_value(),
+    );
+
+    set_hook(
+        "delegateRequestsSent",
+        Closure::<dyn FnMut() -> u32>::new(move || DELEGATE_REQUESTS.with(|n| n.get()))
+            .into_js_value(),
+    );
+
+    // What the Discover index request is answered with: "ready", "hidden",
+    // "empty" or "unavailable" (built through the real decode, verify and
+    // safe-search pipeline), or anything else for no answer ("Loading").
+    set_hook(
+        "setDiscoverFixture",
+        Closure::<dyn FnMut(String)>::new(move |kind: String| {
+            crate::discover_index::fixture::set_answer(crate::discover_index::fixture::view(&kind));
         })
         .into_js_value(),
     );

@@ -45,6 +45,8 @@
 //! A good list is never replaced by a later failure.
 
 pub mod atlas;
+#[cfg(all(feature = "example-data", feature = "no-sync"))]
+pub mod fixture;
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -599,7 +601,16 @@ impl Effects for Live {
         });
     }
 
-    #[cfg(feature = "no-sync")]
+    // The example build has no network. It answers from a fixture a test
+    // chose, or not at all (the view then stays on "Loading").
+    #[cfg(all(feature = "no-sync", feature = "example-data"))]
+    fn get(&mut self, _id: ContractInstanceId, _subscribe: bool) {
+        if let Some(view) = fixture::answer() {
+            self.set_view(view);
+        }
+    }
+
+    #[cfg(all(feature = "no-sync", not(feature = "example-data")))]
     fn get(&mut self, _id: ContractInstanceId, _subscribe: bool) {}
 
     fn set_view(&mut self, view: DiscoverIndex) {

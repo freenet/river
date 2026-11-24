@@ -10845,6 +10845,8 @@ async fn enqueue_delegate_request_inner(
     request: ChatDelegateRequestMsg,
     key_bytes: Vec<u8>,
 ) -> Result<PendingDelegateRequest, String> {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    crate::test_hooks::note_delegate_request();
     debug!(
         "Sending delegate request: {}",
         crate::components::app::freenet_api::response_handler::describe_delegate_request(&request)

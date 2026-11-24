@@ -570,6 +570,15 @@ pub fn App() -> Element {
         }
     };
 
+    // The Discover Rooms view (freenet/river#975) fills the main pane.
+    let discover_open = match crate::discover_view::DISCOVER_OPEN.try_read() {
+        Ok(v) => *v,
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    };
+
     // Seed DM_LAST_SEEN from the room state we just hydrated, so
     // previously-existing inbound DMs don't show up as unread on every
     // page load. We explicitly subscribe to ROOMS here so the effect
@@ -715,6 +724,8 @@ pub fn App() -> Element {
                 },
                 if viewing_room {
                     crate::components::viewed_room::ViewedRoomPane {}
+                } else if discover_open {
+                    crate::components::discover::DiscoverPane {}
                 } else {
                     Conversation {}
                 }

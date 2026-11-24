@@ -3,6 +3,7 @@ pub mod back_to_chat;
 pub(crate) mod connection_activity;
 pub mod conversation;
 pub mod direct_messages;
+pub mod discover;
 pub mod foreground;
 pub(crate) mod icons;
 pub mod invite_click_interceptor;

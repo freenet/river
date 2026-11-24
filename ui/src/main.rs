@@ -8,6 +8,7 @@ mod constants;
 // R2 adds the callers of `discover_index::open`/`close` and `DISCOVER_INDEX`.
 #[allow(dead_code)]
 mod discover_index;
+mod discover_view;
 #[cfg(feature = "example-data")]
 mod example_data;
 mod fonts;
