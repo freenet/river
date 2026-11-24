@@ -232,6 +232,55 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Which solver the last join used: "workers" (Web Workers) or "main" (the
+    // fallback), "" before any join.
+    set_hook(
+        "powSolverMode",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            crate::public_join::SOLVER_MODE
+                .lock()
+                .map(|m| m.to_string())
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // Times the join's solver was retargeted to a changed room policy.
+    set_hook(
+        "powRetargets",
+        Closure::<dyn FnMut() -> u32>::new(move || {
+            crate::public_join::RETARGETS.load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .into_js_value(),
+    );
+
+    // The owner of that example room signs a new open-admission policy: `bits`
+    // in `epoch`. False if the viewed room is not public.
+    set_hook(
+        "retargetPolicy",
+        Closure::<dyn FnMut(String, u32, u32) -> bool>::new(
+            move |kind: String, bits: u32, epoch: u32| {
+                let Some(owner_sk) = crate::example_data::fixture_owner_sk(&kind) else {
+                    return false;
+                };
+                crate::public_room::edit_viewed_state(move |state| {
+                    let mut config = state.configuration.configuration.clone();
+                    config.configuration_version += 1;
+                    if let Some(pow) = config
+                        .public_admission
+                        .as_mut()
+                        .and_then(|p| p.pow.as_mut())
+                    {
+                        pow.difficulty_bits = bits as u8;
+                        pow.epoch = epoch;
+                    }
+                    state.configuration = AuthorizedConfigurationV1::new(config, &owner_sk);
+                })
+            },
+        )
+        .into_js_value(),
+    );
+
     // Base58 of the verifying key the join in progress holds, "" when none:
     // empty after a cancel, ban or failure means no key was kept.
     set_hook(

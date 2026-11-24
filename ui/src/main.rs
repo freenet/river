@@ -16,6 +16,7 @@ mod invites;
 mod nickname;
 #[allow(dead_code)]
 mod pending_invites;
+mod pow_worker;
 mod public_join;
 mod public_room;
 mod room_data;
@@ -60,6 +61,14 @@ unsafe extern "Rust" fn __getrandom_v02_custom(
 }
 
 fn main() {
+    // The same wasm module runs the proof-of-work solver inside a Web Worker
+    // (see `pow_worker`); a worker has no page to start.
+    #[cfg(target_arch = "wasm32")]
+    if web_sys::window().is_none() {
+        pow_worker::worker_main();
+        return;
+    }
+
     dioxus::logger::initialize_default();
 
     #[cfg(target_arch = "wasm32")]

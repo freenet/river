@@ -48,11 +48,21 @@ use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStat
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// Nonces tried between two yields to the browser. About ten milliseconds of
-/// hashing in wasm, so the page stays responsive.
-const SLICE: u64 = 10_000;
-/// Slices between two progress updates (about a tenth of a second).
-const PROGRESS_EVERY: u32 = 10;
+/// Nonces tried between two looks at the clock when solving on the main
+/// thread (the fallback when workers are unavailable).
+const BUDGET: u64 = 2_048;
+/// Milliseconds of hashing on the main thread between two yields to the
+/// browser, so the page stays responsive and Cancel works.
+const SLICE_MS: u64 = 12;
+/// Milliseconds between two progress updates.
+const PROGRESS_MS: u64 = 100;
+/// Milliseconds between two looks at whether the room still admits this
+/// visitor on the same terms.
+const RECHECK_MS: u64 = 500;
+/// Longest a worker-driven solve goes without checking for a cancel, a test
+/// hold, or the room check.
+#[cfg(target_arch = "wasm32")]
+const WAKE_MS: u32 = 100;
 
 /// Why a join stopped, in words the visitor can act on.
 #[derive(Debug, Clone, PartialEq)]
@@ -1079,6 +1089,223 @@ pub fn take_carried_draft() -> String {
     taken.unwrap_or_default()
 }
 
+/// How a solve ended.
+enum Solve {
+    Nonce(u64),
+    /// The join was cancelled or superseded.
+    Stopped,
+    Failed(JoinFailure),
+}
+
+/// What the room asks of this visitor, rechecked now and then while solving:
+/// it may change (a new epoch restarts the search, more bits raise the
+/// target), and one that no longer admits stops the solve.
+struct RoomWatch {
+    owner_vk: VerifyingKey,
+    member_vk: VerifyingKey,
+    readmit: bool,
+    req: PowRequirement,
+    checked: SystemTime,
+}
+
+impl RoomWatch {
+    fn new(
+        owner_vk: VerifyingKey,
+        member_vk: VerifyingKey,
+        readmit: bool,
+        req: PowRequirement,
+    ) -> Self {
+        Self {
+            owner_vk,
+            member_vk,
+            readmit,
+            req,
+            checked: crate::util::get_current_system_time(),
+        }
+    }
+
+    /// `Ok(true)` when the requirement changed (`self.req` is the new one).
+    /// Looks at the room at most every [`RECHECK_MS`]: it clones the room state.
+    fn check(&mut self) -> Result<bool, JoinFailure> {
+        let now = crate::util::get_current_system_time();
+        if elapsed_ms(self.checked, now) < RECHECK_MS {
+            return Ok(false);
+        }
+        self.checked = now;
+        let Some(state) = source_state(&self.owner_vk, self.readmit) else {
+            return Ok(false);
+        };
+        match check_admission_status(&state, &self.owner_vk, &self.member_vk, None, now) {
+            Ok(new_req) if new_req != self.req => {
+                self.req = new_req;
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(f) => Err(f),
+        }
+    }
+
+    /// Whether `nonce` meets what the room now asks.
+    fn accepts(&self, nonce: u64) -> bool {
+        let hash = river_core::room_state::provisional::pow_hash(
+            &self.owner_vk,
+            &self.member_vk,
+            self.req.epoch,
+            nonce,
+        );
+        river_core::room_state::provisional::leading_zero_bits(&hash)
+            >= self.req.difficulty_bits as u32
+    }
+}
+
+fn elapsed_ms(from: SystemTime, to: SystemTime) -> u64 {
+    to.duration_since(from).unwrap_or_default().as_millis() as u64
+}
+
+/// Test hook: a held solver does no hashing but still rechecks the room, so a
+/// ban or policy change is seen.
+fn solver_held_for_test() -> bool {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    {
+        HOLD_SOLVER.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+    {
+        false
+    }
+}
+
+/// Test hook: which solver a join used last, "workers" or "main".
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub static SOLVER_MODE: Mutex<&'static str> = Mutex::new("");
+
+/// Test hook: how many times a solve followed a changed room policy.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub static RETARGETS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn note_retarget() {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    RETARGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_solver_mode(_mode: &'static str) {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    {
+        *SOLVER_MODE.lock().unwrap_or_else(|e| e.into_inner()) = _mode;
+    }
+}
+
+/// Solve in Web Workers, off the page's main thread, and on the main thread
+/// when workers cannot be had.
+async fn solve(generation: u64, mut watch: RoomWatch) -> Solve {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(done) = solve_in_workers(generation, &mut watch).await {
+        return done;
+    }
+    note_solver_mode("main");
+    solve_on_main_thread(generation, &mut watch).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn solve_in_workers(generation: u64, watch: &mut RoomWatch) -> Option<Solve> {
+    let mut pool = crate::pow_worker::Pool::spawn(crate::pow_worker::worker_count()).await?;
+    if !is_current(generation) {
+        return Some(Solve::Stopped);
+    }
+    note_solver_mode("workers");
+    let mut held = solver_held_for_test();
+    pool.start(&watch.owner_vk, &watch.member_vk, &watch.req, held);
+    let mut tried = vec![0u64; pool.len()];
+    let mut reported = SystemTime::UNIX_EPOCH;
+    loop {
+        if !is_current(generation) {
+            return Some(Solve::Stopped);
+        }
+        let now_held = solver_held_for_test();
+        if now_held != held {
+            held = now_held;
+            pool.pause(held);
+        }
+        use crate::pow_worker::FromWorker;
+        match pool.next(WAKE_MS).await {
+            Some((_, FromWorker::Found { nonce })) => {
+                if watch.accepts(nonce) {
+                    return Some(Solve::Nonce(nonce));
+                }
+                // Found for a target the room has since raised: carry on.
+                pool.retarget(&watch.req);
+            }
+            Some((i, FromWorker::Progress { tried: t })) => {
+                tried[i] = t;
+                let now = crate::util::get_current_system_time();
+                if elapsed_ms(reported, now) >= PROGRESS_MS {
+                    reported = now;
+                    let (sum, expected) = (tried.iter().sum(), watch.req.expected_hashes);
+                    step(|m| m.progress(generation, sum, expected));
+                }
+            }
+            Some((_, FromWorker::Failed(_))) => return None,
+            Some((_, FromWorker::Ready)) | None => {}
+        }
+        let epoch = watch.req.epoch;
+        match watch.check() {
+            Err(f) => return Some(Solve::Failed(f)),
+            Ok(true) => {
+                note_retarget();
+                pool.retarget(&watch.req);
+                if watch.req.epoch != epoch {
+                    tried.fill(0);
+                }
+            }
+            Ok(false) => {}
+        }
+    }
+}
+
+async fn solve_on_main_thread(generation: u64, watch: &mut RoomWatch) -> Solve {
+    let mut solver = PowSolver::new(
+        &watch.owner_vk,
+        &watch.member_vk,
+        &watch.req,
+        watch.req.difficulty_bits,
+    );
+    let mut reported = SystemTime::UNIX_EPOCH;
+    loop {
+        if !is_current(generation) {
+            return Solve::Stopped;
+        }
+        if solver_held_for_test() {
+            crate::util::sleep(std::time::Duration::from_millis(20)).await;
+        } else {
+            let began = crate::util::get_current_system_time();
+            loop {
+                match solver.step(BUDGET) {
+                    PowStep::Found { nonce, .. } => return Solve::Nonce(nonce),
+                    PowStep::Progress { tried, expected } => {
+                        let now = crate::util::get_current_system_time();
+                        if elapsed_ms(reported, now) >= PROGRESS_MS {
+                            reported = now;
+                            step(|m| m.progress(generation, tried, expected));
+                        }
+                        if elapsed_ms(began, now) >= SLICE_MS {
+                            break;
+                        }
+                    }
+                }
+            }
+            crate::util::yield_now().await;
+        }
+        match watch.check() {
+            Err(f) => return Solve::Failed(f),
+            Ok(true) => {
+                note_retarget();
+                solver.retarget(&watch.req, watch.req.difficulty_bits);
+            }
+            Ok(false) => {}
+        }
+    }
+}
+
 async fn run(generation: u64, owner_vk: VerifyingKey) {
     let (signing_key, readmit, held) = {
         let m = machine();
@@ -1109,7 +1336,7 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
             Err(f) => return fail(generation, f),
         }
     }
-    let mut req = match check_admission_status(
+    let req = match check_admission_status(
         &state,
         &owner_vk,
         &member_vk,
@@ -1119,50 +1346,15 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
         Ok(r) => r,
         Err(f) => return fail(generation, f),
     };
-    let mut solver = PowSolver::new(&owner_vk, &member_vk, &req, req.difficulty_bits);
-    let mut slices = 0u32;
-    let nonce = loop {
-        if !is_current(generation) {
-            return;
-        }
-        // Test hook: a held solver skips the hashing but still re-checks the
-        // room below, so a ban or policy change is seen.
-        #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-        let held_for_test = HOLD_SOLVER.load(std::sync::atomic::Ordering::Relaxed);
-        #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
-        let held_for_test = false;
-        if !held_for_test {
-            match solver.step(SLICE) {
-                PowStep::Found { nonce, .. } => break nonce,
-                PowStep::Progress { tried, expected } => {
-                    slices += 1;
-                    if slices % PROGRESS_EVERY == 1 {
-                        step(|m| m.progress(generation, tried, expected));
-                    }
-                }
-            }
-        }
-        // The room may change what it asks of newcomers while this runs
-        // (a new epoch restarts the search, more bits raise the target); one
-        // that no longer admits stops it.
-        if let Some(now_state) = source_state(&owner_vk, readmit) {
-            match check_admission_status(
-                &now_state,
-                &owner_vk,
-                &member_vk,
-                None,
-                crate::util::get_current_system_time(),
-            ) {
-                Ok(new_req) if new_req != req => {
-                    solver.retarget(&new_req, new_req.difficulty_bits);
-                    req = new_req;
-                }
-                Ok(_) => {}
-                Err(f) => return fail(generation, f),
-            }
-        }
-        // Yield to the browser so the page stays responsive and Cancel works.
-        crate::util::sleep(std::time::Duration::from_millis(0)).await;
+    let nonce = match solve(
+        generation,
+        RoomWatch::new(owner_vk, member_vk, readmit, req),
+    )
+    .await
+    {
+        Solve::Nonce(n) => n,
+        Solve::Stopped => return,
+        Solve::Failed(f) => return fail(generation, f),
     };
     if !is_current(generation) {
         return;
