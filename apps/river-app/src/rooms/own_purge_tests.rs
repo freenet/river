@@ -912,8 +912,8 @@ fn a_room_whose_leave_has_not_finished_keeps_its_record_even_when_the_leave_fail
         .purge_record_mut()
         .record(&owner, me, &[msgs[0].purge_token()])
         .unwrap();
-    // The last complete read listed the room.
-    device.rooms.stored_owners.insert(owner);
+    // A room the last complete read did not list (joined since): while its leave is pending
+    // it is not gone.
     let key = device.key.clone();
     assert!(device.rooms.list_command(&key, Action::LeaveRoom));
     assert!(device.rooms.list.is_empty(), "shown no more");
@@ -922,7 +922,9 @@ fn a_room_whose_leave_has_not_finished_keeps_its_record_even_when_the_leave_fail
         PurgeRecord::open(&dir).for_room(&owner).is_some(),
         "leave pending"
     );
-    // The tombstone write fails: the leave fails and the room is read back.
+    // One the last complete read listed: when the tombstone write fails, the leave fails and the
+    // room is read back; it is not gone in between.
+    device.rooms.stored_owners.insert(owner);
     device.rooms.outbox.work.halt("the store refused");
     device.rooms.own_purges_tick();
     assert!(device.rooms.list.is_empty());
