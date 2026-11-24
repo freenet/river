@@ -642,10 +642,18 @@ struct World {
     overlaps: usize,
     /// Earlier chat delegates the node holds, with what each stores. Any other is `Missing`.
     legacy: HashMap<DelegateKey, BTreeMap<Vec<u8>, Vec<u8>>>,
-    /// Every request to an earlier chat delegate: the connection and the delegate.
-    legacy_asks: Vec<(usize, DelegateKey)>,
+    /// Every request to an earlier chat delegate: the connection, the delegate and the key a
+    /// `GetRequest` read (`None` for a listing).
+    legacy_asks: Vec<(usize, DelegateKey, Option<Vec<u8>>)>,
     /// Take requests to this earlier delegate but answer nothing.
     silence_legacy: Option<DelegateKey>,
+    /// Answer every request to this earlier delegate with this typed error.
+    error_legacy: Option<(DelegateKey, DelegateError)>,
+    /// Drop the connection when a `GetRequest` of this key reaches an earlier delegate (then
+    /// clear this).
+    drop_on_legacy_get: Option<Vec<u8>>,
+    /// Refuse this many PUTs before taking one.
+    refuse_puts: usize,
 }
 
 /// How the fake node answers signing key requests.
@@ -1072,16 +1080,34 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                     .any(|p| p.key == key),
                 "the app asked a delegate that is neither River's nor an earlier River's: {key}"
             );
-            w.legacy_asks.push((n, key.clone()));
-            if w.silence_legacy.as_ref() == Some(&key) {
-                return out;
-            }
             for msg in inbound {
                 let InboundDelegateMsg::ApplicationMessage(m) = msg else {
                     continue;
                 };
                 let read: ChatDelegateRequestMsg =
                     ciborium::de::from_reader(m.payload.as_slice()).unwrap();
+                let got = match &read {
+                    ChatDelegateRequestMsg::GetRequest { key: k } => Some(k.as_bytes().to_vec()),
+                    _ => None,
+                };
+                w.legacy_asks.push((n, key.clone(), got.clone()));
+                if w.silence_legacy.as_ref() == Some(&key) {
+                    continue;
+                }
+                if got.is_some() && got == w.drop_on_legacy_get {
+                    w.drop_on_legacy_get = None;
+                    w.drop_live = true;
+                    continue;
+                }
+                if let Some((k, e)) = &w.error_legacy
+                    && *k == key
+                {
+                    out.push(encode(Err(ErrorKind::RequestError(
+                        RequestError::DelegateError(e.clone()),
+                    )
+                    .into())));
+                    continue;
+                }
                 let Some(store) = w.legacy.get(&key) else {
                     out.push(encode(Err(ErrorKind::RequestError(
                         RequestError::DelegateError(DelegateError::Missing(key.clone())),
@@ -1090,8 +1116,14 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                     continue;
                 };
                 let reply = match read {
+                    // The key index is a stored key, never listed.
                     ChatDelegateRequestMsg::ListRequest => ChatDelegateResponseMsg::ListResponse {
-                        keys: store.keys().cloned().map(ChatDelegateKey::new).collect(),
+                        keys: store
+                            .keys()
+                            .filter(|k| k.as_slice() != super::super::carry::KEY_INDEX_KEY)
+                            .cloned()
+                            .map(ChatDelegateKey::new)
+                            .collect(),
                     },
                     ChatDelegateRequestMsg::GetRequest { key: k } => {
                         ChatDelegateResponseMsg::GetResponse {
@@ -1398,6 +1430,17 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
         }) => {
             let key = contract.key();
             w.puts.push(key);
+            if w.refuse_puts > 0 {
+                w.refuse_puts -= 1;
+                out.push(encode(Err(ErrorKind::RequestError(
+                    RequestError::ContractError(ContractError::Put {
+                        key,
+                        cause: "refused for the test".into(),
+                    }),
+                )
+                .into())));
+                return out;
+            }
             w.contracts
                 .insert(*key.id(), (key, Contract::State(state.as_ref().to_vec())));
             out.push(encode(Ok(HostResponse::ContractResponse(
@@ -9953,7 +9996,7 @@ fn the_store_retry_waits_double_from_the_first_wait_up_to_the_max() {
 
 mod rekey {
     use super::*;
-    use crate::rooms::carry::predecessors;
+    use crate::rooms::carry::{KEY_INDEX_KEY, predecessors};
 
     fn work_lines(session: &Running) -> Vec<String> {
         session
@@ -9966,6 +10009,64 @@ mod rekey {
             .flatten()
             .map(|w| w.what)
             .collect()
+    }
+
+    /// An earlier chat delegate's store as the delegate keeps it: the entries, and its key index.
+    fn legacy_store(entries: Vec<(Vec<u8>, Vec<u8>)>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut out: BTreeMap<Vec<u8>, Vec<u8>> = entries.into_iter().collect();
+        #[derive(serde::Serialize)]
+        struct Index {
+            keys: Vec<ChatDelegateKey>,
+        }
+        let keys = out.keys().cloned().map(ChatDelegateKey::new).collect();
+        out.insert(KEY_INDEX_KEY.to_vec(), cbor(&Index { keys }));
+        out
+    }
+
+    fn tombstone() -> Vec<u8> {
+        crate::rooms::leave::tombstone_write(None).unwrap().unwrap()
+    }
+
+    fn on_network(w: &mut World, rooms: &[&TestRoom]) {
+        for r in rooms {
+            w.contracts
+                .insert(r.id(), (r.key, Contract::State(cbor(&r.state))));
+        }
+    }
+
+    fn start(node: &FakeNode, dir: &str, pace: Pace) -> Running {
+        let dir = temp_dir(dir);
+        save_token(&dir, "kept-token");
+        Running::start(node, &dir, pace)
+    }
+
+    fn carrying_done(session: &Running) -> bool {
+        session
+            .last_work()
+            .iter()
+            .all(|w| !w.what.contains("earlier version"))
+    }
+
+    fn identity_sources(w: &World) -> Vec<(VerifyingKey, [u8; 32])> {
+        #[derive(serde::Deserialize)]
+        struct Meta {
+            #[serde(default)]
+            identity_sources: Vec<(VerifyingKey, [u8; 32])>,
+        }
+        w.slots
+            .get(ROOMS_META_KEY)
+            .map(|b| {
+                ciborium::de::from_reader::<Meta, _>(b.as_slice())
+                    .unwrap()
+                    .identity_sources
+            })
+            .unwrap_or_default()
+    }
+
+    fn dk(key: &DelegateKey) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(key.bytes());
+        out
     }
 
     /// The regression: a node whose current chat delegate is empty (the delegate was re-keyed
@@ -9981,22 +10082,18 @@ mod rekey {
         let gone_here = TestRoom::new(5, "Left here", 1, &["g1"]);
         let preds = predecessors();
         let (newest, next) = (preds[0].key.clone(), preds[2].key.clone());
-        let tombstone = crate::rooms::leave::tombstone_write(None).unwrap().unwrap();
         node.with(|w| {
-            for r in [&a, &b, &left, &older, &gone_here] {
-                w.contracts
-                    .insert(r.id(), (r.key, Contract::State(cbor(&r.state))));
-            }
+            on_network(w, &[&a, &b, &left, &older, &gone_here]);
             // The current store holds only the tombstone of a room left in this generation.
             w.slots
-                .insert(room_storage_key(&gone_here.vk()), tombstone.clone());
+                .insert(room_storage_key(&gone_here.vk()), tombstone());
             // The newest earlier delegate: A, B, the room left in it, and the room left here.
             w.legacy.insert(
                 newest.clone(),
-                BTreeMap::from([
+                legacy_store(vec![
                     (room_storage_key(&a.vk()), a.slot()),
                     (room_storage_key(&b.vk()), b.slot()),
-                    (room_storage_key(&left.vk()), tombstone.clone()),
+                    (room_storage_key(&left.vk()), tombstone()),
                     (room_storage_key(&gone_here.vk()), gone_here.slot()),
                 ]),
             );
@@ -10004,20 +10101,17 @@ mod rekey {
             // a room only it holds.
             w.legacy.insert(
                 next.clone(),
-                BTreeMap::from([
+                legacy_store(vec![
                     (room_storage_key(&left.vk()), left.slot()),
                     (room_storage_key(&older.vk()), older.slot()),
                 ]),
             );
         });
-        let dir = temp_dir("carry-delegate");
-        save_token(&dir, "kept-token");
-        let session = Running::start(&node, &dir, quick());
+        let session = start(&node, "carry-delegate", quick());
         session.wait_rooms("the carried rooms are shown", |r, _, s| {
             names(r) == ["A", "B", "Older"] && s == LinkStatus::Live
         });
-        // Written to the current store: the rooms, and the tombstone, so the room left stays
-        // left; the room left in this generation is not brought back.
+        session.wait_until("the carry is over", || carrying_done(&session));
         node.with(|w| {
             for r in [&a, &b, &older] {
                 let StoredRoomSlot::Present(s) =
@@ -10027,15 +10121,34 @@ mod rekey {
                 };
                 assert_eq!(s.self_verifying_key(), Some(r.vk()));
             }
+            // The room left in the newest earlier delegate stays left.
             assert!(matches!(
                 decode_room_slot(&w.slots[&room_storage_key(&left.vk())]),
                 Ok(StoredRoomSlot::Tombstone)
             ));
-            assert_eq!(w.slots[&room_storage_key(&gone_here.vk())], tombstone);
-            // Every earlier delegate was asked, newest first, each only on what it holds.
-            let asked: Vec<DelegateKey> = w.legacy_asks.iter().map(|(_, k)| k.clone()).collect();
+            // The room left in this generation is never even read from an earlier one.
+            assert!(
+                w.legacy_asks
+                    .iter()
+                    .all(|(_, _, k)| k.as_deref()
+                        != Some(room_storage_key(&gone_here.vk()).as_slice())),
+                "a room the current store holds was read from an earlier delegate"
+            );
+            assert_eq!(w.slots[&room_storage_key(&gone_here.vk())], tombstone());
+            // Each carried room's identity source is the delegate that supplied it, so the web
+            // UI's ranked merge still lets a newer generation win.
+            let mut sources = identity_sources(w);
+            sources.sort_by_key(|(r, _)| r.to_bytes());
+            let mut expected = vec![
+                (a.vk(), dk(&newest)),
+                (b.vk(), dk(&newest)),
+                (older.vk(), dk(&next)),
+            ];
+            expected.sort_by_key(|(r, _)| r.to_bytes());
+            assert_eq!(sources, expected);
+            // Every earlier delegate was asked, newest first.
             let mut order: Vec<DelegateKey> = Vec::new();
-            for k in &asked {
+            for (_, k, _) in &w.legacy_asks {
                 if order.last() != Some(k) {
                     order.push(k.clone());
                 }
@@ -10043,7 +10156,7 @@ mod rekey {
             let expected: Vec<DelegateKey> = preds.iter().map(|p| p.key.clone()).collect();
             assert_eq!(order, expected);
         });
-        // While it worked the empty list said why.
+        // While it worked, the list said so.
         assert!(
             work_lines(&session)
                 .iter()
@@ -10051,103 +10164,143 @@ mod rekey {
             "{:?}",
             work_lines(&session)
         );
-        // Once done, nothing about it stays on screen.
-        let (_, _, _) = session.last_rooms().unwrap();
-        session.wait_until("the row is gone", || {
-            session
-                .last_work()
-                .iter()
-                .all(|w| !w.what.contains("earlier version"))
-        });
     }
 
-    /// A browser tab that stores a room between the walk's read and its write wins: the write
-    /// finds the key taken and stores nothing.
+    /// Another writer (a browser tab) that stores the room, or the user's tombstone of it,
+    /// between the carry's read and its write wins: the write finds the key taken and stores
+    /// nothing.
     #[test]
-    fn a_room_another_writer_stored_meanwhile_is_not_overwritten() {
+    fn what_another_writer_stored_meanwhile_is_never_overwritten() {
+        for (name, theirs) in [
+            (
+                "a room",
+                cbor(&Slot::Present(Box::new(SlotData {
+                    owner_vk: vk(1),
+                    room_state: TestRoom::new(1, "A", 1, &[]).state,
+                    self_sk: Some(SigningKey::from_bytes(&[99; 32])),
+                    self_vk: None,
+                    contract_key: TestRoom::new(1, "A", 1, &[]).key,
+                    last_read_message_id: None,
+                    self_nickname: None,
+                    invitation_secrets: BTreeMap::new(),
+                }))),
+            ),
+            ("a tombstone", tombstone()),
+        ] {
+            let node = fake_node(vec![]);
+            let a = TestRoom::new(1, "A", 1, &["a1"]);
+            let newest = predecessors()[0].key.clone();
+            let slot_key = room_storage_key(&a.vk());
+            let fired = Arc::new(AtomicBool::new(false));
+            node.with(|w| {
+                on_network(w, &[&a]);
+                w.legacy
+                    .insert(newest, legacy_store(vec![(slot_key.clone(), a.slot())]));
+                let (k, v, fired) = (slot_key.clone(), theirs.clone(), fired.clone());
+                w.before_cas = Some(Box::new(move |slots, generations, key| {
+                    if key == k.as_slice() && !slots.contains_key(&k) {
+                        slots.insert(k.clone(), v.clone());
+                        generations.insert(k.clone(), 1);
+                        fired.store(true, Ordering::SeqCst);
+                    }
+                }));
+            });
+            let session = start(&node, &format!("carry-race-{}", name.len()), quick());
+            session.wait_until("the carry is over", || {
+                fired.load(Ordering::SeqCst) && carrying_done(&session)
+            });
+            node.with(|w| {
+                assert_eq!(w.slots[&slot_key], theirs, "{name}");
+                // The write lost the compare-and-swap, then found the key taken.
+                assert!(w.cas.iter().any(|(k, taken)| *k == slot_key && !taken));
+                assert!(!w.cas.iter().any(|(k, taken)| *k == slot_key && *taken));
+            });
+        }
+    }
+
+    /// A store that keeps changing under the carry's write fails it after the web UI's number
+    /// of attempts, with Try again.
+    #[test]
+    fn a_carry_write_that_keeps_conflicting_fails_with_try_again() {
         let node = fake_node(vec![]);
         let a = TestRoom::new(1, "A", 1, &["a1"]);
         let newest = predecessors()[0].key.clone();
-        // The same room under another identity, as a browser tab stored it.
-        let their_slot = cbor(&Slot::Present(Box::new(SlotData {
-            owner_vk: a.vk(),
-            room_state: a.state.clone(),
-            self_sk: Some(SigningKey::from_bytes(&[99; 32])),
-            self_vk: None,
-            contract_key: a.key,
-            last_read_message_id: None,
-            self_nickname: None,
-            invitation_secrets: BTreeMap::new(),
-        })));
         let slot_key = room_storage_key(&a.vk());
         node.with(|w| {
-            w.contracts
-                .insert(a.id(), (a.key, Contract::State(cbor(&a.state))));
+            on_network(w, &[&a]);
             w.legacy
-                .insert(newest, BTreeMap::from([(slot_key.clone(), a.slot())]));
-            // Another writer stores the room just before the carry's compare-and-swap.
-            let (k, v) = (slot_key.clone(), their_slot.clone());
-            w.before_cas = Some(Box::new(move |slots, generations, key| {
-                if key == k.as_slice() && !slots.contains_key(&k) {
-                    slots.insert(k.clone(), v.clone());
-                    generations.insert(k.clone(), 1);
+                .insert(newest, legacy_store(vec![(slot_key.clone(), a.slot())]));
+            let k = slot_key.clone();
+            // Another writer bumps the generation before every store, leaving the key empty.
+            w.before_cas = Some(Box::new(move |_, generations, key| {
+                if key == k.as_slice() {
+                    *generations.entry(k.clone()).or_insert(0) += 1;
                 }
             }));
         });
-        let dir = temp_dir("carry-race");
-        save_token(&dir, "kept-token");
-        let session = Running::start(&node, &dir, quick());
-        session.wait_rooms("the room is shown", |r, _, _| names(r) == ["A"]);
-        session.wait_until("the carry is over", || {
-            session
-                .last_work()
-                .iter()
-                .all(|w| !w.what.contains("earlier version"))
+        let session = start(&node, "carry-conflicts", quick());
+        session.wait_until("the failure is shown", || {
+            session.last_work().iter().any(|w| {
+                w.what.contains("earlier version")
+                    && matches!(&w.state, WorkState::Failed { retry: true, why } if why.contains("kept changing"))
+            })
         });
-        assert_eq!(node.with(|w| w.slots[&slot_key].clone()), their_slot);
+        let conflicts = node.with(|w| w.cas.iter().filter(|(k, _)| *k == slot_key).count());
+        assert_eq!(conflicts as u32, crate::rooms::work::CAS_ATTEMPTS);
     }
 
-    /// An earlier store that never answers is passed over (on a new connection, so its answer
-    /// can't be taken for another's), the others are still carried, and the screen says what
-    /// could not be read, with Try again.
+    /// An earlier store that never answers stops the walk there (it may hold a newer copy of any
+    /// room, or a tombstone): what newer ones decided is carried, nothing older is read, and the
+    /// screen says so, with Try again, which carries the rest once it answers.
     #[test]
-    fn an_earlier_store_that_does_not_answer_is_said_and_try_again_reads_it() {
+    fn an_earlier_store_that_does_not_answer_stops_the_walk_and_try_again_finishes_it() {
         let node = fake_node(vec![]);
         let a = TestRoom::new(1, "A", 1, &["a1"]);
         let b = TestRoom::new(2, "B", 1, &["b1"]);
+        let c = TestRoom::new(3, "C", 1, &["c1"]);
         let preds = predecessors();
-        let (silent, other) = (preds[0].key.clone(), preds[1].key.clone());
+        let (newest, silent, older) = (
+            preds[0].key.clone(),
+            preds[1].key.clone(),
+            preds[2].key.clone(),
+        );
         node.with(|w| {
-            for r in [&a, &b] {
-                w.contracts
-                    .insert(r.id(), (r.key, Contract::State(cbor(&r.state))));
-            }
+            on_network(w, &[&a, &b, &c]);
             w.legacy.insert(
-                silent.clone(),
-                BTreeMap::from([(room_storage_key(&a.vk()), a.slot())]),
+                newest,
+                legacy_store(vec![(room_storage_key(&a.vk()), a.slot())]),
             );
             w.legacy.insert(
-                other,
-                BTreeMap::from([(room_storage_key(&b.vk()), b.slot())]),
+                silent.clone(),
+                legacy_store(vec![(room_storage_key(&b.vk()), b.slot())]),
+            );
+            w.legacy.insert(
+                older.clone(),
+                legacy_store(vec![(room_storage_key(&c.vk()), c.slot())]),
             );
             w.silence_legacy = Some(silent.clone());
         });
-        let dir = temp_dir("carry-silent");
-        save_token(&dir, "kept-token");
         let pace = Pace {
             delegate_deadline: Duration::from_millis(300),
             ..quick()
         };
-        let session = Running::start(&node, &dir, pace);
+        let session = start(&node, "carry-silent", pace);
         session.wait_until("the failure is shown", || {
             session.last_work().iter().any(|w| {
-                matches!(&w.state, WorkState::Failed { why, retry: true } if why.contains(&preds[0].version))
+                matches!(&w.state, WorkState::Failed { why, retry: true } if why.contains(&preds[1].version))
             })
         });
-        session.wait_rooms("the other store's room is shown", |r, _, _| {
-            names(r) == ["B"]
+        session.wait_rooms("the newer store's room is shown", |r, _, _| {
+            names(r) == ["A"]
         });
-        node.with(|w| w.silence_legacy = None);
+        node.with(|w| {
+            assert!(
+                w.legacy_asks.iter().all(|(_, k, _)| *k != older),
+                "nothing older than the silent store is read"
+            );
+            assert!(!w.slots.contains_key(&room_storage_key(&c.vk())));
+            w.silence_legacy = None;
+        });
         let id = session
             .last_work()
             .iter()
@@ -10155,21 +10308,94 @@ mod rekey {
             .unwrap()
             .id;
         session.list(Action::RetryWork { id });
-        session.wait_rooms("both rooms are shown", |r, _, _| names(r) == ["A", "B"]);
+        session.wait_rooms("every room is shown", |r, _, _| names(r) == ["A", "B", "C"]);
     }
 
-    /// A room stored under an earlier room-contract key whose current key has no state: the
-    /// app follows the current key and carries the room there from the earlier one (merged
-    /// with its own copy), then follows it.
+    /// An earlier store that answers with an error stops the walk the same way, without a new
+    /// connection.
     #[test]
-    fn a_room_under_an_earlier_contract_key_is_moved_to_the_current_one() {
+    fn an_earlier_store_that_answers_with_an_error_stops_the_walk() {
         let node = fake_node(vec![]);
-        let owner = SigningKey::from_bytes(&[1; 32]);
+        let a = TestRoom::new(1, "A", 1, &["a1"]);
+        let preds = predecessors();
+        let (broken, older) = (preds[0].key.clone(), preds[1].key.clone());
+        node.with(|w| {
+            on_network(w, &[&a]);
+            w.legacy.insert(
+                older.clone(),
+                legacy_store(vec![(room_storage_key(&a.vk()), a.slot())]),
+            );
+            w.error_legacy = Some((broken, DelegateError::ExecutionError("trap".into())));
+        });
+        let session = start(&node, "carry-error", quick());
+        session.wait_until("the failure is shown", || {
+            session.last_work().iter().any(|w| {
+                matches!(&w.state, WorkState::Failed { why, retry: true } if why.contains("trap"))
+            })
+        });
+        node.with(|w| {
+            assert_eq!(w.connections.len(), 1, "no new connection");
+            assert!(w.legacy_asks.iter().all(|(_, k, _)| *k != older));
+            assert!(!w.slots.contains_key(&room_storage_key(&a.vk())));
+        });
+    }
+
+    /// A connection lost in the middle of the walk: the walk goes on from where it was on the
+    /// next one, and every room is carried once.
+    #[test]
+    fn a_connection_lost_mid_walk_goes_on_from_where_it_was() {
+        let node = fake_node(vec![]);
+        let a = TestRoom::new(1, "A", 1, &["a1"]);
+        let b = TestRoom::new(2, "B", 1, &["b1"]);
+        let newest = predecessors()[0].key.clone();
+        node.with(|w| {
+            on_network(w, &[&a, &b]);
+            w.legacy.insert(
+                newest.clone(),
+                legacy_store(vec![
+                    (room_storage_key(&a.vk()), a.slot()),
+                    (room_storage_key(&b.vk()), b.slot()),
+                ]),
+            );
+            w.drop_on_legacy_get = Some(KEY_INDEX_KEY.to_vec());
+        });
+        let session = start(&node, "carry-reconnect", quick());
+        session.wait_rooms("both rooms are shown", |r, _, _| names(r) == ["A", "B"]);
+        session.wait_until("the carry is over", || carrying_done(&session));
+        node.with(|w| {
+            assert!(w.connections.len() >= 2, "the connection was dropped");
+            let stores = w
+                .cas
+                .iter()
+                .filter(|(k, taken)| parse_room_storage_key(k).is_some() && *taken)
+                .count();
+            assert_eq!(stores, 2, "each room is written once");
+        });
+        assert!(
+            session
+                .last_work()
+                .iter()
+                .all(|w| !matches!(w.state, WorkState::Failed { .. }))
+        );
+    }
+
+    fn rekeyed_room(seed: u8) -> (TestRoom, ContractKey, ContractKey) {
+        let owner = SigningKey::from_bytes(&[seed; 32]);
         let earlier =
             river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key())[0];
         let current = crate::rooms::create::contract_key(&owner.verifying_key());
-        let mut room = TestRoom::new(1, "A", 1, &["in my copy"]);
+        let mut room = TestRoom::new(seed, "A", 1, &["in my copy"]);
         room.key = earlier;
+        (room, earlier, current)
+    }
+
+    /// A room stored under an earlier room-contract key whose current key has no state: the
+    /// app follows it under its earlier key meanwhile, moves it to the current key (merged with
+    /// its own copy), then follows it there at once.
+    #[test]
+    fn a_room_under_an_earlier_contract_key_is_moved_to_the_current_one() {
+        let node = fake_node(vec![]);
+        let (room, earlier, current) = rekeyed_room(1);
         let mut network = room.state.clone();
         network.recent_messages.messages.push(message(
             &room.owner,
@@ -10183,14 +10409,14 @@ mod rekey {
             w.contracts
                 .insert(*current.id(), (current, Contract::NotFound));
         });
-        let dir = temp_dir("rekey-room");
-        save_token(&dir, "kept-token");
+        // The ordinary retry of a subscribe that found nothing is far off: only following the
+        // moved room at once can subscribe it again within the test.
         let pace = Pace {
-            resubscribe_first: Duration::from_millis(50),
-            resubscribe_max: Duration::from_millis(100),
+            resubscribe_first: Duration::from_secs(30),
+            resubscribe_max: Duration::from_secs(30),
             ..quick()
         };
-        let session = Running::start(&node, &dir, pace);
+        let session = start(&node, "rekey-room", pace);
         session.wait_until("the room is PUT under the current key", || {
             node.with(|w| w.puts.contains(&current))
         });
@@ -10200,21 +10426,83 @@ mod rekey {
                 && texts(&r[0]).contains(&"in my copy".to_owned())
                 && s == LinkStatus::Live
         });
+        session.wait_until("asked for under the current key again", || {
+            node.with(|w| w.subscribes_to(*current.id()) >= 2)
+        });
         node.with(|w| {
-            assert!(
-                w.subscribes_to(*current.id()) >= 2,
-                "asked again once moved"
-            );
-            // The earlier key is only read, never subscribed to or written.
-            assert!(w.reads.iter().any(|(id, _)| id == earlier.id()));
-            assert!(w.updates.iter().all(|(k, _)| k != &earlier));
+            // Meanwhile it was followed under its earlier key.
+            assert!(w.subscribes_to(*earlier.id()) >= 1);
             assert_eq!(w.puts, vec![current]);
-            // What went to the current key carries no pointer elsewhere.
             let Contract::State(bytes) = &w.contracts[current.id()].1 else {
                 panic!("no state under the current key");
             };
             let put: ChatRoomStateV1 = ciborium::de::from_reader(bytes.as_slice()).unwrap();
             assert!(put.upgrade.0.is_none());
         });
+    }
+
+    /// A subscribe that fails for another reason than "no state" is not a re-key: nothing is
+    /// moved, and the room is asked for again by the usual rules.
+    #[test]
+    fn a_failed_subscribe_that_is_not_a_not_found_moves_nothing() {
+        let node = fake_node(vec![]);
+        let (room, earlier, current) = rekeyed_room(2);
+        node.with(|w| {
+            w.slots.insert(room_storage_key(&room.vk()), room.slot());
+            w.contracts
+                .insert(*earlier.id(), (earlier, Contract::State(cbor(&room.state))));
+            w.ignore_subscribes.insert(*current.id());
+            let error: Result<HostResponse, ClientError> = Err(ErrorKind::RequestError(
+                RequestError::ContractError(ContractError::Subscribe {
+                    key: current,
+                    cause: "no route".into(),
+                }),
+            )
+            .into());
+            w.push
+                .push(Message::Binary(bincode::serialize(&error).unwrap().into()));
+        });
+        let session = start(&node, "rekey-not-notfound", quick());
+        session.wait_until("the subscribe was asked", || {
+            node.with(|w| w.subscribes_to(*current.id()) >= 1)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        node.with(|w| {
+            assert!(w.reads.iter().all(|(id, _)| id != earlier.id()));
+            assert!(w.puts.is_empty());
+        });
+        drop(session);
+    }
+
+    /// When no earlier key holds the room either, the user's copy is seeded under the current
+    /// key, as the web UI seeds it; a PUT the node refuses is tried again after a wait.
+    #[test]
+    fn a_room_no_key_holds_is_seeded_from_the_copy_and_a_refused_put_is_tried_again() {
+        let node = fake_node(vec![]);
+        let (room, earlier, current) = rekeyed_room(3);
+        node.with(|w| {
+            w.slots.insert(room_storage_key(&room.vk()), room.slot());
+            w.contracts
+                .insert(*earlier.id(), (earlier, Contract::NotFound));
+            w.contracts
+                .insert(*current.id(), (current, Contract::NotFound));
+            w.refuse_puts = 1;
+        });
+        let pace = Pace {
+            resubscribe_first: Duration::from_millis(50),
+            resubscribe_max: Duration::from_millis(100),
+            ..quick()
+        };
+        let session = start(&node, "rekey-local", pace);
+        session.wait_until("the copy is seeded on the second try", || {
+            node.with(|w| {
+                w.puts.len() >= 2
+                    && matches!(w.contracts.get(current.id()), Some((_, Contract::State(_))))
+            })
+        });
+        session.wait_rooms("the room is followed under the current key", |r, _, s| {
+            r.len() == 1 && texts(&r[0]).contains(&"in my copy".to_owned()) && s == LinkStatus::Live
+        });
+        node.with(|w| assert!(w.puts.iter().all(|k| *k == current)));
     }
 }

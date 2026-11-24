@@ -27,7 +27,8 @@ use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 use freenet_migrate::{
-    NewestFirst, Outcome, ProbeDriver, ProbeStateOps, RollbackRiskAck, SelectionPolicy, Step,
+    FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeStateOps, RollbackRiskAck, SelectionPolicy,
+    Step,
 };
 use freenet_stdlib::client_api::ContractRequest;
 use freenet_stdlib::prelude::{
@@ -45,11 +46,16 @@ use super::create::{self, ROOM_CONTRACT_WASM, params_bytes};
 /// its owner's earlier keys (`None` when the stored key is kept).
 pub fn current_key(room: &StoredRoom) -> (ContractKey, Option<ContractKey>) {
     let stored = room.contract_key;
+    let current = create::contract_key(&room.owner_vk);
+    // The current key is never an earlier one, even if a registry row named it by mistake.
+    if stored.id() == current.id() {
+        return (stored, None);
+    }
     if legacy_contract_keys_for_owner(&room.owner_vk)
         .iter()
         .any(|k| k.id() == stored.id())
     {
-        (create::contract_key(&room.owner_vk), Some(stored))
+        (current, Some(stored))
     } else {
         (stored, None)
     }
@@ -62,8 +68,9 @@ pub fn candidates_down_to(
     stored: Option<&ContractKey>,
 ) -> Vec<ContractInstanceId> {
     let all = legacy_contract_keys_for_owner(owner);
+    let current = *create::contract_key(owner).id();
     let mut out = Vec::new();
-    for k in &all {
+    for k in all.iter().filter(|k| *k.id() != current) {
         out.push(*k.id());
         if stored.is_some_and(|s| s.id() == k.id()) {
             break;
@@ -112,9 +119,40 @@ impl ProbeStateOps for RiverOps {
             }
         }
     }
+
+    fn merge_generations(&self, newer: ChatRoomStateV1, older: ChatRoomStateV1) -> ChatRoomStateV1 {
+        // The web UI's `merge_converging`: merge the older generation in; if that refuses, merge
+        // each side into the other once, which converges where one side only ranks lower; if
+        // that fails too, keep the newer (the older key stays unresolved for a later run only
+        // when it did not answer; a fold that fails is logged).
+        let params = ChatRoomParametersV1 { owner: self.owner };
+        let mut merged = newer.clone();
+        if merged.merge_from(&params, &older).is_ok() {
+            return merged;
+        }
+        let mut other = older.clone();
+        let mut merged = newer.clone();
+        if other.merge_from(&params, &newer).is_ok() && merged.merge_from(&params, &other).is_ok() {
+            return merged;
+        }
+        eprintln!("River: folding an earlier key of a room failed; keeping the newer state");
+        newer
+    }
 }
 
-/// Reading a room's earlier keys, newest first, for the newest real state.
+/// How a probe chooses among the earlier keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// Fold every earlier key down to the one the room was stored under into the user's copy:
+    /// a stored room moved to its current key (the web UI's `start_rekey_merge`), so messages
+    /// that reached any of those keys are carried.
+    Fold,
+    /// The newest key that holds a real room: a join or an ID import, which hold no copy (the
+    /// web UI's backward probe).
+    Newest,
+}
+
+/// Reading a room's earlier keys, newest first.
 pub struct Probe {
     owner: VerifyingKey,
     driver: ProbeDriver<RiverOps>,
@@ -122,9 +160,14 @@ pub struct Probe {
 
 /// What a probe came to.
 pub enum Found {
-    /// A real state, merged with the user's copy: to PUT under the current key.
-    State(Box<ChatRoomStateV1>),
-    /// No earlier key holds a real room (or none answered).
+    /// A real state from an earlier key, merged with the user's copy: to PUT under the current
+    /// key. `unresolved` are earlier keys that did not answer, still to fold in later.
+    State(Box<ChatRoomStateV1>, Vec<ContractInstanceId>),
+    /// Every earlier key answered, and none holds the room: the user's copy is all there is
+    /// (seeded under the current key, as the web UI seeds it).
+    Local(Box<ChatRoomStateV1>),
+    /// Nothing found, and some earlier keys did not answer: whether there is anything is not
+    /// known yet.
     Nothing,
 }
 
@@ -135,15 +178,23 @@ impl Probe {
         owner: VerifyingKey,
         candidates: Vec<ContractInstanceId>,
         local: ChatRoomStateV1,
+        policy: Policy,
     ) -> Probe {
+        let selection = match policy {
+            Policy::Fold => SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+            Policy::Newest => SelectionPolicy::NewestFirstWins,
+        };
         let driver = ProbeDriver::new(
             RiverOps { owner },
             local,
             NewestFirst::assume_ordered(candidates),
-            SelectionPolicy::NewestFirstWins,
+            selection,
         )
         // As the web UI's backward probe: a key that never answers is passed over, so one
-        // unreachable generation does not hide an older one that holds the room.
+        // unreachable generation does not hide an older one that holds the room. (FoldAll
+        // already goes on; the keys passed over come back as `unresolved`.)
         .continue_past_unknown(
             RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
         );
@@ -155,7 +206,12 @@ impl Probe {
         match self.driver.next_action() {
             Step::Get(id) => Ok(id),
             _ => Err(match self.driver.take_outcome() {
-                Some(Outcome::Recovered { merged, .. }) => Found::State(Box::new(merged)),
+                Some(Outcome::Recovered {
+                    merged, unresolved, ..
+                }) => Found::State(Box::new(merged), unresolved),
+                Some(Outcome::SeedLocal { local }) | Some(Outcome::NoLegacy { local }) => {
+                    Found::Local(Box::new(local))
+                }
                 _ => Found::Nothing,
             }),
         }

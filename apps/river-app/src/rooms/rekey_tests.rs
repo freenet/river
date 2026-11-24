@@ -150,9 +150,10 @@ fn the_newest_key_holding_a_real_room_wins() {
         owner().verifying_key(),
         all.clone(),
         ChatRoomStateV1::default(),
+        Policy::Newest,
     );
     let (found, read) = run(probe, &states);
-    let Found::State(state) = found else {
+    let Found::State(state, _) = found else {
         panic!("found nothing");
     };
     assert_eq!(texts(&state), vec!["newer"]);
@@ -167,34 +168,98 @@ fn a_key_that_does_not_answer_is_passed_over() {
         owner().verifying_key(),
         all.clone(),
         ChatRoomStateV1::default(),
+        Policy::Newest,
     );
     let (found, _) = run(probe, &states);
-    assert!(matches!(found, Found::State(s) if texts(&s) == vec!["older"]));
+    assert!(matches!(found, Found::State(s, _) if texts(&s) == vec!["older"]));
 }
 
 #[test]
-fn nothing_found_anywhere_is_nothing() {
+fn every_key_answering_with_nothing_leaves_only_the_users_copy() {
     let all = candidates_down_to(&owner().verifying_key(), None);
     let probe = Probe::new(
         owner().verifying_key(),
         all.clone(),
-        ChatRoomStateV1::default(),
+        room(&["only in my copy"]),
+        Policy::Fold,
     );
     let (found, read) = run(probe, &[]);
-    assert!(matches!(found, Found::Nothing));
+    let Found::Local(state) = found else {
+        panic!("not the user's copy");
+    };
+    assert_eq!(texts(&state), vec!["only in my copy"]);
     assert_eq!(read, all);
+}
+
+#[test]
+fn nothing_found_while_a_key_did_not_answer_is_nothing_yet() {
+    let all = candidates_down_to(&owner().verifying_key(), None);
+    let probe = Probe::new(
+        owner().verifying_key(),
+        all.clone(),
+        room(&["mine"]),
+        Policy::Fold,
+    );
+    let (found, _) = run(probe, &[(all[1], None)]);
+    assert!(matches!(found, Found::Nothing));
 }
 
 #[test]
 fn what_the_users_copy_holds_is_kept() {
     let all = candidates_down_to(&owner().verifying_key(), Some(&earlier()[0]));
     let states = vec![(all[0], Some(cbor(&room(&["from the network"]))))];
-    let probe = Probe::new(owner().verifying_key(), all, room(&["only in my copy"]));
+    let probe = Probe::new(
+        owner().verifying_key(),
+        all,
+        room(&["only in my copy"]),
+        Policy::Fold,
+    );
     let (found, _) = run(probe, &states);
-    let Found::State(state) = found else {
+    let Found::State(state, unresolved) = found else {
         panic!("found nothing");
     };
     assert_eq!(texts(&state), vec!["from the network", "only in my copy"]);
+    assert!(unresolved.is_empty());
+}
+
+/// A stored room is moved by folding EVERY earlier key down to the one it was stored under, as
+/// the web UI's `start_rekey_merge` does: what reached only an older key is not lost.
+#[test]
+fn moving_a_stored_room_folds_every_earlier_key_down_to_its_own() {
+    let all = candidates_down_to(&owner().verifying_key(), Some(&earlier()[2]));
+    assert_eq!(all.len(), 3);
+    let states = vec![
+        (all[0], Some(cbor(&room(&["on the newest"])))),
+        // One that does not answer is folded in later.
+        (all[1], None),
+        (all[2], Some(cbor(&room(&["on the stored key"])))),
+    ];
+    let probe = Probe::new(
+        owner().verifying_key(),
+        all.clone(),
+        room(&[]),
+        Policy::Fold,
+    );
+    let (found, read) = run(probe, &states);
+    let Found::State(state, unresolved) = found else {
+        panic!("found nothing");
+    };
+    assert_eq!(texts(&state), vec!["on the newest", "on the stored key"]);
+    assert_eq!(read, all);
+    assert_eq!(unresolved, vec![all[1]]);
+}
+
+#[test]
+fn the_current_key_is_never_an_earlier_one() {
+    let o = owner().verifying_key();
+    let current = *create::contract_key(&o).id();
+    assert!(candidates_down_to(&o, None).iter().all(|id| *id != current));
+    assert!(
+        legacy_contract_keys_for_owner(&o)
+            .iter()
+            .all(|k| *k.id() != current),
+        "the current room contract is listed in common/legacy_room_contracts.toml"
+    );
 }
 
 #[test]

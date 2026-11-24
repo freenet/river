@@ -2638,43 +2638,199 @@ fn a_join_after_a_room_contract_rekey_carries_the_room_to_its_current_key_first(
     expect_read(&mut w, &room_storage_key(&owner));
 }
 
-/// A PUT the node refuses is said, and Try again reads the earlier keys again.
+fn ids(keys: &[freenet_stdlib::prelude::ContractKey]) -> Vec<ContractInstanceId> {
+    keys.iter().map(|k| *k.id()).collect()
+}
+
+/// A move of a stored room folds every earlier key down to the one it was stored under (the web
+/// UI's `start_rekey_merge`); a PUT the node refuses ends the move unmoved, for the session to
+/// try again later, and a new move reads the earlier keys again.
 #[test]
-fn a_refused_forward_put_is_said_and_try_again_reads_the_earlier_keys_again() {
+fn a_move_folds_every_earlier_key_and_a_refused_put_ends_it_unmoved() {
     let owner_sk = SigningKey::from_bytes(&[61; 32]);
     let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
     let owner = owner_sk.verifying_key();
     let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
     let current = crate::rooms::create::contract_key(&owner);
+    let candidates = ids(&earlier[..3]);
     let mut w = Work::default();
     assert!(w.seed(
         owner,
         "Open".into(),
-        earlier[2],
+        candidates.clone(),
         plan.room.room_state.clone()
     ));
-    // Once per room.
+    // One move of a room at a time.
     assert!(!w.seed(
         owner,
         "Open".into(),
-        earlier[2],
+        candidates.clone(),
         plan.room.room_state.clone()
     ));
     assert!(w.holds(&owner));
-    for k in &earlier[..2] {
+    // It is shown while it works.
+    assert!(w.views()[0].what.contains("Moving"));
+    for (i, k) in earlier[..3].iter().enumerate() {
         let ClientRequest::ContractOp(ContractRequest::Get { key, subscribe, .. }) = next(&mut w)
         else {
             panic!("a GET of an earlier key");
         };
         assert!(!subscribe);
         assert_eq!(key, *k.id());
-        assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+        if i == 1 {
+            get_answer(&mut w, *k, &plan.room.room_state);
+        } else {
+            assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+        }
     }
+    assert!(matches!(
+        next(&mut w),
+        ClientRequest::ContractOp(ContractRequest::Put { .. })
+    ));
+    let refusal: ClientError =
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Put {
+            key: current,
+            cause: "no".into(),
+        }))
+        .into();
+    assert!(w.on_error(&refusal, true, &|_| false));
+    // Not shown once it ended: the session tries it again after a wait.
+    assert!(w.views().is_empty());
+    assert_eq!(
+        w.take_seed_ends(),
+        vec![SeedEnd {
+            room: owner,
+            moved: false,
+            unresolved: Vec::new()
+        }]
+    );
+    assert!(w.take_seed_ends().is_empty());
+    assert!(w.seed(
+        owner,
+        "Open".into(),
+        candidates,
+        plan.room.room_state.clone()
+    ));
     let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
-        panic!("a GET of the key the room was stored under");
+        panic!("a GET");
     };
-    assert_eq!(key, *earlier[2].id());
-    get_answer(&mut w, earlier[2], &plan.room.room_state);
+    assert_eq!(key, *earlier[0].id());
+}
+
+/// Every earlier key answered and none holds the room: the user's copy is PUT under the current
+/// key, as the web UI seeds it, and the move ends moved.
+#[test]
+fn a_room_no_earlier_key_holds_is_seeded_from_the_users_copy() {
+    let owner_sk = SigningKey::from_bytes(&[62; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let owner = owner_sk.verifying_key();
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let current = crate::rooms::create::contract_key(&owner);
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..1]),
+        plan.room.room_state.clone(),
+    );
+    let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
+        panic!("a GET");
+    };
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+    let ClientRequest::ContractOp(ContractRequest::Put {
+        contract, state, ..
+    }) = next(&mut w)
+    else {
+        panic!("a PUT of the user's copy");
+    };
+    assert_eq!(contract.key(), current);
+    let put: ChatRoomStateV1 = ciborium::de::from_reader(state.as_ref()).unwrap();
+    assert_eq!(
+        put.configuration.configuration.display,
+        plan.room.room_state.configuration.configuration.display
+    );
+    assert!(w.on_contract(&ContractResponse::PutResponse { key: current }));
+    assert!(!w.busy());
+    assert_eq!(
+        w.take_seed_ends(),
+        vec![SeedEnd {
+            room: owner,
+            moved: true,
+            unresolved: Vec::new()
+        }]
+    );
+}
+
+/// An earlier key that does not answer is passed over without a new connection, and its late
+/// answer is taken by nobody; with nothing found, the move ends unmoved (nothing is PUT while
+/// it is not known whether a key holds the room).
+#[test]
+fn a_silent_earlier_key_costs_no_connection_and_its_late_answer_is_dropped() {
+    let owner_sk = SigningKey::from_bytes(&[63; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let owner = owner_sk.verifying_key();
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..2]),
+        plan.room.room_state.clone(),
+    );
+    let t0 = Instant::now();
+    let ClientRequest::ContractOp(ContractRequest::Get { key: silent, .. }) = next(&mut w) else {
+        panic!("a GET");
+    };
+    let wait = Duration::from_secs(60);
+    assert!(
+        !w.expire(
+            Duration::from_secs(20),
+            wait,
+            t0 + wait + Duration::from_secs(1)
+        ),
+        "no new connection for an earlier key that does not answer"
+    );
+    assert!(w.has_late());
+    let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
+        panic!("the next earlier key");
+    };
+    assert_eq!(key, *earlier[1].id());
+    // The late answer is nobody's: not the read now out.
+    assert!(w.on_contract(&ContractResponse::NotFound {
+        instance_id: silent
+    }));
+    assert!(!w.has_late());
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+    assert!(w.next_request(false, Instant::now()).is_none());
+    assert_eq!(
+        w.take_seed_ends(),
+        vec![SeedEnd {
+            room: owner,
+            moved: false,
+            unresolved: Vec::new()
+        }]
+    );
+}
+
+/// Try again after a join's forwarding PUT failed reads the room again from the start
+/// (Codex, review of #997).
+#[test]
+fn trying_a_join_again_after_its_forward_put_failed_reads_the_room_again() {
+    let owner_sk = SigningKey::from_bytes(&[64; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let room = LiveRoom::new(stored(&plan.room));
+    let (_inv, link) = invitation(&room, "http://x/").unwrap();
+    let owner = owner_sk.verifying_key();
+    let current = crate::rooms::create::contract_key(&owner);
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let mut w = Work::default();
+    w.join(&link, "Bea", &|_| false);
+    let ClientRequest::ContractOp(ContractRequest::Get { key: id, .. }) = next(&mut w) else {
+        panic!("a GET");
+    };
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: id }));
+    let _ = next(&mut w);
+    get_answer(&mut w, earlier[0], &plan.room.room_state);
     assert!(matches!(
         next(&mut w),
         ClientRequest::ContractOp(ContractRequest::Put { .. })
@@ -2687,36 +2843,133 @@ fn a_refused_forward_put_is_said_and_try_again_reads_the_earlier_keys_again() {
         .into();
     assert!(w.on_error(&refusal, true, &|_| false));
     let view = w.views().pop().unwrap();
-    let WorkState::Failed { why, retry: true } = view.state else {
-        panic!("not failed with Try again: {view:?}");
-    };
-    assert!(why.contains("didn't take"), "{why}");
+    assert!(matches!(view.state, WorkState::Failed { retry: true, .. }));
     assert!(w.retry(view.id));
     let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
-        panic!("a GET");
+        panic!("Try again reads the room's current key again");
     };
-    assert_eq!(key, *earlier[0].id());
+    assert_eq!(key, *current.id());
 }
 
-/// A stored room no earlier key holds is left as it is: nothing is PUT, nothing is said.
+/// A join reads the earlier keys for at most [`PROBE_BUDGET`], then fails with Try again.
 #[test]
-fn moving_a_room_no_earlier_key_holds_puts_nothing() {
-    let owner_sk = SigningKey::from_bytes(&[62; 32]);
+fn a_joins_reading_of_earlier_keys_is_bounded() {
+    let owner_sk = SigningKey::from_bytes(&[65; 32]);
     let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
-    let owner = owner_sk.verifying_key();
-    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let room = LiveRoom::new(stored(&plan.room));
+    let (_inv, link) = invitation(&room, "http://x/").unwrap();
     let mut w = Work::default();
-    w.seed(
-        owner,
-        "Open".into(),
-        earlier[0],
-        plan.room.room_state.clone(),
-    );
-    let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
+    w.join(&link, "Bea", &|_| false);
+    let ClientRequest::ContractOp(ContractRequest::Get { key: id, .. }) = next(&mut w) else {
         panic!("a GET");
     };
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: id }));
+    let t0 = Instant::now();
+    let Some(ClientRequest::ContractOp(ContractRequest::Get { key, .. })) =
+        w.next_request(false, t0)
+    else {
+        panic!("a GET of an earlier key");
+    };
     assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
-    assert!(w.next_request(false, Instant::now()).is_none());
+    // Within the budget, the next key is read.
+    let Some(ClientRequest::ContractOp(ContractRequest::Get { key, .. })) =
+        w.next_request(false, t0 + Duration::from_secs(1))
+    else {
+        panic!("the next earlier key");
+    };
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+    // Past it, the join gives up, with Try again.
+    assert!(w.next_request(false, t0 + PROBE_BUDGET).is_none());
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("not failed");
+    };
+    assert!(why.contains("couldn't find this room"), "{why}");
+    assert!(retry);
+}
+
+fn carry_task(w: &mut Work) -> crate::rooms::carry::Predecessor {
+    let pred = crate::rooms::carry::Predecessor {
+        version: "V39".into(),
+        key: freenet_stdlib::prelude::DelegateKey::new(
+            [39; 32],
+            freenet_stdlib::prelude::CodeHash::new([39; 32]),
+        ),
+    };
+    w.carry(crate::rooms::carry::Carry::new(
+        vec![pred.clone()],
+        Vec::new(),
+        true,
+    ));
+    pred
+}
+
+/// A create the user asks for goes ahead of the carry at the carry's next request, instead of
+/// waiting for the whole walk (review of #997).
+#[test]
+fn a_users_create_goes_ahead_of_the_carry() {
+    let mut w = Work::default();
+    let pred = carry_task(&mut w);
+    // The carry's first request is out: its answer is taken before anything else goes.
+    let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, .. }) = next(&mut w)
+    else {
+        panic!("the carry's listing");
+    };
+    assert_eq!(key, pred.key);
+    w.create("Book club", "Ada", false);
+    assert!(
+        w.next_request(false, Instant::now()).is_none(),
+        "one request out at a time"
+    );
+    assert!(w.on_predecessor(
+        &pred.key,
+        &[ChatDelegateResponseMsg::ListResponse { keys: Vec::new() }]
+    ));
+    // Next: the create's read of its slot, not the carry's next read.
+    let req = next(&mut w);
+    assert!(matches!(
+        delegate_msg(&req),
+        Some(ChatDelegateRequestMsg::GetVersionedRequest { .. })
+    ));
+}
+
+/// A typed delegate error that names no delegate is taken for the carry's read only when no
+/// other delegate request can be out; `Missing` of another delegate never is.
+#[test]
+fn a_delegate_error_is_the_carrys_only_when_nothing_else_could_have_caused_it() {
+    let mut w = Work::default();
+    let pred = carry_task(&mut w);
+    let _ = next(&mut w);
+    let trap: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::ExecutionError("trap".into()),
+    ))
+    .into();
+    let other_missing: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::Missing(crate::rooms::delegate::chat_delegate_key().clone()),
+    ))
+    .into();
+    assert!(!w.on_error(&other_missing, true, &|_| false));
+    w.set_delegate_shared(true);
+    assert!(
+        !w.on_error(&trap, true, &|_| false),
+        "the key sweep's, maybe"
+    );
+    w.set_delegate_shared(false);
+    assert!(w.on_error(&trap, true, &|_| false));
+    let view = w.views().pop().unwrap();
+    let WorkState::Failed { why, retry: true } = view.state else {
+        panic!("not failed: {view:?}");
+    };
+    assert!(why.contains("V39") && why.contains("trap"), "{why}");
+    // Its own `Missing` is "not installed", never a failure.
+    let mut w = Work::default();
+    let pred2 = carry_task(&mut w);
+    assert_eq!(pred2.key, pred.key);
+    let _ = next(&mut w);
+    let missing: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+        DelegateError::Missing(pred.key.clone()),
+    ))
+    .into();
+    assert!(w.on_error(&missing, true, &|_| false));
     assert!(!w.busy());
     assert!(w.views().is_empty());
 }
