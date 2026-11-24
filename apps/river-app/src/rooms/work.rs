@@ -91,7 +91,7 @@
 //! signing key is stored in the delegate by the background sweep in [`super::keys`], not by
 //! these tasks, so a task is done as soon as the room is stored.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
@@ -109,7 +109,7 @@ use river_core::stored_rooms::{
     encode_new_room, meta_with_current_room, reconcile_new_room, room_storage_key,
 };
 
-use super::carry::{self, Ask, Carry};
+use super::carry::{Ask, Carry};
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
 use super::dm_archive::ArchiveOp;
@@ -221,6 +221,11 @@ pub struct SeedEnd {
 /// The longest a task reads a room's earlier contract keys before it gives up for now (a join
 /// or an import then fails with Try again; a move is tried again later).
 pub const PROBE_BUDGET: Duration = Duration::from_secs(180);
+
+/// How long a read of an earlier room-contract key given up on may still answer, so an error
+/// that names nothing could be its: [`super::session::Pace`]'s `resync_late`, the same wait for
+/// a room read given up on.
+pub const LATE_FOR: Duration = Duration::from_secs(300);
 
 /// The longest the walk over earlier chat delegates may take before it stops where it is (what
 /// it found is still written; the rest waits for Try again).
@@ -642,8 +647,6 @@ impl Task {
             // `rooms_meta`, then done (failed, with Try again, when rooms were left behind).
             if c.walked() && c.writes_left() {
                 self.step = Step::Slot;
-            } else if c.walked() && !c.sources().is_empty() {
-                self.step = Step::Meta;
             } else if c.walked() {
                 self.step = Step::Done;
                 if c.stopped.is_some() || c.held() > 0 {
@@ -738,19 +741,15 @@ impl Task {
             };
         }
         if let Kind::Carry(c) = &mut self.kind {
-            if self.step == Step::Meta {
-                return carry::meta_with_sources(value, c.sources()).map_err(|e| {
-                    format!(
-                        "Your rooms were carried over, but River's room list in its storage \
-                         can't be read by this app ({e}), so River in your browser may rank \
-                         them as this version's own. You can dismiss this."
-                    )
-                });
-            }
-            let Some((_, bytes)) = c.write() else {
+            let Some(write) = c.write() else {
                 return Err(unexpected());
             };
-            return Ok(carry::decide(value, &bytes));
+            return write.decide(value).map_err(|e| {
+                format!(
+                    "River's room list in its storage can't be read by this app ({e}), so the \
+                     rooms from an earlier version were not carried over."
+                )
+            });
         }
         if let Kind::Mode { room, mode } = &self.kind {
             return meta_with_mode(value, room, *mode).map_err(|e| {
@@ -840,7 +839,7 @@ pub struct Work {
     /// Another delegate request than the working task's may be out ([`Work::set_delegate_shared`]).
     delegate_shared: bool,
     /// Earlier room-contract keys whose read was given up on, until their answer comes.
-    late: std::collections::HashSet<ContractInstanceId>,
+    late: HashMap<ContractInstanceId, Instant>,
 }
 
 impl Work {
@@ -1515,7 +1514,7 @@ impl Work {
                 (Out::Pred(ask), request)
             }
             (Step::Slot, Kind::Carry(c)) => {
-                let Some((key, _)) = c.write() else {
+                let Some(key) = c.write().map(|w| w.key()) else {
                     t.advance();
                     return None;
                 };
@@ -1663,15 +1662,16 @@ impl Work {
                 // Nothing to store: the room is already there, or the meta already opens it.
                 Ok(None) => {
                     if let Kind::Carry(c) = &mut t.kind {
-                        if t.step == Step::Meta {
-                            c.sources_written();
-                        } else {
-                            c.written(false);
-                        }
+                        c.written(false);
                     }
                     t.advance()
                 }
-                Err(why) => t.fail(why, false),
+                // A carry's write it can't work out is said, with Try again (it reads
+                // everything again); the others' refusals do not change by trying again.
+                Err(why) => {
+                    let retry = t.is_carry();
+                    t.fail(why, retry)
+                }
             },
             (Out::Store(key), ChatDelegateResponseMsg::CasStoreResponse { key: k, result })
                 if k.as_bytes() == key.as_slice() =>
@@ -1679,11 +1679,7 @@ impl Work {
                 match result {
                     CasStoreResult::Stored { .. } => {
                         if let Kind::Carry(c) = &mut t.kind {
-                            if t.step == Step::Meta {
-                                c.sources_written();
-                            } else {
-                                c.written(true);
-                            }
+                            c.written(true);
                         }
                         t.advance()
                     }
@@ -1723,9 +1719,17 @@ impl Work {
             _ => None,
         };
         if let Some(id) = named
-            && self.late.remove(&id)
+            && self.late.remove(&id).is_some()
         {
-            return true;
+            // The same key asked again (a probe tried again) takes it as its own answer: both
+            // are GETs of one key. Otherwise it is nobody's.
+            let awaited = self.active_ref().is_some_and(|t| {
+                t.step == Step::Probe
+                    && matches!(&t.out, Some((Out::Contract(out), _)) if *out == id)
+            });
+            if !awaited {
+                return true;
+            }
         }
         let Some(t) = self.active() else {
             return false;
@@ -1813,6 +1817,25 @@ impl Work {
         alone: bool,
         subscribing: &dyn Fn(&ContractInstanceId) -> bool,
     ) -> bool {
+        // An error that names a read of an earlier key given up on is that read's: over.
+        let late_named = match e.kind() {
+            ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
+                key, ..
+            })) => Some(*key.id()),
+            ErrorKind::RequestError(RequestError::ContractError(
+                ContractError::MissingContract { key },
+            )) => Some(*key),
+            _ => None,
+        };
+        if let Some(id) = late_named
+            && self.late.contains_key(&id)
+            && !self.active_ref().is_some_and(|t| {
+                matches!(&t.out, Some((Out::Contract(out), _)) if *out == id)
+            })
+        {
+            self.late.remove(&id);
+            return true;
+        }
         let shared = self.delegate_shared;
         let Some(t) = self.active() else {
             return false;
@@ -1975,6 +1998,10 @@ impl Work {
         network_wait: Duration,
         now: Instant,
     ) -> bool {
+        // A read of an earlier key given up on stops being waited for after a while, as a
+        // room read given up on does (`Resyncs`, `Pace::resync_late`).
+        self.late
+            .retain(|_, at| now.saturating_duration_since(*at) < LATE_FOR);
         let Some(t) = self.active() else {
             return false;
         };
@@ -1988,7 +2015,6 @@ impl Work {
         if now.saturating_duration_since(*at) < wait {
             return false;
         }
-        // An earlier key that does not answer is passed over in the same way.
         // An earlier key that does not answer is passed over without a new connection: its
         // answer names a key nothing else asks for, and is dropped when it comes
         // ([`Work::has_late`] covers an error that names nothing).
@@ -1998,7 +2024,7 @@ impl Work {
             if let Some(p) = t.probe.as_mut() {
                 p.unknown(id);
             }
-            self.late.insert(id);
+            self.late.insert(id, now);
             return false;
         }
         // An earlier delegate that does not answer stops the walk there (it may hold a newer

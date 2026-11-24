@@ -18,6 +18,7 @@ fn pred(n: u8) -> Predecessor {
     Predecessor {
         version: format!("V{n}"),
         key: DelegateKey::new([n; 32], CodeHash::new([n; 32])),
+        rank: n as u32,
     }
 }
 
@@ -149,11 +150,7 @@ enum Fault {
 /// Run the walk against `stores` (a predecessor missing from it is not installed; one in
 /// `faults` fails) and return what it would write, by room key: the identity of each room
 /// written (`None` for a tombstone).
-fn walk_with(
-    carry: &mut Carry,
-    stores: &Stores,
-    faults: &[(u8, Fault)],
-) -> BTreeMap<Vec<u8>, Option<VerifyingKey>> {
+fn walk_reads(carry: &mut Carry, stores: &Stores, faults: &[(u8, Fault)]) {
     let mut asks = 0;
     while let Some(ask) = carry.next_ask() {
         asks += 1;
@@ -170,16 +167,42 @@ fn walk_with(
         assert!(carry.on_answer(&ask, ask.delegate(), &answer(store, &ask)));
     }
     assert!(carry.walked());
+}
+
+fn walk_with(
+    carry: &mut Carry,
+    stores: &Stores,
+    faults: &[(u8, Fault)],
+) -> BTreeMap<Vec<u8>, Option<VerifyingKey>> {
+    walk_reads(carry, stores, faults);
+    writes(carry).0
+}
+
+/// Make every write of a walk into an empty store: the slots written (by room key, the
+/// identity of each room, `None` for a tombstone) and the ranks recorded.
+fn writes(
+    carry: &mut Carry,
+) -> (
+    BTreeMap<Vec<u8>, Option<VerifyingKey>>,
+    Vec<(VerifyingKey, [u8; 32])>,
+) {
     let mut out = BTreeMap::new();
-    while let Some((k, bytes)) = carry.write() {
-        let identity = match decode_room_slot(&bytes).unwrap() {
-            StoredRoomSlot::Present(r) => Some(r.self_verifying_key().unwrap()),
-            StoredRoomSlot::Tombstone => None,
-        };
-        out.insert(k, identity);
+    let mut ranks = Vec::new();
+    while let Some(w) = carry.write() {
+        match w {
+            Write::Slot(k, bytes) => {
+                let identity = match decode_room_slot(&bytes).unwrap() {
+                    StoredRoomSlot::Present(r) => Some(r.self_verifying_key().unwrap()),
+                    StoredRoomSlot::Tombstone => None,
+                };
+                out.insert(k, identity);
+            }
+            Write::AddRank(room, dk) => ranks.push((room, dk)),
+            Write::RemoveRank(room) => ranks.retain(|(r, _)| *r != room),
+        }
         carry.written(true);
     }
-    out
+    (out, ranks)
 }
 
 fn walk(carry: &mut Carry, stores: &Stores) -> BTreeMap<Vec<u8>, Option<VerifyingKey>> {
@@ -234,13 +257,14 @@ fn rooms_only_in_a_predecessor_are_carried_with_their_identity() {
         store(vec![(key(1), slot(1, 11)), (key(2), slot(2, 12))]),
     )]);
     let mut c = Carry::new(preds(&[39, 38]), Vec::new(), true);
-    let out = walk(&mut c, &stores);
+    walk_reads(&mut c, &stores, &[]);
+    let (out, ranks) = writes(&mut c);
     assert_eq!(out, BTreeMap::from([(key(1), me(11)), (key(2), me(12))]));
     assert_eq!(c.carried, 2);
     assert_eq!(c.not_installed, 1);
     assert!(c.stopped.is_none());
     // Each room's identity source is the delegate that supplied it.
-    let mut sources: Vec<(VerifyingKey, [u8; 32])> = c.sources().to_vec();
+    let mut sources = ranks;
     sources.sort_by_key(|(r, _)| r.to_bytes());
     let mut expected = vec![
         (owner(1).verifying_key(), [39u8; 32]),
@@ -331,7 +355,12 @@ fn first_write(stores: &Stores) -> Vec<u8> {
     while let Some(ask) = c.next_ask() {
         assert!(c.on_answer(&ask, ask.delegate(), &answer(&stores[&39], &ask)));
     }
-    c.write().unwrap().1
+    loop {
+        match c.write().unwrap() {
+            Write::Slot(_, bytes) => return bytes,
+            _ => c.written(true),
+        }
+    }
 }
 
 fn fields_of(bytes: &[u8]) -> Vec<(Value, Value)> {
@@ -586,7 +615,8 @@ fn a_room_rooms_meta_names_but_the_index_leaves_out_stops_the_walk() {
         };
         assert!(c.on_answer(&ask, ask.delegate(), &a));
     }
-    assert!(c.write().is_none());
+    // The room it proves is carried, as the web UI salvages it; nothing older is read.
+    assert_eq!(writes(&mut c).0, BTreeMap::from([(key(1), me(11))]));
     assert!(c.stopped.unwrap().1.contains("index does not list"));
 }
 
@@ -725,4 +755,200 @@ fn identity_sources_are_added_replaced_and_every_other_field_kept() {
     assert_eq!(meta_with_sources(Some(&out), &[]).unwrap(), None);
     // Never over what can't be read.
     assert!(meta_with_sources(Some(b"garbage"), &[(a, [39; 32])]).is_err());
+}
+
+// Ranks: a predecessor's own `identity_sources` (review of #997, round 2) -----------------------
+
+/// `rooms_meta` naming rooms in `order`, with these identity sources.
+fn meta(order: &[u8], sources: &[(u8, u8)]) -> Vec<u8> {
+    cbor(&Value::Map(vec![
+        (
+            Value::Text("room_order".into()),
+            Value::serialized(
+                &order
+                    .iter()
+                    .map(|s| owner(*s).verifying_key())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        ),
+        (
+            Value::Text("identity_sources".into()),
+            Value::serialized(
+                &sources
+                    .iter()
+                    .map(|(room, g)| (owner(*room).verifying_key(), [*g; 32]))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        ),
+    ]))
+}
+
+/// N1: V40 holds the room under identity 11, which V40's web UI carried from V38 (its
+/// `rooms_meta` says so); V39 holds the user's rejoin, identity 22. The web UI ranks V40's copy
+/// at 38, so V39's wins; the carry must choose the same, and record V39's rank.
+#[test]
+fn a_copy_an_earlier_generation_carried_ranks_at_that_generation() {
+    let stores: Stores = BTreeMap::from([
+        (
+            40,
+            store(vec![
+                (key(1), slot(1, 11)),
+                (ROOMS_META_KEY.to_vec(), meta(&[1], &[(1, 38)])),
+            ]),
+        ),
+        (39, store(vec![(key(1), slot(1, 22))])),
+        (38, store(vec![(key(1), slot(1, 11))])),
+    ]);
+    let mut c = Carry::new(preds(&[40, 39, 38]), Vec::new(), true);
+    walk_reads(&mut c, &stores, &[]);
+    let (out, ranks) = writes(&mut c);
+    assert_eq!(out, BTreeMap::from([(key(1), me(22))]));
+    assert_eq!(ranks, vec![(owner(1).verifying_key(), [39; 32])]);
+}
+
+/// Without a newer copy, the provenance's rank is what is recorded: V40 carried it from V38.
+#[test]
+fn a_carried_copy_keeps_the_rank_its_generation_recorded() {
+    let stores: Stores = BTreeMap::from([
+        (
+            40,
+            store(vec![
+                (key(1), slot(1, 11)),
+                (ROOMS_META_KEY.to_vec(), meta(&[1], &[(1, 38)])),
+            ]),
+        ),
+        (38, store(vec![(key(1), slot(1, 11))])),
+    ]);
+    let mut c = Carry::new(preds(&[40, 39, 38]), Vec::new(), true);
+    walk_reads(&mut c, &stores, &[]);
+    let (out, ranks) = writes(&mut c);
+    assert_eq!(out, BTreeMap::from([(key(1), me(11))]));
+    assert_eq!(ranks, vec![(owner(1).verifying_key(), [38; 32])]);
+}
+
+/// A tombstone at a rank above the carried copy's provenance wins (the room was left in V39).
+#[test]
+fn a_tombstone_newer_than_a_copys_provenance_wins() {
+    let stores: Stores = BTreeMap::from([
+        (
+            40,
+            store(vec![
+                (key(1), slot(1, 11)),
+                (ROOMS_META_KEY.to_vec(), meta(&[1], &[(1, 38)])),
+            ]),
+        ),
+        (39, store(vec![(key(1), tombstone())])),
+    ]);
+    let mut c = Carry::new(preds(&[40, 39, 38]), Vec::new(), true);
+    let out = walk(&mut c, &stores);
+    assert_eq!(out, BTreeMap::from([(key(1), None)]));
+}
+
+/// A generation that can't be read and outranks a carried copy's provenance leaves the room
+/// undecided: it may hold the newer copy.
+#[test]
+fn an_unread_generation_above_a_copys_provenance_holds_the_room_back() {
+    let stores: Stores = BTreeMap::from([(
+        40,
+        store(vec![
+            (key(1), slot(1, 11)),
+            (ROOMS_META_KEY.to_vec(), meta(&[1], &[(1, 38)])),
+        ]),
+    )]);
+    let mut c = Carry::new(preds(&[40, 39, 38]), Vec::new(), true);
+    let out = walk_with(&mut c, &stores, &[(39, Fault::Unreadable)]);
+    assert!(out.is_empty());
+    assert_eq!(c.held(), 1);
+}
+
+/// The rooms `rooms_meta` names include its notification modes and identity sources
+/// (`rooms_named_by_meta`): a room only those name, stored but unlisted, proves the index short.
+/// The rooms it proves are carried (as the web UI salvages them) before the walk stops.
+#[test]
+fn a_room_named_only_by_modes_or_sources_proves_the_index_short_and_is_salvaged() {
+    for field in ["notification_modes", "identity_sources"] {
+        let value = match field {
+            "notification_modes" => Value::Map(vec![(
+                Value::serialized(&owner(1).verifying_key()).unwrap(),
+                Value::Text("Mentions".into()),
+            )]),
+            _ => Value::serialized(&vec![(owner(1).verifying_key(), [38u8; 32])]).unwrap(),
+        };
+        let m = cbor(&Value::Map(vec![(Value::Text(field.into()), value)]));
+        // Listing and index agree and hold only rooms_meta; the slot is stored unlisted.
+        let mut s = store(vec![(ROOMS_META_KEY.to_vec(), m)]);
+        s.insert(key(1), slot(1, 11));
+        let stores: Stores = BTreeMap::from([(39, s), (38, store(vec![(key(2), slot(2, 12))]))]);
+        let mut c = Carry::new(preds(&[39, 38]), Vec::new(), true);
+        let out = walk(&mut c, &stores);
+        assert_eq!(out, BTreeMap::from([(key(1), me(11))]), "{field}");
+        assert!(c.stopped.as_ref().unwrap().1.contains("index does not list"), "{field}");
+    }
+}
+
+/// `rooms_data` and `outbound_dms` are probed even when unlisted (`candidate_keys`): stored but
+/// unlisted proves the index short.
+#[test]
+fn a_fixed_key_stored_but_unlisted_stops_the_walk() {
+    for fixed in [b"rooms_data".as_slice(), b"outbound_dms".as_slice()] {
+        let mut s = store(vec![(key(1), slot(1, 11))]);
+        s.insert(fixed.to_vec(), b"x".to_vec());
+        let (c, out) = walk_one(s);
+        assert!(out.is_empty());
+        assert!(c.stopped.unwrap().1.contains("does not list it"));
+    }
+}
+
+/// A room's rank goes to `rooms_meta` before its slot; a slot another writer got to first has
+/// its rank taken out again.
+#[test]
+fn the_rank_is_written_before_the_slot_and_taken_out_when_the_slot_is_lost() {
+    let stores: Stores = BTreeMap::from([(
+        39,
+        store(vec![(key(1), slot(1, 11)), (key(2), slot(2, 12))]),
+    )]);
+    let mut c = Carry::new(preds(&[39]), Vec::new(), true);
+    walk_reads(&mut c, &stores, &[]);
+    let first = c.write().unwrap();
+    let Write::AddRank(room, dk) = first.clone() else {
+        panic!("the rank first: {first:?}");
+    };
+    assert_eq!(dk, [39; 32]);
+    assert_eq!(first.key(), ROOMS_META_KEY.to_vec());
+    c.written(true);
+    let Write::Slot(k, _) = c.write().unwrap() else {
+        panic!("then the slot");
+    };
+    assert_eq!(k, room_storage_key(&room));
+    // Another writer stored the room first: its rank is taken out.
+    c.written(false);
+    assert_eq!(c.write().unwrap(), Write::RemoveRank(room));
+    c.written(true);
+    assert_eq!(c.carried, 0);
+    // The other room goes the same way, and is carried.
+    assert!(matches!(c.write().unwrap(), Write::AddRank(..)));
+    c.written(true);
+    assert!(matches!(c.write().unwrap(), Write::Slot(..)));
+    c.written(true);
+    assert!(c.write().is_none());
+    assert_eq!(c.carried, 1);
+}
+
+#[test]
+fn a_rank_is_taken_out_with_every_other_field_kept() {
+    let (a, b) = (owner(1).verifying_key(), owner(2).verifying_key());
+    let m = meta(&[2], &[(1, 38), (2, 37)]);
+    let out = meta_without_source(Some(&m), &a).unwrap().unwrap();
+    assert_eq!(sources_of(&out), vec![(b, [37; 32])]);
+    let text = format!("{:?}", ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap());
+    assert!(text.contains("room_order"));
+    // The last one out drops the field, as the web UI leaves it out when empty.
+    let out = meta_without_source(Some(&out), &b).unwrap().unwrap();
+    assert!(!format!("{:?}", ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap())
+        .contains("identity_sources"));
+    assert_eq!(meta_without_source(Some(&out), &b).unwrap(), None);
+    assert_eq!(meta_without_source(None, &b).unwrap(), None);
+    assert!(meta_without_source(Some(b"garbage"), &b).is_err());
 }

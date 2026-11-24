@@ -1531,6 +1531,9 @@ struct Loaded {
     listed: usize,
     /// Those keys' rooms, by owner (tombstones included).
     listed_rooms: Vec<VerifyingKey>,
+    /// The earlier room-contract keys each room's slot still owes a merge from (the web UI's
+    /// `rekey_merge.owed`), by owner.
+    owed: HashMap<VerifyingKey, Vec<freenet_stdlib::prelude::ContractKey>>,
     /// Stored rooms that could not be decoded.
     unreadable: usize,
     /// What `outbound_dms` held (read here; written by [`super::dm_save`]).
@@ -1546,6 +1549,7 @@ impl Loaded {
             store_missing: true,
             listed: 0,
             listed_rooms: Vec::new(),
+            owed: HashMap::new(),
             unreadable: 0,
             dms: DmRead::NotListed,
         }
@@ -1648,6 +1652,7 @@ impl Loader {
             None => DmRead::NotListed,
         };
         let mut slots = Vec::new();
+        let mut owed = HashMap::new();
         let mut unreadable = 0;
         for vk in &self.rooms {
             let Some(Some(Some(bytes))) = wanted.remove(&room_storage_key(vk)) else {
@@ -1657,7 +1662,13 @@ impl Loader {
                 continue;
             }
             match decode_room_slot(&bytes) {
-                Ok(StoredRoomSlot::Present(room)) => slots.push(*room),
+                Ok(StoredRoomSlot::Present(room)) => {
+                    let keys = super::rekey::owed_keys(&bytes);
+                    if !keys.is_empty() {
+                        owed.insert(room.owner_vk, keys);
+                    }
+                    slots.push(*room)
+                }
                 Ok(StoredRoomSlot::Tombstone) => {}
                 // One unreadable room must not hide the others; the screen counts it.
                 Err(e) => {
@@ -1673,6 +1684,7 @@ impl Loader {
             store_missing: false,
             listed: self.rooms.len(),
             listed_rooms: self.rooms.clone(),
+            owed,
             unreadable,
             dms,
         }
@@ -2015,7 +2027,10 @@ struct Rooms {
     /// Rooms being moved to their current contract key now.
     seeding: HashSet<VerifyingKey>,
     /// Moves to try again: attempts so far, when, and the earlier keys to read.
-    seed_retry: HashMap<VerifyingKey, (u32, Instant, Vec<ContractInstanceId>)>,
+    /// `None` while that move is under way.
+    seed_retry: HashMap<VerifyingKey, (u32, Option<Instant>, Vec<ContractInstanceId>)>,
+    /// The earlier room-contract keys each stored room's slot still owes a merge from.
+    owed: HashMap<VerifyingKey, Vec<freenet_stdlib::prelude::ContractKey>>,
     /// While the store could not be set up: when the app next registers it by itself, and
     /// the wait after that one. `None` while the store is there.
     register_retry: Option<(Instant, Duration)>,
@@ -2256,6 +2271,7 @@ impl Rooms {
         }
         // The rooms stored now are the ones there are: a finished leave has done its work.
         self.outbox.work.rooms_read();
+        self.owed = std::mem::take(&mut loaded.owed);
         let mut old: HashMap<VerifyingKey, LiveRoom> = self
             .list
             .drain(..)
@@ -3315,14 +3331,25 @@ impl Rooms {
         {
             return None;
         }
-        self.start_seed(
-            owner,
-            super::rekey::candidates_down_to(&owner, Some(&earlier)),
-        );
+        let candidates = self.seed_candidates(&owner, earlier);
+        self.start_seed(owner, candidates);
         self.on_earlier.insert(owner);
         let room = self.list.iter_mut().find(|r| r.stored.owner_vk == owner)?;
         room.stored.contract_key = earlier;
         Some(*earlier.id())
+    }
+
+    /// The earlier keys to fold when moving `owner`'s room, stored under `earlier`: down to the
+    /// deepest of that key and the keys its slot still owes a merge from (the web UI's
+    /// `rekey_candidates`).
+    fn seed_candidates(
+        &self,
+        owner: &VerifyingKey,
+        earlier: freenet_stdlib::prelude::ContractKey,
+    ) -> Vec<ContractInstanceId> {
+        let mut owed = vec![earlier];
+        owed.extend(self.owed.get(owner).into_iter().flatten().copied());
+        super::rekey::candidates_down_to_owed(owner, &owed)
     }
 
     /// Start moving `owner`'s room from the earlier keys `candidates`.
@@ -3348,6 +3375,12 @@ impl Rooms {
                 continue;
             };
             let attempts = self.seed_retry.get(&owner).map_or(0, |(n, _, _)| *n);
+            self.seed_retry.remove(&owner);
+            if !self.list.iter().any(|r| r.stored.owner_vk == owner) {
+                // Left meanwhile: nothing to try again.
+                self.on_earlier.remove(&owner);
+                continue;
+            }
             if end.moved {
                 self.on_earlier.remove(&owner);
                 let current = super::create::contract_key(&owner);
@@ -3355,40 +3388,42 @@ impl Rooms {
                     room.stored.contract_key = current;
                     follow.push(*current.id());
                 }
-                self.seed_retry.remove(&owner);
                 if !end.unresolved.is_empty() {
                     self.seed_retry
-                        .insert(owner, (0, now + pace.resubscribe_first, end.unresolved));
+                        .insert(owner, (0, Some(now + pace.resubscribe_first), end.unresolved));
                 }
             } else {
                 let wait = pace
                     .resubscribe_first
                     .saturating_mul(1 << attempts.min(16))
                     .min(pace.resubscribe_max);
-                let candidates = super::rekey::candidates_down_to(&owner, Some(&earlier));
+                let candidates = self.seed_candidates(&owner, earlier);
                 self.seed_retry
-                    .insert(owner, (attempts.saturating_add(1), now + wait, candidates));
+                    .insert(owner, (attempts.saturating_add(1), Some(now + wait), candidates));
             }
         }
         follow
     }
 
-    /// Start the moves whose wait is over.
+    /// Start the moves whose wait is over. One for a room no longer shown, or no longer
+    /// stored under an earlier key, is dropped.
     fn seeds_due(&mut self, now: Instant) {
         let due: Vec<(VerifyingKey, Vec<ContractInstanceId>)> = self
             .seed_retry
             .iter()
-            .filter(|(o, (_, at, _))| *at <= now && !self.seeding.contains(*o))
+            .filter(|(o, (_, at, _))| at.is_some_and(|at| at <= now) && !self.seeding.contains(*o))
             .map(|(o, (_, _, c))| (*o, c.clone()))
             .collect();
         for (owner, candidates) in due {
-            if !self.rekeyed.contains_key(&owner) {
+            let shown = self.list.iter().any(|r| r.stored.owner_vk == owner);
+            if !shown || !self.rekeyed.contains_key(&owner) {
                 self.seed_retry.remove(&owner);
+                self.on_earlier.remove(&owner);
                 continue;
             }
-            // Keep the attempt count; the wait is set again when it ends.
+            // Under way: the attempt count is kept, and the wait is set again when it ends.
             if let Some(entry) = self.seed_retry.get_mut(&owner) {
-                entry.1 = now + Duration::from_secs(u64::MAX / 4);
+                entry.1 = None;
             }
             self.start_seed(owner, candidates);
         }

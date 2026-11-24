@@ -344,6 +344,7 @@ fn loaded(slots: Vec<StoredRoom>) -> Loaded {
     Loaded {
         listed: slots.len(),
         listed_rooms: slots.iter().map(|s| s.owner_vk).collect(),
+        owed: Default::default(),
         slots,
         meta: StoredRoomsMeta::default(),
         modes: Default::default(),

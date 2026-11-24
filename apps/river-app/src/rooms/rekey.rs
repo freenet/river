@@ -70,6 +70,52 @@ pub fn current_key(room: &StoredRoom) -> (ContractKey, Option<ContractKey>) {
     }
 }
 
+/// The keys a stored room's slot still owes a room-contract merge from (the web UI's
+/// `RekeyMerge::owed`), read from the slot's raw bytes; empty when it owes none or the field is
+/// in a shape the web UI never wrote.
+pub fn owed_keys(raw: &[u8]) -> Vec<ContractKey> {
+    #[derive(serde::Deserialize)]
+    struct Owed {
+        #[serde(default)]
+        owed: Vec<ContractKey>,
+    }
+    let Ok(ciborium::Value::Map(outer)) = ciborium::de::from_reader::<ciborium::Value, _>(raw)
+    else {
+        return Vec::new();
+    };
+    outer
+        .into_iter()
+        .find(|(k, _)| k.as_text() == Some("Present"))
+        .and_then(|(_, v)| match v {
+            ciborium::Value::Map(fields) => fields
+                .into_iter()
+                .find(|(k, _)| k.as_text() == Some("rekey_merge"))
+                .and_then(|(_, v)| v.deserialized::<Owed>().ok()),
+            _ => None,
+        })
+        .map(|o| o.owed)
+        .unwrap_or_default()
+}
+
+/// The earlier keys to fold for a stored room, newest first: every earlier key down to the
+/// deepest of `owed` (the key it was stored under, and any its slot still owes a merge from),
+/// as the web UI's `rekey_candidates`. All of them when none of `owed` is an earlier key.
+pub fn candidates_down_to_owed(
+    owner: &VerifyingKey,
+    owed: &[ContractKey],
+) -> Vec<ContractInstanceId> {
+    let current = *create::contract_key(owner).id();
+    let ids: Vec<ContractInstanceId> = legacy_contract_keys_for_owner(owner)
+        .iter()
+        .map(|k| *k.id())
+        .filter(|id| *id != current)
+        .collect();
+    match ids.iter().rposition(|id| owed.iter().any(|k| k.id() == id)) {
+        Some(deepest) => ids[..=deepest].to_vec(),
+        None => ids,
+    }
+}
+
 /// The earlier keys to read for a room stored under `stored`, newest first, down to it (all of
 /// them when it is not one of them).
 pub fn candidates_down_to(

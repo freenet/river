@@ -75,7 +75,7 @@
 //! the whole walk stops at [`super::work::WALK_BUDGET`]. The node answers a delegate it does not
 //! hold with a typed `Missing` (freenet-core 0.2.156 and later, which the app grant needs).
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 use ciborium::Value;
@@ -87,8 +87,8 @@ use freenet_stdlib::prelude::{
 };
 use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 use river_core::stored_rooms::{
-    NewRoom, ROOMS_META_KEY, StoredRoom, StoredRoomSlot, decode_room_slot, decode_rooms_meta,
-    encode_new_room, parse_room_storage_key, room_storage_key,
+    NewRoom, ROOMS_META_KEY, StoredRoom, StoredRoomSlot, decode_room_slot, encode_new_room,
+    parse_room_storage_key, room_storage_key,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -102,6 +102,9 @@ pub struct Predecessor {
     /// Its version in the registry ("V39").
     pub version: String,
     pub key: DelegateKey,
+    /// Its place in the registry, oldest first (V1 is 0): the web UI's lineage index, the rank
+    /// its merge gives what this generation supplies (`river_delegate_lineage`).
+    pub rank: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -133,12 +136,13 @@ pub fn parse_registry(toml_text: &str) -> Result<Vec<Predecessor>, String> {
     let registry: Registry =
         toml::from_str(toml_text).map_err(|e| format!("legacy_delegates.toml: {e}"))?;
     let mut out = Vec::new();
-    for row in registry.entry {
+    for (rank, row) in registry.entry.into_iter().enumerate() {
         let key = hex32(&row.delegate_key)?;
         let code_hash = hex32(&row.code_hash)?;
         out.push(Predecessor {
             version: row.version,
             key: DelegateKey::new(key, CodeHash::new(code_hash)),
+            rank: rank as u32,
         });
     }
     out.reverse();
@@ -235,6 +239,40 @@ struct RawKeyIndex {
     keys: Vec<ChatDelegateKey>,
 }
 
+/// The web UI's `RoomsMeta` (`ui/src/room_data.rs`), the fields a walk reads, every one
+/// defaulted as there.
+#[derive(serde::Deserialize)]
+struct MetaShape {
+    #[serde(default)]
+    current_room_key: Option<VerifyingKey>,
+    #[serde(default)]
+    notification_modes: HashMap<VerifyingKey, Value>,
+    #[serde(default)]
+    room_order: Vec<VerifyingKey>,
+    #[serde(default)]
+    identity_sources: Vec<(VerifyingKey, [u8; 32])>,
+}
+
+impl MetaShape {
+    /// Every room it names (the web UI's `rooms_named_by_meta`): its order, its notification
+    /// modes, its cursor and its identity provenance.
+    fn named(&self) -> Vec<VerifyingKey> {
+        let mut out: Vec<VerifyingKey> = Vec::new();
+        for vk in self
+            .room_order
+            .iter()
+            .chain(self.notification_modes.keys())
+            .chain(self.current_room_key.iter())
+            .chain(self.identity_sources.iter().map(|(vk, _)| vk))
+        {
+            if !out.contains(vk) {
+                out.push(*vk);
+            }
+        }
+        out
+    }
+}
+
 /// The web UI's `RekeyMerge` (`ui/src/room_data.rs`), every field defaulted as there: read only
 /// to check a carried slot's value is one the web UI reads, before it is kept.
 #[derive(serde::Deserialize)]
@@ -251,30 +289,65 @@ struct RekeyMergeShape {
 }
 
 /// Where the read of one predecessor stands. Its reads follow the web UI's `fetch_secrets`: the
-/// listing, the raw index twice, `rooms_meta`, the rooms `rooms_meta` names but the index does
-/// not list, then the room keys to carry.
+/// listing, the raw index twice, `rooms_meta`, every room `rooms_meta` names that the index does
+/// not list (`rooms_named_by_meta`), the fixed keys `rooms_data` and `outbound_dms`
+/// (`candidate_keys`), then the room keys to carry.
 enum Phase {
     List,
-    /// The first read of the raw index; `listed` is what the listing said.
-    Index {
-        listed: Vec<Vec<u8>>,
-    },
+    /// The first read of the raw index.
+    Index,
     /// The second read; `first` is the first read's bytes (`None`: no index stored).
-    IndexAgain {
-        listed: Vec<Vec<u8>>,
-        first: Option<Vec<u8>>,
-    },
-    Meta {
-        listed: Vec<Vec<u8>>,
-        indexed: bool,
-    },
-    /// Room keys `rooms_meta` names that the index does not list: a stored one proves the
-    /// index short. Then the room keys to read.
+    IndexAgain { first: Option<Vec<u8>> },
+    Meta,
+    /// Named rooms not listed, still to read; `short` once one was found stored.
     Named {
         named: VecDeque<Vec<u8>>,
-        rooms: VecDeque<Vec<u8>>,
+        short: bool,
     },
+    Fixed(VecDeque<Vec<u8>>),
     Rooms(VecDeque<Vec<u8>>),
+}
+
+/// The single-blob era's key and the sent-message store: probed even when unlisted, as the web
+/// UI's `candidate_keys` probes them (`ROOMS_STORAGE_KEY`, `OUTBOUND_DMS_STORAGE_KEY`).
+const FIXED_KEYS: [&[u8]; 2] = [b"rooms_data", b"outbound_dms"];
+
+/// One write of a carry, to the current chat delegate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Write {
+    /// Add (room, delegate key) to `rooms_meta`'s identity sources.
+    AddRank(VerifyingKey, [u8; 32]),
+    /// Store this slot under this room key, where it holds nothing.
+    Slot(Vec<u8>, Vec<u8>),
+    /// Take the room's identity source out again: another writer stored the room first.
+    RemoveRank(VerifyingKey),
+}
+
+impl Write {
+    /// The delegate key written.
+    pub fn key(&self) -> Vec<u8> {
+        match self {
+            Write::Slot(key, _) => key.clone(),
+            Write::AddRank(..) | Write::RemoveRank(_) => ROOMS_META_KEY.to_vec(),
+        }
+    }
+
+    /// What to store, given what the key holds now (as a `GetVersionedResponse` gave it):
+    /// bytes, nothing (already as wanted), or why not.
+    pub fn decide(&self, current: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Write::Slot(_, bytes) => Ok(decide(current, bytes)),
+            Write::AddRank(room, delegate) => meta_with_sources(current, &[(*room, *delegate)]),
+            Write::RemoveRank(room) => meta_without_source(current, room),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteStep {
+    Rank,
+    Slot,
+    Unrank,
 }
 
 /// What decides a room key, as found.
@@ -287,9 +360,15 @@ enum Item {
 
 /// A room key decided by a predecessor.
 struct Found {
-    /// The predecessor's version and its delegate key.
+    /// The version of the predecessor it was read from.
     version: String,
+    /// Its rank: the generation that supplied it, which is the predecessor's own unless that
+    /// predecessor's `rooms_meta` records an older one for the room's identity (the web UI's
+    /// `identity_source_ranks` and `lower_identity_ranks`); and that generation's delegate key.
+    rank: u32,
     delegate: [u8; 32],
+    /// The rank of the predecessor it was read from.
+    read_at: u32,
     item: Item,
 }
 
@@ -304,9 +383,15 @@ pub struct Carry {
     current: HashSet<Vec<u8>>,
     /// Room keys a predecessor decided (the newest that holds one), with what to write.
     found: BTreeMap<Vec<u8>, Found>,
-    /// Room keys a predecessor holds in a form this app can't read: no older generation may
-    /// decide them, so they are not carried (the web UI's walk may).
+    /// Room keys left undecided, with why: a predecessor holds them in a form this app can't
+    /// read, or one that could not be read could hold a newer copy. Nothing older decides them,
+    /// so they are not carried (the web UI's walk may).
     held: BTreeMap<Vec<u8>, String>,
+    /// What the predecessor being read listed, whether it has a key index, and the older ranks
+    /// its `rooms_meta` records for rooms' identities (by room).
+    listed: Vec<Vec<u8>>,
+    indexed: bool,
+    provenance: HashMap<[u8; 32], u32>,
     /// The predecessor the walk stopped at, and why: it could not be read (an error, no answer,
     /// an index that does not add up). Nothing older is read, since that one may hold a newer
     /// copy of any room, or the tombstone of one the user left.
@@ -315,8 +400,8 @@ pub struct Carry {
     writes: VecDeque<Vec<u8>>,
     /// The write being made.
     writing: Option<Vec<u8>>,
-    /// The identity sources to add to `rooms_meta` for rooms written: (room, delegate key).
-    sources: Vec<(VerifyingKey, [u8; 32])>,
+    /// Where the write of `writing` stands.
+    write_step: WriteStep,
     /// Predecessors the node does not hold.
     pub not_installed: usize,
     /// Rooms written.
@@ -344,10 +429,13 @@ impl Carry {
             current: current.into_iter().collect(),
             found: BTreeMap::new(),
             held: BTreeMap::new(),
+            listed: Vec::new(),
+            indexed: false,
+            provenance: HashMap::new(),
             stopped: None,
             writes: VecDeque::new(),
             writing: None,
-            sources: Vec::new(),
+            write_step: WriteStep::Rank,
             not_installed: 0,
             carried: 0,
             tombstones: 0,
@@ -365,13 +453,10 @@ impl Carry {
         let key = pred.key.clone();
         Some(match &self.phase {
             Phase::List => Ask::List(key),
-            Phase::Index { .. } | Phase::IndexAgain { .. } => Ask::Get(key, KEY_INDEX_KEY.to_vec()),
-            Phase::Meta { .. } => Ask::Get(key, ROOMS_META_KEY.to_vec()),
-            Phase::Named { named, rooms } => match named.front() {
-                Some(k) => Ask::Get(key, k.clone()),
-                None => Ask::Get(key, rooms.front()?.clone()),
-            },
-            Phase::Rooms(rooms) => Ask::Get(key, rooms.front()?.clone()),
+            Phase::Index | Phase::IndexAgain { .. } => Ask::Get(key, KEY_INDEX_KEY.to_vec()),
+            Phase::Meta => Ask::Get(key, ROOMS_META_KEY.to_vec()),
+            Phase::Named { named, .. } => Ask::Get(key, named.front()?.clone()),
+            Phase::Fixed(keys) | Phase::Rooms(keys) => Ask::Get(key, keys.front()?.clone()),
         })
     }
 
@@ -383,6 +468,8 @@ impl Carry {
     fn next_pred(&mut self) {
         self.at += 1;
         self.phase = Phase::List;
+        self.listed.clear();
+        self.provenance.clear();
         if self.walked() {
             self.end_walk();
         }
@@ -397,8 +484,25 @@ impl Carry {
         if self.stopped.is_some() || self.at >= self.preds.len() {
             return;
         }
-        let version = self.preds[self.at].version.clone();
+        let (version, rank) = (self.preds[self.at].version.clone(), self.preds[self.at].rank);
         eprintln!("River: an earlier River's storage ({version}) could not be read: {why}");
+        // A copy found at a rank some generation not read could outrank is not decided yet:
+        // this one (unless the copy is this one's own), and every older one above its rank.
+        let unread_above = |f: &Found| {
+            (f.read_at != rank && f.rank < rank)
+                || self.preds.iter().any(|p| p.rank > f.rank && p.rank < rank)
+        };
+        let undecided: Vec<Vec<u8>> = self
+            .found
+            .iter()
+            .filter(|(_, f)| unread_above(f))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in undecided {
+            self.found.remove(&k);
+            self.held
+                .insert(k, format!("{version} could not be read and may hold a newer copy"));
+        }
         self.stopped = Some((version, why));
         self.end_walk();
     }
@@ -422,13 +526,15 @@ impl Carry {
     }
 
     /// The room keys to read from the predecessor being read, given what it lists: room keys
-    /// the current store does not hold and no newer predecessor decided or held.
+    /// the current store does not hold, no newer predecessor held back, and none decided at a
+    /// rank this one outranks.
     fn wanted(&self, listed: &[Vec<u8>]) -> VecDeque<Vec<u8>> {
+        let rank = self.preds[self.at].rank;
         let mut out = VecDeque::new();
         for k in listed {
             if parse_room_storage_key(k).is_some()
                 && !self.current.contains(k)
-                && !self.found.contains_key(k)
+                && self.found.get(k).is_none_or(|f| f.rank < rank)
                 && !self.held.contains_key(k)
                 && !out.contains(k)
             {
@@ -439,12 +545,19 @@ impl Carry {
     }
 
     /// Go on to the room keys of the predecessor being read, or to the next one.
-    fn read_rooms(&mut self, rooms: VecDeque<Vec<u8>>) {
+    fn read_rooms(&mut self) {
+        let rooms = self.wanted(&self.listed.clone());
         if rooms.is_empty() {
             self.next_pred();
         } else {
             self.phase = Phase::Rooms(rooms);
         }
+    }
+
+    /// Go on to the fixed keys, then the rooms.
+    fn read_fixed(&mut self) {
+        let fixed: VecDeque<Vec<u8>> = FIXED_KEYS.iter().map(|k| k.to_vec()).collect();
+        self.phase = Phase::Fixed(fixed);
     }
 
     /// The predecessor's answer to `ask`, the request out. True when it was that answer.
@@ -460,8 +573,8 @@ impl Carry {
         let phase = std::mem::replace(&mut self.phase, Phase::List);
         match (phase, ask, answer) {
             (Phase::List, Ask::List(_), ChatDelegateResponseMsg::ListResponse { keys }) => {
-                let listed = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
-                self.phase = Phase::Index { listed };
+                self.listed = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+                self.phase = Phase::Index;
             }
             (phase, Ask::Get(_, key), ChatDelegateResponseMsg::GetResponse { key: k, value })
                 if k.as_bytes() == key.as_slice() =>
@@ -478,13 +591,14 @@ impl Carry {
 
     fn on_value(&mut self, phase: Phase, key: &[u8], value: Option<&[u8]>) {
         match phase {
-            Phase::Index { listed } => {
+            Phase::Index => {
                 self.phase = Phase::IndexAgain {
-                    listed,
                     first: value.map(<[u8]>::to_vec),
                 };
             }
-            Phase::IndexAgain { listed, first } => {
+            // `fetch_secrets`: two reads that disagree, an index that does not decode, or one
+            // that is not the listing are faults (freenet-core#5857, freenet/river#592).
+            Phase::IndexAgain { first } => {
                 if first.as_deref() != value {
                     return self.stop(
                         "two reads of its key index disagree, so one read failed".to_owned(),
@@ -497,22 +611,20 @@ impl Carry {
                         Err(e) => return self.stop(format!("its key index does not decode ({e})")),
                     },
                 };
-                if indexed != listed {
+                if indexed != self.listed {
                     return self.stop(format!(
                         "it listed {} keys but its index holds {}",
-                        listed.len(),
+                        self.listed.len(),
                         indexed.len()
                     ));
                 }
-                self.phase = Phase::Meta {
-                    listed,
-                    indexed: value.is_some(),
-                };
+                self.indexed = value.is_some();
+                self.phase = Phase::Meta;
             }
-            Phase::Meta { listed, indexed } => {
-                let meta_listed = listed.iter().any(|k| k.as_slice() == ROOMS_META_KEY);
+            Phase::Meta => {
+                let meta_listed = self.listed.iter().any(|k| k.as_slice() == ROOMS_META_KEY);
                 match (value, meta_listed) {
-                    (Some(_), _) if !indexed => {
+                    (Some(_), _) if !self.indexed => {
                         return self.stop("rooms_meta is stored but it has no key index".into());
                     }
                     (Some(_), false) => {
@@ -523,36 +635,91 @@ impl Carry {
                     }
                     _ => {}
                 }
-                // The rooms `rooms_meta` names that the index does not list: a stored one
-                // proves the index short (the web UI's check, freenet/river#592).
+                let meta = value.and_then(|b| ciborium::de::from_reader::<MetaShape, _>(b).ok());
+                // The older generations its `rooms_meta` records for rooms' identities
+                // (`identity_source_ranks`: a delegate key the registry does not list is
+                // ignored).
+                self.provenance = meta
+                    .as_ref()
+                    .map(|m| {
+                        m.identity_sources
+                            .iter()
+                            .filter_map(|(vk, dk)| {
+                                let rank = self.preds.iter().find(|p| p.key.bytes() == dk)?.rank;
+                                Some((vk.to_bytes(), rank))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Every room it names that the index does not list: a stored one proves the
+                // index short (`rooms_named_by_meta`).
                 let mut named = VecDeque::new();
-                if let Some(meta) = value.and_then(|b| decode_rooms_meta(b).ok()) {
-                    for vk in meta.room_order.iter().chain(meta.current_room_key.iter()) {
-                        let k = room_storage_key(vk);
-                        if !listed.contains(&k) && !named.contains(&k) {
+                if let Some(meta) = &meta {
+                    for vk in meta.named() {
+                        let k = room_storage_key(&vk);
+                        if !self.listed.contains(&k) && !named.contains(&k) {
                             named.push_back(k);
                         }
                     }
                 }
-                let rooms = self.wanted(&listed);
                 if named.is_empty() {
-                    self.read_rooms(rooms);
+                    self.read_fixed();
                 } else {
-                    self.phase = Phase::Named { named, rooms };
+                    self.phase = Phase::Named {
+                        named,
+                        short: false,
+                    };
                 }
             }
-            Phase::Named { mut named, rooms } => {
-                if value.is_some_and(|v| !v.is_empty()) {
-                    return self.stop(
+            Phase::Named { mut named, short } => {
+                // A named room stored but not listed proves the index short. Its slot is
+                // carried, as the web UI salvages the rooms a short index proves
+                // (`salvage_short_index_rooms`): every newer generation was read in full.
+                let proven = value.is_some_and(|v| !v.is_empty());
+                if let Some(v) = value.filter(|v| !v.is_empty()) {
+                    self.decide(key, v);
+                }
+                named.pop_front();
+                let short = short || proven;
+                if !named.is_empty() {
+                    self.phase = Phase::Named { named, short };
+                } else if short {
+                    self.stop(
                         "a room its rooms_meta names is stored but its index does not list it"
                             .into(),
                     );
-                }
-                named.pop_front();
-                if named.is_empty() {
-                    self.read_rooms(rooms);
                 } else {
-                    self.phase = Phase::Named { named, rooms };
+                    self.read_fixed();
+                }
+            }
+            Phase::Fixed(mut keys) => {
+                let listed = self.listed.iter().any(|k| k.as_slice() == key);
+                match value {
+                    Some(_) if !listed && self.indexed => {
+                        return self.stop(format!(
+                            "{:?} is stored but its index does not list it",
+                            String::from_utf8_lossy(key)
+                        ));
+                    }
+                    Some(_) if !self.indexed => {
+                        return self.stop(format!(
+                            "{:?} is stored but it has no key index",
+                            String::from_utf8_lossy(key)
+                        ));
+                    }
+                    None if listed => {
+                        return self.stop(format!(
+                            "{:?} is listed but answered no value",
+                            String::from_utf8_lossy(key)
+                        ));
+                    }
+                    _ => {}
+                }
+                keys.pop_front();
+                if keys.is_empty() {
+                    self.read_rooms();
+                } else {
+                    self.phase = Phase::Fixed(keys);
                 }
             }
             Phase::Rooms(mut rooms) => {
@@ -562,49 +729,72 @@ impl Carry {
                 };
                 self.decide(key, value);
                 rooms.pop_front();
-                self.read_rooms(rooms);
+                if rooms.is_empty() {
+                    self.next_pred();
+                } else {
+                    self.phase = Phase::Rooms(rooms);
+                }
             }
             Phase::List => {}
         }
     }
 
-    /// A predecessor's slot for `key`: it decides the key, or holds it back.
+    /// Hold `key` back: the predecessor being read holds it in a form this app can't use.
+    /// Nothing older decides it; a copy already found at a higher rank still does.
+    fn hold(&mut self, key: &[u8], why: String) {
+        let rank = self.preds[self.at].rank;
+        if self.found.get(key).is_some_and(|f| f.rank > rank) {
+            return;
+        }
+        self.found.remove(key);
+        self.held.insert(key.to_vec(), why);
+    }
+
+    /// A predecessor's slot for `key`: it decides the key at its rank (lowered to the older
+    /// generation its `rooms_meta` records for the room's identity), unless a copy found at a
+    /// higher rank already does, or it is held back. As `merge_from_source`: a present copy
+    /// survives a tombstone only from a strictly higher rank, a tombstone wins over a present
+    /// copy only from a strictly higher rank, and of two identities the higher rank wins.
     fn decide(&mut self, key: &[u8], value: &[u8]) {
         let pred = &self.preds[self.at];
         let version = pred.version.clone();
         let mut delegate = [0u8; 32];
         delegate.copy_from_slice(&pred.key.bytes()[..32]);
+        let mut rank = pred.rank;
+        let read_at = pred.rank;
         let item = match decode_room_slot(value) {
             Ok(StoredRoomSlot::Present(room))
                 if parse_room_storage_key(key) == Some(room.owner_vk) =>
             {
                 let owner = room.owner_vk;
+                if let Some(older) = self.provenance.get(&owner.to_bytes()).copied()
+                    && older < rank
+                    && let Some(p) = self.preds.iter().find(|p| p.rank == older)
+                {
+                    rank = older;
+                    delegate.copy_from_slice(&p.key.bytes()[..32]);
+                }
                 match carried_slot(*room, value) {
                     Ok(bytes) => Item::Room(Zeroizing::new(bytes), Box::new(owner)),
-                    Err(e) => {
-                        self.held.insert(key.to_vec(), format!("{version}: {e}"));
-                        return;
-                    }
+                    Err(e) => return self.hold(key, format!("{version}: {e}")),
                 }
             }
             Ok(StoredRoomSlot::Present(_)) => {
-                self.held.insert(
-                    key.to_vec(),
-                    format!("{version}: a slot names another room"),
-                );
-                return;
+                return self.hold(key, format!("{version}: a slot names another room"));
             }
             Ok(StoredRoomSlot::Tombstone) => Item::Tombstone,
-            Err(e) => {
-                self.held.insert(key.to_vec(), format!("{version}: {e}"));
-                return;
-            }
+            Err(e) => return self.hold(key, format!("{version}: {e}")),
         };
+        if self.found.get(key).is_some_and(|f| f.rank >= rank) {
+            return;
+        }
         self.found.insert(
             key.to_vec(),
             Found {
                 version,
+                rank,
                 delegate,
+                read_at,
                 item,
             },
         );
@@ -626,49 +816,60 @@ impl Carry {
         true
     }
 
-    /// The next write, `(room key, bytes)`, or `None` when all are made.
-    pub fn write(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// The next write, or `None` when all are made. A room's rank goes to `rooms_meta` BEFORE
+    /// its slot, so a quit between the two never leaves a carried room unranked (which the web
+    /// UI would read as authoritative for good); a slot another writer got to first has the
+    /// rank taken out again.
+    pub fn write(&mut self) -> Option<Write> {
         if self.writing.is_none() {
             self.writing = self.writes.pop_front();
+            self.write_step = WriteStep::Rank;
         }
         let key = self.writing.clone()?;
-        let bytes = match &self.found.get(&key)?.item {
-            Item::Room(bytes, _) => bytes.to_vec(),
-            Item::Tombstone => tombstone_bytes(),
-        };
-        Some((key, bytes))
+        let found = self.found.get(&key)?;
+        Some(match (&found.item, self.write_step) {
+            (Item::Room(_, owner), WriteStep::Rank) => Write::AddRank(**owner, found.delegate),
+            (Item::Room(bytes, _), WriteStep::Slot) => Write::Slot(key, bytes.to_vec()),
+            (Item::Room(_, owner), WriteStep::Unrank) => Write::RemoveRank(**owner),
+            (Item::Tombstone, _) => Write::Slot(key, tombstone_bytes()),
+        })
     }
 
-    /// The write being made ended: stored, or found something already there (which wins).
+    /// The write being made ended. For a slot: `stored`, or the key held something already
+    /// (which wins). A rank write that found nothing to change has `stored` false too.
     pub fn written(&mut self, stored: bool) {
-        if let Some(key) = self.writing.take()
-            && let Some(found) = self.found.remove(&key)
-        {
-            match found.item {
-                Item::Room(_, owner) if stored => {
-                    self.carried += 1;
-                    eprintln!("River: carried a room over from {}", found.version);
-                    self.sources.push((*owner, found.delegate));
-                }
-                Item::Tombstone if stored => self.tombstones += 1,
-                _ => {}
+        let Some(key) = self.writing.clone() else {
+            return;
+        };
+        let room = matches!(self.found.get(&key).map(|f| &f.item), Some(Item::Room(..)));
+        match (self.write_step, room) {
+            (WriteStep::Rank, true) => {
+                self.write_step = WriteStep::Slot;
+                return;
             }
+            (WriteStep::Slot, true) if !stored => {
+                self.write_step = WriteStep::Unrank;
+                return;
+            }
+            _ => {}
+        }
+        self.writing = None;
+        let Some(found) = self.found.remove(&key) else {
+            return;
+        };
+        match (found.item, self.write_step) {
+            (Item::Room(..), WriteStep::Slot) => {
+                self.carried += 1;
+                eprintln!("River: carried a room over from {}", found.version);
+            }
+            (Item::Tombstone, _) if stored => self.tombstones += 1,
+            _ => {}
         }
     }
 
     /// Whether writes remain.
     pub fn writes_left(&self) -> bool {
         self.writing.is_some() || !self.writes.is_empty()
-    }
-
-    /// The identity sources to add to `rooms_meta` for the rooms written, if any are owed.
-    pub fn sources(&self) -> &[(VerifyingKey, [u8; 32])] {
-        &self.sources
-    }
-
-    /// `rooms_meta`'s identity sources were written.
-    pub fn sources_written(&mut self) {
-        self.sources.clear();
     }
 
     /// Start again (Try again): read every predecessor again. What was written stays written
@@ -678,6 +879,8 @@ impl Carry {
         self.phase = Phase::List;
         self.found.clear();
         self.held.clear();
+        self.listed.clear();
+        self.provenance.clear();
         self.stopped = None;
         self.writes.clear();
         self.writing = None;
@@ -687,11 +890,11 @@ impl Carry {
 }
 
 fn tombstone_bytes() -> Vec<u8> {
-    // A one-variant enum of no data always encodes.
-    super::leave::tombstone_write(None)
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    // The web UI's `RoomSlot::Tombstone`: a unit variant, which CBOR encodes as its name.
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&Value::Text("Tombstone".into()), &mut out)
+        .expect("CBOR of a short text into a Vec cannot fail");
+    out
 }
 
 /// What a carried room is written as: [`NewRoom`] (the fields this app writes for any room it
@@ -815,6 +1018,47 @@ pub fn meta_with_sources(
     }
     if !changed {
         return Ok(None);
+    }
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(entries), &mut out)
+        .map_err(|e| format!("rooms_meta: {e}"))?;
+    Ok(Some(out))
+}
+
+/// `rooms_meta` (`current`) with `room` taken out of its identity sources, every other field
+/// kept; `Ok(None)` when it has none for the room.
+pub fn meta_without_source(
+    current: Option<&[u8]>,
+    room: &VerifyingKey,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(bytes) = current.filter(|b| !b.is_empty()) else {
+        return Ok(None);
+    };
+    let mut entries = match ciborium::de::from_reader::<Value, _>(bytes) {
+        Ok(Value::Map(entries)) => entries,
+        Ok(_) => return Err("rooms_meta: not a map".into()),
+        Err(e) => return Err(format!("rooms_meta: {e}")),
+    };
+    let Some(i) = entries
+        .iter()
+        .position(|(k, _)| k.as_text() == Some("identity_sources"))
+    else {
+        return Ok(None);
+    };
+    let Value::Array(list) = &mut entries[i].1 else {
+        return Err("rooms_meta: identity_sources is not a list".into());
+    };
+    let before = list.len();
+    list.retain(|v| {
+        !v.deserialized::<(VerifyingKey, [u8; 32])>()
+            .is_ok_and(|(r, _)| r == *room)
+    });
+    if list.len() == before {
+        return Ok(None);
+    }
+    // The web UI leaves the field out when it is empty.
+    if list.is_empty() {
+        entries.remove(i);
     }
     let mut out = Vec::new();
     ciborium::ser::into_writer(&Value::Map(entries), &mut out)

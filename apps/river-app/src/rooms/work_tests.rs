@@ -2894,6 +2894,7 @@ fn carry_task(w: &mut Work) -> crate::rooms::carry::Predecessor {
             [39; 32],
             freenet_stdlib::prelude::CodeHash::new([39; 32]),
         ),
+        rank: 39,
     };
     w.carry(crate::rooms::carry::Carry::new(
         vec![pred.clone()],
