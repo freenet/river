@@ -9,7 +9,9 @@
 //! **Background and startup** (the tray and login item, only where the shell offers them,
 //! [`super::background::background_section`]), **Connection** (the Freenet node,
 //! [`connection_section`]), **Identity** (import and export, [`identity_section`]) and
-//! **Appearance** (size and the shortcuts page, [`appearance_section`]). A section exists only when it has content ([`Section::shown`]). A new
+//! **Appearance** (size and the shortcuts page, [`appearance_section`]) and **Diagnostics**
+//! (the log file's path and a button that opens its folder, only where the shell keeps one,
+//! [`super::diagnostics::diagnostics_section`]). A section exists only when it has content ([`Section::shown`]). A new
 //! section is an entry in [`Section::ALL`] and an arm in [`section_content`]; the rest (list,
 //! keys, narrow screens, arrow keys) follows from those.
 //! Which section was last shown is not remembered: the dialog opens on the first section, and
@@ -46,6 +48,7 @@ pub enum Section {
     Connection,
     Identity,
     Appearance,
+    Diagnostics,
 }
 
 impl Section {
@@ -57,6 +60,7 @@ impl Section {
         Section::Connection,
         Section::Identity,
         Section::Appearance,
+        Section::Diagnostics,
     ];
 
     /// The sections the list shows: all of them, but Background and startup only where the
@@ -66,6 +70,7 @@ impl Section {
             .iter()
             .copied()
             .filter(|s| *s != Section::Background || chat.background.is_some())
+            .filter(|s| *s != Section::Diagnostics || chat.diagnostics.is_some())
             .collect()
     }
 
@@ -78,6 +83,7 @@ impl Section {
             Section::Connection => "Connection",
             Section::Identity => "Identity",
             Section::Appearance => "Appearance",
+            Section::Diagnostics => "Diagnostics",
         }
     }
 
@@ -90,6 +96,7 @@ impl Section {
             Section::Connection => "connection",
             Section::Identity => "identity",
             Section::Appearance => "appearance",
+            Section::Diagnostics => "diagnostics",
         }
     }
 
@@ -365,6 +372,7 @@ fn section_content(section: Section, chat: &super::Chat, p: &Palette, k: &Kit) -
         Section::Connection => connection_section(chat, p, k),
         Section::Identity => identity_section(chat, p, k),
         Section::Appearance => appearance_section(chat, p, k),
+        Section::Diagnostics => super::diagnostics::diagnostics_section(chat, p, k),
     }
 }
 

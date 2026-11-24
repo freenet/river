@@ -274,7 +274,10 @@ impl KeySweep {
             ) if *room_key == owner.to_bytes() => match result {
                 Ok(()) => self.go(Phase::Verify),
                 Err(e) => {
-                    eprintln!("River: the delegate refused a room's signing key: {e}");
+                    eprintln!(
+                        "River: the delegate refused a room's signing key: {}",
+                        crate::diag::scrub(&e)
+                    );
                     self.fail(cur.room, pace, now)
                 }
             },
@@ -289,7 +292,10 @@ impl KeySweep {
         let Some(cur) = self.current.filter(|c| c.sent.is_some()) else {
             return false;
         };
-        eprintln!("River: asking the delegate about a room's signing key failed: {why}");
+        eprintln!(
+            "River: asking the delegate about a room's signing key failed: {}",
+            crate::diag::scrub(&why)
+        );
         self.fail(cur.room, pace, now);
         true
     }

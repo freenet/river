@@ -556,7 +556,7 @@ fn run_with(
                             && let Err(e) = store.save(&t)
                         {
                             // Keep using it for this run; the next run asks again.
-                            eprintln!("River: {e}");
+                            eprintln!("River: {}", crate::diag::scrub(&e));
                         }
                         unconfirmed = true;
                         report(RoomsUpdate::Access(Access::Connecting));
@@ -1253,7 +1253,10 @@ fn follow_on(
                             && !subs.pending.contains_key(&id)
                     });
                 if late_reads {
-                    eprintln!("River: an error that may be a read given up on, taken by none: {e}");
+                    eprintln!(
+                        "River: an error that may be a read given up on, taken by none: {}",
+                        crate::diag::scrub(&e)
+                    );
                     // One that names the late read's room is that read's: it is over.
                     if let Some(id) = failed_contract(&e) {
                         resyncs.late_done(&id);
@@ -1287,14 +1290,20 @@ fn follow_on(
                 } else if let Some(id) = rooms.nameless_read(&e, &subs, &resyncs, reload.is_some())
                 {
                     // It frees the room for the next read now, instead of after `resync_wait`.
-                    eprintln!("River: reading a room again failed: {e}");
+                    eprintln!(
+                        "River: reading a room again failed: {}",
+                        crate::diag::scrub(&e)
+                    );
                     resyncs.failed(&id);
                 } else if let Some(id) = failed_contract(&e)
                     && resyncs.is_out(&id)
                     && !subs.pending.contains_key(&id)
                 {
                     // A read of the room failed: the subscription is not in question.
-                    eprintln!("River: reading a room again failed: {e}");
+                    eprintln!(
+                        "River: reading a room again failed: {}",
+                        crate::diag::scrub(&e)
+                    );
                     resyncs.failed(&id);
                 } else if let Some(id) = failed_contract(&e) {
                     changed |= rooms.subscribe_failed(&mut subs, id, pace);
@@ -1302,7 +1311,10 @@ fn follow_on(
                     match delegate_error(&e) {
                         // The store went away: keep the list shown (see the module docs).
                         Ok(()) => eprintln!("River: the stored rooms are gone; keeping the list"),
-                        Err(e) => eprintln!("River: reading the stored rooms again failed: {e}"),
+                        Err(e) => eprintln!(
+                            "River: reading the stored rooms again failed: {}",
+                            crate::diag::scrub(&e)
+                        ),
                     }
                     reload = None;
                     last_read = Instant::now();
@@ -1559,7 +1571,7 @@ impl Loader {
         let (meta, modes) = match wanted.remove(ROOMS_META_KEY) {
             Some(Some(Some(bytes))) if !bytes.is_empty() => (
                 decode_rooms_meta(&bytes).unwrap_or_else(|e| {
-                    eprintln!("River: {e}");
+                    eprintln!("River: {}", crate::diag::scrub(&e));
                     StoredRoomsMeta::default()
                 }),
                 decode_modes(&bytes),
@@ -1572,7 +1584,7 @@ impl Loader {
             Some(Some(Some(bytes))) => match OutboundCache::from_bytes(&bytes) {
                 Ok(cache) => DmRead::Read(Box::new(cache)),
                 Err(e) => {
-                    eprintln!("River: {e}");
+                    eprintln!("River: {}", crate::diag::scrub(&e));
                     DmRead::Unreadable
                 }
             },
@@ -1593,7 +1605,7 @@ impl Loader {
                 Ok(StoredRoomSlot::Tombstone) => {}
                 // One unreadable room must not hide the others; the screen counts it.
                 Err(e) => {
-                    eprintln!("River: skipping a stored room: {e}");
+                    eprintln!("River: skipping a stored room: {}", crate::diag::scrub(&e));
                     unreadable += 1;
                 }
             }
@@ -1663,7 +1675,10 @@ fn register_logged(socket: &mut NodeSocket, pace: &Pace) -> Result<(), SocketErr
     match register(socket, pace)? {
         Registered::Yes => {}
         Registered::Refused(why) => {
-            eprintln!("River: Freenet refused to register River's storage: {why}")
+            eprintln!(
+                "River: Freenet refused to register River's storage: {}",
+                crate::diag::scrub(&why)
+            )
         }
         Registered::Unanswered => {
             eprintln!("River: no answer to registering River's storage; reading the rooms anyway")
@@ -2195,7 +2210,10 @@ impl Rooms {
                     kept.stored.last_read_message_id = slot.last_read_message_id.clone();
                     newer_self_cache(&mut kept.stored, &slot);
                     if let Err(e) = kept.merge_state(&slot.room_state) {
-                        eprintln!("River: the stored copy of a room was not merged: {e}");
+                        eprintln!(
+                            "River: the stored copy of a room was not merged: {}",
+                            crate::diag::scrub(&e)
+                        );
                         self.not_updated.insert(vk);
                     }
                     kept
@@ -2211,7 +2229,10 @@ impl Rooms {
                             new_ids.push(fresh.contract_id());
                         }
                         if let Err(e) = fresh.merge_state(&previous.stored.room_state) {
-                            eprintln!("River: a room's earlier copy was not merged: {e}");
+                            eprintln!(
+                                "River: a room's earlier copy was not merged: {}",
+                                crate::diag::scrub(&e)
+                            );
                             self.not_updated.insert(vk);
                         }
                     } else {
@@ -3231,7 +3252,10 @@ impl Rooms {
                 true
             }
             Err(e) => {
-                eprintln!("River: a room's update from the network was not applied: {e}");
+                eprintln!(
+                    "River: a room's update from the network was not applied: {}",
+                    crate::diag::scrub(&e)
+                );
                 self.not_updated.insert(vk) | kept
             }
         }
@@ -3485,7 +3509,10 @@ impl Rooms {
 
     /// The connection is gone: keep showing the rooms if there are any, and say so.
     fn lost(&self, why: &str, report: &dyn Fn(RoomsUpdate)) {
-        eprintln!("River: lost the connection to Freenet: {why}");
+        eprintln!(
+            "River: lost the connection to Freenet: {}",
+            crate::diag::scrub(&why)
+        );
         if self.loaded {
             report(RoomsUpdate::Status(LinkStatus::Reconnecting));
         } else {

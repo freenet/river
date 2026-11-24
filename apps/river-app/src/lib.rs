@@ -5,6 +5,7 @@
 
 pub mod address;
 pub mod chat;
+pub mod diag;
 #[cfg(test)]
 mod keys_ui_tests;
 pub mod node;
@@ -386,6 +387,12 @@ impl RiverApp {
     /// tray icon and login item).
     pub fn with_background(mut self, host: std::sync::Arc<dyn chat::BackgroundHost>) -> Self {
         self.chat.background = Some(chat::BackgroundUi::new(host));
+        self
+    }
+
+    /// Offer "Diagnostics" in Settings, backed by `host` (the desktop shell's log file).
+    pub fn with_log(mut self, host: std::sync::Arc<dyn chat::LogHost>) -> Self {
+        self.chat.diagnostics = Some(chat::DiagnosticsUi::new(host));
         self
     }
 
@@ -1215,6 +1222,26 @@ fn background_scene(s: &mut RiverApp, tray: bool) {
         PreviewBackground { tray },
     )));
     s.chat.open_background();
+}
+
+/// A shell's log file for the "Diagnostics" scene.
+struct PreviewLog;
+
+impl chat::LogHost for PreviewLog {
+    fn log_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(r"C:\Users\Ada\AppData\Local\Freenet\River\config\logs\river.log")
+    }
+    fn open_log_folder(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The chat screen with Settings open on "Diagnostics".
+fn diagnostics_scene(s: &mut RiverApp) {
+    identity_scene(s, |c| {
+        c.diagnostics = Some(chat::DiagnosticsUi::new(std::sync::Arc::new(PreviewLog)));
+        c.settings.open_at(chat::settings::Section::Diagnostics)
+    });
 }
 
 /// What a notifications scene sets up: the local time (pinned) and the do not disturb choices.
@@ -2537,6 +2564,7 @@ pub const SCENES: &[Scene] = &[
             c.settings.open_at(chat::settings::Section::Appearance)
         })
     }),
+    ("chat-settings-diagnostics", diagnostics_scene),
     ("chat-settings-background", |s| background_scene(s, true)),
     ("chat-settings-background-narrow", |s| {
         background_scene(s, true)

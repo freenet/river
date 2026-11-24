@@ -129,6 +129,13 @@ fn classify_at(answer: Answer) -> NodeProbe {
     }
 }
 
+/// River's own folder for settings, the node's grant token and the log. The local (not
+/// roaming) config directory: on Windows a roaming profile would copy the grant token to other
+/// machines, where it means nothing.
+pub fn config_local_dir() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "Freenet", "River").map(|d| d.config_local_dir().to_owned())
+}
+
 impl NodeHost for DesktopHost {
     fn probe(&self) -> NodeProbe {
         classify(self.ask_node(), find_installed().is_some())
@@ -152,10 +159,7 @@ impl NodeHost for DesktopHost {
     }
 
     fn config_dir(&self) -> Option<std::path::PathBuf> {
-        // The local (not roaming) config directory: on Windows a roaming profile would copy
-        // the node's grant token to other machines, where it means nothing.
-        directories::ProjectDirs::from("", "Freenet", "River")
-            .map(|d| d.config_local_dir().to_owned())
+        config_local_dir()
     }
 
     fn can_install(&self) -> bool {

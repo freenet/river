@@ -598,7 +598,10 @@ impl NodeSocket {
         let decoded: HostResult = match bincode::deserialize(bytes) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("River: skipping a message from Freenet it can't read: {e}");
+                eprintln!(
+                    "River: skipping a message from Freenet it can't read: {}",
+                    crate::diag::scrub(&e)
+                );
                 return Ok(None);
             }
         };

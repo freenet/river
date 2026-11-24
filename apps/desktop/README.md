@@ -137,7 +137,32 @@ Open an issue at <https://github.com/freenet/river/issues> and include:
 - the node status details: open **Node status** and press **Copy diagnostics (includes node
   address)**, then paste the result. It lists versions, your OS, the node's host and port and the
   connection state, so read it before posting if the address is private to you,
+- the log file (see [The log file](#the-log-file)), with the time you noticed the problem,
 - a screenshot, if the problem is visual.
+
+### The log file
+
+River writes what it reports about itself (lost connections, rooms it could not read, updates
+it refused) to a log file, so a bug report can include it even when River has no console. This
+is the case for a Windows release build, and for River started from Finder, a desktop entry, at
+login or from the tray. Each line starts with the time in UTC. When River is run from a terminal
+it also prints the same lines there, and writes the file too.
+
+**Settings > Diagnostics** shows the path and has an **Open log folder** button. The file is
+`river.log` in the `logs` folder of River's config folder:
+
+- Linux: `~/.config/River/logs/river.log` (or under `$XDG_CONFIG_HOME`)
+- Windows: `%LOCALAPPDATA%\Freenet\River\config\logs\river.log`
+- macOS: under `~/Library/Application Support` (Settings shows the exact folder)
+
+The file stops growing at about 2 MB: River then renames it to `river.log.1`, replacing the one
+before, and starts a new `river.log`. Attach `river.log`, and `river.log.1` if the problem is
+older than the newest file. The log holds room keys, contract keys and error messages. It is
+written never to hold message text, nicknames, signing keys, secrets or invite codes; if you find
+a line that does, tell us. It also shows your user name where it is part of a path.
+
+To reproduce a problem and capture only that run, quit River, delete or move the two files, start
+River, trigger the problem, and attach the new `river.log`.
 
 **Never paste an exported identity token, an invite code or a private key.** An exported identity
 token contains your private key, and anyone who has it can write as you in your rooms.

@@ -116,6 +116,7 @@ impl DesktopUpdate {
     /// new one has confirmed it started (the lock is released first).
     fn restart_with(&self, args: &[OsString]) -> Result<(), String> {
         self.restart_and_release(args)?;
+        crate::log::flush();
         std::process::exit(0);
     }
 
