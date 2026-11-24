@@ -426,7 +426,7 @@ pub(crate) fn JoinComposer(
             // the first progress arrives and move the Cancel button under a
             // pointer that is already on its way down.
             format!(
-                "Joining: proving you are not a bot ({}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab.",
+                "Joining: proving you are not a bot ({:\u{a0}>3}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab.",
                 if *expected > 0.0 {
                     ((*tried as f64 / expected) * 100.0).min(99.0) as u32
                 } else {
@@ -504,7 +504,7 @@ pub(crate) fn JoinComposer(
                 }
             }
             p {
-                class: "mt-2 text-xs text-text-muted flex items-center gap-2",
+                class: "mt-2 text-xs text-text-muted flex items-center gap-2 tabular-nums",
                 "data-testid": "{status_testid}",
                 "{status}"
                 if let Some(notice) = notice {

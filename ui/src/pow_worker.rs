@@ -420,7 +420,11 @@ mod browser {
             };
             for i in 0..n {
                 let worker = Worker::new(&blob_url).ok()?;
-                worker.post_message(&module_message().into()).ok()?;
+                if worker.post_message(&module_message().into()).is_err() {
+                    // Not in the pool yet, so the pool's drop would miss it.
+                    worker.terminate();
+                    return give_up_on_workers();
+                }
                 let sender = tx.clone();
                 let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
                     let msg = match e.data().dyn_into::<js_sys::Uint8Array>() {
