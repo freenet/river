@@ -550,7 +550,8 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
             })
             .grow(1.0)
             .min_h(0.0)
-            .scroll_bar_styled(ScrollBarStyle::scroll_view(k)),
+            .pr(ScrollBarStyle::from_kit(k).strip())
+            .scroll_bar(k),
         )
         .child(hline(p))
         .child(footer);
@@ -1081,7 +1082,8 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
                 })
                 .grow(1.0)
                 .min_h(0.0)
-                .scroll_bar_styled(ScrollBarStyle::scroll_view(k)),
+                .pr(ScrollBarStyle::from_kit(k).strip())
+                .scroll_bar(k),
             )
             .child(footer),
     )

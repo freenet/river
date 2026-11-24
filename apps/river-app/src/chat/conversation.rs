@@ -263,11 +263,10 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
                 .label("Conversation history")
                 .scroll_edge_fade(40.0)
                 .on_at_bottom(|s: &mut RiverApp, at| s.chat.at_bottom = at)
-                .on_scroll_offset({
-                    let at = chat.history_offset.clone();
-                    move |p| at.set(p.offset[1])
-                })
-                .scroll_bar_styled(ScrollBarStyle::scroll_view(k)),
+                .on_scroll_offset(chat.history_probe(scroll_key.clone()))
+                // Room for the bar's track, so nothing at the right edge sits under it.
+                .pr(ScrollBarStyle::from_kit(k).strip())
+                .scroll_bar(k),
         );
     // Latest: the web UI's round button in the corner, while the newest message is off screen.
     if !chat.at_bottom {

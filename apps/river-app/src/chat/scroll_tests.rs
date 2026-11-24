@@ -219,6 +219,17 @@ fn the_arrows_stay_in_a_direct_message_box_that_has_text() {
 }
 
 #[test]
+fn held_arrow_repeats_add_up_until_the_view_reports_the_move() {
+    let rt = long_room(|_| {});
+    let mut pos = rt.state.chat.history_pos.borrow_mut();
+    assert_eq!(pos.key_for_test(), HISTORY, "the history reported itself");
+    let start = pos.offset_for_test();
+    // Three presses before a frame reports the new offset.
+    let last = (0..3).map(|_| pos.next_target(-40.0)).last().unwrap();
+    assert!((last - (start - 120.0)).abs() < 0.01, "{start} -> {last}");
+}
+
+#[test]
 fn the_arrows_do_not_scroll_while_the_composer_has_focus() {
     let mut rt = long_room(|_| {});
     let (x, y) = rt.find("composer-field").expect("the composer is drawn");
@@ -234,14 +245,71 @@ fn the_arrows_do_not_scroll_while_the_composer_has_focus() {
 
 #[test]
 fn the_arrows_do_not_scroll_behind_a_dialog() {
-    let mut rt = long_room(|_| {});
-    rt.update(|s, _| {
-        s.chat.open_shortcuts();
-    });
-    settle(&mut rt);
-    let before = y_of(&rt, "row-long-59");
-    key(&mut rt, Key::Up);
-    assert!((y_of(&rt, "row-long-59") - before).abs() < 1.0);
+    type Open = fn(&mut RiverApp);
+    let dialogs: [(&str, Open); 5] = [
+        ("Keyboard shortcuts", |s| {
+            s.chat.open_shortcuts();
+        }),
+        ("Unread and mentions", |s| {
+            s.chat.toggle_overview();
+        }),
+        ("Settings", |s| {
+            s.chat.open_settings();
+        }),
+        ("Export identity", |s| s.chat.open_export()),
+        ("Room details", |s| s.chat.open_details()),
+    ];
+    for (title, open) in dialogs {
+        let mut rt = long_room(|_| {});
+        rt.update(move |s, _| open(s));
+        settle(&mut rt);
+        assert!(
+            rt.state.chat.dialog_open_for_test(),
+            "{title}: the dialog is open"
+        );
+        // Click the dialog's own text first, which leaves nothing focused.
+        let (x, y) = text_at(&rt, title);
+        click(&mut rt, x, y);
+        let before = y_of(&rt, "row-long-59");
+        key(&mut rt, Key::Up);
+        assert!(
+            (y_of(&rt, "row-long-59") - before).abs() < 1.0,
+            "{title}: Up did not scroll the history behind it"
+        );
+    }
+}
+
+/// Nothing at the right edge of a pane sits under the bar's track: the content ends one track
+/// width short of the scroll view's edge.
+#[test]
+fn the_content_leaves_room_for_the_scroll_bar_track() {
+    let strip = rune_kit::ScrollBarStyle::from_kit(&rune_kit::Kit::neutral(true)).strip();
+    let check = |rt: &Runtime<RiverApp>, viewport: &str| {
+        let els = rt.elements();
+        let v = els
+            .iter()
+            .find(|e| e.key.as_deref() == Some(viewport))
+            .unwrap_or_else(|| panic!("{viewport} is drawn"));
+        let inside = format!("{}/", v.path);
+        let edge = v.rect[0] + v.rect[2];
+        let mut n = 0;
+        for e in els.iter().filter(|e| e.path.starts_with(&inside)) {
+            n += 1;
+            assert!(
+                e.rect[0] + e.rect[2] <= edge - strip + 0.5,
+                "{viewport}: {:?} reaches {} of {edge}",
+                e.key,
+                e.rect[0] + e.rect[2]
+            );
+        }
+        assert!(n > 5, "{viewport} has content");
+    };
+    let rt = long_room(|_| {});
+    for pane in [HISTORY, "room-list", "member-list"] {
+        check(&rt, pane);
+    }
+    let (rt, scroll) = long_dm();
+    check(&rt, &scroll);
 }
 
 #[test]
