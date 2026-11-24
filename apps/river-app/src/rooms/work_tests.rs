@@ -2592,3 +2592,131 @@ fn a_generated_nickname_is_cut_to_the_rooms_limit_and_the_cut_is_what_is_joined_
         "{why}"
     );
 }
+
+/// After a room-contract re-key the room's current key may have no state yet: a join reads the
+/// room's earlier keys, newest first, PUTs the newest that holds the room under the current key,
+/// then joins from it (freenet/river#889).
+#[test]
+fn a_join_after_a_room_contract_rekey_carries_the_room_to_its_current_key_first() {
+    let owner_sk = SigningKey::from_bytes(&[60; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let room = LiveRoom::new(stored(&plan.room));
+    let (_inv, link) = invitation(&room, "http://x/").unwrap();
+    let mut w = Work::default();
+    w.join(&link, "Bea", &|_| false);
+    let owner = owner_sk.verifying_key();
+    let current = crate::rooms::create::contract_key(&owner);
+    let ClientRequest::ContractOp(ContractRequest::Get { key: id, .. }) = next(&mut w) else {
+        panic!("a GET");
+    };
+    assert_eq!(id, *current.id());
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: id }));
+    // The earlier keys, newest first: the newest holds nothing, the next holds the room.
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let ClientRequest::ContractOp(ContractRequest::Get { key: first, .. }) = next(&mut w) else {
+        panic!("a GET of an earlier key");
+    };
+    assert_eq!(first, *earlier[0].id());
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: first }));
+    let ClientRequest::ContractOp(ContractRequest::Get { key: second, .. }) = next(&mut w) else {
+        panic!("a GET of the next earlier key");
+    };
+    assert_eq!(second, *earlier[1].id());
+    get_answer(&mut w, earlier[1], &plan.room.room_state);
+    // Nothing older is read once one holds the room: it is PUT under the current key.
+    let ClientRequest::ContractOp(ContractRequest::Put {
+        contract, state, ..
+    }) = next(&mut w)
+    else {
+        panic!("a PUT");
+    };
+    assert_eq!(contract.key(), current);
+    let put: ChatRoomStateV1 = ciborium::de::from_reader(state.as_ref()).unwrap();
+    assert!(put.upgrade.0.is_none());
+    // The node took it: the join goes on from that state, to the store.
+    assert!(w.on_contract(&ContractResponse::PutResponse { key: current }));
+    expect_read(&mut w, &room_storage_key(&owner));
+}
+
+/// A PUT the node refuses is said, and Try again reads the earlier keys again.
+#[test]
+fn a_refused_forward_put_is_said_and_try_again_reads_the_earlier_keys_again() {
+    let owner_sk = SigningKey::from_bytes(&[61; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let owner = owner_sk.verifying_key();
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let current = crate::rooms::create::contract_key(&owner);
+    let mut w = Work::default();
+    assert!(w.seed(
+        owner,
+        "Open".into(),
+        earlier[2],
+        plan.room.room_state.clone()
+    ));
+    // Once per room.
+    assert!(!w.seed(
+        owner,
+        "Open".into(),
+        earlier[2],
+        plan.room.room_state.clone()
+    ));
+    assert!(w.holds(&owner));
+    for k in &earlier[..2] {
+        let ClientRequest::ContractOp(ContractRequest::Get { key, subscribe, .. }) = next(&mut w)
+        else {
+            panic!("a GET of an earlier key");
+        };
+        assert!(!subscribe);
+        assert_eq!(key, *k.id());
+        assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+    }
+    let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
+        panic!("a GET of the key the room was stored under");
+    };
+    assert_eq!(key, *earlier[2].id());
+    get_answer(&mut w, earlier[2], &plan.room.room_state);
+    assert!(matches!(
+        next(&mut w),
+        ClientRequest::ContractOp(ContractRequest::Put { .. })
+    ));
+    let refusal: ClientError =
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Put {
+            key: current,
+            cause: "no".into(),
+        }))
+        .into();
+    assert!(w.on_error(&refusal, true, &|_| false));
+    let view = w.views().pop().unwrap();
+    let WorkState::Failed { why, retry: true } = view.state else {
+        panic!("not failed with Try again: {view:?}");
+    };
+    assert!(why.contains("didn't take"), "{why}");
+    assert!(w.retry(view.id));
+    let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
+        panic!("a GET");
+    };
+    assert_eq!(key, *earlier[0].id());
+}
+
+/// A stored room no earlier key holds is left as it is: nothing is PUT, nothing is said.
+#[test]
+fn moving_a_room_no_earlier_key_holds_puts_nothing() {
+    let owner_sk = SigningKey::from_bytes(&[62; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let owner = owner_sk.verifying_key();
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        earlier[0],
+        plan.room.room_state.clone(),
+    );
+    let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = next(&mut w) else {
+        panic!("a GET");
+    };
+    assert!(w.on_contract(&ContractResponse::NotFound { instance_id: key }));
+    assert!(w.next_request(false, Instant::now()).is_none());
+    assert!(!w.busy());
+    assert!(w.views().is_empty());
+}

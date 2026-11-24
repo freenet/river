@@ -383,6 +383,9 @@ struct Task {
     probe: Option<Box<Probe>>,
     /// The state found under an earlier key, to PUT under the current one (the `Forward` step).
     carried: Option<Box<ChatRoomStateV1>>,
+    /// For a [`Kind::Seed`]: the node took the room under its current key, and the session has
+    /// not been told yet ([`Work::take_moved`]).
+    moved: bool,
 }
 
 /// For tests: how many non-zero secrets of an invitation and of a join plan were wiped on this
@@ -475,6 +478,7 @@ impl Task {
             done_name: None,
             probe: None,
             carried: None,
+            moved: false,
         }
     }
 
@@ -858,6 +862,20 @@ impl Work {
             Step::Probe,
         );
         true
+    }
+
+    /// The rooms moved to their current contract key since the last call: the session asks for
+    /// them again at once, instead of when the subscribe that found nothing is next due.
+    pub fn take_moved(&mut self) -> Vec<VerifyingKey> {
+        let mut out = Vec::new();
+        for t in &mut self.tasks {
+            if std::mem::take(&mut t.moved)
+                && let Some(owner) = t.owner()
+            {
+                out.push(owner);
+            }
+        }
+        out
     }
 
     /// An answer from an earlier chat delegate (`from`). True when it was the working task's.
@@ -1383,6 +1401,13 @@ impl Work {
             Cool::Until(at) if now < at => return None,
             Cool::Until(_) => t.cool = Cool::No,
         }
+        // Reading earlier keys may be over: go on to the PUT (in this same call), or end.
+        if t.step == Step::Probe {
+            settle_probe(t);
+            if !t.running() || t.step != Step::Probe && t.step != Step::Forward {
+                return None;
+            }
+        }
         let owner = t.owner();
         let (out, request) = match (t.step, &mut t.kind) {
             (Step::Walk, Kind::Carry(c)) => {
@@ -1413,55 +1438,19 @@ impl Work {
                     ),
                 }
             }
-            (Step::Probe, kind) => {
-                if t.probe.is_none()
-                    && let Kind::Seed {
-                        room,
-                        candidates,
-                        local,
-                        ..
-                    } = kind
-                {
-                    t.probe = Some(Box::new(Probe::new(
-                        *room,
-                        candidates.clone(),
-                        (**local).clone(),
-                    )));
-                }
-                let Some(p) = t.probe.as_mut() else {
-                    t.fail("Something unexpected went wrong.", true);
+            (Step::Probe, _) => {
+                let Some(Ok(id)) = t.probe.as_mut().map(|p| p.next_read()) else {
                     return None;
                 };
-                match p.next() {
-                    Ok(id) => (
-                        Out::Contract(id),
-                        ClientRequest::ContractOp(ContractRequest::Get {
-                            key: id,
-                            return_contract_code: false,
-                            subscribe: false,
-                            blocking_subscribe: false,
-                        }),
-                    ),
-                    Err(Found::State(state)) => {
-                        t.probe = None;
-                        t.carried = Some(state);
-                        t.step = Step::Forward;
-                        return None;
-                    }
-                    Err(Found::Nothing) => {
-                        t.probe = None;
-                        if t.is_seed() {
-                            // Nothing to carry: the room shows the copy the user holds, as before.
-                            eprintln!(
-                                "River: no earlier key of a re-keyed room holds it; showing the stored copy"
-                            );
-                            t.step = Step::Done;
-                        } else {
-                            t.fail(NOT_FOUND, true);
-                        }
-                        return None;
-                    }
-                }
+                (
+                    Out::Contract(id),
+                    ClientRequest::ContractOp(ContractRequest::Get {
+                        key: id,
+                        return_contract_code: false,
+                        subscribe: false,
+                        blocking_subscribe: false,
+                    }),
+                )
             }
             (Step::Forward, _) => {
                 let (Some(owner), Some(state)) = (owner, t.carried.as_deref()) else {
@@ -1684,7 +1673,10 @@ impl Work {
                             return false;
                         }
                     }
-                    _ => t.advance(),
+                    _ => {
+                        t.moved = t.is_seed();
+                        t.advance()
+                    }
                 }
             }
             (Step::Put, ContractResponse::PutResponse { key }) if *key.id() == id => t.advance(),
@@ -2043,6 +2035,51 @@ fn take_state(t: &mut Task, state: &ChatRoomStateV1) -> bool {
         _ => return false,
     }
     true
+}
+
+/// For a task reading a room's earlier contract keys: start the reading (a move of a stored
+/// room starts it here, and again on Try again), and when it is over, go on: to the PUT when an
+/// earlier key holds the room, otherwise a stored room is left as it is and a join or an import
+/// fails as when the current key holds nothing.
+fn settle_probe(t: &mut Task) {
+    if t.probe.is_none()
+        && let Kind::Seed {
+            room,
+            candidates,
+            local,
+            ..
+        } = &t.kind
+    {
+        t.probe = Some(Box::new(Probe::new(
+            *room,
+            candidates.clone(),
+            (**local).clone(),
+        )));
+    }
+    let Some(p) = t.probe.as_mut() else {
+        t.fail("Something unexpected went wrong.", true);
+        return;
+    };
+    match p.next_read() {
+        Ok(_) => {}
+        Err(Found::State(state)) => {
+            t.probe = None;
+            t.carried = Some(state);
+            t.step = Step::Forward;
+        }
+        Err(Found::Nothing) => {
+            t.probe = None;
+            if t.is_seed() {
+                // Nothing to carry: the room shows the copy the user holds, as before.
+                eprintln!(
+                    "River: no earlier key of a re-keyed room holds it; showing the stored copy"
+                );
+                t.step = Step::Done;
+            } else {
+                t.fail(NOT_FOUND, true);
+            }
+        }
+    }
 }
 
 /// What the screen says while rooms are carried over.

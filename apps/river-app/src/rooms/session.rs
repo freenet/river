@@ -806,6 +806,13 @@ impl Subscriptions {
         self.retry.remove(id);
     }
 
+    /// Ask again for `id` as soon as nothing else is out for it (by [`Self::ask_due`]): the
+    /// network has a copy now (the room was moved to its current contract key).
+    fn due_now(&mut self, id: ContractInstanceId) {
+        let attempts = self.retry.get(&id).map_or(0, |(n, _)| *n);
+        self.retry.insert(id, (attempts, Instant::now()));
+    }
+
     /// The subscribe failed, found nothing, or went unanswered: ask again later.
     fn failed(&mut self, id: ContractInstanceId, pace: &Pace) {
         self.pending.remove(&id);
@@ -1142,6 +1149,12 @@ fn follow_on(
         if let Some(Ok(HostResponse::ContractResponse(r))) = &response
             && rooms.outbox.work.on_contract(r)
         {
+            // A room moved to its current contract key has a copy there now: follow it.
+            for owner in rooms.outbox.work.take_moved() {
+                if let Some(room) = rooms.list.iter().find(|r| r.stored.owner_vk == owner) {
+                    subs.due_now(room.contract_id());
+                }
+            }
             rooms.report(status, report);
             continue;
         }

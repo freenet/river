@@ -121,7 +121,7 @@ fn run(
 ) -> (Found, Vec<ContractInstanceId>) {
     let mut read = Vec::new();
     loop {
-        match probe.next() {
+        match probe.next_read() {
             Ok(id) => {
                 read.push(id);
                 match states.iter().find(|(k, _)| *k == id) {

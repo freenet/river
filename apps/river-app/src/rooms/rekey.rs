@@ -151,7 +151,7 @@ impl Probe {
     }
 
     /// The key to read next, or what was found.
-    pub fn next(&mut self) -> Result<ContractInstanceId, Found> {
+    pub fn next_read(&mut self) -> Result<ContractInstanceId, Found> {
         match self.driver.next_action() {
             Step::Get(id) => Ok(id),
             _ => Err(match self.driver.take_outcome() {
