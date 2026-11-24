@@ -255,6 +255,12 @@ pub fn App() -> Element {
     // Idempotent.
     crate::util::watch_media(WIDE_VIEWPORT_QUERY, &WIDE_VIEWPORT);
 
+    // Read `?room=` (freenet/river#513) now: the invitation handling below
+    // removes `?invitation=` from the address, and a link carrying both must be
+    // judged with the invitation still in it, so the invitation flow wins.
+    // (`VIEWED_ROOM` initialises from the address on first access.)
+    let _ = crate::public_room::VIEWED_ROOM.peek();
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // One-shot guard for the localStorage auto-resume path (#218). The

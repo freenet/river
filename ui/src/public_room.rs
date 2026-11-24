@@ -547,20 +547,53 @@ pub fn retry(owner_vk: VerifyingKey) {
     request_fetch(owner_vk);
 }
 
-fn deliver(id: &ContractInstanceId, answer: Answer) -> bool {
-    let m = mirror();
-    let ours = m.as_ref().is_some_and(|m| is_ours(&m.owner_vk, id));
-    let routed = route(m.as_ref(), id, ours, answer);
-    if let (Some(status), Some(m)) = (routed.status, m.as_ref()) {
-        set_status(m.owner_vk, status);
+/// What `deliver` does with a routed answer. Separate from the routing so the
+/// whole decision (claim, status write, follow-up request) is testable without
+/// the Dioxus runtime or a node.
+trait Effects {
+    fn set_status(&mut self, owner_vk: VerifyingKey, status: ViewedRoomStatus);
+    fn subscribe(&mut self, owner_vk: VerifyingKey);
+    fn refetch(&mut self, owner_vk: VerifyingKey);
+}
+
+struct Live;
+
+impl Effects for Live {
+    fn set_status(&mut self, owner_vk: VerifyingKey, status: ViewedRoomStatus) {
+        set_status(owner_vk, status)
     }
-    if let (Some(follow_up), Some(m)) = (routed.follow_up, m.as_ref()) {
+    fn subscribe(&mut self, owner_vk: VerifyingKey) {
+        request_subscribe(owner_vk)
+    }
+    fn refetch(&mut self, owner_vk: VerifyingKey) {
+        request_refetch(owner_vk)
+    }
+}
+
+fn deliver_with(
+    m: Option<&Mirror>,
+    ours: bool,
+    id: &ContractInstanceId,
+    answer: Answer,
+    fx: &mut impl Effects,
+) -> bool {
+    let routed = route(m, id, ours, answer);
+    if let (Some(status), Some(m)) = (routed.status, m) {
+        fx.set_status(m.owner_vk, status);
+    }
+    if let (Some(follow_up), Some(m)) = (routed.follow_up, m) {
         match follow_up {
-            FollowUp::Subscribe => request_subscribe(m.owner_vk),
-            FollowUp::Refetch => request_refetch(m.owner_vk),
+            FollowUp::Subscribe => fx.subscribe(m.owner_vk),
+            FollowUp::Refetch => fx.refetch(m.owner_vk),
         }
     }
     routed.claimed
+}
+
+fn deliver(id: &ContractInstanceId, answer: Answer) -> bool {
+    let m = mirror();
+    let ours = m.as_ref().is_some_and(|m| is_ours(&m.owner_vk, id));
+    deliver_with(m.as_ref(), ours, id, answer, &mut Live)
 }
 
 /// Route a GET response. `true` if it was the viewer's, which the caller must
@@ -693,6 +726,7 @@ mod tests {
     // ---- claim-first routing -------------------------------------------
 
     use crate::util::owner_vk_to_contract_key;
+    use river_core::room_state::member::MemberId;
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 
     fn mirror_for(vk: &VerifyingKey, requested: bool, status: ViewedRoomStatus) -> Mirror {
@@ -859,6 +893,131 @@ mod tests {
         assert_eq!(m.message.content.as_public_string().as_deref(), Some("hi"));
     }
 
+    #[derive(Default)]
+    struct Recorder {
+        statuses: Vec<ViewedRoomStatus>,
+        subscribed: u32,
+        refetched: u32,
+    }
+
+    impl Effects for Recorder {
+        fn set_status(&mut self, _: VerifyingKey, status: ViewedRoomStatus) {
+            self.statuses.push(status);
+        }
+        fn subscribe(&mut self, _: VerifyingKey) {
+            self.subscribed += 1;
+        }
+        fn refetch(&mut self, _: VerifyingKey) {
+            self.refetched += 1;
+        }
+    }
+
+    #[test]
+    fn delivering_a_viewers_state_claims_it_sets_the_status_and_subscribes() {
+        let vk = key();
+        let m = mirror_for(&vk, true, ViewedRoomStatus::Loading);
+        let mut fx = Recorder::default();
+        let bytes = state_bytes(PrivacyMode::Public);
+        assert!(deliver_with(
+            Some(&m),
+            false,
+            &m.id,
+            Answer::State(&bytes),
+            &mut fx
+        ));
+        assert!(matches!(fx.statuses[..], [ViewedRoomStatus::Public(_)]));
+        assert_eq!((fx.subscribed, fx.refetched), (1, 0));
+        let mut fx = Recorder::default();
+        assert!(deliver_with(
+            Some(&m),
+            false,
+            &m.id,
+            Answer::NotFound,
+            &mut fx
+        ));
+        assert_eq!(fx.statuses, vec![ViewedRoomStatus::NotFound]);
+    }
+
+    #[test]
+    fn delivering_a_private_state_leaves_only_invite_only_and_sends_nothing() {
+        let vk = key();
+        let m = mirror_for(&vk, true, ViewedRoomStatus::Loading);
+        let mut fx = Recorder::default();
+        let bytes = state_bytes(PrivacyMode::Private);
+        assert!(deliver_with(
+            Some(&m),
+            false,
+            &m.id,
+            Answer::State(&bytes),
+            &mut fx
+        ));
+        assert_eq!(fx.statuses, vec![ViewedRoomStatus::InviteOnly]);
+        assert_eq!((fx.subscribed, fx.refetched), (0, 0));
+    }
+
+    #[test]
+    fn a_member_or_pending_invitee_is_never_swallowed_and_nothing_is_written() {
+        // `ours` is true for ROOMS, SYNC_INFO and PENDING_INVITES alike, and
+        // for a contended signal.
+        let vk = key();
+        let m = mirror_for(&vk, true, ViewedRoomStatus::Loading);
+        let bytes = state_bytes(PrivacyMode::Public);
+        for answer in [Answer::State(&bytes), Answer::NotFound, Answer::Delta] {
+            let mut fx = Recorder::default();
+            assert!(!deliver_with(Some(&m), true, &m.id, answer, &mut fx));
+            assert!(fx.statuses.is_empty() && fx.subscribed == 0 && fx.refetched == 0);
+        }
+        // Before the viewer has asked (e.g. before ROOMS hydrates), an answer
+        // for the same contract is not the viewer's either.
+        let unasked = mirror_for(&vk, false, ViewedRoomStatus::Loading);
+        let mut fx = Recorder::default();
+        assert!(!deliver_with(
+            Some(&unasked),
+            false,
+            &unasked.id,
+            Answer::State(&bytes),
+            &mut fx
+        ));
+        assert!(fx.statuses.is_empty());
+    }
+
+    #[test]
+    fn a_delta_for_a_public_view_refetches_and_a_non_viewed_id_is_not_claimed() {
+        let vk = key();
+        let public = ViewedRoomStatus::Public(Box::new(state_with(PrivacyMode::Public)));
+        let m = mirror_for(&vk, true, public);
+        let mut fx = Recorder::default();
+        assert!(deliver_with(Some(&m), false, &m.id, Answer::Delta, &mut fx));
+        assert_eq!(fx.refetched, 1);
+        let other =
+            *owner_vk_to_contract_key(&SigningKey::from_bytes(&[9u8; 32]).verifying_key()).id();
+        let mut fx = Recorder::default();
+        assert!(!deliver_with(
+            Some(&m),
+            false,
+            &other,
+            Answer::Delta,
+            &mut fx
+        ));
+        assert_eq!(fx.refetched, 0);
+    }
+
+    #[test]
+    fn the_viewer_never_writes_to_the_delegate_or_rooms() {
+        let src = handler_source("public_room.rs");
+        for forbidden in [
+            "ROOMS.write",
+            "SYNC_INFO.write",
+            "PENDING_INVITES.write",
+            "chat_delegate",
+        ] {
+            assert!(
+                !src.contains(forbidden),
+                "viewer code must not touch {forbidden}"
+            );
+        }
+    }
+
     // ---- the hooks stay in place ---------------------------------------
     //
     // The handlers cannot be driven natively (they need the Dioxus runtime and
@@ -907,6 +1066,19 @@ mod tests {
             handler.contains("public_room::is_viewers("),
             "the post-subscribe GET is not sent for the viewed room"
         );
+    }
+
+    #[test]
+    fn the_address_is_read_before_the_invitation_is_removed_from_it() {
+        // `App` deletes `?invitation=` from the URL; VIEWED_ROOM judges the
+        // address on first access, so App must touch it first or a link with
+        // both opens the visitor view.
+        let app = handler_source("components/app.rs");
+        let read_at = app.find("VIEWED_ROOM.peek()").expect("early read");
+        let delete_at = app
+            .find("params.delete(\"invitation\")")
+            .expect("invitation removal");
+        assert!(read_at < delete_at);
     }
 
     #[test]

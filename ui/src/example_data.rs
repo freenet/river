@@ -160,11 +160,14 @@ pub fn create_example_rooms() -> Rooms {
     map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let room2 = create_room(
+    // The owner key is fixed so a `?room=` link to this room survives the reload
+    // that opening it involves (freenet/river#513, the member-link spec).
+    let room2 = create_room_with_owner(
         &"Team Chat Room".to_string(),
         SelfIs::Member,
         Some("Hi"),
         HistoryDepth::Standard,
+        Some([0x54; 32]),
     );
     map.insert(room2.owner_vk, room2.room_data);
 

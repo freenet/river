@@ -272,7 +272,7 @@ pub fn EditRoomModal() -> Element {
                                             label: "Copy public link",
                                         }
                                     }
-                                    p { class: "mt-1 text-xs text-text-muted",
+                                    p { class: "mt-1 text-[13px] text-text-muted",
                                         "Anyone with this link can read the room. They cannot post until they join."
                                     }
                                 }
