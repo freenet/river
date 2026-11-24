@@ -92,7 +92,7 @@
 //! these tasks, so a task is done as soon as the room is stored.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::{

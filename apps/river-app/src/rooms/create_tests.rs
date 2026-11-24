@@ -233,7 +233,10 @@ fn joining_adds_the_invitee_their_nickname_and_a_join_event() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].message.author, me);
     assert_eq!(messages[0].message.content, RoomMessageBody::join_event());
-    assert_eq!(messages[0].message.time, at);
+    assert_eq!(
+        messages[0].message.time,
+        crate::signed_time::whole_millis(at)
+    );
     // Joining again at the same time sends the same bytes (a resend after a lost answer).
     let again = join(&inv, "Bea", &state, key, at).unwrap();
     let cbor = |d: &ChatRoomStateV1Delta| {

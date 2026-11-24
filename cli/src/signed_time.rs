@@ -20,7 +20,7 @@ pub fn whole_millis(t: SystemTime) -> SystemTime {
 }
 
 fn trunc(d: Duration) -> Duration {
-    Duration::new(d.as_secs(), d.subsec_nanos() / 1_000_000 * 1_000_000)
+    Duration::new(d.as_secs(), d.subsec_millis() * 1_000_000)
 }
 
 /// The current time, as a whole millisecond. Use for every signed timestamp.
@@ -109,10 +109,7 @@ mod tests {
         assert_eq!(t, UNIX_EPOCH + Duration::new(1_700_000_000, 123_000_000));
         assert_eq!(whole_millis(t), t);
         let before = UNIX_EPOCH - Duration::new(5, 123_456_789);
-        assert_eq!(
-            whole_millis(before).duration_since(UNIX_EPOCH).is_err(),
-            true
-        );
+        assert!(whole_millis(before).duration_since(UNIX_EPOCH).is_err());
     }
 
     #[test]
