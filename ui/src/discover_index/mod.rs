@@ -497,6 +497,12 @@ impl Session {
                     }
                     Err(e) => {
                         let v = merge_view(&self.view, Err(e));
+                        // Once the view is no longer an answer, the stamp of
+                        // the state it came from must not refuse the next
+                        // valid one: that would leave "Loading" with no timer.
+                        if !v.is_answer() {
+                            self.stamp = None;
+                        }
                         self.set_view(v, fx);
                     }
                 }
@@ -1825,6 +1831,32 @@ mod tests {
         let v3 = state_at(3, "Newer name");
         r.s.on_answer(&idx, Answer::State(&v3), &mut r.fx);
         assert_eq!(title(&r), "Newer name");
+    }
+
+    #[test]
+    fn an_older_valid_state_after_a_failure_is_shown_not_left_on_loading() {
+        use atlas::fixtures::*;
+        let hidden_at = |version: u64| {
+            let mut e = room(1, version, "Unclassified", owner_b58(11));
+            e.class = None;
+            encode(&build(vec![e]).state)
+        };
+        let mut r = rig_with(params());
+        r.s.open(&mut r.fx);
+        r.answer_pointer();
+        let idx = r.idx();
+        r.s.on_answer(&idx, Answer::State(&hidden_at(2)), &mut r.fx);
+        assert_eq!(*r.s.view(), DiscoverIndex::Hidden);
+        // An invalid state replaces the answer, then Discover is reopened.
+        r.s.on_answer(&idx, Answer::State(b"junk"), &mut r.fx);
+        assert!(matches!(r.s.view(), DiscoverIndex::Unavailable(_)));
+        r.s.close();
+        r.s.open(&mut r.fx);
+        r.answer_pointer();
+        let idx = r.idx();
+        // A lagging peer serves an older state: it is the best there is.
+        r.s.on_answer(&idx, Answer::State(&hidden_at(1)), &mut r.fx);
+        assert_eq!(*r.s.view(), DiscoverIndex::Hidden);
     }
 
     #[test]
