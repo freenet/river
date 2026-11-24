@@ -1620,7 +1620,8 @@ impl Carol {
             }
             assert!(
                 Instant::now() < deadline,
-                "node B never held the owner's message under secret version {version}"
+                "node B never held the owner's message under secret version {version} (it did not \
+                 arrive, or it was sealed under a different version)"
             );
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -2286,8 +2287,11 @@ fn invitation_from_a_banned_inviter(alice: &mut App, bob: &mut App, b: &str, dir
             contract_key,
             std::time::SystemTime::now(),
         )
-        .is_err(),
-        "an invitation from a banned member is still taken"
+        .err()
+        .is_some_and(|e| !e.retry
+            && e.why.contains("banned")
+            && e.why.contains("no longer be valid")),
+        "an invitation from a banned member is still taken, or is refused without saying why"
     );
     let code = invitation.to_encoded_string().expect("an invite code");
     let started = Instant::now();
@@ -2357,8 +2361,8 @@ const ROTATION_ROOM: &str = "Fresh node rotation room";
 /// A private room where the member who stays is a real app and the one removed is not: Carol
 /// (played by the example, see [`Carol`]) is banned, the owner's ban rotates the secret, and Bob's
 /// app, which stayed, reads what the owner and he write under the new version, while Carol, whose
-/// node holds those messages too, cannot open them with any key she has ever held. Then the owner's own Rotate does the same
-/// once more. (`ban_and_lock_out` covers the other way round: the app banned, a bystander
+/// node holds those messages too, cannot open them with any key she has ever held. Then the
+/// owner's own Rotate does the same once more. (`ban_and_lock_out` covers the other way round: the app banned, a bystander
 /// staying.)
 fn rotation_keeps_a_member_and_drops_another(
     alice: &mut App,

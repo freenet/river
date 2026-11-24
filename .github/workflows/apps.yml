@@ -203,8 +203,10 @@ jobs:
   # The app on two Freenet nodes River never ran on (apps/scripts/fresh-node-e2e.sh):
   # it registers the chat delegate on each, creates a room and an invitation on one,
   # joins from it on the other, and each receives the other's message. Runs on two pinned
-  # Freenet releases: the oldest the desktop app installs, and the current one. Both are
-  # explicit versions, never "latest"; move the second when a newer release is published.
+  # Freenet releases. 0.2.157 is the baseline: the oldest release the desktop app installs
+  # (and what this job ran on before it had a matrix). 0.2.164 is the latest release as of
+  # this change. Both are explicit versions, never "latest", and the second is bumped
+  # deliberately in a PR of its own when a newer release should be covered.
   fresh-node-e2e:
     name: fresh-node-e2e (freenet ${{ matrix.freenet }})
     runs-on: ubuntu-latest
@@ -250,6 +252,9 @@ jobs:
           # The archive stores the binary without its execute bit.
           chmod +x freenet
           ./freenet --version
+          # The binary must be the version this leg claims to test.
+          # First line is "Freenet version: X.Y.Z (<sha>)".
+          ./freenet --version | head -n1 | grep -qF "Freenet version: $FREENET_VERSION ("
 
       - name: Fresh-node end-to-end
         run: FREENET_BIN="$RUNNER_TEMP/freenet/freenet" ./scripts/fresh-node-e2e.sh "$RUNNER_TEMP/e2e"
