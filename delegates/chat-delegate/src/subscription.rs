@@ -86,12 +86,41 @@ fn room_owner_b58(room_owner_vk: &RoomKey) -> String {
 /// the contract to be the contract id the UI explicitly subscribed to via
 /// `EnsureRoomSubscription`. We work around this by storing a second tiny
 /// index keyed by contract_id → room_owner_vk.
-fn contract_id_index_key(contract_id: &[u8; 32]) -> Vec<u8> {
+///
+/// The index is keyed by the contract id AND the owner's member id, and a
+/// notification is resolved through the owner its state names
+/// (`resolve_notified_room`): the contract id is supplied by the caller, so
+/// an entry keyed by contract id alone let one caller's record decide which
+/// room another owner's notifications were routed to.
+fn contract_id_index_key(contract_id: &[u8; 32], owner_id: MemberId) -> Vec<u8> {
     format!(
-        "room_sub_by_cid:{}",
-        bs58::encode(contract_id).into_string()
+        "room_sub_by_cid:{}:{}",
+        bs58::encode(contract_id).into_string(),
+        bs58::encode(owner_id.0 .0.to_le_bytes()).into_string()
     )
     .into_bytes()
+}
+
+/// The room a notification for contract `cid` belongs to, resolved through
+/// the owner its state names: the reverse-index entry for `(cid, owner id)`,
+/// accepted only when its key verifies the state's owner-signed
+/// configuration. `lookup` reads the delegate's secret store.
+/// An entry written for any other owner is never consulted, so a record one
+/// caller wrote can only route notifications of a room whose owner key that
+/// caller named, and that key must have signed the notified configuration.
+pub(crate) fn resolve_notified_room(
+    cid: &[u8; 32],
+    state: &ChatRoomStateV1,
+    lookup: impl Fn(&[u8]) -> Option<Vec<u8>>,
+) -> Option<RoomKey> {
+    let owner_id = state.configuration.configuration.owner_member_id;
+    let room: RoomKey = cbor_decode(&lookup(&contract_id_index_key(cid, owner_id))?).ok()?;
+    // The entry under `(cid, owner id)` names a key with that member id
+    // (`ensure_subscription_writes` derives the id from the key it stores),
+    // and that key must have signed the notified configuration.
+    let vk = VerifyingKey::from_bytes(&room).ok()?;
+    state.configuration.verify_signature(&vk).ok()?;
+    Some(room)
 }
 
 /// Looks up the room-owner signing-key seed previously stored via
@@ -124,6 +153,77 @@ pub(crate) struct RoomSubscriptionContext {
     pub signing_key_origin_b58: String,
 }
 
+/// Whether `stored` is a signing-key seed whose verifying key is
+/// `room_owner_vk`: what `handle_ensure_room_subscription` requires of the
+/// key the caller holds for the room, and what rotation checks again before
+/// it signs.
+pub(crate) fn is_room_owner_signing_key(stored: Option<&[u8]>, room_owner_vk: &RoomKey) -> bool {
+    stored
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .is_some_and(|seed| {
+            SigningKey::from_bytes(&seed).verifying_key().to_bytes() == *room_owner_vk
+        })
+}
+
+/// One secret-store write: key, then value.
+pub(crate) type SecretWrite = (Vec<u8>, Vec<u8>);
+
+/// The caller's stored signing key for the room, as the handler read it.
+pub(crate) enum KeyCheck {
+    /// What the secret store returned for the caller's origin and the room.
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    Stored(Option<Vec<u8>>),
+    /// Not readable in this build (host builds have no secret store); the
+    /// check is skipped.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    Unavailable,
+}
+
+/// The secret-store writes `EnsureRoomSubscription` makes, in order, or the
+/// error it answers with, decided before anything is written: the room's
+/// subscription record (`room_sub:<room>`, naming the caller's origin), then
+/// the reverse index for the room's contract, keyed by the contract id AND
+/// the room owner's member id (see `contract_id_index_key`).
+///
+/// The subscription record names the origin whose key rotation signs with,
+/// so the caller must hold the room OWNER's signing key under its own
+/// origin; a caller holding no key, or another key, is refused and nothing
+/// is written. The reverse index is keyed by the owner the caller named, so
+/// it is only ever read for a notification whose state that owner's key
+/// signed (`resolve_notified_room`).
+pub(crate) fn ensure_subscription_writes(
+    origin_b58: &str,
+    room_owner_vk: RoomKey,
+    contract_id: [u8; 32],
+    key_check: KeyCheck,
+) -> Result<Vec<SecretWrite>, String> {
+    if let KeyCheck::Stored(stored) = &key_check {
+        if !is_room_owner_signing_key(stored.as_deref(), &room_owner_vk) {
+            return Err(
+                "no signing key for the room owner on file for this room; call StoreSigningKey with the owner's key first"
+                    .to_string(),
+            );
+        }
+    }
+    let owner_id = VerifyingKey::from_bytes(&room_owner_vk)
+        .map(|vk| MemberId::from(&vk))
+        .map_err(|e| format!("Invalid room owner key: {e}"))?;
+    let room_b58 = room_owner_b58(&room_owner_vk);
+    let context = RoomSubscriptionContext {
+        room_owner_vk,
+        contract_id,
+        signing_key_origin_b58: origin_b58.to_string(),
+    };
+    let context_bytes =
+        cbor_encode(&context).map_err(|e| format!("Failed to encode subscription record: {e}"))?;
+    let reverse_bytes =
+        cbor_encode(&room_owner_vk).map_err(|e| format!("Failed to encode reverse index: {e}"))?;
+    Ok(vec![
+        (secret_keys::sub_index(&room_b58), context_bytes),
+        (contract_id_index_key(&contract_id, owner_id), reverse_bytes),
+    ])
+}
+
 /// Public entry point invoked from `handlers::handle_application_message`.
 ///
 /// `request_id` is echoed back in the response so the UI's pending-request
@@ -142,80 +242,28 @@ pub(crate) fn handle_ensure_room_subscription(
         bs58::encode(&contract_id).into_string()
     ));
 
-    // Probe for the signing key. The UI is required to send
-    // `StoreSigningKey` before `EnsureRoomSubscription` so the rotation
-    // pipeline has access to the owner's signing key when a notification
-    // arrives. If the key isn't on file we fail fast rather than silently
-    // setting up a sub-index that will never be able to rotate.
-    //
-    // Note: `DelegateCtx::get_secret` returns `None` in non-WASM tests, so
-    // running this check there would always reject. We therefore only
-    // enforce it on WASM. The non-WASM test
-    // `subscribes_to_room_on_ensure_request` documents the legacy
-    // permissive behaviour; a WASM integration test would cover the
-    // rejection path. Filed as a known gap in the test harness — see
-    // module-level comment.
+    // `DelegateCtx::get_secret` returns `None` in non-WASM builds, so the
+    // stored key is read (and checked) on WASM only; host tests drive
+    // `ensure_subscription_writes` directly with a stored key.
     #[cfg(target_family = "wasm")]
+    let key_check =
+        KeyCheck::Stored(ctx.get_secret(&signing_key_secret_key(origin_b58, &room_b58)));
+    #[cfg(not(target_family = "wasm"))]
+    let key_check = KeyCheck::Unavailable;
+
+    let writes = match ensure_subscription_writes(origin_b58, room_owner_vk, contract_id, key_check)
     {
-        let signing_key_present = ctx
-            .get_secret(&signing_key_secret_key(origin_b58, &room_b58))
-            .map(|b| b.len() == 32)
-            .unwrap_or(false);
-        if !signing_key_present {
+        Ok(w) => w,
+        Err(e) => return ok_response(room_owner_vk, request_id, Err(e)),
+    };
+    for (key, value) in &writes {
+        if !ctx_set_secret(ctx, key, value) {
             return ok_response(
                 room_owner_vk,
                 request_id,
-                Err(
-                    "no signing key on file for this room — call StoreSigningKey first".to_string(),
-                ),
+                Err("Failed to persist subscription record (set_secret returned false)".into()),
             );
         }
-    }
-
-    let context = RoomSubscriptionContext {
-        room_owner_vk,
-        contract_id,
-        signing_key_origin_b58: origin_b58.to_string(),
-    };
-
-    let context_bytes = match cbor_encode(&context) {
-        Ok(b) => b,
-        Err(e) => {
-            return ok_response(
-                room_owner_vk,
-                request_id,
-                Err(format!("Failed to encode subscription record: {e}")),
-            )
-        }
-    };
-
-    if !ctx_set_secret(ctx, &secret_keys::sub_index(&room_b58), &context_bytes) {
-        return ok_response(
-            room_owner_vk,
-            request_id,
-            Err("Failed to persist subscription record (set_secret returned false)".into()),
-        );
-    }
-    // Reverse index: contract_id -> room_owner_vk so notification handling
-    // can correlate quickly. Stored as CBOR for consistency with the rest
-    // of the file (the previous raw [u8;32] encoding was the only place
-    // we stepped outside CBOR; harmonising it keeps decode paths uniform).
-    let reverse_bytes = match cbor_encode(&room_owner_vk) {
-        Ok(b) => b,
-        Err(e) => {
-            return ok_response(
-                room_owner_vk,
-                request_id,
-                Err(format!("Failed to encode reverse index: {e}")),
-            )
-        }
-    };
-    if !ctx_set_secret(ctx, &contract_id_index_key(&contract_id), &reverse_bytes) {
-        return ok_response(
-            room_owner_vk,
-            request_id,
-            Err("Failed to persist contract->room reverse index".into()),
-        );
     }
 
     let response = ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
@@ -261,20 +309,22 @@ pub(crate) fn handle_contract_notification(
     let cid_b58 = bs58::encode(&cid_bytes).into_string();
     logging::info(&format!("ContractNotification for cid={cid_b58}"));
 
-    // Look up which room this contract corresponds to. The reverse index is
-    // CBOR-encoded; defensively handle a corrupt entry rather than panic.
-    let room_owner_vk_bytes: RoomKey = match ctx.get_secret(&contract_id_index_key(&cid_bytes)) {
-        Some(b) => match cbor_decode::<RoomKey>(&b) {
-            Ok(k) => k,
-            Err(e) => {
-                logging::info(&format!(
-                    "Corrupt reverse index for cid={cid_b58}: {e} — ignoring"
-                ));
-                return Ok(vec![]);
-            }
-        },
+    // Deserialize the room state from the notification first: the room it
+    // belongs to is resolved through the owner the state names.
+    let new_state: ChatRoomStateV1 = match ciborium::from_reader(notification.new_state.as_ref()) {
+        Ok(s) => s,
+        Err(e) => {
+            logging::info(&format!("Failed to decode room state in notification: {e}"));
+            return Ok(vec![]);
+        }
+    };
+
+    let room_owner_vk_bytes: RoomKey = match resolve_notified_room(&cid_bytes, &new_state, |k| {
+        ctx.get_secret(k)
+    }) {
+        Some(room) => room,
         None => {
-            logging::info("Notification for unknown contract — ignoring");
+            logging::info("Notification for a contract and owner with no subscription — ignoring");
             return Ok(vec![]);
         }
     };
@@ -294,15 +344,14 @@ pub(crate) fn handle_contract_notification(
             return Ok(vec![]);
         }
     };
-
-    // Deserialize the room state from the notification.
-    let new_state: ChatRoomStateV1 = match ciborium::from_reader(notification.new_state.as_ref()) {
-        Ok(s) => s,
-        Err(e) => {
-            logging::info(&format!("Failed to decode room state in notification: {e}"));
-            return Ok(vec![]);
-        }
-    };
+    // The room's subscription names the contract it subscribed to; a
+    // notification for any other contract is not this subscription's.
+    if sub_ctx.contract_id != cid_bytes {
+        logging::info(
+            "Notification for a contract the room's subscription does not name — ignoring",
+        );
+        return Ok(vec![]);
+    }
 
     // Only act on private rooms — public rooms have no secrets to rotate.
     // For public rooms it's safe to update the member-set cache even though
