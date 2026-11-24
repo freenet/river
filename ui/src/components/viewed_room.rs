@@ -388,15 +388,16 @@ pub(crate) fn JoinComposer(
         }
     });
 
-    let (phase, queued_here, notice) = match JOIN.try_read() {
+    let (phase, queued_here, notice, raised) = match JOIN.try_read() {
         Ok(j) => (
             j.phase_for(&owner_vk),
             j.queued_for(&owner_vk),
             j.notice_for(&owner_vk),
+            j.raised_for(&owner_vk),
         ),
         Err(_) => {
             crate::util::signal_guard::schedule_nudge();
-            (JoinPhase::Idle, Vec::new(), None)
+            (JoinPhase::Idle, Vec::new(), None, false)
         }
     };
     let busy = matches!(phase, JoinPhase::Solving { .. } | JoinPhase::Submitting);
@@ -414,6 +415,11 @@ pub(crate) fn JoinComposer(
 
     let (status_testid, status) = match &phase {
         JoinPhase::Idle => ("viewed-room-join-idle", note.clone()),
+        // The room raised what it asks of newcomers: say so, as an explanation.
+        JoinPhase::Solving { .. } if raised => (
+            "viewed-room-join-progress",
+            "Room security was raised; confirming you're human. You can keep writing.".to_string(),
+        ),
         JoinPhase::Solving { tried, expected } => (
             "viewed-room-join-progress",
             if *expected > 0.0 {

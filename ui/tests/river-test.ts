@@ -26,6 +26,8 @@ type RiverTestHooks = {
   viewableRoomKey(kind: "public" | "private" | "missing" | "member" | "open" | "hard" | "full"): string;
   // Which solver the last join used: "workers" (Web Workers) or "main" (the fallback); "" before any join.
   powSolverMode(): string;
+  // As retargetPolicy, for the room the user is a member of (the current room). False if there is none.
+  raiseMemberRoomPolicy(kind: "open" | "hard" | "full", bits: number, epoch: number): boolean;
   // Nonces the join's solver reports tried so far (0 when not solving).
   powTried(): number;
   // How many times the join's solver followed a changed room policy.

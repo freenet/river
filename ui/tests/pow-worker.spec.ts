@@ -88,6 +88,8 @@ test("a changed room policy retargets the workers and the message still posts on
   // More bits and a new epoch: the search restarts for the new policy.
   expect(await callRiverTest(page, "retargetPolicy", "open", 10, 2)).toBe(true);
   await expect.poll(() => callRiverTest(page, "powRetargets"), { timeout: 10_000 }).toBe(before + 1);
+  // The wait is explained, not shown as an error.
+  await expect(page.getByTestId("viewed-room-join-progress")).toContainText("Room security was raised");
   await callRiverTest(page, "holdSolver", false);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
   expect(await callRiverTest(page, "powSolverMode")).toBe("workers");
@@ -137,4 +139,41 @@ test("a join solves in Web Workers inside the gateway's sandboxed iframe", async
   const inner = (await handle!.contentFrame())!;
   const mode = await inner.evaluate(() => (window as any).__riverTest.powSolverMode());
   expect(mode).toBe("workers");
+});
+
+// The room's moderation raises the open-admission difficulty during an attack,
+// which removes members whose proof is below it. An honest member loses
+// nothing: the message they send next re-admits them at the new difficulty and
+// posts exactly once, and the wait is explained, not reported as an error.
+test("a member removed by a raised difficulty is re-admitted by their next message, which posts once", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  await page.getByTestId("viewed-room-composer").fill("Joined");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
+
+  expect(await callRiverTest(page, "raiseMemberRoomPolicy", "open", 12, 2)).toBe(true);
+  // The room drops the entry whose proof is now too weak (the proof stays held here).
+  expect(await callRiverTest(page, "pruneJoiner", false)).toBe(true);
+  const idle = page.getByTestId("viewed-room-join-idle");
+  await expect(idle).toContainText("Room security was raised");
+  await expect(idle).not.toContainText("quiet");
+
+  await callRiverTest(page, "holdSolver", true);
+  const composer = page.getByTestId("viewed-room-composer");
+  await composer.fill("After the raise");
+  await page.getByTestId("viewed-room-send").click();
+  const progress = page.getByTestId("viewed-room-join-progress");
+  await expect(progress).toContainText("Room security was raised; confirming you're human");
+  await expect(page.getByTestId("viewed-room-join-error")).toHaveCount(0);
+  await expect(page.getByTestId("readmit-pending-message")).toContainText("After the raise");
+  await callRiverTest(page, "holdSolver", false);
+
+  await expect.poll(() => callRiverTest(page, "roomMessageCount", "After the raise"), { timeout: 60_000 }).toBe(1);
+  // Not posted a second time, and nothing is left pending.
+  await page.waitForTimeout(1500);
+  expect(await callRiverTest(page, "roomMessageCount", "After the raise")).toBe(1);
+  await expect(page.getByTestId("readmit-pending-message")).toHaveCount(0);
+  expect(await callRiverTest(page, "powSolverMode")).toBe("workers");
+  expect(panics).toEqual([]);
 });

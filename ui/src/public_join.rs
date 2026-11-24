@@ -357,6 +357,10 @@ pub struct JoinUi {
     /// A refusal that does not stop the join in progress (a message that is
     /// too long, or one sent while posting): shown with the composer.
     pub notice: Option<String>,
+    /// The solve in progress is because the room raised what it asks of
+    /// newcomers (more bits, or a new epoch voiding the proof held): shown as
+    /// an explanation, not an error.
+    pub raised: bool,
 }
 
 impl Default for JoinUi {
@@ -367,6 +371,7 @@ impl Default for JoinUi {
             queued: Vec::new(),
             returned: Vec::new(),
             notice: None,
+            raised: false,
         }
     }
 }
@@ -396,6 +401,11 @@ impl JoinUi {
         } else {
             None
         }
+    }
+
+    /// Whether `owner`'s solve is because the room raised what it asks.
+    pub fn raised_for(&self, owner: &VerifyingKey) -> bool {
+        self.owner.as_ref() == Some(owner) && self.raised
     }
 
     pub fn has_returned_for(&self, owner: &VerifyingKey) -> bool {
@@ -458,6 +468,7 @@ pub struct Machine {
     in_flight: Vec<String>,
     returned: Vec<(VerifyingKey, String)>,
     notice: Option<String>,
+    raised: bool,
     signing_key: Option<SigningKey>,
     entry: Option<AuthorizedProvisionalMember>,
     readmit: bool,
@@ -480,6 +491,7 @@ impl Machine {
             in_flight: Vec::new(),
             returned: Vec::new(),
             notice: None,
+            raised: false,
             signing_key: None,
             entry: None,
             readmit: false,
@@ -496,6 +508,14 @@ impl Machine {
             queued: self.in_flight.iter().chain(&self.queue).cloned().collect(),
             returned: self.returned.clone(),
             notice: self.notice.clone(),
+            raised: self.raised,
+        }
+    }
+
+    /// The room raised what it asks (see [`JoinUi::raised`]); only while solving.
+    pub fn note_raised(&mut self, generation: u64) {
+        if self.is_current(generation) && matches!(self.phase, JoinPhase::Solving { .. }) {
+            self.raised = true;
         }
     }
 
@@ -543,6 +563,7 @@ impl Machine {
         self.signing_key = None;
         self.entry = None;
         self.readmit = false;
+        self.raised = false;
     }
 
     /// Stop whatever is under way for another room. Its messages are handed
@@ -579,6 +600,7 @@ impl Machine {
         self.readmit = plan.readmit;
         self.joined = None;
         self.notice = None;
+        self.raised = false;
         self.phase = JoinPhase::Solving {
             tried: 0,
             expected: 0.0,
@@ -704,6 +726,7 @@ impl Machine {
         all.append(&mut self.queue);
         self.queue = all;
         self.entry = None;
+        self.raised = true;
         self.generation += 1;
         self.phase = JoinPhase::Solving {
             tried: 0,
@@ -898,6 +921,10 @@ pub fn readmit_note(
         Ok(_) if entry.is_some() => {
             "The room removed you for being quiet. Your next message rejoins.".to_string()
         }
+        // The proof held no longer passes: the room raised what it asks.
+        Err(JoinFailure::PolicyChanged) if entry.is_some() => "Room security was raised. \
+            Your next message rejoins after a short proof of work."
+            .to_string(),
         Ok(_) | Err(JoinFailure::PolicyChanged) => "The room removed you for being quiet. \
             Your next message rejoins after a short proof of work."
             .to_string(),
@@ -1115,6 +1142,8 @@ struct RoomWatch {
     readmit: bool,
     req: PowRequirement,
     checked: SystemTime,
+    /// The last change `check` saw asks for more than before.
+    raised: bool,
 }
 
 impl RoomWatch {
@@ -1130,6 +1159,7 @@ impl RoomWatch {
             readmit,
             req,
             checked: crate::util::get_current_system_time(),
+            raised: false,
         }
     }
 
@@ -1146,6 +1176,8 @@ impl RoomWatch {
         };
         match check_admission_status(&state, &self.owner_vk, &self.member_vk, None, now) {
             Ok(new_req) if new_req != self.req => {
+                self.raised = new_req.difficulty_bits > self.req.difficulty_bits
+                    || new_req.epoch != self.req.epoch;
                 self.req = new_req;
                 Ok(true)
             }
@@ -1266,6 +1298,9 @@ async fn solve_in_workers(generation: u64, watch: &mut RoomWatch) -> Option<Solv
             Err(f) => return Some(Solve::Failed(f)),
             Ok(true) => {
                 note_retarget();
+                if watch.raised {
+                    step(|m| m.note_raised(generation));
+                }
                 pool.retarget(&watch.req);
                 if watch.req.epoch != epoch {
                     tried.fill(0);
@@ -1313,6 +1348,9 @@ async fn solve_on_main_thread(generation: u64, watch: &mut RoomWatch) -> Solve {
             Err(f) => return Solve::Failed(f),
             Ok(true) => {
                 note_retarget();
+                if watch.raised {
+                    step(|m| m.note_raised(generation));
+                }
                 solver.retarget(&watch.req, watch.req.difficulty_bits);
             }
             Ok(false) => {}
@@ -1346,7 +1384,9 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
                 let action = step(|m| m.solved(generation, entry));
                 return act(action, owner_vk);
             }
-            Err(JoinFailure::PolicyChanged) => {}
+            Err(JoinFailure::PolicyChanged) => {
+                step(|m| m.note_raised(generation));
+            }
             Err(f) => return fail(generation, f),
         }
     }
@@ -1943,6 +1983,8 @@ mod tests {
             now,
         );
         assert!(note.contains("proof of work"), "{note}");
+        assert!(note.contains("Room security was raised"), "{note}");
+        assert!(!note.contains("quiet"), "{note}");
         assert_eq!(
             build_submission(&data.room_state, &owner_vk, &sk, &old_entry, "x", "Me", now)
                 .unwrap_err(),
@@ -2038,6 +2080,36 @@ mod tests {
 
     fn returned(m: &mut Machine, owner: &VerifyingKey) -> String {
         m.take_returned(owner).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_solve_the_room_forced_is_marked_raised_only_while_it_runs() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "one", limits(), fresh()) else {
+            panic!("the first send starts the solve");
+        };
+        assert!(!m.ui().raised, "an ordinary join is not a raise");
+        m.note_raised(g + 1);
+        assert!(!m.ui().raised, "a stale generation is ignored");
+        m.note_raised(g);
+        assert!(m.ui().raised);
+        assert!(m.ui().raised_for(&a) && !m.ui().raised_for(&vk(2)));
+        m.cancel();
+        assert!(!m.ui().raised, "cancel clears it");
+        let Action::Solve(g) = m.send(a, "two", limits(), fresh()) else {
+            panic!("a new join starts");
+        };
+        assert!(!m.ui().raised, "and starts without it");
+        // A proof the room rejects at submit solves again, with the message
+        // kept once, and says why.
+        assert_eq!(m.solved(g, some_entry()), Action::Submit(g));
+        let Action::Solve(g2) = m.restart_solving(g) else {
+            panic!("solves again");
+        };
+        assert!(m.ui().raised);
+        assert_eq!(m.ui().queued, vec!["two"], "kept once");
+        m.note_raised(g);
+        assert_eq!(m.solved(g2, some_entry()), Action::Submit(g2));
     }
 
     #[test]

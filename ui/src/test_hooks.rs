@@ -261,6 +261,43 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // As `retargetPolicy`, for the room the user is a member of (the current
+    // room): the owner raises the open-admission difficulty, as the room's
+    // moderation does during an attack. False if there is no such room.
+    set_hook(
+        "raiseMemberRoomPolicy",
+        Closure::<dyn FnMut(String, u32, u32) -> bool>::new(
+            move |kind: String, bits: u32, epoch: u32| {
+                let (Some(owner_sk), Some(owner)) = (
+                    crate::example_data::fixture_owner_sk(&kind),
+                    CURRENT_ROOM.read().owner_key,
+                ) else {
+                    return false;
+                };
+                ROOMS.with_mut(|rooms| {
+                    let Some(room) = rooms.map.get_mut(&owner) else {
+                        return false;
+                    };
+                    let mut config = room.room_state.configuration.configuration.clone();
+                    config.configuration_version += 1;
+                    let Some(pow) = config
+                        .public_admission
+                        .as_mut()
+                        .and_then(|p| p.pow.as_mut())
+                    else {
+                        return false;
+                    };
+                    pow.difficulty_bits = bits as u8;
+                    pow.epoch = epoch;
+                    room.room_state.configuration =
+                        AuthorizedConfigurationV1::new(config, &owner_sk);
+                    true
+                })
+            },
+        )
+        .into_js_value(),
+    );
+
     // The owner of that example room signs a new open-admission policy: `bits`
     // in `epoch`. False if the viewed room is not public.
     set_hook(
