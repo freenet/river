@@ -6528,28 +6528,14 @@ impl ApiClient {
         // a throwaway proof-of-work key is cheap to mint, so spending the
         // room's small `max_user_bans` budget on each one would evict the
         // bans that matter.
-        let kind = ban_kind(&room_state, banned_member_id);
-        let delta = match kind {
-            BanKind::User => user_ban_delta(
-                owner_member_id,
-                my_member_id,
-                &signing_key,
-                banned_member_id,
-                crate::signed_time::now(),
-            ),
-            BanKind::Provisional => {
-                if let Some(reason) = provisional_ban_refusal(&room_state) {
-                    return Err(anyhow!(reason));
-                }
-                provisional_ban_delta(
-                    room_owner_key,
-                    my_member_id,
-                    &signing_key,
-                    banned_member_id,
-                    crate::signed_time::now(),
-                )
-            }
-        };
+        let (kind, delta) = plan_ban(
+            &room_state,
+            room_owner_key,
+            my_member_id,
+            &signing_key,
+            banned_member_id,
+            crate::signed_time::now(),
+        )?;
 
         // Serialize the delta
         let delta_bytes = {
@@ -6572,13 +6558,21 @@ impl ApiClient {
 
         let client_request = ClientRequest::ContractOp(update_request);
 
-        let mut web_api = self.web_api.lock().await;
-        web_api
-            .send(client_request)
-            .await
-            .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
+        {
+            let mut web_api = self.web_api.lock().await;
+            web_api
+                .send(client_request)
+                .await
+                .map_err(|e| anyhow!("Failed to send update request: {}", e))?;
 
-        await_update_response(&mut web_api, &contract_key).await?;
+            await_update_response(&mut web_api, &contract_key).await?;
+        }
+
+        // The contract can drop a ban it cannot hold (a full provisional ban
+        // list ranks the new ban lowest) while still answering success, so
+        // read the room back and confirm the ban landed.
+        let after = self.get_room(room_owner_key, false).await?;
+        ban_held_check(&after, kind, banned_member_id)?;
         info!(
             "Ban applied successfully for contract: {}",
             contract_key.id()
@@ -7236,6 +7230,9 @@ fn ban_preflight(
         false,
     );
     let provisional_only = present_target.is_none();
+    if provisional_only {
+        provisional_ambiguity(room_state, member_id_short)?;
+    }
     let banned_member_id = present_target
         .or_else(|| resolve_provisional_target(room_state, member_id_short))
         .ok_or_else(|| {
@@ -7366,6 +7363,79 @@ fn user_ban_delta(
     }
 }
 
+/// The kind of ban `member ban` sends for `target` and the signed delta for it.
+/// Pure, so the routing is tested: a provisional-only target must get a
+/// provisional ban and never a `UserBan`.
+fn plan_ban(
+    room_state: &ChatRoomStateV1,
+    owner_vk: &VerifyingKey,
+    banner: MemberId,
+    signing_key: &SigningKey,
+    target: MemberId,
+    at: std::time::SystemTime,
+) -> Result<(BanKind, ChatRoomStateV1Delta)> {
+    let owner_id: MemberId = owner_vk.into();
+    let kind = ban_kind(room_state, target);
+    let delta = match kind {
+        BanKind::User => user_ban_delta(owner_id, banner, signing_key, target, at),
+        BanKind::Provisional => {
+            if let Some(reason) = provisional_ban_refusal(room_state) {
+                return Err(anyhow!(reason));
+            }
+            provisional_ban_delta(owner_vk, banner, signing_key, target, at)
+        }
+    };
+    Ok((kind, delta))
+}
+
+/// Confirm, on the room state read back after a ban, that the ban landed. A
+/// provisional ban must be on the list and the entry gone; a user ban must have
+/// removed the member.
+fn ban_held_check(room_state: &ChatRoomStateV1, kind: BanKind, target: MemberId) -> Result<()> {
+    match kind {
+        BanKind::Provisional => {
+            let entry_gone = !room_state
+                .provisional
+                .entries
+                .iter()
+                .any(|e| e.member_id() == target);
+            let ban_held = room_state
+                .provisional
+                .bans
+                .iter()
+                .any(|b| b.ban.target == target);
+            if entry_gone && ban_held {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "ban was not retained by the room: provisional ban list full (or the \
+                     ban was otherwise dropped); '{}' is {}.",
+                    target,
+                    if entry_gone {
+                        "no longer listed but not banned"
+                    } else {
+                        "still a provisional member"
+                    }
+                ))
+            }
+        }
+        BanKind::User => {
+            if room_state
+                .members
+                .members_by_member_id()
+                .contains_key(&target)
+            {
+                Err(anyhow!(
+                    "ban was not retained by the room: '{}' is still a member.",
+                    target
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Which list bans `target`: a present member gets a `UserBan`; an id that is
 /// held only as a provisional entry gets a provisional ban.
 fn ban_kind(room_state: &ChatRoomStateV1, target: MemberId) -> BanKind {
@@ -7445,6 +7515,7 @@ fn sponsor_preflight(
             "Only the room owner or a present member can sponsor a provisional member."
         ));
     }
+    provisional_ambiguity(room_state, input)?;
     let target = resolve_provisional_target(room_state, input)
         .filter(|id| !members.contains_key(id))
         .ok_or_else(|| {
@@ -7483,6 +7554,22 @@ fn sponsor_preflight(
             ))
         }
     };
+    // A full key names one exact key: the entry must carry it, not just a key
+    // that hashes to the same id.
+    if let Some(typed) = bs58::decode(input)
+        .into_vec()
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .and_then(|b| VerifyingKey::from_bytes(&b).ok())
+    {
+        if typed != target_vk {
+            return Err(anyhow!(
+                "The key given does not match the provisional entry's key for '{}'; not \
+                 sponsoring.",
+                target
+            ));
+        }
+    }
     let held = room_state.members.members.len();
     let max = room_state.configuration.configuration.max_members;
     if held * 10 >= max * 9 {
@@ -7522,17 +7609,53 @@ fn sponsor_delta(
 /// entries, by full verifying key or by id prefix / first 8 characters, the
 /// same matching as [`resolve_deputy_target`].
 fn resolve_provisional_target(room_state: &ChatRoomStateV1, input: &str) -> Option<MemberId> {
-    let ids = || room_state.provisional.entries.iter().map(|e| e.member_id());
+    provisional_matches(room_state, input).into_iter().next()
+}
+
+/// Every distinct provisional id `input` names: one for a full key, any number
+/// for a short id.
+fn provisional_matches(room_state: &ChatRoomStateV1, input: &str) -> Vec<MemberId> {
+    let mut out: Vec<MemberId> = Vec::new();
+    let mut push = |id: MemberId| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    let ids = room_state.provisional.entries.iter().map(|e| e.member_id());
     if let Some(target) = crate::deputies::member_id_from_key_input(input) {
-        return ids().any(|id| id == target).then_some(target);
+        for id in ids {
+            if id == target {
+                push(id);
+            }
+        }
+        return out;
     }
     if input.is_empty() {
-        return None;
+        return out;
     }
-    ids().find(|id| {
+    for id in ids {
         let s = id.to_string();
-        s.starts_with(input) || s[..8.min(s.len())].eq_ignore_ascii_case(input)
-    })
+        if s.starts_with(input) || s[..8.min(s.len())].eq_ignore_ascii_case(input) {
+            push(id);
+        }
+    }
+    out
+}
+
+/// Refuse a short id that names more than one provisional member, listing them.
+fn provisional_ambiguity(room_state: &ChatRoomStateV1, input: &str) -> Result<()> {
+    let matches = provisional_matches(room_state, input);
+    if matches.len() > 1 {
+        let list: Vec<String> = matches.iter().map(|m| m.to_string()).collect();
+        return Err(anyhow!(
+            "'{}' matches {} provisional members ({}); use the full verifying key from \
+             `member list`.",
+            input,
+            matches.len(),
+            list.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `me` is the room owner or a present member the owner has made a
@@ -15506,6 +15629,116 @@ mod provisional_ban_tests {
             .iter()
             .any(|m| m.member.id() == id(&f.a)));
         assert!(has_msg_by(&f, &f.a));
+    }
+
+    #[test]
+    fn plan_ban_routes_each_target_to_its_own_list() {
+        let f = fixture();
+        let (kind, d) = plan_ban(
+            &f.state,
+            &f.params.owner,
+            id(&f.owner),
+            &f.owner,
+            id(&f.a),
+            at(9),
+        )
+        .unwrap();
+        assert_eq!(kind, BanKind::Provisional);
+        assert!(
+            d.bans.is_none(),
+            "a provisional target never gets a UserBan"
+        );
+        assert_eq!(d.provisional.expect("provisional delta").bans.len(), 1);
+        let (kind, d) = plan_ban(
+            &f.state,
+            &f.params.owner,
+            id(&f.owner),
+            &f.owner,
+            id(&f.m),
+            at(9),
+        )
+        .unwrap();
+        assert_eq!(kind, BanKind::User);
+        assert!(d.provisional.is_none());
+        assert_eq!(d.bans.expect("user ban").len(), 1);
+    }
+
+    #[test]
+    fn ban_held_check_passes_when_the_ban_lands_and_fails_when_a_full_list_drops_it() {
+        // Lands.
+        let mut f = fixture();
+        let d = provisional_ban_delta(&f.params.owner, id(&f.owner), &f.owner, id(&f.a), at(9));
+        apply(&mut f, d);
+        assert!(ban_held_check(&f.state, BanKind::Provisional, id(&f.a)).is_ok());
+        // Not applied at all: the entry is still there.
+        let f2 = fixture();
+        let err = ban_held_check(&f2.state, BanKind::Provisional, id(&f2.a)).unwrap_err();
+        assert!(err.to_string().contains("not retained"), "{err}");
+        // A deputy's ban into a list full of owner bans is dropped.
+        let mut f3 = fixture();
+        for n in 100u8..105 {
+            let d = provisional_ban_delta(
+                &f3.params.owner,
+                id(&f3.owner),
+                &f3.owner,
+                id(&sk(n)),
+                at(5),
+            );
+            apply(&mut f3, d);
+        }
+        assert_eq!(f3.state.provisional.bans.len(), 5);
+        let d = provisional_ban_delta(&f3.params.owner, id(&f3.d), &f3.d, id(&f3.a), at(9));
+        apply(&mut f3, d);
+        let err = ban_held_check(&f3.state, BanKind::Provisional, id(&f3.a)).unwrap_err();
+        assert!(
+            err.to_string().contains("provisional ban list full"),
+            "{err}"
+        );
+        // User bans: removed member passes, a member still present fails.
+        let mut f4 = fixture();
+        assert!(ban_held_check(&f4.state, BanKind::User, id(&f4.m)).is_err());
+        let d = user_ban_delta(
+            id(&f4.owner),
+            id(&f4.owner),
+            &f4.owner.clone(),
+            id(&f4.m),
+            at(9),
+        );
+        apply(&mut f4, d);
+        assert!(ban_held_check(&f4.state, BanKind::User, id(&f4.m)).is_ok());
+    }
+
+    #[test]
+    fn an_ambiguous_short_id_is_refused_for_sponsor_and_ban_with_the_candidates() {
+        let mut f = fixture();
+        let first = |k: &SigningKey| short(k).chars().next().unwrap();
+        let b = (11u8..255)
+            .map(sk)
+            .find(|k| first(k) == first(&f.a) && id(k) != id(&f.a))
+            .expect("a second key sharing a first character");
+        let join = join_delta(&f, &b);
+        apply(&mut f, join);
+        assert_eq!(f.state.provisional.entries.len(), 2);
+        let input = first(&f.a).to_string();
+        let owner_id = id(&f.owner);
+        let err = sponsor_preflight(&f.state, owner_id, owner_id, &input)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&short(&f.a)) && err.contains(&short(&b)),
+            "{err}"
+        );
+        let err = ban_preflight(&f.state, owner_id, owner_id, &input, BanSafety::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&short(&f.a)) && err.contains(&short(&b)),
+            "{err}"
+        );
+        // The full key still names one.
+        let full = bs58::encode(f.a.verifying_key().as_bytes()).into_string();
+        assert!(sponsor_preflight(&f.state, owner_id, owner_id, &full).is_ok());
+        assert!(ban_preflight(&f.state, owner_id, owner_id, &full, BanSafety::default()).is_ok());
     }
 
     fn safety(exact: bool, desc: bool, dep: bool) -> BanSafety {

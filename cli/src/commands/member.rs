@@ -276,9 +276,14 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
             {
                 Ok(kind) => match format {
                     OutputFormat::Human => {
+                        let list = match kind {
+                            crate::api::BanKind::User => "the room's user ban list",
+                            crate::api::BanKind::Provisional => "the room's provisional ban list",
+                        };
                         println!(
                             "{}",
-                            format!("Member '{}' has been banned.", member_id).green()
+                            format!("Member '{}' has been banned (on {}).", member_id, list)
+                                .green()
                         );
                     }
                     OutputFormat::Json => {
@@ -288,6 +293,7 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                                 "success": true,
                                 "banned_member_id": member_id,
                                 "ban_kind": kind.as_str(),
+                                "ban_held": true,
                             })
                         );
                     }
