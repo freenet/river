@@ -1185,3 +1185,50 @@ fn a_change_of_the_record_makes_the_tick_look_again() {
             .all(|(r, _)| *r != gone)
     );
 }
+
+/// The storage fails for a while with the record file intact (moved out of the way and back):
+/// a take-back owed meanwhile, then the same token deleted again. The token is already on disk,
+/// so the new deletion adds nothing; it must still own the token, so that its own refusal takes
+/// it back.
+#[test]
+fn a_token_taken_over_from_an_owed_take_back_is_taken_back_with_its_new_deletion() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let token = msgs[0].purge_token();
+    let dir = dir("taken-over");
+    let parked = dir.with_extension("parked");
+    let _ = std::fs::remove_dir_all(&parked);
+    let mut device = device(&dir, &msgs);
+    let owner = owner_of(&device);
+    device.delete(&[token]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent");
+    // The directory is out of the way: the refusal cannot be taken back.
+    std::fs::rename(&dir, &parked).unwrap();
+    std::fs::write(&dir, b"x").unwrap();
+    let id = device.rooms.list[0].contract_id();
+    device.rooms.update_answered(&id, Err("refused".into()));
+    assert!(device.rooms.outbox.retry_takebacks(), "owed");
+    // And back, with the token still recorded on disk.
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::rename(&parked, &dir).unwrap();
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_some());
+    device.delete(&[token]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent again");
+    device
+        .rooms
+        .update_answered(&id, Err("refused again".into()));
+    assert!(
+        PurgeRecord::open(&dir).for_room(&owner).is_none(),
+        "the deletion that took the token over took it back"
+    );
+}
