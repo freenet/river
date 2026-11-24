@@ -935,6 +935,7 @@ fn the_rank_is_written_before_the_slot_and_taken_out_when_the_slot_is_lost() {
     let mut c = Carry::new(preds(&[39]), Vec::new(), true);
     walk_reads(&mut c, &stores, &[]);
     let mut lost = None;
+    let mut removed = 0;
     let mut checks = 0;
     let mut skipped = None;
     while let Some(w) = c.write() {
@@ -971,10 +972,12 @@ fn the_rank_is_written_before_the_slot_and_taken_out_when_the_slot_is_lost() {
             Write::RemoveRank(room, dk) => {
                 assert_eq!(Some(room_storage_key(&room)), lost);
                 assert_eq!(dk, [39; 32]);
+                removed += 1;
                 c.written(true);
             }
         }
     }
+    assert_eq!(removed, 1, "the rank of the room lost is taken out");
     assert_eq!(checks, 3);
     assert_eq!(c.carried, 1);
 }
