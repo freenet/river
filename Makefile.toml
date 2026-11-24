@@ -634,10 +634,13 @@ if ! grep -rqF "$TEST_ID" "$PUBLIC_DIR/index.html"; then
     echo "       Expected $TEST_ID in $PUBLIC_DIR/index.html (stale build?)."
     exit 1
 fi
-if grep -rqF "$PROD_ID" "$PUBLIC_DIR"; then
+# The wasm is excluded: since #996 it embeds the production id on purpose
+# (RIVER_WEB_APP in ui/src/public_room.rs, the id a copied public link names),
+# so it always contains it. The base_path retarget is visible in the HTML/JS.
+if grep -rqF --exclude='*.wasm' "$PROD_ID" "$PUBLIC_DIR"; then
     echo "ERROR: built test webapp still references the production contract ID."
     echo "       The base_path retarget did not take effect; refusing to publish."
-    grep -rlF "$PROD_ID" "$PUBLIC_DIR" || true
+    grep -rlF --exclude='*.wasm' "$PROD_ID" "$PUBLIC_DIR" || true
     exit 1
 fi
 
