@@ -136,6 +136,11 @@ struct BanInfo {
     banned_user_id: String,
     banned_by_id: String,
     banned_at_secs: u64,
+    /// True for a ban held in the provisional (open-admission) ban list rather
+    /// than the user ban list. Omitted for ordinary bans, so their rows are
+    /// unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    provisional: bool,
     /// See [`BanEnforcement`].
     ///
     /// Do NOT reduce this to a bare `is_ban_authorized`. That predicate returns
@@ -227,7 +232,56 @@ fn collect_ban_infos(room_state: &ChatRoomStateV1, owner_vk: &VerifyingKey) -> V
                 banned_user_id: ban.ban.banned_user.to_string(),
                 banned_by_id: ban.banned_by.to_string(),
                 banned_at_secs,
+                provisional: false,
                 enforcement: classify_ban(ban, &resolution, &known, owner_id, owner_vk),
+            }
+        })
+        .chain(collect_provisional_ban_infos(room_state, owner_vk))
+        .collect()
+}
+
+/// The provisional ban list (`room_state.provisional.bans`), projected like a
+/// user ban. The contract honours a provisional ban only from the owner or a
+/// present deputy of the owner, with a signature that verifies under the
+/// issuer's key, so that is what `Enforcing` means here; anything else is
+/// `Inert`. (A user ban on a provisional id is already listed above, from
+/// `room_state.bans`.)
+fn collect_provisional_ban_infos(
+    room_state: &ChatRoomStateV1,
+    owner_vk: &VerifyingKey,
+) -> Vec<BanInfo> {
+    let owner_id = MemberId::from(owner_vk);
+    let members_by_id = room_state.members.members_by_member_id();
+    let deputies = room_state.member_info.deputies_of(owner_id);
+    room_state
+        .provisional
+        .bans
+        .iter()
+        .map(|ban| {
+            let issuer = ban.ban.banned_by;
+            let issuer_vk = if issuer == owner_id {
+                Some(*owner_vk)
+            } else if deputies.contains(&issuer) {
+                members_by_id.get(&issuer).map(|m| m.member.member_vk)
+            } else {
+                None
+            };
+            let enforcing = issuer_vk.is_some_and(|vk| ban.verify_signature(owner_vk, &vk).is_ok());
+            BanInfo {
+                banned_user_id: ban.ban.target.to_string(),
+                banned_by_id: issuer.to_string(),
+                banned_at_secs: ban
+                    .ban
+                    .banned_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                provisional: true,
+                enforcement: if enforcing {
+                    BanEnforcement::Enforcing
+                } else {
+                    BanEnforcement::Inert
+                },
             }
         })
         .collect()
@@ -260,10 +314,15 @@ fn ban_list_lines(bans: &[BanInfo]) -> Vec<String> {
 
     for ban in bans {
         lines.push(format!(
-            "  {} banned by {} at {}{}",
+            "  {} banned by {} at {}{}{}",
             ban.banned_user_id,
             ban.banned_by_id,
             ban.banned_at_secs,
+            if ban.provisional {
+                "  [provisional]"
+            } else {
+                ""
+            },
             ban.enforcement.marker()
         ));
     }
@@ -1361,6 +1420,7 @@ mod tests {
             banned_user_id: user.to_string(),
             banned_by_id: "BANNER".to_string(),
             banned_at_secs: 100,
+            provisional: false,
             enforcement: state,
         }
     }
@@ -1518,6 +1578,84 @@ mod tests {
             "the Bans arm must not construct `BanInfo` itself — that bypasses \
              `classify_ban` and can reintroduce a hardcoded verdict."
         );
+    }
+
+    /// A provisional-list ban by `banner` against `target`, signed by `signer`.
+    fn prov_ban(
+        owner: &SigningKey,
+        banner: &SigningKey,
+        signer: &SigningKey,
+        target: &SigningKey,
+    ) -> river_core::room_state::provisional::AuthorizedProvisionalBan {
+        use river_core::room_state::provisional::{AuthorizedProvisionalBan, ProvisionalBan};
+        AuthorizedProvisionalBan::new(
+            &owner.verifying_key(),
+            ProvisionalBan {
+                banned_by: id(banner),
+                banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(7),
+                target: id(target),
+            },
+            signer,
+        )
+    }
+
+    #[test]
+    fn debug_bans_lists_provisional_list_bans_and_judges_their_issuer() {
+        let owner = key(1);
+        let deputy = key(2);
+        let plain = key(3);
+        let victim = key(9);
+        let mut state = ChatRoomStateV1::default();
+        push_member(&mut state, &owner, &owner, &deputy);
+        push_member(&mut state, &owner, &owner, &plain);
+        push_info(&mut state, &deputy, 1, vec![]);
+        // The owner's record grants `deputy`.
+        let mut oi = MemberInfo::new_public(id(&owner), 1, "owner".to_string());
+        oi.deputies = vec![id(&deputy)];
+        state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new(oi, &owner));
+        state.provisional.bans = vec![
+            prov_ban(&owner, &owner, &owner, &victim),
+            prov_ban(&owner, &deputy, &deputy, &victim),
+            // A plain member's provisional ban is dropped by the contract.
+            prov_ban(&owner, &plain, &plain, &victim),
+            // A deputy-attributed ban signed by someone else is a forgery.
+            prov_ban(&owner, &deputy, &plain, &victim),
+        ];
+        let infos = collect_ban_infos(&state, &owner.verifying_key());
+        assert_eq!(infos.len(), 4);
+        assert!(infos.iter().all(|b| b.provisional));
+        assert!(infos
+            .iter()
+            .all(|b| b.banned_user_id == id(&victim).to_string()));
+        let verdicts: Vec<_> = infos.iter().map(|b| b.enforcement).collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                BanEnforcement::Enforcing,
+                BanEnforcement::Enforcing,
+                BanEnforcement::Inert,
+                BanEnforcement::Inert,
+            ]
+        );
+        // Human output: the same `  ID banned by ...` row shape the autoban
+        // script's already-banned grep reads, with a marker.
+        let lines = ban_list_lines(&infos);
+        assert!(lines[2].starts_with(&format!("  {} banned by ", id(&victim))));
+        assert!(lines[2].contains("[provisional]"));
+        assert!(lines[4].contains("[NOT ENFORCING]"));
+        // JSON: additive `provisional` key, present only on these rows.
+        let json = serde_json::to_value(&infos).unwrap();
+        assert_eq!(json[0]["provisional"], true);
+    }
+
+    #[test]
+    fn ordinary_ban_rows_serialize_without_a_provisional_key() {
+        let json = serde_json::to_value(info("X", BanEnforcement::Enforcing)).unwrap();
+        assert!(json.get("provisional").is_none(), "{json}");
+        assert_eq!(json["banned_user_id"], "X");
     }
 
     #[test]

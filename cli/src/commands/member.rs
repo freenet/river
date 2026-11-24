@@ -151,47 +151,29 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                 })
                 .collect();
 
+            // Open-admission (provisional) members: appended after the invited
+            // members, so everything riverctl printed before is unchanged.
+            // Same human row shape as a member (`"nick" (ID)` then `key:`), plus
+            // a trailing `  provisional` marker the autoban parser ignores;
+            // counted in "N member(s) found" so that figure matches the rows.
+            let provisional: Vec<_> = deputies
+                .provisional_members()
+                .into_iter()
+                .map(|id| {
+                    let party = deputies.party(id);
+                    let verifying_key = deputies
+                        .verifying_key(id)
+                        .map(|vk| bs58::encode(vk.as_bytes()).into_string());
+                    (party, verifying_key)
+                })
+                .collect();
+
             match format {
                 OutputFormat::Human => {
-                    if members.is_empty() {
-                        println!("No members found in room.");
-                    } else {
-                        println!("\n{} member(s) found:\n", members.len());
-                        for (party, _own_deputies, granted_by, verifying_key) in &members {
-                            // Escaped and quoted: an unescaped nickname can
-                            // forge a row that reads as a real deputy grant,
-                            // and `colored` drops the colour that would
-                            // distinguish it as soon as output is piped.
-                            let nickname = party
-                                .nickname
-                                .as_deref()
-                                .map(display_nickname)
-                                .unwrap_or_else(|| "(unknown)".to_string());
-                            print!("  {} ({})", nickname.green(), party.member_id);
-                            if !granted_by.is_empty() {
-                                let names: Vec<String> = granted_by
-                                    .iter()
-                                    .map(|id| party_label(&deputies.party(*id)))
-                                    .collect();
-                                print!("{}", format!("  deputy of: {}", names.join(", ")).yellow());
-                            }
-                            println!();
-                            // Shown for every member by default (deliberately
-                            // not behind a flag): the point is to make the
-                            // collision-proof identity visible so people stop
-                            // trusting the 40-bit short id. Printed plain (no
-                            // colour) so it copies cleanly into an allow-list.
-                            // On verified state the key is always present (see
-                            // the map closure above); this guard is defensive.
-                            if let Some(vk) = verifying_key {
-                                println!("      key: {}", vk);
-                            }
-                        }
-                        println!();
-                    }
+                    print!("{}", member_list_human(&deputies, &members, &provisional));
                 }
                 OutputFormat::Json => {
-                    let json_members: Vec<_> = members
+                    let mut json_members: Vec<_> = members
                         .into_iter()
                         .map(|(party, own_deputies, granted_by, verifying_key)| {
                             member_list_json(
@@ -202,6 +184,9 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                             )
                         })
                         .collect();
+                    json_members.extend(provisional.iter().map(|(party, verifying_key)| {
+                        provisional_member_json(party, verifying_key.as_deref())
+                    }));
                     println!("{}", serde_json::to_string_pretty(&json_members)?);
                 }
             }
@@ -534,6 +519,84 @@ fn member_list_json(
     })
 }
 
+/// The human `member list` text. Pure (returns the text) so the exact shape,
+/// which the moderation bot and the autoban script parse, is pinned by tests.
+#[allow(clippy::type_complexity)]
+fn member_list_human(
+    deputies: &RoomDeputies<'_>,
+    members: &[(DeputyParty, Vec<MemberId>, Vec<MemberId>, Option<String>)],
+    provisional: &[(DeputyParty, Option<String>)],
+) -> String {
+    use std::fmt::Write;
+    let total = members.len() + provisional.len();
+    let mut out = String::new();
+    if total == 0 {
+        out.push_str("No members found in room.\n");
+        return out;
+    }
+    let _ = write!(out, "\n{} member(s) found:\n\n", total);
+    for (party, _own_deputies, granted_by, verifying_key) in members {
+        // Escaped and quoted: an unescaped nickname can forge a row that reads
+        // as a real deputy grant, and `colored` drops the colour that would
+        // distinguish it as soon as output is piped.
+        let nickname = party
+            .nickname
+            .as_deref()
+            .map(display_nickname)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let _ = write!(out, "  {} ({})", nickname.green(), party.member_id);
+        if !granted_by.is_empty() {
+            let names: Vec<String> = granted_by
+                .iter()
+                .map(|id| party_label(&deputies.party(*id)))
+                .collect();
+            let _ = write!(
+                out,
+                "{}",
+                format!("  deputy of: {}", names.join(", ")).yellow()
+            );
+        }
+        out.push('\n');
+        // Shown for every member by default (deliberately not behind a flag):
+        // the point is to make the collision-proof identity visible so people
+        // stop trusting the 40-bit short id. Printed plain (no colour) so it
+        // copies cleanly into an allow-list. On verified state the key is
+        // always present; this guard is defensive.
+        if let Some(vk) = verifying_key {
+            let _ = writeln!(out, "      key: {}", vk);
+        }
+    }
+    for (party, verifying_key) in provisional {
+        let nickname = party
+            .nickname
+            .as_deref()
+            .map(display_nickname)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let _ = writeln!(
+            out,
+            "  {} ({}){}",
+            nickname.green(),
+            party.member_id,
+            "  provisional".yellow()
+        );
+        if let Some(vk) = verifying_key {
+            let _ = writeln!(out, "      key: {}", vk);
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// One provisional (open-admission) row of `member list --format json`: the
+/// same keys as a member row, so a consumer parsing members parses these, plus
+/// `"provisional": true`. A provisional member has no deputy relationships.
+/// Member rows do not carry the `provisional` key at all.
+fn provisional_member_json(party: &DeputyParty, verifying_key: Option<&str>) -> serde_json::Value {
+    let mut row = member_list_json(party, &[], &[], verifying_key);
+    row["provisional"] = serde_json::Value::Bool(true);
+    row
+}
+
 /// `"1 grant"` / `"3 grants"`, so counted output reads as English rather than
 /// as the `N thing(s)` form.
 fn count(n: usize, noun: &str) -> String {
@@ -739,6 +802,158 @@ mod tests {
         // No key in state for this member => explicit null (a consumer must be
         // able to tell "no key known" from an empty string it might compare).
         assert!(json["verifying_key"].is_null());
+    }
+
+    /// A room with the owner, one invited member "Alice" and one provisional
+    /// (proof-of-work admitted) member "Spammer".
+    fn room_with_provisional() -> (
+        ed25519_dalek::SigningKey,
+        river_core::room_state::ChatRoomStateV1,
+        ed25519_dalek::SigningKey,
+        ed25519_dalek::SigningKey,
+    ) {
+        use ed25519_dalek::SigningKey;
+        use river_core::room_state::member::{AuthorizedMember, Member};
+        use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+        use river_core::room_state::provisional::{
+            AdmissionEvidence, AuthorizedProvisionalMember, ProvisionalMember,
+        };
+        let owner = SigningKey::from_bytes(&[1u8; 32]);
+        let alice = SigningKey::from_bytes(&[2u8; 32]);
+        let spam = SigningKey::from_bytes(&[3u8; 32]);
+        let oid: MemberId = owner.verifying_key().into();
+        let mut state = river_core::room_state::ChatRoomStateV1::default();
+        state.members.members.push(AuthorizedMember::new(
+            Member {
+                owner_member_id: oid,
+                invited_by: oid,
+                member_vk: alice.verifying_key(),
+            },
+            &owner,
+        ));
+        for (k, name) in [(&alice, "Alice"), (&spam, "Spammer")] {
+            state
+                .member_info
+                .member_info
+                .push(AuthorizedMemberInfo::new_with_member_key(
+                    MemberInfo::new_public(k.verifying_key().into(), 1, name.to_string()),
+                    k,
+                ));
+        }
+        state
+            .provisional
+            .entries
+            .push(AuthorizedProvisionalMember::new(
+                &owner.verifying_key(),
+                ProvisionalMember {
+                    member_vk: spam.verifying_key(),
+                    evidence: AdmissionEvidence::Pow { nonce: 0 },
+                },
+                &spam,
+            ));
+        (owner, state, alice, spam)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn rows_for(
+        deputies: &RoomDeputies<'_>,
+    ) -> (
+        Vec<(DeputyParty, Vec<MemberId>, Vec<MemberId>, Option<String>)>,
+        Vec<(DeputyParty, Option<String>)>,
+    ) {
+        let key = |id: MemberId| {
+            deputies
+                .verifying_key(id)
+                .map(|vk| bs58::encode(vk.as_bytes()).into_string())
+        };
+        let members = deputies
+            .members_with_info()
+            .map(|id| (deputies.party(id), vec![], vec![], key(id)))
+            .collect();
+        let provisional = deputies
+            .provisional_members()
+            .into_iter()
+            .map(|id| (deputies.party(id), key(id)))
+            .collect();
+        (members, provisional)
+    }
+
+    #[test]
+    fn human_member_list_adds_provisional_rows_the_autoban_parser_reads() {
+        colored::control::set_override(false);
+        let (owner, state, _alice, spam) = room_with_provisional();
+        let secrets = std::collections::HashMap::new();
+        let deputies = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let (members, provisional) = rows_for(&deputies);
+        let text = member_list_human(&deputies, &members, &provisional);
+        let spam_id: MemberId = spam.verifying_key().into();
+        let spam_key = bs58::encode(spam.verifying_key().as_bytes()).into_string();
+
+        // The count covers the provisional row, so "N member(s) found" equals
+        // the number of rows the autoban parser extracts.
+        assert!(text.contains("\n2 member(s) found:\n"), "{text}");
+        // Same `  "nick" (ID)` shape as a member row, then the marker.
+        assert!(
+            text.contains(&format!("  \"Spammer\" ({spam_id})  provisional\n")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("      key: {spam_key}\n")), "{text}");
+        let row_lines = text.lines().filter(|l| l.starts_with("  \"")).count();
+        assert_eq!(row_lines, 2, "{text}");
+    }
+
+    #[test]
+    fn human_member_list_is_unchanged_when_there_are_no_provisional_members() {
+        colored::control::set_override(false);
+        let (owner, mut state, alice, _spam) = room_with_provisional();
+        state.provisional.entries.clear();
+        let secrets = std::collections::HashMap::new();
+        let deputies = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let (members, provisional) = rows_for(&deputies);
+        assert!(provisional.is_empty());
+        let text = member_list_human(&deputies, &members, &provisional);
+        let alice_id: MemberId = alice.verifying_key().into();
+        let alice_key = bs58::encode(alice.verifying_key().as_bytes()).into_string();
+        // Exactly the pre-change rendering: the count is the member count, and
+        // no marker appears.
+        assert!(text.starts_with("\n1 member(s) found:\n\n"), "{text}");
+        assert!(!text.contains("provisional"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "  \"Alice\" ({alice_id})\n      key: {alice_key}\n"
+            )),
+            "{text}"
+        );
+        assert!(text.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn json_member_list_marks_provisional_rows_and_leaves_member_rows_alone() {
+        let (owner, state, alice, spam) = room_with_provisional();
+        let secrets = std::collections::HashMap::new();
+        let deputies = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        let (members, provisional) = rows_for(&deputies);
+        let (party, key) = &provisional[0];
+        let row = provisional_member_json(party, key.as_deref());
+        let spam_id: MemberId = spam.verifying_key().into();
+        assert_eq!(row["member_id"], spam_id.to_string());
+        assert_eq!(row["nickname"], "Spammer");
+        assert_eq!(row["provisional"], true);
+        assert_eq!(
+            row["verifying_key"],
+            bs58::encode(spam.verifying_key().as_bytes()).into_string()
+        );
+        assert!(row["deputies"].as_array().unwrap().is_empty());
+        assert!(row["deputized_by"].as_array().unwrap().is_empty());
+        // Member rows do not carry the key at all.
+        let (mparty, _, _, mkey) = members
+            .iter()
+            .find(|(p, ..)| p.nickname.as_deref() == Some("Alice"))
+            .unwrap();
+        let mrow = member_list_json(mparty, &[], &[], mkey.as_deref());
+        assert!(mrow.get("provisional").is_none());
+        let alice_id: MemberId = alice.verifying_key().into();
+        assert_eq!(mrow["member_id"], alice_id.to_string());
     }
 
     #[test]

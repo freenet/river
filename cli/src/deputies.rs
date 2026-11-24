@@ -205,6 +205,28 @@ pub(crate) fn verifying_key_of(
         .rev()
         .find(|m| m.member.id() == id)
         .map(|m| m.member.member_vk)
+        .or_else(|| provisional_key_of(state, id))
+}
+
+/// The key a provisional (proof-of-work admitted) entry holds for `id`, or
+/// `None` when no entry holds it or the held entries disagree on the key
+/// (the same rule as `ProvisionalV1::key_map`). Checked only after `members`,
+/// so a real member's key always wins.
+pub(crate) fn provisional_key_of(state: &ChatRoomStateV1, id: MemberId) -> Option<VerifyingKey> {
+    let mut found: Option<VerifyingKey> = None;
+    for e in state
+        .provisional
+        .entries
+        .iter()
+        .filter(|e| e.member_id() == id)
+    {
+        match found {
+            None => found = Some(e.provisional.member_vk),
+            Some(vk) if vk == e.provisional.member_vk => {}
+            Some(_) => return None,
+        }
+    }
+    found
 }
 
 impl<'a> RoomDeputies<'a> {
@@ -387,6 +409,23 @@ impl<'a> RoomDeputies<'a> {
             .keys()
             .copied()
             .filter(|id| self.in_room(*id))
+    }
+
+    /// Provisional (proof-of-work admitted) members, deduplicated and ordered,
+    /// leaving out the owner and anyone who is also a regular member. These are
+    /// not in `members_with_info`, which lists invited members only.
+    pub fn provisional_members(&self) -> Vec<MemberId> {
+        let mut ids: Vec<MemberId> = self
+            .state
+            .provisional
+            .entries
+            .iter()
+            .map(|e| e.member_id())
+            .filter(|id| !self.in_room(*id))
+            .collect();
+        ids.sort_by_key(|id| id.to_string());
+        ids.dedup();
+        ids
     }
 
     /// Resolve one member for display.
@@ -944,6 +983,43 @@ mod tests {
         let grant = d.grant(id(&owner), id(&moderator));
         assert!(!grant.active && !grant.deputy.retains_ban_authority);
         assert_eq!(grant.members_deputy_can_ban, 0);
+    }
+
+    /// A provisional (proof-of-work admitted) entry for `k`, as the room holds it.
+    fn push_provisional(state: &mut ChatRoomStateV1, owner: &SigningKey, k: &SigningKey) {
+        use river_core::room_state::provisional::{
+            AdmissionEvidence, AuthorizedProvisionalMember, ProvisionalMember,
+        };
+        state
+            .provisional
+            .entries
+            .push(AuthorizedProvisionalMember::new(
+                &owner.verifying_key(),
+                ProvisionalMember {
+                    member_vk: k.verifying_key(),
+                    evidence: AdmissionEvidence::Pow { nonce: 0 },
+                },
+                k,
+            ));
+    }
+
+    #[test]
+    fn verifying_key_and_provisional_members_cover_open_admission_entries() {
+        let owner = key(1);
+        let alice = key(2);
+        let spam = key(8);
+        let mut state = room(&owner, &[&alice]);
+        push_provisional(&mut state, &owner, &spam);
+        // An entry whose key also belongs to a regular member is not listed twice.
+        push_provisional(&mut state, &owner, &alice);
+        let secrets = no_secrets();
+        let d = RoomDeputies::new(&state, &owner.verifying_key(), &secrets);
+        // Resolved by the provisional entry (this was null before #1004).
+        assert_eq!(d.verifying_key(id(&spam)), Some(spam.verifying_key()));
+        assert_eq!(d.verifying_key(id(&alice)), Some(alice.verifying_key()));
+        assert_eq!(d.provisional_members(), vec![id(&spam)]);
+        // Never read as an invited member.
+        assert!(!d.members_with_info().any(|m| m == id(&spam)));
     }
 
     #[test]
