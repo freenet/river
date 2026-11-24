@@ -2974,3 +2974,142 @@ fn a_delegate_error_is_the_carrys_only_when_nothing_else_could_have_caused_it() 
     assert!(!w.busy());
     assert!(w.views().is_empty());
 }
+
+/// The walk over earlier delegates stops at [`WALK_BUDGET`], says so with Try again, and Try
+/// again starts a new budget.
+#[test]
+fn the_walk_stops_at_its_budget_and_try_again_starts_a_new_one() {
+    let mut w = Work::default();
+    let pred = carry_task(&mut w);
+    let t0 = Instant::now();
+    assert!(w.next_request(false, t0).is_some());
+    assert!(w.on_predecessor(
+        &pred.key,
+        &[ChatDelegateResponseMsg::ListResponse { keys: Vec::new() }]
+    ));
+    assert!(w.next_request(false, t0 + WALK_BUDGET).is_none());
+    let view = w.views().pop().unwrap();
+    let WorkState::Failed { why, retry: true } = view.state else {
+        panic!("not failed: {view:?}");
+    };
+    assert!(why.contains("too long"), "{why}");
+    assert!(w.retry(view.id));
+    let later = t0 + WALK_BUDGET + Duration::from_secs(1);
+    assert!(w.next_request(false, later).is_some(), "a new budget");
+}
+
+/// The user's rows come before the background ones; a carry halted because River moved on,
+/// and a move that ended, are not shown.
+#[test]
+fn the_users_rows_come_first_and_ended_background_work_is_hidden() {
+    let mut w = Work::default();
+    carry_task(&mut w);
+    w.create("Book club", "Ada", false);
+    let views = w.views();
+    assert_eq!(views.len(), 2);
+    assert!(views[0].what.contains("Book club"), "{views:?}");
+    assert!(views[1].what.contains("earlier version"), "{views:?}");
+    assert!(w.halt("River moved on"));
+    assert!(
+        w.views()
+            .iter()
+            .all(|v| !v.what.contains("earlier version")),
+        "a halted carry is the newer build's to finish"
+    );
+    // A move is shown while it works, not once it failed (the session tries it again).
+    let owner_sk = SigningKey::from_bytes(&[66; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let owner = owner_sk.verifying_key();
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..1]),
+        plan.room.room_state.clone(),
+    );
+    assert!(w.views()[0].what.contains("Moving"));
+    assert!(w.halt("River moved on"));
+    assert!(w.views().is_empty());
+}
+
+/// The carry writes a room's rank before its slot; `rooms_meta` it can't read stops it before
+/// the slot, with Try again, and a conflict on it is read again.
+#[test]
+fn the_carrys_rank_write_conflicts_and_refusals() {
+    let pred = crate::rooms::carry::Predecessor {
+        version: "V39".into(),
+        key: freenet_stdlib::prelude::DelegateKey::new(
+            [39; 32],
+            freenet_stdlib::prelude::CodeHash::new([39; 32]),
+        ),
+        rank: 39,
+    };
+    let owner_sk = SigningKey::from_bytes(&[67; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let slot = river_core::stored_rooms::encode_new_room(&plan.room).unwrap();
+    let slot_key = room_storage_key(&owner_sk.verifying_key());
+    let mut w = Work::default();
+    w.carry(crate::rooms::carry::Carry::new(
+        vec![pred.clone()],
+        Vec::new(),
+        true,
+    ));
+    // Walk V39: one room.
+    #[derive(serde::Serialize)]
+    struct Index {
+        keys: Vec<ChatDelegateKey>,
+    }
+    let index = {
+        let mut b = Vec::new();
+        ciborium::ser::into_writer(
+            &Index {
+                keys: vec![ChatDelegateKey::new(slot_key.clone())],
+            },
+            &mut b,
+        )
+        .unwrap();
+        b
+    };
+    let get = |k: &[u8], v: Option<Vec<u8>>| ChatDelegateResponseMsg::GetResponse {
+        key: ChatDelegateKey::new(k.to_vec()),
+        value: v,
+    };
+    let _ = next(&mut w);
+    assert!(w.on_predecessor(
+        &pred.key,
+        &[ChatDelegateResponseMsg::ListResponse {
+            keys: vec![ChatDelegateKey::new(slot_key.clone())]
+        }]
+    ));
+    for answer in [
+        get(crate::rooms::carry::KEY_INDEX_KEY, Some(index.clone())),
+        get(crate::rooms::carry::KEY_INDEX_KEY, Some(index.clone())),
+        get(ROOMS_META_KEY, None),
+        get(b"rooms_data", None),
+        get(b"outbound_dms", None),
+        get(&slot_key, Some(slot.clone())),
+    ] {
+        let _ = next(&mut w);
+        assert!(w.on_predecessor(&pred.key, &[answer]));
+    }
+    // The rank first: rooms_meta is read, and someone else wrote it meanwhile.
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 4)));
+    let _ = expect_store(&mut w, ROOMS_META_KEY, 4);
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Conflict {
+            current_generation: 5,
+            current_value: Some(b"garbage".to_vec())
+        }
+    )));
+    // Read again: now it can't be read; the slot is never written, and Try again is offered.
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(b"garbage".to_vec()), 5)));
+    let view = w.views().pop().unwrap();
+    let WorkState::Failed { retry: true, .. } = view.state else {
+        panic!("not failed with Try again: {view:?}");
+    };
+    assert!(w.next_request(false, Instant::now()).is_none());
+}

@@ -13,9 +13,9 @@
 #   3. ui/public/contracts/ at <commit> is byte-identical to ui/public/contracts/ at the
 #      latest "chore(publish): bump webapp contract version" commit on main's first-parent
 #      history. The app compiles in chat_delegate.wasm (the delegate key it reads the
-#      user's rooms under) and room_contract.wasm (part of every room's contract key), and
-#      it cannot migrate from one key to another. So it must carry exactly the WASM the
-#      live River web UI carries. The check is:
+#      user's rooms under) and room_contract.wasm (part of every room's contract key). It
+#      carries rooms forward from EARLIER keys (the registries list them), never to newer
+#      ones, so it must carry exactly the WASM the live River web UI carries. The check is:
 #
 #        bump=$(git log origin/main --first-parent -1 --format=%H \
 #                 --grep='^chore(publish): bump webapp contract version')

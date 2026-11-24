@@ -15,8 +15,10 @@
 #
 # Usage: apps/scripts/rekey-rehearsal.sh <work dir> [<old commit> ...]
 #   With no commit: the commit before the last change to ui/public/contracts/chat_delegate.wasm
-#   (the outgoing chat delegate, which is what a re-key publish strands). Give several, oldest
-#   first, to rehearse a skipped release too, e.g. `14d9632d e9dae028^`.
+#   or room_contract.wasm (the outgoing generation, which is what a re-key publish strands; it
+#   needs the git history, so not a shallow clone). Give several, oldest first, to rehearse a
+#   skipped release too, e.g. `14d9632d e9dae028^`. Nothing enforces running it: it is a step
+#   of the publish and release procedures.
 #   FREENET_BIN          the freenet binary to run (default: freenet on PATH)
 #   REHEARSAL_PORT_BASE  first of the two ports used (default 39500): network, API
 #   CARGO                the cargo command (default: cargo), e.g. a wrapper that takes a lock
@@ -32,7 +34,10 @@ shift
 APPS="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$APPS/.." && pwd)"
 if [ "$#" -eq 0 ]; then
-  last=$(git -C "$REPO" log -1 --format=%H -- ui/public/contracts/chat_delegate.wasm)
+  # The build before the last change to either WASM: the outgoing generation of whichever
+  # re-keyed last. Needs the history (not a shallow clone).
+  last=$(git -C "$REPO" log -1 --format=%H -- ui/public/contracts/chat_delegate.wasm \
+    ui/public/contracts/room_contract.wasm)
   set -- "$last^"
 fi
 FREENET_BIN="${FREENET_BIN:-freenet}"

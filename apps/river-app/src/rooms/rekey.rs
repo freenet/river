@@ -14,7 +14,8 @@
 //!   one from a NEWER River, which this build must not move back.
 //! - **Carrying the state.** Only when the current key answers `NotFound` (never on another
 //!   failure). A stored room is then followed under its earlier key again while it is moved:
-//!   every earlier key down to the one it was stored under (the web UI's `rekey_candidates`) is
+//!   every earlier key down to the deepest of the one it was stored under and those its slot
+//!   still owes a merge from (`rekey_merge.owed`; the web UI's `rekey_candidates`) is
 //!   folded into the copy the user holds ([`Policy::Fold`], the web UI's `start_rekey_merge`),
 //!   and the result PUT under the current key; when every earlier key answered with nothing, the
 //!   user's copy is PUT, as the web UI seeds it. A move that did not end well is tried again
@@ -30,7 +31,9 @@
 //! - **What is left to the web UI.** Folding earlier keys into a current key that already had
 //!   state when this app first followed it (the web UI's owed re-key merge, `rekey_merge`, which
 //!   a carried slot keeps). An owner who uses only this app does not publish the upgrade pointer
-//!   on the old contract.
+//!   on the old contract. Messages posted to the earlier key between the move's reads and its
+//!   PUT are not folded (the web UI has the same window). While a room moves, the session also
+//!   subscribes to its earlier key: both are GETs of one key, so either answer serves either.
 
 use std::sync::Arc;
 

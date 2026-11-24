@@ -294,3 +294,37 @@ fn the_put_goes_to_the_current_key_without_an_upgrade_pointer() {
     };
     assert_eq!(cbor(&sent.normalized(&params).unwrap()), cbor(&sent));
 }
+
+#[test]
+fn the_keys_a_slot_still_owes_a_merge_from_are_read_from_its_rekey_merge() {
+    let o = owner().verifying_key();
+    let owed = vec![earlier()[2], earlier()[4]];
+    let slot = cbor(&ciborium::Value::Map(vec![(
+        ciborium::Value::Text("Present".into()),
+        ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("owner_vk".into()),
+                ciborium::Value::serialized(&o).unwrap(),
+            ),
+            (
+                ciborium::Value::Text("rekey_merge".into()),
+                ciborium::Value::Map(vec![(
+                    ciborium::Value::Text("owed".into()),
+                    ciborium::Value::serialized(&owed).unwrap(),
+                )]),
+            ),
+        ]),
+    )]));
+    assert_eq!(owed_keys(&slot), owed);
+    assert!(owed_keys(b"garbage").is_empty());
+    // Down to the deepest of the stored key and what it owes.
+    let all = candidates_down_to(&o, None);
+    assert_eq!(
+        candidates_down_to_owed(&o, &[earlier()[0], earlier()[4]]),
+        all[..5].to_vec()
+    );
+    assert_eq!(
+        candidates_down_to_owed(&o, &[earlier()[1]]),
+        all[..2].to_vec()
+    );
+}

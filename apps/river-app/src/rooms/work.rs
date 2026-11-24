@@ -278,8 +278,9 @@ enum Kind {
         listed: bool,
     },
     /// Carry the user's rooms over from earlier chat delegates ([`super::carry`]): read them
-    /// (`Walk`), then add each room or tombstone found to the store (`Slot`, once per room).
-    /// Shown only while it has found rooms, or the list is empty, and when it fails.
+    /// (`Walk`), then make each write (`Slot`): a room's rank in `rooms_meta`, its slot, and the
+    /// rank taken out again when another writer stored the room first; a tombstone's slot.
+    /// Shown while it works, and when it failed with Try again.
     Carry(Box<Carry>),
     /// Carry `room` (named `name`), stored under an earlier room-contract key, to the current
     /// key, which has no state on the network ([`super::rekey`]): read the earlier keys
@@ -1820,7 +1821,8 @@ impl Work {
         // An error that names a read of an earlier key given up on is that read's: over.
         let late_named = match e.kind() {
             ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
-                key, ..
+                key,
+                ..
             })) => Some(*key.id()),
             ErrorKind::RequestError(RequestError::ContractError(
                 ContractError::MissingContract { key },
@@ -1829,9 +1831,9 @@ impl Work {
         };
         if let Some(id) = late_named
             && self.late.contains_key(&id)
-            && !self.active_ref().is_some_and(|t| {
-                matches!(&t.out, Some((Out::Contract(out), _)) if *out == id)
-            })
+            && !self
+                .active_ref()
+                .is_some_and(|t| matches!(&t.out, Some((Out::Contract(out), _)) if *out == id))
         {
             self.late.remove(&id);
             return true;

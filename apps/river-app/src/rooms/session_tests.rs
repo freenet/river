@@ -10522,3 +10522,189 @@ mod rekey {
         node.with(|w| assert!(w.puts.iter().all(|k| *k == current)));
     }
 }
+
+mod rekey_state {
+    use super::*;
+    use crate::rooms::create::contract_key;
+    use freenet_stdlib::client_api::ContractRequest as CR;
+
+    /// A signing key sweep request out is another request an error naming nothing could be.
+    #[test]
+    fn a_key_request_out_means_an_unnamed_error_is_not_the_tasks_alone() {
+        assert!(nothing_else_out(false, false, false, false, false));
+        for i in 0..5 {
+            let mut v = [false; 5];
+            v[i] = true;
+            assert!(!nothing_else_out(v[0], v[1], v[2], v[3], v[4]), "{i}");
+        }
+    }
+
+    fn pace() -> Pace {
+        Pace {
+            resubscribe_first: Duration::from_millis(100),
+            resubscribe_max: Duration::from_millis(250),
+            ..quick()
+        }
+    }
+
+    /// Rooms holding one room stored under an earlier room-contract key, and that key.
+    fn rekeyed(seed: u8) -> (Rooms, TestRoom, ContractKey) {
+        let owner = SigningKey::from_bytes(&[seed; 32]);
+        let earlier =
+            river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key())[0];
+        let mut room = TestRoom::new(seed, "A", 1, &["mine"]);
+        room.key = earlier;
+        let mut rooms = Rooms::default();
+        rooms.replace(loaded(vec![room.stored()]));
+        (rooms, room, earlier)
+    }
+
+    /// Drive the move under way: every earlier key it reads answers NotFound, then its PUT of
+    /// the user's copy gets `put`.
+    fn drive(rooms: &mut Rooms, now: Instant, put: Result<(), ()>) {
+        let work = &mut rooms.outbox.work;
+        loop {
+            match work.next_request(false, now) {
+                Some(ClientRequest::ContractOp(CR::Get { key, .. })) => {
+                    assert!(work.on_contract(&ContractResponse::NotFound { instance_id: key }));
+                }
+                Some(ClientRequest::ContractOp(CR::Put { contract, .. })) => {
+                    let key = contract.key();
+                    match put {
+                        Ok(()) => assert!(work.on_contract(&ContractResponse::PutResponse { key })),
+                        Err(()) => assert!(
+                            work.on_error(
+                                &ErrorKind::RequestError(RequestError::ContractError(
+                                    ContractError::Put {
+                                        key,
+                                        cause: "no".into()
+                                    }
+                                ))
+                                .into(),
+                                true,
+                                &|_| false
+                            )
+                        ),
+                    }
+                    return;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// Mutation 11 of the round-1 review: a subscribe that failed for another reason than
+    /// NotFound starts no move.
+    #[test]
+    fn a_subscribe_failure_that_is_not_a_not_found_starts_no_move() {
+        let (mut rooms, room, _) = rekeyed(1);
+        let current = *contract_key(&room.vk()).id();
+        assert_eq!(rooms.contract_ids(), vec![current]);
+        let mut subs = Subscriptions::default();
+        rooms.subscribe_failed(&mut subs, current, &pace());
+        assert!(!rooms.outbox.work.busy());
+        assert!(rooms.seeding.is_empty() && rooms.on_earlier.is_empty());
+        // A NotFound does.
+        assert!(rooms.seed_if_rekeyed(&current).is_some());
+        assert!(rooms.outbox.work.busy());
+    }
+
+    #[test]
+    fn a_move_that_fails_is_tried_again_after_a_wait_that_doubles_up_to_the_cap() {
+        let (mut rooms, room, earlier) = rekeyed(2);
+        let current = *contract_key(&room.vk()).id();
+        let pace = pace();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        assert_eq!(rooms.seed_if_rekeyed(&current), Some(*earlier.id()));
+        // Followed under the earlier key while it moves.
+        assert_eq!(rooms.contract_ids(), vec![*earlier.id()]);
+        for (attempt, wait) in [(0u64, 100u64), (1, 200), (2, 250), (3, 250)] {
+            let start = ms(attempt * 1000);
+            drive(&mut rooms, start, Err(()));
+            assert!(rooms.seed_ends(&pace, start).is_empty());
+            rooms.seeds_due(start + Duration::from_millis(wait - 1));
+            assert!(
+                !rooms.outbox.work.busy(),
+                "attempt {attempt}: not before {wait} ms"
+            );
+            rooms.seeds_due(start + Duration::from_millis(wait));
+            assert!(
+                rooms.outbox.work.busy(),
+                "attempt {attempt}: after {wait} ms"
+            );
+        }
+        // It moves: followed under the current key at once, nothing left to try.
+        drive(&mut rooms, ms(9000), Ok(()));
+        assert_eq!(rooms.seed_ends(&pace, ms(9000)), vec![current]);
+        assert_eq!(rooms.contract_ids(), vec![current]);
+        assert!(rooms.seed_retry.is_empty() && rooms.on_earlier.is_empty());
+    }
+
+    /// Earlier keys that did not answer while a room moved are folded in later.
+    #[test]
+    fn keys_that_did_not_answer_during_a_move_are_folded_in_later() {
+        let (mut rooms, room, _) = rekeyed(3);
+        let current = *contract_key(&room.vk()).id();
+        let pace = pace();
+        let t0 = Instant::now();
+        let earlier = river_core::migration::legacy_contract_keys_for_owner(&room.vk());
+        rooms.seed_if_rekeyed(&current);
+        // The stored key is the newest earlier one: one read, which never answers.
+        let work = &mut rooms.outbox.work;
+        let Some(ClientRequest::ContractOp(CR::Get { key, .. })) = work.next_request(false, t0)
+        else {
+            panic!("a read");
+        };
+        assert_eq!(key, *earlier[0].id());
+        let late = t0 + Duration::from_secs(61);
+        assert!(!work.expire(Duration::from_secs(20), Duration::from_secs(60), late));
+        // Nothing found: no copy is PUT while a key may still hold the room.
+        assert!(work.next_request(false, late).is_none());
+        assert!(rooms.seed_ends(&pace, late).is_empty());
+        assert_eq!(rooms.seed_retry[&room.vk()].2, vec![*earlier[0].id()]);
+    }
+
+    #[test]
+    fn a_move_of_a_room_left_meanwhile_is_dropped() {
+        let (mut rooms, room, _) = rekeyed(4);
+        let current = *contract_key(&room.vk()).id();
+        let pace = pace();
+        let t0 = Instant::now();
+        rooms.seed_if_rekeyed(&current);
+        drive(&mut rooms, t0, Err(()));
+        // Left: the stored rooms read again no longer hold it.
+        rooms.replace(loaded(vec![TestRoom::new(9, "B", 1, &[]).stored()]));
+        assert!(rooms.seed_ends(&pace, t0).is_empty());
+        assert!(rooms.seed_retry.is_empty());
+        rooms.seeds_due(t0 + Duration::from_secs(10));
+        assert!(!rooms.outbox.work.busy());
+    }
+
+    /// A slot that still owes a merge from a key older than the one it is stored under has that
+    /// key folded too (`rekey_candidates`).
+    #[test]
+    fn a_move_folds_down_to_the_oldest_key_the_slot_owes() {
+        let owner = SigningKey::from_bytes(&[5; 32]);
+        let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key());
+        let mut room = TestRoom::new(5, "A", 1, &[]);
+        room.key = earlier[0];
+        let mut rooms = Rooms::default();
+        let mut l = loaded(vec![room.stored()]);
+        l.owed.insert(room.vk(), vec![earlier[3]]);
+        rooms.replace(l);
+        let current = *contract_key(&room.vk()).id();
+        rooms.seed_if_rekeyed(&current);
+        let mut read = Vec::new();
+        let t0 = Instant::now();
+        let work = &mut rooms.outbox.work;
+        while let Some(ClientRequest::ContractOp(CR::Get { key, .. })) =
+            work.next_request(false, t0)
+        {
+            read.push(key);
+            assert!(work.on_contract(&ContractResponse::NotFound { instance_id: key }));
+        }
+        let want: Vec<ContractInstanceId> = earlier[..4].iter().map(|k| *k.id()).collect();
+        assert_eq!(read, want);
+    }
+}

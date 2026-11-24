@@ -884,7 +884,14 @@ fn a_room_named_only_by_modes_or_sources_proves_the_index_short_and_is_salvaged(
         let mut c = Carry::new(preds(&[39, 38]), Vec::new(), true);
         let out = walk(&mut c, &stores);
         assert_eq!(out, BTreeMap::from([(key(1), me(11))]), "{field}");
-        assert!(c.stopped.as_ref().unwrap().1.contains("index does not list"), "{field}");
+        assert!(
+            c.stopped
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("index does not list"),
+            "{field}"
+        );
     }
 }
 
@@ -942,12 +949,20 @@ fn a_rank_is_taken_out_with_every_other_field_kept() {
     let m = meta(&[2], &[(1, 38), (2, 37)]);
     let out = meta_without_source(Some(&m), &a).unwrap().unwrap();
     assert_eq!(sources_of(&out), vec![(b, [37; 32])]);
-    let text = format!("{:?}", ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap());
+    let text = format!(
+        "{:?}",
+        ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap()
+    );
     assert!(text.contains("room_order"));
     // The last one out drops the field, as the web UI leaves it out when empty.
     let out = meta_without_source(Some(&out), &b).unwrap().unwrap();
-    assert!(!format!("{:?}", ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap())
-        .contains("identity_sources"));
+    assert!(
+        !format!(
+            "{:?}",
+            ciborium::de::from_reader::<Value, _>(out.as_slice()).unwrap()
+        )
+        .contains("identity_sources")
+    );
     assert_eq!(meta_without_source(Some(&out), &b).unwrap(), None);
     assert_eq!(meta_without_source(None, &b).unwrap(), None);
     assert!(meta_without_source(Some(b"garbage"), &b).is_err());

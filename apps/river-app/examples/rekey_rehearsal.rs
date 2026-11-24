@@ -299,6 +299,8 @@ fn main() {
                 );
                 std::thread::sleep(Duration::from_millis(200));
             }
+            // For `load`, which must find the tombstone carried.
+            std::fs::write(dir.join(format!("gamma-{t}")), &gamma).unwrap();
         }
         "load" => {
             let mut want: Vec<String> = tags
@@ -324,6 +326,21 @@ fn main() {
                 app.work_seen
             );
             for t in &tags {
+                // Gamma's tombstone was carried, so the room stays left.
+                let gamma = std::fs::read_to_string(dir.join(format!("gamma-{t}"))).unwrap();
+                let gamma: [u8; 32] = bs58::decode(gamma.trim())
+                    .into_vec()
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let gamma = VerifyingKey::from_bytes(&gamma).unwrap();
+                assert!(
+                    matches!(
+                        stored(authority, &dir, &gamma),
+                        Some(StoredRoomSlot::Tombstone)
+                    ),
+                    "{t} Gamma's tombstone is not in the current chat delegate"
+                );
                 let alpha = app.room(&name(t, "Alpha")).unwrap().clone();
                 let beta = app.room(&name(t, "Beta")).unwrap().clone();
                 for room in [&alpha, &beta] {

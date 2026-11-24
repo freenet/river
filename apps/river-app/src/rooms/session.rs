@@ -1298,14 +1298,16 @@ fn follow_on(
                 let mut taken_by_work = false;
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
-                let alone = subs.pending.is_empty()
-                    && !resyncs.any_out()
-                    && reload.is_none()
-                    && !rooms.keys.busy()
-                    && !rooms
+                let alone = nothing_else_out(
+                    !subs.pending.is_empty(),
+                    resyncs.any_out(),
+                    reload.is_some(),
+                    rooms.keys.busy(),
+                    rooms
                         .list
                         .iter()
-                        .any(|r| rooms.outbox.owes(&r.stored.owner_vk));
+                        .any(|r| rooms.outbox.owes(&r.stored.owner_vk)),
+                );
                 // A read given up on may still fail (the node retries a GET, each attempt up to
                 // a minute): an error naming nothing, or naming its room with no other request
                 // out for that room, may be that read's, so it is claimed by nobody. What else
@@ -1470,6 +1472,19 @@ impl SweepGate {
 /// would put its requests beside the task's, and an error names neither.
 fn reload_due(work: &mut super::work::Work, since_read: Duration, pace: &Pace) -> bool {
     !work.busy() && (work.take_reload() || since_read >= pace.refresh)
+}
+
+/// Whether nothing but a create's or join's request can have caused an error that names
+/// nothing: no subscribe, room read, read of the stored rooms or signing key request is out,
+/// and no room owes an update's answer.
+fn nothing_else_out(
+    subscribing: bool,
+    reading_rooms: bool,
+    reading_store: bool,
+    key_request: bool,
+    update_owed: bool,
+) -> bool {
+    !subscribing && !reading_rooms && !reading_store && !key_request && !update_owed
 }
 
 /// Whether the node's error names no request: how it reports one that failed to start
@@ -3389,8 +3404,10 @@ impl Rooms {
                     follow.push(*current.id());
                 }
                 if !end.unresolved.is_empty() {
-                    self.seed_retry
-                        .insert(owner, (0, Some(now + pace.resubscribe_first), end.unresolved));
+                    self.seed_retry.insert(
+                        owner,
+                        (0, Some(now + pace.resubscribe_first), end.unresolved),
+                    );
                 }
             } else {
                 let wait = pace
@@ -3398,8 +3415,10 @@ impl Rooms {
                     .saturating_mul(1 << attempts.min(16))
                     .min(pace.resubscribe_max);
                 let candidates = self.seed_candidates(&owner, earlier);
-                self.seed_retry
-                    .insert(owner, (attempts.saturating_add(1), Some(now + wait), candidates));
+                self.seed_retry.insert(
+                    owner,
+                    (attempts.saturating_add(1), Some(now + wait), candidates),
+                );
             }
         }
         follow

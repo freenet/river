@@ -19,31 +19,46 @@
 //! two reads must agree, decode, and equal the listing: a frozen delegate's listing turns an
 //! unreadable index into an empty one, and a failed read reports "not found",
 //! freenet-core#5857); `rooms_meta` (stored but not indexed, or listed with no value, is a
-//! fault); every room `rooms_meta` names that the index does not list (a stored one proves the
-//! index short); then the room keys to carry (a listed one with no value is a read fault).
+//! fault); every room `rooms_meta` names that the index does not list (`rooms_named_by_meta`:
+//! its order, notification modes, open room and identity sources; a stored one proves the index
+//! short); the fixed keys `rooms_data` and `outbound_dms`, read even when unlisted
+//! (`candidate_keys`: stored but unlisted proves the index short); then the room keys to carry
+//! (a listed one with no value is a read fault).
 //!
-//! **What is carried.** The walk reads predecessors newest first. For each room key
-//! (`room:<owner>`) the current store did not list, the NEWEST generation holding a slot for it
-//! decides: a room is added, a tombstone (a room the user left) is written as a tombstone, so it
-//! stays left. This is the web UI's ranked merge (`Rooms::merge_from_source`) for a room the
-//! current delegate does not hold: a tombstone is recorded at its generation's rank and a present
-//! copy survives it only from a strictly newer generation, and of two identities the strictly
-//! newer one wins. A room the current store holds in any form, room or tombstone, is never
-//! touched, as the web UI never lets an older generation replace the current one's copy.
+//! **What is carried, at what rank.** As the web UI's ranked merge (`Rooms::merge_from_source`
+//! at each generation's lineage rank): for each room key (`room:<owner>`) the current store did
+//! not list, the copy with the highest RANK decides. A copy's rank is its generation's, LOWERED
+//! to the older generation the predecessor's own `rooms_meta.identity_sources` records for the
+//! room's identity, when it has one (`identity_source_ranks`, applied by `flush_predecessor`'s
+//! `lower_identity_ranks`): a copy that V40 carried from V38 ranks 38, so a rejoin V39 holds
+//! still wins. So a predecessor older than the one that holds a copy is still read for that
+//! room while it could outrank it. A tombstone wins over a present copy, and a present copy over
+//! a tombstone, only from a strictly higher rank; of two identities the higher rank wins. A
+//! tombstone is written as a tombstone, so a room the user left stays left. A room the current
+//! store holds in any form is never touched, as the web UI never lets an older generation
+//! replace the current one's copy.
 //!
 //! **A generation that can't be read stops the walk.** An error, no answer, or any fault above
 //! ends the walk at that predecessor: it may hold a newer copy of any room (a rejoin under a new
-//! identity) or the tombstone of one the user left, so NOTHING older may decide anything. What
-//! newer generations decided, and what this one decided from its verified listing, is still
-//! written; the rest waits for Try again. A slot that does not decode (or names another room)
-//! holds its room back from older generations the same way. Only "not installed" (the node holds
-//! no such delegate) is an empty store, passed over. Writing an older copy instead would be
-//! permanent: the write never replaces what the current key holds, and the web UI reads a room
-//! in the current delegate as authoritative.
+//! identity) or the tombstone of one the user left, so nothing it or an older generation could
+//! outrank is decided. A room it proves it holds (named by its `rooms_meta`, stored but left out
+//! of its short index) is carried first, as the web UI salvages it (`salvage_short_index_rooms`).
+//! What is decided at a rank no unread generation can outrank is still written; the rest waits
+//! for Try again. A slot that does not decode (or names another room) holds its room back from
+//! older generations the same way. Writing an older copy instead would be permanent: the write
+//! never replaces what the current key holds, and the web UI reads a room in the current
+//! delegate as authoritative. "Not installed" (a typed `Missing`: the node holds no such
+//! delegate) is an empty store and is passed over; the web UI keeps such a predecessor pending,
+//! since a node can unregister a delegate without deleting its store, which River never does.
 //!
-//! **Its rank is recorded.** For each room written, `rooms_meta.identity_sources` gets the
-//! generation that supplied it, as the web UI's walk persists it, so the web UI's ranked merge
-//! still lets a newer generation's copy win when that generation answers later.
+//! **Its rank is recorded, before the room.** For each room written, `rooms_meta`'s
+//! `identity_sources` gets the generation its rank is (as the web UI persists ranks below the
+//! current one, `persisted_identity_sources`), so the web UI's ranked merge still lets a newer
+//! generation's copy win when that generation answers later. The rank is written BEFORE the
+//! room's slot, so a quit between the two can't leave a carried room unranked (which the web UI
+//! would read as authoritative for good); when another writer stored the room first, the rank is
+//! taken out again. A rank write that can't be made fails the carry with Try again, before the
+//! slot.
 //!
 //! The room is written as [`NewRoom`], the fields this app already writes for a room it creates
 //! or joins, which the `stored_rooms_drift` tests in `ui/src/room_data.rs` pin as decodable by
@@ -297,7 +312,9 @@ enum Phase {
     /// The first read of the raw index.
     Index,
     /// The second read; `first` is the first read's bytes (`None`: no index stored).
-    IndexAgain { first: Option<Vec<u8>> },
+    IndexAgain {
+        first: Option<Vec<u8>>,
+    },
     Meta,
     /// Named rooms not listed, still to read; `short` once one was found stored.
     Named {
@@ -484,7 +501,10 @@ impl Carry {
         if self.stopped.is_some() || self.at >= self.preds.len() {
             return;
         }
-        let (version, rank) = (self.preds[self.at].version.clone(), self.preds[self.at].rank);
+        let (version, rank) = (
+            self.preds[self.at].version.clone(),
+            self.preds[self.at].rank,
+        );
         eprintln!("River: an earlier River's storage ({version}) could not be read: {why}");
         // A copy found at a rank some generation not read could outrank is not decided yet:
         // this one (unless the copy is this one's own), and every older one above its rank.
@@ -500,8 +520,10 @@ impl Carry {
             .collect();
         for k in undecided {
             self.found.remove(&k);
-            self.held
-                .insert(k, format!("{version} could not be read and may hold a newer copy"));
+            self.held.insert(
+                k,
+                format!("{version} could not be read and may hold a newer copy"),
+            );
         }
         self.stopped = Some((version, why));
         self.end_walk();
