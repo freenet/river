@@ -99,5 +99,7 @@ test("closing the viewer returns to the user's own rooms", async ({ page }) => {
   await openLink(page, key);
   await page.getByTestId("viewed-room-close").click();
   await expect(page.getByTestId("viewed-room")).toHaveCount(0);
+  // The user's own rooms are untouched and open normally.
+  await selectRoom(page, "Team Chat Room");
   await expect(page.getByTestId("message-composer").first()).toBeVisible();
 });
