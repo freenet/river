@@ -28,6 +28,7 @@ impl DesktopLog {
 impl LogHost for DesktopLog {
     fn log_state(&self) -> LogState {
         match &self.started {
+            Started::File(_) if crate::log::silenced() => LogState::Stopped,
             Started::File(p) => LogState::File(p.clone()),
             Started::Left => LogState::Elsewhere,
             Started::Failed => LogState::Unavailable,

@@ -12,8 +12,8 @@
 //! and Settings says so.
 //!
 //! There is no pipe and no thread: the file is the process's stderr, so nothing can hang in a
-//! diagnostics path (a write that fails, such as a full disk, makes stderr the null device
-//! once: [`silence_stderr`]), and a process that inherits fd 2 (an `exec`, a relaunch, a
+//! diagnostics path (a write to the log file that fails for real, such as a full disk, makes stderr the
+//! null device once: [`on_write_failure`]), and a process that inherits fd 2 (an `exec`, a relaunch, a
 //! child) holds a plain file. The time on each line comes from `diag!`, not from here.
 //!
 //! The file is rotated at start only: when `river.log` is over [`LIMIT`] it is renamed to
@@ -67,7 +67,6 @@ pub fn decide(stderr: Stderr) -> bool {
 static PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// The file stderr was pointed at, once [`start`] has done it.
-#[cfg(unix)]
 pub fn active() -> Option<&'static Path> {
     PATH.get().map(|p| p.as_path())
 }
@@ -194,9 +193,30 @@ fn probe() -> Stderr {
     sys::probe()
 }
 
-/// What `river_app::diag::on_failure` runs.
-pub fn silence_stderr() {
-    sys::silence_stderr();
+static SILENCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether writing to the log file failed and stderr was made the null device.
+pub fn silenced() -> bool {
+    SILENCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a failed write to stderr is one to answer by silencing it: only when stderr is the
+/// log file this process opened (a terminal, file or pipe the user chose is theirs to deal
+/// with), and only for a real failure (a full disk, an I/O error, a closed pipe), never for
+/// `WouldBlock` or anything else that may pass.
+pub fn should_silence(ours: bool, error: &io::Error) -> bool {
+    ours && error.raw_os_error().is_some_and(sys::is_real_failure)
+}
+
+/// What `river_app::diag::on_failure` runs: after a write to the log file fails for real,
+/// make stderr the null device, so a later `eprintln!` (which panics on a failing stderr) does
+/// not, and let Settings say the log stopped.
+pub fn on_write_failure(error: &io::Error) {
+    if should_silence(active().is_some(), error)
+        && !SILENCED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        sys::silence_stderr();
+    }
 }
 
 #[cfg(unix)]
@@ -225,7 +245,20 @@ mod sys {
         Stderr::Other
     }
 
-    /// Make stderr the null device (a write to it failed: a full disk, a closed pipe).
+    /// The errno values that mean the log file cannot be written, as opposed to a write that
+    /// may be tried again.
+    pub fn is_real_failure(code: i32) -> bool {
+        [
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EIO,
+            libc::EPIPE,
+            libc::EFBIG,
+        ]
+        .contains(&code)
+    }
+
+    /// Make stderr the null device.
     pub fn silence_stderr() {
         if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
             // SAFETY: dup2 onto fd 2 from a valid descriptor.
@@ -278,7 +311,24 @@ mod sys {
         Stderr::Other
     }
 
-    /// Make stderr the null device (a write to it failed: a full disk, a closed pipe).
+    /// The Win32 errors that mean the log file cannot be written.
+    pub fn is_real_failure(code: i32) -> bool {
+        use windows_sys::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE,
+            ERROR_NO_DATA,
+        };
+        [
+            ERROR_DISK_FULL,
+            ERROR_HANDLE_DISK_FULL,
+            ERROR_BROKEN_PIPE,
+            ERROR_NO_DATA,
+            ERROR_IO_DEVICE,
+        ]
+        .iter()
+        .any(|&e| e as i32 == code)
+    }
+
+    /// Make stderr the null device.
     pub fn silence_stderr() {
         if let Ok(null) = std::fs::OpenOptions::new().write(true).open("NUL") {
             let _ = take_stderr(null);
@@ -305,6 +355,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_real_failure_of_our_own_log_silences_stderr() {
+        let full = io::Error::from_raw_os_error(libc::ENOSPC);
+        let io_error = io::Error::from_raw_os_error(libc::EIO);
+        let would_block = io::Error::from(io::ErrorKind::WouldBlock);
+        let again = io::Error::from_raw_os_error(libc::EAGAIN);
+        let bad_fd = io::Error::from_raw_os_error(libc::EBADF);
+        assert!(should_silence(true, &full));
+        assert!(should_silence(true, &io_error));
+        // Not our file: a terminal, a file or a pipe the user chose is left alone.
+        assert!(!should_silence(false, &full));
+        assert!(!should_silence(false, &io_error));
+        // A write that may pass, or is not a full disk or a broken device.
+        assert!(!should_silence(true, &would_block));
+        assert!(!should_silence(true, &again));
+        assert!(!should_silence(true, &bad_fd));
     }
 
     #[test]

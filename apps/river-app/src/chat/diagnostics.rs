@@ -28,6 +28,8 @@ pub enum LogState {
     Elsewhere,
     /// Nowhere: nothing reads them and the file could not be made.
     Unavailable,
+    /// To this file until writing to it failed (a full disk, an I/O error); lost since.
+    Stopped,
 }
 
 /// What the shell offers for its log file.
@@ -80,6 +82,14 @@ pub(super) fn diagnostics_section(chat: &super::Chat, p: &Palette, k: &Kit) -> E
                  system's log), so its diagnostics go there and River keeps no log file of its \
                  own.",
                 "settings-log-elsewhere",
+                p,
+            );
+        }
+        LogState::Stopped => {
+            return notice(
+                "River's log file stopped: writing to it failed (the disk may be full), and \
+                 diagnostics since then are lost. Free some space, then start River again.",
+                "settings-log-stopped",
                 p,
             );
         }

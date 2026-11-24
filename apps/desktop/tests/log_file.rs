@@ -22,7 +22,7 @@ const SEP: char = '\u{1f}';
 /// (`diag!`), `eprintln:TEXT` (std's, which panics if stderr is broken), `child:TEXT` (a
 /// process that inherits stderr writes TEXT), `relaunch:TEXT` (a new probe started the way the
 /// updater starts River, run to the end) and `exec:TEXT` (replace this process with one),
-/// `execfail:TEXT` (an exec that fails, as the updater's rollback can, then the probe goes on)
+/// `fsize:BYTES` (limit the file size), `bulk:N` (N `diag!` lines), `execfail:TEXT` (an exec that fails, as the updater's rollback can, then the probe goes on)
 /// and `panic:TEXT`.
 #[test]
 fn probe_entry() {
@@ -31,7 +31,7 @@ fn probe_entry() {
     };
     let args: Vec<&str> = spec.split(SEP).collect();
     // As `main` does: the failure handler first, then the log.
-    river_app::diag::on_failure(log::silence_stderr);
+    river_app::diag::on_failure(log::on_write_failure);
     let started = log::start(Some(Path::new(args[0])));
     println!(
         "log={}",
@@ -61,6 +61,24 @@ fn probe_entry() {
                 let err = nested(args[0], text).exec();
                 panic!("exec failed: {err}");
             }
+            "fsize" => {
+                // A limit on file size: past it a write fails with EFBIG, as a full disk
+                // fails with ENOSPC (a real full disk cannot be made in a test).
+                let limit = libc::rlimit {
+                    rlim_cur: text.parse().unwrap(),
+                    rlim_max: text.parse().unwrap(),
+                };
+                // SAFETY: ignoring SIGXFSZ and lowering our own file-size limit.
+                unsafe {
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                    assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+                }
+            }
+            "bulk" => {
+                for i in 0..text.parse::<u32>().unwrap() {
+                    river_app::diag!("bulk line {i} {}", "z".repeat(150));
+                }
+            }
             "execfail" => {
                 let err = log::exec_with_child_stderr(&mut Command::new("/nonexistent/river"));
                 river_app::diag!("exec failed as expected: {} ({text})", err.kind());
@@ -69,6 +87,7 @@ fn probe_entry() {
             _ => panic!("unknown command {cmd}"),
         }
     }
+    println!("silenced={}", log::silenced());
 }
 
 /// A probe started as `restart_into` and the Linux relaunch start River: stderr from
@@ -207,23 +226,49 @@ fn stderr_sent_to_a_pipe_is_left_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A full disk (`/dev/full` fails every write with ENOSPC): `diag!` must not panic, and the
-/// plain `eprintln!` that a dependency makes afterwards must not either, because the first
-/// failed write pointed stderr at the null device.
+/// A stderr the user chose, here `/dev/full` (every write fails with ENOSPC): River does not
+/// own it, so it is not silenced, and `diag!` never panics on it.
 #[test]
-fn a_stderr_that_fails_every_write_never_panics_diag_or_eprintln() {
+fn a_failing_stderr_that_is_not_ours_is_left_alone_and_diag_does_not_panic() {
     let dir = temp("full");
     let full = std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/full")
         .unwrap();
-    let out = run(
-        &dir,
-        Stdio::from(full),
-        &["say:one", "say:two", "eprintln:three", "eprintln:four"],
-    );
+    let out = run(&dir, Stdio::from(full), &["say:one", "say:two"]);
     assert!(out.status.success(), "{out:?}");
     assert!(said(&out).contains("log=none"), "{}", said(&out));
+    assert!(said(&out).contains("silenced=false"), "{}", said(&out));
+    assert!(!dir.join("logs").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The log file stops accepting writes (EFBIG from a file-size limit stands in for ENOSPC):
+/// stderr is made the null device once, neither `diag!` nor a later plain `eprintln!` panics,
+/// and the lines written before the failure are in the file.
+#[test]
+fn when_our_log_file_fails_stderr_is_silenced_and_nothing_panics() {
+    let dir = temp("failing");
+    let out = run(
+        &dir,
+        Stdio::null(),
+        &[
+            "say:before",
+            "fsize:2000",
+            "bulk:50",
+            "eprintln:after",
+            "say:after too",
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(said(&out).contains("silenced=true"), "{}", said(&out));
+    let log = log_of(&dir);
+    assert!(
+        log.contains("before") && log.contains("bulk line 0 "),
+        "{log}"
+    );
+    assert!(!log.contains("after too"), "{log}");
+    assert!(std::fs::metadata(dir.join("logs/river.log")).unwrap().len() <= 2000);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

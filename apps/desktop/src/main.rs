@@ -119,7 +119,7 @@ fn main() {
         }
     });
     // Diagnostics go to a file when nobody is reading stderr (see `log`).
-    river_app::diag::on_failure(log::silence_stderr);
+    river_app::diag::on_failure(log::on_write_failure);
     let log_state = log::start(host.config_dir().as_deref());
     for line in &early {
         river_app::diag!("river: {line}");
