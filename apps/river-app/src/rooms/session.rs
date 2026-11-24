@@ -1289,6 +1289,12 @@ fn follow_on(
                 // River's storage went missing from the node: whatever was waiting on it fails
                 // below, and the next connection registers it again before anything else.
                 let store_gone = chat_delegate_missing(&e);
+                // Whether a delegate error could be the signing key sweep's or the stored rooms
+                // read's, rather than a task's read of an earlier delegate.
+                rooms
+                    .outbox
+                    .work
+                    .set_delegate_shared(rooms.keys.busy() || reload.is_some());
                 let mut taken_by_work = false;
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
@@ -1317,15 +1323,9 @@ fn follow_on(
                     if let Some(id) = failed_contract(&e) {
                         resyncs.late_done(&id);
                     }
-                } else if {
-                    rooms
-                        .outbox
-                        .work
-                        .set_delegate_shared(rooms.keys.busy() || reload.is_some());
-                    rooms.outbox.work.on_error(&e, alone, &|id| {
-                        subs.pending.contains_key(id) || resyncs.is_out(id)
-                    })
-                } {
+                } else if rooms.outbox.work.on_error(&e, alone, &|id| {
+                    subs.pending.contains_key(id) || resyncs.is_out(id)
+                }) {
                     changed = true;
                     taken_by_work = true;
                 } else if rooms.keys.busy()

@@ -14,6 +14,14 @@
 //! registers one; a predecessor the node does not hold answers `DelegateError::Missing` and is
 //! passed over.
 //!
+//! **Reading a predecessor.** As the web UI's `fetch_secrets` reads one, so a short export is
+//! never taken for a complete one (freenet/river#592): the listing; the raw key index twice (the
+//! two reads must agree, decode, and equal the listing: a frozen delegate's listing turns an
+//! unreadable index into an empty one, and a failed read reports "not found",
+//! freenet-core#5857); `rooms_meta` (stored but not indexed, or listed with no value, is a
+//! fault); every room `rooms_meta` names that the index does not list (a stored one proves the
+//! index short); then the room keys to carry (a listed one with no value is a read fault).
+//!
 //! **What is carried.** The walk reads predecessors newest first. For each room key
 //! (`room:<owner>`) the current store did not list, the NEWEST generation holding a slot for it
 //! decides: a room is added, a tombstone (a room the user left) is written as a tombstone, so it
@@ -23,13 +31,30 @@
 //! newer one wins. A room the current store holds in any form, room or tombstone, is never
 //! touched, as the web UI never lets an older generation replace the current one's copy.
 //!
+//! **A generation that can't be read stops the walk.** An error, no answer, or any fault above
+//! ends the walk at that predecessor: it may hold a newer copy of any room (a rejoin under a new
+//! identity) or the tombstone of one the user left, so NOTHING older may decide anything. What
+//! newer generations decided, and what this one decided from its verified listing, is still
+//! written; the rest waits for Try again. A slot that does not decode (or names another room)
+//! holds its room back from older generations the same way. Only "not installed" (the node holds
+//! no such delegate) is an empty store, passed over. Writing an older copy instead would be
+//! permanent: the write never replaces what the current key holds, and the web UI reads a room
+//! in the current delegate as authoritative.
+//!
+//! **Its rank is recorded.** For each room written, `rooms_meta.identity_sources` gets the
+//! generation that supplied it, as the web UI's walk persists it, so the web UI's ranked merge
+//! still lets a newer generation's copy win when that generation answers later.
+//!
 //! The room is written as [`NewRoom`], the fields this app already writes for a room it creates
 //! or joins, which the `stored_rooms_drift` tests in `ui/src/room_data.rs` pin as decodable by
-//! the web UI. Raw bytes from an older web UI are not copied: a field whose shape changed since
-//! would be refused by the current web UI's reader, and an unreadable slot stops its walk on
-//! every load (`room_set_complete`). The room keeps the contract key it was stored with, so the
-//! web UI still sees that the room contract moved and merges the old contract's state
-//! (`regenerate_contract_key`).
+//! the web UI, plus the slot's `previous_contract_key` and `rekey_merge` when they read as the web
+//! UI reads them (so a room-contract merge the web UI still owes is not dropped). Raw bytes from
+//! an older web UI are not copied: a field whose shape changed since would be refused by the
+//! current web UI's reader, and an unreadable slot stops its walk on every load
+//! (`room_set_complete`). The room keeps the contract key it was stored with, so the web UI still
+//! sees that the room contract moved and merges the old contract's state
+//! (`regenerate_contract_key`). A slot is encoded when it is decided, so a room that would not
+//! encode is held back and said, never a write that can't be made.
 //!
 //! Each write is the web UI's compare-and-swap, through [`super::work`], and only where the
 //! current key still holds nothing; another writer's value, read at the write, wins.
@@ -39,9 +64,16 @@
 //! was carried here (the same rooms at the same ranks, so they converge). What only that walk
 //! does: folding older generations' other fields into the winning copy (`own_purges`,
 //! `invitation_secrets`, read markers), merging `rooms_meta`'s room order, the single-blob
-//! `rooms_data` era, and the sent-message store (`outbound_dms`).
+//! `rooms_data` era, and the sent-message store (`outbound_dms`, with the archive list). For a
+//! desktop-only user those stay in the earlier delegate (stranded, not lost): sent direct
+//! messages from before the re-key do not show their text, and archived threads show again.
 //!
-//! **When.** Once per run, after the first read of the stored rooms; again with Try again.
+//! **When.** Once per run, after the first read of the stored rooms; again with Try again. It is
+//! a task like a create or join, one request at a time, behind the write gate; a task the user
+//! asks for goes ahead of it at its next request. An earlier delegate that does not answer costs
+//! one new connection (so its answer can't be taken for another request's) and stops the walk;
+//! the whole walk stops at [`super::work::WALK_BUDGET`]. The node answers a delegate it does not
+//! hold with a typed `Missing` (freenet-core 0.2.156 and later, which the app grant needs).
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::OnceLock;
@@ -249,7 +281,7 @@ enum Phase {
 enum Item {
     /// The slot to write (zeroed when dropped: it holds the user's signing key), and the room's
     /// owner, for `rooms_meta`'s identity sources.
-    Room(Zeroizing<Vec<u8>>, VerifyingKey),
+    Room(Zeroizing<Vec<u8>>, Box<VerifyingKey>),
     Tombstone,
 }
 
@@ -548,7 +580,7 @@ impl Carry {
             {
                 let owner = room.owner_vk;
                 match carried_slot(*room, value) {
-                    Ok(bytes) => Item::Room(Zeroizing::new(bytes), owner),
+                    Ok(bytes) => Item::Room(Zeroizing::new(bytes), Box::new(owner)),
                     Err(e) => {
                         self.held.insert(key.to_vec(), format!("{version}: {e}"));
                         return;
@@ -616,7 +648,7 @@ impl Carry {
                 Item::Room(_, owner) if stored => {
                     self.carried += 1;
                     eprintln!("River: carried a room over from {}", found.version);
-                    self.sources.push((owner, found.delegate));
+                    self.sources.push((*owner, found.delegate));
                 }
                 Item::Tombstone if stored => self.tombstones += 1,
                 _ => {}
@@ -774,7 +806,7 @@ pub fn meta_with_sources(
             v.deserialized::<(VerifyingKey, [u8; 32])>()
                 .is_ok_and(|(r, _)| r == *room)
         };
-        if list.iter().any(|v| *v == entry) {
+        if list.contains(&entry) {
             continue;
         }
         list.retain(|v| !names_room(v));

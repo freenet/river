@@ -12,16 +12,25 @@
 //!   `common/legacy_room_contracts.toml`, never from the network) is followed under the key this
 //!   build's WASM gives it ([`current_key`]). Any other key is kept: it is the current one, or
 //!   one from a NEWER River, which this build must not move back.
-//! - **Carrying the state.** When the current key has no state on the network, the earlier keys
-//!   are read newest first and the newest that holds a real room (its configuration verifies
-//!   against the owner) is PUT under the current key, merged with the copy the user holds, its
-//!   upgrade pointer stripped and normalized as the web UI's `put_state_to_current_key` sends it.
-//!   freenet-migrate's [`ProbeDriver`] orders the reads and decides, as it does for the web UI.
-//!   For a stored room the reads go down to the key it was stored under (the web UI's
-//!   `rekey_candidates`); for a join or an ID import, which hold no key, down to the oldest.
-//! - **What is left to the web UI.** Folding the OTHER earlier keys' states into a current key
-//!   that already has state (the web UI's owed re-key merge, `rekey_merge`), and seeding the
-//!   user's own copy when no key has any state.
+//! - **Carrying the state.** Only when the current key answers `NotFound` (never on another
+//!   failure). A stored room is then followed under its earlier key again while it is moved:
+//!   every earlier key down to the one it was stored under (the web UI's `rekey_candidates`) is
+//!   folded into the copy the user holds ([`Policy::Fold`], the web UI's `start_rekey_merge`),
+//!   and the result PUT under the current key; when every earlier key answered with nothing, the
+//!   user's copy is PUT, as the web UI seeds it. A move that did not end well is tried again
+//!   after a wait that doubles, and keys that did not answer are folded in later (a PUT of a
+//!   contract that exists merges). A join or an ID import, which hold no copy, reads every
+//!   earlier key newest first for the newest real room ([`Policy::Newest`], the web UI's
+//!   backward probe), for at most [`super::work::PROBE_BUDGET`]. The PUT's state has its upgrade
+//!   pointer stripped and is normalized, as the web UI's `put_state_to_current_key` sends it.
+//!   freenet-migrate's [`ProbeDriver`] orders the reads and decides, as it does for the web UI. A
+//!   read that goes unanswered is passed over without a new connection: its answer names a key
+//!   nothing else asks for. `NotFound` is not proof of absence; the PUT is safe because the room
+//!   contract merges.
+//! - **What is left to the web UI.** Folding earlier keys into a current key that already had
+//!   state when this app first followed it (the web UI's owed re-key merge, `rekey_merge`, which
+//!   a carried slot keeps). An owner who uses only this app does not publish the upgrade pointer
+//!   on the old contract.
 
 use std::sync::Arc;
 

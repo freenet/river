@@ -1,26 +1,36 @@
 //! Rehearsal of a re-key for the native app (freenet/river#889), run by
 //! `apps/scripts/rekey-rehearsal.sh` against one isolated Freenet node.
 //!
-//! The same file is built twice: in a checkout of an OLDER River (whose chat delegate and room
-//! contract are earlier generations) to seed the node, and in this checkout to load it.
+//! The same file is built in a checkout of each OLDER River given (whose chat delegate and room
+//! contract are earlier generations) to seed the node, and in this checkout to load it. Each
+//! older build seeds under its own tag `T`, so rooms from several generations can be told apart.
 //!
-//! - `seed <node> <dir>`: create the rooms "Alpha" (with a message), "Beta" and "Gamma", then
-//!   leave "Gamma". Everything goes to the older delegate and the older room contract.
-//! - `load <node> <dir>`: this build must show Alpha and Beta, with Alpha's message, and not
-//!   Gamma; its store must hold both rooms and Gamma's tombstone; it must send into Alpha, under
-//!   Alpha's current contract key.
-//! - `seed-late <node> <dir>`: the older build again, after the new one ran: create "Delta" (a
-//!   late write from an earlier generation).
-//! - `load-late <node> <dir>`: this build must show Delta too.
+//! - `seed <node> <dir> T`: create the rooms "T Alpha" (with the message "T before"), "T Beta" and
+//!   "T Gamma", then leave "T Gamma". Everything goes to that build's delegate and room contract.
+//! - `load <node> <dir> T1,T2,...`: this build must show every tag's Alpha and Beta, with Alpha's
+//!   message, and no Gamma. Read back from the node: its current chat delegate holds each room
+//!   and each Gamma's tombstone; each Alpha is sent into, and the message is read back from the
+//!   room's CURRENT contract key.
+//! - `seed-late <node> <dir> T`: an older build again, after this one ran: create "T Delta" (a late
+//!   write from an earlier generation).
+//! - `load-late <node> <dir> T1,T2,...`: this build must show "T Delta" too, for the last tag.
 //!
-//! Only the River app's own API is used, so the file builds at the older commit too.
+//! Only API the older builds also have is used, so the file builds there too.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use river_app::chat::model::Room;
+use river_app::rooms::delegate::{self, Read};
+use river_app::rooms::socket::NodeSocket;
+use river_app::rooms::token::{TokenStore, node_dir};
 use river_app::rooms::{Access, Action, Command, Link, RoomsUpdate};
+use river_core::chat_delegate::ChatDelegateResponseMsg;
+use river_core::room_state::ChatRoomStateV1;
+use river_core::stored_rooms::{StoredRoomSlot, decode_room_slot, room_storage_key};
 
 const STEP: Duration = Duration::from_secs(240);
 
@@ -180,40 +190,132 @@ fn approve(authority: &str, url: &str) {
     println!("approved the grant");
 }
 
+/// A connection of its own to the node, with the app's grant.
+fn socket(authority: &str, dir: &Path) -> NodeSocket {
+    let token = TokenStore::in_dir(&node_dir(dir, authority, false))
+        .load()
+        .expect("the app's grant token");
+    let mut socket = NodeSocket::connect(authority, &token, &Default::default()).expect("connect");
+    socket
+        .set_read_timeout(Duration::from_secs(30))
+        .expect("a read timeout");
+    socket
+}
+
+fn owner_of(room: &Room) -> VerifyingKey {
+    let bytes: [u8; 32] = bs58::decode(&room.key)
+        .into_vec()
+        .expect("a base58 room key")
+        .try_into()
+        .expect("32 bytes");
+    VerifyingKey::from_bytes(&bytes).expect("the room key is the owner's key")
+}
+
+/// What this build's chat delegate holds for `owner`'s room.
+fn stored(authority: &str, dir: &Path, owner: &VerifyingKey) -> Option<StoredRoomSlot> {
+    let mut socket = socket(authority, dir);
+    socket
+        .send(&delegate::request(&Read::Get(room_storage_key(owner))))
+        .expect("send");
+    loop {
+        if let Ok(response @ HostResponse::DelegateResponse { .. }) = socket.recv().expect("recv")
+            && let Some(ChatDelegateResponseMsg::GetResponse { value, .. }) =
+                delegate::answers(&response).pop()
+        {
+            return value.map(|v| decode_room_slot(&v).expect("a slot the app reads"));
+        }
+    }
+}
+
+/// The messages under `owner`'s room's CURRENT contract key (this build's room contract).
+fn current_texts(authority: &str, dir: &Path, owner: &VerifyingKey) -> Vec<String> {
+    let mut socket = socket(authority, dir);
+    let key = river_app::rooms::create::contract_key(owner);
+    socket
+        .send(&ClientRequest::ContractOp(ContractRequest::Get {
+            key: *key.id(),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .expect("send");
+    loop {
+        match socket.recv().expect("recv") {
+            Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. })) => {
+                let state: ChatRoomStateV1 =
+                    ciborium::de::from_reader(state.as_ref()).expect("a room state");
+                return state
+                    .recent_messages
+                    .messages
+                    .iter()
+                    .filter_map(|m| m.message.content.as_public_string())
+                    .collect();
+            }
+            Ok(HostResponse::ContractResponse(ContractResponse::NotFound { .. })) => {
+                return Vec::new();
+            }
+            Ok(_) => {}
+            Err(e) => panic!("reading the current key failed: {e}"),
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let [_, mode, authority, dir] = args.as_slice() else {
-        panic!("usage: rekey_rehearsal seed|load|seed-late|load-late <node> <dir>");
+    let [_, mode, authority, dir, tags] = args.as_slice() else {
+        panic!("usage: rekey_rehearsal seed|load|seed-late|load-late <node> <dir> <tag[,tag...]>");
     };
+    let tags: Vec<&str> = tags.split(',').collect();
     let dir = PathBuf::from(dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut app = App::start(authority, &dir);
     app.until("connected", |app| app.ready);
+    let name = |t: &str, r: &str| format!("{t} {r}");
     match mode.as_str() {
         "seed" => {
-            app.create("Alpha");
-            app.say("Alpha", "before the re-key");
-            app.create("Beta");
-            app.create("Gamma");
-            let gamma = app.room("Gamma").unwrap().key.clone();
+            let t = tags[0];
+            app.create(&name(t, "Alpha"));
+            app.say(&name(t, "Alpha"), &format!("{t} before"));
+            app.create(&name(t, "Beta"));
+            app.create(&name(t, "Gamma"));
+            let gamma = app.room(&name(t, "Gamma")).unwrap().key.clone();
             app.send(&gamma, Action::LeaveRoom);
-            app.until("Gamma is left", |app| app.room("Gamma").is_none());
-            // Let the leave's writes finish before the run ends.
-            std::thread::sleep(Duration::from_secs(3));
-            app.until("Gamma stays left", |app| {
-                app.room("Gamma").is_none() && app.work.is_empty()
+            app.until("Gamma is left and every write is done", |app| {
+                app.room(&name(t, "Gamma")).is_none() && app.work.is_empty()
             });
+            // The leave's tombstone is in this build's store before the run ends.
+            let owner = {
+                let bytes: [u8; 32] = bs58::decode(&gamma).into_vec().unwrap().try_into().unwrap();
+                VerifyingKey::from_bytes(&bytes).unwrap()
+            };
+            let deadline = Instant::now() + STEP;
+            while !matches!(
+                stored(authority, &dir, &owner),
+                Some(StoredRoomSlot::Tombstone)
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "Gamma's tombstone was never stored"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
         "load" => {
+            let mut want: Vec<String> = tags
+                .iter()
+                .flat_map(|t| [name(t, "Alpha"), name(t, "Beta")])
+                .collect();
+            want.sort();
             app.until(
-                "Alpha and Beta are carried over, and Gamma stays left",
+                "every Alpha and Beta is carried over, and no Gamma",
                 |app| {
-                    app.names() == ["Alpha", "Beta"]
-                        && app.has_text("Alpha", "before the re-key")
+                    app.names() == want
+                        && tags
+                            .iter()
+                            .all(|t| app.has_text(&name(t, "Alpha"), &format!("{t} before")))
                         && app.work.is_empty()
                 },
             );
-            app.say("Alpha", "after the re-key");
             assert!(
                 app.work_seen
                     .iter()
@@ -221,20 +323,57 @@ fn main() {
                 "the list said nothing about carrying rooms over: {:?}",
                 app.work_seen
             );
+            for t in &tags {
+                let alpha = app.room(&name(t, "Alpha")).unwrap().clone();
+                let beta = app.room(&name(t, "Beta")).unwrap().clone();
+                for room in [&alpha, &beta] {
+                    assert!(
+                        matches!(
+                            stored(authority, &dir, &owner_of(room)),
+                            Some(StoredRoomSlot::Present(_))
+                        ),
+                        "{} is not in the current chat delegate",
+                        room.name
+                    );
+                }
+                let text = format!("{t} after");
+                app.say(&alpha.name, &text);
+                let owner = owner_of(&alpha);
+                let deadline = Instant::now() + STEP;
+                loop {
+                    let texts = current_texts(authority, &dir, &owner);
+                    if texts.contains(&text) && texts.contains(&format!("{t} before")) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{}'s current contract key never held both messages: {texts:?}",
+                        alpha.name
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                println!("ok: {} is under its current contract key", alpha.name);
+            }
         }
         "seed-late" => {
-            app.create("Delta");
-            app.say("Delta", "a late write");
+            let t = tags[0];
+            app.create(&name(t, "Delta"));
+            app.say(&name(t, "Delta"), &format!("{t} late"));
         }
         "load-late" => {
+            let t = tags[tags.len() - 1];
             app.until(
-                "Delta, written late by the older build, is carried over",
+                "Delta, written late by an older build, is carried over",
                 |app| {
-                    app.names() == ["Alpha", "Beta", "Delta"]
-                        && app.has_text("Delta", "a late write")
-                        && app.has_text("Alpha", "after the re-key")
+                    app.room(&name(t, "Delta")).is_some()
+                        && app.has_text(&name(t, "Delta"), &format!("{t} late"))
                 },
             );
+            let delta = owner_of(app.room(&name(t, "Delta")).unwrap());
+            assert!(matches!(
+                stored(authority, &dir, &delta),
+                Some(StoredRoomSlot::Present(_))
+            ));
         }
         other => panic!("unknown mode {other}"),
     }

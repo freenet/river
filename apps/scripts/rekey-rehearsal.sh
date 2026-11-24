@@ -1,34 +1,50 @@
 #!/usr/bin/env bash
 # Rehearsal of a re-key for the native app (freenet/river#889), on one isolated Freenet node.
+# Run it before every River publish that changes chat_delegate.wasm or room_contract.wasm, and
+# before the desktop release that carries them (.claude/rules/river-publish.md,
+# .claude/rules/desktop-release.md).
 #
-# An OLDER River app (built from <old commit>, whose chat delegate and room contract are earlier
-# generations than this checkout's) seeds the node: it creates three rooms, sends a message in one
-# and leaves another. Then this checkout's app runs on the same node and must show the two rooms
-# kept (with the message, which lives under the older room contract), not the one left, and send
-# under the current room contract. Then the older app writes a new room (a late write from an
-# earlier generation) and this checkout's app, started again, must show it too.
-# apps/river-app/examples/rekey_rehearsal.rs is the driver; it is copied into the older checkout.
+# Each OLDER River app given (built from that commit, whose chat delegate and room contract are
+# earlier generations than this checkout's) seeds the node under its own tag: it creates three
+# rooms, sends a message in one and leaves another. Then this checkout's app runs on the same
+# node and must show every kept room (with the message, which lives under the older room
+# contract), none left, hold them in its own chat delegate, and send under the current room
+# contract. Then the newest older app writes a new room (a late write from an earlier
+# generation) and this checkout's app, started again, must show it too.
+# apps/river-app/examples/rekey_rehearsal.rs is the driver; it is copied into each older checkout.
 #
-# Usage: apps/scripts/rekey-rehearsal.sh <work dir> <old commit>
+# Usage: apps/scripts/rekey-rehearsal.sh <work dir> [<old commit> ...]
+#   With no commit: the commit before the last change to ui/public/contracts/chat_delegate.wasm
+#   (the outgoing chat delegate, which is what a re-key publish strands). Give several, oldest
+#   first, to rehearse a skipped release too, e.g. `14d9632d e9dae028^`.
 #   FREENET_BIN          the freenet binary to run (default: freenet on PATH)
 #   REHEARSAL_PORT_BASE  first of the two ports used (default 39500): network, API
 #   CARGO                the cargo command (default: cargo), e.g. a wrapper that takes a lock
 #
+# Needs: git, cargo, freenet (0.2.156 or later: the app grant), b3sum, openssl, curl, od.
+# Each older commit is a full build of apps/ (several minutes); each step waits up to 4 minutes.
 # The node runs on loopback with no peers, its own empty directories and telemetry off. Nothing
 # outside <work dir> is written, apart from cargo's build output for this checkout.
 set -euo pipefail
 
-WORK="${1:?usage: $0 <work dir> <old commit>}"
-OLD="${2:?usage: $0 <work dir> <old commit>}"
+WORK="${1:?usage: $0 <work dir> [<old commit> ...]}"
+shift
+APPS="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$APPS/.." && pwd)"
+if [ "$#" -eq 0 ]; then
+  last=$(git -C "$REPO" log -1 --format=%H -- ui/public/contracts/chat_delegate.wasm)
+  set -- "$last^"
+fi
 FREENET_BIN="${FREENET_BIN:-freenet}"
 BASE="${REHEARSAL_PORT_BASE:-39500}"
 NET=$BASE API=$((BASE + 1))
-APPS="$(cd "$(dirname "$0")/.." && pwd)"
-REPO="$(cd "$APPS/.." && pwd)"
+for tool in git b3sum openssl curl od "$FREENET_BIN"; do
+  command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }
+done
 
 mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
-for d in node old app; do
+for d in node old0 app; do
   if [ -e "$WORK/$d" ]; then
     echo "$WORK/$d exists; use an empty work dir" >&2
     exit 1
@@ -42,6 +58,7 @@ openssl pkey -in "$WORK/node/x25519.pem" -outform DER | tail -c 32 | od -An -tx1
   > "$WORK/node/transport_keypair"
 
 NODE_PID=""
+TREES=()
 cleanup() {
   status=$?
   if [ -n "$NODE_PID" ]; then
@@ -49,7 +66,9 @@ cleanup() {
     for _ in $(seq 1 50); do kill -0 "$NODE_PID" 2>/dev/null || break; sleep 0.1; done
     kill -9 "$NODE_PID" 2>/dev/null || true
   fi
-  git -C "$REPO" worktree remove --force "$WORK/old" 2>/dev/null || true
+  for t in "${TREES[@]}"; do
+    git -C "$REPO" worktree remove --force "$t" 2>/dev/null || true
+  done
   if [ "$status" -ne 0 ]; then
     echo "--- last lines of the node's log"
     tail -n 40 "$WORK/node/stdout.log" 2>/dev/null || true
@@ -75,21 +94,36 @@ done
 [ "$up" = true ] || { echo "the node did not come up" >&2; exit 1; }
 echo "node up on API port $API"
 
-git -C "$REPO" worktree add --detach "$WORK/old" "$OLD" >/dev/null
-cp "$APPS/river-app/examples/rekey_rehearsal.rs" "$WORK/old/apps/river-app/examples/"
-old_delegate=$(b3sum --no-names "$WORK/old/ui/public/contracts/chat_delegate.wasm")
-old_room=$(b3sum --no-names "$WORK/old/ui/public/contracts/room_contract.wasm")
-echo "older build: chat delegate code hash $old_delegate, room contract $old_room"
-grep -q "$old_delegate" "$REPO/legacy_delegates.toml" \
-  || { echo "the older build's chat delegate is not an earlier generation here" >&2; exit 1; }
-grep -q "$old_room" "$REPO/common/legacy_room_contracts.toml" \
-  || { echo "the older build's room contract is not an earlier generation here" >&2; exit 1; }
+run_in() { (cd "$1" && ${CARGO:-cargo} run --locked -q -p river-app --example rekey_rehearsal -- "$2" "127.0.0.1:$API" "$WORK/app" "$3"); }
 
-run_old() { (cd "$WORK/old/apps" && ${CARGO:-cargo} run --locked -q -p river-app --example rekey_rehearsal -- "$1" "127.0.0.1:$API" "$WORK/app"); }
-run_new() { (cd "$APPS" && ${CARGO:-cargo} run --locked -q -p river-app --example rekey_rehearsal -- "$1" "127.0.0.1:$API" "$WORK/app"); }
-
-run_old seed
-run_new load
-run_old seed-late
-run_new load-late
+TAGS=()
+i=0
+for old in "$@"; do
+  tree="$WORK/old$i"
+  git -C "$REPO" worktree add --detach "$tree" "$old" >/dev/null
+  TREES+=("$tree")
+  cp "$APPS/river-app/examples/rekey_rehearsal.rs" "$tree/apps/river-app/examples/"
+  delegate_hash=$(b3sum --no-names "$tree/ui/public/contracts/chat_delegate.wasm")
+  room_hash=$(b3sum --no-names "$tree/ui/public/contracts/room_contract.wasm")
+  echo "older build $old: chat delegate $delegate_hash, room contract $room_hash"
+  current_delegate=$(b3sum --no-names "$REPO/ui/public/contracts/chat_delegate.wasm")
+  current_room=$(b3sum --no-names "$REPO/ui/public/contracts/room_contract.wasm")
+  if [ "$delegate_hash" != "$current_delegate" ]; then
+    grep -q "$delegate_hash" "$REPO/legacy_delegates.toml" \
+      || { echo "$old's chat delegate is not an earlier generation here" >&2; exit 1; }
+  fi
+  if [ "$room_hash" != "$current_room" ]; then
+    grep -q "$room_hash" "$REPO/common/legacy_room_contracts.toml" \
+      || { echo "$old's room contract is not an earlier generation here" >&2; exit 1; }
+  fi
+  tag="G$i"
+  run_in "$tree/apps" seed "$tag"
+  TAGS+=("$tag")
+  i=$((i + 1))
+done
+all=$(IFS=,; echo "${TAGS[*]}")
+last="${TAGS[${#TAGS[@]} - 1]}"
+run_in "$APPS" load "$all"
+run_in "${TREES[${#TREES[@]} - 1]}/apps" seed-late "$last"
+run_in "$APPS" load-late "$all"
 echo "rekey rehearsal passed"

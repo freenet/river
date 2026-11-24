@@ -29,7 +29,8 @@
 //!   invitation's secrets up to the room's current version.
 //!
 //! Where joining differs: the web UI publishes the joined room with a whole-state PUT. This
-//! app never PUTs a room it did not just create, so it sends the same additions as an UPDATE
+//! app PUTs a joined room only to move it to its current contract key after a re-key
+//! ([`super::rekey`]), so it sends the same additions as an UPDATE
 //! delta, as riverctl's `accept_invitation_struct` (`cli/src/api.rs`) does: the membership,
 //! the invite chain members the room lacks, the nickname record, the join event. Before
 //! anything is sent, the delta is applied to the room as read, and a room that would not

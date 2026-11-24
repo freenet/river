@@ -58,7 +58,9 @@
 //!   registered, that build showed "update this app" instead. Detecting a newer delegate
 //!   through River's pointer records and refusing to write closes this (`generation.rs`,
 //!   freenet/river#888). A desktop-only user's rooms are carried forward by this app itself
-//!   ([`super::carry`], #889), a task like the others here.
+//!   ([`super::carry`], #889), a background task like the moves of rooms to their current
+//!   contract key ([`super::rekey`]); a task the user asks for goes ahead of a background one at
+//!   its next request (one request is still out at a time).
 //! - **Schema skew.** The walk runs only over a complete current room set
 //!   (`room_set_complete`), which needs every stored slot and `rooms_meta` to decode. A slot
 //!   or meta written by this app in a shape an older web UI cannot decode refuses the walk
@@ -1426,7 +1428,10 @@ impl Work {
     /// be taken for. A read of an earlier chat delegate is not one: its answers name that
     /// delegate, its errors are typed delegate errors (an error that names nothing is never a
     /// delegate's: a delegate runs on the node itself, with no ring), and an `Unhandled` is taken
-    /// for it only when nothing else is out.
+    /// for it only when nothing else is out. So contract reads may go beside it; other delegate
+    /// requests may not: the signing key sweep and the read of the stored rooms wait while a task
+    /// works ([`Work::busy`]), and a typed error is taken for the read only when neither is out
+    /// ([`Work::set_delegate_shared`]).
     pub fn has_out(&self) -> bool {
         self.active_ref().is_some_and(|t| {
             t.out

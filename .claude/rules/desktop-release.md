@@ -60,14 +60,14 @@ The `verify` job runs `apps/desktop/packaging/verify-release.sh`, tested by `scr
 |---|---|
 | Tag version matches `apps/Cargo.toml` | |
 | The commit is on main | |
-| `ui/public/contracts/` is byte-identical to the latest `chore(publish): bump webapp contract version` commit on main's first-parent history | The app compiles in the chat delegate and room contract WASM and cannot migrate between keys, so it must carry exactly what the live web UI carries |
+| `ui/public/contracts/` is byte-identical to the latest `chore(publish): bump webapp contract version` commit on main's first-parent history | The app compiles in the chat delegate and room contract WASM and reads and writes the user's rooms under their keys, so it must carry exactly what the live web UI carries (it carries rooms forward from EARLIER keys, never to newer ones) |
 | Both WASMs' BLAKE3 hashes match `pointer-records.toml` | Same |
 
 If the WASM changed since the last UI publish, publish the UI first. The release notes record the published web UI version and both hashes, and list what the app does not do yet (direct messages, moderation, nickname edits, room upgrades).
 
 ## Re-keying publishes
 
-A re-keying River publish needs a new desktop release ready first. Once its pointer records are published, every installed desktop build is read-only until the user updates (`.claude/rules/river-publish.md`, step 7). That release must also carry a desktop-only user's rooms from the previous delegate key, which the app cannot do yet (freenet/river#889), so the first re-key after v0.1.0 waits on it.
+A re-keying River publish needs a new desktop release ready first. Once its pointer records are published, every installed desktop build is read-only until the user updates (`.claude/rules/river-publish.md`, step 7). The new release carries a desktop-only user's rooms from the earlier chat delegates and room-contract keys the registries list (`apps/river-app/src/rooms/carry.rs` and `rekey.rs`, freenet/river#889), so the registry rows the publish adds are all it needs. **Before tagging, run the rehearsal** on the release commit: `apps/scripts/rekey-rehearsal.sh <work dir>` (with no commit it seeds from the build before the last chat-delegate change; give older commits too, oldest first, to rehearse a skipped release). It must end with `rekey rehearsal passed`; record the command and result in the release PR.
 
 ## What CI checks per platform
 

@@ -654,6 +654,8 @@ struct World {
     drop_on_legacy_get: Option<Vec<u8>>,
     /// Refuse this many PUTs before taking one.
     refuse_puts: usize,
+    /// Answer a subscribing GET of these rooms with a `ContractError::Get` (no route).
+    subscribe_errors: HashSet<ContractInstanceId>,
 }
 
 /// How the fake node answers signing key requests.
@@ -1345,6 +1347,19 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
         }) => {
             w.subscribes.push(id);
             if subscribe && w.ignore_subscribes.contains(&id) {
+                return out;
+            }
+            if subscribe && w.subscribe_errors.contains(&id) {
+                let key = w.contracts.get(&id).map(|(k, _)| *k);
+                if let Some(key) = key {
+                    out.push(encode(Err(ErrorKind::RequestError(
+                        RequestError::ContractError(ContractError::Get {
+                            key,
+                            cause: "no route".into(),
+                        }),
+                    )
+                    .into())));
+                }
                 return out;
             }
             let mut from = id;
@@ -10451,24 +10466,24 @@ mod rekey {
             w.slots.insert(room_storage_key(&room.vk()), room.slot());
             w.contracts
                 .insert(*earlier.id(), (earlier, Contract::State(cbor(&room.state))));
-            w.ignore_subscribes.insert(*current.id());
-            let error: Result<HostResponse, ClientError> = Err(ErrorKind::RequestError(
-                RequestError::ContractError(ContractError::Subscribe {
-                    key: current,
-                    cause: "no route".into(),
-                }),
-            )
-            .into());
-            w.push
-                .push(Message::Binary(bincode::serialize(&error).unwrap().into()));
+            w.contracts
+                .insert(*current.id(), (current, Contract::NotFound));
+            w.subscribe_errors.insert(*current.id());
         });
-        let session = start(&node, "rekey-not-notfound", quick());
-        session.wait_until("the subscribe was asked", || {
-            node.with(|w| w.subscribes_to(*current.id()) >= 1)
+        let pace = Pace {
+            resubscribe_first: Duration::from_millis(20),
+            resubscribe_max: Duration::from_millis(40),
+            ..quick()
+        };
+        let session = start(&node, "rekey-not-notfound", pace);
+        session.wait_until("the subscribe failed a few times", || {
+            node.with(|w| w.subscribes_to(*current.id()) >= 3)
         });
-        std::thread::sleep(Duration::from_millis(300));
         node.with(|w| {
-            assert!(w.reads.iter().all(|(id, _)| id != earlier.id()));
+            assert!(
+                w.reads.iter().all(|(id, _)| id != earlier.id()),
+                "an earlier key was read"
+            );
             assert!(w.puts.is_empty());
         });
         drop(session);
