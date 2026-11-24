@@ -126,9 +126,15 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
+  # Format, clippy and unit tests. The screen renders and the self-update checks
+  # are separate jobs below so the three run in parallel: run in sequence they
+  # took about 20 minutes on main and hit the 30-minute limit on branches. All
+  # three restore one rust-cache key; only this job saves it, because it builds the
+  # most (dev-dependencies, clippy, tests). A faster job saving first would store a
+  # cache without those and every later run would rebuild them here.
   desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: apps
@@ -149,6 +155,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps
+          shared-key: apps-desktop
 
       - name: Format
         run: cargo fmt --all --check
@@ -158,6 +165,35 @@ jobs:
 
       - name: Tests
         run: cargo test --locked
+
+  # Render every named screen headlessly and keep the PNGs for review (the step's
+  # comment says what it does and does not check).
+  desktop-screens:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: apps
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rune links libxkbcommon and libwayland-client at build time; the
+      # software Vulkan driver lets the headless renderer run with no GPU.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev mesa-vulkan-drivers
+
+      # apps/rust-toolchain.toml pins the compiler; this installs it.
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+          shared-key: apps-desktop
+          # Restore only: the desktop job saves this key (see the comment above it).
+          save-if: false
 
       # Render every named screen (setup and chat) and keep the PNGs for review. This
       # fails when rendering panics or writes nothing; it does not compare
@@ -187,18 +223,46 @@ jobs:
             test -s "snapshots/$scene.png"
           done
 
-      # River's self-update against a local server with a throwaway key: a current manifest
-      # is "up to date", and tampered, unsigned, wrongly signed and replayed manifests are
-      # refused with the installed binary unchanged (see the script's header).
-      - name: Self-update checks
-        run: scripts/update-ci.sh
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: setup-screens
           path: apps/snapshots/
           if-no-files-found: ignore
+
+  # River's self-update checks against a local server (see the step's comment).
+  desktop-update-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rune links libxkbcommon and libwayland-client at build time. This job renders
+      # nothing; it installs the same packages as the other two so the builds match.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev mesa-vulkan-drivers
+
+      # apps/rust-toolchain.toml pins the compiler; this installs it.
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+          shared-key: apps-desktop
+          # Restore only: the desktop job saves this key (see the comment above it).
+          save-if: false
+
+      # River's self-update against a local server with a throwaway key: a current manifest
+      # is "up to date", and tampered, unsigned, wrongly signed and replayed manifests are
+      # refused with the installed binary unchanged (see the script's header).
+      - name: Self-update checks
+        run: scripts/update-ci.sh
 
   # The app on two Freenet nodes River never ran on (apps/scripts/fresh-node-e2e.sh):
   # it registers the chat delegate on each, creates a room and an invitation on one,
