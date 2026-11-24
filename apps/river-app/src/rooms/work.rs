@@ -755,6 +755,9 @@ impl Task {
                 c.checked(value);
                 return Ok(None);
             }
+            if let carry::Write::Slot(..) = write {
+                c.slot_seen(value);
+            }
             return write.decide(value).map_err(|e| {
                 format!(
                     "River's room list in its storage can't be read by this app ({e}), so the \
@@ -1437,13 +1440,6 @@ impl Work {
         self.delegate_shared = shared;
     }
 
-    /// Forget the reads given up on of keys the session itself asks for (a room followed under
-    /// its earlier key while it moves): an answer for one of them is the session's, and both
-    /// are GETs of one key, so nothing is lost by taking it as such.
-    pub fn forget_late(&mut self, followed: &[ContractInstanceId]) {
-        self.late.retain(|id, _| !followed.contains(id));
-    }
-
     /// Whether a read of an earlier room-contract key was given up on and may still answer, so an
     /// error that names nothing could be its.
     pub fn has_late(&self) -> bool {
@@ -1744,6 +1740,18 @@ impl Work {
 
     /// A contract answer. True when it was the working task's.
     pub fn on_contract(&mut self, response: &ContractResponse) -> bool {
+        self.on_contract_beside(response, &|_| false)
+    }
+
+    /// [`Work::on_contract`], when the session itself awaits an answer for some keys
+    /// (`session_awaits`: a subscribe or a read of a room it follows, which during a move can be
+    /// a key a move gave up reading). Such an answer is the session's: it is not taken as the
+    /// late read's, whose entry stays, so an error naming nothing is still not blamed on others.
+    pub fn on_contract_beside(
+        &mut self,
+        response: &ContractResponse,
+        session_awaits: &dyn Fn(&ContractInstanceId) -> bool,
+    ) -> bool {
         // An answer to a read of an earlier key given up on: nobody else asked for that key.
         let named = match response {
             ContractResponse::GetResponse { key, .. } => Some(*key.id()),
@@ -1751,8 +1759,10 @@ impl Work {
             _ => None,
         };
         if let Some(id) = named
-            && self.late.remove(&id).is_some()
+            && self.late.contains_key(&id)
+            && !session_awaits(&id)
         {
+            self.late.remove(&id);
             // The same key asked again (a probe tried again) takes it as its own answer: both
             // are GETs of one key. Otherwise it is nobody's.
             let awaited = self.active_ref().is_some_and(|t| {

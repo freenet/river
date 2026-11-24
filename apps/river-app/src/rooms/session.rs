@@ -969,7 +969,6 @@ fn follow_on(
             }
             None => {}
         }
-        rooms.forget_followed_late();
         if let Err(e) = subs.ask_due(socket, &|id| resyncs.is_out(id)) {
             return e;
         }
@@ -1158,7 +1157,10 @@ fn follow_on(
         };
         // A create's or join's own answer is its alone (`work` takes only what it awaits).
         if let Some(Ok(HostResponse::ContractResponse(r))) = &response
-            && rooms.outbox.work.on_contract(r)
+            && rooms
+                .outbox
+                .work
+                .on_contract_beside(r, &|id| subs.pending.contains_key(id) || resyncs.is_out(id))
         {
             rooms.report(status, report);
             continue;
@@ -1299,17 +1301,7 @@ fn follow_on(
                 let mut taken_by_work = false;
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
-                let alone = OtherOut {
-                    subscribing: !subs.pending.is_empty(),
-                    reading_rooms: resyncs.any_out(),
-                    reading_store: reload.is_some(),
-                    key_request: rooms.keys.busy(),
-                    update_owed: rooms
-                        .list
-                        .iter()
-                        .any(|r| rooms.outbox.owes(&r.stored.owner_vk)),
-                }
-                .none();
+                let alone = other_out(&subs, &resyncs, reload.is_some(), rooms).none();
                 // A read given up on may still fail (the node retries a GET, each attempt up to
                 // a minute): an error naming nothing, or naming its room with no other request
                 // out for that room, may be that read's, so it is claimed by nobody. What else
@@ -1488,6 +1480,25 @@ struct OtherOut {
     reading_store: bool,
     key_request: bool,
     update_owed: bool,
+}
+
+/// What else is out on the connection now.
+fn other_out(
+    subs: &Subscriptions,
+    resyncs: &Resyncs,
+    reading_store: bool,
+    rooms: &Rooms,
+) -> OtherOut {
+    OtherOut {
+        subscribing: !subs.pending.is_empty(),
+        reading_rooms: resyncs.any_out(),
+        reading_store,
+        key_request: rooms.keys.busy(),
+        update_owed: rooms
+            .list
+            .iter()
+            .any(|r| rooms.outbox.owes(&r.stored.owner_vk)),
+    }
 }
 
 impl OtherOut {
@@ -3367,6 +3378,8 @@ impl Rooms {
         self.on_earlier.insert(owner);
         let room = self.list.iter_mut().find(|r| r.stored.owner_vk == owner)?;
         room.stored.contract_key = earlier;
+        // Answers owed under the key left won't come under this one (as `replace` does).
+        self.outbox.forget_owed(&owner);
         Some(*earlier.id())
     }
 
@@ -3381,13 +3394,6 @@ impl Rooms {
         let mut owed = vec![earlier];
         owed.extend(self.owed.get(owner).into_iter().flatten().copied());
         super::rekey::candidates_down_to_owed(owner, &owed)
-    }
-
-    /// A room followed under a key a move gave up reading: its answers are the session's, so the
-    /// move's work stops treating that key as a read given up on.
-    fn forget_followed_late(&mut self) {
-        let followed = self.contract_ids();
-        self.outbox.work.forget_late(&followed);
     }
 
     /// Start moving `owner`'s room from the earlier keys `candidates`.
@@ -3436,6 +3442,8 @@ impl Rooms {
                 let current = super::create::contract_key(&owner);
                 if let Some(room) = self.list.iter_mut().find(|r| r.stored.owner_vk == owner) {
                     room.stored.contract_key = current;
+                    // Answers owed under the key left won't come under this one.
+                    self.outbox.forget_owed(&owner);
                     follow.push(*current.id());
                 }
                 // Keys still owed are read again a bounded number of times a run (the web UI

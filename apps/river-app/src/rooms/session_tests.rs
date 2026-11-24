@@ -10284,6 +10284,38 @@ mod rekey {
         });
     }
 
+    /// Another writer (a browser tab carrying the same room) stores the same copy first: the
+    /// rank the carry added is right for it and stays.
+    #[test]
+    fn the_rank_stays_when_another_writer_stored_the_same_room_first() {
+        let node = fake_node(vec![]);
+        let a = TestRoom::new(1, "A", 1, &["a1"]);
+        let newest = predecessors()[0].key.clone();
+        let slot_key = room_storage_key(&a.vk());
+        node.with(|w| {
+            on_network(w, &[&a]);
+            w.legacy.insert(
+                newest.clone(),
+                legacy_store(vec![(slot_key.clone(), a.slot())]),
+            );
+            let (k, v) = (slot_key.clone(), a.slot());
+            w.before_cas = Some(Box::new(move |slots, generations, key| {
+                if key == k.as_slice() && !slots.contains_key(&k) {
+                    slots.insert(k.clone(), v.clone());
+                    generations.insert(k.clone(), 1);
+                }
+            }));
+        });
+        let session = start(&node, "carry-same-copy", quick());
+        session.wait_until("the carry is over", || {
+            node.with(|w| w.cas.iter().any(|(k, taken)| *k == slot_key && !taken))
+                && carrying_done(&session)
+        });
+        node.with(|w| {
+            assert_eq!(identity_sources(w), vec![(a.vk(), dk(&newest))]);
+        });
+    }
+
     /// A store that keeps changing under the carry's write fails it after the web UI's number
     /// of attempts, with Try again.
     #[test]
@@ -10837,26 +10869,74 @@ mod rekey_state {
         assert_eq!(moves as u32, 1 + MAX_FOLD_RETRIES);
     }
 
-    /// A key a move gave up reading is no longer treated as such once the room is followed
-    /// under it: its answers are the session's.
+    /// Switching the key a room is followed under, in place, forgets the update answers owed
+    /// under the key left: they won't come under the new one, and the next send goes at once.
     #[test]
-    fn a_followed_key_is_not_a_read_given_up_on() {
-        let (mut rooms, room, earlier) = rekeyed(8);
+    fn switching_a_rooms_key_forgets_the_answers_owed_under_the_old_one() {
+        let (mut rooms, room, _) = rekeyed(9);
         let current = *contract_key(&room.vk()).id();
-        rooms.seed_if_rekeyed(&current);
+        let pace = pace();
         let t0 = Instant::now();
-        let work = &mut rooms.outbox.work;
-        let _ = work.next_request(false, t0);
-        assert!(!work.expire(
-            Duration::from_secs(20),
-            Duration::from_secs(60),
-            t0 + Duration::from_secs(61)
-        ));
-        assert!(work.has_late());
-        // The room is followed under that key meanwhile.
-        assert_eq!(rooms.contract_ids(), vec![*earlier.id()]);
-        rooms.forget_followed_late();
-        assert!(!rooms.outbox.work.has_late());
+        let out = |rooms: &mut Rooms| {
+            let live = &rooms.list[0];
+            assert!(rooms.outbox.command(live, say("out")));
+            let mut changed = false;
+            assert!(rooms.outbox.next_update(live, t0, &mut changed).is_some());
+            assert!(rooms.outbox.owes(&room.vk()));
+        };
+        // Under the current key, then switched to the earlier one for the move.
+        out(&mut rooms);
+        rooms.seed_if_rekeyed(&current);
+        assert!(!rooms.outbox.owes(&room.vk()));
+        // Under the earlier key, then switched back once moved.
+        out(&mut rooms);
+        drive(&mut rooms, t0, Ok(()));
+        rooms.seed_ends(&pace, t0);
+        assert_eq!(rooms.contract_ids(), vec![current]);
+        assert!(!rooms.outbox.owes(&room.vk()));
+    }
+
+    /// Each request that may be out reaches its own field of what is out (a swap at the call
+    /// site would make an error naming nothing the wrong request's).
+    #[test]
+    fn what_is_out_is_read_from_each_request() {
+        let a = TestRoom::new(10, "A", 1, &["a1"]);
+        let mut rooms = Rooms::default();
+        rooms.replace(loaded(vec![a.stored()]));
+        let mut subs = Subscriptions::default();
+        let resyncs = Resyncs::new(Instant::now());
+        let o = other_out(&subs, &resyncs, false, &rooms);
+        assert!(o.none(), "{o:?}");
+        let o = other_out(&subs, &resyncs, true, &rooms);
+        assert!(o.reading_store && !o.key_request && !o.subscribing, "{o:?}");
+        // A signing key request out.
+        assert!(
+            rooms
+                .keys
+                .next_request(&rooms.list, true, Instant::now())
+                .is_some()
+        );
+        let o = other_out(&subs, &resyncs, false, &rooms);
+        assert!(
+            o.key_request && !o.reading_store && !o.subscribing && !o.update_owed,
+            "{o:?}"
+        );
+        rooms.keys = Default::default();
+        subs.pending.insert(a.id(), Instant::now());
+        let o = other_out(&subs, &resyncs, false, &rooms);
+        assert!(o.subscribing && !o.key_request && !o.reading_store, "{o:?}");
+        subs.pending.clear();
+        let live = &rooms.list[0];
+        assert!(rooms.outbox.command(live, say("out")));
+        let mut changed = false;
+        assert!(
+            rooms
+                .outbox
+                .next_update(live, Instant::now(), &mut changed)
+                .is_some()
+        );
+        let o = other_out(&subs, &resyncs, false, &rooms);
+        assert!(o.update_owed && !o.subscribing && !o.key_request, "{o:?}");
     }
 
     #[test]

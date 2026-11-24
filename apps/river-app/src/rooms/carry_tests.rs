@@ -1071,3 +1071,40 @@ fn a_rank_is_taken_out_with_every_other_field_kept() {
     assert_eq!(meta_without_source(None, &b, &[37; 32]).unwrap(), None);
     assert!(meta_without_source(Some(b"garbage"), &b, &[37; 32]).is_err());
 }
+
+/// Another writer that stored the same room under the same identity carried the same copy: the
+/// rank stays. Under another identity it is taken out, and a removal not made yet is made first
+/// after Try again.
+#[test]
+fn a_lost_slot_keeps_the_rank_for_the_same_identity_and_removes_it_otherwise() {
+    let stores: Stores = BTreeMap::from([(39, store(vec![(key(1), slot(1, 11))]))]);
+    let run = |theirs: Vec<u8>| {
+        let mut c = Carry::new(preds(&[39]), Vec::new(), true);
+        walk_reads(&mut c, &stores, &[]);
+        assert!(matches!(c.write(), Some(Write::Check(_))));
+        c.checked(None);
+        c.written(false);
+        assert!(matches!(c.write(), Some(Write::AddRank(..))));
+        c.written(true);
+        assert!(matches!(c.write(), Some(Write::Slot(..))));
+        c.slot_seen(Some(&theirs));
+        c.written(false);
+        c
+    };
+    let mut same = run(slot(1, 11));
+    assert!(same.write().is_none(), "the same identity keeps the rank");
+    let mut other = run(slot(1, 99));
+    assert_eq!(
+        other.write(),
+        Some(Write::RemoveRank(owner(1).verifying_key(), [39; 32]))
+    );
+    // Cut off (the rank write failed, or the user tried again): it is kept and made first.
+    other.restart();
+    assert!(other.writes_left());
+    assert_eq!(
+        other.write(),
+        Some(Write::RemoveRank(owner(1).verifying_key(), [39; 32]))
+    );
+    other.written(true);
+    assert!(other.write().is_none());
+}

@@ -3189,8 +3189,8 @@ fn a_late_read_expires_and_a_new_read_of_the_key_keeps_its_answer() {
     assert!(!w.has_late());
 }
 
-/// An error that names a key a move gave up reading is that read's, nobody else's; and a key
-/// the session follows is no longer treated as given up (its answers are the session's).
+/// An error that names a key a move gave up reading is that read's, nobody else's; and an
+/// answer the session itself awaits is the session's, while the late entry stays.
 #[test]
 fn an_error_naming_a_key_given_up_on_and_a_followed_key() {
     let owner_sk = SigningKey::from_bytes(&[70; 32]);
@@ -3219,7 +3219,8 @@ fn an_error_naming_a_key_given_up_on_and_a_followed_key() {
         .into();
     assert!(w.on_error(&named, false, &|_| false));
     assert!(!w.has_late());
-    // A key followed by the session is forgotten as late: its answer reaches the session.
+    // An answer the session itself awaits (its subscribe to a key a move follows) is the
+    // session's, not the late read's; the late entry stays, for errors that name nothing.
     let mut w = Work::default();
     w.seed(
         owner,
@@ -3229,9 +3230,12 @@ fn an_error_naming_a_key_given_up_on_and_a_followed_key() {
     );
     let _ = w.next_request(false, t0);
     assert!(!w.expire(Duration::from_secs(20), Duration::from_secs(60), gave_up));
-    w.forget_late(&[*earlier[0].id()]);
+    let answer = ContractResponse::NotFound {
+        instance_id: *earlier[0].id(),
+    };
+    assert!(!w.on_contract_beside(&answer, &|id| *id == *earlier[0].id()));
+    assert!(w.has_late());
+    // Not awaited by the session: nobody's.
+    assert!(w.on_contract(&answer));
     assert!(!w.has_late());
-    assert!(!w.on_contract(&ContractResponse::NotFound {
-        instance_id: *earlier[0].id()
-    }));
 }

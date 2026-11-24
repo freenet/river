@@ -65,9 +65,13 @@
 //! a room the store holds by now is skipped. The rank is written BEFORE the room's slot, so a
 //! quit between the two can't leave a carried room unranked (which the web UI would read as
 //! authoritative for good); an entry another writer made for the room is never replaced; when
-//! another writer stored the room first, the exact entry this carry added (and only if it added
-//! one) is taken out again. A rank write that can't be made fails the carry with Try again,
-//! before the slot. A room written is never carried again, Try again included.
+//! another writer stored the room first under another identity, the exact entry this carry
+//! added (and only if it added one) is taken out again; under the same identity it stays (both
+//! carried the same copy, so the rank is right). A removal not made yet is kept across Try again
+//! and made first. A rank write that can't be made fails the carry with Try again, before the
+//! slot. A room written is never carried again, Try again included. Residual: a quit after the
+//! rank write and before the slot leaves the rank; if another writer then stores the room under
+//! another identity before the next walk, that rank stays with it.
 //!
 //! The room is written as [`NewRoom`], the fields this app already writes for a room it creates
 //! or joins, which the `stored_rooms_drift` tests in `ui/src/room_data.rs` pin as decodable by
@@ -377,7 +381,6 @@ enum WriteStep {
     Check,
     Rank,
     Slot,
-    Unrank,
 }
 
 /// What decides a room key, as found.
@@ -436,6 +439,13 @@ pub struct Carry {
     check_empty: bool,
     /// This carry's rank write for the room changed `rooms_meta`.
     rank_added: bool,
+    /// The slot write found the same room under the same identity there.
+    same_identity: bool,
+    /// Ranks this carry added for rooms another writer stored first: to take out, kept across
+    /// Try again.
+    unranks: Vec<(VerifyingKey, [u8; 32])>,
+    /// The write being made is the first of `unranks`.
+    unranking: bool,
     /// Predecessors the node does not hold.
     pub not_installed: usize,
     /// Rooms written.
@@ -472,6 +482,9 @@ impl Carry {
             write_step: WriteStep::Check,
             check_empty: false,
             rank_added: false,
+            same_identity: false,
+            unranks: Vec::new(),
+            unranking: false,
             not_installed: 0,
             carried: 0,
             tombstones: 0,
@@ -863,10 +876,18 @@ impl Carry {
     /// authoritative for good); and when another writer stores the room first after all, the
     /// rank this carry added (only that, and only if it added one) is taken out again.
     pub fn write(&mut self) -> Option<Write> {
+        // A rank still to take out (a lost slot), before anything else, Try again included.
+        if self.writing.is_none()
+            && let Some(&(room, delegate)) = self.unranks.first()
+        {
+            self.unranking = true;
+            return Some(Write::RemoveRank(room, delegate));
+        }
         if self.writing.is_none() {
             self.writing = self.writes.pop_front();
             self.write_step = WriteStep::Check;
             self.rank_added = false;
+            self.same_identity = false;
         }
         let key = self.writing.clone()?;
         let found = self.found.get(&key)?;
@@ -874,7 +895,6 @@ impl Carry {
             (Item::Room(..), WriteStep::Check) => Write::Check(key),
             (Item::Room(_, owner), WriteStep::Rank) => Write::AddRank(**owner, found.delegate),
             (Item::Room(bytes, _), WriteStep::Slot) => Write::Slot(key, bytes.to_vec()),
-            (Item::Room(_, owner), WriteStep::Unrank) => Write::RemoveRank(**owner, found.delegate),
             (Item::Tombstone, _) => Write::Slot(key, tombstone_bytes()),
         })
     }
@@ -884,9 +904,36 @@ impl Carry {
         self.check_empty = current.is_none_or(<[u8]>::is_empty);
     }
 
+    /// What the room key holds when the slot write reads it: whether it is the same room under
+    /// the same identity as the one being carried (another writer carried it too, so the rank
+    /// added is right and stays).
+    pub fn slot_seen(&mut self, current: Option<&[u8]>) {
+        let Some(key) = &self.writing else {
+            return;
+        };
+        let ours = match self.found.get(key).map(|f| &f.item) {
+            Some(Item::Room(bytes, _)) => match decode_room_slot(bytes) {
+                Ok(StoredRoomSlot::Present(r)) => r.self_verifying_key(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let theirs = match current.map(decode_room_slot) {
+            Some(Ok(StoredRoomSlot::Present(r))) => r.self_verifying_key(),
+            _ => None,
+        };
+        self.same_identity = ours.is_some() && ours == theirs;
+    }
+
     /// The write being made ended. For a slot: `stored`, or the key held something already
     /// (which wins). For a rank: `stored` when it changed `rooms_meta`.
     pub fn written(&mut self, stored: bool) {
+        if std::mem::take(&mut self.unranking) {
+            if !self.unranks.is_empty() {
+                self.unranks.remove(0);
+            }
+            return;
+        }
         let Some(key) = self.writing.clone() else {
             return;
         };
@@ -899,10 +946,6 @@ impl Carry {
             (WriteStep::Rank, true) => {
                 self.rank_added = stored;
                 self.write_step = WriteStep::Slot;
-                return;
-            }
-            (WriteStep::Slot, true) if !stored && self.rank_added => {
-                self.write_step = WriteStep::Unrank;
                 return;
             }
             _ => {}
@@ -918,6 +961,11 @@ impl Carry {
                 self.carried += 1;
                 eprintln!("River: carried a room over from {}", found.version);
             }
+            // Another writer stored the room first, under another identity (or something else):
+            // the rank this carry added is not that room's, so it is taken out.
+            (Item::Room(_, owner), WriteStep::Slot) if self.rank_added && !self.same_identity => {
+                self.unranks.push((*owner, found.delegate));
+            }
             (Item::Tombstone, _) if stored => self.tombstones += 1,
             _ => {}
         }
@@ -925,7 +973,7 @@ impl Carry {
 
     /// Whether writes remain.
     pub fn writes_left(&self) -> bool {
-        self.writing.is_some() || !self.writes.is_empty()
+        self.writing.is_some() || !self.writes.is_empty() || !self.unranks.is_empty()
     }
 
     /// Start again (Try again): read every predecessor again. What was written stays written
@@ -940,6 +988,8 @@ impl Carry {
         self.stopped = None;
         self.writes.clear();
         self.writing = None;
+        // The ranks still to take out stay: they are taken out first.
+        self.unranking = false;
         self.not_installed = 0;
         self.began = None;
     }
