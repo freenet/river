@@ -60,13 +60,18 @@ impl ContractInterface for Contract {
             let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-            // Validate deltas incrementally: the stored state passed
-            // `validate_state` on this node, so the signatures its `verify`
-            // relies on are recorded as already checked and only signatures a
-            // delta adds cost crypto. Apply, cleanup and the whole-state check
-            // below are the unchanged rules. A seeding failure (a stored state
-            // that no longer verifies) continues unseeded, which is correct but
-            // slower. `seed_from` is called from here and nowhere else.
+            // Validate deltas incrementally. freenet-core stores only states
+            // that passed `validate_state`, so the signatures the stored
+            // state's `verify` relies on are recorded as already checked, and
+            // only signatures a delta adds cost crypto. Apply, cleanup and
+            // the whole-state check below are the unchanged rules. This
+            // relies on the stored state being valid: a stored state that
+            // is not (disk damage) seeds its bad signatures as good, and
+            // the output check below cannot see them. The host's own
+            // `validate_state` of the result, which it runs today, is what
+            // refuses such a state. A seeding error (a structural fault in
+            // the stored state) continues unseeded. `seed_from` is called
+            // from here and nowhere else.
             let _ = river_core::room_state::sigcheck::seed_from(|| {
                 chat_state.verify(&chat_state, &parameters)
             });
@@ -121,9 +126,9 @@ impl ContractInterface for Contract {
             into_writer(&chat_state, &mut updated_state)
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-            // The same whole-state check `validate_state` runs, on the result, so
-            // an `Ok` here is a state that passes `validate_state`. Its
-            // signature checks are memo hits.
+            // The same whole-state check `validate_state` runs, on the result.
+            // For a valid stored state, an `Ok` here is a state that passes
+            // `validate_state`; its signature checks are memo hits.
             chat_state
                 .validate_whole_state(&parameters, &updated_state)
                 .map_err(|e| ContractError::InvalidUpdateWithInfo {

@@ -29,13 +29,25 @@ thread_local! {
     /// Facts recorded while assuming; merged into `MEMO` only if the seeding
     /// run returned `Ok`.
     static ASSUMED: RefCell<Option<HashMap<Fact, bool>>> = const { RefCell::new(None) };
+    #[cfg(any(test, feature = "sig-counters"))]
     static REAL_CHECKS: Cell<usize> = const { Cell::new(0) };
+    /// Set when a seeding run succeeded in this scope: the memo then holds
+    /// facts taken on trust from the stored state.
+    static SEEDED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Real ed25519 checks run on this thread so far: a deterministic cost
-/// counter for tests and benchmarks.
+/// counter for tests and benchmarks (feature `sig-counters`).
+#[cfg(any(test, feature = "sig-counters"))]
 pub fn real_checks() -> usize {
     REAL_CHECKS.with(|c| c.get())
+}
+
+/// Whether the memo in this scope holds facts taken on trust from a seeding
+/// run (so a debug-only cross-check that re-derives answers with real crypto
+/// may legitimately differ from it on a stored state that was not valid).
+pub fn seeded() -> bool {
+    SEEDED.with(|c| c.get())
 }
 
 /// Whether a memo scope is active on this thread.
@@ -74,6 +86,7 @@ pub(crate) fn verify(
             return Ok(());
         }
     }
+    #[cfg(any(test, feature = "sig-counters"))]
     REAL_CHECKS.with(|c| c.set(c.get() + 1));
     let result = match kind {
         Kind::Plain => vk.verify(msg, sig),
@@ -105,6 +118,7 @@ pub fn scope<R>(f: impl FnOnce() -> R) -> R {
         fn drop(&mut self) {
             MEMO.with(|m| *m.borrow_mut() = None);
             ASSUMED.with(|a| *a.borrow_mut() = None);
+            SEEDED.with(|c| c.set(false));
         }
     }
     let outermost = MEMO.with(|m| {
@@ -116,7 +130,7 @@ pub fn scope<R>(f: impl FnOnce() -> R) -> R {
             false
         }
     });
-    let _clear = outermost.then_some(Clear);
+    let _clear = outermost.then(|| Clear);
     f()
 }
 
@@ -126,8 +140,12 @@ pub fn scope<R>(f: impl FnOnce() -> R) -> R {
 /// entries made meanwhile, are kept only if `f` returned `Ok`; on `Err` they
 /// are all discarded, so a failed seeding leaves no unchecked fact behind.
 ///
-/// Sound only because every signature check inside `verify` is mandatory (a
-/// false result makes `verify` return `Err`). Do not add a check inside any
+/// Sound only for a stored state that really validates (the host stores only
+/// validated states), and only because every signature check inside `verify`
+/// is mandatory (a false result makes `verify` return `Err`). In assume mode
+/// a bad signature cannot make `verify` fail, so seeding failing means a
+/// structural fault, not a bad signature: a stored state with a bad signature
+/// seeds as valid. Do not add a check inside any
 /// field's `verify` that tolerates a bad signature. Called from exactly one
 /// place, the room contract's `update_state`.
 pub fn seed_from<R, E>(f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
@@ -150,11 +168,14 @@ pub fn seed_from<R, E>(f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
     let assumed = ASSUMED.with(|a| a.borrow_mut().take());
     drop(guard);
     match (&result, assumed) {
-        (Ok(_), Some(assumed)) => MEMO.with(|m| {
-            if let Some(m) = m.borrow_mut().as_mut() {
-                m.extend(assumed);
-            }
-        }),
+        (Ok(_), Some(assumed)) => {
+            MEMO.with(|m| {
+                if let Some(m) = m.borrow_mut().as_mut() {
+                    m.extend(assumed);
+                }
+            });
+            SEEDED.with(|c| c.set(true));
+        }
         _ => {
             MEMO.with(|m| *m.borrow_mut() = before.0);
             crate::room_state::ban::signature_memo::restore(before.1);
@@ -170,8 +191,10 @@ pub(crate) fn set_aside<R>(f: impl FnOnce() -> R) -> R {
     let held = MEMO.with(|m| m.borrow_mut().take());
     // The cross-check exists only in debug builds, so its checks are not
     // counted: the counter reports what a release build does.
+    #[cfg(any(test, feature = "sig-counters"))]
     let counted = REAL_CHECKS.with(|c| c.get());
     let r = f();
+    #[cfg(any(test, feature = "sig-counters"))]
     REAL_CHECKS.with(|c| c.set(counted));
     MEMO.with(|m| *m.borrow_mut() = held);
     r

@@ -923,13 +923,18 @@ impl ChatRoomStateV1 {
         // converges, which no test would otherwise notice.
         //
         // `debug_assert` so the release WASM pays nothing.
+        // Skipped when the memo was seeded from a stored state: the cross-check
+        // re-derives its set with real crypto, so it can differ from a memo
+        // seeded on a stored state that was not valid.
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            dm_apply_time_ban_set, enforced_banned_ids,
-            "enforced_ban_set_of (at DM apply) diverged from step 0's enforced_banned_ids; \
+        if !crate::room_state::sigcheck::seeded() {
+            debug_assert_eq!(
+                dm_apply_time_ban_set, enforced_banned_ids,
+                "enforced_ban_set_of (at DM apply) diverged from step 0's enforced_banned_ids; \
              the apply-time DM sweep and the step-6 sweep are no longer the same predicate \
              (freenet/river#675)"
-        );
+            );
+        }
         self.members
             .members
             .retain(|m| !enforced_banned_ids.contains(&m.member.id()));

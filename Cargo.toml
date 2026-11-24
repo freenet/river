@@ -87,6 +87,8 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.sha2]
 opt-level = 3
+[profile.release.package.blake3]
+opt-level = 3
 
 # Debug and test builds compile the signature and hash crates optimized.
 # Unoptimized ed25519/curve25519 made the randomized fork-merge test

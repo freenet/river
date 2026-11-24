@@ -18,8 +18,10 @@ use river_core::room_state::sigcheck;
 
 type Bytes = Vec<u8>;
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 enum Input {
-    Delta(Box<ChatRoomStateV1Delta>),
+    Delta(ChatRoomStateV1Delta),
     State(Bytes),
 }
 
@@ -257,14 +259,43 @@ fn forged_records_are_rejected() {
     };
     refused(Input::Delta(d), "forged copy of a held message");
 
-    // A ban whose signature is corrupted.
+    // A held ban re-sent with a corrupted signature (same body).
     let mut ban = f.state.bans.0[0].clone();
-    ban.ban.banned_at += std::time::Duration::from_secs(1);
+    ban.signature = corrupt(&ban.signature);
     let d = ChatRoomStateV1Delta {
         bans: Some(vec![ban]),
         ..Default::default()
     };
-    refused(Input::Delta(d), "forged ban");
+    refused(Input::Delta(d), "held ban with a corrupted signature");
+
+    // A held owner ban re-attributed to a member: same body, same signature,
+    // checked against a different key, so it must not verify.
+    let mut ban = f.state.bans.0[0].clone();
+    ban.banned_by = MemberId::from(f.members[3].verifying_key());
+    ban.ban.banned_user = MemberId::from(f.members[4].verifying_key());
+    let d = ChatRoomStateV1Delta {
+        bans: Some(vec![ban]),
+        ..Default::default()
+    };
+    refused(Input::Delta(d), "re-attributed ban");
+
+    // The same re-attribution of a record already held, body unchanged.
+    let mut ban = f.state.bans.0[0].clone();
+    ban.banned_by = MemberId::from(f.members[3].verifying_key());
+    let d = ChatRoomStateV1Delta {
+        bans: Some(vec![ban]),
+        ..Default::default()
+    };
+    refused(Input::Delta(d), "held ban attributed to another member");
+
+    // A message re-sent with a corrupted signature.
+    let mut held = f.state.recent_messages.messages[1].clone();
+    held.signature = corrupt(&held.signature);
+    let d = ChatRoomStateV1Delta {
+        recent_messages: Some(vec![held]),
+        ..Default::default()
+    };
+    refused(Input::Delta(d), "message with a corrupted signature");
 
     // A stored state that is invalid, then a forged delta: still refused,
     // and a valid state in the same thread is still checked afterwards.
@@ -277,17 +308,49 @@ fn forged_records_are_rejected() {
     assert!(contract_validate(&p, &s));
 }
 
-/// A stored state that no longer verifies (disk damage): seeding fails and the
-/// update continues unseeded, with the plain rules' result.
+/// A stored state with a bad signature (disk damage) cannot be told apart by
+/// seeding, which takes the stored state on trust. What holds is that the
+/// result never passes `validate_state`: the update returns an error, or an
+/// output that `validate_state` (which the host runs on every result) refuses.
+/// None of these panics, in assume mode or in the cleanup cross-check.
 #[test]
-fn seeding_failure_continues_unseeded() {
+fn a_corrupted_stored_state_never_yields_a_validating_output() {
     let (f, p, _) = fixture(8);
-    let mut bad = f.state.clone();
-    bad.recent_messages.messages[0].signature = corrupt(&bad.recent_messages.messages[0].signature);
-    let bad = cbor(&bad);
-    let d = Input::Delta(msg_delta(&f, &f.members[3], 10_000));
-    let _ = same(&p, &bad, &d);
-    assert!(!sigcheck::is_active());
+    type Mutate = fn(&mut ChatRoomStateV1);
+    let corruptions: Vec<(&str, Mutate)> = vec![
+        ("configuration", |s| {
+            s.configuration.signature = corrupt(&s.configuration.signature)
+        }),
+        ("member", |s| {
+            let m = &mut s.members.members[0];
+            m.signature = corrupt(&m.signature)
+        }),
+        ("ban", |s| {
+            let b = &mut s.bans.0[0];
+            b.signature = corrupt(&b.signature)
+        }),
+        ("message", |s| {
+            let m = &mut s.recent_messages.messages.last_mut().unwrap();
+            m.signature = corrupt(&m.signature)
+        }),
+    ];
+    for (what, mutate) in corruptions {
+        let mut bad = f.state.clone();
+        mutate(&mut bad);
+        let bad = cbor(&bad);
+        assert!(
+            !contract_validate(&p, &bad),
+            "{what}: the stored state is invalid"
+        );
+        let d = Input::Delta(msg_delta(&f, &f.members[3], 10_000));
+        if let Ok(out) = contract_update(&p, &bad, &d) {
+            assert!(
+                !contract_validate(&p, &out),
+                "{what}: an output that passes validate_state came from an invalid stored state"
+            );
+        }
+        assert!(!sigcheck::is_active());
+    }
 }
 
 /// Seeded facts are true: re-check every fact the seeding run recorded.
@@ -351,29 +414,132 @@ fn every_signature_check_in_verify_is_mandatory() {
     }
 }
 
+/// Inputs of every kind the contract sees, built from one room: messages,
+/// joins, `member_info`, owner bans, new members, DMs, configuration changes,
+/// full states from forks, and forged variants.
+fn input_pool(f: &Fix, p: &Bytes, s0: &Bytes) -> Vec<Input> {
+    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    use river_core::room_state::configuration::AuthorizedConfigurationV1;
+    use river_core::room_state::direct_messages::{sign_direct_message, DirectMessagesDelta};
+    use river_core::room_state::member::{AuthorizedMember, Member, MembersDelta};
+
+    let owner = sk(1_000_000);
+    let owner_id = f.params.owner_id();
+    let mut pool: Vec<Input> = Vec::new();
+    for (i, k) in f.members.iter().take(6).enumerate() {
+        pool.push(Input::Delta(msg_delta(f, k, 10_000 + i as u64)));
+    }
+    for (i, k) in f.pool.iter().take(3).enumerate() {
+        pool.push(Input::Delta(msg_delta(f, k, 11_000 + i as u64)));
+    }
+    for i in 0..4u32 {
+        pool.push(Input::Delta(join_delta(
+            f,
+            &sk(710_000 + i),
+            12_000 + i as u64,
+        )));
+    }
+    pool.push(Input::Delta(ChatRoomStateV1Delta {
+        member_info: Some(vec![info(&f.members[2], "renamed member")]),
+        ..Default::default()
+    }));
+    // Owner bans of members who hold messages, and of a stranger.
+    for i in [40usize, 41, 90] {
+        let ban = AuthorizedUserBan::new(
+            UserBan {
+                owner_member_id: owner_id,
+                banned_at: fixture::t0() + std::time::Duration::from_secs(50_000),
+                banned_user: MemberId::from(f.members[i].verifying_key()),
+            },
+            owner_id,
+            &owner,
+        );
+        pool.push(Input::Delta(ChatRoomStateV1Delta {
+            bans: Some(vec![ban]),
+            ..Default::default()
+        }));
+    }
+    // New members invited by the owner, one with a message.
+    for i in 0..3u32 {
+        let k = sk(720_000 + i);
+        let member = AuthorizedMember::new(
+            Member {
+                owner_member_id: owner_id,
+                invited_by: owner_id,
+                member_vk: k.verifying_key(),
+            },
+            &owner,
+        );
+        pool.push(Input::Delta(ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![member])),
+            member_info: Some(vec![info(&k, "invited")]),
+            recent_messages: Some(vec![msg(owner_id, &k, 13_000 + i as u64)]),
+            ..Default::default()
+        }));
+    }
+    // A direct message between two members.
+    let dm = sign_direct_message(
+        &f.members[30],
+        MemberId::from(f.members[30].verifying_key()),
+        MemberId::from(f.members[31].verifying_key()),
+        &f.params.owner,
+        14_000,
+        b"hello".to_vec(),
+    )
+    .expect("sign");
+    pool.push(Input::Delta(ChatRoomStateV1Delta {
+        direct_messages: Some(DirectMessagesDelta {
+            new_messages: vec![dm],
+            advanced_purges: vec![],
+        }),
+        ..Default::default()
+    }));
+    // Configuration changes: lower and raise the message window.
+    for (v, window) in [(1u32, 150usize), (2, 250)] {
+        let mut cfg = f.state.configuration.configuration.clone();
+        cfg.configuration_version += v;
+        cfg.max_recent_messages = window;
+        pool.push(Input::Delta(ChatRoomStateV1Delta {
+            configuration: Some(AuthorizedConfigurationV1::new(cfg, &owner)),
+            ..Default::default()
+        }));
+    }
+    // Forged variants.
+    let mut m = msg(owner_id, &f.members[7], 15_000);
+    m.signature = corrupt(&m.signature);
+    pool.push(Input::Delta(ChatRoomStateV1Delta {
+        recent_messages: Some(vec![m]),
+        ..Default::default()
+    }));
+    let mut ban = f.state.bans.0[1].clone();
+    ban.signature = corrupt(&ban.signature);
+    pool.push(Input::Delta(ChatRoomStateV1Delta {
+        bans: Some(vec![ban]),
+        ..Default::default()
+    }));
+    // Full states from forks: one message ahead, a ban and a join ahead, and
+    // the room itself.
+    let n = pool.len();
+    for pick in [0usize, 9, n - 17, n - 12] {
+        if let Input::Delta(d) = &pool[pick] {
+            if let Ok(out) = reference_update(p, s0, &Input::Delta(d.clone())) {
+                pool.push(Input::State(out));
+            }
+        }
+    }
+    pool.push(Input::State(s0.clone()));
+    pool
+}
+
 /// Deterministic pseudo-random sequences of inputs, in different orders, with
-/// duplicates and stale deltas: each step compared with the plain rules.
+/// duplicates and stale ones: each step compared with the plain rules.
 #[test]
 fn random_sequences_match_the_plain_rules() {
     let (f, p, s0) = fixture(8);
-    let owner_id = f.params.owner_id();
-    let newcomers: Vec<SigningKey> = (0..6).map(|i| sk(710_000 + i)).collect();
-    let mut inputs: Vec<ChatRoomStateV1Delta> = Vec::new();
-    for (i, k) in f.members.iter().take(8).enumerate() {
-        inputs.push(msg_delta(&f, k, 10_000 + i as u64));
-    }
-    for (i, k) in f.pool.iter().take(3).enumerate() {
-        inputs.push(msg_delta(&f, k, 11_000 + i as u64));
-    }
-    for (i, k) in newcomers.iter().enumerate() {
-        inputs.push(join_delta(&f, k, 12_000 + i as u64));
-    }
-    inputs.push(ChatRoomStateV1Delta {
-        member_info: Some(vec![info(&f.members[2], "renamed member")]),
-        ..Default::default()
-    });
-    let _ = owner_id;
-    for seed in 0..6u64 {
+    let pool = input_pool(&f, &p, &s0);
+    assert!(pool.len() > 25, "pool of {}", pool.len());
+    let mut accepted = 0;
+    for seed in 0..5u64 {
         let mut rng = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -386,18 +552,20 @@ fn random_sequences_match_the_plain_rules() {
         let mut state = s0.clone();
         let mut seen: Vec<usize> = Vec::new();
         for _ in 0..8 {
-            // pick a fresh delta, a duplicate of an earlier one, or a stale one
+            // pick a fresh input, or a duplicate of an earlier one
             let pick = if !seen.is_empty() && next() % 3 == 0 {
                 seen[next() % seen.len()]
             } else {
-                next() % inputs.len()
+                next() % pool.len()
             };
             seen.push(pick);
-            if let Ok(out) = same(&p, &state, &Input::Delta(inputs[pick].clone())) {
+            if let Ok(out) = same(&p, &state, &pool[pick]) {
                 state = out;
+                accepted += 1;
             }
         }
     }
+    assert!(accepted > 15, "only {accepted} steps were accepted");
 }
 
 /// Two forks exchange full states through `update_state` and converge to
@@ -428,40 +596,74 @@ fn full_state_with_invalid_parts_matches_the_plain_rules() {
     let _ = same(&p, &s, &Input::State(cbor(&t)));
 }
 
+/// Source of a file without its `#[cfg(test)] mod ... { }` blocks.
+fn without_test_modules(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let is_test_mod = lines[i].trim() == "#[cfg(test)]"
+            && lines
+                .get(i + 1)
+                .is_some_and(|l| l.trim_start().starts_with("mod ") && l.trim_end().ends_with('{'));
+        if is_test_mod {
+            let mut depth = 0i32;
+            i += 1;
+            loop {
+                depth += lines[i].matches('{').count() as i32;
+                depth -= lines[i].matches('}').count() as i32;
+                i += 1;
+                if depth <= 0 || i >= lines.len() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// No file outside `sigcheck.rs` runs ed25519 itself, outside its test modules.
 #[test]
 fn only_the_sigcheck_module_runs_ed25519() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../common/src");
     let mut stack = vec![std::path::PathBuf::from(root)];
     let mut offenders = Vec::new();
+    let mut scanned = 0;
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|x| x == "rs") {
-                let name = path.file_name().unwrap().to_string_lossy().to_string();
-                if name == "sigcheck.rs" {
+                if path.file_name().unwrap() == "sigcheck.rs" {
                     continue;
                 }
-                let text = std::fs::read_to_string(&path).unwrap();
-                // Production code only: stop at the first test module.
-                let prod = text.split("#[cfg(test)]").next().unwrap();
+                scanned += 1;
+                let prod = without_test_modules(&std::fs::read_to_string(&path).unwrap());
                 for (i, line) in prod.lines().enumerate() {
                     let l = line.trim_start();
                     if l.starts_with("//") {
                         continue;
                     }
-                    if l.contains(".verify_strict(")
-                        || l.contains(".verify(&") && l.contains("_vk")
-                        || l.contains("verifying_key.verify(")
-                    {
-                        offenders.push(format!("{}:{}", path.display(), i + 1));
+                    let imports_verifier = l.starts_with("use ") && l.contains("Verifier");
+                    let direct = l.contains(".verify_strict(")
+                        || (l.contains("key.verify(") || l.contains("_vk.verify("));
+                    if imports_verifier || direct {
+                        offenders.push(format!("{}:{}: {l}", path.display(), i + 1));
                     }
                 }
             }
         }
     }
-    assert!(offenders.is_empty(), "direct ed25519 checks: {offenders:?}");
+    assert!(scanned > 20, "scanned only {scanned} files");
+    assert!(
+        offenders.is_empty(),
+        "direct ed25519 checks: {offenders:#?}"
+    );
 }
 
 #[test]
@@ -489,7 +691,7 @@ fn seeding_is_called_only_from_update_state() {
 #[test]
 fn crypto_crates_build_optimised() {
     let toml = include_str!("../../../Cargo.toml");
-    for krate in ["curve25519-dalek", "ed25519-dalek", "sha2"] {
+    for krate in ["curve25519-dalek", "ed25519-dalek", "sha2", "blake3"] {
         let header = format!("[profile.release.package.{krate}]");
         let at = toml
             .find(&header)

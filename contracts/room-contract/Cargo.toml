@@ -37,6 +37,7 @@ net = ["freenet-stdlib/net"]
 integration-test = ["net"]
 
 [dev-dependencies]
+river-core = { workspace = true, features = ["sig-counters"] }
 serde.workspace = true
 anyhow = "1.0"
 freenet = "0.1.179"

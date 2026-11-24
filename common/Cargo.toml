@@ -50,6 +50,9 @@ freenet-stdlib.workspace = true
 
 [features]
 default = []
+# Counts real ed25519 checks (`room_state::sigcheck::real_checks`), for cost
+# tests. Off in every shipped build.
+sig-counters = []
 # ECIES helpers for room-secret distribution. Deterministic-only API surface
 # (encrypt_secret_for_member, decrypt_*, unseal_*). Off by default so
 # room-contract WASM stays small (it doesn't need these). The chat-delegate
