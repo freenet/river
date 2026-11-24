@@ -3511,7 +3511,7 @@ impl Rooms {
     fn lost(&self, why: &str, report: &dyn Fn(RoomsUpdate)) {
         eprintln!(
             "River: lost the connection to Freenet: {}",
-            crate::diag::scrub(&why)
+            crate::diag::scrub(why)
         );
         if self.loaded {
             report(RoomsUpdate::Status(LinkStatus::Reconnecting));

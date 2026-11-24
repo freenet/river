@@ -276,7 +276,7 @@ impl KeySweep {
                 Err(e) => {
                     eprintln!(
                         "River: the delegate refused a room's signing key: {}",
-                        crate::diag::scrub(&e)
+                        crate::diag::scrub(e)
                     );
                     self.fail(cur.room, pace, now)
                 }
@@ -294,7 +294,7 @@ impl KeySweep {
         };
         eprintln!(
             "River: asking the delegate about a room's signing key failed: {}",
-            crate::diag::scrub(&why)
+            crate::diag::scrub(why)
         );
         self.fail(cur.room, pace, now);
         true
