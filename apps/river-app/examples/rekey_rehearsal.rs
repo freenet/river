@@ -1,5 +1,3 @@
-// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
-#![allow(clippy::disallowed_methods)]
 //! Rehearsal of a re-key for the native app (freenet/river#889), run by
 //! `apps/scripts/rekey-rehearsal.sh` against one isolated Freenet node.
 //!
