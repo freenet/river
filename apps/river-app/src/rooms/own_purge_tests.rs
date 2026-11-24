@@ -866,8 +866,9 @@ fn trying_a_refused_deletion_again_records_it_again_and_clears_what_was_owed() {
     device.rooms.update_answered(&id, Err("refused".into()));
     assert!(device.rooms.outbox.retry_takebacks(), "owed");
     assert!(device.rooms.outbox.command(&room, Action::Retry { entry }));
-    mend_storage(&dir);
+    // Still broken, and yet nothing is owed any more: that try is the deletion's again.
     assert!(!device.rooms.outbox.retry_takebacks(), "no longer owed");
+    mend_storage(&dir);
 }
 
 /// Entry E1 was taken by the node (and shown as not kept); the same deletion asked for again
