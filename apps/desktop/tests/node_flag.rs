@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! The `--node` flag and `FREENET_NODE`, through the real binary (`--node-check` reports what the
 //! arguments name and exits, without a window).
 

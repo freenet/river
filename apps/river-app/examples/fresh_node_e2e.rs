@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! End-to-end run of the native app against two Freenet nodes that River never ran on.
 //!
 //! Each node is fresh: no River web UI, no chat delegate. On each, the app's own background

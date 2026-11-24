@@ -248,7 +248,7 @@ pub fn build_join(
     let member_vk = signing_key.verifying_key();
     let config = &room_state.configuration.configuration;
     let stored = storage.get_provisional_entry(owner_key, &member_vk)?;
-    let now = SystemTime::now();
+    let now = crate::signed_time::now();
     match admission_status(room_state, &params, &member_vk, stored.as_ref(), now) {
         AdmissionStatus::Owner | AdmissionStatus::Member => {
             bail!("this key is already a member of the room; use `riverctl message send`")
@@ -330,7 +330,7 @@ pub fn build_join(
     );
     // Taken after the proof solve, which can run for minutes: a message
     // stamped before it would be older than the work that admits it.
-    let message_time = SystemTime::now();
+    let message_time = crate::signed_time::now();
     let message = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: MemberId::from(owner_key),
@@ -653,6 +653,35 @@ mod tests {
             params,
             owner,
         )
+    }
+
+    /// The join message is stamped from the real clock; it must be a whole millisecond or a
+    /// Windows verifier rejects its signature (freenet/river#971).
+    #[test]
+    fn the_join_message_is_stamped_a_whole_millisecond() {
+        let (state, params, _owner) = open_room(6);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(Some(dir.path().to_str().unwrap())).unwrap();
+        for seed in 1..=5u8 {
+            let k = SigningKey::from_bytes(&[seed; 32]);
+            let (delta, _) = build_join(
+                &storage,
+                &state,
+                &params.owner,
+                &k,
+                &JoinOptions {
+                    nickname: "Ann",
+                    text: "hello",
+                    extra_bits: 0,
+                    threads: 1,
+                },
+                |_, _| {},
+            )
+            .unwrap();
+            let time = delta.recent_messages.unwrap()[0].message.time;
+            let d = time.duration_since(std::time::UNIX_EPOCH).unwrap();
+            assert_eq!(d.subsec_nanos() % 1_000_000, 0, "{d:?}");
+        }
     }
 
     /// `room join --pow` builds one delta that the room's own apply accepts,

@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "a time that gets signed must be a whole millisecond (freenet/river#971): use signed_time::now(); a raw clock read needs an #[allow] saying why" },
+]

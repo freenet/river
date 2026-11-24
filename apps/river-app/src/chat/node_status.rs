@@ -978,6 +978,8 @@ pub fn sanitize(text: &str) -> String {
 // Time ----------------------------------------------------------------------------------------
 
 /// Seconds since 1970 now, for stamping an error. 0 when the clock is before 1970.
+// Unix seconds for stamping a displayed error; nothing is signed.
+#[allow(clippy::disallowed_methods)]
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

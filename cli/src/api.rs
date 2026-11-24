@@ -2545,7 +2545,7 @@ fn build_new_room_state(
         let version_record = SecretVersionRecordV1 {
             version: 0,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: std::time::SystemTime::now(),
+            created_at: crate::signed_time::now(),
         };
         room_state
             .secrets
@@ -4228,7 +4228,7 @@ impl ApiClient {
             room_owner: params.owner_id(),
             author: self_id,
             content: river_core::room_state::message::RoomMessageBody::join_event(),
-            time: std::time::SystemTime::now(),
+            time: crate::signed_time::now(),
         };
         let auth_join_message =
             river_core::room_state::message::AuthorizedMessageV1::new(join_message, signing_key);
@@ -4936,7 +4936,7 @@ impl ApiClient {
         .map_err(|e| anyhow!(e))?;
 
         // Create the message
-        let message_time = std::time::SystemTime::now();
+        let message_time = crate::signed_time::now();
         let message = river_core::room_state::message::MessageV1 {
             room_owner: MemberId::from(*room_owner_key),
             author: sender_member_id,
@@ -5084,7 +5084,7 @@ impl ApiClient {
             room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: std::time::SystemTime::now(),
+            time: crate::signed_time::now(),
         };
 
         // Sign the message
@@ -5233,7 +5233,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: std::time::SystemTime::now(),
+            time: crate::signed_time::now(),
         };
 
         // Sign the message
@@ -5306,7 +5306,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: std::time::SystemTime::now(),
+            time: crate::signed_time::now(),
         };
 
         // Sign the message
@@ -5381,7 +5381,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: std::time::SystemTime::now(),
+            time: crate::signed_time::now(),
         };
 
         // Sign the message
@@ -5459,7 +5459,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: std::time::SystemTime::now(),
+            time: crate::signed_time::now(),
         };
 
         // Sign the message
@@ -5584,7 +5584,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: std::time::SystemTime::now(),
+            time: crate::signed_time::now(),
         };
 
         // Sign the message
@@ -6598,7 +6598,7 @@ impl ApiClient {
         // Create the ban
         let user_ban = UserBan {
             owner_member_id,
-            banned_at: std::time::SystemTime::now(),
+            banned_at: crate::signed_time::now(),
             banned_user: banned_member_id,
         };
 

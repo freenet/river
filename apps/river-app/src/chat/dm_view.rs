@@ -146,6 +146,8 @@ pub struct DmUi {
 /// notification: one hour. Older ones count as unread but stay quiet.
 pub const MAX_NOTIFY_AGE_SECS: u64 = 3600;
 
+// Read-side unix seconds for notification age; nothing is signed.
+#[allow(clippy::disallowed_methods)]
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

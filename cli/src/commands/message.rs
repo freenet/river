@@ -218,6 +218,8 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
 
             // Apply time filter if specified
             if let Some(minutes) = since_minutes {
+                // A read-side comparison against stored times; nothing is signed.
+                #[allow(clippy::disallowed_methods)]
                 let cutoff_time =
                     std::time::SystemTime::now() - std::time::Duration::from_secs(minutes * 60);
                 messages.retain(|msg| msg.message.time >= cutoff_time);

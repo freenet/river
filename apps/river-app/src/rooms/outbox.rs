@@ -1550,6 +1550,7 @@ fn build(
     intent: &Intent,
     time: SystemTime,
 ) -> Result<(VerifyingKey, Vec<AuthorizedMessageV1>), String> {
+    let time = crate::signed_time::whole_millis(time);
     participation(room).map_err(|b| b.reason().to_owned())?;
     let sk = room
         .stored
@@ -1981,7 +1982,7 @@ impl Default for Outbox {
             next: 0,
             waiting: Vec::new(),
             work: Default::default(),
-            clock: Box::new(SystemTime::now),
+            clock: Box::new(crate::signed_time::now),
             owed: HashMap::new(),
             reconnect: false,
             stale: HashMap::new(),
@@ -2005,6 +2006,12 @@ const IDENTITY_CHANGED: &str =
     "This room's identity changed after it was written, so it was not sent.";
 
 impl Outbox {
+    /// The time to stamp on what is signed: the clock, to a whole millisecond (see
+    /// [`crate::signed_time`]).
+    fn now(&self) -> SystemTime {
+        crate::signed_time::whole_millis((self.clock)())
+    }
+
     #[cfg(test)]
     pub fn with_clock(clock: Clock) -> Self {
         Outbox {
@@ -2108,7 +2115,7 @@ impl Outbox {
             intent: None,
             label: BAN_LABEL,
             author: room.stored.self_verifying_key(),
-            time: (self.clock)(),
+            time: self.now(),
             messages: Vec::new(),
             info: None,
             config: None,
@@ -2134,7 +2141,7 @@ impl Outbox {
             intent: None,
             label: DEPUTY_NOTE_LABEL,
             author: room.stored.self_verifying_key(),
-            time: (self.clock)(),
+            time: self.now(),
             messages: Vec::new(),
             info: None,
             config: None,
@@ -2414,7 +2421,7 @@ impl Outbox {
             label,
             // Written as the room's identity now, whether or not it can be built yet.
             author: room.stored.self_verifying_key(),
-            time: (self.clock)(),
+            time: self.now(),
             messages: Vec::new(),
             info: None,
             config: None,
@@ -2464,7 +2471,7 @@ impl Outbox {
             intent: Some(Intent::Dm(peer)),
             label: DM_LABEL,
             author,
-            time: (self.clock)(),
+            time: self.now(),
             messages: Vec::new(),
             info: None,
             config: None,
@@ -2512,7 +2519,7 @@ impl Outbox {
             intent: Some(Intent::Dm(peer)),
             label: DM_LABEL,
             author,
-            time: (self.clock)(),
+            time: self.now(),
             messages: Vec::new(),
             info: None,
             config: None,
@@ -2673,7 +2680,7 @@ impl Outbox {
             intent: Some(Intent::Purge(work.peer)),
             label: PURGE_LABEL,
             author: room.stored.self_verifying_key(),
-            time: (self.clock)(),
+            time: self.now(),
             messages: Vec::new(),
             info: None,
             config: None,
@@ -2986,6 +2993,7 @@ impl Outbox {
         let fresh = self.fresh_info_version(room, id);
         let ctx = self.config_ctx(room, id);
         let current = room.current_secret().map(|(_, v)| v);
+        let now = self.now();
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -3028,7 +3036,7 @@ impl Outbox {
             // Refused, or never sendable: a new send, stamped now, as the web UI's
             // `Outbox::retry`. Still as the identity it was written as (`rebuild` checks).
             _ => {
-                entry.time = (self.clock)();
+                entry.time = now;
                 entry.status = Status::Queued;
                 entry.sent = false;
                 // A refused nickname is signed again at a fresh version, never one it already
