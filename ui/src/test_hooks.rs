@@ -245,6 +245,13 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Nonces the join's solver reports tried so far (0 when not solving).
+    set_hook(
+        "powTried",
+        Closure::<dyn FnMut() -> f64>::new(move || crate::public_join::tried_for_test() as f64)
+            .into_js_value(),
+    );
+
     // Times the join's solver was retargeted to a changed room policy.
     set_hook(
         "powRetargets",

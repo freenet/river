@@ -159,7 +159,7 @@ mod browser {
     use std::rc::Rc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
-    use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, Worker, WorkerOptions, WorkerType};
+    use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, Worker};
 
     /// Nonces tried between two looks at the clock.
     const BUDGET: u64 = 2048;
@@ -298,8 +298,10 @@ mod browser {
             // A worker made from a blob has a `blob:` base, against which the
             // glue's own root-relative fetch of the wasm cannot resolve, so
             // fetches in the worker resolve against the page's base instead.
-            // (A worker created straight from the glue's URL would be refused
-            // in the sandboxed iframe the container serves the app in.)
+            // The worker is a classic one that `import()`s the glue: in the
+            // sandboxed iframe the container serves the app in, a module worker
+            // made from a blob fails to start, and one made straight from the
+            // glue's URL is a cross-origin worker and is refused.
             let script = format!(
                 "const base = {base};\n\
                  const nativeFetch = self.fetch.bind(self);\n\
@@ -323,9 +325,7 @@ mod browser {
                 _error_handlers: Vec::new(),
             };
             for i in 0..n {
-                let opts = WorkerOptions::new();
-                opts.set_type(WorkerType::Module);
-                let worker = Worker::new_with_options(&blob_url, &opts).ok()?;
+                let worker = Worker::new(&blob_url).ok()?;
                 let sender = tx.clone();
                 let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
                     let msg = match e.data().dyn_into::<js_sys::Uint8Array>() {

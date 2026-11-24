@@ -942,6 +942,15 @@ pub fn session_member_vk() -> Option<VerifyingKey> {
     machine().signing_key.as_ref().map(|k| k.verifying_key())
 }
 
+/// Nonces the join in progress reports tried (test hooks; 0 when not solving).
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub fn tried_for_test() -> u64 {
+    match machine().ui().phase {
+        JoinPhase::Solving { tried, .. } => tried,
+        _ => 0,
+    }
+}
+
 /// Test hook support: while set, the solver does no work, so a test that must
 /// cancel or ban mid-solve does not race a lucky proof.
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]

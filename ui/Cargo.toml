@@ -52,8 +52,6 @@ web-sys = { workspace = true, features = [
     "MessagePort",
     "Url",
     "Worker",
-    "WorkerOptions",
-    "WorkerType",
     "File",
     "HtmlAnchorElement",
     "HtmlElement",
