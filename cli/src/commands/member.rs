@@ -39,6 +39,17 @@ pub enum MemberCommands {
         #[arg(long)]
         require_not_deputy: bool,
     },
+    /// Sponsor a provisional (open-admission) member: make them an ordinary
+    /// member, invited by the key you sign with. Their key and messages are kept.
+    /// Refused when the target is banned, is not provisional, or the room is at
+    /// 90% of its member limit.
+    Sponsor {
+        /// Room ID (owner key in base58)
+        room_id: String,
+        /// Provisional member: an 8-character short ID, or the full verifying key
+        /// (from `member list`).
+        member_id: String,
+    },
     /// Deputize a member so they can help moderate (ban) within your invite subtree
     Deputize {
         /// Room ID (owner key in base58)
@@ -263,7 +274,7 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                 .ban_member_with_safety(&owner_vk, &member_id, safety)
                 .await
             {
-                Ok(()) => match format {
+                Ok(kind) => match format {
                     OutputFormat::Human => {
                         println!(
                             "{}",
@@ -276,9 +287,36 @@ pub async fn execute(command: MemberCommands, api: ApiClient, format: OutputForm
                             serde_json::json!({
                                 "success": true,
                                 "banned_member_id": member_id,
+                                "ban_kind": kind.as_str(),
                             })
                         );
                     }
+                },
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    return Err(e);
+                }
+            }
+            Ok(())
+        }
+        MemberCommands::Sponsor { room_id, member_id } => {
+            if !matches!(format, OutputFormat::Json) {
+                eprintln!("Sponsoring member '{}' in room: {}", member_id, room_id);
+            }
+            let owner_vk = parse_room_id(&room_id)?;
+            match api.sponsor_member(&owner_vk, &member_id).await {
+                Ok(id) => match format {
+                    OutputFormat::Human => println!(
+                        "{}",
+                        format!("Member '{}' ({}) is now sponsored.", member_id, id).green()
+                    ),
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "success": true,
+                            "sponsored_member_id": id.to_string(),
+                        })
+                    ),
                 },
                 Err(e) => {
                     eprintln!("{} {}", "Error:".red(), e);
