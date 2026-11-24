@@ -563,6 +563,10 @@ fn a_sent_deletion_that_is_failed_without_an_answer_stays_recorded() {
     device.rooms.outbox.requeue();
     assert!(device.rooms.outbox.fail_queued("River has moved on"));
     assert!(PurgeRecord::open(&dir).for_room(&owner).is_some());
+    // The failed entry stays shown and holds nothing up: what was sent is signed again.
+    let node = Node::of(&device);
+    device.hear(&node);
+    assert!(device.rooms.outbox.heal_in_progress(&owner));
 }
 
 /// The node refused it and the record could not be taken back (the storage failed): the tokens
@@ -763,7 +767,7 @@ fn a_full_envelope_is_not_signed_over_and_does_not_use_up_the_version() {
         .unwrap();
     device.rooms.own_purges_tick();
     assert!(device.rooms.outbox.is_empty());
-    assert!(device.rooms.healed_run.get(&owner).is_none());
+    assert!(!device.rooms.healed_run.contains_key(&owner));
 }
 
 /// A room the user is not in loses its record once a read has listed every room, and a record

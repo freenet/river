@@ -23,7 +23,8 @@
 //! the old one, directory synced). A crash between the record and the send leaves a recorded
 //! token the room does not hold, which the next heal signs. The record is bounded: a room's
 //! entries go when its recipient is no longer a member ([`OwnPurges::prune`], as `riverctl`
-//! does), and the whole entry goes when the user leaves the room ([`PurgeRecord::forget`]).
+//! does), and the whole entry goes when the user leaves the room ([`PurgeRecord::forget`], retried until it
+//! works) or is found not to be in the room ([`PurgeRecord::retain_rooms`]).
 //! A deletion can only be queued while it fits the room's 1000-token cap, so what is recorded
 //! for one recipient is bounded the same way.
 //!
@@ -142,8 +143,8 @@ impl PurgeRecord {
         })
     }
 
-    /// Take back a record of `tokens` for a deletion the user gave up (it was refused, and they
-    /// dismissed it).
+    /// Take back a record of `tokens` for a deletion the node refused when it went out once, so it
+    /// never took it. Only the outbox calls it, at the moment of the refusal.
     pub fn unrecord(
         &mut self,
         owner: &VerifyingKey,

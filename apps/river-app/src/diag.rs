@@ -248,7 +248,7 @@ mod tests {
             }
         }
         assert_eq!(
-            scrubbed, 34,
+            scrubbed, 35,
             "the scrubbed sites changed: update this count on purpose"
         );
     }
