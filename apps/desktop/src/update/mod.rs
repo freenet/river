@@ -762,7 +762,7 @@ impl Updater {
             if restored {
                 return Some(p.install_path);
             }
-            eprintln!("River: {message}");
+            river_app::diag!("River: {message}");
             return None;
         }
         report_unrecorded(
@@ -833,7 +833,7 @@ impl Updater {
 /// that was not counted, or a swap that was not confirmed, visible.
 fn report_unrecorded<T>(what: &str, result: Result<T, String>) {
     if let Err(e) = result {
-        eprintln!("River: the update notes did not record {what}: {e}");
+        river_app::diag!("River: the update notes did not record {what}: {e}");
     }
 }
 

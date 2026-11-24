@@ -136,7 +136,7 @@ mod linux {
     /// Show the icon. False when this desktop has no tray to show it in.
     pub fn start(handle: &AppHandle<RiverApp>) -> bool {
         let Some(rgba) = icon_rgba() else {
-            eprintln!("river: the tray icon could not be read");
+            river_app::diag!("river: the tray icon could not be read");
             return false;
         };
         // RGBA to ARGB.
@@ -157,7 +157,7 @@ mod linux {
                 true
             }
             Err(e) => {
-                eprintln!("river: no tray icon ({e}); closing the window will quit River");
+                river_app::diag!("river: no tray icon ({e}); closing the window will quit River");
                 false
             }
         }
@@ -184,13 +184,13 @@ mod native {
     /// Show the icon. Call on the thread that runs the window system's events.
     pub fn start(handle: &AppHandle<RiverApp>) -> bool {
         let Some(rgba) = icon_rgba() else {
-            eprintln!("river: the tray icon could not be read");
+            river_app::diag!("river: the tray icon could not be read");
             return false;
         };
         let icon = match Icon::from_rgba(rgba, SIDE as u32, SIDE as u32) {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("river: the tray icon could not be made: {e}");
+                river_app::diag!("river: the tray icon could not be made: {e}");
                 return false;
             }
         };
@@ -198,7 +198,7 @@ mod native {
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
         if let Err(e) = menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit]) {
-            eprintln!("river: the tray menu could not be made: {e}");
+            river_app::diag!("river: the tray menu could not be made: {e}");
             return false;
         }
         let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
@@ -240,7 +240,7 @@ mod native {
                 true
             }
             Err(e) => {
-                eprintln!("river: no tray icon ({e}); closing the window will quit River");
+                river_app::diag!("river: no tray icon ({e}); closing the window will quit River");
                 false
             }
         }

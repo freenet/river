@@ -35,6 +35,10 @@ png = "0.18"
 # The single-instance token.
 getrandom = "0.3"
 
+# The diagnostics log (src/log.rs) points fd 2 at a file with dup2. Already in the lockfile.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # OS notifications (src/notify/). MIT OR Apache-2.0. Linux speaks D-Bus through zbus (the `z`
 # feature, no libdbus); the notification images feature is off.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
@@ -56,7 +60,7 @@ notify-rust = { version = "4.19", default-features = false, features = ["preview
 # same windows-sys version rune already uses.
 [target.'cfg(windows)'.dependencies]
 notify-rust = { version = "4.19", default-features = false }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_Shell"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_Shell"] }
 
 # Icon and version resource for river.exe (build.rs). Windows only, so Linux and macOS builds
 # never compile it.

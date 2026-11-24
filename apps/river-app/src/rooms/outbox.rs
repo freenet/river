@@ -3194,7 +3194,10 @@ impl Outbox {
                         ));
                     }
                     Err(e) => {
-                        eprintln!("River: a message Freenet took was not applied here: {e}");
+                        crate::diag!(
+                            "River: a message Freenet took was not applied here: {}",
+                            crate::diag::scrub(&e)
+                        );
                         self.entries[i].status = Status::Unconfirmed(format!(
                             "Freenet took it, but the room here couldn't apply it: {e}"
                         ));

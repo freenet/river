@@ -7,7 +7,8 @@
 //! prints the node the arguments and environment name and exits (2 if the address is not valid).
 //! `-- --self-update` checks for, installs and starts a newer signed River once, without a
 //! window (see `update/`). `-- --background` starts hidden in the tray (what start at login
-//! runs). Windows release builds have no console, so they print nothing.
+//! runs). Where nothing reads stderr (a Windows release build, a launcher with no output) the
+//! app's stderr goes to a log file instead (see `log`).
 //!
 //! Only one River runs per user: a second launch shows the first one's window and exits.
 
@@ -18,8 +19,10 @@ mod autostart;
 mod background;
 #[cfg(windows)]
 mod console;
+mod diagnostics;
 mod host;
 mod install;
+mod log;
 mod notify;
 mod release;
 mod single;
@@ -60,6 +63,9 @@ fn main() {
     // The node to use: `--node host:port`, else $FREENET_NODE, else the address saved from the
     // app's own screens, else the Freenet on this computer.
     let startup = NodeChoice::startup(std::env::args_os(), host.config_dir().as_deref());
+    // Lines for stderr that come before the log is open (it is opened only by a River that is
+    // going to stay: a second launch must not rotate the first one's file).
+    let mut early: Vec<String> = Vec::new();
     if let Some(problem) = &startup.problem {
         // From a terminal this is a command that failed. Anywhere else (a launcher, a Windows
         // release build with no console) nobody would see it, so the window says it.
@@ -67,10 +73,10 @@ fn main() {
             say(problem);
             std::process::exit(2);
         }
-        say(problem);
+        early.push(problem.to_string());
     }
     if let Some(notice) = &startup.notice {
-        say(notice);
+        early.push(notice.to_string());
     }
     let updater = update::host::DesktopUpdate::new();
     let background_start = std::env::args_os().any(|a| a == autostart::BACKGROUND_FLAG);
@@ -94,6 +100,9 @@ fn main() {
                 if asked && let Some(u) = &updater {
                     u.second_launch_here();
                 }
+                for line in &early {
+                    say(line);
+                }
                 if !asked {
                     tell_user(
                         "River is already running but did not answer. Look for its icon \
@@ -104,11 +113,17 @@ fn main() {
             }
             // Better two Rivers than none.
             Err(e) => {
-                say(&format!("couldn't check for another River: {e}"));
+                early.push(format!("couldn't check for another River: {e}"));
                 None
             }
         }
     });
+    // Diagnostics go to a file when nobody is reading stderr (see `log`).
+    river_app::diag::on_failure(log::on_write_failure);
+    let log_state = log::start(host.config_dir().as_deref());
+    for line in &early {
+        river_app::diag!("river: {line}");
+    }
     let for_app = updater.clone();
     let for_settings = settings.clone();
     let app = river_app::app(move |handle| {
@@ -150,6 +165,7 @@ fn main() {
         )
         .with_notifier(Box::new(notifier))
         .with_background(for_settings);
+        let app = app.with_log(Arc::new(diagnostics::DesktopLog::new(log_state)));
         match updates {
             Some(updates) => app.with_updates(updates),
             None => app,

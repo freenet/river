@@ -236,9 +236,10 @@ impl Waiter for PollWaiter {
 fn note_poller_failure(why: &str) {
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "River: the readiness poller for the Freenet connection failed ({why}); waiting for \
+        crate::diag!(
+            "River: the readiness poller for the Freenet connection failed ({}); waiting for \
              Freenet by sleeping {}ms at a time instead, which slows every answer",
+            crate::diag::scrub(why),
             POLL.as_millis()
         );
     }
@@ -598,7 +599,10 @@ impl NodeSocket {
         let decoded: HostResult = match bincode::deserialize(bytes) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("River: skipping a message from Freenet it can't read: {e}");
+                crate::diag!(
+                    "River: skipping a message from Freenet it can't read: {}",
+                    crate::diag::scrub(&e)
+                );
                 return Ok(None);
             }
         };
@@ -821,10 +825,11 @@ fn note_pending(reading: bool, e: &std::io::Error) {
         return;
     }
     *last = Some(Instant::now());
-    eprintln!(
-        "River: a socket {} ended with os error {:?} ({e}); the connection is dropped and opened again (number {count} this run)",
+    crate::diag!(
+        "River: a socket {} ended with os error {:?} ({}); the connection is dropped and opened again (number {count} this run)",
         if reading { "read" } else { "write" },
         e.raw_os_error(),
+        crate::diag::scrub(e),
     );
 }
 
@@ -2232,7 +2237,7 @@ mod tests {
             assert!(text.contains(&format!("frame {i}")), "frame {i} was {text}");
         }
         if timeouts == 0 {
-            eprintln!("note: no wait ran out, so nothing was raced (a coarse-timer runner)");
+            crate::diag!("note: no wait ran out, so nothing was raced (a coarse-timer runner)");
         }
         drop(socket);
         server.join().unwrap();
