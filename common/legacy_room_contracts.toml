@@ -277,3 +277,9 @@ version = "V40"
 description = "Open-admission room contract (freenet/river#974, merged as #979), the last generation before member content was checked against the key that holds the id"
 date = "2026-11-23"
 code_hash = "86c0fce06032efc32c024f3cb03b767f399592c5464272f677fa48567c1b10bf"
+
+[[entry]]
+version = "V41"
+description = "Room-contract generation before deltas are validated incrementally (performance)"
+date = "2026-11-24"
+code_hash = "a365799aa6d679d6aa3522e33c6dab1c56c7c0a323b97ff058b721b52ba5c861"

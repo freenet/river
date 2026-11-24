@@ -19,7 +19,7 @@ use river_core::room_state::sigcheck;
 type Bytes = Vec<u8>;
 
 enum Input {
-    Delta(ChatRoomStateV1Delta),
+    Delta(Box<ChatRoomStateV1Delta>),
     State(Bytes),
 }
 

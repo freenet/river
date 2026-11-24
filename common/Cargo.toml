@@ -134,6 +134,11 @@ serde_json = "1.0"
 name = "provisional_pair"
 harness = false
 
+# Fixtures for timing the room contract on an Official-room-shaped room.
+[[bench]]
+name = "incremental_pair"
+harness = false
+
 # Measurement switches for out-of-tree tools only, set with RUSTFLAGS, never
 # Cargo features, so no published build or feature unification can turn them
 # on: `--cfg river_cleanup_counters` exposes `room_state::cleanup_counters`

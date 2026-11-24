@@ -293,3 +293,10 @@ description = "Chat delegate before the room subscription record required the ro
 date = "2026-11-23"
 delegate_key = "c6fa1ad833f3f8bc74b43390827a35f376ccf948c7416d2c390087777a5ca185"
 code_hash = "4fbc0f3a4940d1dace00415337d3cfae7ea3eceac03a8877a2b62fc9455bf4c4"
+
+[[entry]]
+version = "V41"
+description = "Chat delegate before the signature crates were built for speed (performance), which the delegate links"
+date = "2026-11-24"
+delegate_key = "968c30168d4cac98bf3d1111f112b5572f50d1993303fec17745c6d2018dca41"
+code_hash = "110b4dff1fcacd8658ea7a464ff9591508b056721c1bff5d06ba45bfa5931e2c"
