@@ -10641,17 +10641,22 @@ mod rekey_state {
         assert!(rooms.seed_retry.is_empty() && rooms.on_earlier.is_empty());
     }
 
-    /// Earlier keys that did not answer while a room moved are folded in later.
+    /// Earlier keys that did not answer while a room moved are folded in later: the move ends
+    /// moved, and only those keys are read again after a wait.
     #[test]
     fn keys_that_did_not_answer_during_a_move_are_folded_in_later() {
-        let (mut rooms, room, _) = rekeyed(3);
+        let owner = SigningKey::from_bytes(&[3; 32]);
+        let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key());
+        let mut room = TestRoom::new(3, "A", 1, &["mine"]);
+        room.key = earlier[1];
+        let mut rooms = Rooms::default();
+        rooms.replace(loaded(vec![room.stored()]));
         let current = *contract_key(&room.vk()).id();
         let pace = pace();
         let t0 = Instant::now();
-        let earlier = river_core::migration::legacy_contract_keys_for_owner(&room.vk());
         rooms.seed_if_rekeyed(&current);
-        // The stored key is the newest earlier one: one read, which never answers.
         let work = &mut rooms.outbox.work;
+        // The newest earlier key never answers; the one it was stored under holds it.
         let Some(ClientRequest::ContractOp(CR::Get { key, .. })) = work.next_request(false, t0)
         else {
             panic!("a read");
@@ -10659,10 +10664,33 @@ mod rekey_state {
         assert_eq!(key, *earlier[0].id());
         let late = t0 + Duration::from_secs(61);
         assert!(!work.expire(Duration::from_secs(20), Duration::from_secs(60), late));
-        // Nothing found: no copy is PUT while a key may still hold the room.
-        assert!(work.next_request(false, late).is_none());
-        assert!(rooms.seed_ends(&pace, late).is_empty());
-        assert_eq!(rooms.seed_retry[&room.vk()].2, vec![*earlier[0].id()]);
+        let Some(ClientRequest::ContractOp(CR::Get { key, .. })) = work.next_request(false, late)
+        else {
+            panic!("the next read");
+        };
+        assert_eq!(key, *earlier[1].id());
+        let mut state = Vec::new();
+        ciborium::ser::into_writer(&room.state, &mut state).unwrap();
+        assert!(work.on_contract(&ContractResponse::GetResponse {
+            key: earlier[1],
+            contract: None,
+            state: WrappedState::new(state),
+        }));
+        let Some(ClientRequest::ContractOp(CR::Put { contract, .. })) =
+            work.next_request(false, late)
+        else {
+            panic!("the PUT");
+        };
+        assert!(work.on_contract(&ContractResponse::PutResponse {
+            key: contract.key()
+        }));
+        // Moved: followed under the current key, and the silent key is read again later.
+        assert_eq!(rooms.seed_ends(&pace, late), vec![current]);
+        let (_, due, candidates) = rooms.seed_retry[&room.vk()].clone();
+        assert_eq!(candidates, vec![*earlier[0].id()]);
+        assert_eq!(due, Some(late + pace.resubscribe_first));
+        rooms.seeds_due(late + pace.resubscribe_first);
+        assert!(rooms.outbox.work.busy());
     }
 
     #[test]
