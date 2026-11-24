@@ -12,6 +12,7 @@
 # Wire encoding: V33 and earlier serialized byte fields as CBOR integer arrays;
 # V34 onward (freenet/river#757) use CBOR byte strings.
 CURRENT works bytes  current committed build
+V40     works bytes  last build before the room subscription record required the owner's key
 V39     works bytes  last build before public-room admission (#974)
 V38     works bytes  stdlib 0.8.5, last build before stdlib 0.12.1
 V37     works bytes

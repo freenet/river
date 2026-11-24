@@ -6809,12 +6809,16 @@ mod tests {
     /// river-core 0.4.0 -> 0.5.0): the delegate links the room-state code that
     /// change adds to, and a delta literal gained `provisional: None`. V39
     /// (`264a9301…`) is the outgoing generation.
+    ///
+    /// Updated for V40 (the room subscription record requires the room
+    /// owner's signing key): a check in `subscription.rs`. V40 (`4fbc0f3a…`)
+    /// is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "4fbc0f3a4940d1dace00415337d3cfae7ea3eceac03a8877a2b62fc9455bf4c4",
+            "110b4dff1fcacd8658ea7a464ff9591508b056721c1bff5d06ba45bfa5931e2c",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"

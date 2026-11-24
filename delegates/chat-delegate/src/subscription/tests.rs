@@ -20,12 +20,14 @@
 //! exercised end-to-end here because they require state to round-trip
 //! through the secret store:
 //!
-//! - **EnsureRoomSubscription rejects when no signing key on file**
-//!   (Fix 5): the WASM-only probe runs only when `get_secret` can return
-//!   `Some(...)`. The probe is gated on `target_family = "wasm"` so the
-//!   permissive behaviour observed by `subscribes_to_room_on_ensure_request`
-//!   is correct under non-WASM. A future WASM integration test (e.g. via
-//!   `freenet local` end-to-end harness) would cover the rejection path.
+//! - **EnsureRoomSubscription rejects when the caller holds no key for the
+//!   room owner** (Fix 5): the WASM-only probe runs only when `get_secret`
+//!   can return `Some(...)`. The probe is gated on `target_family = "wasm"`
+//!   so the permissive behaviour observed by
+//!   `subscribes_to_room_on_ensure_request` is correct under non-WASM. The
+//!   decision the handler makes from the stored key, and the writes it then
+//!   makes, are `ensure_subscription_writes`, tested directly below with a
+//!   stored key; only the secret-store read itself is WASM-only.
 //!
 //! - **Cache-not-updated-when-signing-key-missing** (Fix 3): exercising
 //!   the cache-discipline rule needs `set_secret` to actually persist the
@@ -906,5 +908,186 @@ fn backfill_handles_sparse_high_version_state() {
     assert_eq!(
         emitted, expected,
         "must emit only the versions we actually have secrets for"
+    );
+}
+
+/// The subscription record is shared by every caller, so
+/// `EnsureRoomSubscription` accepts only a caller holding the room owner's
+/// signing key: the owner's key passes; another key (such as a member's,
+/// stored under the same room), a missing key and a key of the wrong length
+/// are refused.
+#[test]
+fn only_the_room_owners_signing_key_may_set_the_subscription_record() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let room = owner.verifying_key().to_bytes();
+    assert!(is_room_owner_signing_key(
+        Some(owner.to_bytes().as_slice()),
+        &room
+    ));
+    assert!(!is_room_owner_signing_key(
+        Some(other.to_bytes().as_slice()),
+        &room
+    ));
+    assert!(!is_room_owner_signing_key(None, &room));
+    assert!(!is_room_owner_signing_key(
+        Some(&owner.to_bytes()[..31]),
+        &room
+    ));
+    assert!(!is_room_owner_signing_key(Some(&[0u8; 33]), &room));
+}
+
+/// `EnsureRoomSubscription` decides before writing anything: a caller
+/// holding no key for the room, or a key that is not the owner's, gets an
+/// error and no write; the owner's key gives exactly the subscription record
+/// and the reverse index, the latter keyed by the contract id and the
+/// owner's member id.
+#[test]
+fn ensure_checks_the_owner_key_before_any_write() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let member = SigningKey::generate(&mut OsRng);
+    let room = owner.verifying_key().to_bytes();
+    let cid = [7u8; 32];
+    for refused in [None, Some(member.to_bytes().to_vec()), Some(vec![1u8; 31])] {
+        assert!(
+            ensure_subscription_writes("origin", room, cid, KeyCheck::Stored(refused)).is_err()
+        );
+    }
+    let writes = ensure_subscription_writes(
+        "origin",
+        room,
+        cid,
+        KeyCheck::Stored(Some(owner.to_bytes().to_vec())),
+    )
+    .expect("the owner's key is accepted");
+    let keys: Vec<Vec<u8>> = writes.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            secret_keys::sub_index(&room_owner_b58(&room)),
+            contract_id_index_key(&cid, MemberId::from(&owner.verifying_key())),
+        ]
+    );
+}
+
+/// The writes of every `EnsureRoomSubscription` in `calls`, applied in order
+/// to one store, as the delegate applies them.
+fn store_after(
+    calls: &[(&str, &SigningKey, [u8; 32])],
+) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+    let mut store = std::collections::HashMap::new();
+    for (origin, sk, cid) in calls {
+        let room = sk.verifying_key().to_bytes();
+        for (k, v) in ensure_subscription_writes(
+            origin,
+            room,
+            *cid,
+            KeyCheck::Stored(Some(sk.to_bytes().to_vec())),
+        )
+        .unwrap()
+        {
+            store.insert(k, v);
+        }
+    }
+    store
+}
+
+/// A subscription another caller makes for its own room, naming the
+/// contract id of someone else's room, never decides where that room's
+/// notifications go: they resolve through the owner the notified state names,
+/// in either order of the two subscriptions.
+#[test]
+fn another_callers_subscription_never_captures_a_rooms_notifications() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let cid = [9u8; 32];
+    let state = private_room_state(&owner, &[]);
+    for calls in [
+        vec![("owner-origin", &owner, cid), ("other-origin", &other, cid)],
+        vec![("other-origin", &other, cid), ("owner-origin", &owner, cid)],
+    ] {
+        let store = store_after(&calls);
+        assert_eq!(
+            resolve_notified_room(&cid, &state, |k| store.get(k).cloned()),
+            Some(owner.verifying_key().to_bytes()),
+            "the owner's room, whichever subscription was written last"
+        );
+    }
+    // With only the other caller's subscription on file, the owner's
+    // notifications resolve to no room at all.
+    let store = store_after(&[("other-origin", &other, cid)]);
+    assert_eq!(
+        resolve_notified_room(&cid, &state, |k| store.get(k).cloned()),
+        None
+    );
+}
+
+/// A notified state whose configuration names an owner but is not signed by
+/// that owner's key resolves to no room.
+#[test]
+fn a_notification_whose_configuration_the_owner_did_not_sign_resolves_to_no_room() {
+    let owner = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let cid = [3u8; 32];
+    let store = store_after(&[("owner-origin", &owner, cid)]);
+    let mut state = private_room_state(&owner, &[]);
+    state.configuration =
+        AuthorizedConfigurationV1::new(state.configuration.configuration.clone(), &other);
+    assert_eq!(
+        resolve_notified_room(&cid, &state, |k| store.get(k).cloned()),
+        None
+    );
+    let good = private_room_state(&owner, &[]);
+    assert_eq!(
+        resolve_notified_room(&cid, &good, |k| store.get(k).cloned()),
+        Some(owner.verifying_key().to_bytes())
+    );
+}
+
+/// `handle_contract_notification` reads the delegate's secret store, which
+/// the host `DelegateCtx` stubs out, so no host test can drive it. Its two
+/// routing checks are pinned by reading the source instead (the idiom of
+/// `cli/src/commands/debug.rs`): it must resolve the room through
+/// `resolve_notified_room` (never a plain read of the reverse index), and
+/// must ignore a notification for a contract the room's subscription does
+/// not name, both before it acts on the notified state. Whitespace is
+/// removed before matching so a reformat does not break the pin; the source
+/// is cut at its test module so this test's own text cannot satisfy it.
+#[test]
+fn the_notification_handler_routes_through_the_owner_and_the_subscribed_contract() {
+    let src = include_str!("../subscription.rs");
+    let src = &src[..src.find("#[cfg(test)]\nmod tests").unwrap_or(src.len())];
+    let start = src
+        .find("pub(crate) fn handle_contract_notification(")
+        .expect("the notification handler exists");
+    let end = src[start + 1..]
+        .find("\nfn ")
+        .map(|i| start + 1 + i)
+        .unwrap_or(src.len());
+    let body: String = src[start..end].split_whitespace().collect();
+
+    let resolve = body
+        .find("resolve_notified_room(&cid_bytes,&new_state,")
+        .expect("the room is resolved through resolve_notified_room");
+    assert!(
+        !body.contains("contract_id_index_key("),
+        "the handler must not read the reverse index directly"
+    );
+    let check = body
+        .find("ifsub_ctx.contract_id!=cid_bytes{")
+        .expect("a notification for a contract the subscription does not name is ignored");
+    assert!(
+        body[check..].starts_with("ifsub_ctx.contract_id!=cid_bytes{")
+            && body[check..]
+                .split_once('}')
+                .is_some_and(|(arm, _)| arm.contains("returnOk(vec![]);")),
+        "the contract check must return without acting"
+    );
+    let acts = body
+        .find("privacy_mode")
+        .expect("the handler reads the notified room's privacy mode");
+    assert!(
+        resolve < check && check < acts,
+        "both checks run before the handler acts on the notified state"
     );
 }
