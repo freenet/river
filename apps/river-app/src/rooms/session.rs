@@ -1026,8 +1026,6 @@ fn follow_on(
                 "reconnecting to finish creating or joining a room".into()
             });
         }
-        rooms.archive_revival(unix_secs());
-        rooms.dm_save_tick(writes, Instant::now());
         // Moves of rooms to their current contract key: follow a moved room there at once,
         // and start the moves whose wait is over.
         for id in rooms.seed_ends(pace, Instant::now()) {
@@ -1038,6 +1036,8 @@ fn follow_on(
             rooms.seeds_due(Instant::now());
         }
         subs.keep_only(&rooms.contract_ids());
+        rooms.archive_revival(unix_secs());
+        rooms.dm_save_tick(writes, Instant::now());
         if writes {
             match rooms.send_updates(socket) {
                 Ok(failed) => changed |= failed,

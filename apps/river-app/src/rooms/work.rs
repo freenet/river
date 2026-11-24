@@ -2058,16 +2058,20 @@ impl Work {
     }
 
     pub fn views(&self) -> Vec<WorkView> {
-        // A mode that was saved needs no row; one still working or failed does.
-        self.tasks
-            .iter()
+        // A mode that was saved needs no row; one still working or failed does. What the user
+        // asked for is listed first, the app's own background work after it.
+        let (asked, background): (Vec<&Task>, Vec<&Task>) =
+            self.tasks.iter().partition(|t| !t.is_background());
+        asked
+            .into_iter()
+            .chain(background)
             .filter(|t| !t.is_dm())
             .filter(|t| !((t.is_mode() || t.is_leave()) && t.step == Step::Done))
             .filter(|t| match &t.kind {
-                // Carrying rooms over is shown while it has rooms to carry, or the list is empty
-                // (so an empty list says why), and when it failed with something to try again.
-                // Not once done (the rooms show), and not when River moved on (halted: the
-                // newer build carries them).
+                // Carrying rooms over is shown while it works, and when it failed with something
+                // to try again. Not once done (the rooms show), and not when River moved on
+                // (halted: the newer build carries them). A move of a room only while it works:
+                // the session tries one that failed again on its own.
                 Kind::Carry(_) => match &t.failed {
                     Some((_, retry)) => *retry,
                     None => t.step != Step::Done,
