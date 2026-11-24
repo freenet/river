@@ -202,13 +202,19 @@ jobs:
 
   # The app on two Freenet nodes River never ran on (apps/scripts/fresh-node-e2e.sh):
   # it registers the chat delegate on each, creates a room and an invitation on one,
-  # joins from it on the other, and each receives the other's message. Runs a pinned
-  # Freenet release, the oldest the desktop app installs or newer.
+  # joins from it on the other, and each receives the other's message. Runs on two pinned
+  # Freenet releases: the oldest the desktop app installs, and the current one. Both are
+  # explicit versions, never "latest"; move the second when a newer release is published.
   fresh-node-e2e:
+    name: fresh-node-e2e (freenet ${{ matrix.freenet }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        freenet: ['0.2.157', '0.2.164']
     env:
-      FREENET_VERSION: '0.2.157'
+      FREENET_VERSION: ${{ matrix.freenet }}
     defaults:
       run:
         working-directory: apps
