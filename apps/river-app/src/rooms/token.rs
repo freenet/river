@@ -106,7 +106,7 @@ impl TokenStore {
 }
 
 #[cfg(unix)]
-fn lock_file(path: &Path) -> std::io::Result<fs::File> {
+pub(super) fn lock_file(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
         .write(true)
@@ -117,7 +117,7 @@ fn lock_file(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn lock_file(path: &Path) -> std::io::Result<fs::File> {
+pub(super) fn lock_file(path: &Path) -> std::io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -126,7 +126,7 @@ fn lock_file(path: &Path) -> std::io::Result<fs::File> {
 }
 
 /// Make the rename durable. Best effort, and only meaningful on Unix.
-fn sync_dir(dir: &Path) {
+pub(super) fn sync_dir(dir: &Path) {
     #[cfg(unix)]
     if let Ok(d) = fs::File::open(dir) {
         let _ = d.sync_all();
@@ -136,7 +136,7 @@ fn sync_dir(dir: &Path) {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if !dir.exists() {
         fs::DirBuilder::new()
@@ -153,12 +153,12 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)
 }
 
 #[cfg(unix)]
-fn private_file(path: &Path) -> std::io::Result<fs::File> {
+pub(super) fn private_file(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
         .write(true)
@@ -168,7 +168,7 @@ fn private_file(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn private_file(path: &Path) -> std::io::Result<fs::File> {
+pub(super) fn private_file(path: &Path) -> std::io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)

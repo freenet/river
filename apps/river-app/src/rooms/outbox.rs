@@ -1952,6 +1952,9 @@ pub(super) struct Outbox {
     preview: Option<(VerifyingKey, MemberId)>,
     /// The last answer of [`Outbox::cached_preview`] and the digest of what it was for.
     preview_cache: std::cell::RefCell<Option<(u64, crate::chat::model::BanPreview)>>,
+    /// This device's record of the deletions it sent ([`super::purge_record`]). Kept here so it
+    /// outlives a session as what was sent does: a deletion is recorded as it first goes out.
+    purge_record: super::purge_record::PurgeRecord,
 }
 
 impl Default for Outbox {
@@ -1967,6 +1970,7 @@ impl Default for Outbox {
             stale: HashMap::new(),
             preview: None,
             preview_cache: Default::default(),
+            purge_record: Default::default(),
         }
     }
 }
@@ -2568,6 +2572,44 @@ impl Outbox {
         Ok(())
     }
 
+    /// Keep this device's record of deletions in `dir` (the app's config directory), unless it
+    /// already is. Without a directory it stays in memory.
+    pub fn keep_purge_record_in(&mut self, dir: Option<&std::path::Path>) {
+        if let Some(dir) = dir
+            && !self.purge_record.is_in(dir)
+        {
+            self.purge_record = super::purge_record::PurgeRecord::open(dir);
+        }
+    }
+
+    /// This device's record of the deletions it sent.
+    pub fn purge_record(&self) -> &super::purge_record::PurgeRecord {
+        &self.purge_record
+    }
+
+    /// The same, to change it (pruning, forgetting a room left).
+    pub fn purge_record_mut(&mut self) -> &mut super::purge_record::PurgeRecord {
+        &mut self.purge_record
+    }
+
+    /// Whether a deletion of `room` is queued, out, or failed and still shown: a re-signed
+    /// envelope waits for it, since it may be the one that restores what is missing, and one
+    /// the user was told failed must not be signed behind their back. One the node took but the
+    /// room did not keep is not waited for: re-signing is what repairs it.
+    pub fn purge_pending(&self, room: &VerifyingKey) -> bool {
+        self.entries.iter().any(|e| {
+            e.room == *room
+                && e.purge.is_some()
+                && !matches!(e.status, Status::Unconfirmed(_))
+        })
+    }
+
+    /// Queue the re-signed envelope `work` ([`super::dm_purge::heal`]) for `room`.
+    pub fn heal_purge(&mut self, room: &LiveRoom, work: super::dm_purge::Work) {
+        debug_assert!(work.heal);
+        self.push_purge(room, work);
+    }
+
     fn push_purge(&mut self, room: &LiveRoom, work: super::dm_purge::Work) {
         self.next += 1;
         self.entries.push(Entry {
@@ -2599,7 +2641,7 @@ impl Outbox {
             .iter()
             .filter(|e| e.room == *room)
             .filter_map(|e| {
-                let work = e.purge.as_ref()?;
+                let work = e.purge.as_ref().filter(|w| !w.heal)?;
                 Some(PurgeRow {
                     peer: work.peer,
                     count: work.tokens.len(),
@@ -2634,10 +2676,36 @@ impl Outbox {
             Action::Discard { entry } => {
                 // Only what is shown as not sent, and only in the room it was written in.
                 let before = self.entries.len();
-                self.entries.retain(|e| {
-                    e.id != entry || e.room != room.stored.owner_vk || e.trouble().is_none()
-                });
-                return self.entries.len() != before;
+                let vk = room.stored.owner_vk;
+                // A deletion the room refused and the user gives up is no longer one this
+                // device is to sign again ([`super::purge_record`]). One the node took but the
+                // room does not show stays recorded: it was sent.
+                let given_up: Vec<super::dm_purge::Work> = self
+                    .entries
+                    .iter()
+                    .filter(|e| e.id == entry && e.room == vk)
+                    .filter(|e| matches!(e.status, Status::Failed(_)))
+                    .filter_map(|e| e.purge.clone())
+                    .filter(|w| !w.heal)
+                    .collect();
+                self.entries
+                    .retain(|e| e.id != entry || e.room != vk || e.trouble().is_none());
+                let discarded = self.entries.len() != before;
+                if discarded {
+                    for work in given_up {
+                        if let Err(e) = self.purge_record.unrecord(
+                            &vk,
+                            work.envelope.recipient_id,
+                            &work.tokens,
+                        ) {
+                            crate::diag!(
+                                "River: a dismissed deletion stays recorded: {}",
+                                crate::diag::scrub(&e)
+                            );
+                        }
+                    }
+                }
+                return discarded;
             }
             action => self.intent(room, action),
         };
@@ -3069,6 +3137,28 @@ impl Outbox {
                         continue;
                     }
                 }
+            }
+            // A deletion is recorded before it first goes out, so a crash after it is sent
+            // cannot lose the record that lets a lost race be signed again. A record that
+            // cannot be kept stops the deletion: sent unrecorded, it could come back unrepaired.
+            if !entry.sent
+                && let Some(work) = &entry.purge
+                && !work.heal
+                && let Err(e) =
+                    self.purge_record
+                        .record(&vk, work.envelope.recipient_id, &work.tokens)
+            {
+                crate::diag!(
+                    "River: a deletion was not sent, its record was not saved: {}",
+                    crate::diag::scrub(&e)
+                );
+                entry.status = Status::Failed(format!(
+                    "The deletion was not sent: this computer could not save the record that \
+                     lets River sign it again if another device of yours deletes at the same \
+                     moment. {e}"
+                ));
+                *changed = true;
+                continue;
             }
             entry.status = Status::InFlight {
                 at: now,
