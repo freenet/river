@@ -17,7 +17,7 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
     }
 
     // A public room viewed read-only (freenet/river#513): not a room of ours, never re-PUT.
-    if crate::public_room::is_viewed(key.id()) {
+    if crate::public_room::is_viewers(key.id()) {
         return false;
     }
 

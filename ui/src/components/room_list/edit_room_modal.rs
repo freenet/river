@@ -451,6 +451,7 @@ pub fn EditRoomModal() -> Element {
 
                                                     // Check and potentially clear CURRENT_ROOM
                                                     if CURRENT_ROOM.read().owner_key == Some(room_vk) {
+                                                        crate::public_room::close();
                                                         CURRENT_ROOM.write().owner_key = None;
                                                     }
 

@@ -167,6 +167,20 @@ pub fn install_test_hooks() {
         "viewableRoomKey",
         Closure::<dyn FnMut(String) -> String>::new(move |kind: String| {
             // A well-formed key no fixture room has: the not-found case.
+            // A room the user is in (the example list's "Team Chat Room").
+            if kind == "member" {
+                return ROOMS
+                    .try_read()
+                    .ok()
+                    .and_then(|rooms| {
+                        rooms
+                            .map
+                            .iter()
+                            .find(|(_, r)| r.display_name() == "Team Chat Room")
+                            .map(|(vk, _)| crate::public_room::owner_key_b58(vk))
+                    })
+                    .unwrap_or_default();
+            }
             if kind == "missing" {
                 let vk = SigningKey::from_bytes(&[0x53; 32]).verifying_key();
                 return crate::public_room::owner_key_b58(&vk);

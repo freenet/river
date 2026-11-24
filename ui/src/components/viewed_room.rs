@@ -1,12 +1,13 @@
 //! The read-only pane for a room opened by `?room=` link (freenet/river#513).
 //! State and rules: [`crate::public_room`].
 
+use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{CURRENT_ROOM, ROOMS, SYNC_STATUS};
 use crate::components::room_list::edit_room_modal::CopyButton;
 use crate::public_room::{
-    close, composer_note, public_room_link, should_request, ViewedRoom, ViewedRoomStatus,
-    VIEWED_ROOM,
+    close, composer_note, fetch_action, public_room_link, request_fetch, request_subscribe, retry,
+    FetchAction, ViewedRoom, ViewedRoomStatus, VIEWED_ROOM,
 };
 use crate::room_data::CurrentRoom;
 use crate::util::display_name::display_nickname;
@@ -18,7 +19,10 @@ use std::time::UNIX_EPOCH;
 
 #[component]
 pub fn ViewedRoomPane() -> Element {
-    // Fetch once connected, and again after a reconnect, while still waiting.
+    // Fetch once connected and the user's own rooms have loaded; subscribe once
+    // the room is known to be public, and again after each reconnect.
+    let last_connected = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    let asked = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     use_effect(move || {
         crate::util::signal_guard::anchor();
         let connected = match SYNC_STATUS.try_read() {
@@ -28,18 +32,50 @@ pub fn ViewedRoomPane() -> Element {
                 return;
             }
         };
+        let rooms_loaded = match ROOMS_LOAD_STATE.try_read() {
+            Ok(s) => *s == RoomsLoadState::Loaded,
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                return;
+            }
+        };
+        let just_connected = connected && !last_connected.replace(connected);
+        if !connected {
+            last_connected.set(false);
+        }
         let Ok(viewed) = VIEWED_ROOM.try_read() else {
             crate::util::signal_guard::schedule_nudge();
             return;
         };
-        if let Some(ViewedRoom {
+        let Some(ViewedRoom {
             owner_vk: Some(owner_vk),
             status,
         }) = viewed.as_ref()
-        {
-            if should_request(connected, status) {
-                crate::public_room::request_fetch(*owner_vk);
+        else {
+            return;
+        };
+        let owner_vk = *owner_vk;
+        let ours = match ROOMS.try_read() {
+            Ok(rooms) => rooms.map.contains_key(&owner_vk),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                true
             }
+        };
+        match fetch_action(
+            connected,
+            just_connected,
+            asked.get(),
+            rooms_loaded,
+            ours,
+            status,
+        ) {
+            Some(FetchAction::Get) => {
+                asked.set(true);
+                request_fetch(owner_vk);
+            }
+            Some(FetchAction::Subscribe) => request_subscribe(owner_vk),
+            None => {}
         }
     });
 
@@ -125,6 +161,11 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
             "Its messages and members are private. To join, ask a member for an invitation."
                 .to_string(),
         ),
+        ViewedRoomStatus::TimedOut => (
+            "viewed-room-timed-out",
+            "No answer yet".to_string(),
+            "Nothing replied about this room. Check your connection and try again.".to_string(),
+        ),
         ViewedRoomStatus::Invalid(e) => (
             "viewed-room-invalid",
             "Invalid room link".to_string(),
@@ -132,7 +173,10 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
         ),
         ViewedRoomStatus::Public(_) => ("viewed-room-loading", String::new(), String::new()),
     };
-    let can_retry = matches!(status, ViewedRoomStatus::NotFound) && owner_vk.is_some();
+    let can_retry = matches!(
+        status,
+        ViewedRoomStatus::NotFound | ViewedRoomStatus::TimedOut
+    ) && owner_vk.is_some();
     rsx! {
         div { class: "flex-1 flex items-center justify-center p-6",
             div {
@@ -148,12 +192,7 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
                             class: "px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text text-sm transition-colors",
                             onclick: move |_| {
                                 if let Some(owner_vk) = owner_vk {
-                                    crate::util::defer(move || {
-                                        *VIEWED_ROOM.write() = Some(ViewedRoom {
-                                            owner_vk: Some(owner_vk),
-                                            status: ViewedRoomStatus::Loading,
-                                        });
-                                    });
+                                    crate::util::defer(move || retry(owner_vk));
                                 }
                             },
                             "Try again"
@@ -170,7 +209,7 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
 struct Line {
     author: String,
     when: String,
-    text: String,
+    html: String,
 }
 
 /// The shown messages, oldest first: public text only, as the room's actions
@@ -199,7 +238,7 @@ fn lines(state: &ChatRoomStateV1) -> Vec<Line> {
             Some(Line {
                 author,
                 when: crate::util::format_utc_as_full_datetime(ms),
-                text,
+                html: crate::components::conversation::message_to_html(&text),
             })
         })
         .collect()
@@ -262,7 +301,10 @@ fn PublicRoomView(
                         " "
                         span { "{line.when}" }
                     }
-                    div { class: "text-sm text-text whitespace-pre-wrap break-words", "{line.text}" }
+                    div {
+                        class: "text-sm text-text break-words",
+                        dangerous_inner_html: "{line.html}",
+                    }
                 }
             }
         }

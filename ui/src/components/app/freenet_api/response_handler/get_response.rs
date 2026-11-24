@@ -865,6 +865,7 @@ pub async fn handle_get_response(
                             );
                         }
                     });
+                    crate::public_room::close();
                     CURRENT_ROOM.with_mut(|current_room| {
                         current_room.owner_key = Some(owner_vk);
                     });

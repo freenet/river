@@ -2597,6 +2597,7 @@ fn complete_identity_import(
             );
         }
 
+        crate::public_room::close();
         CURRENT_ROOM.with_mut(|current| {
             current.owner_key = Some(owner_key);
         });

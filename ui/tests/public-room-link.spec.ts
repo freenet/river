@@ -7,12 +7,18 @@ import { captureClipboardWrites, clipboardWrites } from "./clipboard";
 // membership. The example build has no network, so it resolves the key from
 // two fixture rooms that are NOT in the room list (one public, one private).
 
-async function keyOf(page: Page, kind: "public" | "private" | "missing") {
+async function keyOf(page: Page, kind: "public" | "private" | "missing" | "member") {
   await page.goto("/");
   await waitForApp(page);
+  await hooksReady(page);
   const key = await callRiverTest(page, "viewableRoomKey", kind);
   expect(key.length).toBeGreaterThan(30);
   return key;
+}
+
+// The app is up and its test hooks are installed (they appear after first render).
+async function hooksReady(page: Page) {
+  await page.waitForFunction(() => typeof (window as any).__riverTest?.viewableRoomKey === "function");
 }
 
 async function openLink(page: Page, key: string) {
@@ -102,4 +108,29 @@ test("closing the viewer returns to the user's own rooms", async ({ page }) => {
   // The user's own rooms are untouched and open normally.
   await selectRoom(page, "Team Chat Room");
   await expect(page.getByTestId("message-composer").first()).toBeVisible();
+});
+
+test("a link to a room the user is already in opens their own room, not a visitor view", async ({ page }) => {
+  const panics = panicsOf(page);
+  const key = await keyOf(page, "member");
+  await openLink(page, key);
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0);
+  await expect(page.getByTestId("message-composer").first()).toBeVisible();
+  expect(panics).toEqual([]);
+});
+
+test("an invitation in the URL wins over room", async ({ page }) => {
+  const key = await keyOf(page, "public");
+  // An undecodable invitation: the invitation flow owns the URL, so no visitor view opens.
+  await page.goto(`/?invitation=notarealinvitation&room=${key}`);
+  await waitForApp(page);
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0);
+});
+
+test("a link in a public message is rendered as a link", async ({ page }) => {
+  const key = await keyOf(page, "public");
+  await openLink(page, key);
+  await expect(page.getByTestId("viewed-room-messages")).toBeVisible();
+  // Messages go through the same renderer as the member view: no raw markup shows.
+  await expect(page.getByTestId("viewed-room-messages")).not.toContainText("<p>");
 });
