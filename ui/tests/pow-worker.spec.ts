@@ -4,7 +4,12 @@ import { callRiverTest } from "./river-test";
 
 // freenet/river#1023: the admission proof of work runs in Web Workers, off the
 // page's main thread. The fixture rooms (see public-room-join.spec.ts) are
-// `open` (4 bits) and `hard` (26 bits, never solved by a test).
+// `open` (4 bits) and `hard` (26 bits: held by the holdSolver hook, or raised
+// to 32, since Web Workers can solve 26 bits in seconds).
+
+// Each join loads the app's wasm into several workers; a loaded machine (the
+// suite runs projects in parallel) takes a while.
+test.setTimeout(120_000);
 
 async function hooksReady(page: Page) {
   await page.waitForFunction(() => typeof (window as any).__riverTest?.viewableRoomKey === "function");
@@ -25,7 +30,7 @@ test("a join solves in Web Workers and posts exactly once", async ({ page }) => 
   await openRoom(page, "open");
   await page.getByTestId("viewed-room-composer").fill("From a worker");
   await page.getByTestId("viewed-room-send").click();
-  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
   expect(await callRiverTest(page, "powSolverMode")).toBe("workers");
   expect(await callRiverTest(page, "roomMessageCount", "From a worker")).toBe(1);
   // The solve is over: its workers are gone.
@@ -36,11 +41,14 @@ test("a join solves in Web Workers and posts exactly once", async ({ page }) => 
 test("cancelling a running solve stops its workers and keeps the draft", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "hard");
+  // The room's 26 bits are within a few seconds of four workers, so a test
+  // that must not finish asks for the contract's maximum, 32 bits.
+  expect(await callRiverTest(page, "retargetPolicy", "hard", 32, 2)).toBe(true);
   await page.getByTestId("viewed-room-composer").fill("Keep me");
   await page.getByTestId("viewed-room-send").click();
   await expect(page.getByTestId("viewed-room-join-progress")).toBeVisible();
   // Really hashing (26 bits is out of reach of a test), in workers, not on the page.
-  await expect.poll(() => callRiverTest(page, "powSolverMode"), { timeout: 30_000 }).toBe("workers");
+  await expect.poll(() => callRiverTest(page, "powSolverMode"), { timeout: 60_000 }).toBe("workers");
   expect(page.workers().length).toBeGreaterThan(0);
 
   await page.getByTestId("viewed-room-join-cancel").click();
@@ -52,6 +60,21 @@ test("cancelling a running solve stops its workers and keeps the draft", async (
   expect(panics).toEqual([]);
 });
 
+test("cancelling while the workers are still loading leaves none running", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "hard");
+  expect(await callRiverTest(page, "retargetPolicy", "hard", 32, 2)).toBe(true);
+  await page.getByTestId("viewed-room-composer").fill("Too early");
+  await page.getByTestId("viewed-room-send").click();
+  await page.getByTestId("viewed-room-join-cancel").click();
+  await expect(page.getByTestId("viewed-room-composer")).toHaveValue("Too early");
+  // Whether the workers had loaded or not, none outlive the cancel.
+  await expect.poll(() => page.workers().length, { timeout: 30_000 }).toBe(0);
+  expect(await callRiverTest(page, "joinSessionKey")).toBe("");
+  expect(await callRiverTest(page, "roomMessageCount", "Too early")).toBe(0);
+  expect(panics).toEqual([]);
+});
+
 test("a changed room policy retargets the workers and the message still posts once", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "open");
@@ -59,12 +82,14 @@ test("a changed room policy retargets the workers and the message still posts on
   await page.getByTestId("viewed-room-composer").fill("After retarget");
   await page.getByTestId("viewed-room-send").click();
   await expect(page.getByTestId("viewed-room-join-progress")).toBeVisible();
+  // Retarget a solve that is running, not one still loading its workers.
+  await expect.poll(() => callRiverTest(page, "powSolverMode"), { timeout: 60_000 }).toBe("workers");
   const before = await callRiverTest(page, "powRetargets");
   // More bits and a new epoch: the search restarts for the new policy.
   expect(await callRiverTest(page, "retargetPolicy", "open", 10, 2)).toBe(true);
   await expect.poll(() => callRiverTest(page, "powRetargets"), { timeout: 10_000 }).toBe(before + 1);
   await callRiverTest(page, "holdSolver", false);
-  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
   expect(await callRiverTest(page, "powSolverMode")).toBe("workers");
   expect(await callRiverTest(page, "roomMessageCount", "After retarget")).toBe(1);
   expect(panics).toEqual([]);
@@ -100,8 +125,6 @@ test("a join solves in Web Workers inside the gateway's sandboxed iframe", async
   await hooksReady(page);
   const key = await callRiverTest(page, "viewableRoomKey", "open");
 
-  page.on("console", (m) => console.log("console:", m.type(), m.text()));
-  page.on("pageerror", (e) => console.log("pageerror:", e.message));
   await page.setContent(
     `<iframe id="app" src="${base}/?room=${key}" sandbox="allow-scripts allow-forms allow-popups" style="width:1000px;height:700px"></iframe>`,
   );
@@ -109,7 +132,7 @@ test("a join solves in Web Workers inside the gateway's sandboxed iframe", async
   await expect(frame.getByTestId("viewed-room-name")).toBeVisible({ timeout: 30_000 });
   await frame.getByTestId("viewed-room-composer").fill("Sandboxed");
   await frame.getByTestId("viewed-room-send").click();
-  await expect(frame.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  await expect(frame.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
   const handle = await page.locator("#app").elementHandle();
   const inner = (await handle!.contentFrame())!;
   const mode = await inner.evaluate(() => (window as any).__riverTest.powSolverMode());

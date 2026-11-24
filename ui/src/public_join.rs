@@ -1217,10 +1217,14 @@ async fn solve(generation: u64, mut watch: RoomWatch) -> Solve {
 
 #[cfg(target_arch = "wasm32")]
 async fn solve_in_workers(generation: u64, watch: &mut RoomWatch) -> Option<Solve> {
-    let mut pool = crate::pow_worker::Pool::spawn(crate::pow_worker::worker_count()).await?;
+    let spawned = crate::pow_worker::Pool::spawn(crate::pow_worker::worker_count(), || {
+        is_current(generation)
+    })
+    .await;
     if !is_current(generation) {
         return Some(Solve::Stopped);
     }
+    let mut pool = spawned?;
     note_solver_mode("workers");
     let mut held = solver_held_for_test();
     pool.start(&watch.owner_vk, &watch.member_vk, &watch.req, held);

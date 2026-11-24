@@ -170,6 +170,8 @@ mod browser {
     /// How long a worker may take to load its module before the page gives up
     /// on workers (a phone fetching and compiling the wasm).
     const READY_TIMEOUT_MS: u32 = 30_000;
+    /// How often loading workers are checked for a cancel.
+    const READY_POLL_MS: u32 = 200;
     /// Most workers one join starts.
     const MAX_WORKERS: usize = 4;
 
@@ -290,8 +292,9 @@ mod browser {
 
     impl Pool {
         /// Start `n` workers and wait until all have loaded. `None` if any
-        /// cannot start or loading takes longer than [`READY_TIMEOUT_MS`].
-        pub async fn spawn(n: usize) -> Option<Pool> {
+        /// cannot start, loading takes longer than [`READY_TIMEOUT_MS`], or
+        /// `keep_waiting` turns false (the join was cancelled).
+        pub async fn spawn(n: usize, keep_waiting: impl Fn() -> bool) -> Option<Pool> {
             let document = web_sys::window()?.document()?;
             let glue = glue_url()?;
             let base = document.base_uri().ok().flatten()?;
@@ -346,11 +349,15 @@ mod browser {
                 pool._error_handlers.push(on_error);
             }
             drop(tx);
-            let mut ready = 0;
+            let (mut ready, mut waited) = (0, 0);
             while ready < n {
-                match pool.next(READY_TIMEOUT_MS).await {
+                if !keep_waiting() || waited >= READY_TIMEOUT_MS {
+                    return None;
+                }
+                match pool.next(READY_POLL_MS).await {
                     Some((_, FromWorker::Ready)) => ready += 1,
-                    _ => return None,
+                    Some(_) => return None,
+                    None => waited += READY_POLL_MS,
                 }
             }
             Some(pool)
