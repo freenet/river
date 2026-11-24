@@ -304,6 +304,7 @@ fn day_break(items: El, day: &mut Option<u32>, time: u32, chat: &Chat, p: &Palet
 /// people are named in its tooltip.
 fn join_el(chat: &Chat, j: &model::Join, p: &Palette) -> El {
     let (mut line, bold) = j.line();
+    let said = line.clone();
     line.push_str(" \u{b7} ");
     line.push_str(&model::clock(j.time));
     let spans = bold
@@ -314,32 +315,62 @@ fn join_el(chat: &Chat, j: &model::Join, p: &Palette) -> El {
                 .color(p.text_secondary)
         })
         .collect();
-    let mut text = rune::rich(line, spans)
+    let text = rune::rich(line, spans)
         .font(st::JOIN)
         .color(p.text_muted)
         .shrink()
         .selectable(true);
-    if j.names.len() > 2 {
-        text = text.help(j.names.join(", "));
-    }
-    row()
-        .key(format!("join-{}", j.key))
-        .label(format!(
-            "{} at {}",
-            j.line().0,
-            model::full_time(chat.day_zero, j.time)
-        ))
+    let when = model::full_time(chat.day_zero, j.time);
+    let key = format!("join-{}", j.key);
+    let icon_cell = el()
+        .w(GUTTER)
+        .center()
+        .child(icon(&icons::JOIN, 14.0).color(p.text_muted));
+    // Three or more are counted, not named: pressing the line (or Enter on it) lists them, as
+    // the web UI's `details` does, and the names are in its label and tooltip too.
+    let names = j.names.join(", ");
+    let counted = j.names.len() > 2;
+    let open = counted && chat.joins_open.contains(&j.key);
+    let mut line_row = row()
+        .key(key.clone())
         .w_full()
         .pt(3.0)
         .pb(3.0)
         .pr(24.0)
         .center_y()
+        .child(icon_cell)
+        .child(text);
+    if counted {
+        let toggle = j.key.clone();
+        line_row = line_row
+            .role("button")
+            .label(format!("{said} at {when}: {names}"))
+            .help(names.clone())
+            .cursor(rune::Cursor::Pointer)
+            .on_press(move |s: &mut RiverApp| {
+                if !s.chat.joins_open.remove(&toggle) {
+                    s.chat.joins_open.insert(toggle.clone());
+                }
+            });
+    } else {
+        line_row = line_row.label(format!("{said} at {when}"));
+    }
+    if !open {
+        return line_row;
+    }
+    col()
+        .key(format!("{key}-open"))
+        .w_full()
+        .child(line_row)
         .child(
-            el().w(GUTTER)
-                .center()
-                .child(icon(&icons::JOIN, 14.0).color(p.text_muted)),
+            row().w_full().pr(24.0).pb(3.0).child(el().w(GUTTER)).child(
+                label(names, st::JOIN, p.text_muted)
+                    .key(format!("{key}-names"))
+                    .wrap()
+                    .shrink()
+                    .selectable(true),
+            ),
         )
-        .child(text)
 }
 
 pub(super) fn day_divider(day: u32, text: String, p: &Palette) -> El {

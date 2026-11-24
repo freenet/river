@@ -244,7 +244,7 @@ pub struct Message {
 /// unread, searched or notified.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Join {
-    /// Stable across updates: the key of the newest event folded in.
+    /// Stable across updates: the key of the first event folded in.
     pub key: String,
     /// Who joined, in join order.
     pub names: Vec<String>,

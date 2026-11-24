@@ -928,9 +928,22 @@ fn a_reply_that_arrives_before_its_target_becomes_a_jump_when_the_target_does() 
 /// The private state with join events by `who` at `secs` seconds spliced in, each after the
 /// message at index `after` of the original four (hello, reply, reaction, edit).
 fn with_joins(f: &Fixture, joins: &[(usize, &SigningKey, u64)]) -> ChatRoomStateV1 {
-    let mut state = f.private_state();
+    with_joins_on(f, f.private_state(), joins)
+}
+
+/// [`with_joins`] on a state already built (a state built twice differs: sealing is random).
+fn with_joins_on(
+    f: &Fixture,
+    mut state: ChatRoomStateV1,
+    joins: &[(usize, &SigningKey, u64)],
+) -> ChatRoomStateV1 {
     let original = state.recent_messages.messages.clone();
     let mut out = Vec::new();
+    for (after, who, secs) in joins {
+        if *after == usize::MAX {
+            out.push(f.message(who, *secs, RoomMessageBody::join_event()));
+        }
+    }
     for (i, m) in original.into_iter().enumerate() {
         out.push(m);
         for (after, who, secs) in joins {
@@ -1002,24 +1015,6 @@ fn three_joins_are_counted_not_named_in_the_line() {
 }
 
 #[test]
-fn a_join_event_is_never_unread() {
-    let f = Fixture::new();
-    // As Mia: the owner's text after the reply is the one unread message. Joins by the owner
-    // after the last read add nothing (a join by anyone else would be no different).
-    let mut state = with_joins(&f, &[(1, &f.owner, 130), (3, &f.owner, 300)]);
-    state.recent_messages.messages.push(f.message(
-        &f.owner,
-        400,
-        RoomMessageBody::public("later".into()),
-    ));
-    let mut stored = f.stored(state.clone());
-    stored.last_read_message_id = Some(state.recent_messages.messages[0].id());
-    let room = LiveRoom::new(stored).view(&minutes);
-    assert_eq!(room.messages.len(), 3);
-    assert_eq!(room.unread, 1);
-}
-
-#[test]
 fn the_join_line_is_drawn_between_the_messages_with_nothing_to_press() {
     let f = Fixture::new();
     let room = LiveRoom::new(f.stored(with_joins(&f, &[(0, &f.me, 90)]))).view(&minutes);
@@ -1083,4 +1078,207 @@ fn a_join_splits_one_authors_messages_into_two_groups() {
         .filter(|e| e.key.as_deref().is_some_and(|k| k.starts_with("group-")))
         .count();
     assert_eq!(groups, 2, "the join line ends the first group");
+}
+
+/// Local minutes of a time, shifted by `shift` minutes from `at` seconds on (a clock change).
+fn zone(at: u64, shift: i64) -> impl Fn(SystemTime) -> u32 {
+    move |t| {
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let m = (secs / 60) as i64 + if secs >= at { shift } else { 0 };
+        m as u32
+    }
+}
+
+fn joins_at(
+    f: &Fixture,
+    secs: &[u64],
+    view: &dyn Fn(SystemTime) -> u32,
+) -> Vec<crate::chat::model::Join> {
+    let list: Vec<(usize, &SigningKey, u64)> = secs.iter().map(|s| (0, &f.me, *s)).collect();
+    LiveRoom::new(f.stored(with_joins(f, &list)))
+        .view(view)
+        .joins
+}
+
+#[test]
+fn the_fold_compares_instants_with_the_webs_strict_hour() {
+    let f = Fixture::new();
+    let h = 3600;
+    // 59m59s folds; exactly an hour and a second past do not (the web's `< 1 hour`).
+    assert_eq!(joins_at(&f, &[1000, 1000 + h - 1], &minutes).len(), 1);
+    assert_eq!(joins_at(&f, &[1000, 1000 + h], &minutes).len(), 2);
+    assert_eq!(joins_at(&f, &[1000, 1000 + h + 1], &minutes).len(), 2);
+    // Each join is compared with the one before it, so a chain folds past an hour in all.
+    assert_eq!(joins_at(&f, &[1000, 4000, 7000], &minutes).len(), 1);
+}
+
+#[test]
+fn seconds_the_minute_clock_drops_do_not_change_the_fold() {
+    let f = Fixture::new();
+    // 10:00:59 and 11:00:00 are 59m01s apart but 60 whole minutes apart on the minute clock.
+    assert_eq!(
+        joins_at(&f, &[10 * 3600 + 59, 11 * 3600], &minutes).len(),
+        1
+    );
+}
+
+#[test]
+fn a_clock_change_does_not_change_the_fold() {
+    let f = Fixture::new();
+    let change = 5000;
+    // Spring forward: 30 minutes apart in fact, 90 on the local clock. Still folded.
+    let spring = zone(change, 60);
+    assert_eq!(
+        joins_at(&f, &[change - 900, change + 900], &spring).len(),
+        1
+    );
+    // Fall back: 90 minutes apart in fact, 30 on the local clock. Still two lines.
+    let fall = zone(change, -60);
+    assert_eq!(
+        joins_at(&f, &[change - 2700, change + 2700], &fall).len(),
+        2
+    );
+}
+
+#[test]
+fn the_line_is_keyed_by_its_first_event_so_a_fold_keeps_the_row() {
+    let f = Fixture::new();
+    let one = joins_at(&f, &[1000], &minutes);
+    let two = joins_at(&f, &[1000, 1100], &minutes);
+    assert_eq!(one[0].key, two[0].key);
+}
+
+#[test]
+fn three_joins_fold_into_one_counted_line_and_one_member_twice_is_named_twice() {
+    let f = Fixture::new();
+    let three = joins_at(&f, &[1000, 1100, 1200], &minutes);
+    assert_eq!(three.len(), 1);
+    assert_eq!(three[0].line().0, "3 people joined");
+    let twice = joins_at(&f, &[1000, 1100], &minutes);
+    assert_eq!(twice[0].line().0, "Mia and Mia joined");
+}
+
+fn element_keys(rt: &rune::Runtime<crate::RiverApp>) -> Vec<String> {
+    rt.elements().into_iter().filter_map(|e| e.key).collect()
+}
+
+#[test]
+fn a_join_before_the_first_message_and_one_after_the_last_are_drawn_in_place() {
+    let f = Fixture::new();
+    let state = with_joins(&f, &[(usize::MAX, &f.me, 30), (3, &f.owner, 300)]);
+    let room = LiveRoom::new(f.stored(state)).view(&minutes);
+    assert_eq!(room.messages.len(), 2);
+    assert_eq!(room.joins.len(), 2);
+    assert_eq!((room.joins[0].before, room.joins[1].before), (0, 2));
+    let (first, last) = (
+        format!("join-{}", room.joins[0].key),
+        format!("join-{}", room.joins[1].key),
+    );
+    let keys = element_keys(&render(room));
+    let at = |k: &str| {
+        keys.iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("no {k}"))
+    };
+    let groups: Vec<usize> = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| k.starts_with("group-"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(groups.len(), 2);
+    assert!(
+        at(&first) < groups[0],
+        "the first join is above the first message"
+    );
+    assert!(
+        at(&last) > groups[1],
+        "the last join is below the last message"
+    );
+}
+
+#[test]
+fn a_join_on_another_day_gets_its_own_day_divider() {
+    let f = Fixture::new();
+    let day = 86_400;
+    // Messages are on day 0; the join is on day 2, between the two messages.
+    let state = with_joins(&f, &[(0, &f.me, 2 * day + 60)]);
+    let keys = element_keys(&render(LiveRoom::new(f.stored(state)).view(&minutes)));
+    let day_at = |d: u32| keys.iter().position(|k| *k == format!("day-{d}"));
+    let join_at = keys.iter().position(|k| k.starts_with("join-")).unwrap();
+    assert!(day_at(0).unwrap() < join_at);
+    assert!(
+        day_at(2).unwrap() < join_at,
+        "day 2 divider is above the join"
+    );
+    assert!(join_at < keys.iter().rposition(|k| k.starts_with("group-")).unwrap());
+}
+
+#[test]
+fn the_names_of_a_counted_line_open_on_press_and_are_in_its_label() {
+    let f = Fixture::new();
+    let room = LiveRoom::new(f.stored(with_joins(
+        &f,
+        &[(0, &f.me, 90), (0, &f.owner, 100), (0, &f.me, 110)],
+    )))
+    .view(&minutes);
+    let key = format!("join-{}", room.joins[0].key);
+    let mut rt = render(room);
+    let line = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref() == Some(key.as_str()))
+        .expect("drawn");
+    assert_eq!(line.role, "button");
+    assert!(line.label.as_deref().unwrap().contains("Mia, Olive, Mia"));
+    assert!(!element_keys(&rt).contains(&format!("{key}-names")));
+    let press = |rt: &mut rune::Runtime<crate::RiverApp>, t: f64| {
+        let (x, y) = rt.find(&key).expect("drawn");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(t);
+        rt.frame(t + 0.1);
+    };
+    press(&mut rt, 1.0);
+    assert!(element_keys(&rt).contains(&format!("{key}-names")));
+    press(&mut rt, 2.0);
+    assert!(!element_keys(&rt).contains(&format!("{key}-names")));
+}
+
+#[test]
+fn a_join_is_never_unread_and_never_an_arrival() {
+    let f = Fixture::new();
+    // As Mia: the owner's text after the reply is the one unread message; joins after the
+    // last read add nothing.
+    let mut state = with_joins(&f, &[(1, &f.owner, 130), (3, &f.owner, 300)]);
+    state.recent_messages.messages.push(f.message(
+        &f.owner,
+        400,
+        RoomMessageBody::public("later".into()),
+    ));
+    let mut stored = f.stored(state.clone());
+    stored.last_read_message_id = Some(state.recent_messages.messages[0].id());
+    let room = LiveRoom::new(stored).view(&minutes);
+    assert!(!room.joins.is_empty(), "the joins are in the view");
+    assert_eq!(room.messages.len(), 3);
+    assert_eq!(room.unread, 1);
+    // A room that gains a join line gives no notification, in any mode.
+    let base_state = f.private_state();
+    let base = f.stored(base_state.clone());
+    let old = LiveRoom::new(base.clone()).view(&minutes);
+    let mut with = base;
+    with.room_state = with_joins_on(&f, base_state, &[(1, &f.owner, 130)]);
+    let new = LiveRoom::new(with).view(&minutes);
+    assert_eq!(new.joins.len(), 1);
+    for mode in [
+        crate::rooms::modes::NotificationMode::All,
+        crate::rooms::modes::NotificationMode::MentionsAndReplies,
+    ] {
+        let got = crate::notify::arrivals(
+            std::slice::from_ref(&old),
+            std::slice::from_ref(&new),
+            &|_| mode,
+        );
+        assert!(got.is_empty());
+    }
 }

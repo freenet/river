@@ -44,7 +44,7 @@ pub const NO_SECRET_TO_EDIT: &str = "This private room's key hasn't reached this
 const REPLY_PREVIEW_CHARS: usize = 100;
 /// Join events fold into one line while each is within this long of the one before (the web
 /// UI's one hour).
-const JOIN_FOLD_MINUTES: u32 = 60;
+const JOIN_FOLD_SECS: u64 = 60 * 60;
 
 #[derive(Clone)]
 pub struct LiveRoom {
@@ -870,32 +870,38 @@ impl LiveRoom {
     /// reads.
     fn joins(&self, me: Option<RiverMemberId>, minutes: &dyn Fn(SystemTime) -> u32) -> Vec<Join> {
         let mut out: Vec<Join> = Vec::new();
+        // The newest folded event's real time: the fold compares instants, as the web UI does,
+        // not the local minutes shown (which lose seconds and jump at a clock change).
+        let mut last_secs = 0u64;
         let mut before = 0;
         for m in self.stored.room_state.recent_messages.display_messages() {
             if !m.message.content.is_event() {
                 before += 1;
                 continue;
             }
-            let time = minutes(m.message.time);
+            let secs = m
+                .message
+                .time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
             let name = self.nickname(m.message.author, me);
-            let key = message_key(&m.id());
             match out.last_mut() {
                 Some(j)
                     if j.before == before
-                        && time.saturating_sub(j.time) < JOIN_FOLD_MINUTES
-                        && time >= j.time =>
+                        && secs >= last_secs
+                        && secs - last_secs < JOIN_FOLD_SECS =>
                 {
                     j.names.push(name);
-                    j.time = time;
-                    j.key = key;
+                    j.time = minutes(m.message.time);
                 }
                 _ => out.push(Join {
-                    key,
+                    key: message_key(&m.id()),
                     names: vec![name],
-                    time,
+                    time: minutes(m.message.time),
                     before,
                 }),
             }
+            last_secs = secs;
         }
         out
     }

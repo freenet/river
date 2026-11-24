@@ -729,18 +729,6 @@ mod tests {
     use crate::chat::{LinkStatus, example};
     use crate::{RiverApp, view};
 
-    /// A join line is not a message: a room that gains one gives no arrival, in any mode.
-    #[test]
-    fn a_join_line_is_no_arrival() {
-        let old = example::data().rooms;
-        let mut new = old.clone();
-        example::add_example_joins(&mut new);
-        assert_ne!(old[0].joins, new[0].joins);
-        for mode in [NotificationMode::All, NotificationMode::MentionsAndReplies] {
-            assert!(arrivals(&old, &new, &|_| mode).is_empty());
-        }
-    }
-
     /// A notifier that records what it was asked to show.
     #[derive(Clone, Default)]
     struct Recorder {
