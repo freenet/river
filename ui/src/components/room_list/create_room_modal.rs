@@ -103,6 +103,7 @@ pub fn CreateRoomModal() -> Element {
 
             // Update current room
             info!("🔵 Updating CURRENT_ROOM...");
+            crate::public_room::close();
             CURRENT_ROOM.with_mut(|current_room| {
                 current_room.owner_key = Some(new_room_key);
             });

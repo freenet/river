@@ -160,11 +160,14 @@ pub fn create_example_rooms() -> Rooms {
     map.insert(room1.owner_vk, room1.room_data);
 
     // Room where you're a member
-    let room2 = create_room(
+    // The owner key is fixed so a `?room=` link to this room survives the reload
+    // that opening it involves (freenet/river#513, the member-link spec).
+    let room2 = create_room_with_owner(
         &"Team Chat Room".to_string(),
         SelfIs::Member,
         Some("Hi"),
         HistoryDepth::Standard,
+        Some([0x54; 32]),
     );
     map.insert(room2.owner_vk, room2.room_data);
 
@@ -273,8 +276,50 @@ pub fn create_example_rooms() -> Rooms {
     }
 }
 
+/// Rooms a `?room=` link can open in the no-sync example build, which has no
+/// network to fetch from: one public, one private. They are NOT in `ROOMS`, so
+/// opening one exercises the visitor path. The owner keys are fixed, so a link
+/// survives the reload that opening it involves.
+pub fn viewable_fixtures() -> &'static [(&'static str, VerifyingKey, ChatRoomStateV1)] {
+    use std::sync::OnceLock;
+    static FIXTURES: OnceLock<Vec<(&'static str, VerifyingKey, ChatRoomStateV1)>> = OnceLock::new();
+    FIXTURES.get_or_init(|| {
+        let public = create_room_with_owner(
+            &"Open Public Room".to_string(),
+            SelfIs::Observer,
+            Some("Anyone with the link can read this."),
+            HistoryDepth::Standard,
+            Some([0x51; 32]),
+        );
+        let private = create_room_with_owner(
+            &"Secret Members Room".to_string(),
+            SelfIs::Observer,
+            None,
+            HistoryDepth::Standard,
+            Some([0x52; 32]),
+        );
+        let mut private_state = private.room_data.room_state.clone();
+        let mut config = private_state.configuration.configuration.clone();
+        config.privacy_mode = river_core::room_state::privacy::PrivacyMode::Private;
+        private_state.configuration = AuthorizedConfigurationV1::new(config, &private.owner_sk);
+        vec![
+            ("public", public.owner_vk, public.room_data.room_state),
+            ("private", private.owner_vk, private_state),
+        ]
+    })
+}
+
+/// The fixture room whose owner key is `owner_vk`.
+pub fn viewable_room_state(owner_vk: &VerifyingKey) -> Option<ChatRoomStateV1> {
+    viewable_fixtures()
+        .iter()
+        .find(|(_, vk, _)| vk == owner_vk)
+        .map(|(_, _, state)| state.clone())
+}
+
 struct CreatedRoom {
     owner_vk: VerifyingKey,
+    owner_sk: SigningKey,
     room_data: RoomData,
 }
 
@@ -293,6 +338,18 @@ fn create_room(
     description: Option<&str>,
     history_depth: HistoryDepth,
 ) -> CreatedRoom {
+    create_room_with_owner(room_name, self_is, description, history_depth, None)
+}
+
+/// [`create_room`] with the owner's key fixed by `owner_seed`, so a room's
+/// address survives a page reload (a `?room=` link must resolve after one).
+fn create_room_with_owner(
+    room_name: &String,
+    self_is: SelfIs,
+    description: Option<&str>,
+    history_depth: HistoryDepth,
+    owner_seed: Option<[u8; 32]>,
+) -> CreatedRoom {
     let mut csprng = OsRng;
 
     // Plain names, as people choose them: no " (You)" / " (Owner)" /
@@ -310,6 +367,8 @@ fn create_room(
     // Create owner of the room
     let owner_sk = if self_is == SelfIs::Owner {
         &self_sk
+    } else if let Some(seed) = owner_seed {
+        &SigningKey::from_bytes(&seed)
     } else {
         &SigningKey::generate(&mut csprng)
     };
@@ -532,6 +591,7 @@ fn create_room(
 
     CreatedRoom {
         owner_vk,
+        owner_sk: owner_sk.clone(),
         room_data: RoomData {
             owner_vk: owner_vk.clone(),
             room_state,

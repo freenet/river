@@ -607,6 +607,7 @@ pub fn install_shell_notification_listener() {
         // Signal mutation from a JS event callback must be deferred to a clean
         // execution context (Dioxus signal-safety rules).
         crate::util::defer(move || {
+            crate::public_room::close();
             *CURRENT_ROOM.write() = CurrentRoom {
                 owner_key: Some(room_key),
             };
@@ -789,6 +790,7 @@ fn create_notification_internal(
                 info!("Notification clicked, switching to room");
 
                 // Switch to the room
+                crate::public_room::close();
                 *CURRENT_ROOM.write() = CurrentRoom {
                     owner_key: Some(room_key),
                 };

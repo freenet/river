@@ -48,6 +48,12 @@ pub async fn handle_get_response(
         return Ok(());
     }
 
+    // A public room opened by `?room=` link (freenet/river#513): viewed
+    // read-only, never one of the user's rooms.
+    if crate::public_room::deliver_state(key.id(), &state) {
+        return Ok(());
+    }
+
     // Backward-probe routing (freenet/river#292): a GET response whose
     // contract id matches an outstanding legacy-key probe is for a
     // *previous* room-contract generation. It cannot be resolved to an
@@ -859,6 +865,7 @@ pub async fn handle_get_response(
                             );
                         }
                     });
+                    crate::public_room::close();
                     CURRENT_ROOM.with_mut(|current_room| {
                         current_room.owner_key = Some(owner_vk);
                     });
@@ -1444,6 +1451,9 @@ pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
     // check asks again.
     if crate::components::app::freenet_api::generation_watch::is_watched(&instance_id) {
         info!("generation watch: pointer {instance_id} not found");
+        return;
+    }
+    if crate::public_room::deliver_not_found(&instance_id) {
         return;
     }
     if deliver_probe_absent(instance_id).await {

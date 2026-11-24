@@ -681,6 +681,8 @@ pub fn RoomList() -> Element {
                                         // The title effect applies the read rule
                                         // on this write.
                                         *CURRENT_ROOM.write() = CurrentRoom { owner_key: Some(room_key) };
+                                        // Leave a public room being viewed read-only.
+                                        crate::public_room::close();
                                         // Switch to chat view on mobile
                                         *MOBILE_VIEW.write() = MobileView::Chat;
                                         spawn(async move {
