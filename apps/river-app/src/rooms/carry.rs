@@ -41,9 +41,8 @@
 //! **A generation that can't be read stops the walk.** An error, no answer, or any fault above
 //! ends the walk at that predecessor: it may hold a newer copy of any room (a rejoin under a new
 //! identity) or the tombstone of one the user left, so nothing it or an older generation could
-//! outrank is decided. A room it proves it holds (named by its `rooms_meta`, stored but left out
-//! of its short index) is carried first, as the web UI salvages it (`salvage_short_index_rooms`).
-//! What is decided at a rank no unread generation can outrank is still written; the rest waits
+//! outrank is decided. A short index (a room its `rooms_meta` names is stored but unlisted) and
+//! a `rooms_meta` that does not decode are such faults too. What is decided at a rank no unread generation can outrank is still written; the rest waits
 //! for Try again. A slot that does not decode (or names another room) holds its room back from
 //! older generations the same way. Writing an older copy instead would be permanent: the write
 //! never replaces what the current key holds, and the web UI reads a room in the current
@@ -53,20 +52,22 @@
 //!
 //! **Residual: a permanently unreadable generation.** A generation that can never be read (a
 //! frozen short index, an old WASM that traps on the current runtime) stops the walk on every
-//! start, after what it proves it holds is carried. A desktop-only user then does not get the
-//! rooms only that generation and older ones hold until the web UI runs on the node once: its
+//! start. This is decided, not a gap to close here: a desktop-only user then does not get the
+//! rooms only that generation and older ones hold until the web UI runs on the node once (its
 //! journaled walk carries older generations past a faulty one under ranks and corrects them
-//! later, which needs its room merge (`merge_from_source`); this app does not carry past it.
-//! The failure row says to open River in the browser once, then Try again.
+//! later, which needs its room merge, `merge_from_source`; sharing that merge is
+//! freenet/river#1000). The failure row says to open River in the browser once, then Try again.
 //!
 //! **Its rank is recorded, before the room.** For each room written, `rooms_meta`'s
 //! `identity_sources` gets the generation its rank is (as the web UI persists ranks below the
 //! current one, `persisted_identity_sources`), so the web UI's ranked merge still lets a newer
-//! generation's copy win when that generation answers later. The rank is written BEFORE the
-//! room's slot, so a quit between the two can't leave a carried room unranked (which the web UI
-//! would read as authoritative for good); when another writer stored the room first, the rank is
-//! taken out again. A rank write that can't be made fails the carry with Try again, before the
-//! slot.
+//! generation's copy win when that generation answers later. The room's key is read first, and
+//! a room the store holds by now is skipped. The rank is written BEFORE the room's slot, so a
+//! quit between the two can't leave a carried room unranked (which the web UI would read as
+//! authoritative for good); an entry another writer made for the room is never replaced; when
+//! another writer stored the room first, the exact entry this carry added (and only if it added
+//! one) is taken out again. A rank write that can't be made fails the carry with Try again,
+//! before the slot. A room written is never carried again, Try again included.
 //!
 //! The room is written as [`NewRoom`], the fields this app already writes for a room it creates
 //! or joins, which the `stored_rooms_drift` tests in `ui/src/room_data.rs` pin as decodable by
@@ -324,10 +325,9 @@ enum Phase {
         first: Option<Vec<u8>>,
     },
     Meta,
-    /// Named rooms not listed, still to read; `short` once one was found stored.
+    /// Named rooms not listed, still to read.
     Named {
         named: VecDeque<Vec<u8>>,
-        short: bool,
     },
     Fixed(VecDeque<Vec<u8>>),
     Rooms(VecDeque<Vec<u8>>),
@@ -340,20 +340,23 @@ const FIXED_KEYS: [&[u8]; 2] = [b"rooms_data", b"outbound_dms"];
 /// One write of a carry, to the current chat delegate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Write {
-    /// Add (room, delegate key) to `rooms_meta`'s identity sources.
+    /// Read the room key, to skip a room the store holds by now ([`Carry::checked`]).
+    Check(Vec<u8>),
+    /// Add (room, delegate key) to `rooms_meta`'s identity sources, unless it has one for the
+    /// room already.
     AddRank(VerifyingKey, [u8; 32]),
     /// Store this slot under this room key, where it holds nothing.
     Slot(Vec<u8>, Vec<u8>),
-    /// Take the room's identity source out again: another writer stored the room first.
-    RemoveRank(VerifyingKey),
+    /// Take out the identity source this carry added: another writer stored the room first.
+    RemoveRank(VerifyingKey, [u8; 32]),
 }
 
 impl Write {
     /// The delegate key written.
     pub fn key(&self) -> Vec<u8> {
         match self {
-            Write::Slot(key, _) => key.clone(),
-            Write::AddRank(..) | Write::RemoveRank(_) => ROOMS_META_KEY.to_vec(),
+            Write::Check(key) | Write::Slot(key, _) => key.clone(),
+            Write::AddRank(..) | Write::RemoveRank(..) => ROOMS_META_KEY.to_vec(),
         }
     }
 
@@ -361,15 +364,17 @@ impl Write {
     /// bytes, nothing (already as wanted), or why not.
     pub fn decide(&self, current: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
         match self {
+            Write::Check(_) => Ok(None),
             Write::Slot(_, bytes) => Ok(decide(current, bytes)),
             Write::AddRank(room, delegate) => meta_with_sources(current, &[(*room, *delegate)]),
-            Write::RemoveRank(room) => meta_without_source(current, room),
+            Write::RemoveRank(room, delegate) => meta_without_source(current, room, delegate),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteStep {
+    Check,
     Rank,
     Slot,
     Unrank,
@@ -427,6 +432,10 @@ pub struct Carry {
     writing: Option<Vec<u8>>,
     /// Where the write of `writing` stands.
     write_step: WriteStep,
+    /// The room key being carried held nothing when it was read.
+    check_empty: bool,
+    /// This carry's rank write for the room changed `rooms_meta`.
+    rank_added: bool,
     /// Predecessors the node does not hold.
     pub not_installed: usize,
     /// Rooms written.
@@ -460,7 +469,9 @@ impl Carry {
             stopped: None,
             writes: VecDeque::new(),
             writing: None,
-            write_step: WriteStep::Rank,
+            write_step: WriteStep::Check,
+            check_empty: false,
+            rank_added: false,
             not_installed: 0,
             carried: 0,
             tombstones: 0,
@@ -665,7 +676,15 @@ impl Carry {
                     }
                     _ => {}
                 }
-                let meta = value.and_then(|b| ciborium::de::from_reader::<MetaShape, _>(b).ok());
+                // A `rooms_meta` that does not decode is a fault: without it neither the ranks it
+                // records nor the rooms it names can be checked.
+                let meta = match value.map(ciborium::de::from_reader::<MetaShape, _>) {
+                    None => None,
+                    Some(Ok(meta)) => Some(meta),
+                    Some(Err(e)) => {
+                        return self.stop(format!("its rooms_meta does not decode ({e})"));
+                    }
+                };
                 // The older generations its `rooms_meta` records for rooms' identities
                 // (`identity_source_ranks`: a delegate key the registry does not list is
                 // ignored).
@@ -695,31 +714,23 @@ impl Carry {
                 if named.is_empty() {
                     self.read_fixed();
                 } else {
-                    self.phase = Phase::Named {
-                        named,
-                        short: false,
-                    };
+                    self.phase = Phase::Named { named };
                 }
             }
-            Phase::Named { mut named, short } => {
-                // A named room stored but not listed proves the index short. Its slot is
-                // carried, as the web UI salvages the rooms a short index proves
-                // (`salvage_short_index_rooms`): every newer generation was read in full.
-                let proven = value.is_some_and(|v| !v.is_empty());
-                if let Some(v) = value.filter(|v| !v.is_empty()) {
-                    self.decide(key, v);
-                }
-                named.pop_front();
-                let short = short || proven;
-                if !named.is_empty() {
-                    self.phase = Phase::Named { named, short };
-                } else if short {
-                    self.stop(
+            Phase::Named { mut named } => {
+                // A named room stored but not listed proves the index short: a fault, like an
+                // unreadable generation. Nothing in it is decided.
+                if value.is_some_and(|v| !v.is_empty()) {
+                    return self.stop(
                         "a room its rooms_meta names is stored but its index does not list it"
                             .into(),
                     );
-                } else {
+                }
+                named.pop_front();
+                if named.is_empty() {
                     self.read_fixed();
+                } else {
+                    self.phase = Phase::Named { named };
                 }
             }
             Phase::Fixed(mut keys) => {
@@ -846,49 +857,64 @@ impl Carry {
         true
     }
 
-    /// The next write, or `None` when all are made. A room's rank goes to `rooms_meta` BEFORE
-    /// its slot, so a quit between the two never leaves a carried room unranked (which the web
-    /// UI would read as authoritative for good); a slot another writer got to first has the
-    /// rank taken out again.
+    /// The next write, or `None` when all are made. For a room: read its slot first and skip it
+    /// if the key holds anything; then its rank goes to `rooms_meta` BEFORE the slot, so a quit
+    /// between the two never leaves a carried room unranked (which the web UI would read as
+    /// authoritative for good); and when another writer stores the room first after all, the
+    /// rank this carry added (only that, and only if it added one) is taken out again.
     pub fn write(&mut self) -> Option<Write> {
         if self.writing.is_none() {
             self.writing = self.writes.pop_front();
-            self.write_step = WriteStep::Rank;
+            self.write_step = WriteStep::Check;
+            self.rank_added = false;
         }
         let key = self.writing.clone()?;
         let found = self.found.get(&key)?;
         Some(match (&found.item, self.write_step) {
+            (Item::Room(..), WriteStep::Check) => Write::Check(key),
             (Item::Room(_, owner), WriteStep::Rank) => Write::AddRank(**owner, found.delegate),
             (Item::Room(bytes, _), WriteStep::Slot) => Write::Slot(key, bytes.to_vec()),
-            (Item::Room(_, owner), WriteStep::Unrank) => Write::RemoveRank(**owner),
+            (Item::Room(_, owner), WriteStep::Unrank) => Write::RemoveRank(**owner, found.delegate),
             (Item::Tombstone, _) => Write::Slot(key, tombstone_bytes()),
         })
     }
 
+    /// What the room key being carried holds now, read by a [`Write::Check`].
+    pub fn checked(&mut self, current: Option<&[u8]>) {
+        self.check_empty = current.is_none_or(<[u8]>::is_empty);
+    }
+
     /// The write being made ended. For a slot: `stored`, or the key held something already
-    /// (which wins). A rank write that found nothing to change has `stored` false too.
+    /// (which wins). For a rank: `stored` when it changed `rooms_meta`.
     pub fn written(&mut self, stored: bool) {
         let Some(key) = self.writing.clone() else {
             return;
         };
         let room = matches!(self.found.get(&key).map(|f| &f.item), Some(Item::Room(..)));
         match (self.write_step, room) {
+            (WriteStep::Check, true) if self.check_empty => {
+                self.write_step = WriteStep::Rank;
+                return;
+            }
             (WriteStep::Rank, true) => {
+                self.rank_added = stored;
                 self.write_step = WriteStep::Slot;
                 return;
             }
-            (WriteStep::Slot, true) if !stored => {
+            (WriteStep::Slot, true) if !stored && self.rank_added => {
                 self.write_step = WriteStep::Unrank;
                 return;
             }
             _ => {}
         }
         self.writing = None;
+        // The key holds something now: never carried again, Try again included.
+        self.current.insert(key.clone());
         let Some(found) = self.found.remove(&key) else {
             return;
         };
         match (found.item, self.write_step) {
-            (Item::Room(..), WriteStep::Slot) => {
+            (Item::Room(..), WriteStep::Slot) if stored => {
                 self.carried += 1;
                 eprintln!("River: carried a room over from {}", found.version);
             }
@@ -998,8 +1024,8 @@ pub fn decide(current: Option<&[u8]>, bytes: &[u8]) -> Option<Vec<u8>> {
 /// `rooms_meta` (`current`, as a `GetVersionedResponse` gave it) with `sources` added to its
 /// identity sources (the web UI's `RoomsMeta::identity_sources`: for a room whose identity an
 /// earlier delegate supplied, that delegate's key, so the web UI's ranked merge still lets a
-/// newer generation's copy win). An entry for the same room is replaced. `Ok(None)` when nothing
-/// changes. Every other field is kept as CBOR; a value that is not a map, or an identity source
+/// newer generation's copy win). A room that has an entry already (another writer's) is left as
+/// it is. `Ok(None)` when nothing changes. Every other field is kept as CBOR; a value that is not a map, or an identity source
 /// list in a shape the web UI never wrote, is an error and never overwritten.
 pub fn meta_with_sources(
     current: Option<&[u8]>,
@@ -1039,10 +1065,10 @@ pub fn meta_with_sources(
             v.deserialized::<(VerifyingKey, [u8; 32])>()
                 .is_ok_and(|(r, _)| r == *room)
         };
-        if list.contains(&entry) {
+        // Another entry for the room (another writer's) is never replaced.
+        if list.contains(&entry) || list.iter().any(names_room) {
             continue;
         }
-        list.retain(|v| !names_room(v));
         list.push(entry);
         changed = true;
     }
@@ -1055,11 +1081,12 @@ pub fn meta_with_sources(
     Ok(Some(out))
 }
 
-/// `rooms_meta` (`current`) with `room` taken out of its identity sources, every other field
-/// kept; `Ok(None)` when it has none for the room.
+/// `rooms_meta` (`current`) with the identity source (`room`, `delegate`) taken out, every
+/// other entry and field kept; `Ok(None)` when it does not hold that one.
 pub fn meta_without_source(
     current: Option<&[u8]>,
     room: &VerifyingKey,
+    delegate: &[u8; 32],
 ) -> Result<Option<Vec<u8>>, String> {
     let Some(bytes) = current.filter(|b| !b.is_empty()) else {
         return Ok(None);
@@ -1081,7 +1108,7 @@ pub fn meta_without_source(
     let before = list.len();
     list.retain(|v| {
         !v.deserialized::<(VerifyingKey, [u8; 32])>()
-            .is_ok_and(|(r, _)| r == *room)
+            .is_ok_and(|(r, d)| r == *room && d == *delegate)
     });
     if list.len() == before {
         return Ok(None);

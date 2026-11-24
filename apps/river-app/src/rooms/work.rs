@@ -109,7 +109,7 @@ use river_core::stored_rooms::{
     encode_new_room, meta_with_current_room, reconcile_new_room, room_storage_key,
 };
 
-use super::carry::{Ask, Carry};
+use super::carry::{self, Ask, Carry};
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
 use super::dm_archive::ArchiveOp;
@@ -285,11 +285,14 @@ enum Kind {
     /// Carry `room` (named `name`), stored under an earlier room-contract key, to the current
     /// key, which has no state on the network ([`super::rekey`]): read the earlier keys
     /// (`Probe`), then PUT the newest real state found, merged with `local` (`Forward`).
-    /// `candidates` are the earlier keys to read, newest first.
+    /// `candidates` are the earlier keys to read, newest first; `owed` those of them a merge is
+    /// owed from (the stored key, and the slot's `rekey_merge.owed`): one answering NotFound is
+    /// read again later, as the web UI keeps an owed key until it answered.
     Seed {
         room: VerifyingKey,
         name: String,
         candidates: Vec<ContractInstanceId>,
+        owed: Vec<ContractInstanceId>,
         local: Box<ChatRoomStateV1>,
     },
     /// Refused before it started; never works.
@@ -412,6 +415,8 @@ struct Task {
     unresolved: Vec<ContractInstanceId>,
     /// When the reading of earlier keys began ([`PROBE_BUDGET`]).
     probe_began: Option<Instant>,
+    /// Earlier keys read that answered NotFound.
+    absent: Vec<ContractInstanceId>,
 }
 
 /// For tests: how many non-zero secrets of an invitation and of a join plan were wiped on this
@@ -506,6 +511,7 @@ impl Task {
             carried: None,
             unresolved: Vec::new(),
             probe_began: None,
+            absent: Vec::new(),
         }
     }
 
@@ -745,6 +751,10 @@ impl Task {
             let Some(write) = c.write() else {
                 return Err(unexpected());
             };
+            if let carry::Write::Check(_) = write {
+                c.checked(value);
+                return Ok(None);
+            }
             return write.decide(value).map_err(|e| {
                 format!(
                     "River's room list in its storage can't be read by this app ({e}), so the \
@@ -886,6 +896,18 @@ impl Work {
         candidates: Vec<ContractInstanceId>,
         local: ChatRoomStateV1,
     ) -> bool {
+        self.seed_owing(room, name, candidates, Vec::new(), local)
+    }
+
+    /// [`Work::seed`], with the earlier keys a merge is owed from (`owed`).
+    pub fn seed_owing(
+        &mut self,
+        room: VerifyingKey,
+        name: String,
+        candidates: Vec<ContractInstanceId>,
+        owed: Vec<ContractInstanceId>,
+        local: ChatRoomStateV1,
+    ) -> bool {
         if self
             .tasks
             .iter()
@@ -901,6 +923,7 @@ impl Work {
                 room,
                 name,
                 candidates,
+                owed,
                 local: Box::new(local),
             },
             Step::Probe,
@@ -1324,6 +1347,7 @@ impl Work {
         t.probe = None;
         t.carried = None;
         t.probe_began = None;
+        t.absent.clear();
         if t.is_seed() {
             t.step = Step::Probe;
         }
@@ -1411,6 +1435,13 @@ impl Work {
     /// error to [`Work::on_error`].
     pub fn set_delegate_shared(&mut self, shared: bool) {
         self.delegate_shared = shared;
+    }
+
+    /// Forget the reads given up on of keys the session itself asks for (a room followed under
+    /// its earlier key while it moves): an answer for one of them is the session's, and both
+    /// are GETs of one key, so nothing is lost by taking it as such.
+    pub fn forget_late(&mut self, followed: &[ContractInstanceId]) {
+        self.late.retain(|id, _| !followed.contains(id));
     }
 
     /// Whether a read of an earlier room-contract key was given up on and may still answer, so an
@@ -1785,6 +1816,7 @@ impl Work {
                 if let Some(p) = t.probe.as_mut() {
                     p.absent(id);
                 }
+                t.absent.push(id);
                 t.out = None;
             }
             (Step::Forward, ContractResponse::PutResponse { key }) if *key.id() == id => {
@@ -1923,6 +1955,9 @@ impl Work {
                 } else {
                     p.unknown(id);
                 }
+            }
+            if absent {
+                t.absent.push(id);
             }
             t.out = None;
             return true;
@@ -2230,12 +2265,14 @@ fn settle_probe(t: &mut Task, now: Instant) {
         Found::State(state, unresolved) => {
             t.carried = Some(state);
             t.unresolved = unresolved;
+            t.unresolved.extend(owed_absent(t));
             t.step = Step::Forward;
         }
         // Every earlier key answered and none holds the room: the user's copy goes to the
         // current key, as the web UI seeds it. Only a stored room has a copy.
         Found::Local(state) if t.is_seed() => {
             t.carried = Some(state);
+            t.unresolved = owed_absent(t);
             t.step = Step::Forward;
         }
         Found::Local(_) | Found::Nothing if !t.is_seed() => t.fail(NOT_FOUND, true),
@@ -2245,6 +2282,20 @@ fn settle_probe(t: &mut Task, now: Instant) {
             );
             t.fail("Not all of the room's earlier keys answered.", true);
         }
+    }
+}
+
+/// The owed keys of a move that answered NotFound: kept to read again, since NotFound is not
+/// proof the key holds nothing (`.claude/rules/contract-upgrade.md`).
+fn owed_absent(t: &Task) -> Vec<ContractInstanceId> {
+    match &t.kind {
+        Kind::Seed { owed, .. } => t
+            .absent
+            .iter()
+            .filter(|id| owed.contains(id))
+            .copied()
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

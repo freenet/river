@@ -10234,6 +10234,56 @@ mod rekey {
         }
     }
 
+    /// Another writer that stores the room, with its own rank for it, between this carry's
+    /// rank write and its slot write keeps both: the slot is not overwritten, and its rank entry
+    /// survives the carry taking its own back out.
+    #[test]
+    fn another_writers_room_and_rank_survive_between_the_carrys_rank_and_slot() {
+        let node = fake_node(vec![]);
+        let a = TestRoom::new(1, "A", 1, &["a1"]);
+        let newest = predecessors()[0].key.clone();
+        let slot_key = room_storage_key(&a.vk());
+        let their_slot = cbor(&Slot::Present(Box::new(SlotData {
+            owner_vk: a.vk(),
+            room_state: a.state.clone(),
+            self_sk: Some(SigningKey::from_bytes(&[99; 32])),
+            self_vk: None,
+            contract_key: a.key,
+            last_read_message_id: None,
+            self_nickname: None,
+            invitation_secrets: BTreeMap::new(),
+        })));
+        let their_rank = (a.vk(), [7u8; 32]);
+        node.with(|w| {
+            on_network(w, &[&a]);
+            w.legacy
+                .insert(newest, legacy_store(vec![(slot_key.clone(), a.slot())]));
+            let (k, v) = (slot_key.clone(), their_slot.clone());
+            // Just before the carry's slot store: the web UI saves the room and its own rank
+            // (its save writes the identity sources it holds, which replace the carry's).
+            w.before_cas = Some(Box::new(move |slots, generations, key| {
+                if key == k.as_slice() && !slots.contains_key(&k) {
+                    slots.insert(k.clone(), v.clone());
+                    generations.insert(k.clone(), 1);
+                    let meta = cbor(&ciborium::Value::Map(vec![(
+                        ciborium::Value::Text("identity_sources".into()),
+                        ciborium::Value::serialized(&vec![their_rank]).unwrap(),
+                    )]));
+                    slots.insert(ROOMS_META_KEY.to_vec(), meta);
+                    *generations.entry(ROOMS_META_KEY.to_vec()).or_insert(0) += 1;
+                }
+            }));
+        });
+        let session = start(&node, "carry-rank-race", quick());
+        session.wait_until("the carry is over", || {
+            node.with(|w| w.slots.get(&slot_key) == Some(&their_slot)) && carrying_done(&session)
+        });
+        node.with(|w| {
+            assert_eq!(w.slots[&slot_key], their_slot);
+            assert_eq!(identity_sources(w), vec![their_rank]);
+        });
+    }
+
     /// A store that keeps changing under the carry's write fails it after the web UI's number
     /// of attempts, with Try again.
     #[test]
@@ -10528,14 +10578,35 @@ mod rekey_state {
     use crate::rooms::create::contract_key;
     use freenet_stdlib::client_api::ContractRequest as CR;
 
-    /// A signing key sweep request out is another request an error naming nothing could be.
+    /// Each request that may be out makes an error naming nothing not the task's alone,
+    /// the signing key sweep's included. (Named fields: a swap of two would not compile.)
     #[test]
     fn a_key_request_out_means_an_unnamed_error_is_not_the_tasks_alone() {
-        assert!(nothing_else_out(false, false, false, false, false));
-        for i in 0..5 {
-            let mut v = [false; 5];
-            v[i] = true;
-            assert!(!nothing_else_out(v[0], v[1], v[2], v[3], v[4]), "{i}");
+        assert!(OtherOut::default().none());
+        let each = [
+            OtherOut {
+                subscribing: true,
+                ..Default::default()
+            },
+            OtherOut {
+                reading_rooms: true,
+                ..Default::default()
+            },
+            OtherOut {
+                reading_store: true,
+                ..Default::default()
+            },
+            OtherOut {
+                key_request: true,
+                ..Default::default()
+            },
+            OtherOut {
+                update_owed: true,
+                ..Default::default()
+            },
+        ];
+        for (i, o) in each.into_iter().enumerate() {
+            assert!(!o.none(), "{i}");
         }
     }
 
@@ -10638,7 +10709,10 @@ mod rekey_state {
         drive(&mut rooms, ms(9000), Ok(()));
         assert_eq!(rooms.seed_ends(&pace, ms(9000)), vec![current]);
         assert_eq!(rooms.contract_ids(), vec![current]);
-        assert!(rooms.seed_retry.is_empty() && rooms.on_earlier.is_empty());
+        assert!(rooms.on_earlier.is_empty());
+        // The key it was stored under answered NotFound: a merge is still owed from it, so it
+        // is read again later (NotFound is not proof the key holds nothing).
+        assert_eq!(rooms.seed_retry[&room.vk()].2, vec![*earlier.id()]);
     }
 
     /// Earlier keys that did not answer while a room moved are folded in later: the move ends
@@ -10735,4 +10809,42 @@ mod rekey_state {
         let want: Vec<ContractInstanceId> = earlier[..4].iter().map(|k| *k.id()).collect();
         assert_eq!(read, want);
     }
+}
+
+/// The keys a stored slot still owes a merge from reach the moves: the stored rooms' reader
+/// reads them from each slot, and a read of the store hands them on.
+#[test]
+fn owed_keys_go_from_the_stored_slot_to_the_rooms() {
+    let owner = SigningKey::from_bytes(&[7; 32]);
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key());
+    let mut room = TestRoom::new(7, "A", 1, &[]);
+    room.key = earlier[0];
+    // The slot, with `rekey_merge.owed`.
+    let ciborium::Value::Map(mut outer) =
+        ciborium::de::from_reader::<ciborium::Value, _>(room.slot().as_slice()).unwrap()
+    else {
+        panic!("a map");
+    };
+    if let Some((_, ciborium::Value::Map(fields))) = outer.first_mut() {
+        fields.push((
+            ciborium::Value::Text("rekey_merge".into()),
+            ciborium::Value::Map(vec![(
+                ciborium::Value::Text("owed".into()),
+                ciborium::Value::serialized(&vec![earlier[3]]).unwrap(),
+            )]),
+        ));
+    }
+    let slot = cbor(&ciborium::Value::Map(outer));
+    let (mut loader, _) = Loader::start();
+    let k = room_storage_key(&room.vk());
+    let _ = loader.on_answer(ChatDelegateResponseMsg::ListResponse {
+        keys: vec![ChatDelegateKey::new(k.clone())],
+    });
+    let Step::Done(l) = loader.on_answer(get_answer(k, Some(slot))) else {
+        panic!("done");
+    };
+    assert_eq!(l.owed.get(&room.vk()), Some(&vec![earlier[3]]));
+    let mut rooms = Rooms::default();
+    rooms.replace(*l);
+    assert_eq!(rooms.owed.get(&room.vk()), Some(&vec![earlier[3]]));
 }

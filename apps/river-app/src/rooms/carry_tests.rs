@@ -197,8 +197,14 @@ fn writes(carry: &mut Carry) -> Written {
                 };
                 out.insert(k, identity);
             }
+            Write::Check(_) => {
+                // An empty store: the key holds nothing.
+                carry.checked(None);
+                carry.written(false);
+                continue;
+            }
             Write::AddRank(room, dk) => ranks.push((room, dk)),
-            Write::RemoveRank(room) => ranks.retain(|(r, _)| *r != room),
+            Write::RemoveRank(room, dk) => ranks.retain(|p| *p != (room, dk)),
         }
         carry.written(true);
     }
@@ -358,6 +364,10 @@ fn first_write(stores: &Stores) -> Vec<u8> {
     loop {
         match c.write().unwrap() {
             Write::Slot(_, bytes) => return bytes,
+            Write::Check(_) => {
+                c.checked(None);
+                c.written(false);
+            }
             _ => c.written(true),
         }
     }
@@ -434,7 +444,7 @@ fn an_owed_merge_in_a_shape_the_web_ui_never_wrote_is_left_out() {
     );
 }
 
-// An earlier generation that can't be read must never let an older one decide (review of #997).
+// An earlier generation that can't be read must never let an older one decide.
 
 #[test]
 fn an_unreadable_newer_generation_stops_the_walk_and_nothing_older_is_carried() {
@@ -615,8 +625,8 @@ fn a_room_rooms_meta_names_but_the_index_leaves_out_stops_the_walk() {
         };
         assert!(c.on_answer(&ask, ask.delegate(), &a));
     }
-    // The room it proves is carried, as the web UI salvages it; nothing older is read.
-    assert_eq!(writes(&mut c).0, BTreeMap::from([(key(1), me(11))]));
+    // A fault: nothing is carried from it, and nothing older is read.
+    assert!(writes(&mut c).0.is_empty());
     assert!(c.stopped.unwrap().1.contains("index does not list"));
 }
 
@@ -739,7 +749,8 @@ fn identity_sources_are_added_replaced_and_every_other_field_kept() {
         .unwrap();
     let mut sources = sources_of(&out);
     sources.sort_by_key(|(r, _)| r.to_bytes());
-    let mut expected = vec![(a, [39; 32]), (b, [38; 32])];
+    // `a` had an entry (another writer's): kept as it was; `b` is added.
+    let mut expected = vec![(a, [5; 32]), (b, [38; 32])];
     expected.sort_by_key(|(r, _)| r.to_bytes());
     assert_eq!(sources, expected);
     let text = format!(
@@ -749,7 +760,7 @@ fn identity_sources_are_added_replaced_and_every_other_field_kept() {
     assert!(text.contains("future") && text.contains("room_order"));
     // Nothing to change: no write.
     assert_eq!(
-        meta_with_sources(Some(&out), &[(a, [39; 32])]).unwrap(),
+        meta_with_sources(Some(&out), &[(b, [38; 32])]).unwrap(),
         None
     );
     assert_eq!(meta_with_sources(Some(&out), &[]).unwrap(), None);
@@ -757,7 +768,7 @@ fn identity_sources_are_added_replaced_and_every_other_field_kept() {
     assert!(meta_with_sources(Some(b"garbage"), &[(a, [39; 32])]).is_err());
 }
 
-// Ranks: a predecessor's own `identity_sources` (review of #997, round 2) -----------------------
+// Ranks: a predecessor's own `identity_sources` ---------------------------------------------------
 
 /// `rooms_meta` naming rooms in `order`, with these identity sources.
 fn meta(order: &[u8], sources: &[(u8, u8)]) -> Vec<u8> {
@@ -864,10 +875,10 @@ fn an_unread_generation_above_a_copys_provenance_holds_the_room_back() {
 }
 
 /// The rooms `rooms_meta` names include its notification modes and identity sources
-/// (`rooms_named_by_meta`): a room only those name, stored but unlisted, proves the index short.
-/// The rooms it proves are carried (as the web UI salvages them) before the walk stops.
+/// (`rooms_named_by_meta`): a room only those name, stored but unlisted, proves the index short,
+/// which stops the walk with nothing from that generation carried.
 #[test]
-fn a_room_named_only_by_modes_or_sources_proves_the_index_short_and_is_salvaged() {
+fn a_room_named_only_by_modes_or_sources_proves_the_index_short() {
     for field in ["notification_modes", "identity_sources"] {
         let value = match field {
             "notification_modes" => Value::Map(vec![(
@@ -883,7 +894,7 @@ fn a_room_named_only_by_modes_or_sources_proves_the_index_short_and_is_salvaged(
         let stores: Stores = BTreeMap::from([(39, s), (38, store(vec![(key(2), slot(2, 12))]))]);
         let mut c = Carry::new(preds(&[39, 38]), Vec::new(), true);
         let out = walk(&mut c, &stores);
-        assert_eq!(out, BTreeMap::from([(key(1), me(11))]), "{field}");
+        assert!(out.is_empty(), "{field}");
         assert!(
             c.stopped
                 .as_ref()
@@ -908,46 +919,131 @@ fn a_fixed_key_stored_but_unlisted_stops_the_walk() {
     }
 }
 
-/// A room's rank goes to `rooms_meta` before its slot; a slot another writer got to first has
-/// its rank taken out again.
+/// A room's slot is read first and the room skipped when the key holds anything; then its
+/// rank goes to `rooms_meta` before its slot; a slot another writer got to first has the rank
+/// this carry added taken out again, and only that.
 #[test]
 fn the_rank_is_written_before_the_slot_and_taken_out_when_the_slot_is_lost() {
     let stores: Stores = BTreeMap::from([(
         39,
-        store(vec![(key(1), slot(1, 11)), (key(2), slot(2, 12))]),
+        store(vec![
+            (key(1), slot(1, 11)),
+            (key(2), slot(2, 12)),
+            (key(3), slot(3, 13)),
+        ]),
     )]);
     let mut c = Carry::new(preds(&[39]), Vec::new(), true);
     walk_reads(&mut c, &stores, &[]);
-    let first = c.write().unwrap();
-    let Write::AddRank(room, dk) = first.clone() else {
-        panic!("the rank first: {first:?}");
-    };
-    assert_eq!(dk, [39; 32]);
-    assert_eq!(first.key(), ROOMS_META_KEY.to_vec());
-    c.written(true);
-    let Write::Slot(k, _) = c.write().unwrap() else {
-        panic!("then the slot");
-    };
-    assert_eq!(k, room_storage_key(&room));
-    // Another writer stored the room first: its rank is taken out.
-    c.written(false);
-    assert_eq!(c.write().unwrap(), Write::RemoveRank(room));
-    c.written(true);
-    assert_eq!(c.carried, 0);
-    // The other room goes the same way, and is carried.
-    assert!(matches!(c.write().unwrap(), Write::AddRank(..)));
-    c.written(true);
-    assert!(matches!(c.write().unwrap(), Write::Slot(..)));
-    c.written(true);
-    assert!(c.write().is_none());
+    let mut lost = None;
+    let mut checks = 0;
+    let mut skipped = None;
+    while let Some(w) = c.write() {
+        match w {
+            Write::Check(k) => {
+                checks += 1;
+                // The first room was stored by another writer since the walk read the store.
+                if checks == 1 {
+                    c.checked(Some(b"theirs"));
+                    skipped = Some(k);
+                } else {
+                    c.checked(None);
+                }
+                c.written(false);
+            }
+            Write::AddRank(room, dk) => {
+                assert_eq!(dk, [39; 32]);
+                assert_ne!(
+                    Some(room_storage_key(&room)),
+                    skipped,
+                    "no rank for a room skipped"
+                );
+                c.written(true);
+            }
+            Write::Slot(k, _) => {
+                // The second room is lost to another writer at the slot.
+                if lost.is_none() {
+                    lost = Some(k);
+                    c.written(false);
+                } else {
+                    c.written(true);
+                }
+            }
+            Write::RemoveRank(room, dk) => {
+                assert_eq!(Some(room_storage_key(&room)), lost);
+                assert_eq!(dk, [39; 32]);
+                c.written(true);
+            }
+        }
+    }
+    assert_eq!(checks, 3);
     assert_eq!(c.carried, 1);
+}
+
+/// A rank write that found an entry for the room already (another writer's) changed nothing,
+/// so a lost slot takes nothing out.
+#[test]
+fn nothing_is_taken_out_when_this_carry_added_no_rank() {
+    let stores: Stores = BTreeMap::from([(39, store(vec![(key(1), slot(1, 11))]))]);
+    let mut c = Carry::new(preds(&[39]), Vec::new(), true);
+    walk_reads(&mut c, &stores, &[]);
+    assert!(matches!(c.write(), Some(Write::Check(_))));
+    c.checked(None);
+    c.written(false);
+    assert!(matches!(c.write(), Some(Write::AddRank(..))));
+    c.written(false);
+    assert!(matches!(c.write(), Some(Write::Slot(..))));
+    c.written(false);
+    assert!(c.write().is_none());
+}
+
+/// Another writer's entry for the room survives both rank writes: it is never replaced, and
+/// taking this carry's rank out removes only the exact pair this carry added.
+#[test]
+fn another_writers_rank_for_the_room_survives() {
+    let a = owner(1).verifying_key();
+    let theirs = meta(&[1], &[(1, 40)]);
+    assert_eq!(
+        meta_with_sources(Some(&theirs), &[(a, [39; 32])]).unwrap(),
+        None
+    );
+    assert_eq!(
+        meta_without_source(Some(&theirs), &a, &[39; 32]).unwrap(),
+        None
+    );
+    assert_eq!(sources_of(&theirs), vec![(a, [40; 32])]);
+}
+
+/// A room written keeps its key out of a later walk (Try again): it is in the store now.
+#[test]
+fn try_again_never_carries_a_room_written_before() {
+    let stores: Stores = BTreeMap::from([(39, store(vec![(key(1), slot(1, 11))]))]);
+    let mut c = Carry::new(preds(&[39]), Vec::new(), true);
+    assert_eq!(walk(&mut c, &stores).len(), 1);
+    c.restart();
+    assert!(walk(&mut c, &stores).is_empty());
+}
+
+/// A `rooms_meta` that does not decode is a fault: the walk stops there.
+#[test]
+fn a_rooms_meta_that_does_not_decode_stops_the_walk() {
+    let s = store(vec![
+        (key(1), slot(1, 11)),
+        (ROOMS_META_KEY.to_vec(), b"garbage".to_vec()),
+    ]);
+    let (c, out) = walk_one(s);
+    assert!(out.is_empty());
+    assert!(c.stopped.unwrap().1.contains("rooms_meta does not decode"));
 }
 
 #[test]
 fn a_rank_is_taken_out_with_every_other_field_kept() {
     let (a, b) = (owner(1).verifying_key(), owner(2).verifying_key());
     let m = meta(&[2], &[(1, 38), (2, 37)]);
-    let out = meta_without_source(Some(&m), &a).unwrap().unwrap();
+    // Not the pair this carry would have added: nothing.
+    assert_eq!(meta_without_source(Some(&m), &a, &[39; 32]).unwrap(), None);
+    let out = meta_without_source(Some(&m), &a, &[38; 32])
+        .unwrap()
+        .unwrap();
     assert_eq!(sources_of(&out), vec![(b, [37; 32])]);
     let text = format!(
         "{:?}",
@@ -955,7 +1051,9 @@ fn a_rank_is_taken_out_with_every_other_field_kept() {
     );
     assert!(text.contains("room_order"));
     // The last one out drops the field, as the web UI leaves it out when empty.
-    let out = meta_without_source(Some(&out), &b).unwrap().unwrap();
+    let out = meta_without_source(Some(&out), &b, &[37; 32])
+        .unwrap()
+        .unwrap();
     assert!(
         !format!(
             "{:?}",
@@ -963,7 +1061,10 @@ fn a_rank_is_taken_out_with_every_other_field_kept() {
         )
         .contains("identity_sources")
     );
-    assert_eq!(meta_without_source(Some(&out), &b).unwrap(), None);
-    assert_eq!(meta_without_source(None, &b).unwrap(), None);
-    assert!(meta_without_source(Some(b"garbage"), &b).is_err());
+    assert_eq!(
+        meta_without_source(Some(&out), &b, &[37; 32]).unwrap(),
+        None
+    );
+    assert_eq!(meta_without_source(None, &b, &[37; 32]).unwrap(), None);
+    assert!(meta_without_source(Some(b"garbage"), &b, &[37; 32]).is_err());
 }

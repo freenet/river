@@ -969,6 +969,8 @@ fn follow_on(
             }
             None => {}
         }
+        // A room followed under a key a move gave up reading: its answers are the session's.
+        rooms.outbox.work.forget_late(&rooms.contract_ids());
         if let Err(e) = subs.ask_due(socket, &|id| resyncs.is_out(id)) {
             return e;
         }
@@ -1298,16 +1300,17 @@ fn follow_on(
                 let mut taken_by_work = false;
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
-                let alone = nothing_else_out(
-                    !subs.pending.is_empty(),
-                    resyncs.any_out(),
-                    reload.is_some(),
-                    rooms.keys.busy(),
-                    rooms
+                let alone = OtherOut {
+                    subscribing: !subs.pending.is_empty(),
+                    reading_rooms: resyncs.any_out(),
+                    reading_store: reload.is_some(),
+                    key_request: rooms.keys.busy(),
+                    update_owed: rooms
                         .list
                         .iter()
                         .any(|r| rooms.outbox.owes(&r.stored.owner_vk)),
-                );
+                }
+                .none();
                 // A read given up on may still fail (the node retries a GET, each attempt up to
                 // a minute): an error naming nothing, or naming its room with no other request
                 // out for that room, may be that read's, so it is claimed by nobody. What else
@@ -1474,17 +1477,31 @@ fn reload_due(work: &mut super::work::Work, since_read: Duration, pace: &Pace) -
     !work.busy() && (work.take_reload() || since_read >= pace.refresh)
 }
 
-/// Whether nothing but a create's or join's request can have caused an error that names
-/// nothing: no subscribe, room read, read of the stored rooms or signing key request is out,
-/// and no room owes an update's answer.
-fn nothing_else_out(
+/// How many times a run a moved room's earlier keys that did not answer, or answered NotFound
+/// while a merge is owed from them, are read again.
+const MAX_FOLD_RETRIES: u32 = 5;
+
+/// What else may be out on the connection when an error that names nothing arrives.
+#[derive(Clone, Copy, Debug, Default)]
+struct OtherOut {
     subscribing: bool,
     reading_rooms: bool,
     reading_store: bool,
     key_request: bool,
     update_owed: bool,
-) -> bool {
-    !subscribing && !reading_rooms && !reading_store && !key_request && !update_owed
+}
+
+impl OtherOut {
+    /// Whether nothing but a create's or join's request can have caused an error that names
+    /// nothing: no subscribe, room read, read of the stored rooms or signing key request is
+    /// out, and no room owes an update's answer.
+    fn none(self) -> bool {
+        !self.subscribing
+            && !self.reading_rooms
+            && !self.reading_store
+            && !self.key_request
+            && !self.update_owed
+    }
 }
 
 /// Whether the node's error names no request: how it reports one that failed to start
@@ -3373,7 +3390,19 @@ impl Rooms {
             return;
         };
         let (name, local) = (room.name(), room.stored.room_state.clone());
-        if self.outbox.work.seed(owner, name, candidates, local) {
+        // The keys a merge is owed from: the one it was stored under, and its slot's.
+        let owed: Vec<ContractInstanceId> = self
+            .rekeyed
+            .get(&owner)
+            .into_iter()
+            .chain(self.owed.get(&owner).into_iter().flatten())
+            .map(|k| *k.id())
+            .collect();
+        if self
+            .outbox
+            .work
+            .seed_owing(owner, name, candidates, owed, local)
+        {
             self.seeding.insert(owner);
         }
     }
@@ -3403,10 +3432,16 @@ impl Rooms {
                     room.stored.contract_key = current;
                     follow.push(*current.id());
                 }
-                if !end.unresolved.is_empty() {
+                // Keys still owed are read again a bounded number of times a run (the web UI
+                // gives one up after `MAX_UNFINISHED_REKEY_LOADS` loads).
+                if !end.unresolved.is_empty() && attempts < MAX_FOLD_RETRIES {
+                    let wait = pace
+                        .resubscribe_first
+                        .saturating_mul(1 << attempts.min(16))
+                        .min(pace.resubscribe_max);
                     self.seed_retry.insert(
                         owner,
-                        (0, Some(now + pace.resubscribe_first), end.unresolved),
+                        (attempts.saturating_add(1), Some(now + wait), end.unresolved),
                     );
                 }
             } else {

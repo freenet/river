@@ -2813,7 +2813,7 @@ fn a_silent_earlier_key_costs_no_connection_and_its_late_answer_is_dropped() {
 }
 
 /// Try again after a join's forwarding PUT failed reads the room again from the start
-/// (Codex, review of #997).
+/// (it must not stay at the PUT).
 #[test]
 fn trying_a_join_again_after_its_forward_put_failed_reads_the_room_again() {
     let owner_sk = SigningKey::from_bytes(&[64; 32]);
@@ -2905,7 +2905,7 @@ fn carry_task(w: &mut Work) -> crate::rooms::carry::Predecessor {
 }
 
 /// A create the user asks for goes ahead of the carry at the carry's next request, instead of
-/// waiting for the whole walk (review of #997).
+/// waiting for the whole walk.
 #[test]
 fn a_users_create_goes_ahead_of_the_carry() {
     let mut w = Work::default();
@@ -3035,8 +3035,8 @@ fn the_users_rows_come_first_and_ended_background_work_is_hidden() {
     assert!(w.views().is_empty());
 }
 
-/// The carry writes a room's rank before its slot; `rooms_meta` it can't read stops it before
-/// the slot, with Try again, and a conflict on it is read again.
+/// The carry reads a room's key, then writes its rank before its slot; `rooms_meta` it can't
+/// read stops it before the slot, with Try again, and a conflict on it is read again.
 #[test]
 fn the_carrys_rank_write_conflicts_and_refusals() {
     let pred = crate::rooms::carry::Predecessor {
@@ -3095,7 +3095,10 @@ fn the_carrys_rank_write_conflicts_and_refusals() {
         let _ = next(&mut w);
         assert!(w.on_predecessor(&pred.key, &[answer]));
     }
-    // The rank first: rooms_meta is read, and someone else wrote it meanwhile.
+    // The room's key is read first: it holds nothing, so the room is carried.
+    expect_read(&mut w, &slot_key);
+    assert!(w.on_delegate(&read_answer(&slot_key, None, 0)));
+    // Then the rank: rooms_meta is read, and someone else wrote it meanwhile.
     expect_read(&mut w, ROOMS_META_KEY);
     assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 4)));
     let _ = expect_store(&mut w, ROOMS_META_KEY, 4);
@@ -3117,7 +3120,7 @@ fn the_carrys_rank_write_conflicts_and_refusals() {
 }
 
 /// A read of an earlier key given up on stops being waited for after [`LATE_FOR`], and a
-/// move that reads the same key again takes the answer as its own (Codex, review of #997).
+/// move that reads the same key again takes the answer as its own.
 #[test]
 fn a_late_read_expires_and_a_new_read_of_the_key_keeps_its_answer() {
     let owner_sk = SigningKey::from_bytes(&[68; 32]);
@@ -3184,4 +3187,51 @@ fn a_late_read_expires_and_a_new_read_of_the_key_keeps_its_answer() {
         gave_up + LATE_FOR
     ));
     assert!(!w.has_late());
+}
+
+/// An error that names a key a move gave up reading is that read's, nobody else's; and a key
+/// the session follows is no longer treated as given up (its answers are the session's).
+#[test]
+fn an_error_naming_a_key_given_up_on_and_a_followed_key() {
+    let owner_sk = SigningKey::from_bytes(&[70; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let owner = owner_sk.verifying_key();
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..2]),
+        plan.room.room_state.clone(),
+    );
+    let t0 = Instant::now();
+    let _ = w.next_request(false, t0);
+    let gave_up = t0 + Duration::from_secs(61);
+    assert!(!w.expire(Duration::from_secs(20), Duration::from_secs(60), gave_up));
+    assert!(w.has_late());
+    // The next key is read now; an error naming the first is that late read's.
+    let _ = w.next_request(false, gave_up);
+    let named: ClientError =
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
+            key: earlier[0],
+            cause: "no route".into(),
+        }))
+        .into();
+    assert!(w.on_error(&named, false, &|_| false));
+    assert!(!w.has_late());
+    // A key followed by the session is forgotten as late: its answer reaches the session.
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..2]),
+        plan.room.room_state.clone(),
+    );
+    let _ = w.next_request(false, t0);
+    assert!(!w.expire(Duration::from_secs(20), Duration::from_secs(60), gave_up));
+    w.forget_late(&[*earlier[0].id()]);
+    assert!(!w.has_late());
+    assert!(!w.on_contract(&ContractResponse::NotFound {
+        instance_id: *earlier[0].id()
+    }));
 }
