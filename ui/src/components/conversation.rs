@@ -50,7 +50,7 @@ mod mobile_message_actions;
 mod mobile_message_sheet;
 mod mobile_sheet_drag;
 mod mobile_surface;
-mod newcomer_ban;
+pub(crate) mod newcomer_ban;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 mod pending_effects;
@@ -4758,6 +4758,7 @@ fn MessageGroupComponent(
                                         let reply_preview_source = msg.content_text.clone();
                                         let reply_preview_names = preview_names.clone();
                                         let reply_author_name = group.author_name.clone();
+                                        let ban_author_name = group.author_name.clone();
 
                                         let invoker_target = sheet_target.clone();
 
@@ -5097,7 +5098,7 @@ fn MessageGroupComponent(
                                                                     newcomer_ban::request_ban(
                                                                         room,
                                                                         author_id,
-                                                                        reply_author_name.clone(),
+                                                                        ban_author_name.clone(),
                                                                     );
                                                                 }
                                                             },

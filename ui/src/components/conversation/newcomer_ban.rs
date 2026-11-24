@@ -120,6 +120,7 @@ pub(crate) fn build_ban(
 }
 
 /// The contract's own check of `ban`'s signature against the issuer's key.
+#[cfg(test)]
 pub(crate) fn ban_verifies(
     ban: &AuthorizedProvisionalBan,
     owner_vk: &VerifyingKey,
@@ -260,5 +261,153 @@ pub(crate) fn NewcomerBanDialog() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::member::{AuthorizedMember, Member};
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use river_core::room_state::provisional::{
+        AdmissionEvidence, AuthorizedProvisionalMember, ProvisionalMember,
+    };
+
+    fn key(n: u8) -> SigningKey {
+        SigningKey::from_bytes(&[n; 32])
+    }
+
+    fn id(n: u8) -> MemberId {
+        MemberId::from(&key(n).verifying_key())
+    }
+
+    fn member(owner: &SigningKey, sk: &SigningKey) -> AuthorizedMember {
+        AuthorizedMember::new(
+            Member {
+                owner_member_id: MemberId::from(&owner.verifying_key()),
+                invited_by: MemberId::from(&owner.verifying_key()),
+                member_vk: sk.verifying_key(),
+            },
+            owner,
+        )
+    }
+
+    fn entry(sk: &SigningKey) -> AuthorizedProvisionalMember {
+        AuthorizedProvisionalMember {
+            provisional: ProvisionalMember {
+                member_vk: sk.verifying_key(),
+                evidence: AdmissionEvidence::Pow { nonce: 0 },
+            },
+            signature: sk.sign(b"test"),
+        }
+    }
+
+    /// Owner 1, deputy 2, ordinary member 3, full-member author 4, newcomer 5.
+    fn state() -> ChatRoomStateV1 {
+        let owner = key(1);
+        let mut s = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: MemberId::from(&owner.verifying_key()),
+                    ..Default::default()
+                },
+                &owner,
+            ),
+            ..Default::default()
+        };
+        for n in [2, 3, 4] {
+            s.members.members.push(member(&owner, &key(n)));
+        }
+        let mut owner_info = MemberInfo::new_public(id(1), 1, "o".into());
+        owner_info.deputies = vec![id(2)];
+        s.member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new(owner_info, &owner));
+        s.provisional.entries.push(entry(&key(5)));
+        s
+    }
+
+    fn can(s: &ChatRoomStateV1, reader: u8, author: u8) -> bool {
+        can_ban_newcomer(
+            s,
+            &key(1).verifying_key(),
+            Some(&key(reader).verifying_key()),
+            id(author),
+        )
+    }
+
+    #[test]
+    fn owner_and_a_deputy_are_offered_the_ban_on_a_newcomer() {
+        let s = state();
+        assert!(can(&s, 1, 5), "owner");
+        assert!(can(&s, 2, 5), "deputy");
+    }
+
+    #[test]
+    fn an_ordinary_member_or_a_reader_with_no_key_is_not_offered_it() {
+        let s = state();
+        assert!(!can(&s, 3, 5), "ordinary member");
+        assert!(!can(&s, 5, 5), "a newcomer");
+        assert!(!can_ban_newcomer(&s, &key(1).verifying_key(), None, id(5)));
+    }
+
+    #[test]
+    fn it_is_never_offered_for_a_full_member_yourself_the_owner_or_a_stranger() {
+        let s = state();
+        assert!(!can(&s, 1, 4), "full member");
+        assert!(!can(&s, 2, 2), "yourself");
+        assert!(!can(&s, 2, 1), "the owner");
+        assert!(!can(&s, 1, 9), "an author with no entry");
+    }
+
+    #[test]
+    fn it_is_not_offered_again_once_the_ban_stands() {
+        let mut s = state();
+        let ban = build_ban(&key(1).verifying_key(), &key(1), id(5), SystemTime::now());
+        s.provisional.bans.push(ban);
+        assert!(!can(&s, 1, 5));
+    }
+
+    #[test]
+    fn a_key_that_is_not_the_owner_or_a_deputy_record_is_not_an_issuer() {
+        let s = state();
+        assert!(!is_ban_issuer(
+            &s,
+            &key(1).verifying_key(),
+            &key(7).verifying_key()
+        ));
+        assert!(!is_ban_issuer(
+            &s,
+            &key(1).verifying_key(),
+            &key(3).verifying_key()
+        ));
+    }
+
+    #[test]
+    fn the_built_ban_verifies_under_the_contract_check_for_owner_and_deputy() {
+        let owner_vk = key(1).verifying_key();
+        for issuer in [1u8, 2] {
+            let ban = build_ban(&owner_vk, &key(issuer), id(5), SystemTime::now());
+            assert!(ban_verifies(&ban, &owner_vk, &key(issuer).verifying_key()));
+            assert_eq!(ban.ban.target, id(5));
+            assert_eq!(ban.ban.banned_by, id(issuer));
+            assert!(
+                !ban_verifies(&ban, &owner_vk, &key(3).verifying_key()),
+                "another key does not verify it"
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_says_whether_the_merged_state_holds_the_ban() {
+        let mut s = state();
+        let ban = build_ban(&key(1).verifying_key(), &key(1), id(5), SystemTime::now());
+        assert_eq!(outcome(&s, &ban), BanOutcome::NotKept);
+        s.provisional.bans.push(ban.clone());
+        assert_eq!(outcome(&s, &ban), BanOutcome::Stands);
+        assert!(outcome_message("N", BanOutcome::NotKept).contains("not kept"));
+        assert!(!outcome_message("N", BanOutcome::Stands).contains("not kept"));
     }
 }

@@ -1974,6 +1974,51 @@ mod tests {
     }
 
     #[test]
+    fn a_newcomer_ban_built_by_the_menu_is_kept_by_the_rooms_own_apply() {
+        use crate::components::conversation::newcomer_ban::{
+            build_ban, can_ban_newcomer, outcome, BanOutcome,
+        };
+        use river_core::room_state::provisional::ProvisionalDelta;
+        use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+        let state = room(PrivacyMode::Public, Some(policy(6, 2)));
+        let sk = SigningKey::from_bytes(&[41u8; 32]);
+        let (owner_vk, entry) = solved(&state, &sk);
+        let sub = build_submission(
+            &state,
+            &owner_vk,
+            &sk,
+            &entry,
+            "hi",
+            "Visitor",
+            SystemTime::now(),
+        )
+        .unwrap();
+        let mut after = sub.state_after;
+        let target = MemberId::from(&sk.verifying_key());
+        assert!(can_ban_newcomer(&after, &owner_vk, Some(&owner_vk), target));
+        let ban = build_ban(&owner_vk, &owner(), target, SystemTime::now());
+        let before = after.clone();
+        after
+            .apply_delta(
+                &before,
+                &ChatRoomParametersV1 { owner: owner_vk },
+                &Some(ChatRoomStateV1Delta {
+                    provisional: Some(ProvisionalDelta {
+                        entries: vec![],
+                        bans: vec![ban.clone()],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("the room accepts the ban");
+        assert_eq!(outcome(&after, &ban), BanOutcome::Stands);
+        assert!(
+            !can_ban_newcomer(&after, &owner_vk, Some(&owner_vk), target),
+            "not offered again"
+        );
+    }
+
+    #[test]
     fn a_pruned_open_member_is_told_and_a_held_proof_is_resubmitted_with_the_same_key() {
         let (data, sk, entry) = pruned_member();
         assert!(data.is_pruned_open_member());
